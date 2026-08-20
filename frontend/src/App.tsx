@@ -31,6 +31,10 @@ const PublishedPages = lazy(() => import('./pages/PublishedPages'));
 const PublishedPageAccess = lazy(() => import('./pages/PublishedPageAccess'));
 const PublishedPageViewer = lazy(() => import('./pages/PublishedPageViewer'));
 const PublishedPageUnavailable = lazy(() => import('./pages/PublishedPageUnavailable'));
+const ProjectPortfolioPage = lazy(() => import('./features/projects/ProjectPortfolioPage'));
+const ProjectTemplatesPage = lazy(() => import('./features/projects/ProjectTemplatesPage'));
+const ProjectCreatePage = lazy(() => import('./features/projects/ProjectCreatePage'));
+const ProjectWorkspacePage = lazy(() => import('./features/projects/ProjectWorkspacePage'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -316,6 +320,10 @@ export default function App() {
                     <Route path="agents/:id/settings" element={<AgentDetail />} />
                     <Route path="messages" element={<Messages />} />
                     <Route path="published-pages" element={<PublishedPages />} />
+                    <Route path="projects" element={<ProjectPortfolioPage />} />
+                    <Route path="projects/templates" element={<ProjectTemplatesPage />} />
+                    <Route path="projects/new" element={<ProjectCreatePage />} />
+                    <Route path="projects/:projectId/*" element={<ProjectWorkspacePage />} />
                     <Route path="enterprise" element={<CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute>} />
                     <Route path="okr" element={<OKR />} />
                     <Route path="invitations" element={<InvitationCodes />} />

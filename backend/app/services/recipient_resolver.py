@@ -93,7 +93,7 @@ def parse_canonical_id(value: object, field_name: str) -> uuid.UUID:
 class ResolvedAgentRecipient:
     source_agent: Agent
     target_agent: Agent
-    relationship: AgentAgentRelationship
+    relationship: AgentAgentRelationship | None
 
 
 @dataclass(frozen=True)
@@ -135,8 +135,16 @@ async def resolve_agent_recipient(
     db: AsyncSession,
     source_agent_id: uuid.UUID,
     target_agent_id: object,
+    *,
+    project_id: uuid.UUID | None = None,
 ) -> ResolvedAgentRecipient:
-    """Resolve one exact, same-tenant, active A2A relationship by Agent.id."""
+    """Resolve one exact, same-tenant A2A recipient.
+
+    The ordinary path requires an active global relationship. A project-scoped
+    call may instead use two enabled member snapshots in the same project;
+    this grants no authority outside that project and never mutates either
+    source Agent's global relationship graph.
+    """
 
     target_id = parse_canonical_id(target_agent_id, "agent_id")
     source = await _load_source_agent(db, source_agent_id)
@@ -163,6 +171,32 @@ async def resolve_agent_recipient(
     )
     relationship = relationship_result.scalar_one_or_none()
     if relationship is None:
+        if project_id is not None:
+            from app.models.project import Project, ProjectMemberSnapshot
+
+            project = (
+                await db.execute(
+                    select(Project).where(
+                        Project.id == project_id,
+                        Project.tenant_id == source.tenant_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if project is not None:
+                member_ids = set(
+                    (
+                        await db.execute(
+                            select(ProjectMemberSnapshot.agent_id).where(
+                                ProjectMemberSnapshot.project_id == project.id,
+                                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                                ProjectMemberSnapshot.agent_id.in_([source.id, target.id]),
+                                ProjectMemberSnapshot.is_enabled.is_(True),
+                            )
+                        )
+                    ).scalars()
+                )
+                if member_ids == {source.id, target.id}:
+                    return ResolvedAgentRecipient(source, target, None)
         raise RecipientResolutionError(
             "recipient_not_related",
             "agent_id does not identify an active related digital employee",

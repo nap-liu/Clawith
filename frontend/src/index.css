@@ -1580,6 +1580,12 @@ select:focus {
   padding-top: 8px;
 }
 
+/* Project workspaces provide their own project-level header and navigation. */
+.main-content.project-workspace-page {
+  padding: 0;
+  min-height: 0;
+}
+
 /* ─── Collapsed Sidebar Overrides ───────────────────── */
 .sidebar.collapsed {
   --sidebar-width: var(--sidebar-width-collapsed);

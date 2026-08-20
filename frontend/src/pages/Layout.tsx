@@ -33,6 +33,7 @@ import {
     IconCheck,
     IconApps,
     IconFileDescription,
+    IconFolder,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
@@ -435,6 +436,7 @@ export default function Layout() {
     // Detect chat page: needs fixed-height main-content for inner scroll to work
     const isChatPage = !!useMatch('/agents/:id/chat');
     const isAgentSettingsPage = !!useMatch('/agents/:id/settings');
+    const isProjectWorkspacePage = !!useMatch('/projects/:projectId/*');
     const activeAgentNestedMatch = useMatch('/agents/:id/*');
     const activeAgentRootMatch = useMatch('/agents/:id');
     const activeAgentId = activeAgentNestedMatch?.params.id || activeAgentRootMatch?.params.id;
@@ -1061,6 +1063,12 @@ export default function Layout() {
 
 
                     <div className="sidebar-section" data-tour-target="main-nav">
+                        <NavLink to="/projects" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                <IconFolder size={14} stroke={1.5} />
+                            </span>
+                            <span className="sidebar-item-text">{t('nav.projects', '项目')}</span>
+                        </NavLink>
                         <NavLink to="/explore" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
                                 <IconApps size={14} stroke={1.5} />
@@ -1469,7 +1477,7 @@ export default function Layout() {
                 </div>
             )}
 
-            <main className={`main-content${isChatPage ? ' chat-page' : ''}${isAgentSettingsPage ? ' agent-settings-page' : ''}`}>
+            <main className={`main-content${isChatPage ? ' chat-page' : ''}${isAgentSettingsPage ? ' agent-settings-page' : ''}${isProjectWorkspacePage ? ' project-workspace-page' : ''}`}>
                 <Outlet context={{ openTalentMarket: () => setShowTalentMarket(true) }} />
             </main>
 

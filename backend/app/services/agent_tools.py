@@ -10605,8 +10605,14 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
         async with async_session() as db:
             try:
+                project_id = None
+                if args.get("_project_id"):
+                    try:
+                        project_id = uuid.UUID(str(args["_project_id"]))
+                    except (TypeError, ValueError):
+                        return "❌ _project_id must be a complete platform UUID"
                 recipient = await resolve_agent_recipient(
-                    db, from_agent_id, canonical_agent_id
+                    db, from_agent_id, canonical_agent_id, project_id=project_id
                 )
             except RecipientResolutionError as exc:
                 return exc.as_json()

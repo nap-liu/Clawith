@@ -41,6 +41,18 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     fc-cache -fv && \
     rm -rf /var/lib/apt/lists/*
 
+# Project workspaces use native Git for immutable commit history, safe restore
+# commits, and project-local branches. Keep this in its own layer so changing
+# the Git dependency does not invalidate the large Chromium/runtime layer.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s/deb.debian.org/${CLAWITH_APT_MIRROR}/g" /etc/apt/sources.list.d/debian.sources; \
+    else \
+        sed -i "s/deb.debian.org/${CLAWITH_APT_MIRROR}/g" /etc/apt/sources.list; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy installed packages from deps stage
 COPY --from=deps /usr/local/lib/python3.12/site-packages/ /usr/local/lib/python3.12/site-packages/
 COPY --from=deps /usr/local/bin/ /usr/local/bin/

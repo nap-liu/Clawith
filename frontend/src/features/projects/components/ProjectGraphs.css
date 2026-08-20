@@ -1,0 +1,226 @@
+.project-graph {
+    width: 100%;
+    height: 100%;
+    min-height: 390px;
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+}
+
+.project-graph .react-flow {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.project-graph .react-flow__pane {
+    cursor: grab;
+}
+
+.project-graph .react-flow__pane.dragging {
+    cursor: grabbing;
+}
+
+.project-graph .react-flow__node-projectGraph {
+    width: 238px;
+    border-radius: var(--radius-lg);
+    outline: none;
+}
+
+.project-graph__node {
+    min-height: 72px;
+    padding: var(--space-3);
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-sm);
+    color: var(--text-primary);
+    transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+
+.project-graph__node:hover {
+    border-color: var(--border-strong);
+    box-shadow: var(--shadow-md);
+}
+
+.project-graph__node.is-selected {
+    border-color: var(--info);
+    box-shadow: var(--shadow-md);
+}
+
+.project-graph__node.is-info { border-left: 3px solid var(--info); }
+.project-graph__node.is-success { border-left: 3px solid var(--success); }
+.project-graph__node.is-warning { border-left: 3px solid var(--warning); }
+.project-graph__node.is-danger { border-left: 3px solid var(--error); }
+.project-graph__node.is-neutral { border-left: 3px solid var(--border-strong); }
+
+.project-graph__node-icon {
+    width: 34px;
+    height: 34px;
+    flex: 0 0 34px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-md);
+    background: var(--bg-active);
+    color: var(--text-secondary);
+}
+
+.project-graph__node.is-info .project-graph__node-icon { background: var(--info-subtle); color: var(--info); }
+.project-graph__node.is-success .project-graph__node-icon { background: var(--success-subtle); color: var(--success); }
+.project-graph__node.is-warning .project-graph__node-icon { background: var(--warning-subtle); color: var(--warning); }
+.project-graph__node.is-danger .project-graph__node-icon { background: var(--error-subtle); color: var(--error); }
+
+.project-graph__node-copy {
+    min-width: 0;
+    flex: 1;
+}
+
+.project-graph__node-copy strong,
+.project-graph__node-copy small,
+.project-graph__node-copy code {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.project-graph__node-copy strong {
+    font-size: var(--text-xs);
+    font-weight: 650;
+    line-height: 1.35;
+}
+
+.project-graph__node-copy small {
+    margin-top: var(--space-1);
+    color: var(--text-secondary);
+    font-size: 9px;
+}
+
+.project-graph__node-copy code {
+    margin-top: var(--space-1);
+    color: var(--text-tertiary);
+    font-size: 8px;
+}
+
+.project-graph__node > em {
+    max-width: 68px;
+    padding: 3px 6px;
+    overflow: hidden;
+    border-radius: var(--radius-full);
+    background: var(--bg-active);
+    color: var(--text-secondary);
+    font-size: 8px;
+    font-style: normal;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.project-graph__handle {
+    width: 7px;
+    height: 7px;
+    border: 1px solid var(--bg-elevated);
+    background: var(--text-tertiary);
+}
+
+.project-graph .react-flow__edge-path {
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.project-graph .react-flow__edge.selected .react-flow__edge-path,
+.project-graph .react-flow__edge:focus .react-flow__edge-path {
+    stroke: var(--info);
+    stroke-width: 2;
+}
+
+.project-graph .react-flow__controls {
+    overflow: hidden;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+}
+
+.project-graph .react-flow__controls-button {
+    border: 0;
+    border-bottom: 1px solid var(--border-default);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+}
+
+.project-graph .react-flow__controls-button:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+
+.project-graph .react-flow__controls-button svg {
+    fill: currentColor;
+}
+
+.project-graph .react-flow__minimap {
+    overflow: hidden;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-sm);
+}
+
+.project-graph__legend {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+    color: var(--text-tertiary);
+    font-size: 9px;
+}
+
+.project-graph__legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.project-graph__legend i {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--border-strong);
+}
+
+.project-graph__legend i.is-info { background: var(--info); }
+.project-graph__legend i.is-success { background: var(--success); }
+.project-graph__legend i.is-warning { background: var(--warning); }
+.project-graph__legend i.is-danger { background: var(--error); }
+
+@media (max-width: 720px) {
+    .project-graph {
+        min-height: 340px;
+    }
+
+    .project-graph .react-flow__node-projectGraph {
+        width: 210px;
+    }
+
+    .project-graph__node {
+        min-height: 66px;
+        padding: var(--space-2) var(--space-3);
+    }
+
+    .project-graph .react-flow__minimap {
+        display: none;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .project-graph__node {
+        transition: none;
+    }
+
+    .project-graph .react-flow__edge.animated path {
+        animation: none;
+    }
+}

@@ -1,0 +1,350 @@
+"""Request/response contracts for AI-native projects."""
+
+import uuid
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class ProjectMemberCreate(BaseModel):
+    agent_id: uuid.UUID
+    is_leader: bool = False
+    is_enabled: bool = True
+    enabled_inherited_capability_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class ProjectCapabilityCreate(BaseModel):
+    capability_type: Literal["skill", "mcp", "tool"]
+    capability_id: uuid.UUID | None = None
+    capability_name: str | None = None
+    source: Literal["shared", "inherited"] = "shared"
+    inherited_from_agent_id: uuid.UUID | None = None
+    is_enabled: bool = True
+    scope: dict = Field(default_factory=dict)
+    config: dict = Field(default_factory=dict)
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    goal: str = ""
+    objective: str | None = None
+    success_criteria: list[str] = Field(default_factory=list)
+    visibility: Literal["private", "shared"] = "private"
+    shared_with_user_ids: list[uuid.UUID] = Field(default_factory=list)
+    shared_user_ids: list[uuid.UUID] = Field(default_factory=list)
+    status: Literal["initializing", "running", "waiting", "paused", "completed", "archived", "failed"] = "initializing"
+    template_id: uuid.UUID | None = None
+    members: list[ProjectMemberCreate] = Field(default_factory=list)
+    capabilities: list[ProjectCapabilityCreate] = Field(default_factory=list)
+    shared_capability_ids: list[uuid.UUID] = Field(default_factory=list)
+    settings: dict = Field(default_factory=dict)
+    git: dict = Field(default_factory=dict)
+    runtime: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_frontend_payload(self):
+        if not self.goal and self.objective:
+            self.goal = self.objective
+        if not self.shared_with_user_ids and self.shared_user_ids:
+            self.shared_with_user_ids = self.shared_user_ids
+        if self.git or self.runtime:
+            self.settings = {**self.settings, "git": self.git, "runtime": self.runtime}
+        return self
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    goal: str | None = None
+    success_criteria: list[str] | None = None
+    visibility: Literal["private", "shared"] | None = None
+    status: Literal["initializing", "running", "waiting", "paused", "completed", "archived", "failed"] | None = None
+    settings: dict | None = None
+    shared_with_user_ids: list[uuid.UUID] | None = None
+
+
+class ProjectSettingsUpdate(BaseModel):
+    """Project-local runtime and governance settings.
+
+    Extra keys are intentionally accepted because project templates can define
+    domain-specific policies. Git repository ownership/configuration is guarded
+    by the endpoint and cannot be changed through this contract.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    policies: dict[str, Any] | None = None
+    runtime: dict[str, Any] | None = None
+    current_signal: str | None = Field(default=None, max_length=500)
+    next_action: str | None = Field(default=None, max_length=500)
+
+
+class ProjectOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    owner_user_id: uuid.UUID
+    template_id: uuid.UUID | None
+    name: str
+    description: str
+    goal: str
+    success_criteria: list
+    visibility: str
+    status: str
+    settings: dict
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectMemberUpdate(BaseModel):
+    is_enabled: bool | None = None
+    is_leader: bool | None = None
+    config_snapshot: dict | None = None
+
+
+class ProjectMemberOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    agent_id: uuid.UUID
+    name_snapshot: str
+    role_snapshot: str
+    config_snapshot: dict
+    source_updated_at: datetime | None
+    is_leader: bool
+    is_enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectAccessGrantCreate(BaseModel):
+    user_id: uuid.UUID
+    role: Literal["view", "edit"] = "view"
+
+
+class ProjectAccessGrantOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    user_id: uuid.UUID
+    role: str
+    created_by_user_id: uuid.UUID | None
+    created_at: datetime
+
+
+class LeaderUpdate(BaseModel):
+    agent_id: uuid.UUID
+
+
+class CapabilityUpdate(BaseModel):
+    is_enabled: bool | None = None
+    scope: dict | None = None
+    config: dict | None = None
+
+
+class CapabilityOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    capability_type: str
+    capability_id: uuid.UUID | None
+    capability_name: str
+    source: str
+    inherited_from_agent_id: uuid.UUID | None
+    is_enabled: bool
+    scope: dict
+    config: dict
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    category: str = "general"
+    version: str = "1.0.0"
+    is_published: bool = False
+    definition: dict = Field(default_factory=dict)
+
+
+class ProjectTemplateOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID | None
+    created_by_user_id: uuid.UUID | None
+    name: str
+    description: str
+    category: str
+    version: str
+    is_published: bool
+    definition: dict
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectFromTemplateCreate(BaseModel):
+    template_id: uuid.UUID
+    name: str | None = None
+    description: str | None = None
+    visibility: Literal["private", "shared"] = "private"
+    overrides: dict = Field(default_factory=dict)
+
+
+class WorkItemCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    description: str = ""
+    parent_id: uuid.UUID | None = None
+    assignee_agent_id: uuid.UUID | None = None
+    status: Literal["backlog", "todo", "in_progress", "review", "blocked", "done"] = "backlog"
+    priority: Literal["low", "medium", "high", "urgent"] = "medium"
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    dependency_ids: list[uuid.UUID] = Field(default_factory=list)
+    due_at: datetime | None = None
+
+
+class WorkItemUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    description: str | None = None
+    assignee_agent_id: uuid.UUID | None = None
+    status: Literal["backlog", "todo", "in_progress", "review", "blocked", "done"] | None = None
+    priority: Literal["low", "medium", "high", "urgent"] | None = None
+    acceptance_criteria: list[str] | None = None
+    dependency_ids: list[uuid.UUID] | None = None
+    due_at: datetime | None = None
+
+
+class WorkItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    parent_id: uuid.UUID | None
+    assignee_agent_id: uuid.UUID | None
+    created_by_user_id: uuid.UUID | None
+    created_by_agent_id: uuid.UUID | None
+    title: str
+    description: str
+    status: str
+    priority: str
+    acceptance_criteria: list
+    dependency_ids: list
+    due_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectRunCreate(BaseModel):
+    work_item_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
+    trigger_type: Literal["manual", "leader", "a2a", "schedule", "retry"] = "manual"
+    input: dict = Field(default_factory=dict)
+
+
+class ProjectRunUpdate(BaseModel):
+    status: Literal["queued", "running", "waiting", "succeeded", "failed", "cancelled"] | None = None
+    output: dict | None = None
+    error: str | None = None
+
+
+class ProjectRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    work_item_id: uuid.UUID | None
+    agent_id: uuid.UUID | None
+    initiated_by_user_id: uuid.UUID | None
+    status: str
+    trigger_type: str
+    input: dict
+    output: dict
+    error: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectRunMemberSnapshotOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    run_id: uuid.UUID
+    project_member_id: uuid.UUID
+    agent_id: uuid.UUID
+    is_leader: bool
+    member_config_snapshot: dict
+    capability_snapshot: list
+    created_at: datetime
+
+
+class ProjectEventCreate(BaseModel):
+    event_type: str = Field(min_length=1, max_length=100)
+    summary: str = Field(default="", max_length=500)
+    work_item_id: uuid.UUID | None = None
+    run_id: uuid.UUID | None = None
+    actor_agent_id: uuid.UUID | None = None
+    metadata: dict = Field(default_factory=dict)
+
+
+class ProjectEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    work_item_id: uuid.UUID | None
+    run_id: uuid.UUID | None
+    actor_user_id: uuid.UUID | None
+    actor_agent_id: uuid.UUID | None
+    from_agent_id: uuid.UUID | None
+    to_agent_id: uuid.UUID | None
+    event_type: str
+    summary: str
+    event_metadata: dict
+    created_at: datetime
+
+
+class A2AWakeRequest(BaseModel):
+    from_agent_id: uuid.UUID
+    to_agent_id: uuid.UUID
+    message: str = Field(min_length=1)
+    mode: Literal["notify", "consult", "delegate", "review"] = "notify"
+    work_item_id: uuid.UUID | None = None
+    new_conversation: bool = False
+
+
+class GitRestoreRequest(BaseModel):
+    commit: str = Field(pattern=r"^[0-9a-fA-F]{7,64}$")
+    message: str | None = None
+
+
+class GitBranchRequest(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9._/-]+$")
+    from_commit: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{7,64}$")
+
+
+class ProjectFileWriteRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    content: str
+
+
+class GitCommitRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+    paths: list[str] | None = None
+    milestone: bool = False
+
+    @model_validator(mode="after")
+    def validate_paths(self):
+        if self.paths is not None and not self.paths:
+            raise ValueError("paths must be omitted or contain at least one path")
+        if self.paths and len(self.paths) != len(set(self.paths)):
+            raise ValueError("paths must not contain duplicates")
+        return self

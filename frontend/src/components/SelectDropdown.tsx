@@ -15,6 +15,7 @@ type SelectDropdownProps<T extends string> = {
     ariaLabel: string;
     disabled?: boolean;
     className?: string;
+    placeholder?: string;
 };
 
 export default function SelectDropdown<T extends string>({
@@ -24,6 +25,7 @@ export default function SelectDropdown<T extends string>({
     ariaLabel,
     disabled = false,
     className = '',
+    placeholder,
 }: SelectDropdownProps<T>) {
     return (
         <div className={`select-dropdown ${className}`.trim()}>
@@ -33,7 +35,7 @@ export default function SelectDropdown<T extends string>({
                 disabled={disabled}
             >
                 <Select.Trigger className="select-dropdown__trigger" aria-label={ariaLabel}>
-                    <Select.Value />
+                    <Select.Value placeholder={placeholder} />
                     <Select.Icon asChild>
                         <IconChevronDown size={16} />
                     </Select.Icon>

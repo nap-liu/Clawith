@@ -208,6 +208,7 @@ async def lifespan(fastapi_app: FastAPI):
             import app.models.mcp_server     # noqa  # FK target of tools.mcp_server_id; fresh-DB create_all needs it registered
             import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
             import app.models.scene          # noqa
+            import app.models.project        # noqa
 
             import app.models.identity       # noqa
             import app.models.published_page  # noqa
@@ -481,6 +482,7 @@ from app.api.confirmations import router as confirmations_router
 from app.api.speech import router as speech_router
 from app.api.speech_config import router as speech_config_router
 from app.api.toolscall import router as toolscall_router
+from app.api.projects import router as projects_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -551,6 +553,7 @@ app.include_router(confirmations_router, prefix=settings.API_PREFIX)
 app.include_router(speech_router)
 app.include_router(speech_config_router)
 app.include_router(toolscall_router, prefix=settings.API_PREFIX)
+app.include_router(projects_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])
