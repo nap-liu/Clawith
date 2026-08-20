@@ -1420,8 +1420,23 @@ async def call_llm(
             tools=tools_for_llm if tools_for_llm else None,
             max_output_tokens=max_tokens,
         )
+        # All persisted conversation surfaces (Web Chat, project group leader
+        # children, project A2A children, and ordinary IM sessions) share the
+        # same first-dispatch compaction boundary.  Previously recovery only
+        # ran after the prompt no longer fit, even though the canonical
+        # compactor exposes a conservative pre-flight threshold specifically
+        # to avoid reaching that cliff.  Keep recovery single-shot and anchored
+        # to a durable fresh turn, but invoke it when either the hard guard or
+        # the standard pre-flight policy says the session should compact.
+        from app.services.llm.compactor import should_compact
+
+        preflight_compaction_required, _, _ = should_compact(
+            model=model,
+            last_prompt_tokens=None,
+            pre_flight_estimate=dispatch_budget.estimated_tokens,
+        )
         if (
-            not dispatch_budget.fits
+            (not dispatch_budget.fits or preflight_compaction_required)
             and round_i == 0
             and turn_anchor_id is not None
             and context_recovery is not None

@@ -676,6 +676,7 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
         captured.update(kwargs)
         captured["user_text"] = user_text
         assert await kwargs["before_round"](0) == []
+        await kwargs["on_thinking"]("child hidden reasoning")
         await runtime.send_subagent_message_to_parent(
             agent_id=_agent_id,
             execution_user_id=user_id,
@@ -692,7 +693,10 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
     assert (status, result) == ("completed", "child result")
     assert parent_messages == ["sync interim"]
     assert captured["model_name"] == "Readable-Test-Model"
-    assert captured["broadcast_web"] is False
+    assert captured["broadcast_web"] is True
+    assert captured["turn_anchor_id"] is not None
+    assert captured["continue_turn"] is False
+    assert captured["recovery_mode"] is False
     assert captured["prepared_tools"][0]["function"]["name"] == "safe"
     async with async_session() as db:
         final = (
@@ -707,7 +711,108 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
             )
         ).scalar_one()
     assert final.content == "child result"
+    assert final.thinking == "child hidden reasoning"
     assert final.message_meta["subagent_wake"] is False
+
+
+async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypatch):
+    from app.services import confirmation_service
+
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-confirmation",
+        task="confirm before continuing",
+        mode="async",
+        model="Readable-Test-Model",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    invocations = []
+    pending_call_id = None
+
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del _agent_id, _session_id, execution_user_id
+        return []
+
+    async def fake_llm(_db, _agent_id, user_text, **kwargs):
+        nonlocal pending_call_id
+        invocations.append(dict(kwargs, user_text=user_text))
+        if len(invocations) == 1:
+            pending_call_id = await confirmation_service.suspend_for_confirmation(
+                agent_id=_agent_id,
+                conversation_id=kwargs["session_id"],
+                chat_session_id=uuid.UUID(kwargs["session_id"]),
+                source_channel="subagent",
+                user_id=user_id,
+                intro_text="需要确认",
+                title="继续执行",
+                summary="确认后继续当前项目任务",
+                action={"tool": "project_write_file", "args": {"path": "ok.txt"}},
+                risk_level="medium",
+                buttons=[{"label": "继续", "value": "continue"}],
+                force_confirmation=True,
+                turn_anchor_id=kwargs["turn_anchor_id"],
+            )
+            return ""
+        assert kwargs["continue_turn"] is True
+        assert kwargs["recovery_mode"] is True
+        assert any(row.get("role") == "tool" for row in kwargs["history"])
+        await kwargs["on_thinking"]("resumed hidden reasoning")
+        return "confirmed child result"
+
+    async def no_origin_card(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
+    monkeypatch.setattr(confirmation_service, "_update_origin_card", no_origin_card)
+
+    await runtime.execute_claimed_subagent(run.id)
+    assert pending_call_id is not None
+    async with async_session() as db:
+        parked = await db.get(SubagentRun, run.id)
+        processing = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(run.id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == runtime.SUBAGENT_INPUT,
+                )
+            )
+        ).scalar_one()
+        assert parked.status == runtime.RUN_WAITING
+        assert processing.message_meta["subagent_input_state"] == runtime.INPUT_PROCESSING
+
+    resolved = await confirmation_service.resolve_confirmation(
+        agent_id=agent_id,
+        call_id=pending_call_id,
+        button_value="continue",
+        button_label="继续",
+        resolving_user_id=user_id,
+    )
+    assert resolved and "继续" in resolved
+    assert len(invocations) == 2
+    async with async_session() as db:
+        completed = await db.get(SubagentRun, run.id)
+        confirmation = await db.get(ChatMessage, pending_call_id)
+        final = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(run.id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == runtime.SUBAGENT_COMPLETION,
+                )
+                .limit(1)
+            )
+        ).scalar_one()
+    assert completed.status == runtime.RUN_COMPLETED
+    assert json.loads(confirmation.content)["status"] == "done"
+    assert final.content == "confirmed child result"
+    assert final.thinking == "resumed hidden reasoning"
 
 
 async def test_revoked_execution_user_fails_before_llm_or_tool_side_effect(monkeypatch):

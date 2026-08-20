@@ -212,7 +212,11 @@ async def deliver_message_to_runtime(
         delivered = await _deliver_wechat(agent_id, runtime, message)
     elif channel == "discord":
         delivered = await _deliver_discord(agent_id, runtime, message)
-    elif channel in {"agent", "trigger"}:
+    elif channel in {"agent", "trigger", "subagent"}:
+        # Durable child Sessions have no external transport adapter. Their DB
+        # history is the authoritative delivery surface (and the normal parent
+        # event dispatcher consumes terminal child rows). Treat the persisted
+        # reply exactly like Web/Agent history instead of retrying forever.
         return await _deliver_web(agent_id, runtime, message)
 
     if delivered is not None:

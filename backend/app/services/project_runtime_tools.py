@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from typing import Any
@@ -14,6 +15,7 @@ from app.models.chat_session import ChatSession
 from app.models.project import (
     Project,
     ProjectCapabilityBinding,
+    ProjectEvent,
     ProjectMemberSnapshot,
     ProjectRun,
     ProjectWorkItem,
@@ -59,6 +61,63 @@ PROJECT_RUNTIME_TOOL_NAMES = PARTICIPANT_PROJECT_TOOLS | LEADER_ONLY_PROJECT_TOO
 
 WORK_ITEM_STATUSES = {"backlog", "todo", "in_progress", "review", "blocked", "done"}
 WORK_ITEM_PRIORITIES = {"low", "medium", "high", "urgent"}
+
+
+def _milestone_operation_key(
+    project: Project,
+    member: ProjectMemberSnapshot,
+    project_run: ProjectRun | None,
+    session_id: str,
+    message: str,
+    paths: list[str] | None,
+    related_work_item_ids: set[uuid.UUID],
+    related_run_ids: set[uuid.UUID],
+) -> str:
+    """Build a semantic retry key independent of an LLM-generated tool-call id."""
+
+    payload = {
+        "version": 1,
+        "project_id": str(project.id),
+        "agent_id": str(member.agent_id),
+        "project_run_id": str(project_run.id) if project_run else None,
+        "session_id": session_id,
+        "message": message,
+        "paths": sorted(paths or []),
+        "related_work_item_ids": sorted(str(value) for value in related_work_item_ids),
+        "related_run_ids": sorted(str(value) for value in related_run_ids),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"project-milestone-v1-{digest}"
+
+
+async def _milestone_operation_event(
+    db,
+    project: Project,
+    operation_key: str,
+) -> ProjectEvent | None:
+    candidates = (
+        (
+            await db.execute(
+                select(ProjectEvent).where(
+                    ProjectEvent.project_id == project.id,
+                    ProjectEvent.tenant_id == project.tenant_id,
+                    ProjectEvent.event_type.in_(["git.milestone.prepared", "git.milestone.created"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return next(
+        (
+            event
+            for event in candidates
+            if dict(event.event_metadata or {}).get("milestone_operation_key") == operation_key
+        ),
+        None,
+    )
 
 
 def _schema(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
@@ -627,6 +686,24 @@ async def execute_project_runtime_tool(
             _uuid(value, "related_work_item_id") for value in arguments.get("related_work_item_ids", [])
         }
         related_run_ids = {_uuid(value, "related_run_id") for value in arguments.get("related_run_ids", [])}
+        operation_key = _milestone_operation_key(
+            project,
+            member,
+            project_run,
+            session_id,
+            message,
+            paths,
+            related_work_item_ids,
+            related_run_ids,
+        )
+        related_metadata = {
+            **trace_metadata,
+            "milestone_operation_key": operation_key,
+            "milestone_message": message,
+            "description": message,
+            "related_work_item_ids": [str(value) for value in sorted(related_work_item_ids, key=str)],
+            "related_run_ids": [str(value) for value in sorted(related_run_ids, key=str)],
+        }
         async with async_session() as db:
             if related_work_item_ids:
                 found_work_items = set(
@@ -654,29 +731,52 @@ async def execute_project_runtime_tool(
                 )
                 if found_runs != related_run_ids:
                     raise ValueError("Every related run must belong to the current project")
-        result = await commit_project_changes(project, message, paths, milestone=True)
+            operation_event = await _milestone_operation_event(db, project, operation_key)
+            if operation_event is None:
+                operation_event = add_event(
+                    db,
+                    project,
+                    "git.milestone.prepared",
+                    f"{member.name_snapshot} prepared a project Git milestone",
+                    actor_agent_id=agent_id,
+                    work_item_id=project_run.work_item_id if project_run else None,
+                    run_id=project_run.id if project_run else None,
+                    metadata={**related_metadata, "milestone_state": "prepared"},
+                )
+                await db.flush()
+            operation_event_id = operation_event.id
+            # The prepared audit row is the durable operation journal.  Any DB
+            # constraint/serialization failure happens before Git is touched.
+            await db.commit()
+        result = await commit_project_changes(
+            project,
+            message,
+            paths,
+            milestone=True,
+            operation_key=operation_key,
+        )
         async with async_session() as db:
             attached = await db.get(Project, project.id)
+            operation_event = await db.get(ProjectEvent, operation_event_id)
+            if operation_event is None:
+                operation_event = await _milestone_operation_event(db, attached, operation_key)
+            if operation_event is None:
+                raise RuntimeError("Durable milestone operation journal is missing")
             settings = dict(attached.settings or {})
             settings["git"] = {**dict(settings.get("git") or {}), "head": result["commit"]}
             attached.settings = settings
-            add_event(
-                db,
-                attached,
-                "git.milestone.created",
-                f"{member.name_snapshot} created milestone: {message}",
-                actor_agent_id=agent_id,
-                work_item_id=project_run.work_item_id if project_run else None,
-                run_id=project_run.id if project_run else None,
-                metadata={
-                    **result,
-                    **trace_metadata,
-                    "related_work_item_ids": [str(value) for value in sorted(related_work_item_ids, key=str)],
-                    "related_run_ids": [str(value) for value in sorted(related_run_ids, key=str)],
-                },
+            operation_event.event_type = "git.milestone.created"
+            operation_event.summary = (
+                f"{member.name_snapshot} created project Git milestone {result['commit'][:12]}"
             )
+            operation_event.event_metadata = {
+                **dict(operation_event.event_metadata or {}),
+                **result,
+                **related_metadata,
+                "milestone_state": "created",
+            }
             await db.commit()
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps({**result, "event_id": str(operation_event_id)}, ensure_ascii=False)
 
     async with async_session() as db:
         attached = await db.get(Project, project.id)

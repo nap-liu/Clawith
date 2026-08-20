@@ -64,6 +64,48 @@ def _handler() -> WebSocketChatHandler:
     return handler
 
 
+async def test_project_subagent_message_loop_stops_before_generic_web_llm():
+    """A handled durable child input must never reach the direct WS caller."""
+
+    h = _handler()
+    h.websocket = _FakeWS([{"content": "continue", "message_id": "client-1"}])
+    h.welcome_message = ""
+    h.history_messages = []
+    h.onboarding_required = False
+    h.project_session_access = "edit"
+    h.read_only = False
+    h.source_channel = "subagent"
+
+    routed: list[dict] = []
+
+    async def _still_writable():
+        return True
+
+    async def _enqueue(**kwargs):
+        routed.append(kwargs)
+        return True
+
+    async def _generic_path_must_not_run(*_args, **_kwargs):
+        raise AssertionError("project child input fell through to the generic WS LLM path")
+
+    h._project_session_still_writable = _still_writable
+    h._enqueue_project_subagent_message = _enqueue
+    h._load_scene_manifest = _generic_path_must_not_run
+
+    with pytest.raises(WebSocketDisconnect):
+        await h.message_loop()
+
+    assert routed == [
+        {
+            "content": "continue",
+            "display_content": "",
+            "file_name": "",
+            "client_message_id": "client-1",
+            "attachments": None,
+        }
+    ]
+
+
 # ── 1. permission gate ────────────────────────────────────────────────────────
 
 

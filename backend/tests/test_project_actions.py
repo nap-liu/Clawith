@@ -44,6 +44,7 @@ from app.core.security import get_current_user
 from app.database import Base, get_db
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
+from app.models.llm import LLMModel
 from app.models.project import Project, ProjectAccessGrant, ProjectEvent
 from app.models.tenant import Tenant
 from app.models.tool import Tool
@@ -162,6 +163,18 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
     tenant = Tenant(name="Project API", slug=f"project-api-{uuid.uuid4().hex[:8]}")
     session.add(tenant)
     await session.flush()
+    tenant_model = LLMModel(
+        tenant_id=tenant.id,
+        provider="openai",
+        model="project-tenant-default",
+        api_key_encrypted="test-only",
+        label="Project tenant default",
+        enabled=True,
+        context_window=128000,
+    )
+    session.add(tenant_model)
+    await session.flush()
+    tenant.default_model_id = tenant_model.id
     owner = await _user(session, tenant, "Owner")
     viewer = await _user(session, tenant, "Viewer")
     leader = await _agent(session, tenant, owner, "Leader", "Drive outcomes")
@@ -545,6 +558,48 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     live_handler.read_only = False
     assert await live_handler._project_session_still_writable() is True
 
+    # Sending from the exact project child drawer is a durable inbox append,
+    # not a second generic Web LLM turn.  Client retry is idempotent, keeps the
+    # active ProjectRun association explicit and returns the persisted receipt.
+    live_handler.agent_id = env.worker_id
+    live_handler.source_channel = "subagent"
+    receipts: list[dict] = []
+
+    async def _capture_ws(payload: dict):
+        receipts.append(payload)
+
+    live_handler._safe_send = _capture_ws
+    for _retry in range(2):
+        assert await live_handler._enqueue_project_subagent_message(
+            content="Continue from the project drawer",
+            display_content="Continue from the project drawer",
+            file_name="evidence.txt",
+            client_message_id="drawer-client-1",
+            attachments=[{"type": "file", "name": "evidence.txt", "url": "/evidence.txt"}],
+        ) is True
+
+    env.db.expire_all()
+    drawer_inputs = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(first_child_id),
+                ChatMessage.content == "Continue from the project drawer",
+            )
+        )
+    ).scalars().all()
+    durable_child = await env.db.get(SubagentRun, first_child_id)
+    assert len(drawer_inputs) == 1
+    assert drawer_inputs[0].message_meta["kind"] == "subagent_input"
+    assert drawer_inputs[0].message_meta["subagent_input_state"] == "pending"
+    assert drawer_inputs[0].message_meta["project_run_id"] == str(first_project_run_id)
+    assert drawer_inputs[0].message_meta["attachments"][0]["name"] == "evidence.txt"
+    assert durable_child is not None and durable_child.status == "queued"
+    assert durable_child.lease_owner is None
+    assert durable_child.lease_expires_at is None
+    committed = [row for row in receipts if row.get("type") == "user_message_committed"]
+    assert len(committed) == 2
+    assert {row["message_id"] for row in committed} == {str(drawer_inputs[0].id)}
+
     removed = await env.client.post(
         f"/api/projects/{project_id}/members/{worker['id']}/remove",
         json={"reason": "staffing change"},
@@ -751,6 +806,165 @@ async def test_manual_run_requires_kickoff_and_dispatches_default_leader(project
     assert child_session.agent_id == env.leader_id
     assert run is not None and run.output["subagent_run_id"] == str(child.id)
     assert child.project_id == project_id
+    tenant = await env.db.get(Tenant, env.tenant_id)
+    anchor = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child.id),
+                ChatMessage.message_meta["project_run_id"].as_string() == str(run.id),
+            )
+        )
+    ).scalar_one()
+    assert tenant is not None and tenant.default_model_id is not None
+    assert anchor.message_meta["model_id"] == str(tenant.default_model_id)
+
+
+async def test_project_run_without_agent_model_uses_exact_project_model(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.project import ProjectRun
+    from app.models.subagent_run import SubagentRun
+
+    env = project_api
+    selected = LLMModel(
+        tenant_id=env.tenant_id,
+        provider="openai",
+        model="project-explicit-model",
+        api_key_encrypted="project-test-only",
+        label="Project explicit model",
+        enabled=True,
+        context_window=64000,
+    )
+    env.db.add(selected)
+    await env.db.flush()
+    project = await _create_project(env, name="Project model fallback")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    stored_project.settings = {
+        **dict(stored_project.settings or {}),
+        "runtime": {"model": str(selected.id)},
+    }
+    await env.db.commit()
+
+    response = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={
+            "agent_id": str(env.worker_id),
+            "trigger_type": "manual",
+            "input": {"objective": "Use the project model"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    child_id = uuid.UUID(payload["output"]["subagent_session_id"])
+    child = await env.db.get(SubagentRun, child_id)
+    project_run = await env.db.get(ProjectRun, uuid.UUID(payload["id"]))
+    anchor = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["project_run_id"].as_string() == payload["id"],
+            )
+        )
+    ).scalar_one()
+    assert child is not None and child.project_id == project_id
+    assert project_run is not None and project_run.status in {"queued", "running"}
+    assert anchor.message_meta["model_id"] == str(selected.id)
+
+    # Historical project child inputs did not carry a per-turn model snapshot.
+    # The unified channel path must still resolve the same project model rather
+    # than falling back to an absent Agent-level configuration.
+    anchor.message_meta = {
+        key: value for key, value in dict(anchor.message_meta or {}).items() if key != "model_id"
+    }
+    await env.db.commit()
+    captured: dict = {}
+
+    async def _fake_scene(*_args, **_kwargs):
+        return {}
+
+    async def _fake_llm(**kwargs):
+        captured.update(kwargs)
+        return "project model works"
+
+    monkeypatch.setattr("app.services.scene_service.load_turn_scene_context", _fake_scene)
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", _fake_llm)
+    monkeypatch.setattr("app.services.channel_llm.is_agent_expired", lambda _agent: False)
+    from app.services.channel_llm import _call_agent_llm
+
+    async with env.session_factory() as runtime_db:
+        reply = await _call_agent_llm(
+            runtime_db,
+            env.worker_id,
+            anchor.content,
+            session_id=str(child_id),
+            user_id=env.owner_id,
+            turn_anchor_id=anchor.id,
+            prepared_tools=[],
+            broadcast_web=False,
+        )
+    assert reply == "project model works"
+    assert captured["primary_model"].id == selected.id
+
+
+async def test_project_run_without_any_tenant_model_fails_without_child(project_api: ProjectApiEnv):
+    from app.models.project import ProjectRun
+    from app.models.subagent_run import SubagentRun
+
+    env = project_api
+    tenant_models = (
+        await env.db.execute(select(LLMModel).where(LLMModel.tenant_id == env.tenant_id))
+    ).scalars().all()
+    for model in tenant_models:
+        model.enabled = False
+
+    foreign_tenant = Tenant(name="Foreign", slug=f"foreign-{uuid.uuid4().hex[:8]}")
+    env.db.add(foreign_tenant)
+    await env.db.flush()
+    foreign_model = LLMModel(
+        tenant_id=foreign_tenant.id,
+        provider="openai",
+        model="foreign-model",
+        api_key_encrypted="must-not-cross-tenant",
+        label="Foreign model",
+        enabled=True,
+        context_window=64000,
+    )
+    env.db.add(foreign_model)
+    await env.db.flush()
+
+    project = await _create_project(env, name="No model project")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    stored_project.settings = {
+        **dict(stored_project.settings or {}),
+        "runtime": {"model": str(foreign_model.id)},
+    }
+    await env.db.commit()
+
+    response = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={
+            "agent_id": str(env.worker_id),
+            "trigger_type": "manual",
+            "input": {"objective": "Must fail explicitly"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    project_run = await env.db.get(ProjectRun, uuid.UUID(payload["id"]))
+    children = (
+        await env.db.execute(select(SubagentRun).where(SubagentRun.project_id == project_id))
+    ).scalars().all()
+    assert project_run is not None and project_run.status == "failed"
+    assert "没有可用的 LLM 模型" in str(project_run.error)
+    assert payload["output"].get("subagent_session_id") is None
+    assert children == []
 
 
 async def test_project_run_reconcile_persists_finished_terminal_state(project_api: ProjectApiEnv):
@@ -854,6 +1068,184 @@ async def test_dispatch_does_not_regress_child_completed_project_run(
     assert persisted.finished_at is not None
     assert persisted.output["result"] == "Fast result"
     assert persisted.output["subagent_session_id"] == str(child_id)
+
+
+async def test_active_child_inputs_durably_advance_only_their_exact_project_runs(
+    project_api: ProjectApiEnv,
+):
+    """Worker recovery must not leave the Runs UI stuck at queued."""
+    from app.models.project import ProjectMemberSnapshot, ProjectRun
+    from app.models.subagent_run import SubagentRun
+    from app.services import subagent_runtime
+
+    env = project_api
+    project = await _create_project(env, name="Project run worker state")
+    project_id = uuid.UUID(project["id"])
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    leader_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project_id,
+                ProjectMemberSnapshot.agent_id == env.leader_id,
+            )
+        )
+    ).scalar_one()
+    anchor = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=uuid.UUID(group["access_agent_id"]),
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Run the exact durable input",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_run_request"},
+    )
+    project_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="queued",
+        trigger_type="manual",
+        input={
+            "dispatch": {
+                "group_session_id": group["id"],
+                "project_member_id": str(leader_member.id),
+                "turn_anchor_id": str(anchor.id),
+                "task": "Run the exact durable input",
+            }
+        },
+    )
+    unrelated_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="queued",
+        trigger_type="manual",
+        input={"objective": "Must remain queued until its own input runs"},
+    )
+    terminal_finished_at = datetime.now(UTC)
+    terminal_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="succeeded",
+        trigger_type="manual",
+        input={"objective": "Already finished"},
+        finished_at=terminal_finished_at,
+    )
+    env.db.add_all([anchor, project_run, unrelated_run, terminal_run])
+    await env.db.commit()
+    project_run_id = project_run.id
+    unrelated_run_id = unrelated_run.id
+    terminal_run_id = terminal_run.id
+
+    dispatched = await subagent_runtime.dispatch_project_run(project_run_id)
+    child_id = uuid.UUID(dispatched["subagent_session_id"])
+    assert dispatched["status"] == "queued"
+
+    # Reproduce a process exit after the exact input became processing but
+    # before an older worker updated ProjectRun.
+    assert await subagent_runtime._claim_subagent(child_id) == child_id
+    async with env.session_factory() as crash_db:
+        child = await crash_db.get(SubagentRun, child_id, with_for_update=True)
+        child_input = (
+            await crash_db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(child_id),
+                    ChatMessage.message_meta["project_run_id"].as_string()
+                    == str(project_run_id),
+                )
+            )
+        ).scalar_one()
+        child_input.message_meta = {
+            **dict(child_input.message_meta or {}),
+            "subagent_input_state": "processing",
+            "subagent_turn_anchor_id": str(child_input.id),
+            "turn_status": "running",
+        }
+        child.lease_expires_at = datetime(2000, 1, 1, tzinfo=UTC)
+        await crash_db.commit()
+
+    assert await subagent_runtime._claim_subagent(child_id) == child_id
+    recovered = await subagent_runtime._load_or_start_input(child_id)
+    assert recovered is not None and recovered[1] is True
+
+    env.db.expire_all()
+    running = await env.db.get(ProjectRun, project_run_id)
+    untouched = await env.db.get(ProjectRun, unrelated_run_id)
+    terminal = await env.db.get(ProjectRun, terminal_run_id)
+    assert running is not None and running.status == "running"
+    assert running.started_at is not None
+    first_started_at = running.started_at
+    assert untouched is not None and untouched.status == "queued"
+    assert untouched.started_at is None
+    assert terminal is not None and terminal.status == "succeeded"
+    assert terminal.finished_at is not None
+    terminal_persisted_finished_at = terminal.finished_at
+
+    # Inputs appended while the reusable child is already executing are
+    # consumed at a round boundary. They use the same exact-id transition;
+    # a referenced terminal Run must still remain terminal.
+    env.db.add_all(
+        [
+            ChatMessage(
+                agent_id=env.leader_id,
+                user_id=env.owner_id,
+                sender_user_id=env.owner_id,
+                role="user",
+                content="Start the second exact run",
+                conversation_id=str(child_id),
+                message_meta={
+                    "kind": "subagent_input",
+                    "subagent_input_state": "pending",
+                    "project_run_id": str(unrelated_run_id),
+                },
+            ),
+            ChatMessage(
+                agent_id=env.leader_id,
+                user_id=env.owner_id,
+                sender_user_id=env.owner_id,
+                role="user",
+                content="Do not regress the terminal run",
+                conversation_id=str(child_id),
+                message_meta={
+                    "kind": "subagent_input",
+                    "subagent_input_state": "pending",
+                    "project_run_id": str(terminal_run_id),
+                },
+            ),
+        ]
+    )
+    await env.db.commit()
+    injected = await subagent_runtime._drain_subagent_inbox(
+        child_id,
+        recovered[0].id,
+    )
+    assert {row["content"] for row in injected} == {
+        "Start the second exact run",
+        "Do not regress the terminal run",
+    }
+    env.db.expire_all()
+    now_running = await env.db.get(ProjectRun, unrelated_run_id)
+    terminal_after_drain = await env.db.get(ProjectRun, terminal_run_id)
+    assert now_running is not None and now_running.status == "running"
+    assert now_running.started_at is not None
+    assert terminal_after_drain is not None
+    assert terminal_after_drain.status == "succeeded"
+    assert terminal_after_drain.finished_at == terminal_persisted_finished_at
+
+    # Idempotent recovery keeps the original start timestamp and terminal fact.
+    recovered_again = await subagent_runtime._load_or_start_input(child_id)
+    assert recovered_again is not None and recovered_again[1] is True
+    env.db.expire_all()
+    running_again = await env.db.get(ProjectRun, project_run_id)
+    terminal_again = await env.db.get(ProjectRun, terminal_run_id)
+    assert running_again is not None and running_again.started_at == first_started_at
+    assert terminal_again is not None and terminal_again.status == "succeeded"
+    assert terminal_again.finished_at == terminal_persisted_finished_at
 
 
 async def test_project_a2a_delivery_returns_scoped_session_identifiers(
@@ -1092,6 +1484,7 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
             )
         )
     ).scalar_one()
+    assert completion.message_meta["subagent_wake"] is True
     assert await subagent_runtime._dispatch_parent_event(completion.id) is True
 
     visible_rows = (
@@ -1115,7 +1508,43 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
     assert final_reply.message_meta["a2a_session_id"] == str(a2a_session_id)
     assert final_reply.message_meta["subagent_session_id"] == str(child_id)
 
+    # An exact peer-to-peer A2A reply remains visible in its own standard Chat
+    # Session and also enters the durable project coordination queue.  It must
+    # not directly resume/broadcast; the existing batch dispatcher gives the
+    # Leader one coalesced follow-up turn.
+    group_session = (
+        await env.db.execute(
+            select(ChatSession).where(
+                ChatSession.project_id == project_id,
+                ChatSession.source_channel == "project",
+            )
+        )
+    ).scalar_one()
+    group_reply = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.external_event_key
+                == f"project-a2a-group-reply:{completion.id}"
+            )
+        )
+    ).scalar_one()
+    assert group_reply.conversation_id == str(group_session.id)
+    assert group_reply.sender_agent_id == env.worker_id
+    assert group_reply.message_meta["source_a2a_session_id"] == str(a2a_session_id)
+    assert group_reply.message_meta["leader_batch_state"] == "pending"
+    group_reply_id = group_reply.id
+    assert (
+        await subagent_runtime._dispatch_project_leader_batch(
+            group_session.id,
+            debounce_seconds=0,
+        )
+        is True
+    )
     env.db.expire_all()
+    delivered_group_reply = await env.db.get(ChatMessage, group_reply_id)
+    assert delivered_group_reply is not None
+    assert delivered_group_reply.message_meta["leader_batch_state"] == "delivered"
+
     completed_run = await env.db.get(ProjectRun, project_run_id)
     completed_item = await env.db.get(ProjectWorkItem, work_item_id)
     assert completed_run is not None and completed_run.status == "succeeded"
@@ -2412,7 +2841,10 @@ async def test_work_item_mutations_update_dashboard_and_audit(project_api: Proje
     assert {"status", "priority"} <= set(updated["event_metadata"]["changed_fields"])
 
 
-async def test_run_work_item_and_milestone_contracts_are_explicit(project_api: ProjectApiEnv):
+async def test_run_work_item_and_milestone_contracts_are_explicit(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
     from app.models.project import ProjectRun
     from app.services.project_runtime_tools import execute_project_runtime_tool
 
@@ -2485,11 +2917,13 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(project_api: P
             turn_anchor_id=anchor_id,
         )
     )
+    long_milestone_message = "里程碑完整说明：" + "六个Agent的交付证据、评审结论与回滚锚点均已核验。" * 40
+    assert len(long_milestone_message) > 500
     milestone_result = json.loads(
         await execute_project_runtime_tool(
             "project_create_milestone",
             {
-                "message": "Trace contract milestone",
+                "message": long_milestone_message,
                 "related_work_item_ids": [item_id],
                 "related_run_ids": [run["id"]],
             },
@@ -2593,6 +3027,109 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(project_api: P
     assert milestone["agent_name"] == "Leader"
     assert milestone["related_run_ids"] == [run["id"]]
     assert milestone["related_work_item_ids"] == [item_id]
+    assert milestone["message"] == long_milestone_message
+    milestone_event = await env.db.get(ProjectEvent, uuid.UUID(milestone_result["event_id"]))
+    assert milestone_event is not None
+    assert milestone_event.event_type == "git.milestone.created"
+    assert len(milestone_event.summary) <= 500
+    assert milestone_event.event_metadata["milestone_message"] == long_milestone_message
+    assert milestone_event.event_metadata["description"] == long_milestone_message
+
+    # A repository commit can win immediately before the metadata transaction
+    # fails.  The durable prepared event and Git operation trailer let a retry
+    # finalize that same semantic operation without another empty commit.
+    from app.services import project_runtime_tools
+
+    commit_attempts = {"value": 0}
+
+    class FailSecondCommitSession:
+        def __init__(self):
+            self._session = env.session_factory()
+
+        async def __aenter__(self):
+            await self._session.__aenter__()
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return await self._session.__aexit__(exc_type, exc, traceback)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        async def commit(self):
+            commit_attempts["value"] += 1
+            if commit_attempts["value"] == 2:
+                await self._session.rollback()
+                raise RuntimeError("injected metadata commit failure")
+            await self._session.commit()
+
+    recovery_arguments = {
+        "message": "Recover this semantic milestone after DB failure",
+        "related_work_item_ids": [item_id],
+        "related_run_ids": [run["id"]],
+    }
+    monkeypatch.setattr(project_runtime_tools, "async_session", FailSecondCommitSession)
+    with pytest.raises(RuntimeError, match="injected metadata commit failure"):
+        await execute_project_runtime_tool(
+            "project_create_milestone",
+            recovery_arguments,
+            agent_id=env.leader_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            tool_call_id="recovery-first-call",
+            turn_anchor_id=anchor_id,
+        )
+
+    repo = project_repo_path(env.tenant_id, uuid.UUID(project_id))
+    operation_commits_after_failure = subprocess.check_output(
+        ["git", "-C", str(repo), "log", "--format=%H", "--fixed-strings", "--grep=Clawith-Milestone-Operation:"],
+        text=True,
+    ).splitlines()
+    assert len(operation_commits_after_failure) == 2
+
+    monkeypatch.setattr(project_runtime_tools, "async_session", env.session_factory)
+    recovered_result = json.loads(
+        await execute_project_runtime_tool(
+            "project_create_milestone",
+            recovery_arguments,
+            agent_id=env.leader_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            # A regenerated model tool call has another tool_call_id; semantic
+            # milestone identity must still recover the original operation.
+            tool_call_id="recovery-regenerated-call",
+            turn_anchor_id=anchor_id,
+        )
+    )
+    assert recovered_result["idempotent_replay"] is True
+    assert recovered_result["commit"] == operation_commits_after_failure[0]
+    operation_commits_after_retry = subprocess.check_output(
+        ["git", "-C", str(repo), "log", "--format=%H", "--fixed-strings", "--grep=Clawith-Milestone-Operation:"],
+        text=True,
+    ).splitlines()
+    assert operation_commits_after_retry == operation_commits_after_failure
+    recovered_events = (
+        (
+            await env.db.execute(
+                select(ProjectEvent).where(
+                    ProjectEvent.project_id == uuid.UUID(project_id),
+                    ProjectEvent.event_type.in_(["git.milestone.prepared", "git.milestone.created"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    operation_keys = [
+        event.event_metadata.get("milestone_operation_key")
+        for event in recovered_events
+        if event.event_metadata.get("milestone_message") == recovery_arguments["message"]
+    ]
+    assert len(operation_keys) == 1
+    assert next(
+        event for event in recovered_events if event.event_metadata.get("milestone_message") == recovery_arguments["message"]
+    ).event_type == "git.milestone.created"
+    assert not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain"], text=True).strip()
 
     completed = json.loads(
         await execute_project_runtime_tool(

@@ -6,6 +6,7 @@ under the configured ``_projects`` root.
 """
 
 import asyncio
+import codecs
 import fcntl
 import ipaddress
 import json
@@ -120,7 +121,7 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         "GIT_SSH_COMMAND": "ssh -oBatchMode=yes",
     }
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-c", f"safe.directory={repo}", "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=30,
@@ -797,7 +798,12 @@ def _mime_and_kind(path: str, sample: bytes) -> tuple[str, str, bool]:
     if b"\x00" in sample:
         return mime_type or "application/octet-stream", "binary", False
     try:
-        sample.decode("utf-8")
+        # ``sample`` is a bounded blob prefix and may end in the middle of a
+        # valid multi-byte code point. An incremental decoder validates every
+        # complete sequence while retaining an incomplete trailing sequence
+        # for the unread next chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        decoder.decode(sample, final=False)
     except UnicodeDecodeError:
         return mime_type or "application/octet-stream", "binary", False
     if known_text or mime_type is None:
@@ -993,10 +999,72 @@ async def write_project_file(project: Project, path: str, content: str) -> dict:
     return await asyncio.to_thread(_write_file, project, path, content)
 
 
-def _commit(project: Project, message: str, paths: list[str] | None, *, milestone: bool) -> dict:
+_MILESTONE_OPERATION_TRAILER = "Clawith-Milestone-Operation"
+
+
+def _existing_milestone_operation_commit(repo: Path, operation_key: str) -> str | None:
+    trailer = f"{_MILESTONE_OPERATION_TRAILER}: {operation_key}"
+    result = _git(
+        repo,
+        "log",
+        "--all",
+        "-1",
+        "--format=%H",
+        "--fixed-strings",
+        f"--grep={trailer}",
+        check=False,
+    )
+    return result.stdout.strip() or None
+
+
+def _milestone_commit_result(
+    repo: Path,
+    commit: str,
+    message: str,
+    normalized_paths: list[str] | None,
+    *,
+    recovered: bool,
+) -> dict:
+    changed_paths = [
+        line
+        for line in _git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", commit).stdout.splitlines()
+        if line
+    ]
+    return {
+        "status": "completed",
+        "operation": "milestone_commit",
+        "commit": commit,
+        "message": message,
+        "paths": normalized_paths,
+        "changed": bool(changed_paths),
+        "milestone": True,
+        "idempotent_replay": recovered,
+    }
+
+
+def _commit(
+    project: Project,
+    message: str,
+    paths: list[str] | None,
+    *,
+    milestone: bool,
+    operation_key: str | None = None,
+) -> dict:
     repo = _repo_for(project)
     with _repo_lock(repo):
         normalized_paths = [_safe_relative_path(repo, path)[0] for path in paths] if paths else None
+        if operation_key:
+            if not milestone:
+                raise ValueError("A milestone operation key can only be used for milestone commits")
+            existing_commit = _existing_milestone_operation_commit(repo, operation_key)
+            if existing_commit:
+                return _milestone_commit_result(
+                    repo,
+                    existing_commit,
+                    message,
+                    normalized_paths,
+                    recovered=True,
+                )
         add_args = ["add", "-A", "--", *(normalized_paths or ["."])]
         _git(repo, *add_args)
         diff_args = ["diff", "--cached", "--quiet"]
@@ -1011,10 +1079,20 @@ def _commit(project: Project, message: str, paths: list[str] | None, *, mileston
         if normalized_paths:
             commit_args.append("--only")
         commit_args.extend(["-m", message])
+        if operation_key:
+            commit_args.extend(["-m", f"{_MILESTONE_OPERATION_TRAILER}: {operation_key}"])
         if normalized_paths:
             commit_args.extend(["--", *normalized_paths])
         _git(repo, *commit_args)
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        if milestone:
+            return _milestone_commit_result(
+                repo,
+                head,
+                message,
+                normalized_paths,
+                recovered=False,
+            )
         return {
             "status": "completed",
             "operation": "milestone_commit" if milestone else "commit",
@@ -1032,8 +1110,16 @@ async def commit_project_changes(
     paths: list[str] | None = None,
     *,
     milestone: bool = False,
+    operation_key: str | None = None,
 ) -> dict:
-    return await asyncio.to_thread(_commit, project, message, paths, milestone=milestone)
+    return await asyncio.to_thread(
+        _commit,
+        project,
+        message,
+        paths,
+        milestone=milestone,
+        operation_key=operation_key,
+    )
 
 
 def _repository_state(project: Project, limit: int) -> dict:

@@ -635,6 +635,131 @@ class WebSocketChatHandler:
 
             return await project_session_access_mode(db, user, session) == "edit"
 
+    async def _enqueue_project_subagent_message(
+        self,
+        *,
+        content: str,
+        display_content: str,
+        file_name: str,
+        client_message_id: str | None,
+        attachments: list[dict] | None,
+    ) -> bool:
+        """Route an editable project child Session through its durable inbox.
+
+        A project member Session is a ``SubagentRun`` execution surface, not a
+        second independent Web-chat runtime.  Driving it through the generic WS
+        caller would let one browser turn race the durable worker and bypass its
+        lease, membership snapshot and inbox batching.  Return ``True`` whenever
+        this is a project child Session (including a rejected enqueue), so the
+        caller must never fall through to the generic model path.
+        """
+
+        if self.source_channel != "subagent" or self.project_session_access is None:
+            return False
+        if not self.conv_id or self.user_id is None:
+            await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+            return True
+
+        try:
+            child_id = uuid.UUID(self.conv_id)
+        except (TypeError, ValueError):
+            await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+            return True
+
+        from app.models.project import ProjectRun
+        from app.services.subagent_runtime import SubagentError, append_subagent_message
+
+        async with async_session() as db:
+            child = await db.get(ChatSession, child_id)
+            run = await db.get(SubagentRun, child_id)
+            if (
+                child is None
+                or run is None
+                or child.source_channel != "subagent"
+                or child.project_id is None
+                or run.project_id != child.project_id
+                or child.agent_id != self.agent_id
+            ):
+                await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+                return True
+
+            # Preserve an exact active ProjectRun association when this child is
+            # currently executing one.  Never infer a historical association by
+            # title/time/session history: only the durable output contract counts.
+            active_project_runs = (
+                await db.execute(
+                    select(ProjectRun)
+                    .where(
+                        ProjectRun.project_id == child.project_id,
+                        ProjectRun.agent_id == child.agent_id,
+                        ProjectRun.status.in_(["queued", "running", "waiting"]),
+                    )
+                    .order_by(ProjectRun.created_at.desc(), ProjectRun.id.desc())
+                )
+            ).scalars().all()
+            project_run_id = next(
+                (
+                    row.id
+                    for row in active_project_runs
+                    if str(dict(row.output or {}).get("subagent_session_id") or "")
+                    == str(child_id)
+                ),
+                None,
+            )
+            parent_session_id = str(run.parent_session_id)
+            execution_user_id = run.execution_user_id
+
+        raw_client_id = str(client_message_id or "").strip()
+        durable_message_key = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"clawith:project-subagent-web:{child_id}:{raw_client_id}",
+        ) if raw_client_id else uuid.uuid4()
+        origin_tool_call_id = f"project-web:{durable_message_key}"
+        event_key = f"subagent-parent-input:{child_id}:{origin_tool_call_id}"
+        try:
+            await append_subagent_message(
+                agent_id=self.agent_id,
+                parent_session_id=parent_session_id,
+                subagent_id=str(child_id),
+                message=content,
+                execution_user_id=execution_user_id,
+                origin_tool_call_id=origin_tool_call_id,
+                project_run_id=project_run_id,
+                input_metadata={
+                    "project_web_input": True,
+                    "web_sender_user_id": str(self.user_id),
+                    "client_message_id": raw_client_id or None,
+                    "display_content": display_content or None,
+                    "file_name": file_name or None,
+                    "attachments": list(attachments or []),
+                },
+            )
+        except SubagentError as exc:
+            # Membership/confirmation may have changed after the per-turn ACL
+            # check.  Keep the historical session visible, but never fall back
+            # to a direct model call.
+            await self._safe_send({"type": "error", "content": str(exc)})
+            return True
+
+        if raw_client_id:
+            async with async_session() as db:
+                persisted_id = (
+                    await db.execute(
+                        select(ChatMessage.id).where(
+                            ChatMessage.external_event_key == event_key
+                        )
+                    )
+                ).scalar_one_or_none()
+            if persisted_id is not None:
+                await self._safe_send(
+                    {
+                        "type": "user_message_committed",
+                        "client_message_id": raw_client_id,
+                        "message_id": str(persisted_id),
+                    }
+                )
+        return True
+
     async def _load_scene_manifest(self, db: AsyncSession | None = None) -> None:
         """Load the current scene revision without binding it to the session."""
         self.scene_manifest = None
@@ -815,6 +940,18 @@ class WebSocketChatHandler:
                         {"type": "error", "content": f"附件无效：{exc}"}
                     )
                     continue
+
+            if await self._enqueue_project_subagent_message(
+                content=content,
+                display_content=display_content,
+                file_name=file_name,
+                client_message_id=data.get("message_id") or data.get("client_message_id"),
+                attachments=validated_attachments,
+            ):
+                # The durable worker owns persistence, compaction, tools and the
+                # model call.  Its standard Web broadcasts complete this exact
+                # Session's streaming bubble for every subscribed drawer.
+                continue
 
             # Scene changes apply to the next turn. The session itself remains
             # unchanged; the exact scene revision used is recorded on messages.

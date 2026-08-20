@@ -204,11 +204,37 @@ async def _call_agent_llm(
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
         )
-        resolved_models = await resolve_runtime_models(
-            db,
-            agent=agent,
-            override_model_id=turn_model_id,
-        )
+        if turn_model_id:
+            resolved_models = await resolve_runtime_models(
+                db,
+                agent=agent,
+                override_model_id=turn_model_id,
+            )
+        else:
+            # Compatibility for project child inputs created before per-turn
+            # model snapshots were introduced.  Keep the fallback inside the
+            # unified channel path so retries and compaction use the same model.
+            from app.models.chat_session import ChatSession
+            from app.models.project import Project
+            from app.services.chat_model_selection import resolve_project_runtime_models
+
+            try:
+                runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
+            except (TypeError, ValueError):
+                runtime_session = None
+            if (
+                runtime_session is not None
+                and runtime_session.source_channel == "subagent"
+                and runtime_session.project_id is not None
+            ):
+                project = await db.get(Project, runtime_session.project_id)
+                resolved_models = await resolve_project_runtime_models(
+                    db,
+                    agent=agent,
+                    project_settings=project.settings if project is not None else {},
+                )
+            else:
+                resolved_models = await resolve_runtime_models(db, agent=agent)
         if (
             turn_model_id
             and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}

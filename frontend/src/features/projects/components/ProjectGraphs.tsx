@@ -29,6 +29,7 @@ import {
 
 import '@xyflow/react/dist/style.css';
 import './ProjectGraphs.css';
+import { resolveProjectSessionRoute } from '../projectSessionRouting';
 
 export type ProjectGraphRecord = Record<string, unknown>;
 
@@ -41,6 +42,7 @@ type GraphNodeData = {
     badge?: string;
     tone: GraphTone;
     kind: 'agent' | 'mesh' | 'source' | 'snapshot' | 'run' | 'work' | 'commit';
+    interactive?: boolean;
 };
 type ProjectGraphNode = Node<GraphNodeData, 'projectGraph'>;
 type Selection = { kind: GraphNodeData['kind']; id: string; record: ProjectGraphRecord };
@@ -121,7 +123,7 @@ function GraphIcon({ kind }: { kind: GraphNodeData['kind'] }) {
 function ProjectGraphNodeView({ data, selected }: NodeProps<ProjectGraphNode>) {
     const vertical = data.kind === 'commit';
     return (
-        <div className={`project-graph__node is-${data.tone}${selected ? ' is-selected' : ''}`}>
+        <div className={`project-graph__node is-${data.tone}${selected ? ' is-selected' : ''}${data.interactive === false ? ' is-static' : ''}`}>
             <Handle type="target" position={vertical ? Position.Bottom : Position.Left} className="project-graph__handle project-graph__handle--target" />
             <span className="project-graph__node-icon"><GraphIcon kind={data.kind} /></span>
             <span className="project-graph__node-copy">
@@ -162,6 +164,10 @@ function ProjectGraphCanvas({
     records,
     direction = 'horizontal',
     miniMap = false,
+    focusNodeIds,
+    fitViewMinZoom,
+    fitViewMaxZoom,
+    summary,
     onSelect,
 }: {
     ariaLabel: string;
@@ -170,6 +176,10 @@ function ProjectGraphCanvas({
     records: Map<string, ProjectGraphRecord>;
     direction?: GraphDirection;
     miniMap?: boolean;
+    focusNodeIds?: string[];
+    fitViewMinZoom?: number;
+    fitViewMaxZoom?: number;
+    summary?: string;
     onSelect?: (selection: Selection) => void;
 }) {
     return (
@@ -181,6 +191,10 @@ function ProjectGraphCanvas({
                 records={records}
                 direction={direction}
                 miniMap={miniMap}
+                focusNodeIds={focusNodeIds}
+                fitViewMinZoom={fitViewMinZoom}
+                fitViewMaxZoom={fitViewMaxZoom}
+                summary={summary}
                 onSelect={onSelect}
             />
         </ReactFlowProvider>
@@ -194,6 +208,10 @@ function ProjectGraphViewport({
     records,
     direction,
     miniMap,
+    focusNodeIds,
+    fitViewMinZoom,
+    fitViewMaxZoom,
+    summary,
     onSelect,
 }: {
     ariaLabel: string;
@@ -202,6 +220,10 @@ function ProjectGraphViewport({
     records: Map<string, ProjectGraphRecord>;
     direction: GraphDirection;
     miniMap: boolean;
+    focusNodeIds?: string[];
+    fitViewMinZoom?: number;
+    fitViewMaxZoom?: number;
+    summary?: string;
     onSelect?: (selection: Selection) => void;
 }) {
     const [nodes, setNodes, onNodesChange] = useNodesState<ProjectGraphNode>(sourceNodes);
@@ -210,9 +232,14 @@ function ProjectGraphViewport({
     const nodesInitialized = useNodesInitialized();
     const viewportRef = useRef<HTMLDivElement>(null);
     const signature = useMemo(
-        () => `${sourceNodes.map((node) => node.id).join('|')}::${sourceEdges.map((edge) => edge.id).join('|')}`,
-        [sourceEdges, sourceNodes],
+        () => `${sourceNodes.map((node) => node.id).join('|')}::${sourceEdges.map((edge) => edge.id).join('|')}::${focusNodeIds?.join('|') || ''}`,
+        [focusNodeIds, sourceEdges, sourceNodes],
     );
+    const focusNodes = useMemo(() => {
+        if (!focusNodeIds?.length) return undefined;
+        const ids = new Set(focusNodeIds);
+        return sourceNodes.filter((node) => ids.has(node.id));
+    }, [focusNodeIds, sourceNodes]);
 
     useEffect(() => {
         setNodes(sourceNodes);
@@ -230,7 +257,13 @@ function ProjectGraphViewport({
             previousWidth = width;
             previousHeight = height;
             window.cancelAnimationFrame(frame);
-            frame = window.requestAnimationFrame(() => void fitView({ padding: 0.18, duration }));
+            frame = window.requestAnimationFrame(() => void fitView({
+                padding: 0.18,
+                duration,
+                ...(focusNodes?.length ? { nodes: focusNodes } : {}),
+                ...(fitViewMinZoom === undefined ? {} : { minZoom: fitViewMinZoom }),
+                ...(fitViewMaxZoom === undefined ? {} : { maxZoom: fitViewMaxZoom }),
+            }));
         };
         const initialRect = viewport.getBoundingClientRect();
         refit(initialRect.width, initialRect.height, 260);
@@ -242,7 +275,7 @@ function ProjectGraphViewport({
             resizeObserver.disconnect();
             window.cancelAnimationFrame(frame);
         };
-    }, [fitView, nodesInitialized, signature]);
+    }, [fitView, fitViewMaxZoom, fitViewMinZoom, focusNodes, nodesInitialized, signature]);
 
     return (
         <div ref={viewportRef} className={`project-graph project-graph--${direction}`} role="img" aria-label={ariaLabel}>
@@ -252,11 +285,14 @@ function ProjectGraphViewport({
                 nodeTypes={graphNodeTypes}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
-                onNodeClick={(_, node) => onSelect?.({
-                    kind: node.data.kind,
-                    id: node.id,
-                    record: records.get(node.id) || {},
-                })}
+                onNodeClick={(_, node) => {
+                    if (node.data.interactive === false) return;
+                    onSelect?.({
+                        kind: node.data.kind,
+                        id: node.id,
+                        record: records.get(node.id) || {},
+                    });
+                }}
                 minZoom={0.35}
                 maxZoom={1.8}
                 nodesConnectable={false}
@@ -277,6 +313,7 @@ function ProjectGraphViewport({
                     />
                 )}
             </ReactFlow>
+            {summary && <div className="project-graph__summary" role="status">{summary}</div>}
         </div>
     );
 }
@@ -385,7 +422,7 @@ export interface SnapshotLineageGraphProps {
 
 export function SnapshotLineageGraph({ member, runs = [], runSnapshots = [], onNodeSelect }: SnapshotLineageGraphProps) {
     const graph = useMemo(() => {
-        if (!member) return { nodes: [] as ProjectGraphNode[], edges: [] as Edge[], records: new Map<string, ProjectGraphRecord>() };
+        if (!member) return { nodes: [] as ProjectGraphNode[], edges: [] as Edge[], records: new Map<string, ProjectGraphRecord>(), visibleRunCount: 0, totalRunCount: 0 };
         const memberId = valueText(member, 'id', 'member_id');
         const agentId = valueText(member, 'agent_id');
         const sourceId = `source:${agentId || memberId}`;
@@ -398,14 +435,29 @@ export function SnapshotLineageGraph({ member, runs = [], runSnapshots = [], onN
         const matchingRuns = matchingSnapshots.length
             ? matchingSnapshots
             : runs.filter((run) => !valueText(run, 'agent_id') || valueText(run, 'agent_id') === agentId);
-        const visibleRuns = matchingRuns.slice(0, 8);
+        const traceableRuns = matchingRuns.map((entry) => {
+            const runRecord = matchingSnapshots.length
+                ? runs.find((run) => valueText(run, 'id', 'run_id') === valueText(entry, 'run_id')) || entry
+                : entry;
+            return { entry, runRecord };
+        }).filter(({ runRecord }) => Boolean(resolveProjectSessionRoute(runRecord, 'run'))).sort((left, right) => {
+            const timestamp = (record: ProjectGraphRecord) => {
+                const raw = valueText(record, 'finished_at', 'started_at', 'updated_at', 'created_at');
+                const parsed = raw ? new Date(raw).getTime() : 0;
+                return Number.isFinite(parsed) ? parsed : 0;
+            };
+            return timestamp(right.runRecord) - timestamp(left.runRecord)
+                || valueText(right.runRecord, 'id', 'run_id').localeCompare(valueText(left.runRecord, 'id', 'run_id'));
+        });
+        const visibleRuns = traceableRuns.slice(0, 8);
         const runGap = 118;
-        const firstRunY = -((visibleRuns.length - 1) * runGap) / 2;
+        const runColumns = visibleRuns.length > 4 ? 2 : 1;
+        const rowsPerColumn = Math.ceil(visibleRuns.length / runColumns);
         const nodes: ProjectGraphNode[] = [
             {
                 id: sourceId,
                 type: 'projectGraph',
-                position: { x: 0, y: 0 },
+                position: { x: 0, y: -190 },
                 data: {
                     kind: 'source',
                     label: valueText(member, 'name_snapshot', 'agent_name', 'name') || '源 Agent',
@@ -413,12 +465,13 @@ export function SnapshotLineageGraph({ member, runs = [], runSnapshots = [], onN
                     meta: compactId(agentId),
                     badge: '只读源',
                     tone: 'neutral',
+                    interactive: false,
                 },
             },
             {
                 id: projectId,
                 type: 'projectGraph',
-                position: { x: 300, y: 0 },
+                position: { x: 310, y: -190 },
                 data: {
                     kind: 'snapshot',
                     label: '项目隔离快照',
@@ -426,22 +479,25 @@ export function SnapshotLineageGraph({ member, runs = [], runSnapshots = [], onN
                     meta: compactId(memberId),
                     badge: member.is_leader === true ? 'Leader' : member.is_enabled === false ? '已停用' : '生效中',
                     tone: member.is_enabled === false ? 'neutral' : 'info',
+                    interactive: false,
                 },
             },
         ];
         const records = new Map<string, ProjectGraphRecord>([[sourceId, member], [projectId, member]]);
         const edges: Edge[] = [makeEdge('source-to-project', sourceId, projectId, { label: '创建快照' })];
-        visibleRuns.forEach((entry, index) => {
-            const runRecord = matchingSnapshots.length
-                ? runs.find((run) => valueText(run, 'id', 'run_id') === valueText(entry, 'run_id')) || entry
-                : entry;
+        visibleRuns.forEach(({ entry, runRecord }, index) => {
             const runId = valueText(entry, 'run_id', 'id') || `${index}`;
             const nodeId = `run:${runId}`;
             const status = valueText(runRecord, 'status') || 'frozen';
+            const column = Math.floor(index / rowsPerColumn);
+            const row = index % rowsPerColumn;
             nodes.push({
                 id: nodeId,
                 type: 'projectGraph',
-                position: { x: 610, y: firstRunY + (index * runGap) },
+                position: {
+                    x: column * 310,
+                    y: -30 + (row * runGap),
+                },
                 data: {
                     kind: 'run',
                     label: valueText(runRecord, 'name', 'title') || `Run ${compactId(runId)}`,
@@ -449,20 +505,30 @@ export function SnapshotLineageGraph({ member, runs = [], runSnapshots = [], onN
                     meta: compactId(runId),
                     badge: '不可变',
                     tone: statusTone(status),
+                    interactive: true,
                 },
             });
             records.set(nodeId, runRecord);
             edges.push(makeEdge(`project-to-${nodeId}`, projectId, nodeId, { label: '运行时冻结' }));
         });
-        return { nodes, edges, records };
+        return {
+            nodes,
+            edges,
+            records,
+            visibleRunCount: visibleRuns.length,
+            totalRunCount: matchingRuns.length,
+        };
     }, [member, runSnapshots, runs]);
 
     return (
         <ProjectGraphCanvas
-            ariaLabel={`成员快照血缘图，共 ${graph.nodes.length} 个版本节点`}
+            ariaLabel={`成员快照血缘图，最近 ${graph.visibleRunCount} 个可追溯 Run，共 ${graph.totalRunCount} 个 Run`}
             nodes={graph.nodes}
             edges={graph.edges}
             records={graph.records}
+            fitViewMinZoom={0.82}
+            fitViewMaxZoom={1}
+            summary={`最近 ${graph.visibleRunCount} / 共 ${graph.totalRunCount} 次 Run`}
             onSelect={onNodeSelect}
         />
     );
@@ -547,7 +613,13 @@ export function WorkDependencyGraph({ items, selectedWorkItemId, onWorkItemSelec
                 }
             }
         }
-        return { nodes, edges, records };
+        const activeStatuses = new Set(['running', 'doing', 'in_progress', 'review', 'blocked', 'waiting', 'paused']);
+        let focusIndex = nodes.findIndex((node) => activeStatuses.has(valueText(records.get(node.id) || {}, 'status', 'state')));
+        if (focusIndex < 0) focusIndex = nodes.findIndex((node) => !['done', 'completed', 'success', 'succeeded'].includes(valueText(records.get(node.id) || {}, 'status', 'state')));
+        if (focusIndex < 0) focusIndex = Math.max(0, nodes.length - 1);
+        const focusStart = Math.min(Math.max(0, focusIndex - 1), Math.max(0, nodes.length - 3));
+        const focusNodeIds = nodes.slice(focusStart, focusStart + 3).map((node) => node.id);
+        return { nodes, edges, records, focusNodeIds };
     }, [items, selectedWorkItemId]);
 
     return (
@@ -556,7 +628,10 @@ export function WorkDependencyGraph({ items, selectedWorkItemId, onWorkItemSelec
             nodes={graph.nodes}
             edges={graph.edges}
             records={graph.records}
-            miniMap={graph.nodes.length > 9}
+            miniMap={graph.nodes.length > 4}
+            focusNodeIds={graph.focusNodeIds}
+            fitViewMinZoom={0.85}
+            fitViewMaxZoom={1}
             onSelect={({ id, record }) => onWorkItemSelect?.(id, record)}
         />
     );

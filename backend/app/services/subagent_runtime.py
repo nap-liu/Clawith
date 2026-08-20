@@ -35,6 +35,7 @@ INPUT_CANCELLED = "cancelled"
 
 RUN_QUEUED = "queued"
 RUN_RUNNING = "running"
+RUN_WAITING = "waiting_confirmation"
 RUN_COMPLETED = "completed"
 RUN_FAILED = "failed"
 RUN_CANCELLED = "cancelled"
@@ -146,6 +147,21 @@ async def _resolve_model_name(db, agent: Agent, requested: str | None) -> str | 
     if resolved.status != MODEL_STATUS_OK or resolved.model is None:
         raise SubagentError(f"找不到可用模型 {model_name}。")
     return resolved.model.model
+
+
+async def _project_turn_model_id(db, agent: Agent, project) -> str:
+    from app.services.chat_model_selection import resolve_project_runtime_models
+
+    resolved = await resolve_project_runtime_models(
+        db,
+        agent=agent,
+        project_settings=project.settings,
+    )
+    if resolved.primary_model is None:
+        raise SubagentError(
+            "当前 Agent、项目和租户均没有可用的 LLM 模型，请先在项目设置或租户模型池中配置。"
+        )
+    return str(resolved.primary_model.id)
 
 
 def _fork_row_meta(row) -> dict:
@@ -313,6 +329,7 @@ async def create_subagent(
             and parent.source_channel not in {"agent", "trigger", SUBAGENT_CHANNEL}
             else None
         )
+        project = None
         project_member = None
         project_capabilities: list[dict] = []
         project_tool_policy_snapshot: dict = {}
@@ -358,6 +375,10 @@ async def create_subagent(
             project_tool_policy_snapshot = dict(
                 dict((project.settings or {}).get("policies") or {}).get("project_tools") or {}
             ) if project is not None else {}
+
+        task_metadata = dict(input_metadata or {})
+        if project is not None and canonical_model is None and not task_metadata.get("model_id"):
+            task_metadata["model_id"] = await _project_turn_model_id(db, agent, project)
 
         child = ChatSession(
             id=child_id,
@@ -431,7 +452,7 @@ async def create_subagent(
             content=task_text,
             conversation_id=str(child_id),
             message_meta={
-                **dict(input_metadata or {}),
+                **task_metadata,
                 "kind": SUBAGENT_INPUT,
                 "subagent_input_state": INPUT_PENDING,
                 "attachments": [],
@@ -490,7 +511,7 @@ async def append_subagent_message(
         if child is None or child.agent_id != agent_id:
             raise SubagentError("当前 Agent 无权操作这个 Subagent。")
         try:
-            await _validate_execution_identity(db, run, child)
+            agent = await _validate_execution_identity(db, run, child)
         except RuntimeError as exc:
             raise SubagentError("项目成员已退出，不能继续这个工作会话。") from exc
         existing = (
@@ -502,7 +523,34 @@ async def append_subagent_message(
         ).scalar_one_or_none()
         if existing is not None:
             return run.status
+        from app.services.confirmation_service import (
+            find_pending_confirmation,
+            ignore_pending_confirmation_for_new_input,
+        )
+
+        pending_confirmation = await find_pending_confirmation(
+            db,
+            agent_id=child.agent_id,
+            conversation_id=str(child.id),
+        )
+        ignored_confirmation = None
+        if pending_confirmation is not None:
+            if pending_confirmation.force_confirmation:
+                raise SubagentError("Subagent 正在等待人工确认，不能追加新的项目消息。")
+            ignored_confirmation = await ignore_pending_confirmation_for_new_input(
+                db,
+                pending_confirmation,
+            )
         now = datetime.now(UTC)
+        supplied_metadata = dict(input_metadata or {})
+        if run.project_id is not None and not run.model and not supplied_metadata.get("model_id"):
+            from app.models.project import Project
+
+            project = await db.get(Project, run.project_id)
+            if project is None:
+                raise SubagentError("项目不存在，不能继续这个工作会话。")
+            supplied_metadata["model_id"] = await _project_turn_model_id(db, agent, project)
+        supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
         db.add(
             ChatMessage(
                 agent_id=child.agent_id,
@@ -513,22 +561,29 @@ async def append_subagent_message(
                 conversation_id=str(child_id),
                 external_event_key=event_key,
                 message_meta={
-                    **dict(input_metadata or {}),
+                    **supplied_metadata,
                     "kind": SUBAGENT_INPUT,
                     "subagent_input_state": INPUT_PENDING,
-                    "attachments": [],
+                    "attachments": supplied_attachments,
                     **({"project_run_id": str(project_run_id)} if project_run_id else {}),
                 },
                 created_at=now,
             )
         )
         child.last_message_at = now
-        if run.status in {RUN_COMPLETED, RUN_FAILED}:
+        if run.status in {RUN_COMPLETED, RUN_FAILED, RUN_WAITING}:
             run.status = RUN_QUEUED
             run.mode = "async"
             run.lease_owner = None
             run.lease_expires_at = None
         await db.commit()
+        if ignored_confirmation:
+            from app.services.confirmation_service import publish_ignored_confirmation
+
+            await publish_ignored_confirmation(
+                pending_confirmation,
+                ignored_confirmation,
+            )
         return run.status
 
 
@@ -818,6 +873,58 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
         return run.id
 
 
+async def _mark_input_project_runs_running(
+    db,
+    *,
+    run: SubagentRun,
+    input_rows: list[ChatMessage],
+) -> None:
+    """Advance only the ProjectRuns explicitly owned by active child inputs.
+
+    A project child is reusable, so neither its session id nor its claim time
+    identifies which ProjectRun is executing.  The durable input row is the
+    outbox/inbox hand-off and carries the exact ``project_run_id``.  Updating
+    from that association in the same transaction that marks the input as
+    processing makes the transition idempotent and safe when an expired lease
+    is reclaimed after restart.
+    """
+    if run.project_id is None:
+        return
+
+    project_run_ids: set[uuid.UUID] = set()
+    for row in input_rows:
+        raw_project_run_id = _message_meta(row).get("project_run_id")
+        if not raw_project_run_id:
+            continue
+        try:
+            project_run_ids.add(uuid.UUID(str(raw_project_run_id)))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[subagent] ignoring invalid project_run_id on active input=%s",
+                row.id,
+            )
+    if not project_run_ids:
+        return
+
+    from app.models.project import ProjectRun
+    from app.services.project_service import apply_run_status
+
+    project_runs = (
+        await db.execute(
+            select(ProjectRun)
+            .where(
+                ProjectRun.id.in_(project_run_ids),
+                ProjectRun.project_id == run.project_id,
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    for project_run in project_runs:
+        # apply_run_status reconciles finished_at first and never regresses a
+        # succeeded/failed/cancelled execution back to a live state.
+        apply_run_status(project_run, "running")
+
+
 async def _load_or_start_input(
     run_id: uuid.UUID,
 ) -> tuple[ChatMessage, bool] | None:
@@ -874,6 +981,25 @@ async def _load_or_start_input(
             }
         )
         anchor.message_meta = meta
+        await db.flush()
+        active_inputs = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(run_id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == SUBAGENT_INPUT,
+                    ChatMessage.message_meta["subagent_input_state"].as_string()
+                    == INPUT_PROCESSING,
+                    ChatMessage.message_meta["subagent_turn_anchor_id"].as_string()
+                    == str(anchor.id),
+                )
+            )
+        ).scalars().all()
+        await _mark_input_project_runs_running(
+            db,
+            run=run,
+            input_rows=list(active_inputs),
+        )
         run.lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)
         await db.commit()
         return anchor, recovering
@@ -929,9 +1055,148 @@ async def _drain_subagent_inbox(
             )
             row.message_meta = meta
             injected.append({"role": "user", "content": row.content})
+        await _mark_input_project_runs_running(
+            db,
+            run=run,
+            input_rows=list(pending),
+        )
         run.lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)
         await db.commit()
         return injected
+
+
+async def _park_subagent_confirmation(
+    run_id: uuid.UUID,
+    anchor_id: uuid.UUID,
+) -> bool:
+    """Release a child lease when the unified caller suspended on confirmation.
+
+    The confirmation tool row remains the single durable truth.  A pending row
+    parks the Run; a row resolved before this worker observes it re-queues the
+    same processing anchor for standard restart recovery.  No confirmation
+    transcript or continuation logic is duplicated here.
+    """
+    from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
+
+    async with async_session() as db:
+        run = await db.get(SubagentRun, run_id, with_for_update=True)
+        if run is None or run.status == RUN_CANCELLED:
+            return False
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(run_id),
+                    ChatMessage.role == "tool_call",
+                    ChatMessage.message_meta["turn_anchor_id"].as_string()
+                    == str(anchor_id),
+                )
+                .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            )
+        ).scalars().all()
+        confirmation_payload = None
+        for row in rows:
+            try:
+                payload = json.loads(row.content or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("name") == REQUEST_CONFIRMATION_TOOL_NAME:
+                confirmation_payload = payload
+                break
+        if confirmation_payload is None:
+            return False
+        pending = confirmation_payload.get("status") == "pending"
+        run.status = RUN_WAITING if pending else RUN_QUEUED
+        run.lease_owner = None
+        run.lease_expires_at = None
+        anchor = await db.get(ChatMessage, anchor_id)
+        if anchor is not None:
+            anchor.message_meta = {
+                **_message_meta(anchor),
+                "turn_status": "waiting_confirmation" if pending else "running",
+            }
+        from app.models.project import Project, ProjectEvent, ProjectRun
+        from app.services.project_service import add_event
+
+        processing = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(run_id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == SUBAGENT_INPUT,
+                    ChatMessage.message_meta["subagent_input_state"].as_string()
+                    == INPUT_PROCESSING,
+                    ChatMessage.message_meta["subagent_turn_anchor_id"].as_string()
+                    == str(anchor_id),
+                )
+            )
+        ).scalars().all()
+        project_run_ids = {
+            uuid.UUID(str(value))
+            for row in processing
+            for value in [_message_meta(row).get("project_run_id")]
+            if value
+        }
+        if project_run_ids:
+            project_runs = (
+                await db.execute(
+                    select(ProjectRun).where(
+                        ProjectRun.id.in_(project_run_ids),
+                        ProjectRun.project_id == run.project_id,
+                    )
+                )
+            ).scalars().all()
+            for project_run in project_runs:
+                if project_run.status not in {"succeeded", "failed", "cancelled"}:
+                    project_run.status = "waiting" if pending else "queued"
+                if pending:
+                    existing = (
+                        await db.execute(
+                            select(ProjectEvent.id).where(
+                                ProjectEvent.run_id == project_run.id,
+                                ProjectEvent.event_type == "run.waiting_confirmation",
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    project = await db.get(Project, project_run.project_id)
+                    if existing is None and project is not None:
+                        add_event(
+                            db,
+                            project,
+                            "run.waiting_confirmation",
+                            "Project run is waiting for human confirmation",
+                            actor_agent_id=project_run.agent_id,
+                            work_item_id=project_run.work_item_id,
+                            run_id=project_run.id,
+                            metadata={
+                                "project_run_id": str(project_run.id),
+                                "session_id": str(run.id),
+                                "subagent_session_id": str(run.id),
+                            },
+                        )
+        await db.commit()
+        return True
+
+
+async def resume_subagent_after_confirmation(run_id: uuid.UUID) -> bool:
+    """Re-queue and execute one resolved durable child confirmation turn."""
+    async with async_session() as db:
+        run = await db.get(SubagentRun, run_id, with_for_update=True)
+        if run is None or run.status in TERMINAL_STATUSES:
+            return False
+        if run.status == RUN_WAITING:
+            run.status = RUN_QUEUED
+            run.lease_owner = None
+            run.lease_expires_at = None
+            await db.commit()
+        elif run.status == RUN_RUNNING:
+            # The original worker will observe the resolved tool row and queue
+            # restart recovery after the caller returns.
+            return True
+    claimed = await _claim_subagent(run_id)
+    if claimed is not None:
+        await execute_claimed_subagent(claimed)
+    return True
 
 
 async def _finish_subagent_turn(
@@ -940,6 +1205,7 @@ async def _finish_subagent_turn(
     anchor_id: uuid.UUID,
     reply: str,
     failed: bool,
+    thinking: str | None = None,
 ) -> bool:
     """Persist the reply and lifecycle transition behind the same Run lock."""
     from app.services.chat_history import persist_assistant_reply_row
@@ -1076,6 +1342,7 @@ async def _finish_subagent_turn(
             user_id=run.execution_user_id,
             conversation_id=str(run_id),
             content=content,
+            thinking=thinking,
             message_meta={
                 "kind": kind,
                 "subagent_wake": terminal and run.mode == "async",
@@ -1190,6 +1457,15 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     child.id,
                     execution_user_id=run.execution_user_id,
                 )
+                thinking_parts: list[str] = []
+
+                async def _capture_thinking(
+                    text: str,
+                    parts: list[str] = thinking_parts,
+                ) -> None:
+                    if text:
+                        parts.append(str(text))
+
                 reply = await _call_agent_llm(
                     db,
                     child.agent_id,
@@ -1203,12 +1479,25 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     turn_anchor_id=anchor.id,
                     model_name=run.model,
                     prepared_tools=tools,
+                    on_thinking=_capture_thinking,
                     before_round=lambda _round, aid=anchor.id: _drain_subagent_inbox(
                         run_id, aid
                     ),
                     before_tool_execution=lambda: _assert_subagent_running(run_id),
-                    broadcast_web=False,
+                    # Exact-session drawers are subscribers, never a second
+                    # execution runtime.  Reuse the unified channel bridge for
+                    # standard thinking/chunk/tool/done packets while this
+                    # durable worker remains the sole model caller.
+                    broadcast_web=True,
                 )
+            if not str(reply or "").strip() and await _park_subagent_confirmation(
+                run_id,
+                anchor.id,
+            ):
+                # ``request_confirmation`` is a standard suspended tool call.
+                # Its ChatMessage row is the durable continuation point; this
+                # worker only releases the child lease.
+                return
             reply_text = str(reply or "")
             failed = is_error_result(reply_text) or reply_text.startswith(
                 (
@@ -1224,6 +1513,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                 anchor_id=anchor.id,
                 reply=reply,
                 failed=failed,
+                thinking="".join(thinking_parts) or None,
             )
             if terminal:
                 return
@@ -1381,6 +1671,7 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
         parent_anchor = aliased(ChatMessage)
         parent_final = aliased(ChatMessage)
         project_materialized = aliased(ChatMessage)
+        parent_session = aliased(ChatSession)
         completed_exists = exists(
             select(parent_final.id)
             .select_from(parent_anchor)
@@ -1426,7 +1717,57 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
                 .limit(limit)
             )
         ).scalars().all()
-        return list(rows)
+        # A crash can happen after the exact A2A timeline is committed (the
+        # `project-subagent:*` key exists) but before its project-group handoff
+        # is written.  That half-delivered row is no longer in the ordinary
+        # parent queue, so reconcile it explicitly and idempotently.
+        a2a_candidates = (
+            await db.execute(
+                select(ChatMessage.id)
+                .join(
+                    SubagentRun,
+                    cast(ChatMessage.conversation_id, String)
+                    == cast(SubagentRun.id, String),
+                )
+                .join(parent_session, parent_session.id == SubagentRun.parent_session_id)
+                .where(
+                    ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+                    ChatMessage.message_meta["kind"].as_string().in_(
+                        [SUBAGENT_COMPLETION, SUBAGENT_FAILURE]
+                    ),
+                    parent_session.source_channel == "agent",
+                    parent_session.project_id.is_not(None),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+                .limit(limit)
+            )
+        ).scalars().all()
+        a2a_handoffs: list[uuid.UUID] = []
+        if a2a_candidates:
+            expected_keys = {
+                key
+                for message_id in a2a_candidates
+                for key in (
+                    f"project-subagent:{message_id}",
+                    f"project-a2a-group-reply:{message_id}",
+                )
+            }
+            stored_keys = set(
+                (
+                    await db.execute(
+                        select(ChatMessage.external_event_key).where(
+                            ChatMessage.external_event_key.in_(expected_keys)
+                        )
+                    )
+                ).scalars().all()
+            )
+            a2a_handoffs = [
+                message_id
+                for message_id in a2a_candidates
+                if f"project-subagent:{message_id}" in stored_keys
+                and f"project-a2a-group-reply:{message_id}" not in stored_keys
+            ]
+        return list(dict.fromkeys([*rows, *a2a_handoffs]))[:limit]
 
 
 async def _materialize_project_a2a_turn(
@@ -1581,6 +1922,81 @@ async def _materialize_project_a2a_turn(
                     "trace_message_ids": [str(row.id) for row in trace_rows],
                 },
             )
+
+        # Exact A2A is the visible peer-to-peer conversation, but its durable
+        # completion must also re-enter the project's coordination loop.  The
+        # project group is deliberately append-only: we mirror one final reply
+        # there and mark it pending for the existing coalesced Leader inbox.
+        # This does not resume or broadcast from the A2A Session; several Agent
+        # replies are still consumed by one Leader batch turn.
+        group = (
+            await db.execute(
+                select(ChatSession)
+                .where(
+                    ChatSession.project_id == parent.project_id,
+                    ChatSession.source_channel == "project",
+                )
+                .order_by(ChatSession.created_at, ChatSession.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if group is not None:
+            from app.models.project import ProjectMemberSnapshot
+
+            group_external_key = f"project-a2a-group-reply:{event.id}"
+            group_reply_exists = (
+                await db.execute(
+                    select(ChatMessage.id).where(
+                        ChatMessage.external_event_key == group_external_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if group_reply_exists is None:
+                leader_agent_id = (
+                    await db.execute(
+                        select(ProjectMemberSnapshot.agent_id).where(
+                            ProjectMemberSnapshot.project_id == parent.project_id,
+                            ProjectMemberSnapshot.is_leader.is_(True),
+                            ProjectMemberSnapshot.is_enabled.is_(True),
+                        )
+                    )
+                ).scalar_one_or_none()
+                is_leader_reply = leader_agent_id == child.agent_id
+                db.add(
+                    ChatMessage(
+                        agent_id=group.agent_id,
+                        sender_agent_id=child.agent_id,
+                        role="assistant",
+                        content=event.content,
+                        conversation_id=str(group.id),
+                        external_event_key=group_external_key,
+                        message_meta={
+                            "kind": "project_subagent_reply",
+                            "project_id": str(parent.project_id),
+                            "visible_to_group": True,
+                            "mentions": [],
+                            "awakened_agent_ids": [],
+                            "subagent_id": str(child.id),
+                            "child_message_id": str(event.id),
+                            "source_project_run_ids": [str(value) for value in project_run_ids],
+                            "source_a2a_session_id": str(parent.id),
+                            "attachments": event_meta.get("attachments", []),
+                            "wake_policy": (
+                                "leader_self_no_wake"
+                                if is_leader_reply
+                                else "leader_batch_pending"
+                            ),
+                            "leader_batch_state": (
+                                "ignored_leader_self" if is_leader_reply else "pending"
+                            ),
+                            "default_leader_agent_id": (
+                                str(leader_agent_id) if leader_agent_id else None
+                            ),
+                        },
+                        created_at=event.created_at,
+                    )
+                )
+                group.last_message_at = event.created_at or datetime.now(UTC)
         try:
             await db.commit()
         except IntegrityError:

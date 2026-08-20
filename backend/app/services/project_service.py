@@ -1,5 +1,6 @@
 """Tenant-safe orchestration services for AI-native projects."""
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -27,6 +28,32 @@ from app.models.skill import Skill
 from app.models.subagent_run import SubagentRun
 from app.models.user import User
 from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
+
+PROJECT_EVENT_SUMMARY_MAX_LENGTH = 500
+
+
+def bounded_project_event_summary(event_type: str, summary: str) -> tuple[str, dict[str, Any]]:
+    """Return a database-safe one-line summary without silently losing detail.
+
+    Project event detail belongs in ``event_metadata``.  For an unexpectedly
+    large summary, use a stable, searchable event-type marker instead of
+    slicing user text at an arbitrary Unicode/code-point boundary.  The caller
+    receives the complete original summary and its digest for the audit JSON.
+    """
+
+    original = str(summary or "")
+    normalized = " ".join(original.split())
+    if len(normalized) <= PROJECT_EVENT_SUMMARY_MAX_LENGTH:
+        return normalized, {}
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    return (
+        f"{event_type} · full details stored in event metadata · sha256:{digest}",
+        {
+            "full_summary": original,
+            "summary_sha256": digest,
+            "summary_compacted": True,
+        },
+    )
 
 
 def _tenant_id(user: User) -> uuid.UUID:
@@ -209,18 +236,19 @@ def add_event(
     run_id: uuid.UUID | None = None,
     metadata: dict | None = None,
 ) -> ProjectEvent:
+    bounded_summary, overflow_metadata = bounded_project_event_summary(event_type, summary)
     event = ProjectEvent(
         tenant_id=project.tenant_id,
         project_id=project.id,
         event_type=event_type,
-        summary=summary,
+        summary=bounded_summary,
         actor_user_id=actor_user_id,
         actor_agent_id=actor_agent_id,
         from_agent_id=from_agent_id,
         to_agent_id=to_agent_id,
         work_item_id=work_item_id,
         run_id=run_id,
-        event_metadata=metadata or {},
+        event_metadata={**overflow_metadata, **dict(metadata or {})},
     )
     db.add(event)
     return event

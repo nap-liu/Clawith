@@ -24,6 +24,8 @@ from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
 from app.services.project_git_service import (
+    _git,
+    _mime_and_kind,
     commit_project_changes,
     create_branch,
     initialize_project_repo,
@@ -32,7 +34,13 @@ from app.services.project_git_service import (
     validate_project_remote_url,
     write_project_file,
 )
-from app.services.project_service import create_project, freeze_run_members, require_project
+from app.services.project_service import (
+    PROJECT_EVENT_SUMMARY_MAX_LENGTH,
+    bounded_project_event_summary,
+    create_project,
+    freeze_run_members,
+    require_project,
+)
 from app.services.recipient_resolver import RecipientResolutionError, resolve_agent_recipient
 
 TABLES = [
@@ -55,6 +63,17 @@ TABLES = [
     "project_events",
     "chat_sessions",
 ]
+
+
+def test_project_event_summary_boundary_keeps_full_unicode_detail_in_metadata():
+    original = "完整中文事件说明" * 100
+    summary, metadata = bounded_project_event_summary("project.tool.updated", original)
+
+    assert len(summary) <= PROJECT_EVENT_SUMMARY_MAX_LENGTH
+    assert summary.startswith("project.tool.updated · full details stored in event metadata")
+    assert metadata["full_summary"] == original
+    assert metadata["summary_compacted"] is True
+    assert len(metadata["summary_sha256"]) == 64
 
 
 @pytest.fixture
@@ -125,6 +144,42 @@ async def test_git_remote_validation_blocks_non_public_dns(monkeypatch: pytest.M
         "git@public.example:org/repo.git",
     ):
         assert await validate_project_remote_url(public_remote) == public_remote
+
+
+@pytest.mark.parametrize("trailing_bytes", [1, 2])
+def test_mime_detection_accepts_utf8_split_at_blob_prefix_boundary(trailing_bytes: int):
+    encoded = "中".encode()
+    sample = b"a" * (8192 - trailing_bytes) + encoded[:trailing_bytes]
+
+    assert len(sample) == 8192
+    assert _mime_and_kind("notes.txt", sample) == ("text/plain", "text", True)
+
+
+def test_mime_detection_still_rejects_invalid_utf8_inside_blob_prefix():
+    sample = b"valid-prefix\n" + b"\xff" + b"valid-suffix\n"
+
+    assert _mime_and_kind("notes.txt", sample) == ("text/plain", "binary", False)
+
+
+def test_git_commands_trust_only_the_exact_managed_repository(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr("app.services.project_git_service.subprocess.run", fake_run)
+
+    result = _git(tmp_path, "status", "--short")
+
+    assert result.stdout == "ok"
+    assert captured["command"][:5] == [
+        "git",
+        "-c",
+        f"safe.directory={tmp_path}",
+        "-C",
+        str(tmp_path),
+    ]
 
 
 async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatch):

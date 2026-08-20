@@ -2948,9 +2948,13 @@ async def create_git_commit(
             db,
             project,
             "git.milestone.created",
-            f"Created delivery milestone: {data.message}",
+            f"Created delivery milestone {result['commit'][:12]}",
             actor_user_id=current_user.id,
-            metadata=result,
+            metadata={
+                **result,
+                "milestone_message": data.message,
+                "description": data.message,
+            },
         )
     await db.flush()
     return {
@@ -3058,7 +3062,11 @@ async def list_project_milestones(
                 "project_id": project.id,
                 "commit": commit_hash,
                 "short_commit": commit.get("short_commit") or commit_hash[:12],
-                "message": commit.get("message") or metadata.get("message") or event.summary,
+                "message": metadata.get("milestone_message")
+                or metadata.get("description")
+                or commit.get("message")
+                or metadata.get("message")
+                or event.summary,
                 "author": commit.get("author"),
                 "created_at": event.created_at,
                 "commit_created_at": commit.get("created_at"),
