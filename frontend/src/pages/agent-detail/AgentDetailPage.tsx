@@ -7082,7 +7082,7 @@ export default function AgentDetailPage() {
                 target={subagentSessionRun?.sessionId ? {
                     sessionId: subagentSessionRun.sessionId,
                     agentId: subagentSessionRun.executionAgentId,
-                    title: subagentSessionRun.task,
+                    title: subagentSessionRun.name || subagentSessionRun.task,
                     status: subagentSessionRun.status,
                     mode: subagentSessionRun.mode,
                     model: subagentSessionRun.model,
