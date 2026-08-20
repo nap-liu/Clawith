@@ -725,6 +725,10 @@ export const skillApi = {
             }),
         offline: (skillId: string) =>
             request<MarketSkill>(`/skills/${skillId}/offline`, { method: 'POST' }),
+        relist: (skillId: string) =>
+            request<MarketSkill>(`/skills/${skillId}/relist`, { method: 'POST' }),
+        deleteOffline: (skillId: string) =>
+            request<{ status: string; skill_id: string }>(`/skills/market/${skillId}`, { method: 'DELETE' }),
     },
 };
 

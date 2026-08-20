@@ -11,6 +11,7 @@ import {
     IconFolder,
     IconFolderOpen,
     IconPackage,
+    IconTrash,
     IconUpload,
     IconWorld,
     IconX,
@@ -225,6 +226,8 @@ function SkillCard({
     onDetail,
     onInstall,
     onOffline,
+    onRelist,
+    onDelete,
 }: {
     skill: MarketSkill;
     mine?: boolean;
@@ -232,6 +235,8 @@ function SkillCard({
     onDetail: () => void;
     onInstall: () => void;
     onOffline: () => void;
+    onRelist: () => void;
+    onDelete: () => void;
 }) {
     const { t } = useTranslation();
     const published = skill.status === 'published';
@@ -245,6 +250,7 @@ function SkillCard({
                     <div className="skill-market-card-title-row">
                         <h3>{skill.name}</h3>
                         <span className="skill-market-version">{t('skillMarket.version', { version: skill.version })}</span>
+                        {mine && !published && <span className="skill-market-offline-status">{t('skillMarket.offlineStatus')}</span>}
                     </div>
                     <div className="skill-market-publisher">
                         {t('skillMarket.by')} · {skill.is_builtin ? t('skillMarket.platformPublisher') : skill.publisher_name}
@@ -264,9 +270,20 @@ function SkillCard({
                     {t('skillMarket.viewDetails')} <IconChevronRight size={14} />
                 </Button>
                 {mine ? (
-                    published && <Button variant="secondary" type="button" onClick={(event) => { event.stopPropagation(); onOffline(); }} disabled={busy}>
-                        <IconArchive size={14} />{busy ? t('skillMarket.working') : t('skillMarket.takeOffline')}
-                    </Button>
+                    published ? (
+                        <Button variant="secondary" type="button" onClick={(event) => { event.stopPropagation(); onOffline(); }} disabled={busy}>
+                            <IconArchive size={14} />{busy ? t('skillMarket.working') : t('skillMarket.takeOffline')}
+                        </Button>
+                    ) : (
+                        <div className="skill-market-card-actions">
+                            <Button variant="secondary" type="button" onClick={(event) => { event.stopPropagation(); onRelist(); }} disabled={busy}>
+                                <IconUpload size={14} />{busy ? t('skillMarket.working') : t('skillMarket.relist')}
+                            </Button>
+                            <Button variant="danger" type="button" onClick={(event) => { event.stopPropagation(); onDelete(); }} disabled={busy}>
+                                <IconTrash size={14} />{busy ? t('skillMarket.working') : t('skillMarket.deleteOffline')}
+                            </Button>
+                        </div>
+                    )
                 ) : (
                     <Button variant="primary" type="button" onClick={(event) => { event.stopPropagation(); onInstall(); }} disabled={busy}>
                         <IconDownload size={14} />{t('skillMarket.install')}
@@ -454,6 +471,38 @@ export default function SkillMarket() {
         }
     };
 
+    const deleteOffline = async (skill: MarketSkill) => {
+        const confirmed = await dialog.confirm(
+            t('skillMarket.deleteConfirm', { name: skill.name }),
+            { title: t('skillMarket.deleteTitle'), danger: true },
+        );
+        if (!confirmed) return;
+        setBusyKey(`delete:${skill.id}`);
+        try {
+            await skillApi.market.deleteOffline(skill.id);
+            if (detailId === skill.id) setDetailId(null);
+            toast.success(t('skillMarket.toast.deleted'));
+            await refresh();
+        } catch (error: any) {
+            toast.error(t('skillMarket.toast.deleteFailed'), { details: error?.message || String(error) });
+        } finally {
+            setBusyKey('');
+        }
+    };
+
+    const relist = async (skill: MarketSkill) => {
+        setBusyKey(`relist:${skill.id}`);
+        try {
+            await skillApi.market.relist(skill.id);
+            toast.success(t('skillMarket.toast.relisted', { name: skill.name }));
+            await refresh();
+        } catch (error: any) {
+            toast.error(t('skillMarket.toast.relistFailed'), { details: error?.message || String(error) });
+        } finally {
+            setBusyKey('');
+        }
+    };
+
     const skills = tab === 'discover' ? marketSkills : mySkills;
     const loading = tab === 'discover' ? marketLoading : mineLoading;
 
@@ -559,6 +608,8 @@ export default function SkillMarket() {
                             onDetail={() => openDetail(skill.id)}
                             onInstall={() => openInstall(skill)}
                             onOffline={() => takeOffline(skill)}
+                            onRelist={() => relist(skill)}
+                            onDelete={() => deleteOffline(skill)}
                         />
                     ))}
                 </section>

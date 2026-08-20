@@ -79,9 +79,6 @@
     background: var(--bg-elevated);
     box-shadow: 0 7px 22px rgba(15, 23, 42, .035);
     transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
-}
-
-.skill-market-card:not(.is-offline) {
     cursor: pointer;
 }
 .skill-market-card:hover { transform: translateY(-2px); border-color: var(--border-strong); box-shadow: 0 10px 28px rgba(15, 23, 42, .07); }
@@ -93,6 +90,7 @@
 .skill-market-card-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .skill-market-card h3 { margin: 0; overflow: hidden; color: var(--text-primary); font-size: 15px; font-weight: 720; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
 .skill-market-version { flex: 0 0 auto; padding: 2px 5px; border: 1px solid var(--border-subtle); border-radius: 4px; color: var(--text-tertiary); font-family: var(--font-mono); font-size: 9px; }
+.skill-market-offline-status { flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; background: var(--bg-tertiary); color: var(--text-secondary); font-size: 9px; font-weight: 650; }
 .skill-market-publisher { margin-top: 3px; color: var(--text-tertiary); font-size: 11px; }
 .skill-market-card > p { min-height: 58px; margin: 17px 0 13px; color: var(--text-secondary); font-size: 12px; line-height: 1.62; display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .skill-market-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px 12px; color: var(--text-tertiary); font-size: 10px; }
@@ -100,6 +98,7 @@
 .skill-market-category { padding: 2px 6px; border-radius: 999px; background: var(--bg-tertiary); }
 .skill-market-card footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; padding-top: 16px; }
 .skill-market-card footer .btn { min-height: 30px; padding: 5px 9px; font-size: 11px; }
+.skill-market-card-actions { display: flex; align-items: center; gap: 6px; }
 .skill-market-detail-button { margin-left: -9px; color: var(--text-tertiary); }
 
 .skill-market-empty { min-height: 310px; max-width: 1240px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-tertiary); text-align: center; }

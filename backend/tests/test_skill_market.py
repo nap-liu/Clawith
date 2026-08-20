@@ -11,17 +11,19 @@ from app.api.skills import SkillUpdateIn, _save_skill_to_db, delete_skill, updat
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest
-from app.models.skill import Skill, SkillInstall
+from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.agent_provisioning import validate_requested_skill_ids
 from app.services.agent_tools import execute_tool
 from app.services.autonomy_service import autonomy_service
 from app.services.skill_market import (
+    delete_offline_market_skill,
     get_market_skill_detail,
     install_market_skill,
     list_market_skills,
     publish_agent_skill,
+    relist_market_skill,
     serialize_market_skill,
     take_skill_offline,
     uninstall_market_skill,
@@ -172,6 +174,14 @@ async def test_market_publish_visibility_permissions_install_and_unique_counts(m
         assert count == 1
 
     await _write_skill(agent_a.id, folder, "Analyze market data v2")
+    async with async_session() as db:
+        unchanged_snapshot = await get_market_skill_detail(
+            db,
+            skill_id=skill_id,
+            tenant_id=tenant_a.id,
+        )
+        assert "Analyze market data v2" not in unchanged_snapshot["skill_md"]
+
     async with async_session() as db:
         updated = await publish_agent_skill(
             db,
@@ -634,6 +644,16 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
             visibility="tenant",
         )
         skill_id = skill.id
+        db.add(
+            SkillInstall(
+                tenant_id=tenant.id,
+                skill_id=skill_id,
+                agent_id=agent.id,
+                installed_version=1,
+                installed_by_user_id=owner.id,
+                is_active=True,
+            )
+        )
         await db.commit()
 
     async with async_session() as db:
@@ -678,6 +698,25 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
 
     async with async_session() as db:
         assert (await db.get(Skill, skill_id)).status == "offline"
+        assert all(
+            item["id"] != str(skill_id)
+            for item in await list_market_skills(db, tenant_id=tenant.id)
+        )
+        owner_detail = await get_market_skill_detail(
+            db,
+            skill_id=skill_id,
+            tenant_id=tenant.id,
+            viewer_user_id=owner.id,
+        )
+        assert owner_detail["status"] == "offline"
+        with pytest.raises(HTTPException) as hidden_from_other_user:
+            await get_market_skill_detail(
+                db,
+                skill_id=skill_id,
+                tenant_id=tenant.id,
+                viewer_user_id=guest.id,
+            )
+        assert hidden_from_other_user.value.status_code == 404
 
     replay = await execute_tool(
         "withdraw_skill_from_market",
@@ -689,19 +728,26 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
     )
     assert "already been executed" in replay
 
+    # Relisting refreshes the market snapshot from the unchanged source folder.
+    await _write_skill(agent.id, folder, "Withdrawal behavior v2")
     async with async_session() as db:
-        publisher = await db.get(Agent, agent.id)
-        actor = await db.get(User, owner.id)
-        republished = await publish_agent_skill(
+        republished = await relist_market_skill(
             db,
-            agent=publisher,
-            actor=actor,
-            path=f"skills/{folder}",
-            name="Withdrawal Skill",
-            description="Withdrawal behavior",
-            category="general",
-            visibility="tenant",
+            skill_id=skill_id,
+            actor=await db.get(User, owner.id),
         )
+        assert republished.status == "published"
+        assert republished.version == 2
+        assert serialize_market_skill(republished)["updated_at"] is not None
+        await db.commit()
+
+    async with async_session() as db:
+        refreshed_detail = await get_market_skill_detail(
+            db,
+            skill_id=skill_id,
+            tenant_id=tenant.id,
+        )
+        assert "Withdrawal behavior v2" in refreshed_detail["skill_md"]
         intruder = Agent(
             tenant_id=tenant.id,
             creator_id=owner.id,
@@ -714,8 +760,18 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
         db.add(intruder)
         await db.flush()
         with pytest.raises(HTTPException) as wrong_agent:
-            await withdraw_agent_skill(db, skill_id=republished.id, agent=intruder)
+            await withdraw_agent_skill(db, skill_id=skill_id, agent=intruder)
         assert wrong_agent.value.status_code == 403
+        await db.rollback()
+
+    async with async_session() as db:
+        with pytest.raises(HTTPException) as still_published:
+            await delete_offline_market_skill(
+                db,
+                skill_id=skill_id,
+                actor=await db.get(User, owner.id),
+            )
+        assert still_published.value.status_code == 409
         await db.rollback()
 
     async with async_session() as db:
@@ -726,6 +782,33 @@ async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundarie
         )
         assert withdrawn.status == "offline"
         assert serialize_market_skill(withdrawn)["status"] == "offline"
+        await db.commit()
+
+    async with async_session() as db:
+        with pytest.raises(HTTPException) as wrong_user:
+            await delete_offline_market_skill(
+                db,
+                skill_id=skill_id,
+                actor=await db.get(User, guest.id),
+            )
+        assert wrong_user.value.status_code == 403
+        await db.rollback()
+
+    async with async_session() as db:
+        deleted = await delete_offline_market_skill(
+            db,
+            skill_id=skill_id,
+            actor=await db.get(User, owner.id),
+        )
+        assert deleted == {"status": "ok", "skill_id": str(skill_id)}
+        await db.commit()
+        assert await db.get(Skill, skill_id) is None
+        assert await db.scalar(select(func.count(SkillFile.id)).where(SkillFile.skill_id == skill_id)) == 0
+        assert await db.scalar(select(func.count(SkillInstall.id)).where(SkillInstall.skill_id == skill_id)) == 0
+
+    source_manifest = normalize_storage_key(f"{agent.id}/skills/{folder}/SKILL.md")
+    assert await get_storage_backend().is_file(source_manifest)
+    assert b"Withdrawal behavior v2" in await get_storage_backend().read_bytes(source_manifest)
 
 
 def test_skill_validation_rejects_missing_manifest_and_secret_content():

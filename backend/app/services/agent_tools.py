@@ -2269,8 +2269,9 @@ AGENT_TOOLS = [
         "function": {
             "name": "withdraw_skill_from_market",
             "description": (
-                "Withdraw one market Skill previously published by this Agent. Existing installs remain available. "
-                "The platform always requires L3 approval before withdrawal."
+                "Take one market Skill copy previously published by this Agent offline. The source Skill and "
+                "existing installs remain available, and publishing the source folder again relists a fresh copy. "
+                "The platform always requires L3 approval before taking it offline."
             ),
             "parameters": {
                 "type": "object",
@@ -17496,10 +17497,13 @@ async def _withdraw_skill_from_market(
                 return error
             skill = await withdraw_agent_skill(db, skill_id=skill_id, agent=agent)
             await db.commit()
-        return f"✅ Withdrew '{skill.name}' from the Skill market. Existing installs are unaffected."
+        return (
+            f"✅ Took '{skill.name}' offline from the Skill market. "
+            "The source Skill and existing installs are unaffected, and it may be published again."
+        )
     except Exception as exc:
         detail = getattr(exc, "detail", str(exc))
-        return f"❌ Skill withdrawal failed: {str(detail)[:260]}"
+        return f"❌ Taking the Skill offline failed: {str(detail)[:260]}"
 
 
 # ─── sql_execute memory-safe limits ─────────────────────────────────────

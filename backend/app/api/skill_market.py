@@ -11,11 +11,13 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.user import User
 from app.services.skill_market import (
+    delete_offline_market_skill,
     get_market_skill_detail,
     install_market_skill,
     list_market_skills,
     list_my_published_skills,
     publish_agent_skill,
+    relist_market_skill,
     serialize_market_skill,
     take_skill_offline,
     uninstall_market_skill,
@@ -73,7 +75,17 @@ async def market_detail(
         db,
         skill_id=skill_id,
         tenant_id=current_user.tenant_id,
+        viewer_user_id=current_user.id,
     )
+
+
+@market_router.delete("/market/{skill_id}")
+async def delete_offline_skill(
+    skill_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await delete_offline_market_skill(db, skill_id=skill_id, actor=current_user)
 
 
 @market_router.get("/mine")
@@ -91,6 +103,16 @@ async def offline_skill(
     db: AsyncSession = Depends(get_db),
 ):
     skill = await take_skill_offline(db, skill_id=skill_id, actor=current_user)
+    return serialize_market_skill(skill)
+
+
+@market_router.post("/{skill_id}/relist")
+async def relist_skill(
+    skill_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    skill = await relist_market_skill(db, skill_id=skill_id, actor=current_user)
     return serialize_market_skill(skill)
 
 
