@@ -13,7 +13,6 @@ import MCPServerEditor from '../components/MCPServerEditor';
 import { effectiveEditorRole } from '../components/MCPServerEditor/role';
 import OrgTab from './enterprise-settings/tabs/OrgTab';
 import SkillsTab from './enterprise-settings/tabs/SkillsTab';
-import OkrTab from './enterprise-settings/tabs/OkrTab';
 import LlmTab from './enterprise-settings/tabs/LlmTab';
 import SpeechRecognitionTab from './enterprise-settings/tabs/SpeechRecognitionTab';
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
@@ -134,8 +133,8 @@ export default function EnterpriseSettings() {
     const qc = useQueryClient();
     const currentUser = useAuthStore((s) => s.user);
     const isPlatformAdmin = currentUser?.role === 'platform_admin' || currentUser?.is_platform_admin === true;
-    type TabKey = 'llm' | 'speech' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'okr';
-    const VALID_TABS: TabKey[] = ['info', 'llm', 'speech', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    type TabKey = 'llm' | 'speech' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites';
+    const VALID_TABS: TabKey[] = ['info', 'llm', 'speech', 'tools', 'skills', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
     const getTabFromHash = (): TabKey => {
         const hash = window.location.hash.replace('#', '') as TabKey;
         return VALID_TABS.includes(hash) ? hash : 'info';
@@ -295,7 +294,6 @@ export default function EnterpriseSettings() {
         aware: 'Triggers, reminders, and awareness workflows',
         email: 'Email reading and sending tools',
         feishu: 'Feishu / Lark messaging and collaboration',
-        okr: 'Objectives, key results, and progress reporting',
         social: 'Social publishing and community workflows',
         discovery: 'Tool and capability discovery',
         custom: 'Company-added or MCP tools',
@@ -491,7 +489,7 @@ export default function EnterpriseSettings() {
                 </div>
 
                 <div className="tabs">
-                    {(['info', 'llm', 'speech', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'] as const).map(tab => (
+                    {(['info', 'llm', 'speech', 'tools', 'skills', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'] as const).map(tab => (
                         <div
                             key={tab}
                             className={`tab ${activeTab === tab ? 'active' : ''}`}
@@ -501,12 +499,10 @@ export default function EnterpriseSettings() {
                                 setActiveTab(tab);
                             }}
                         >
-                            {tab === 'quotas' ? t('enterprise.tabs.quotas', 'Quotas') : tab === 'users' ? t('enterprise.tabs.users', 'Users') : tab === 'invites' ? t('enterprise.tabs.invites', 'Invitations') : tab === 'okr' ? t('nav.okr', 'OKR') : t(`enterprise.tabs.${tab}`)}
+                            {tab === 'quotas' ? t('enterprise.tabs.quotas', 'Quotas') : tab === 'users' ? t('enterprise.tabs.users', 'Users') : tab === 'invites' ? t('enterprise.tabs.invites', 'Invitations') : t(`enterprise.tabs.${tab}`)}
                         </div>
                     ))}
                 </div>
-
-                {activeTab === 'okr' && <OkrTab tenantId={selectedTenantId} t={t} />}
 
                 {/* ── LLM Model Pool ── */}
                 {activeTab === 'llm' && <LlmTab selectedTenantId={selectedTenantId} />}

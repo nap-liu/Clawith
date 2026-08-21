@@ -1305,7 +1305,7 @@
         "Pacific/Auckland": "太平洋/奥克兰 (新西兰时间, UTC+12/+13)"
       },
       "countryRegionTitle": "公司所在国家或地区",
-      "countryRegionDescription": "用于自动设置公司默认时区和 OKR 休息日规则。当前时区：{{timezone}}",
+      "countryRegionDescription": "用于自动设置公司默认时区。当前时区：{{timezone}}",
       "searchPlaceholder": "搜索国家或地区、代码或时区",
       "collapseRegionList": "收起地区列表",
       "expandRegionList": "展开地区列表",
@@ -1383,7 +1383,7 @@
       "enabledHint": "数字员工可使用 notify、task_delegate 和 consult 三种通信模式。",
       "disabledHint": "所有数字员工消息使用同步 consult 模式。",
       "enableWarning": "您即将开启数字员工间异步通信功能（测试版）。\n\n此功能允许数字员工通过 notify 和 task_delegate 模式进行异步通信。\n\n已知可能的问题：\n• 数字员工的回复中可能包含内部技术术语（触发器名称、关注项等）\n• task_delegate 回调可能因速率限制而偶尔延迟或丢失\n• Token 消耗将增加，因为每条异步消息都会触发一个独立的数字员工会话\n• 如果触发器配置不当，可能出现数字员工循环调用\n\n如遇到任何问题，请返回此页面关闭开关，即可恢复稳定的同步通信行为。\n\n确定要开启此功能吗？",
-      "note": "说明：OKR 日报收集本身会优先使用更稳的同步方式，不依赖这里的异步开关。"
+      "note": "说明：此设置仅影响数字员工之间的异步消息。"
     },
     "invites": {
       "pageTitle": "邀请码",

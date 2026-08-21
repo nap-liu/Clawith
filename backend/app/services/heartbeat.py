@@ -169,6 +169,10 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             agent = result.scalar_one_or_none()
             if not agent:
                 return
+            from app.core.okr_feature import is_retired_okr_agent
+
+            if await is_retired_okr_agent(db, agent):
+                return
 
             model_id = agent.primary_model_id or agent.fallback_model_id
             if not model_id:
@@ -638,6 +642,11 @@ async def run_agent_oneshot(
             agent = result.scalar_one_or_none()
             if not agent:
                 logger.warning(f"[Oneshot] Agent {agent_id} not found — aborting")
+                return ""
+            from app.core.okr_feature import is_retired_okr_agent
+
+            if await is_retired_okr_agent(db, agent):
+                logger.info(f"[Oneshot] Retired system Agent {agent_id} skipped")
                 return ""
 
             model_id = agent.primary_model_id or agent.fallback_model_id

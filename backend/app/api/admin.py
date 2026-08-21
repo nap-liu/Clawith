@@ -11,7 +11,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel, Field
-from sqlalchemy import func as sqla_func, select
+from sqlalchemy import func as sqla_func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import require_role
@@ -465,6 +465,12 @@ async def get_platform_leaderboards(
     db: AsyncSession = Depends(get_db),
 ):
     """Get Top 20 token consuming companies and agents."""
+    from app.core.okr_feature import hidden_okr_agent_clause, okr_feature_enabled
+
+    visible_agent_filters = []
+    if not okr_feature_enabled():
+        visible_agent_filters.append(not_(hidden_okr_agent_clause(Agent)))
+
     # Top 20 Companies by total tokens
     top_companies_q = await db.execute(
         select(
@@ -473,6 +479,7 @@ async def get_platform_leaderboards(
             sqla_func.coalesce(sqla_func.sum(Agent.cache_read_tokens_total), 0).label('cache_read'),
         )
         .join(Agent, Agent.tenant_id == Tenant.id)
+        .where(*visible_agent_filters)
         .group_by(Tenant.id)
         .order_by(sqla_func.sum(Agent.tokens_used_total).desc())
         .limit(20)
@@ -491,6 +498,7 @@ async def get_platform_leaderboards(
     top_agents_q = await db.execute(
         select(Agent.name, Tenant.name.label('tenant_name'), Agent.tokens_used_total, Agent.cache_read_tokens_total)
         .join(Tenant, Tenant.id == Agent.tenant_id)
+        .where(*visible_agent_filters)
         .order_by(Agent.tokens_used_total.desc())
         .limit(20)
     )
@@ -521,6 +529,7 @@ async def get_enhanced_metrics(
     """
     from app.models.chat_session import ChatSession
     from app.models.tool import Tool, AgentTool
+    from app.core.okr_feature import OKR_TOOL_NAMES, okr_feature_enabled
     from sqlalchemy import text
     from datetime import timedelta
 
@@ -590,12 +599,20 @@ async def get_enhanced_metrics(
 
     # ── 4. Top 10 Tool Categories ──
     # Count enabled agent_tools grouped by tool category
+    tool_filters = [AgentTool.enabled == True, Tool.enabled == True]  # noqa: E712
+    if not okr_feature_enabled():
+        tool_filters.extend(
+            [
+                Tool.name.not_in(OKR_TOOL_NAMES),
+                or_(Tool.category.is_(None), Tool.category != "okr"),
+            ]
+        )
     tool_q = await db.execute(
         select(
             Tool.category,
             sqla_func.count().label('count')
         ).join(AgentTool, AgentTool.tool_id == Tool.id)
-        .where(AgentTool.enabled == True)  # noqa: E712
+        .where(*tool_filters)
         .group_by(Tool.category)
         .order_by(sqla_func.count().desc())
         .limit(10)

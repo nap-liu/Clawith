@@ -32,6 +32,7 @@ from app.services.trigger_runtime.evaluator import (
 from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
     enqueue_due_trigger,
+    mark_trigger_executions_completed,
 )
 from app.services.trigger_runtime.executions import renew_trigger_execution_leases
 from app.services.trigger_runtime.cron_schedule import (
@@ -138,6 +139,10 @@ async def _evaluate_trigger(
     cron_occurrence: CronOccurrence | None = None,
 ) -> bool:
     """Return True if this trigger should fire right now."""
+    from app.core.okr_feature import is_retired_okr_trigger
+
+    if is_retired_okr_trigger(trigger.name, trigger.agent_id):
+        return False
     if not _is_trigger_eligible(trigger, now):
         return False
 
@@ -1089,6 +1094,29 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
 
+    from app.core.okr_feature import partition_retired_okr_triggers
+
+    retired_triggers, active_triggers = partition_retired_okr_triggers(triggers)
+    if retired_triggers:
+        retired_execution_ids: list[uuid.UUID] = []
+        for trigger in retired_triggers:
+            execution_id = (trigger.config or {}).get("_execution_id")
+            if execution_id:
+                try:
+                    retired_execution_ids.append(uuid.UUID(str(execution_id)))
+                except (ValueError, TypeError):
+                    pass
+        if retired_execution_ids:
+            await mark_trigger_executions_completed(retired_execution_ids)
+        triggers = active_triggers
+        logger.info(
+            "Skipped %s retired system trigger(s) for agent %s",
+            len(retired_triggers),
+            agent_id,
+        )
+        if not triggers:
+            return
+
     # Each runtime trigger carries the id of the leased TriggerExecution it was
     # claimed from (build_execution_runtime_trigger injects `_execution_id`). The
     # lease is held in status="processing" with a 5-minute expiry; if we never
@@ -1162,6 +1190,10 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             agent = result.scalar_one_or_none()
             if not agent or agent.is_expired:
                 raise RuntimeError("Agent is unavailable or expired")
+            from app.core.okr_feature import is_retired_okr_agent
+
+            if await is_retired_okr_agent(db, agent):
+                return
 
             # Load LLM model
             if not agent.primary_model_id:

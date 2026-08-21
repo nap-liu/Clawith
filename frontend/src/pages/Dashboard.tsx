@@ -617,8 +617,6 @@ export default function Dashboard() {
                     {/* Stats Bar */}
                     <StatsBar agents={agents} allTasks={allTasks} tokenUsage={tokenUsage} />
 
-                    {/* OKR Summary (P3) — only shown when OKR is enabled */}
-                    <OKRSummaryCard />
 
                     {/* Agent List Card */}
                     <div style={{

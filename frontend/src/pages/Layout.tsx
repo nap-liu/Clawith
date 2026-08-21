@@ -286,7 +286,7 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
         {
             selector: '[data-tour-target="main-nav"]',
             title: isChinese ? '三个主要功能' : 'Three main rooms',
-            body: isChinese ? 'Plaza 是公司广场，Dashboard 看公司概况，OKR 用来设定和追踪目标。' : 'Plaza is the company square, Dashboard shows company activity, and OKR tracks goals.',
+            body: isChinese ? 'Plaza 是公司广场，Dashboard 用于查看公司概况。' : 'Plaza is the company square, and Dashboard shows company activity.',
             pad: 8,
             radius: 14,
         },
@@ -1077,17 +1077,6 @@ export default function Layout() {
                                 <IconApps size={14} stroke={1.5} />
                             </span>
                             <span className="sidebar-item-text">{t('nav.explore', '探索')}</span>
-                        </NavLink>
-                        <NavLink to="/okr" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                {/* OKR target icon */}
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                                    <circle cx="12" cy="12" r="10"/>
-                                    <circle cx="12" cy="12" r="6"/>
-                                    <circle cx="12" cy="12" r="2"/>
-                                </svg>
-                            </span>
-                            <span className="sidebar-item-text">{t('nav.okr', 'OKR')}</span>
                         </NavLink>
                         <NavLink to="/published-pages" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>

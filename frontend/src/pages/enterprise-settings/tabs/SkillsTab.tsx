@@ -907,7 +907,7 @@ function CompanyTimezoneEditor() {
                 {t('enterprise.timezone.countryRegionTitle', 'Company Country or Region')}
             </div>
             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
-                {t('enterprise.timezone.countryRegionDescription', { timezone, defaultValue: 'Used to set the company timezone and OKR non-workday rules. Current timezone: {{timezone}}' })}
+                {t('enterprise.timezone.countryRegionDescription', { timezone, defaultValue: 'Used to set the company timezone. Current timezone: {{timezone}}' })}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '10px', width: '100%' }}>
                 <div ref={regionPickerRef} style={{ position: 'relative', width: 'min(420px, 100%)' }}>
@@ -1162,7 +1162,7 @@ function A2AAsyncToggle() {
                 </div>
             </div>
             <div style={{ marginTop: '6px', fontSize: '11px', color: 'var(--text-tertiary)', maxWidth: '640px' }}>
-                {t('enterprise.a2aAsync.note', 'Note: OKR daily collection itself uses the more reliable synchronous path and does not depend on this toggle.')}
+                {t('enterprise.a2aAsync.note', 'This setting only affects asynchronous Agent-to-Agent messaging.')}
             </div>
         </div>
     );

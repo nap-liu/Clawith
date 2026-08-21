@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
@@ -37,6 +37,10 @@ class CollaborationService:
         to_agent = to_result.scalar_one_or_none()
 
         if not from_agent or not to_agent:
+            raise ValueError("Agent not found")
+        from app.core.okr_feature import is_retired_okr_agent
+
+        if await is_retired_okr_agent(db, from_agent) or await is_retired_okr_agent(db, to_agent):
             raise ValueError("Agent not found")
         if to_agent.status != "running":
             raise ValueError(f"Target agent '{to_agent.name}' is not running")
@@ -86,12 +90,17 @@ class CollaborationService:
             return []
 
         # Find agents by same creator or with company-wide permissions
-        collaborators_result = await db.execute(
-            select(Agent).where(
+        collaborators_query = select(Agent).where(
                 Agent.id != agent_id,
                 Agent.status.in_(["running", "stopped"]),
             ).order_by(Agent.name)
-        )
+        from app.core.okr_feature import hidden_okr_agent_clause, okr_feature_enabled
+
+        if not okr_feature_enabled():
+            collaborators_query = collaborators_query.where(
+                not_(hidden_okr_agent_clause(Agent))
+            )
+        collaborators_result = await db.execute(collaborators_query)
         agents = collaborators_result.scalars().all()
 
         return [
@@ -114,6 +123,17 @@ class CollaborationService:
         """
         from_result = await db.execute(select(Agent).where(Agent.id == from_agent_id))
         from_agent = from_result.scalar_one_or_none()
+        to_result = await db.execute(select(Agent).where(Agent.id == to_agent_id))
+        to_agent = to_result.scalar_one_or_none()
+        from app.core.okr_feature import is_retired_okr_agent
+
+        if (
+            not from_agent
+            or not to_agent
+            or await is_retired_okr_agent(db, from_agent)
+            or await is_retired_okr_agent(db, to_agent)
+        ):
+            raise ValueError("Agent not found")
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         rel_path = f"workspace/inbox/{timestamp}_{str(from_agent_id)[:8]}.md"

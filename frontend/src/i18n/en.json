@@ -1251,7 +1251,7 @@
       "enabledHint": "Agents can use notify, task_delegate, and consult modes.",
       "disabledHint": "All agent messages use synchronous consult mode.",
       "enableWarning": "You are about to enable the A2A Async Communication feature (Beta).\n\nThis feature allows agents to communicate asynchronously via notify and task_delegate modes.\n\nKnown potential issues:\n• Agent replies may contain internal technical terms (trigger names, focus items, etc.)\n• task_delegate callbacks may occasionally be delayed or dropped due to rate limiting\n• Token consumption will increase because each async message triggers a separate agent session\n• Agent loops may occur if triggers are not properly configured\n\nIf you encounter any issues, please return to this page and disable the toggle to restore stable synchronous behavior.\n\nAre you sure you want to enable this feature?",
-      "note": "Note: OKR daily collection itself uses the more reliable synchronous path and does not depend on this toggle."
+      "note": "This setting only affects asynchronous Agent-to-Agent messaging."
     },
     "invites": {
       "pageTitle": "Invitation Codes",
@@ -1867,7 +1867,7 @@
         "Pacific/Auckland": "Pacific/Auckland (New Zealand Time, UTC+12/+13)"
       },
       "countryRegionTitle": "Company Country or Region",
-      "countryRegionDescription": "Used to set the company timezone and OKR non-workday rules. Current timezone: {{timezone}}",
+      "countryRegionDescription": "Used to set the company timezone. Current timezone: {{timezone}}",
       "searchPlaceholder": "Search country, code, or timezone",
       "collapseRegionList": "Collapse region list",
       "expandRegionList": "Expand region list",

@@ -288,19 +288,30 @@ async def lifespan(fastapi_app: FastAPI):
         # Default agents (Morty & Meeseeks) are now only created on first user
         # registration (auth.py), not on every startup.
 
-        try:
-            from app.services.agent_seeder import seed_okr_agent
-            await seed_okr_agent()
-        except Exception as e:
-            logger.warning(f"[startup] OKR Agent seed failed: {e}")
+        if settings.OKR_FEATURE_ENABLED:
+            try:
+                from app.services.agent_seeder import seed_okr_agent
+                await seed_okr_agent()
+            except Exception as e:
+                logger.warning(f"[startup] OKR Agent seed failed: {e}")
 
-        try:
-            from app.services.agent_seeder import patch_existing_okr_agent
-            await patch_existing_okr_agent()
-        except Exception as e:
-            logger.warning(f"[startup] OKR Agent patch failed: {e}")
+            try:
+                from app.services.agent_seeder import patch_existing_okr_agent
+                await patch_existing_okr_agent()
+            except Exception as e:
+                logger.warning(f"[startup] OKR Agent patch failed: {e}")
     else:
         logger.info(f"[startup] bootstrap skipped for PROCESS_ROLE={settings.PROCESS_ROLE}")
+
+    # Load the immutable platform-wide retirement identity set before API or
+    # background workers can list or invoke Agents. Failure is fatal: exposing
+    # a retired system Agent is less safe than refusing to start.
+    if _role_enabled("all", "bootstrap", "api", "worker", "connector"):
+        from app.core.okr_feature import refresh_retired_okr_agent_ids
+        from app.database import async_session as _identity_session
+
+        async with _identity_session() as _identity_db:
+            await refresh_retired_okr_agent_ids(_identity_db)
 
     if _role_enabled("all", "api"):
         try:
@@ -477,7 +488,6 @@ from app.api.pages import router as pages_router, public_router as pages_public_
 from app.api.agent_credentials import router as credentials_router
 from app.api.agentbay_control import router as agentbay_control_router
 from app.api.metrics import router as metrics_router
-from app.api.okr import router as okr_router
 from app.api.mcp_servers import router as mcp_servers_router
 from app.api.sdk_auth import router as sdk_auth_router
 from app.api.onboarding import router as onboarding_router
@@ -550,7 +560,10 @@ app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
 # for the rationale. Mounted under API_PREFIX so it shares the auth base
 # path with the rest of the admin surface.
 app.include_router(metrics_router, prefix=settings.API_PREFIX)
-app.include_router(okr_router)  # OKR — self-prefixed at /api/okr
+if settings.OKR_FEATURE_ENABLED:
+    from app.api.okr import router as okr_router
+
+    app.include_router(okr_router)  # self-prefixed at /api/okr
 app.include_router(mcp_servers_router, prefix=settings.API_PREFIX)
 app.include_router(sdk_auth_router, prefix=settings.API_PREFIX)
 app.include_router(onboarding_router, prefix=settings.API_PREFIX)
