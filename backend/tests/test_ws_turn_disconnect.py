@@ -16,11 +16,14 @@ These tests pin the drive-loop invariant directly (no live socket needed):
 from __future__ import annotations
 
 import asyncio
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
-from app.api.websocket import _await_turn_with_abort
+from app.api.websocket import WebSocketChatHandler, _await_turn_with_abort
 
 pytestmark = pytest.mark.asyncio
 
@@ -100,3 +103,66 @@ async def test_normal_completion_returns_reply():
     resp, outcome = await _await_turn_with_abort(task, _recv, [])
     assert outcome == "completed"
     assert resp == "正常回复"
+
+
+async def test_external_control_plane_cancel_is_normalized_as_abort():
+    async def _turn():
+        await asyncio.sleep(5)
+        return "nope"
+
+    task = asyncio.create_task(_turn())
+
+    async def _recv():
+        await asyncio.sleep(10)
+        return {}
+
+    asyncio.get_running_loop().call_later(0.01, task.cancel)
+    resp, outcome = await _await_turn_with_abort(task, _recv, ["partial"])
+
+    assert outcome == "aborted"
+    assert resp == "partial\n\n*[Generation stopped]*"
+
+
+async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatch):
+    handler = WebSocketChatHandler(
+        websocket=SimpleNamespace(),
+        agent_id=uuid.uuid4(),
+        token="test",
+        session_id=str(uuid.uuid4()),
+    )
+    handler.user_id = uuid.uuid4()
+    handler.conv_id = handler.session_id_param
+    handler.conversation = [{"role": "user", "content": "hello"}]
+    handler._run_llm_and_stream = AsyncMock(
+        return_value=("completed reply", [], [], "completed", True)
+    )
+    handler._safe_send = AsyncMock()
+    save_calls: list[uuid.UUID] = []
+
+    async def save_with_commit_race(*_args, message_id, **_kwargs):
+        save_calls.append(message_id)
+        if len(save_calls) == 1:
+            # Model a commit that succeeded server-side just before the outer
+            # task received cancellation. The retry sees the same durable id.
+            raise asyncio.CancelledError
+        return False
+
+    monkeypatch.setattr(handler, "_save_assistant_reply", save_with_commit_race)
+
+    disposition = await handler._execute_web_turn(
+        effective_llm_model=SimpleNamespace(),
+        is_onboarding_trigger=False,
+        onboarding_claim=None,
+        turn_anchor_id=uuid.uuid4(),
+        task_match=None,
+    )
+
+    assert disposition == "continue"
+    assert save_calls[0] == save_calls[1]
+    assert handler.conversation[-1] == {
+        "role": "assistant",
+        "content": "completed reply",
+    }
+    handler._safe_send.assert_awaited_once_with(
+        {"type": "done", "role": "assistant", "content": "completed reply"}
+    )

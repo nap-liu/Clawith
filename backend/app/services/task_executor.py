@@ -4,8 +4,9 @@ Uses the same agent context (soul, memory, skills, relationships, tools)
 as the chat dialog. Supports tool-calling loop for autonomous execution.
 """
 
+import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from loguru import logger
 from sqlalchemy import select
@@ -19,6 +20,23 @@ settings = get_settings()
 
 
 async def execute_task(
+    task_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID | None = None,
+) -> None:
+    """Run a task and always restore a cancelled durable execution."""
+
+    try:
+        await _execute_task_impl(task_id, agent_id, execution_user_id)
+    except asyncio.CancelledError:
+        await _restore_cancelled_task(
+            task_id,
+            execution_user_id=execution_user_id,
+        )
+        raise
+
+
+async def _execute_task_impl(
     task_id: uuid.UUID,
     agent_id: uuid.UUID,
     execution_user_id: uuid.UUID | None = None,
@@ -43,8 +61,19 @@ async def execute_task(
             logger.warning(f"[TaskExec] Task {task_id} not found")
             return
 
+        task_execution_user_id = (
+            execution_user_id or task.execution_user_id or task.created_by
+        )
+        from app.services.active_turns import ensure_active_turn
+
+        await ensure_active_turn(
+            owner_user_id=task_execution_user_id,
+            agent_id=agent_id,
+            session_id=str(task_id),
+            turn_type="task",
+            title=task.title,
+        )
         task.status = "doing"
-        task_execution_user_id = execution_user_id or task.execution_user_id
         task_run = TaskLog(
             task_id=task_id,
             content="🤖 开始执行任务...",
@@ -127,7 +156,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
 
     try:
         logger.info(f"[TaskExec] Calling LLM with tools for task: {task_title}")
-        
+
         async with async_session() as db:
             reply = await call_agent_llm_with_tools(
                 db=db,
@@ -136,42 +165,46 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
                 user_prompt=user_prompt,
                 max_rounds=50,
                 session_id=str(task_id),
-            execution_user_id=task_execution_user_id,
+                execution_user_id=task_execution_user_id,
+                turn_type="task",
             )
-            
+
         logger.info(f"[TaskExec] LLM reply: {reply[:80]}")
-    except Exception as e:
+
+        # Step 5: Save result and update status
+        async with async_session() as db:
+            result = await db.execute(select(Task).where(Task.id == task_id))
+            task = result.scalar_one_or_none()
+            if task:
+                if task_type == 'supervision':
+                    # Supervision tasks stay active; just log the result
+                    task.status = "pending"
+                    db.add(TaskLog(task_id=task_id, content=f"✅ 督办执行完成\n\n{reply}"))
+                else:
+                    task.status = "done"
+                    task.completed_at = datetime.now(UTC)
+                    db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
+                await db.commit()
+                logger.info(f"[TaskExec] Task {task_id} {'logged' if task_type == 'supervision' else 'completed'}!")
+
+        # Log activity
+        from app.services.activity_logger import log_activity
+        await log_activity(
+            agent_id, "task_updated",
+            f"{'督办' if task_type == 'supervision' else '任务'}执行: {task_title[:60]}",
+            detail={"task_id": str(task_id), "task_type": task_type, "title": task_title, "reply": reply[:500]},
+            related_id=task_id,
+        )
+    except asyncio.CancelledError:
+        await _restore_cancelled_task(task_id, execution_user_id=task_execution_user_id)
+        raise
+    except Exception as e:  # noqa: BLE001 - task failures are persisted for operators
         error_msg = str(e) or repr(e)
         logger.error(f"[TaskExec] Error: {error_msg}")
         await _log_error(task_id, f"执行出错: {error_msg[:150]}")
         if task_type == 'supervision':
             await _restore_supervision_status(task_id)
         return
-
-    # Step 5: Save result and update status
-    async with async_session() as db:
-        result = await db.execute(select(Task).where(Task.id == task_id))
-        task = result.scalar_one_or_none()
-        if task:
-            if task_type == 'supervision':
-                # Supervision tasks stay active; just log the result
-                task.status = "pending"
-                db.add(TaskLog(task_id=task_id, content=f"✅ 督办执行完成\n\n{reply}"))
-            else:
-                task.status = "done"
-                task.completed_at = datetime.now(timezone.utc)
-                db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
-            await db.commit()
-            logger.info(f"[TaskExec] Task {task_id} {'logged' if task_type == 'supervision' else 'completed'}!")
-
-    # Log activity
-    from app.services.activity_logger import log_activity
-    await log_activity(
-        agent_id, "task_updated",
-        f"{'督办' if task_type == 'supervision' else '任务'}执行: {task_title[:60]}",
-        detail={"task_id": str(task_id), "task_type": task_type, "title": task_title, "reply": reply[:500]},
-        related_id=task_id,
-    )
 
 
 async def _log_error(task_id: uuid.UUID, message: str) -> None:
@@ -189,4 +222,28 @@ async def _restore_supervision_status(task_id: uuid.UUID) -> None:
         task = result.scalar_one_or_none()
         if task and task.status == "doing":
             task.status = "pending"
+            await db.commit()
+
+
+async def _restore_cancelled_task(
+    task_id: uuid.UUID,
+    *,
+    execution_user_id: uuid.UUID | None,
+) -> None:
+    """Return an interrupted task to a retryable state and leave an audit log."""
+
+    async with async_session() as db:
+        task = await db.scalar(select(Task).where(Task.id == task_id))
+        if task and task.status == "doing":
+            log_execution_user_id = (
+                execution_user_id or task.execution_user_id or task.created_by
+            )
+            task.status = "pending"
+            db.add(
+                TaskLog(
+                    task_id=task_id,
+                    content="⏹️ 本次执行已被管理员终止，可重新执行。",
+                    execution_user_id=log_execution_user_id,
+                )
+            )
             await db.commit()

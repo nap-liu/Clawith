@@ -266,6 +266,7 @@ async def test_consult_calls_llm_synchronously():
     # DB for reply-save block (second async_session context)
     db2 = RecordingDB(responses=[
         DummyResult(scalar_value=tgt_participant),
+        DummyResult(scalar_value=MagicMock(message_meta={})),
     ])
 
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
@@ -606,6 +607,7 @@ async def test_feature_flag_off_falls_back_to_consult():
 
     db2 = RecordingDB(responses=[
         DummyResult(scalar_value=tgt_participant),
+        DummyResult(scalar_value=MagicMock(message_meta={})),
     ])
 
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \

@@ -153,6 +153,7 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
     ])
     db_reply = RecordingDB(responses=[
         DummyResult(scalar_value=tgt_participant), # tgt_participant for reply-save
+        DummyResult(scalar_value=MagicMock(message_meta={})),
     ])
 
     captured_on_tool_call = []
@@ -235,6 +236,7 @@ async def test_consult_persists_target_thinking():
     ])
     db_reply = RecordingDB(responses=[
         DummyResult(scalar_value=tgt_participant),
+        DummyResult(scalar_value=MagicMock(message_meta={})),
     ])
 
     async def fake_failover(**kwargs):
@@ -314,6 +316,7 @@ async def test_consult_persist_tool_call_stores_raw_connection_string():
     ])
     db_reply = RecordingDB(responses=[
         DummyResult(scalar_value=tgt_participant),
+        DummyResult(scalar_value=MagicMock(message_meta={})),
     ])
 
     real_conn_str = "mysql://user:secret@prod-host:3306/mydb"

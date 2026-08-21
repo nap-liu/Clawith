@@ -26,6 +26,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.database import async_session
+from app.services.active_turns import active_turn_boundary
 
 if TYPE_CHECKING:
     from app.models.chat_session import ChatSession
@@ -209,22 +210,23 @@ async def run_channel_message(
     if current_task is not None:
         await _register_running_turn(lock_key, current_task)
     try:
-        lock = await _get_session_lock(lock_key)
-        async with lock:
-            async def _run_locked() -> str:
-                await _safe(reactions.on_consume)
-                try:
-                    reply = await work()
-                except BaseException as exc:
-                    await _safe(reactions.on_error, exc)
-                    raise
-                await _safe(reactions.on_complete, reply)
-                return reply
+        async with active_turn_boundary():
+            lock = await _get_session_lock(lock_key)
+            async with lock:
+                async def _run_locked() -> str:
+                    await _safe(reactions.on_consume)
+                    try:
+                        reply = await work()
+                    except BaseException as exc:
+                        await _safe(reactions.on_error, exc)
+                        raise
+                    await _safe(reactions.on_complete, reply)
+                    return reply
 
-            if distributed:
-                async with _distributed_session_lock(lock_key):
-                    return await _run_locked()
-            return await _run_locked()
+                if distributed:
+                    async with _distributed_session_lock(lock_key):
+                        return await _run_locked()
+                return await _run_locked()
     finally:
         if current_task is not None:
             await _clear_running_turn(lock_key, current_task)

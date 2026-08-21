@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import uuid
 from datetime import datetime, timezone
@@ -221,14 +222,15 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             await db.flush()
             session_id = session.id
             messages = [{"role": "user", "content": trigger_context}]
-            db.add(ChatMessage(
+            turn_anchor = ChatMessage(
                 agent_id=agent_id,
                 conversation_id=str(session_id),
                 role="user",
                 content=trigger_context,
                 user_id=agent.creator_id,
                 participant_id=agent_participant.id if agent_participant else None,
-            ))
+            )
+            db.add(turn_anchor)
             await db.commit()
             agent_participant_id = agent_participant.id if agent_participant else None
 
@@ -290,24 +292,38 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             on_chunk=on_chunk,
             on_tool_call=on_tool_call,
             current_user_name_override=from_agent_name,
+            turn_anchor_id=turn_anchor.id,
+            turn_type="trigger",
         )
 
+        from app.services.chat_history import lock_turn_anchor_for_finalization
+
+        final_reply = reply or "".join(collected_content)
         async with async_session() as db:
             result = await db.execute(
                 select(Participant).where(Participant.type == "agent", Participant.ref_id == agent_id)
             )
             agent_participant = result.scalar_one_or_none()
+            await lock_turn_anchor_for_finalization(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(session_id),
+                turn_anchor_id=turn_anchor.id,
+            )
             db.add(ChatMessage(
                 agent_id=agent_id,
                 conversation_id=str(session_id),
                 role="assistant",
-                content=reply or "".join(collected_content),
+                content=final_reply,
                 user_id=agent.creator_id,
                 participant_id=agent_participant.id if agent_participant else None,
+                message_meta={
+                    "turn_anchor_id": str(turn_anchor.id),
+                    "turn_status": "completed",
+                },
             ))
             await db.commit()
 
-        final_reply = reply or "".join(collected_content)
         for t in triggers:
             a2a_sid = (t.config or {}).get("_a2a_session_id")
             if a2a_sid and final_reply:
@@ -401,6 +417,18 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
 
         if execution_ids:
             await mark_trigger_executions_completed(execution_ids)
+    except asyncio.CancelledError:
+        execution_ids = [
+            uuid.UUID(str((t.config or {}).get("_execution_id")))
+            for t in triggers
+            if (t.config or {}).get("_execution_id")
+        ]
+        if execution_ids:
+            await mark_trigger_executions_failed(
+                execution_ids,
+                "cancelled by control plane",
+            )
+        raise
     except Exception as e:
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
         import traceback

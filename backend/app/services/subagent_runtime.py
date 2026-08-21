@@ -778,12 +778,6 @@ async def _finish_subagent_turn(
                 )
             )
         ).scalars().all()
-        for row in processed:
-            meta = _message_meta(row)
-            meta["subagent_input_state"] = INPUT_DONE
-            meta["turn_status"] = "completed" if not failed else "failed"
-            row.message_meta = meta
-
         pending_exists = bool(
             (
                 await db.execute(
@@ -827,6 +821,11 @@ async def _finish_subagent_turn(
             },
             turn_anchor_id=anchor_id,
         )
+        for row in processed:
+            meta = _message_meta(row)
+            meta["subagent_input_state"] = INPUT_DONE
+            meta["turn_status"] = "completed" if not failed else "failed"
+            row.message_meta = meta
         child.last_message_at = datetime.now(UTC)
         if terminal:
             run.status = RUN_FAILED if failed else RUN_COMPLETED
@@ -940,6 +939,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     continue_turn=recovering,
                     recovery_mode=recovering,
                     turn_anchor_id=anchor.id,
+                    turn_type="subagent",
                     model_name=run.model,
                     include_soul=run.soul,
                     include_memory=run.memory,
@@ -970,6 +970,9 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                 return
     except asyncio.CancelledError:
         try:
+            from app.services.active_turns import is_current_turn_cancel_requested
+
+            control_plane_cancelled = is_current_turn_cancel_requested()
             async with async_session() as cancel_db:
                 owned = await cancel_db.get(SubagentRun, run_id, with_for_update=True)
                 if (
@@ -977,9 +980,28 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     and owned.status == RUN_RUNNING
                     and owned.lease_owner == settings.INSTANCE_ID
                 ):
-                    owned.status = RUN_QUEUED
+                    owned.status = RUN_CANCELLED if control_plane_cancelled else RUN_QUEUED
                     owned.lease_owner = None
                     owned.lease_expires_at = None
+                    if control_plane_cancelled:
+                        rows = (
+                            await cancel_db.execute(
+                                select(ChatMessage).where(
+                                    ChatMessage.conversation_id == str(run_id),
+                                    ChatMessage.message_meta["kind"].as_string()
+                                    == SUBAGENT_INPUT,
+                                    ChatMessage.message_meta[
+                                        "subagent_input_state"
+                                    ].as_string()
+                                    == INPUT_PROCESSING,
+                                )
+                            )
+                        ).scalars().all()
+                        for row in rows:
+                            meta = _message_meta(row)
+                            meta["subagent_input_state"] = INPUT_CANCELLED
+                            meta["turn_status"] = "cancelled"
+                            row.message_meta = meta
                     await cancel_db.commit()
         except Exception as exc:  # noqa: BLE001 - lease expiry remains the fallback
             logger.warning(f"[subagent] cancelled run release deferred run={run_id}: {exc}")

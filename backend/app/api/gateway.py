@@ -591,15 +591,25 @@ async def _send_to_agent_background(
             user_id=target_creator_id,
             session_id=conv_id,
             on_chunk=on_chunk,
+            turn_anchor_id=ingested.message.id,
+            turn_type="gateway",
         )
         final_reply = reply or "".join(collected)
 
         # Save assistant reply to conversation
         async with async_session() as db:
             from app.models.participant import Participant
+            from app.services.chat_history import lock_turn_anchor_for_finalization
+
             tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
             tgt_participant = tgt_part_r.scalar_one_or_none()
-            
+            await lock_turn_anchor_for_finalization(
+                db,
+                agent_id=uuid.UUID(str(target_agent_id)),
+                conversation_id=conv_id,
+                turn_anchor_id=ingested.message.id,
+            )
+
             reply_row = ChatMessage(
                 agent_id=target_agent_id,
                 conversation_id=conv_id,

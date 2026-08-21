@@ -320,6 +320,58 @@ async def test_startup_scan_skips_cancelled_turn(monkeypatch):
     assert anchor.message_meta["cancel_reason"] == "stop"
 
 
+async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatch):
+    """Each startup anchor is a separate cancel unit, not the scanner task."""
+    from types import SimpleNamespace
+
+    from app.services import turn_recovery
+    from app.services.active_turns import (
+        cancel_active_turn,
+        ensure_active_turn,
+        list_active_turns,
+        reset_active_turns_for_testing,
+    )
+
+    await reset_active_turns_for_testing()
+    owner_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    anchors = [SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())]
+    first_ready = asyncio.Event()
+    resumed_ids: list[uuid.UUID] = []
+
+    async def fake_load(_db, *, limit):
+        assert limit == 2
+        return anchors
+
+    async def fake_resume(anchor):
+        await ensure_active_turn(
+            owner_user_id=owner_id,
+            agent_id=agent_id,
+            session_id=str(anchor.id),
+            turn_type="recovery",
+        )
+        resumed_ids.append(anchor.id)
+        if anchor is anchors[0]:
+            first_ready.set()
+            await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+
+    scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=2))
+    await first_ready.wait()
+    record = (await list_active_turns(owner_user_id=owner_id))[0]
+    await cancel_active_turn(record.turn_id, owner_user_id=owner_id)
+
+    stats = await scanner
+    assert resumed_ids == [anchors[0].id, anchors[1].id]
+    assert stats.scanned == 2
+    assert stats.skipped == 1
+    assert stats.resumed == 1
+    await reset_active_turns_for_testing()
+
+
 async def test_stop_command_cancels_recovery_without_local_running_task(monkeypatch):
     """A startup-recovered turn is stoppable even though it is not in _running_turns."""
     from app.services import channel_commands, turn_recovery

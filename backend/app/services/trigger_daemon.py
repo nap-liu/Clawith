@@ -1327,14 +1327,15 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             ]
 
             # Store trigger context as a message in the session
-            db.add(ChatMessage(
+            turn_anchor = ChatMessage(
                 agent_id=agent_id,
                 conversation_id=str(session_id),
                 role="user",
                 content=trigger_context,
                 user_id=agent.creator_id,
                 participant_id=agent_participant.id if agent_participant else None,
-            ))
+            )
+            db.add(turn_anchor)
             if execution_ids:
                 execution_rows = (
                     await db.execute(
@@ -1414,13 +1415,21 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             on_chunk=on_chunk,
             on_tool_call=on_tool_call,
             on_thinking=on_thinking,
+            turn_anchor_id=turn_anchor.id,
+            turn_type="trigger",
             # A2A wake uses the agent's own max_tool_rounds setting (no override)
         )
 
         # Cap the turn's accumulated thinking once; reused by all assistant rows
         # persisted below (Reflection / A2A mirror / delivery). UI-only field.
-        from app.services.chat_history import cap_thinking
+        from app.services.chat_history import (
+            cap_thinking,
+            lock_turn_anchor_for_finalization,
+        )
         _capped_thinking = cap_thinking("".join(collected_thinking))
+
+        # Compute final reply text once
+        final_reply = reply or "".join(collected_content)
 
         # Save assistant reply to Reflection session
         async with async_session() as db:
@@ -1429,14 +1438,24 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             )
             agent_participant = result.scalar_one_or_none()
 
+            await lock_turn_anchor_for_finalization(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(session_id),
+                turn_anchor_id=turn_anchor.id,
+            )
             db.add(ChatMessage(
                 agent_id=agent_id,
                 conversation_id=str(session_id),
                 role="assistant",
-                content=reply or "".join(collected_content),
+                content=final_reply,
                 user_id=agent.creator_id,
                 participant_id=agent_participant.id if agent_participant else None,
                 thinking=_capped_thinking,
+                message_meta={
+                    "turn_anchor_id": str(turn_anchor.id),
+                    "turn_status": "completed",
+                },
             ))
 
             # NOTE: trigger state (last_fired_at, fire_count, auto-disable)
@@ -1444,9 +1463,6 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             # to prevent race-condition duplicate fires.
 
             await db.commit()
-
-        # Compute final reply text once
-        final_reply = reply or "".join(collected_content)
 
         # ── Save reply to A2A session if this was an agent-to-agent wake ──
         # This makes the target agent's reply visible in the A2A chat history
@@ -1620,6 +1636,10 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
         logger.info(f"⚡ Triggers fired for {agent.name}: {[t.name for t in triggers]}")
 
+    except asyncio.CancelledError:
+        invocation_error = "cancelled by control plane"
+        invocation_retryable = False
+        raise
     except Exception as e:
         invocation_error = str(e)
         invocation_retryable = isinstance(e, RetryableOnMessageError)

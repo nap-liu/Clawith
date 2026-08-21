@@ -10,16 +10,60 @@ import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Literal
+from typing import Any, Literal
 
 import httpx
 from loguru import logger
 
-
 # ============================================================================
 # Data Models
 # ============================================================================
+
+
+class LLMClientCloseGuard:
+    """Close a provider client once, including when its owner task is cancelled."""
+
+    def __init__(self, client: Any):
+        self._client = client
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._owner_task = asyncio.current_task()
+        if self._owner_task is not None:
+            self._owner_task.add_done_callback(self._on_owner_done)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        await asyncio.shield(self._ensure_close_task())
+
+    def _ensure_close_task(self) -> asyncio.Task[None]:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(self._on_close_done)
+        return self._close_task
+
+    async def _close(self) -> None:
+        try:
+            await self._client.close()
+        except Exception as exc:  # noqa: BLE001 - cleanup must never mask turn result
+            logger.warning("[LLM] client close failed (ignored): {}", exc)
+
+    def _on_close_done(self, _task: asyncio.Task[None]) -> None:
+        self._closed = True
+        if self._owner_task is not None:
+            self._owner_task.remove_done_callback(self._on_owner_done)
+            self._owner_task = None
+
+    def _on_owner_done(self, _task: asyncio.Task) -> None:
+        if self._closed:
+            return
+        try:
+            self._ensure_close_task()
+        except RuntimeError:
+            pass
+
 
 @dataclass
 class LLMMessage:

@@ -276,11 +276,28 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             await db.commit()
         # DB session is now closed — connection returned to pool
 
+        from app.services.active_turns import ensure_active_turn
+
+        await ensure_active_turn(
+            owner_user_id=agent_creator_id,
+            agent_id=agent_id,
+            session_id=f"heartbeat:{uuid.uuid4()}",
+            turn_type="heartbeat",
+            title=heartbeat_instruction.strip()[:40] or None,
+        )
+
         # ── Phase 2: LLM calls (no DB connection held) ──
         full_instruction = heartbeat_instruction + recent_context + inbox_context
 
         # Call LLM with tools using unified client
-        from app.services.llm import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
+        from app.services.llm import (
+            LLMClientCloseGuard,
+            LLMError,
+            LLMMessage,
+            create_llm_client,
+            get_max_tokens,
+            get_model_api_key,
+        )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
 
         try:
@@ -291,6 +308,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 base_url=model_base_url,
                 timeout=float(model_request_timeout or 120.0),
             )
+            client_guard = LLMClientCloseGuard(client)
         except Exception as e:
             logger.error(f"Failed to create LLM client: {e}")
             return
@@ -331,7 +349,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     _, _token_limit_msg = await _get_agent_config(agent_id)
                     if _token_limit_msg:
                         logger.warning(f"[Heartbeat] Token limit exceeded mid-loop: {_token_limit_msg}")
-                        await client.close()
+                        await client_guard.close()
                         reply = _token_limit_msg
                         break
 
@@ -445,7 +463,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 reply = response.content or ""
                 break
 
-        await client.close()
+        await client_guard.close()
 
         # ── Phase 3: Write results back to DB (short transaction) ──
         async with async_session() as db:
@@ -689,8 +707,19 @@ async def run_agent_oneshot(
             await db.commit()
         # DB session is now closed — connection returned to pool
 
+        from app.services.active_turns import ensure_active_turn
+
+        await ensure_active_turn(
+            owner_user_id=execution_user_id,
+            agent_id=agent_id,
+            session_id=f"oneshot:{uuid.uuid4()}",
+            turn_type="oneshot",
+            title=prompt.strip()[:40] or None,
+        )
+
         # ── Phase 2: LLM tool-call loop (no DB connection held) ────────────────
         from app.services.llm import (
+            LLMClientCloseGuard,
             create_llm_client,
             get_max_tokens,
             LLMMessage,
@@ -712,6 +741,7 @@ async def run_agent_oneshot(
                 base_url=model_base_url,
                 timeout=float(model_request_timeout or 120.0),
             )
+            client_guard = LLMClientCloseGuard(client)
         except Exception as e:
             msg = f"Failed to initialise the LLM client: {e}"
             logger.error(f"[Oneshot] Failed to create LLM client for {agent_name}: {e}")
@@ -741,7 +771,7 @@ async def run_agent_oneshot(
                     _, _token_limit_msg = await _get_agent_config(agent_id)
                     if _token_limit_msg:
                         logger.warning(f"[Oneshot] Token limit exceeded mid-loop: {_token_limit_msg}")
-                        await client.close()
+                        await client_guard.close()
                         reply = _token_limit_msg
                         break
 
@@ -818,7 +848,7 @@ async def run_agent_oneshot(
                 reply = response.content or ""
                 break
 
-        await client.close()
+        await client_guard.close()
 
         # ── Phase 3: Record token usage (best-effort) ───────────────────────────
         if unsaved_usage.total_tokens > 0:
