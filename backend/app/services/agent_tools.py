@@ -2115,7 +2115,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "update_published_page_access",
-            "description": "Change an existing page published by this Agent. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
+            "description": "Change an existing published page. Company and platform administrators may change any page in their current company; other users may only change a page published by this Agent that they manage. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -16587,7 +16587,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Published by: {publication_actor_label}\n"
         f"Published at: {publication_time.isoformat() if publication_time else 'not recorded'}\n\n"
         f"Access: {effective_access_mode}.\n"
-        f"Platform watermark: {'disabled for public access' if effective_access_mode == 'public' else 'enabled automatically'}.\n"
+        f"Platform watermark: enabled automatically ({'anonymous visitor ID and access time' if effective_access_mode == 'public' else 'signed-in user identity'}).\n"
         "Automatic SSO: off by default; append ?auto_login=1 only when explicitly requested, "
         "and optionally append &sso=<provider_type>."
         f"{url_note}"
@@ -16818,6 +16818,7 @@ async def _search_page_viewers(agent_id: uuid.UUID, user_id: uuid.UUID, argument
 
 
 async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID, arguments: dict) -> str:
+    from app.core.permissions import is_platform_admin_user
     from app.models.published_page import PublishedPage
     from app.models.user import User
     from app.services.published_page_access import can_manage_page
@@ -16827,19 +16828,33 @@ async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID,
         return "Invalid access_mode; use public, authenticated, or restricted"
     try:
         async with async_session() as db:
-            page = await db.scalar(select(PublishedPage).where(
-                PublishedPage.agent_id == agent_id, PublishedPage.short_id == short_id
-            ))
-            if not page:
-                return "Published page not found for this agent"
             actor = await db.get(User, user_id)
-            if actor is None or not await can_manage_page(db, page, actor):
-                return "Permission denied: only the page publisher or Agent creator can change page access"
+            if actor is None:
+                return "Permission denied: user not found"
+            page_query = select(PublishedPage).where(PublishedPage.short_id == short_id)
+            if not (is_platform_admin_user(actor) or actor.role == "org_admin"):
+                page_query = page_query.where(PublishedPage.agent_id == agent_id)
+            page = await db.scalar(page_query.with_for_update())
+            if not page:
+                return "Published page not found or not manageable from this conversation"
+            if not await can_manage_page(db, page, actor):
+                return "Permission denied: page management access required"
             if page.tenant_id is None:
                 page.tenant_id = actor.tenant_id
             page.access_mode = access_mode
             allowed_user_ids = arguments.get("allowed_user_ids", []) if access_mode == "restricted" else []
             await _replace_page_allowed_users(db, page, allowed_user_ids, user_id)
+            db.add(AuditLog(
+                user_id=user_id,
+                agent_id=page.agent_id,
+                action="published_page_access_updated",
+                details={
+                    "page_id": str(page.id),
+                    "access_mode": access_mode,
+                    "allowed_user_ids": [str(value) for value in allowed_user_ids],
+                    "source": "agent_tool",
+                },
+            ))
             await db.commit()
         return f"Updated /p/{short_id} access to {access_mode}."
     except Exception as exc:

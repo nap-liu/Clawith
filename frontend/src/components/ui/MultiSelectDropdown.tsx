@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { IconChevronDown } from '@tabler/icons-react';
+import { IconChevronDown, IconX } from '@tabler/icons-react';
 
 import Button from './Button';
 import Checkbox from './Checkbox';
@@ -21,6 +21,7 @@ type MultiSelectDropdownProps = {
     noOptionsLabel: string;
     noMatchesLabel: string;
     ariaLabel: string;
+    clearLabel?: string;
     className?: string;
 };
 
@@ -34,6 +35,7 @@ export default function MultiSelectDropdown({
     noOptionsLabel,
     noMatchesLabel,
     ariaLabel,
+    clearLabel = '清空',
     className = '',
 }: MultiSelectDropdownProps) {
     const [open, setOpen] = useState(false);
@@ -113,6 +115,20 @@ export default function MultiSelectDropdown({
                         aria-label={searchPlaceholder}
                         autoFocus
                     />
+                    {values.length > 0 && (
+                        <div className="ui-multi-select__actions">
+                            <span>已选 {values.length} 项</span>
+                            <Button
+                                type="button"
+                                variant="ghost"
+                                className="ui-multi-select__clear"
+                                onClick={() => onChange([])}
+                            >
+                                <IconX size={14} aria-hidden="true" />
+                                {clearLabel}
+                            </Button>
+                        </div>
+                    )}
                     <div className="ui-multi-select__options">
                         {options.length === 0 ? (
                             <div className="ui-multi-select__empty">{noOptionsLabel}</div>

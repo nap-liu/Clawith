@@ -8,10 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.permissions import is_platform_admin_user
 from app.models.agent import Agent
 from app.models.published_page import PublishedPage, PublishedPageAccess
 from app.models.user import User
-
 
 PAGE_SESSION_COOKIE = "published_page_session"
 PAGE_SESSION_HOURS = 12
@@ -81,8 +81,13 @@ async def can_view_page(db: AsyncSession, page: PublishedPage, user: User | None
 
 
 async def can_manage_page(db: AsyncSession, page: PublishedPage, user: User) -> bool:
-    if page.tenant_id is not None and page.tenant_id != user.tenant_id:
+    page_tenant_id = page.tenant_id
+    if page_tenant_id is None:
+        page_tenant_id = await db.scalar(select(Agent.tenant_id).where(Agent.id == page.agent_id))
+    if page_tenant_id != user.tenant_id:
         return False
+    if is_platform_admin_user(user) or user.role == "org_admin":
+        return True
     if page.user_id == user.id:
         return True
     creator_id = await db.scalar(select(Agent.creator_id).where(Agent.id == page.agent_id))

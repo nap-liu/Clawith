@@ -414,6 +414,29 @@ export const chatSessionApi = {
         return request<any[]>(`/agents/${agentId}/sessions?${params.toString()}`);
     },
 
+    listPage: (agentId: string, options: {
+        scope?: 'mine' | 'all';
+        source_channel?: string;
+        limit?: number;
+        offset?: number;
+        cursor?: string;
+        exclude_mine?: boolean;
+        signal?: AbortSignal;
+    } = {}) => {
+        const params = new URLSearchParams();
+        params.set('scope', options.scope || 'mine');
+        params.set('paginated', 'true');
+        if (options.source_channel) params.set('source_channel', options.source_channel);
+        if (options.limit != null) params.set('limit', String(options.limit));
+        if (options.offset != null) params.set('offset', String(options.offset));
+        if (options.cursor) params.set('cursor', options.cursor);
+        if (options.exclude_mine) params.set('exclude_mine', 'true');
+        return request<{ items: any[]; has_more: boolean; next_offset: number | null; next_cursor: string | null }>(
+            `/agents/${agentId}/sessions?${params.toString()}`,
+            { signal: options.signal },
+        );
+    },
+
     get: (agentId: string, sessionId: string) =>
         request<Record<string, any> & { view_scope: 'mine' | 'all' }>(`/agents/${agentId}/sessions/${sessionId}`),
 

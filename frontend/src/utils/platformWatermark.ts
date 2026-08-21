@@ -20,7 +20,6 @@ type PlatformWatermarkInstallOptions = {
 };
 
 const WATERMARK_ATTRIBUTE = 'data-platform-watermark';
-const WATERMARK_HOST_ID = 'clawith-platform-watermark-host';
 const MAX_NAME_CHARACTERS = 24;
 const MAX_DEVICE_PIXEL_RATIO = 3;
 const MOBILE_VIEWPORT_MAX_WIDTH = 600;
@@ -223,11 +222,8 @@ export function installPlatformWatermark(
     }: PlatformWatermarkInstallOptions = {},
 ) {
     const body = targetDocument.body;
-    const staleHost = targetDocument.getElementById(WATERMARK_HOST_ID);
-    staleHost?.parentNode?.removeChild(staleHost);
 
     const host = targetDocument.createElement('div');
-    host.id = WATERMARK_HOST_ID;
     host.setAttribute(WATERMARK_ATTRIBUTE, 'true');
     host.setAttribute('aria-hidden', 'true');
     host.style.cssText = WATERMARK_HOST_STYLE;
@@ -243,6 +239,9 @@ export function installPlatformWatermark(
     let currentTheme: PlatformWatermarkTheme | null = null;
     let currentLayoutKey = '';
     let resizeFrame: number | null = null;
+    let stopped = false;
+    const canonicalHostCssText = host.style.cssText;
+    let canonicalLayerCssText = layer.style.cssText;
 
     const getLayoutKey = () => {
         const viewport = targetWindow.innerWidth <= MOBILE_VIEWPORT_MAX_WIDTH ? 'narrow' : 'wide';
@@ -261,12 +260,54 @@ export function installPlatformWatermark(
         );
         layer.style.setProperty('background-image', `url("${tile.dataUrl}")`, 'important');
         layer.style.setProperty('background-size', `${tile.width}px ${tile.height}px`, 'important');
+        canonicalLayerCssText = layer.style.cssText;
         currentTheme = nextTheme;
         currentLayoutKey = nextLayoutKey;
     };
 
     render();
     body.appendChild(host);
+
+    const restoreWatermark = () => {
+        if (stopped) return;
+        try {
+            if (host.parentNode !== body) body.appendChild(host);
+            if (host.hasAttribute('id')) host.removeAttribute('id');
+            if (host.hasAttribute('class')) host.removeAttribute('class');
+            for (const attribute of Array.from(host.attributes)) {
+                if (!['style', WATERMARK_ATTRIBUTE, 'aria-hidden'].includes(attribute.name)) {
+                    host.removeAttribute(attribute.name);
+                }
+            }
+            if (host.getAttribute(WATERMARK_ATTRIBUTE) !== 'true') {
+                host.setAttribute(WATERMARK_ATTRIBUTE, 'true');
+            }
+            if (host.getAttribute('aria-hidden') !== 'true') host.setAttribute('aria-hidden', 'true');
+
+            if (host.style.cssText !== canonicalHostCssText) {
+                host.style.cssText = canonicalHostCssText;
+            }
+
+            if (layer.parentNode !== renderRoot) renderRoot.appendChild(layer);
+            for (const attribute of Array.from(layer.attributes)) {
+                if (!['style', 'part'].includes(attribute.name)) layer.removeAttribute(attribute.name);
+            }
+            if (layer.getAttribute('part') !== 'layer') layer.setAttribute('part', 'layer');
+            if (layer.style.cssText !== canonicalLayerCssText) layer.style.cssText = canonicalLayerCssText;
+        } catch (guardError) {
+            console.warn('Unable to restore the published-page watermark', guardError);
+        }
+    };
+
+    const Observer = (targetWindow as Window & typeof globalThis).MutationObserver;
+    const guardObserver = Observer ? new Observer(restoreWatermark) : null;
+    guardObserver?.observe(body, { childList: true });
+    guardObserver?.observe(host, {
+        attributes: true,
+    });
+    guardObserver?.observe(layer, {
+        attributes: true,
+    });
 
     const handleThemeChange = (event: Event) => {
         const detail = (event as CustomEvent<{ theme?: PlatformWatermarkTheme }>).detail;
@@ -284,6 +325,8 @@ export function installPlatformWatermark(
     targetWindow.addEventListener('resize', handleResize);
 
     return () => {
+        stopped = true;
+        guardObserver?.disconnect();
         targetWindow.removeEventListener(DOCUMENT_THEME_CHANGE_EVENT, handleThemeChange);
         targetWindow.removeEventListener('resize', handleResize);
         if (resizeFrame != null) targetWindow.cancelAnimationFrame(resizeFrame);

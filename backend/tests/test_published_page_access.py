@@ -1,3 +1,4 @@
+import asyncio
 import pathlib
 import uuid
 from datetime import datetime, timezone
@@ -33,9 +34,9 @@ from app.services.agent_tools import (
 from app.services.published_page_access import PAGE_SESSION_COOKIE, create_page_session
 from app.services.tool_seeder import BUILTIN_TOOLS
 
-
 pytestmark = pytest.mark.asyncio
 settings = get_settings()
+IFRAME_HEADERS = {"Sec-Fetch-Dest": "iframe", "Sec-Fetch-Site": "same-origin"}
 
 
 @pytest.fixture(autouse=True)
@@ -45,11 +46,16 @@ async def _dispose_engine():
     await engine.dispose()
 
 
-async def _make_user(db, tenant_id, name):
-    identity = Identity(username=f"{name}_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:8]}@test.local", password_hash="x")
+async def _make_user(db, tenant_id, name, role="member", is_platform_admin=False):
+    identity = Identity(
+        username=f"{name}_{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:8]}@test.local",
+        password_hash="x",
+        is_platform_admin=is_platform_admin,
+    )
     db.add(identity)
     await db.flush()
-    user = User(identity_id=identity.id, tenant_id=tenant_id, display_name=name, role="member", is_active=True)
+    user = User(identity_id=identity.id, tenant_id=tenant_id, display_name=name, role=role, is_active=True)
     db.add(user)
     await db.flush()
     return user
@@ -126,7 +132,10 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         assert context.status_code == 200
         assert context.json()["watermark_identity"]["display_name"] == "Viewer"
         assert context.json()["allow_top_navigation"] is False
-        content = await client.get(f"/api/pages/{short_id}/content")
+        direct_content = await client.get(f"/api/pages/{short_id}/content", follow_redirects=False)
+        assert direct_content.status_code == 302
+        assert direct_content.headers["location"] == f"/p/{short_id}"
+        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
         assert content.status_code == 200
         assert content.headers["content-type"].startswith("text/html")
         assert content.headers["cache-control"] == "no-store"
@@ -185,8 +194,16 @@ async def test_public_and_authenticated_modes_keep_expected_access_boundaries():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         public = await client.get(f"/p/{short_id}")
         assert public.status_code == 200
-        assert public.text == "<h1>secret</h1>"
-        assert "x-accel-redirect" not in public.headers
+        assert public.headers["x-accel-redirect"] == "/__published_page_viewer"
+        assert "<h1>secret</h1>" not in public.text
+        context = await client.get(f"/api/pages/{short_id}/viewer-context")
+        assert context.status_code == 200
+        assert context.json()["watermark_identity"] is None
+        assert context.json()["watermark_text"].startswith("匿名访客 ")
+        assert context.json()["watermark_text"].endswith(" UTC")
+        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+        assert content.status_code == 200
+        assert content.text == "<h1>secret</h1>"
 
     async with async_session() as db:
         page = await db.get(PublishedPage, page_id)
@@ -204,9 +221,75 @@ async def test_public_and_authenticated_modes_keep_expected_access_boundaries():
         authenticated = await client.get(f"/p/{short_id}")
         assert authenticated.status_code == 200
         assert authenticated.headers["x-accel-redirect"] == "/__published_page_viewer"
-        content = await client.get(f"/api/pages/{short_id}/content")
+        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
         assert content.status_code == 200
         assert content.text == "<h1>secret</h1>"
+
+
+async def test_public_page_content_remains_available_when_watermark_formatting_fails(monkeypatch):
+    short_id, page_id, _agent_id, _owner_id, _viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        page = await db.get(PublishedPage, page_id)
+        page.access_mode = "public"
+        await db.commit()
+
+    def fail_watermark_formatting(*_args, **_kwargs):
+        raise RuntimeError("simulated watermark failure")
+
+    monkeypatch.setattr(pages_api, "_public_watermark_text", fail_watermark_formatting)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/p/{short_id}")
+        context = await client.get(f"/api/pages/{short_id}/viewer-context")
+        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+
+    assert response.status_code == 200
+    assert response.headers["x-accel-redirect"] == "/__published_page_viewer"
+    assert context.status_code == 200
+    assert context.json()["watermark_text"] is None
+    assert content.status_code == 200
+    assert "<h1>secret</h1>" in content.text
+
+
+async def test_public_report_dom_and_strict_csp_are_isolated_from_platform_watermark():
+    short_id, page_id, agent_id, _owner_id, _viewer_id = await _make_restricted_page()
+    source = pathlib.Path(settings.AGENT_DATA_DIR) / str(agent_id) / "out" / "protected.html"
+    source.write_text(
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'none\'">'
+        '<main id="published-page-watermark-host">report remains intact</main>'
+        '<!-- legacy reference must not grant top navigation: /sdk/clawith.js -->',
+        encoding="utf-8",
+    )
+    async with async_session() as db:
+        page = await db.get(PublishedPage, page_id)
+        page.access_mode = "public"
+        await db.commit()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        viewer = await client.get(f"/p/{short_id}")
+        context = await client.get(f"/api/pages/{short_id}/viewer-context")
+        top_level_embed = await client.get(
+            f"/p/{short_id}?__report_embed=1", follow_redirects=False,
+        )
+        embedded = await client.get(
+            f"/p/{short_id}?__report_embed=1", headers=IFRAME_HEADERS,
+        )
+        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+
+    assert viewer.status_code == 200
+    assert viewer.headers["x-accel-redirect"] == "/__published_page_viewer"
+    assert context.status_code == 200
+    assert context.json()["watermark_text"].startswith("匿名访客 ")
+    assert context.json()["allow_top_navigation"] is False
+    assert top_level_embed.headers["x-accel-redirect"] == "/__published_page_viewer"
+    assert embedded.status_code == 200
+    assert "report remains intact" in embedded.text
+    assert "/sdk/clawith.js" in embedded.text
+    assert content.status_code == 200
+    assert "default-src 'none'" in content.text
+    assert 'id="published-page-watermark-host"' in content.text
+    assert "report remains intact" in content.text
 
 
 async def test_missing_page_and_source_use_the_frontend_unavailable_page():
@@ -243,18 +326,24 @@ async def test_public_anonymous_visits_are_aggregated_by_platform_cookie():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as first_browser:
         first = await first_browser.get(f"/p/{short_id}")
         assert first.status_code == 200
-        assert first.text == "<h1>secret</h1>"
         cookie_header = first.headers["set-cookie"]
         assert "published_page_visitor=" in cookie_header
         assert "HttpOnly" in cookie_header
-        assert "Path=/p/" in cookie_header
+        assert "Path=/" in cookie_header
+        first_context = await first_browser.get(f"/api/pages/{short_id}/viewer-context")
+        first_content = await first_browser.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+        assert first_content.text == "<h1>secret</h1>"
         second = await first_browser.get(f"/p/{short_id}")
         assert second.status_code == 200
         assert "published_page_visitor=" not in second.headers.get("set-cookie", "")
+        second_context = await first_browser.get(f"/api/pages/{short_id}/viewer-context")
+        await first_browser.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as second_browser:
         third = await second_browser.get(f"/p/{short_id}")
         assert third.status_code == 200
+        await second_browser.get(f"/api/pages/{short_id}/viewer-context")
+        await second_browser.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
 
     async with async_session() as db:
         anonymous_visitors = (await db.scalars(
@@ -262,6 +351,10 @@ async def test_public_anonymous_visits_are_aggregated_by_platform_cookie():
         )).all()
         assert len(anonymous_visitors) == 2
         assert sorted(visitor.view_count for visitor in anonymous_visitors) == [1, 2]
+        repeat_visitor = next(visitor for visitor in anonymous_visitors if visitor.view_count == 2)
+        expected_label = f"匿名访客 {repeat_visitor.visitor_key[:12].upper()}"
+        assert expected_label in first_context.json()["watermark_text"]
+        assert expected_label in second_context.json()["watermark_text"]
         assert all(visitor.first_viewed_at is not None and visitor.last_viewed_at is not None for visitor in anonymous_visitors)
         page = await db.get(PublishedPage, page_id)
         assert page.view_count == 3
@@ -277,6 +370,43 @@ async def test_public_anonymous_visits_are_aggregated_by_platform_cookie():
         assert payload["total"] == 2
         assert all(item["visitor_type"] == "anonymous" for item in payload["items"])
         assert sorted(item["view_count"] for item in payload["items"]) == [1, 2]
+
+
+async def test_public_embed_stays_anonymous_with_existing_page_session():
+    short_id, page_id, _agent_id, _owner_id, viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        page = await db.get(PublishedPage, page_id)
+        page.access_mode = "public"
+        await db.commit()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        viewer = await client.get(f"/p/{short_id}")
+        assert viewer.status_code == 200
+        client.cookies.set(PAGE_SESSION_COOKIE, create_page_session(viewer_id), path="/")
+        embedded = await client.get(
+            f"/p/{short_id}?__report_embed=1",
+            headers=IFRAME_HEADERS,
+        )
+        assert embedded.status_code == 200
+
+    async with async_session() as db:
+        authenticated_visit = await db.scalar(
+            select(PublishedPageVisitor).where(
+                PublishedPageVisitor.page_id == page_id,
+                PublishedPageVisitor.user_id == viewer_id,
+            )
+        )
+        anonymous_visits = (
+            await db.scalars(
+                select(PublishedPageAnonymousVisitor).where(
+                    PublishedPageAnonymousVisitor.page_id == page_id
+                )
+            )
+        ).all()
+        assert authenticated_visit is None
+        assert len(anonymous_visits) == 1
+        assert anonymous_visits[0].view_count == 1
 
 
 async def test_anonymous_visitor_key_is_isolated_per_page():
@@ -336,6 +466,7 @@ async def test_public_visit_from_another_tenant_is_recorded_anonymously():
         client.cookies.set(PAGE_SESSION_COOKIE, create_page_session(outsider_id), path="/")
         response = await client.get(f"/p/{short_id}")
         assert response.status_code == 200
+        await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
 
     async with async_session() as db:
         visitors = (await db.scalars(select(PublishedPageAnonymousVisitor).where(
@@ -343,6 +474,34 @@ async def test_public_visit_from_another_tenant_is_recorded_anonymously():
         ))).all()
         assert len(visitors) == 1
         assert visitors[0].view_count == 1
+
+
+async def test_public_page_keeps_same_tenant_session_anonymous():
+    short_id, page_id, _agent_id, owner_id, _viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        page = await db.get(PublishedPage, page_id)
+        page.access_mode = "public"
+        await db.commit()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        client.cookies.set(PAGE_SESSION_COOKIE, create_page_session(owner_id), path="/")
+        response = await client.get(f"/p/{short_id}")
+        assert response.status_code == 200
+        context = await client.get(f"/api/pages/{short_id}/viewer-context")
+        assert "匿名访客" in context.json()["watermark_text"]
+        await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+
+    async with async_session() as db:
+        anonymous = (await db.scalars(select(PublishedPageAnonymousVisitor).where(
+            PublishedPageAnonymousVisitor.page_id == page_id
+        ))).all()
+        authenticated = (await db.scalars(select(PublishedPageVisitor).where(
+            PublishedPageVisitor.page_id == page_id
+        ))).all()
+        assert len(anonymous) == 1
+        assert authenticated == []
+        assert f"匿名访客 {anonymous[0].visitor_key[:12].upper()}" in context.json()["watermark_text"]
 
 
 async def test_legacy_page_without_tenant_remains_visible_and_is_repaired_on_access_update():
@@ -505,6 +664,75 @@ async def test_shared_agent_user_cannot_change_page_access_through_tools():
         assert page.access_mode == "authenticated"
 
 
+async def test_admin_agent_tool_can_change_any_page_in_current_company_only():
+    async with async_session() as db:
+        tenant = Tenant(name="Admin Tool Tenant", slug=f"admin-tool-{uuid.uuid4().hex[:8]}", im_provider="web_only")
+        other_tenant = Tenant(name="Other Tool Tenant", slug=f"other-tool-{uuid.uuid4().hex[:8]}", im_provider="web_only")
+        db.add_all([tenant, other_tenant])
+        await db.flush()
+        current_owner = await _make_user(db, tenant.id, "Current Agent Owner")
+        page_owner = await _make_user(db, tenant.id, "Other Page Owner")
+        org_admin = await _make_user(db, tenant.id, "Tool Company Admin", role="org_admin")
+        platform_admin = await _make_user(db, tenant.id, "Tool Platform Admin", is_platform_admin=True)
+        other_admin = await _make_user(db, other_tenant.id, "Other Company Admin", role="org_admin")
+        current_agent = Agent(
+            name="Current Conversation Agent", role_description="", creator_id=current_owner.id,
+            tenant_id=tenant.id, agent_type="native",
+        )
+        page_agent = Agent(
+            name="Different Page Agent", role_description="", creator_id=page_owner.id,
+            tenant_id=tenant.id, agent_type="native",
+        )
+        db.add_all([current_agent, page_agent])
+        await db.flush()
+        page = PublishedPage(
+            short_id=f"p{uuid.uuid4().hex[:7]}", agent_id=page_agent.id, user_id=page_owner.id,
+            tenant_id=tenant.id, source_path="admin-tool.html", title="Admin Tool Page",
+            access_mode="restricted",
+        )
+        db.add(page)
+        await db.commit()
+        current_agent_id = current_agent.id
+        page_id = page.id
+        short_id = page.short_id
+        current_owner_id = current_owner.id
+        org_admin_id = org_admin.id
+        platform_admin_id = platform_admin.id
+        other_admin_id = other_admin.id
+
+    denied_member = await _update_published_page_access(
+        current_agent_id,
+        current_owner_id,
+        {"short_id": short_id, "access_mode": "public", "allowed_user_ids": []},
+    )
+    assert denied_member.startswith("Published page not found")
+
+    updated_by_company_admin = await _update_published_page_access(
+        current_agent_id,
+        org_admin_id,
+        {"short_id": short_id, "access_mode": "authenticated", "allowed_user_ids": []},
+    )
+    assert updated_by_company_admin.startswith("Updated")
+
+    updated_by_platform_admin = await _update_published_page_access(
+        current_agent_id,
+        platform_admin_id,
+        {"short_id": short_id, "access_mode": "public", "allowed_user_ids": []},
+    )
+    assert updated_by_platform_admin.startswith("Updated")
+
+    denied_cross_tenant = await _update_published_page_access(
+        current_agent_id,
+        other_admin_id,
+        {"short_id": short_id, "access_mode": "restricted", "allowed_user_ids": []},
+    )
+    assert denied_cross_tenant.startswith("Permission denied")
+
+    async with async_session() as db:
+        updated_page = await db.get(PublishedPage, page_id)
+        assert updated_page.access_mode == "public"
+
+
 async def test_page_list_returns_summary_and_detail_is_loaded_separately():
     _short_id, page_id, _agent_id, owner_id, viewer_id = await _make_restricted_page()
     async with async_session() as db:
@@ -546,6 +774,175 @@ async def test_page_list_returns_summary_and_detail_is_loaded_separately():
         assert visitors.json()["total"] == 1
         assert visitors.json()["items"][0]["id"] == str(viewer_id)
         assert visitors.json()["items"][0]["view_count"] == 3
+
+
+async def test_company_and_platform_admins_see_all_pages_in_current_company_with_pagination():
+    async with async_session() as db:
+        tenant = Tenant(name="Admin Page List", slug=f"admin-pages-{uuid.uuid4().hex[:8]}", im_provider="web_only")
+        other_tenant = Tenant(name="Other Admin Page List", slug=f"other-pages-{uuid.uuid4().hex[:8]}", im_provider="web_only")
+        db.add_all([tenant, other_tenant])
+        await db.flush()
+        first_owner = await _make_user(db, tenant.id, "First Owner")
+        second_owner = await _make_user(db, tenant.id, "Second Owner")
+        org_admin = await _make_user(db, tenant.id, "Company Admin", role="org_admin")
+        platform_admin = await _make_user(db, tenant.id, "Platform Admin", is_platform_admin=True)
+        outsider = await _make_user(db, other_tenant.id, "Other Owner")
+        first_agent = Agent(
+            name="First Agent", role_description="", creator_id=first_owner.id,
+            tenant_id=tenant.id, agent_type="native", access_mode="company",
+        )
+        private_agent = Agent(
+            name="Private Agent", role_description="", creator_id=second_owner.id,
+            tenant_id=tenant.id, agent_type="native", access_mode="private",
+        )
+        outsider_agent = Agent(
+            name="Other Agent", role_description="", creator_id=outsider.id,
+            tenant_id=other_tenant.id, agent_type="native",
+        )
+        db.add_all([first_agent, private_agent, outsider_agent])
+        await db.flush()
+        first_page = PublishedPage(
+            short_id=f"p{uuid.uuid4().hex[:7]}", agent_id=first_agent.id, user_id=first_owner.id,
+            tenant_id=tenant.id, source_path="first.html", title="First", access_mode="authenticated",
+        )
+        private_page = PublishedPage(
+            short_id=f"p{uuid.uuid4().hex[:7]}", agent_id=private_agent.id, user_id=second_owner.id,
+            tenant_id=tenant.id, source_path="private.html", title="Private", access_mode="restricted",
+        )
+        outsider_page = PublishedPage(
+            short_id=f"p{uuid.uuid4().hex[:7]}", agent_id=outsider_agent.id, user_id=outsider.id,
+            tenant_id=other_tenant.id, source_path="other.html", title="Other", access_mode="public",
+        )
+        db.add_all([first_page, private_page, outsider_page])
+        await db.commit()
+        expected_page_ids = {str(first_page.id), str(private_page.id)}
+        expected_agent_ids = {str(first_agent.id), str(private_agent.id)}
+        first_page_id = first_page.id
+        first_owner_id = first_owner.id
+        org_admin_id = org_admin.id
+        platform_admin_id = platform_admin.id
+        private_page_id = private_page.id
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for admin_id in (org_admin_id, platform_admin_id):
+            token = create_access_token(str(admin_id), "member")
+            headers = {"Authorization": f"Bearer {token}"}
+            listed_ids = set()
+            for page_number in (1, 2):
+                response = await client.get(
+                    "/api/pages/mine",
+                    params={"page": page_number, "page_size": 1},
+                    headers=headers,
+                )
+                assert response.status_code == 200
+                assert response.json()["total"] == 2
+                assert response.json()["page_size"] == 1
+                listed_ids.update(item["id"] for item in response.json()["items"])
+            assert listed_ids == expected_page_ids
+
+            options = await client.get("/api/pages/agent-options", headers=headers)
+            assert options.status_code == 200
+            assert {item["id"] for item in options.json()} == expected_agent_ids
+
+        owner_token = create_access_token(str(first_owner_id), "member")
+        owner_list = await client.get(
+            "/api/pages/mine",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        assert owner_list.status_code == 200
+        assert {item["id"] for item in owner_list.json()["items"]} == {str(first_page_id)}
+
+        admin_token = create_access_token(str(org_admin_id), "org_admin")
+        detail = await client.get(
+            f"/api/pages/{private_page_id}/detail",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert detail.status_code == 200
+
+        bulk_update = await client.put(
+            "/api/pages/batch/access",
+            json={
+                "page_ids": list(expected_page_ids),
+                "access_mode": "public",
+                "allowed_user_ids": [],
+            },
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert bulk_update.status_code == 200
+        assert bulk_update.json() == {"updated_count": 2}
+
+        denied_bulk_update = await client.put(
+            "/api/pages/batch/access",
+            json={
+                "page_ids": list(expected_page_ids),
+                "access_mode": "authenticated",
+                "allowed_user_ids": [],
+            },
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        assert denied_bulk_update.status_code == 404
+
+    async with async_session() as db:
+        updated_modes = set((await db.scalars(select(PublishedPage.access_mode).where(
+            PublishedPage.id.in_([first_page_id, private_page_id])
+        ))).all())
+        assert updated_modes == {"public"}
+
+
+async def test_bulk_access_limit_and_concurrent_replacements_remain_complete_sets():
+    _short_id, page_id, _agent_id, owner_id, first_viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        owner = await db.get(User, owner_id)
+        owner.role = "org_admin"
+        second_viewer = await _make_user(db, owner.tenant_id, "Second Viewer")
+        await db.commit()
+        second_viewer_id = second_viewer.id
+
+    token = create_access_token(str(owner_id), "org_admin")
+    headers = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        too_many = await client.put(
+            "/api/pages/batch/access",
+            json={
+                "page_ids": [str(uuid.uuid4()) for _ in range(101)],
+                "access_mode": "authenticated",
+                "allowed_user_ids": [],
+            },
+            headers=headers,
+        )
+        assert too_many.status_code == 422
+
+        first_update, second_update = await asyncio.gather(
+            client.put(
+                "/api/pages/batch/access",
+                json={
+                    "page_ids": [str(page_id)],
+                    "access_mode": "restricted",
+                    "allowed_user_ids": [str(first_viewer_id)],
+                },
+                headers=headers,
+            ),
+            client.put(
+                "/api/pages/batch/access",
+                json={
+                    "page_ids": [str(page_id)],
+                    "access_mode": "restricted",
+                    "allowed_user_ids": [str(second_viewer_id)],
+                },
+                headers=headers,
+            ),
+        )
+        assert first_update.status_code == 200
+        assert second_update.status_code == 200
+
+    async with async_session() as db:
+        approved_ids = set((await db.scalars(select(PublishedPageAccess.user_id).where(
+            PublishedPageAccess.page_id == page_id,
+            PublishedPageAccess.status == "approved",
+        ))).all())
+    assert approved_ids in ({first_viewer_id}, {second_viewer_id})
 
 
 async def test_historical_page_reports_unrecorded_last_publication():
@@ -671,7 +1068,7 @@ async def test_publish_tool_defaults_new_pages_to_authenticated_and_preserves_ex
 
     first = await _publish_page(agent_id, owner_id, source.parent, {"path": source_path})
     assert "Access: authenticated." in first
-    assert "Platform watermark: enabled automatically." in first
+    assert "Platform watermark: enabled automatically (signed-in user identity)." in first
     assert "Page URL:" in first and "Management URL:" in first
     assert "Published by: Default Owner" in first
     assert "Published at:" in first
@@ -690,6 +1087,7 @@ async def test_publish_tool_defaults_new_pages_to_authenticated_and_preserves_ex
 
     second = await _publish_page(agent_id, owner_id, source.parent, {"path": source_path})
     assert "Access: public." in second
+    assert "Platform watermark: enabled automatically (anonymous visitor ID and access time)." in second
     async with async_session() as db:
         published = await db.scalar(select(PublishedPage).where(
             PublishedPage.agent_id == agent_id,

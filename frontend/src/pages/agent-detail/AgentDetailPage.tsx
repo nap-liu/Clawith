@@ -119,6 +119,7 @@ import SceneConfigTab from './tabs/SceneConfigTab';
 import { useUnsavedChangesGuard } from '../../hooks/useUnsavedChangesGuard';
 import SkillsTab from './tabs/SkillsTab';
 import ToolsTab from './tabs/ToolsTab';
+import VirtualSessionList from './components/VirtualSessionList';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
 import { fetchAuth } from './utils/fetchAuth';
 
@@ -135,6 +136,16 @@ const WORKSPACE_TOOLS = new Set([
 ]);
 
 const AWARE_TOOLS = new Set(['set_trigger', 'update_trigger', 'cancel_trigger', 'list_triggers', 'list_focus_items', 'upsert_focus_item', 'complete_focus_item']);
+const SESSION_PAGE_SIZE = 40;
+const mergeSessionsById = (first: any[], second: any[]) => {
+    const seen = new Set<string>();
+    return [...first, ...second].filter((session) => {
+        const sessionId = String(session.id);
+        if (seen.has(sessionId)) return false;
+        seen.add(sessionId);
+        return true;
+    });
+};
 const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
 const trimLeadingPictograph = (value: string) => value.replace(/^\p{Extended_Pictographic}\s*/u, '');
 const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
@@ -1789,6 +1800,10 @@ export default function AgentDetailPage() {
     // ── Session state (replaces old conversations query) ──────────────────
     const [sessions, setSessions] = useState<any[]>([]);
     const [allSessions, setAllSessions] = useState<any[]>([]);
+    const [sessionsHasMore, setSessionsHasMore] = useState(false);
+    const [allSessionsHasMore, setAllSessionsHasMore] = useState(false);
+    const [sessionsNextCursor, setSessionsNextCursor] = useState<string | null>(null);
+    const [allSessionsNextCursor, setAllSessionsNextCursor] = useState<string | null>(null);
     const [activeSession, setActiveSession] = useState<any | null>(null);
     const [subagentSessionRun, setSubagentSessionRun] = useState<SubagentRunCardData | null>(null);
     const openSubagentSession = useCallback((run: SubagentRunCardData) => setSubagentSessionRun(run), []);
@@ -1811,6 +1826,8 @@ export default function AgentDetailPage() {
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
+    const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false);
+    const [allSessionsLoadingMore, setAllSessionsLoadingMore] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
     // Websocket chat state (for 'me' conversation)
     const token = useAuthStore((s) => s.token);
@@ -1841,6 +1858,10 @@ export default function AgentDetailPage() {
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
     const historyMoreAbortRef = useRef<AbortController | null>(null);
+    const sessionsListAbortRef = useRef<AbortController | null>(null);
+    const allSessionsListAbortRef = useRef<AbortController | null>(null);
+    const sessionsListGenerationRef = useRef(0);
+    const allSessionsListGenerationRef = useRef(0);
     const sessionLoadSeqRef = useRef(0);
     const pcPageSuspendedRef = useRef(false);
     const pcHiddenDroppedEventRef = useRef(false);
@@ -1999,21 +2020,9 @@ export default function AgentDetailPage() {
 
     const isViewingOtherUsersSessions = canViewAllAgentChatSessions && chatScope === 'all';
 
-    /** Sessions in scope=all that are not the current viewer's own P2P rows (for admin「其他用户」tab).
-     *  Agent-to-agent sessions (source_channel === 'agent') store the creator's user_id, so we must
-     *  exempt them from the user_id check — otherwise they'd always be hidden. */
-    const otherUsersSessions = useMemo(() => {
-        const vu = viewerUserIdStr();
-        return allSessions.filter((s: any) => {
-            // Always show agent-to-agent sessions in the "Other users" tab
-            if (isAgentChatSession(s)) return true;
-            const su = sessionUserIdStr(s);
-            if (vu && su === vu) return false;
-            return true;
-        });
-    }, [allSessions, currentUser?.id]);
-
-    const othersListForPicker = otherUsersSessions;
+    // Filtering out the viewer's own rows happens in SQL before offset/limit,
+    // keeping every incremental page dense and stable.
+    const othersListForPicker = allSessions;
 
     useEffect(() => {
         if (!canViewAllAgentChatSessions && chatScope === 'all') setChatScope('mine');
@@ -2048,7 +2057,7 @@ export default function AgentDetailPage() {
 
     const onAdminTabOthers = () => {
         setChatScope('all');
-        fetchAllSessions();
+        if (allSessions.length === 0) void fetchAllSessions();
         if (activeSession && sessionUserIdStr(activeSession) === viewerUserIdStr()) clearChatSelection();
     };
     const syncActiveSocketState = (sess: any | null = activeSession, agentId: string | undefined = id) => {
@@ -2073,48 +2082,132 @@ export default function AgentDetailPage() {
         }
     };
 
-    const fetchMySessions = async (silent = false, agentId: string | undefined = id) => {
+    const fetchMySessions = async (
+        silent = false,
+        agentId: string | undefined = id,
+        append = false,
+    ) => {
         if (!agentId) return [];
-        if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(true);
+        const existingCount = currentAgentIdRef.current === agentId ? sessions.length : 0;
+        const refreshLimit = silent && !append
+            ? Math.min(200, Math.max(SESSION_PAGE_SIZE, existingCount))
+            : SESSION_PAGE_SIZE;
+        const requestCursor = append ? sessionsNextCursor : null;
+        if (append && requestCursor == null) return [];
+        const generation = append
+            ? sessionsListGenerationRef.current
+            : ++sessionsListGenerationRef.current;
+        sessionsListAbortRef.current?.abort();
+        const controller = new AbortController();
+        sessionsListAbortRef.current = controller;
+        if (append) setSessionsLoadingMore(true);
+        else {
+            // A reset/refresh supersedes any append request. Clear its spinner
+            // immediately because the aborted append's finally block is no
+            // longer allowed to mutate state for the new request generation.
+            setSessionsLoadingMore(false);
+            if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(true);
+        }
         try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${agentId}/sessions?scope=mine`, { headers: { Authorization: `Bearer ${tkn}` } });
-            if (res.ok) {
-                const data = (await res.json()).map((row: any) => normalizeChatSession(row));
-                if (currentAgentIdRef.current === agentId) setSessions(data);
-                if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(false);
-                return data;
+            const page = await chatSessionApi.listPage(agentId, {
+                scope: 'mine',
+                limit: refreshLimit,
+                cursor: requestCursor || undefined,
+                signal: controller.signal,
+            });
+            const data = page.items.map((row: any) => normalizeChatSession(row));
+            if (
+                currentAgentIdRef.current === agentId
+                && generation === sessionsListGenerationRef.current
+            ) {
+                if (append) {
+                    setSessions(prev => mergeSessionsById(prev, data));
+                    setSessionsHasMore(page.has_more);
+                    setSessionsNextCursor(page.next_cursor);
+                } else if (silent && existingCount > 200) {
+                    setSessions(prev => mergeSessionsById(data, prev));
+                } else {
+                    setSessions(data);
+                    setSessionsHasMore(page.has_more);
+                    setSessionsNextCursor(page.next_cursor);
+                }
             }
-        } catch { }
-        if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(false);
-        return [];
+            return data;
+        } catch (error: any) {
+            if (error?.name !== 'AbortError') console.warn('[chat] failed to load session list', error);
+            return [];
+        } finally {
+            if (sessionsListAbortRef.current === controller) {
+                sessionsListAbortRef.current = null;
+                if (append) setSessionsLoadingMore(false);
+                else if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(false);
+            }
+        }
     };
 
-    const fetchAllSessions = async () => {
-        if (!id || !canViewAllAgentChatSessions) return [];
-        setAllSessionsLoading(true);
+    const fetchAllSessions = async (silent = false, append = false, agentId: string | undefined = id) => {
+        if (!agentId || !canViewAllAgentChatSessions) return [];
+        const existingCount = currentAgentIdRef.current === agentId ? allSessions.length : 0;
+        const refreshLimit = silent && !append
+            ? Math.min(200, Math.max(SESSION_PAGE_SIZE, existingCount))
+            : SESSION_PAGE_SIZE;
+        const requestCursor = append ? allSessionsNextCursor : null;
+        if (append && requestCursor == null) return [];
+        const generation = append
+            ? allSessionsListGenerationRef.current
+            : ++allSessionsListGenerationRef.current;
+        allSessionsListAbortRef.current?.abort();
+        const controller = new AbortController();
+        allSessionsListAbortRef.current = controller;
+        if (append) setAllSessionsLoadingMore(true);
+        else {
+            // See fetchMySessions: a newer reset owns the loading state after
+            // aborting an in-flight append.
+            setAllSessionsLoadingMore(false);
+            if (!silent) setAllSessionsLoading(true);
+        }
         try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${id}/sessions?scope=all`, { headers: { Authorization: `Bearer ${tkn}` } });
-            if (!currentAgentIdRef.current || currentAgentIdRef.current !== id) return;
-            if (res.ok) {
-                const all = (await res.json())
-                    .filter((s: any) => String(s.source_channel || 'direct').toLowerCase() !== 'trigger')
-                    .map((row: any) => normalizeChatSession(row));
-                setAllSessions(all);
-                return all;
+            const page = await chatSessionApi.listPage(agentId, {
+                scope: 'all',
+                exclude_mine: true,
+                limit: refreshLimit,
+                cursor: requestCursor || undefined,
+                signal: controller.signal,
+            });
+            if (
+                currentAgentIdRef.current !== agentId
+                || generation !== allSessionsListGenerationRef.current
+            ) return [];
+            const data = page.items.map((row: any) => normalizeChatSession(row));
+            if (append) {
+                setAllSessions(prev => mergeSessionsById(prev, data));
+                setAllSessionsHasMore(page.has_more);
+                setAllSessionsNextCursor(page.next_cursor);
+            } else if (silent && existingCount > 200) {
+                setAllSessions(prev => mergeSessionsById(data, prev));
             } else {
+                setAllSessions(data);
+                setAllSessionsHasMore(page.has_more);
+                setAllSessionsNextCursor(page.next_cursor);
+            }
+            return data;
+        } catch (error: any) {
+            if (currentAgentIdRef.current === agentId && !silent && !append && error?.name !== 'AbortError') {
                 setAllSessions([]);
-                if (res.status === 403) {
+                setAllSessionsHasMore(false);
+                setAllSessionsNextCursor(null);
+                if (error?.status === 403) {
                     console.warn('[chat] scope=all sessions forbidden (need org/platform/agent admin)');
                 }
             }
-        } catch {
-            if (currentAgentIdRef.current === id) setAllSessions([]);
+            return [];
         } finally {
-            setAllSessionsLoading(false);
+            if (allSessionsListAbortRef.current === controller) {
+                allSessionsListAbortRef.current = null;
+                if (append) setAllSessionsLoadingMore(false);
+                else if (!silent) setAllSessionsLoading(false);
+            }
         }
-        return [];
     };
 
     const selectSession = async (
@@ -2866,6 +2959,16 @@ export default function AgentDetailPage() {
         setChatScope('mine');
         setSessions([]);
         setAllSessions([]);
+        setSessionsHasMore(false);
+        setAllSessionsHasMore(false);
+        setSessionsNextCursor(null);
+        setAllSessionsNextCursor(null);
+        sessionsListAbortRef.current?.abort();
+        allSessionsListAbortRef.current?.abort();
+        sessionsListGenerationRef.current += 1;
+        allSessionsListGenerationRef.current += 1;
+        setSessionsLoadingMore(false);
+        setAllSessionsLoadingMore(false);
         setAgentExpired(false);
         settingsInitRef.current = false;
     }, [id]);
@@ -2874,6 +2977,14 @@ export default function AgentDetailPage() {
     useEffect(() => {
         setSessions([]);
         setAllSessions([]);
+        setSessionsHasMore(false);
+        setAllSessionsHasMore(false);
+        setSessionsNextCursor(null);
+        setAllSessionsNextCursor(null);
+        sessionsListAbortRef.current?.abort();
+        allSessionsListAbortRef.current?.abort();
+        sessionsListGenerationRef.current += 1;
+        allSessionsListGenerationRef.current += 1;
         setChatScope('mine');
         sessionMsgAbortRef.current?.abort();
         historyMoreAbortRef.current?.abort();
@@ -2887,6 +2998,8 @@ export default function AgentDetailPage() {
         setIsStopping(false);
         setSessionsLoading(false);
         setAllSessionsLoading(false);
+        setSessionsLoadingMore(false);
+        setAllSessionsLoadingMore(false);
         Object.keys(reconnectDisabledRef.current).forEach((k) => {
             reconnectDisabledRef.current[k] = true;
         });
@@ -3454,7 +3567,7 @@ export default function AgentDetailPage() {
                 if (currentSessionId) clearUnreadForSession(currentSessionId);
                 fetchMySessions(true, agentId);
                 if (canViewAllAgentChatSessions && (scopeDropdownOpen || chatScope === 'all' || allSessions.length > 0)) {
-                    fetchAllSessions();
+                    fetchAllSessions(true, false, agentId);
                 }
                 queryClient.invalidateQueries({ queryKey: ['agents'] });
             } else if (d.type === 'error' || d.type === 'quota_exceeded') {
@@ -6179,11 +6292,7 @@ export default function AgentDetailPage() {
                                             <div className="scope-dropdown" ref={scopeDropdownRef}>
                                                 <button
                                                     className="scope-dropdown-trigger"
-                                                    onClick={() => {
-                                                        const nextOpen = !scopeDropdownOpen;
-                                                        setScopeDropdownOpen(nextOpen);
-                                                        if (nextOpen && !allSessions.length) fetchAllSessions();
-                                                    }}
+                                                    onClick={() => setScopeDropdownOpen(open => !open)}
                                                 >
                                                     <span className="scope-dropdown-label">
                                                         {chatScope === 'mine'
@@ -6241,13 +6350,18 @@ export default function AgentDetailPage() {
 
                                 <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
                                     {(!canViewAllAgentChatSessions || chatScope === 'mine') ? (
-                                        <>
-                                            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '4px 0' }}>
-                                                {sessionsLoading ? (
-                                                    <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
-                                                ) : sessions.length === 0 ? (
-                                                    <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('agent.chat.noSessionsYet')}<br />{t('agent.chat.clickToStart')}</div>
-                                                ) : sessions.map((s: any) => {
+                                        <VirtualSessionList
+                                            key={`${id || 'unknown'}:mine`}
+                                            items={sessions}
+                                            hasMore={sessionsHasMore}
+                                            initialLoading={sessionsLoading}
+                                            loadingMore={sessionsLoadingMore}
+                                            estimateSize={59}
+                                            loadingState={<div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>}
+                                            emptyState={<div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('agent.chat.noSessionsYet')}<br />{t('agent.chat.clickToStart')}</div>}
+                                            loadMoreLabel={t('common.loading')}
+                                            onLoadMore={() => fetchMySessions(true, id, true)}
+                                            renderItem={(s: any) => {
                                                     const isActive = activeSession?.id === s.id && (chatScope === 'mine' || !canViewAllAgentChatSessions);
                                                     const channelLabel: Record<string, string> = {
                                                         feishu: t('common.channels.feishu'),
@@ -6313,25 +6427,30 @@ export default function AgentDetailPage() {
                                                             </button>
                                                         </div>
                                                     );
-                                                })}
-                                            </div>
-                                        </>
+                                            }}
+                                        />
                                     ) : (
-                                        <>
-                                            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '4px 0' }}>
-                                                {allSessionsLoading ? (
-                                                    <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                                        {[...Array(3)].map((_, i) => (
-                                                            <div key={i} style={{ padding: '6px 0', animation: 'pulse 1.5s ease-in-out infinite', animationDelay: `${i * 0.1}s` }}>
-                                                                <div style={{ height: '12px', width: `${70 + (i % 3) * 10}%`, background: 'var(--bg-tertiary)', borderRadius: '4px', marginBottom: '6px' }} />
-                                                                <div style={{ height: '10px', width: `${40 + (i % 4) * 8}%`, background: 'var(--bg-tertiary)', borderRadius: '3px', opacity: 0.6 }} />
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                ) : othersListForPicker.length === 0 ? (
-                                                    <div style={{ padding: '16px 12px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>{t('agent.chat.noSessionsYet')}</div>
-                                                ) : (
-                                                    othersListForPicker.map((s: any) => {
+                                        <VirtualSessionList
+                                            key={`${id || 'unknown'}:all`}
+                                            items={othersListForPicker}
+                                            hasMore={allSessionsHasMore}
+                                            initialLoading={allSessionsLoading}
+                                            loadingMore={allSessionsLoadingMore}
+                                            estimateSize={48}
+                                            loadingState={(
+                                                <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                                    {[...Array(3)].map((_, i) => (
+                                                        <div key={i} style={{ padding: '6px 0', animation: 'pulse 1.5s ease-in-out infinite', animationDelay: `${i * 0.1}s` }}>
+                                                            <div style={{ height: '12px', width: `${70 + (i % 3) * 10}%`, background: 'var(--bg-tertiary)', borderRadius: '4px', marginBottom: '6px' }} />
+                                                            <div style={{ height: '10px', width: `${40 + (i % 4) * 8}%`, background: 'var(--bg-tertiary)', borderRadius: '3px', opacity: 0.6 }} />
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            emptyState={<div style={{ padding: '16px 12px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>{t('agent.chat.noSessionsYet')}</div>}
+                                            loadMoreLabel={t('common.loading')}
+                                            onLoadMore={() => fetchAllSessions(true, true, id)}
+                                            renderItem={(s: any) => {
                                                         const isActive = activeSession?.id === s.id && chatScope === 'all';
                                                         const channelLabel: Record<string, string> = {
                                                             feishu: t('common.channels.feishu'),
@@ -6389,10 +6508,8 @@ export default function AgentDetailPage() {
                                                                 </div>
                                                             </div>
                                                         );
-                                                    })
-                                                )}
-                                            </div>
-                                        </>
+                                            }}
+                                        />
                                     )}
                                 </div>
                             </div>

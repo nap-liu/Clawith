@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import {
@@ -20,7 +20,10 @@ import OrgMemberAccessPicker, { type AgentAccessUser } from '../components/OrgMe
 import ConfirmModal from '../components/ConfirmModal';
 import PublishedPageAttribution, { type PublishedPageActor } from '../components/PublishedPageAttribution';
 import PublishedPageFilters, { type PublishedPageAgentOption } from '../components/PublishedPageFilters';
+import SelectDropdown from '../components/SelectDropdown';
 import { useToast } from '../components/Toast/ToastProvider';
+import Button from '../components/ui/Button';
+import Checkbox from '../components/ui/Checkbox';
 import { fetchJson } from '../services/api';
 import { copyToClipboard } from '../utils/clipboard';
 import './PublishedPages.css';
@@ -62,8 +65,21 @@ type PublishedPage = {
 };
 type PublishedPageDetail = Omit<PublishedPage, 'visitors'> & { access_users: AccessUser[] };
 type Paged<T> = { items: T[]; total: number; page: number; page_size: number };
+type PaginationItem = number | 'gap-left' | 'gap-right';
 
-const PAGE_SIZE = 20;
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_BULK_PAGE_SELECTION = 100;
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
+const VISITOR_PAGE_SIZE = 20;
+const PAGE_SIZE_SELECT_OPTIONS = PAGE_SIZE_OPTIONS.map(option => ({
+    value: String(option),
+    label: `${option} / 页`,
+}));
+const ACCESS_MODE_OPTIONS = [
+    { value: 'public', label: '公开' },
+    { value: 'authenticated', label: '仅登录' },
+    { value: 'restricted', label: '指定人员' },
+] as const;
 const modeLabels: Record<AccessMode, string> = {
     public: '公开', authenticated: '仅登录', restricted: '指定人员',
 };
@@ -80,6 +96,28 @@ function absolutePageUrl(url: string) {
     }
 }
 
+function readPageSize(value: string | null) {
+    const parsed = Number(value);
+    return PAGE_SIZE_OPTIONS.includes(parsed as typeof PAGE_SIZE_OPTIONS[number]) ? parsed : DEFAULT_PAGE_SIZE;
+}
+
+function readPageNumber(value: string | null) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(1, Math.trunc(parsed)) : 1;
+}
+
+function buildPaginationItems(currentPage: number, totalPages: number): PaginationItem[] {
+    if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
+    const items: PaginationItem[] = [1];
+    const start = Math.max(2, currentPage - 1);
+    const end = Math.min(totalPages - 1, currentPage + 1);
+    if (start > 2) items.push('gap-left');
+    for (let page = start; page <= end; page += 1) items.push(page);
+    if (end < totalPages - 1) items.push('gap-right');
+    items.push(totalPages);
+    return items;
+}
+
 export default function PublishedPages() {
     const queryClient = useQueryClient();
     const toast = useToast();
@@ -92,7 +130,8 @@ export default function PublishedPages() {
     ])).sort();
     const selectedAgentIdsKey = selectedAgentIds.join(',');
     const searchQuery = searchParams.get('q') || '';
-    const pageNo = Math.max(1, Number(searchParams.get('page_no')) || 1);
+    const pageNo = readPageNumber(searchParams.get('page_no'));
+    const pageSize = readPageSize(searchParams.get('page_size'));
     const [activeTab, setActiveTab] = useState<'permissions' | 'visitors'>('permissions');
     const [visitorPage, setVisitorPage] = useState(1);
     const [mode, setMode] = useState<AccessMode>('public');
@@ -102,8 +141,16 @@ export default function PublishedPages() {
     const [deleting, setDeleting] = useState(false);
     const [saving, setSaving] = useState(false);
     const [searchDraft, setSearchDraft] = useState(searchQuery);
+    const [jumpPage, setJumpPage] = useState(String(pageNo));
+    const [selectedPages, setSelectedPages] = useState<Record<string, PublishedPage>>({});
+    const selectedPagesRef = useRef<Record<string, PublishedPage>>({});
+    const [bulkMode, setBulkMode] = useState<AccessMode>('authenticated');
+    const [bulkPeople, setBulkPeople] = useState<AgentAccessUser[]>([]);
+    const [showBulkMemberPicker, setShowBulkMemberPicker] = useState(false);
+    const [showBulkConfirm, setShowBulkConfirm] = useState(false);
+    const [bulkSaving, setBulkSaving] = useState(false);
 
-    const listParams = new URLSearchParams({ page: String(pageNo), page_size: String(PAGE_SIZE) });
+    const listParams = new URLSearchParams({ page: String(pageNo), page_size: String(pageSize) });
     selectedAgentIds.forEach(id => listParams.append('agent_ids', id));
     if (searchQuery) listParams.set('q', searchQuery);
     const { data: agentOptions = [] } = useQuery({
@@ -111,7 +158,7 @@ export default function PublishedPages() {
         queryFn: () => fetchJson<PublishedPageAgentOption[]>('/pages/agent-options'),
     });
     const { data: pageData, isLoading } = useQuery({
-        queryKey: ['published-pages', 'list', pageNo, selectedAgentIdsKey, searchQuery],
+        queryKey: ['published-pages', 'list', pageNo, pageSize, selectedAgentIdsKey, searchQuery],
         queryFn: () => fetchJson<Paged<PublishedPage>>(`/pages/mine?${listParams}`),
     });
     const pages = pageData?.items || [];
@@ -122,13 +169,24 @@ export default function PublishedPages() {
     });
     const { data: visitorData, isLoading: visitorsLoading } = useQuery({
         queryKey: ['published-pages', 'visitors', selectedPageId, visitorPage],
-        queryFn: () => fetchJson<Paged<Visitor>>(`/pages/${selectedPageId}/visitors?page=${visitorPage}&page_size=${PAGE_SIZE}`),
+        queryFn: () => fetchJson<Paged<Visitor>>(`/pages/${selectedPageId}/visitors?page=${visitorPage}&page_size=${VISITOR_PAGE_SIZE}`),
         enabled: Boolean(selectedPageId) && activeTab === 'visitors',
     });
 
     useEffect(() => {
         setSearchDraft(searchQuery);
     }, [searchQuery]);
+
+    useEffect(() => {
+        setJumpPage(String(pageNo));
+    }, [pageNo]);
+
+    useEffect(() => {
+        selectedPagesRef.current = {};
+        setSelectedPages({});
+        setBulkPeople([]);
+        setShowBulkConfirm(false);
+    }, [selectedAgentIdsKey, searchQuery]);
 
     useEffect(() => {
         if (!selected) return;
@@ -155,11 +213,13 @@ export default function PublishedPages() {
 
     const updateSearch = (updates: Record<string, string | null>) => {
         const next = new URLSearchParams(searchParams);
+        next.delete('token');
         Object.entries(updates).forEach(([key, value]) => value === null ? next.delete(key) : next.set(key, value));
         setSearchParams(next);
     };
     const updateAgentFilter = (ids: string[]) => {
         const next = new URLSearchParams(searchParams);
+        next.delete('token');
         next.delete('agent_id');
         next.delete('agent_ids');
         ids.slice().sort().forEach(id => next.append('agent_ids', id));
@@ -177,6 +237,95 @@ export default function PublishedPages() {
     const searchPages = () => {
         const normalized = searchDraft.trim();
         updateSearch({ q: normalized || null, page_no: null, page: null });
+    };
+
+    const totalPages = Math.max(1, Math.ceil((pageData?.total || 0) / pageSize));
+    const goToPage = (nextPage: number) => {
+        const clamped = Math.min(totalPages, Math.max(1, Math.trunc(nextPage)));
+        updateSearch({ page_no: String(clamped), page: null });
+    };
+    const commitJumpPage = () => {
+        const parsed = Number(jumpPage);
+        if (Number.isFinite(parsed)) goToPage(parsed);
+        else setJumpPage(String(pageNo));
+    };
+
+    useEffect(() => {
+        if (pageData && pageNo > totalPages) goToPage(totalPages);
+    }, [pageData, pageNo, totalPages]);
+
+    const selectedPageList = Object.values(selectedPages);
+    const selectedPageIds = Object.keys(selectedPages);
+    const allCurrentPageSelected = pages.length > 0 && pages.every(page => Boolean(selectedPages[page.id]));
+    const togglePageSelection = (page: PublishedPage) => {
+        const current = selectedPagesRef.current;
+        if (!current[page.id] && Object.keys(current).length >= MAX_BULK_PAGE_SELECTION) {
+            toast.error(`单次最多选择 ${MAX_BULK_PAGE_SELECTION} 个页面`);
+            return;
+        }
+        const next = { ...current };
+        if (next[page.id]) delete next[page.id];
+        else next[page.id] = page;
+        selectedPagesRef.current = next;
+        setSelectedPages(next);
+    };
+    const toggleCurrentPage = () => {
+        const current = selectedPagesRef.current;
+        const currentPageSelected = pages.length > 0 && pages.every(page => Boolean(current[page.id]));
+        const unselectedOnPage = pages.filter(page => !current[page.id]);
+        if (!currentPageSelected && Object.keys(current).length + unselectedOnPage.length > MAX_BULK_PAGE_SELECTION) {
+            toast.error(`单次最多选择 ${MAX_BULK_PAGE_SELECTION} 个页面，已按上限选择`);
+        }
+        const next = { ...current };
+        if (currentPageSelected) pages.forEach(page => { delete next[page.id]; });
+        else {
+            let remaining = MAX_BULK_PAGE_SELECTION - Object.keys(next).length;
+            pages.forEach(page => {
+                if (!next[page.id] && remaining > 0) {
+                    next[page.id] = page;
+                    remaining -= 1;
+                }
+            });
+        }
+        selectedPagesRef.current = next;
+        setSelectedPages(next);
+    };
+    const clearBulkSelection = () => {
+        selectedPagesRef.current = {};
+        setSelectedPages({});
+        setBulkPeople([]);
+        setShowBulkMemberPicker(false);
+        setShowBulkConfirm(false);
+    };
+
+    useEffect(() => {
+        if (selectedPageIds.length === 0) {
+            setBulkPeople([]);
+            setShowBulkMemberPicker(false);
+            setShowBulkConfirm(false);
+        }
+    }, [selectedPageIds.length]);
+    const applyBulkAccess = async () => {
+        if (selectedPageIds.length === 0 || bulkSaving) return;
+        setBulkSaving(true);
+        try {
+            await fetchJson('/pages/batch/access', {
+                method: 'PUT',
+                body: JSON.stringify({
+                    page_ids: selectedPageIds,
+                    access_mode: bulkMode,
+                    allowed_user_ids: bulkMode === 'restricted' ? bulkPeople.map(user => user.id) : [],
+                }),
+            });
+            setShowBulkConfirm(false);
+            clearBulkSelection();
+            await refresh();
+            toast.success(`已更新 ${selectedPageIds.length} 个页面的访问权限`);
+        } catch (error: any) {
+            toast.error('批量权限修改失败', { details: error?.message || String(error) });
+        } finally {
+            setBulkSaving(false);
+        }
     };
 
     const save = async () => {
@@ -228,8 +377,8 @@ export default function PublishedPages() {
         }
     };
 
-    const totalPages = Math.max(1, Math.ceil((pageData?.total || 0) / PAGE_SIZE));
-    const visitorPages = Math.max(1, Math.ceil((visitorData?.total || 0) / PAGE_SIZE));
+    const visitorPages = Math.max(1, Math.ceil((visitorData?.total || 0) / VISITOR_PAGE_SIZE));
+    const paginationItems = buildPaginationItems(pageNo, totalPages);
     const pendingUsers = selected?.access_users.filter(user => user.status === 'pending') || [];
     const hasAppliedFilters = Boolean(searchQuery || selectedAgentIds.length);
     const hasResettableFilters = Boolean(searchDraft.trim() || selectedAgentIds.length);
@@ -261,6 +410,34 @@ export default function PublishedPages() {
                 </div>
             ) : (
                 <>
+                    <div className="published-pages-bulk" role="toolbar" aria-label="批量修改页面权限">
+                        <label className="published-pages-bulk__select-all">
+                            <Checkbox
+                                checked={allCurrentPageSelected}
+                                onChange={toggleCurrentPage}
+                                aria-label={allCurrentPageSelected ? '取消选择本页' : '选择本页'}
+                            />
+                            <span>{selectedPageIds.length > 0 ? `已选 ${selectedPageIds.length} 个页面` : '选择本页'}</span>
+                        </label>
+                        {selectedPageIds.length > 0 && (
+                            <>
+                                <SelectDropdown
+                                    value={bulkMode}
+                                    options={ACCESS_MODE_OPTIONS}
+                                    onChange={setBulkMode}
+                                    ariaLabel="批量访问权限"
+                                    className="published-pages-bulk__mode"
+                                />
+                                {bulkMode === 'restricted' && (
+                                    <Button type="button" variant="secondary" onClick={() => setShowBulkMemberPicker(true)}>
+                                        {bulkPeople.length > 0 ? `已选 ${bulkPeople.length} 人` : '选择可访问人员'}
+                                    </Button>
+                                )}
+                                <Button type="button" variant="primary" onClick={() => setShowBulkConfirm(true)}>批量修改</Button>
+                                <Button type="button" variant="ghost" onClick={clearBulkSelection}>取消选择</Button>
+                            </>
+                        )}
+                    </div>
                     <div style={{ border: '1px solid var(--border-subtle)', borderRadius: 10, overflow: 'hidden' }}>
                         {pages.map((publishedPage, index) => (
                             <div
@@ -276,15 +453,24 @@ export default function PublishedPages() {
                                     display: 'grid', alignItems: 'center', gap: 14,
                                 }}
                             >
-                                <div style={{ minWidth: 0 }}>
-                                    <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{publishedPage.title || publishedPage.source_path}</div>
-                                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{publishedPage.agent_name} · {publishedPage.source_path}</div>
-                                    <PublishedPageAttribution
-                                        createdBy={publishedPage.created_by}
-                                        createdAt={publishedPage.created_at}
-                                        lastPublishedBy={publishedPage.last_published_by}
-                                        lastPublishedAt={publishedPage.last_published_at}
-                                    />
+                                <div className="published-pages-row__identity">
+                                    <span onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}>
+                                        <Checkbox
+                                            checked={Boolean(selectedPages[publishedPage.id])}
+                                            onChange={() => togglePageSelection(publishedPage)}
+                                            aria-label={`选择页面 ${publishedPage.title || publishedPage.source_path}`}
+                                        />
+                                    </span>
+                                    <div style={{ minWidth: 0 }}>
+                                        <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{publishedPage.title || publishedPage.source_path}</div>
+                                        <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{publishedPage.agent_name} · {publishedPage.source_path}</div>
+                                        <PublishedPageAttribution
+                                            createdBy={publishedPage.created_by}
+                                            createdAt={publishedPage.created_at}
+                                            lastPublishedBy={publishedPage.last_published_by}
+                                            lastPublishedAt={publishedPage.last_published_at}
+                                        />
+                                    </div>
                                 </div>
                                 <div className="published-pages-row__url" style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
                                     <a
@@ -314,13 +500,68 @@ export default function PublishedPages() {
                             </div>
                         ))}
                     </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14, color: 'var(--text-secondary)', fontSize: 12 }}>
-                        <span>共 {pageData?.total || 0} 条</span>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                            <button className="btn btn-secondary btn-sm" disabled={pageNo <= 1} onClick={() => updateSearch({ page_no: String(pageNo - 1), page: null })}><IconChevronLeft size={14} /> 上一页</button>
-                            <span>{pageNo} / {totalPages}</span>
-                            <button className="btn btn-secondary btn-sm" disabled={pageNo >= totalPages} onClick={() => updateSearch({ page_no: String(pageNo + 1), page: null })}>下一页 <IconChevronRight size={14} /></button>
+                    <div className="published-pages-pagination">
+                        <span className="published-pages-pagination__total">共 {pageData?.total || 0} 条</span>
+                        <nav className="published-pages-pagination__pages" aria-label="发布页分页">
+                            <button
+                                type="button"
+                                className="published-pages-pagination__button"
+                                aria-label="上一页"
+                                disabled={pageNo <= 1}
+                                onClick={() => goToPage(pageNo - 1)}
+                            ><IconChevronLeft size={16} /></button>
+                            {paginationItems.map(item => typeof item === 'number' ? (
+                                <button
+                                    key={item}
+                                    type="button"
+                                    className={`published-pages-pagination__button${item === pageNo ? ' is-active' : ''}`}
+                                    aria-current={item === pageNo ? 'page' : undefined}
+                                    onClick={() => goToPage(item)}
+                                >{item}</button>
+                            ) : (
+                                <span key={item} className="published-pages-pagination__gap" aria-hidden="true">…</span>
+                            ))}
+                            <button
+                                type="button"
+                                className="published-pages-pagination__button"
+                                aria-label="下一页"
+                                disabled={pageNo >= totalPages}
+                                onClick={() => goToPage(pageNo + 1)}
+                            ><IconChevronRight size={16} /></button>
+                        </nav>
+                        <div className="published-pages-pagination__size">
+                            <SelectDropdown
+                                ariaLabel="每页数量"
+                                value={String(pageSize)}
+                                options={PAGE_SIZE_SELECT_OPTIONS}
+                                onChange={value => updateSearch({
+                                    page_size: value,
+                                    page_no: '1',
+                                    page: null,
+                                })}
+                                className="published-pages-pagination__page-size"
+                            />
                         </div>
+                        <label className="published-pages-pagination__jump">
+                            <span>跳至</span>
+                            <input
+                                type="number"
+                                min={1}
+                                max={totalPages}
+                                value={jumpPage}
+                                aria-label="跳转页码"
+                                onChange={event => setJumpPage(event.target.value)}
+                                onBlur={commitJumpPage}
+                                onKeyDown={event => {
+                                    if (event.key === 'Enter') {
+                                        event.preventDefault();
+                                        commitJumpPage();
+                                        event.currentTarget.blur();
+                                    }
+                                }}
+                            />
+                            <span>页</span>
+                        </label>
                     </div>
                 </>
             )}
@@ -408,7 +649,7 @@ export default function PublishedPages() {
                                 <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{visitor.view_count} 次</span>
                             </div>
                         ))}
-                        {(visitorData?.total || 0) > PAGE_SIZE && <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 14, fontSize: 12 }}>
+                        {(visitorData?.total || 0) > VISITOR_PAGE_SIZE && <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 14, fontSize: 12 }}>
                             <button className="btn btn-secondary btn-sm" disabled={visitorPage <= 1} onClick={() => setVisitorPage(page => page - 1)}>上一页</button>
                             <span>{visitorPage} / {visitorPages}</span>
                             <button className="btn btn-secondary btn-sm" disabled={visitorPage >= visitorPages} onClick={() => setVisitorPage(page => page + 1)}>下一页</button>
@@ -427,6 +668,27 @@ export default function PublishedPages() {
                     />
                 </aside>
             </div>}
+            <ConfirmModal
+                open={showBulkConfirm && selectedPageIds.length > 0}
+                title="批量修改访问权限"
+                message={`将 ${selectedPageIds.length} 个页面统一设为“${modeLabels[bulkMode]}”${bulkMode === 'restricted' ? `，允许 ${bulkPeople.length} 名已选人员访问` : ''}。确认继续吗？`}
+                confirmLabel={bulkSaving ? '修改中…' : '确认修改'}
+                cancelLabel="取消"
+                onConfirm={() => void applyBulkAccess()}
+                onCancel={() => { if (!bulkSaving) setShowBulkConfirm(false); }}
+            />
+            {showBulkMemberPicker && selectedPageList[0] && (
+                <OrgMemberAccessPicker
+                    open
+                    agentId={selectedPageList[0].agent_id}
+                    directoryBaseUrl={`/pages/${selectedPageList[0].id}/directory`}
+                    membersOnly
+                    users={bulkPeople}
+                    departments={[]}
+                    onClose={() => setShowBulkMemberPicker(false)}
+                    onSave={async users => setBulkPeople(users)}
+                />
+            )}
             <ConfirmModal
                 open={showDeleteConfirm && Boolean(selected)}
                 title="删除发布地址"

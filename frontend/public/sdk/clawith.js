@@ -40,6 +40,14 @@
 
   function startOAuth() {
     var returnTo = location.href.split("#")[0].split("?")[0]; // 干净 URL（不含 query/fragment，兼容 opaque origin）
+    // Published pages run in a sandboxed iframe so their content cannot
+    // replace the platform watermark. Ask the trusted parent viewer to start
+    // OAuth at top level; it builds the return URL itself and forwards the
+    // eventual code/state back into the report iframe.
+    if (window.parent !== window && shortIdFromUrl()) {
+      window.parent.postMessage({ type: "published-page:sdk-auth-start" }, "*");
+      return new Promise(function () { /* 顶层页面即将跳转，永不 resolve */ });
+    }
     location.assign(API_BASE + "/api/sdk/auth/start?return_to=" + encodeURIComponent(returnTo));
     return new Promise(function () { /* 页面即将卸载，永不 resolve */ });
   }

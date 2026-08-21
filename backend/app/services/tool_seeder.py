@@ -3580,7 +3580,7 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "update_published_page_access", "display_name": "Update Page Access",
-        "description": "Change an existing page published by this Agent. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
+        "description": "Change an existing published page. Company and platform administrators may change any page in their current company; other users may only change a page published by this Agent that they manage. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
         "category": "pages", "icon": "🔐", "is_default": True,
         "parameters_schema": {"type": "object", "properties": {
             "short_id": {"type": "string"},

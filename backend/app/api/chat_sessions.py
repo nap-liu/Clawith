@@ -1,5 +1,8 @@
 """Chat session management API endpoints."""
 
+import base64
+import binascii
+import json
 import re
 import uuid
 from datetime import datetime
@@ -79,6 +82,58 @@ class SessionRuntimeOut(BaseModel):
 class SessionDetailOut(SessionOut):
     view_scope: Literal["mine", "all"]
     runtime: Optional[SessionRuntimeOut] = None
+
+
+class SessionPageOut(BaseModel):
+    items: list[SessionOut]
+    has_more: bool
+    next_offset: Optional[int] = None
+    next_cursor: Optional[str] = None
+
+
+def _encode_session_cursor(
+    session: ChatSession | None,
+    *,
+    scope: Literal["mine", "all"],
+    primary_id: uuid.UUID | None = None,
+) -> str:
+    payload = {
+        "v": 1,
+        "scope": scope,
+        "created_at": session.created_at.isoformat() if session is not None else None,
+        "id": str(session.id) if session is not None else None,
+        "primary_id": str(primary_id) if primary_id else None,
+    }
+    return base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _decode_session_cursor(
+    cursor: str,
+    *,
+    scope: Literal["mine", "all"],
+) -> tuple[datetime | None, uuid.UUID | None, uuid.UUID | None]:
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(f"{cursor}{padding}").decode("utf-8"))
+        if payload.get("v") != 1 or payload.get("scope") != scope:
+            raise ValueError("cursor scope mismatch")
+        created_at = datetime.fromisoformat(payload["created_at"]) if payload.get("created_at") else None
+        session_id = uuid.UUID(payload["id"]) if payload.get("id") else None
+        primary_id = uuid.UUID(payload["primary_id"]) if payload.get("primary_id") else None
+        if (created_at is None) != (session_id is None):
+            raise ValueError("incomplete cursor")
+        return created_at, session_id, primary_id
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="Invalid session cursor") from exc
+
+
+def _session_cursor_filter(created_at: datetime, session_id: uuid.UUID):
+    return or_(
+        ChatSession.created_at < created_at,
+        and_(ChatSession.created_at == created_at, ChatSession.id < session_id),
+    )
 
 
 class CreateSessionIn(BaseModel):
@@ -255,6 +310,9 @@ async def list_sessions(
     source_channel: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    cursor: Optional[str] = None,
+    paginated: bool = False,
+    exclude_mine: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -269,6 +327,23 @@ async def list_sessions(
     source_channel = (source_channel or "").strip() or None
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
+    use_cursor_pagination = paginated and (cursor is not None or offset == 0)
+    group_membership = (
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.conversation_id == cast(ChatSession.id, String),
+            ChatMessage.role == "user",
+            or_(
+                ChatMessage.sender_user_id == current_user.id,
+                and_(
+                    ChatMessage.sender_user_id.is_(None),
+                    ChatMessage.user_id == current_user.id,
+                ),
+            ),
+        )
+        .correlate(ChatSession)
+        .exists()
+    )
 
     if scope == "all":
         if not _can_view_all_agent_chat_sessions(current_user, agent):
@@ -282,16 +357,50 @@ async def list_sessions(
             )
             & (ChatSession.source_channel != "subagent")
         )
-        query = select(ChatSession).where(all_where)
+        has_messages = (
+            select(ChatMessage.id)
+            .where(ChatMessage.conversation_id == cast(ChatSession.id, String))
+            .correlate(ChatSession)
+            .exists()
+        )
+        query = select(ChatSession).where(
+            all_where,
+            or_(ChatSession.is_primary.is_(True), has_messages),
+        )
+        if exclude_mine:
+            query = query.where(
+                ChatSession.source_channel != "trigger",
+                or_(
+                    ChatSession.source_channel == "agent",
+                    and_(ChatSession.is_group.is_(True), ~group_membership),
+                    and_(
+                        ChatSession.is_group.is_(False),
+                        ChatSession.user_id.is_not(None),
+                        ChatSession.user_id != current_user.id,
+                    ),
+                ),
+            )
         if source_channel:
             query = query.where(ChatSession.source_channel == source_channel)
-        result = await db.execute(
-            query
-            .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
-        sessions = result.scalars().all()
+        cursor_created_at = None
+        cursor_session_id = None
+        if use_cursor_pagination and cursor:
+            cursor_created_at, cursor_session_id, _primary_id = _decode_session_cursor(cursor, scope="all")
+            if cursor_created_at is not None and cursor_session_id is not None:
+                query = query.where(_session_cursor_filter(cursor_created_at, cursor_session_id))
+        if use_cursor_pagination:
+            query = query.order_by(ChatSession.created_at.desc(), ChatSession.id.desc())
+        else:
+            query = query.order_by(
+                ChatSession.last_message_at.desc().nulls_last(),
+                ChatSession.created_at.desc().nulls_last(),
+                ChatSession.id.desc(),
+            ).offset(offset)
+        result = await db.execute(query.limit(limit + 1))
+        raw_sessions = list(result.scalars().all())
+        has_more = len(raw_sessions) > limit
+        sessions = raw_sessions[:limit]
+        cursor_anchor = sessions[-1] if sessions else None
         if hasattr(agent, "tenant_id"):
             sessions = await filter_tenant_safe_chat_sessions(
                 db, list(sessions), agent.tenant_id
@@ -398,25 +507,30 @@ async def list_sessions(
                 is_group=session.is_group,
                 group_name=session.group_name,
             ))
+        if paginated:
+            next_cursor = (
+                _encode_session_cursor(cursor_anchor, scope="all")
+                if use_cursor_pagination and has_more and cursor_anchor is not None
+                else None
+            )
+            return SessionPageOut(
+                items=out,
+                has_more=has_more,
+                next_offset=None if use_cursor_pagination else (offset + limit if has_more else None),
+                next_cursor=next_cursor,
+            )
         return out
 
     else:  # scope == "mine"
         # Group membership signal: at least one user-role message authored by
         # the current user in this session. Mirrors P2P/group-chat client UX —
-        # if you have spoken in the group, the conversation surfaces in your
-        # own session list (you don't need admin scope=all to see it).
-        group_membership = (
+        # if you have spoken in the group, the conversation surfaces only in
+        # the viewer's own list and is excluded from "other sessions".
+        has_agent_messages = (
             select(ChatMessage.id)
             .where(
                 ChatMessage.conversation_id == cast(ChatSession.id, String),
-                ChatMessage.role == "user",
-                or_(
-                    ChatMessage.sender_user_id == current_user.id,
-                    and_(
-                        ChatMessage.sender_user_id.is_(None),
-                        ChatMessage.user_id == current_user.id,
-                    ),
-                ),
+                ChatMessage.agent_id == agent_id,
             )
             .correlate(ChatSession)
             .exists()
@@ -426,6 +540,7 @@ async def list_sessions(
             .where(
                 ChatSession.agent_id == agent_id,
                 ChatSession.source_channel.notin_(["agent", "trigger", "subagent"]),
+                or_(ChatSession.is_primary.is_(True), has_agent_messages),
                 or_(
                     and_(
                         ChatSession.is_group == False,
@@ -440,18 +555,54 @@ async def list_sessions(
         )
         if source_channel:
             query = query.where(ChatSession.source_channel == source_channel)
-        result = await db.execute(
-            query
-            .order_by(
-                ChatSession.is_primary.desc(),
-                ChatSession.last_message_at.desc().nulls_last(),
-                ChatSession.created_at.desc().nulls_last(),
-                ChatSession.id.desc(),
+        primary_id = None
+        cursor_anchor = None
+        if use_cursor_pagination:
+            cursor_created_at = None
+            cursor_session_id = None
+            if cursor:
+                cursor_created_at, cursor_session_id, primary_id = _decode_session_cursor(cursor, scope="mine")
+            primary_session = None
+            ordinary_query = query
+            if cursor is None:
+                primary_session = await db.scalar(
+                    query.where(ChatSession.is_primary.is_(True))
+                    .order_by(ChatSession.created_at.desc(), ChatSession.id.desc())
+                    .limit(1)
+                )
+                primary_id = primary_session.id if primary_session else None
+                ordinary_query = ordinary_query.where(ChatSession.is_primary.is_(False))
+            elif primary_id is not None:
+                ordinary_query = ordinary_query.where(ChatSession.id != primary_id)
+            if cursor_created_at is not None and cursor_session_id is not None:
+                ordinary_query = ordinary_query.where(
+                    _session_cursor_filter(cursor_created_at, cursor_session_id)
+                )
+            ordinary_capacity = limit - (1 if primary_session is not None else 0)
+            ordinary_rows = list((await db.scalars(
+                ordinary_query
+                .order_by(ChatSession.created_at.desc(), ChatSession.id.desc())
+                .limit(ordinary_capacity + 1)
+            )).all())
+            has_more = len(ordinary_rows) > ordinary_capacity
+            ordinary_sessions = ordinary_rows[:ordinary_capacity]
+            sessions = ([primary_session] if primary_session is not None else []) + ordinary_sessions
+            cursor_anchor = ordinary_sessions[-1] if ordinary_sessions else None
+        else:
+            result = await db.execute(
+                query
+                .order_by(
+                    ChatSession.is_primary.desc(),
+                    ChatSession.last_message_at.desc().nulls_last(),
+                    ChatSession.created_at.desc().nulls_last(),
+                    ChatSession.id.desc(),
+                )
+                .offset(offset)
+                .limit(limit + 1)
             )
-            .offset(offset)
-            .limit(limit)
-        )
-        sessions = result.scalars().all()
+            raw_sessions = list(result.scalars().all())
+            has_more = len(raw_sessions) > limit
+            sessions = raw_sessions[:limit]
         if hasattr(agent, "tenant_id"):
             sessions = await filter_tenant_safe_chat_sessions(
                 db, list(sessions), agent.tenant_id
@@ -517,6 +668,18 @@ async def list_sessions(
                 is_group=bool(session.is_group),
                 group_name=session.group_name,
             ))
+        if paginated:
+            next_cursor = (
+                _encode_session_cursor(cursor_anchor, scope="mine", primary_id=primary_id)
+                if use_cursor_pagination and has_more
+                else None
+            )
+            return SessionPageOut(
+                items=out,
+                has_more=has_more,
+                next_offset=None if use_cursor_pagination else (offset + limit if has_more else None),
+                next_cursor=next_cursor,
+            )
         return out
 
 
