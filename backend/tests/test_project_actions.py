@@ -3170,6 +3170,30 @@ async def test_file_commits_restore_branch_and_milestone_preserve_history(projec
     write_commit = write_response.json()["commit"]
     assert write_commit != initial_head
 
+    diff_response = await env.client.get(
+        f"/api/projects/{project_id}/git/diff",
+        params={"commit": write_commit, "path": "deliverables/report.md"},
+    )
+    assert diff_response.status_code == 200, diff_response.text
+    diff_payload = diff_response.json()
+    assert diff_payload["parent_commit"] == initial_head
+    assert diff_payload["files"][0]["path"] == "deliverables/report.md"
+    assert diff_payload["files"][0]["original_content"] == ""
+    assert diff_payload["files"][0]["modified_content"].startswith("# Evidence")
+
+    unsafe_diff = await env.client.get(
+        f"/api/projects/{project_id}/git/diff",
+        params={"commit": write_commit, "path": "../outside.md"},
+    )
+    assert unsafe_diff.status_code == 422
+    env.authenticate_as(env.viewer_id)
+    hidden_diff = await env.client.get(
+        f"/api/projects/{project_id}/git/diff",
+        params={"commit": write_commit},
+    )
+    assert hidden_diff.status_code == 404
+    env.authenticate_as(env.owner_id)
+
     for unsafe_path in ("../outside.md", ".git/config", ".GIT/config", "deliverables//hidden.md"):
         rejected = await env.client.put(
             f"/api/projects/{project_id}/files",

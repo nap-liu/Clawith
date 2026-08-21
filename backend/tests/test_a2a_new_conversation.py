@@ -10,6 +10,7 @@ Validates three behaviours:
 """
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -45,6 +46,9 @@ class DummyResult:
 
     def scalars(self):
         return self
+
+    def __iter__(self):
+        return iter(self._scalars_list or self._values)
 
     def all(self):
         return list(self._scalars_list or self._values)
@@ -87,20 +91,21 @@ class RecordingDB:
         self.flushed = True
 
 
-def _project_notify_db(*, source_agent, target_agent, existing_session=None):
+def _project_notify_db(
+    *, source_agent, target_agent, project_id, existing_session=None
+):
     """Recording DB for one native notify through an active relationship."""
+    project = SimpleNamespace(id=project_id, tenant_id=source_agent.tenant_id)
     responses = [
         DummyResult(scalar_value=source_agent),
         DummyResult(scalars_list=[target_agent]),
-        DummyResult(scalar_value=uuid.uuid4()),
+        DummyResult(scalar_value=project),
+        DummyResult(scalars_list=[source_agent.id, target_agent.id]),
         DummyResult(scalar_value=_make_participant(ref_id=source_agent.id)),
         DummyResult(scalar_value=_make_participant(ref_id=target_agent.id)),
         DummyResult(values=[existing_session] if existing_session else []),
     ]
-    if existing_session is None:
-        responses.append(DummyResult(scalar_value=_make_tenant()))
-    else:
-        responses.append(DummyResult(scalar_value=_make_tenant()))
+    responses.append(DummyResult(scalar_value=_make_tenant()))
     return RecordingDB(responses=responses)
 
 
@@ -142,8 +147,8 @@ def _make_tenant(a2a_async_enabled=True):
 async def test_new_conversation_creates_session_with_external_conv_id():
     """(a) new_conversation=True, no prior session → ChatSession with non-null
     external_conv_id in a2a-<hex> format."""
-    from app.services.agent_tools import _send_message_to_agent
     from app.models.chat_session import ChatSession
+    from app.services.agent_tools import _send_message_to_agent
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
@@ -205,8 +210,8 @@ async def test_new_conversation_creates_session_with_external_conv_id():
 async def test_new_conversation_force_creates_even_when_prior_session_exists():
     """(b) new_conversation=True skips the find query even when a prior session
     exists — a new ChatSession is created, distinguished by external_conv_id."""
-    from app.services.agent_tools import _send_message_to_agent
     from app.models.chat_session import ChatSession
+    from app.services.agent_tools import _send_message_to_agent
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
@@ -263,8 +268,8 @@ async def test_new_conversation_force_creates_even_when_prior_session_exists():
 async def test_default_reuses_existing_session_no_new_session_added():
     """(c) Without new_conversation, the most-recent existing session is reused
     and no new ChatSession is added to the DB."""
-    from app.services.agent_tools import _send_message_to_agent
     from app.models.chat_session import ChatSession
+    from app.services.agent_tools import _send_message_to_agent
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
@@ -323,9 +328,21 @@ async def test_project_scope_creates_distinct_threads_for_same_agent_pair():
     created = []
 
     for project_id in projects:
-        db = _project_notify_db(source_agent=source, target_agent=target)
+        db = _project_notify_db(
+            source_agent=source,
+            target_agent=target,
+            project_id=project_id,
+        )
         with patch("app.services.agent_tools.async_session") as session_ctx, patch(
             "app.services.agent_tools._wake_agent_async", new_callable=AsyncMock
+        ), patch(
+            "app.services.subagent_runtime.enqueue_project_a2a_run",
+            new_callable=AsyncMock,
+            return_value={
+                "project_run_id": str(uuid.uuid4()),
+                "subagent_run_id": str(uuid.uuid4()),
+                "subagent_session_id": str(uuid.uuid4()),
+            },
         ):
             session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
             session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -339,10 +356,10 @@ async def test_project_scope_creates_distinct_threads_for_same_agent_pair():
                     "_project_id": str(project_id),
                 },
             )
-        assert "Notification sent" in result
+        assert '"status": "queued"' in result
         session = next(row for row in db.added if isinstance(row, ChatSession))
         created.append(session)
-        session_lookup = str(db.statements[5])
+        session_lookup = str(db.statements[6])
         assert "chat_sessions.project_id =" in session_lookup
 
     assert [row.project_id for row in created] == projects
@@ -364,10 +381,19 @@ async def test_same_project_reuses_scoped_thread_and_new_conversation_stays_scop
     db = _project_notify_db(
         source_agent=source,
         target_agent=target,
+        project_id=project_id,
         existing_session=existing,
     )
     with patch("app.services.agent_tools.async_session") as session_ctx, patch(
         "app.services.agent_tools._wake_agent_async", new_callable=AsyncMock
+    ), patch(
+        "app.services.subagent_runtime.enqueue_project_a2a_run",
+        new_callable=AsyncMock,
+        return_value={
+            "project_run_id": str(uuid.uuid4()),
+            "subagent_run_id": str(uuid.uuid4()),
+            "subagent_session_id": str(uuid.uuid4()),
+        },
     ):
         session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -381,14 +407,20 @@ async def test_same_project_reuses_scoped_thread_and_new_conversation_stays_scop
                 "_project_id": str(project_id),
             },
         )
-    assert "Notification sent" in result
+    assert '"status": "queued"' in result
     assert not [row for row in db.added if isinstance(row, ChatSession)]
 
     fresh_db = RecordingDB(
         responses=[
             DummyResult(scalar_value=source),
             DummyResult(scalars_list=[target]),
-            DummyResult(scalar_value=uuid.uuid4()),
+            DummyResult(
+                scalar_value=SimpleNamespace(
+                    id=project_id,
+                    tenant_id=source.tenant_id,
+                )
+            ),
+            DummyResult(scalars_list=[source.id, target.id]),
             DummyResult(scalar_value=_make_participant(ref_id=source.id)),
             DummyResult(scalar_value=_make_participant(ref_id=target.id)),
             DummyResult(scalar_value=1),
@@ -397,6 +429,14 @@ async def test_same_project_reuses_scoped_thread_and_new_conversation_stays_scop
     )
     with patch("app.services.agent_tools.async_session") as session_ctx, patch(
         "app.services.agent_tools._wake_agent_async", new_callable=AsyncMock
+    ), patch(
+        "app.services.subagent_runtime.enqueue_project_a2a_run",
+        new_callable=AsyncMock,
+        return_value={
+            "project_run_id": str(uuid.uuid4()),
+            "subagent_run_id": str(uuid.uuid4()),
+            "subagent_session_id": str(uuid.uuid4()),
+        },
     ):
         session_ctx.return_value.__aenter__ = AsyncMock(return_value=fresh_db)
         session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)

@@ -10,6 +10,10 @@
     "projectAgent": "项目 Agent",
     "projectUser": "项目用户",
     "projectSystem": "项目系统",
+    "eventFallback": "项目事件",
+    "noDetails": "该事件没有附加说明。",
+    "expandDetails": "展开完整内容",
+    "riskEventHint": "失败记录已保留，可在项目事件审计中查看完整上下文。",
     "events": {
       "project": {
         "created": "创建项目",
@@ -43,15 +47,67 @@
         "failed": "运行执行失败",
         "cancelled": "运行已取消"
       },
-      "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "completed": "A2A 协作已完成", "delivery_failed": "A2A 消息送达失败" },
+      "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "completed": "A2A 协作已完成", "cancelled": "A2A 协作已取消", "delivery_failed": "A2A 消息送达失败" },
       "group": { "message": { "created": "创建项目群消息" } },
       "git": {
         "commit": { "created": "创建 Git 提交" },
-        "milestone": { "created": "创建交付里程碑" },
+        "milestone": { "prepared": "准备交付里程碑", "created": "创建交付里程碑" },
         "branch": { "created": "创建 Git 分支" },
         "restore_commit": { "created": "创建恢复提交" },
+        "restored": "恢复 Git 版本",
         "remote": { "configured": "配置 Git 远端", "deleted": "删除 Git 远端" },
         "repository": { "cloned": "从远程克隆项目仓库" }
+      }
+    },
+    "details": {
+      "project": {
+        "created": "项目已创建，并建立隔离工作区。",
+        "initialized": "项目隔离工作区与 Git 基线已初始化。",
+        "updated": "项目基本信息已更新。",
+        "archived": "项目已归档，历史记录继续保留。",
+        "shared": "项目可见范围已更新为指定成员共享。",
+        "unshared": "项目共享授权已撤销。",
+        "settings": { "updated": "项目运行与治理设置已更新。" },
+        "file": { "committed": "项目文件已写入 Git，并创建可追溯提交。" },
+        "plan": { "updated": "项目计划已更新。" },
+        "status": { "updated": "项目状态已更新。" },
+        "trace": { "repaired": "项目运行、会话与产物的追溯关联已修复。" },
+        "agent": { "message": { "sent": "项目 Agent 消息已发送。" } },
+        "kickoff": { "confirmed": "方案已确认，Leader 已开始自驱推进。", "failed": "项目启动失败，相关上下文已保留。" },
+        "agent_reply_batch": { "dispatched": "Agent 回复已合并为一轮并交给 Leader 处理。" }
+      },
+      "member": {
+        "snapshot": { "created": "项目成员快照已创建。", "updated": "项目成员快照已更新。" },
+        "departed": "成员已退出项目，历史记录保持只读可见。",
+        "restored": "成员已恢复参与项目，新的执行将使用新一代快照。"
+      },
+      "leader": { "changed": "项目 Leader 已变更。" },
+      "capability": { "bound": "项目共享能力已绑定。", "updated": "项目能力启用范围已更新。" },
+      "work_item": { "created": "工作项已创建。", "updated": "工作项内容、进度或证据已更新。" },
+      "run": {
+        "queued": "运行已进入队列，等待可用 Agent 处理。",
+        "running": "Agent 已开始处理本次运行。",
+        "waiting": "本次运行正在等待后续输入或确认。",
+        "succeeded": "本次运行已成功完成，结果与会话保持可追溯。",
+        "failed": "本次运行执行失败，错误与会话上下文已保留。",
+        "cancelled": "本次运行已取消，既有记录继续保留。"
+      },
+      "a2a": {
+        "queued": "一条点对点 A2A 请求已进入目标 Agent 队列。",
+        "delivered": "A2A 消息已送达目标 Agent 的项目运行时。",
+        "completed": "目标 Agent 已完成本轮 A2A 协作。",
+        "cancelled": "本轮 A2A 协作已取消。",
+        "delivery_failed": "A2A 消息未能送达，失败上下文已保留。"
+      },
+      "group": { "message": { "created": "项目群消息已写入共享时间线，并按 @ 提及精确唤醒成员。" } },
+      "git": {
+        "commit": { "created": "项目变更已创建 Git 提交。" },
+        "milestone": { "prepared": "交付里程碑正在创建。", "created": "交付里程碑与关联证据已固化。" },
+        "branch": { "created": "Git 分支已创建。" },
+        "restore_commit": { "created": "恢复操作已创建新的 Git 提交，原历史保持不变。" },
+        "restored": "指定 Git 版本已通过新提交恢复。",
+        "remote": { "configured": "Git 远端已配置。", "deleted": "Git 远端已删除。" },
+        "repository": { "cloned": "远程仓库已安全克隆并替换初始化基线。" }
       }
     }
   },

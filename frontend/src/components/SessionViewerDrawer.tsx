@@ -35,6 +35,10 @@ import { createClientId } from '../utils/clientId';
 
 export type SessionViewerTarget = {
     sessionId: string;
+    /** Durable ChatMessage id for the exact project Run/event turn. */
+    anchorMessageId?: string;
+    /** Lets the viewer resolve a child-session anchor from durable message metadata. */
+    projectRunId?: string;
     agentId?: string;
     title?: string;
     status?: string;
@@ -196,6 +200,7 @@ export default function SessionViewerDrawer({
     const [connected, setConnected] = useState(false);
     const [sending, setSending] = useState(false);
     const [groupTurn, setGroupTurn] = useState<GroupTurnState | null>(null);
+    const [resolvedAnchorMessageId, setResolvedAnchorMessageId] = useState('');
     const [serverReadOnly, setServerReadOnly] = useState(false);
     const [mentions, setMentions] = useState<string[]>([]);
     const [internalUnavailableAttachments, setInternalUnavailableAttachments] = useState<Set<string>>(() => new Set());
@@ -253,6 +258,31 @@ export default function SessionViewerDrawer({
                     } : null;
                 })
                 .filter((message): message is ConversationMessage => Boolean(message));
+            const runAnchor = target?.projectRunId ? (Array.isArray(rows) ? rows : []).find((row) => {
+                const metadata = groupMessageMetadata(row);
+                const linkedRunIds = [
+                    metadata.project_run_id,
+                    ...(Array.isArray(metadata.project_run_ids) ? metadata.project_run_ids : []),
+                    ...(Array.isArray(metadata.source_project_run_ids) ? metadata.source_project_run_ids : []),
+                ].map((value) => String(value || ''));
+                return linkedRunIds.includes(target.projectRunId || '');
+            }) : undefined;
+            const runAnchorRecord = runAnchor && typeof runAnchor === 'object' ? runAnchor as Record<string, any> : null;
+            const runAnchorMetadata = groupMessageMetadata(runAnchorRecord);
+            const candidateAnchor = String(
+                runAnchorMetadata.subagent_turn_anchor_id
+                || runAnchorMetadata.turn_anchor_id
+                || runAnchorRecord?.id
+                || '',
+            );
+            const requestedAnchor = String(target?.anchorMessageId || '');
+            setResolvedAnchorMessageId(
+                candidateAnchor && normalized.some((message) => message.id === candidateAnchor)
+                    ? candidateAnchor
+                    : requestedAnchor && normalized.some((message) => message.id === requestedAnchor)
+                        ? requestedAnchor
+                        : '',
+            );
             const nextGroupTurn = groupConfig ? deriveGroupTurnState(Array.isArray(rows) ? rows : []) : null;
             setSession(detail);
             setMessages(normalized);
@@ -269,7 +299,7 @@ export default function SessionViewerDrawer({
         } finally {
             if (sequence === requestSequenceRef.current && !background) setLoading(false);
         }
-    }, [accessAgentId, groupConfig, sessionId, t]);
+    }, [accessAgentId, groupConfig, sessionId, t, target?.anchorMessageId, target?.projectRunId]);
 
     useEffect(() => {
         if (!sessionId) return;
@@ -283,6 +313,7 @@ export default function SessionViewerDrawer({
         setConnected(false);
         setSending(false);
         setGroupTurn(null);
+        setResolvedAnchorMessageId('');
         groupSendInFlightRef.current = false;
         setServerReadOnly(false);
         setMentions([]);
@@ -290,7 +321,7 @@ export default function SessionViewerDrawer({
         return () => {
             requestSequenceRef.current += 1;
         };
-    }, [accessAgentId, sessionId]);
+    }, [accessAgentId, sessionId, target?.anchorMessageId, target?.projectRunId]);
 
     // Refreshing the group configuration (for example after a workspace data
     // poll) must not clear an in-progress draft or its structured mentions.
@@ -490,12 +521,12 @@ export default function SessionViewerDrawer({
     }, [embedded, onClose, target?.sessionId]);
 
     useEffect(() => {
-        if (!messages.length) return;
+        if (!messages.length || resolvedAnchorMessageId) return;
         window.requestAnimationFrame(() => {
             const element = scrollerRef.current;
             if (element) element.scrollTop = element.scrollHeight;
         });
-    }, [messages.length, sessionId]);
+    }, [messages.length, resolvedAnchorMessageId, sessionId]);
 
     if (!target || !sessionId) return null;
 
@@ -768,6 +799,7 @@ export default function SessionViewerDrawer({
                             agentName={executionAgentName}
                             messages={timelineMessages}
                             scrollerRef={scrollerRef}
+                            focusMessageId={resolvedAnchorMessageId || undefined}
                             isRunning={active}
                             runningLabel={groupProcessingLabel || undefined}
                             mode={routeMode}

@@ -83,6 +83,7 @@ from app.services.project_git_service import (
     iter_project_file_blob,
     list_git_remotes,
     list_project_files,
+    project_commit_diff,
     put_git_remote,
     read_project_file_content,
     reconcile_project_repository_operations,
@@ -3097,3 +3098,18 @@ async def get_git_state(
     project = await require_project(db, current_user, project_id)
     await reconcile_project_repository_operations(project.id, db=db)
     return await repository_state(project, limit)
+
+
+@router.get("/{project_id}/git/diff")
+async def get_git_diff(
+    project_id: uuid.UUID,
+    commit: str = Query(..., min_length=7, max_length=64),
+    parent: str | None = Query(None, min_length=7, max_length=64),
+    path: str | None = Query(None, min_length=1, max_length=4096),
+    max_patch_bytes: int = Query(256 * 1024, ge=1, le=1024 * 1024),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    return await project_commit_diff(project, commit, parent, path, max_patch_bytes)

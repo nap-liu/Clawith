@@ -475,6 +475,11 @@ class LLMModelUpdate(BaseModel):
     request_timeout: int | None = None
 
 
+class LLMModelClone(BaseModel):
+    model: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=200)
+
+
 class LLMModelOut(BaseModel):
     id: uuid.UUID
     provider: str

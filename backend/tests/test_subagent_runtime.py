@@ -134,6 +134,9 @@ async def _make_context(*, parent_channel: str = "web"):
 
 async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(monkeypatch):
     agent_id, _, _, _ = await _make_context()
+    # The suite must be self-contained on a fresh disposable database; do not
+    # depend on another test process having seeded the built-in tools first.
+    await seed_builtin_tools()
 
     async def normal_tools(_agent_id):
         assert _agent_id == agent_id

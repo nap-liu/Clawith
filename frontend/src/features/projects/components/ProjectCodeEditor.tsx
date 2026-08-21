@@ -1,4 +1,4 @@
-import Editor, { loader, type Monaco } from '@monaco-editor/react';
+import Editor, { DiffEditor, loader, type Monaco } from '@monaco-editor/react';
 import * as localMonaco from 'monaco-editor';
 import CssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker';
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
@@ -26,6 +26,13 @@ type Props = {
     value: string;
     readOnly?: boolean;
     onChange?: (value: string) => void;
+    ariaLabel?: string;
+};
+
+type DiffProps = {
+    path: string;
+    original: string;
+    modified: string;
     ariaLabel?: string;
 };
 
@@ -95,13 +102,7 @@ function defineClawithTheme(monaco: Monaco, theme: ResolvedTheme) {
     });
 }
 
-export default function ProjectCodeEditor({
-    path,
-    value,
-    readOnly = false,
-    onChange,
-    ariaLabel = '项目文件编辑器',
-}: Props) {
+function useProjectMonacoTheme() {
     const [theme, setTheme] = useState<ResolvedTheme>(currentTheme);
 
     useEffect(() => {
@@ -119,6 +120,18 @@ export default function ProjectCodeEditor({
         defineClawithTheme(localMonaco, theme);
         localMonaco.editor.setTheme(`clawith-${theme}`);
     }, [theme]);
+
+    return theme;
+}
+
+export default function ProjectCodeEditor({
+    path,
+    value,
+    readOnly = false,
+    onChange,
+    ariaLabel = '项目文件编辑器',
+}: Props) {
+    const theme = useProjectMonacoTheme();
 
     return (
         <div className="project-file-workspace__monaco" aria-label={ariaLabel}>
@@ -148,6 +161,55 @@ export default function ProjectCodeEditor({
                     scrollBeyondLastLine: false,
                     smoothScrolling: true,
                     stickyScroll: { enabled: true },
+                    wordWrap: 'on',
+                    wrappingIndent: 'indent',
+                    accessibilitySupport: 'auto',
+                }}
+            />
+        </div>
+    );
+}
+
+export function ProjectCodeDiffEditor({
+    path,
+    original,
+    modified,
+    ariaLabel = '项目代码变更对比',
+}: DiffProps) {
+    const theme = useProjectMonacoTheme();
+    const language = languageForPath(path);
+
+    return (
+        <div className="project-file-workspace__monaco project-git-diff__monaco" aria-label={ariaLabel}>
+            <DiffEditor
+                width="100%"
+                height="100%"
+                original={original}
+                modified={modified}
+                originalLanguage={language}
+                modifiedLanguage={language}
+                originalModelPath={`git-original://${path}`}
+                modifiedModelPath={`git-modified://${path}`}
+                theme={`clawith-${theme}`}
+                beforeMount={(monaco) => defineClawithTheme(monaco, theme)}
+                loading={<span className="project-file-workspace__editor-loading">正在载入代码差异…</span>}
+                options={{
+                    automaticLayout: true,
+                    readOnly: true,
+                    domReadOnly: true,
+                    renderSideBySide: true,
+                    enableSplitViewResizing: true,
+                    fontFamily: 'var(--font-mono)',
+                    fontLigatures: true,
+                    fontSize: 13,
+                    lineHeight: 21,
+                    lineNumbersMinChars: 3,
+                    minimap: { enabled: false },
+                    overviewRulerBorder: false,
+                    renderOverviewRuler: false,
+                    scrollBeyondLastLine: false,
+                    smoothScrolling: true,
+                    stickyScroll: { enabled: false },
                     wordWrap: 'on',
                     wrappingIndent: 'indent',
                     accessibilitySupport: 'auto',

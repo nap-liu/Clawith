@@ -8428,6 +8428,26 @@ select:focus {
   margin-bottom: 0;
 }
 
+.conversation-timeline__focus-anchor {
+  scroll-margin-block: 72px;
+}
+
+.conversation-timeline__focus-anchor > .chat-msg-row {
+  border-radius: var(--radius-lg);
+  animation: conversation-anchor-focus 1.8s ease-out both;
+}
+
+@keyframes conversation-anchor-focus {
+  0%, 22% { background: var(--info-subtle); box-shadow: 0 0 0 2px var(--info); }
+  100% { background: transparent; box-shadow: 0 0 0 0 transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-timeline__focus-anchor > .chat-msg-row {
+    animation-duration: 1ms;
+  }
+}
+
 /* Run Subagent tool: compact execution handoff card + read-only session drawer. */
 .chat-msg-row--run-subagent {
   align-items: flex-start;
@@ -8681,8 +8701,9 @@ select:focus {
   z-index: auto;
   display: block;
   width: 100%;
-  height: calc(100vh - var(--header-height) - 88px);
-  min-height: 540px;
+  height: auto;
+  min-height: 0;
+  flex: 1 1 auto;
 }
 
 .session-viewer-drawer-layer--embedded .session-viewer-drawer {

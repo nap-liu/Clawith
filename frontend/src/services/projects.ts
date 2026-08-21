@@ -33,6 +33,36 @@ export type ProjectFileContent = {
     ticket_expires_in: number;
 };
 
+export type ProjectGitDiffFile = {
+    path: string;
+    status: 'added' | 'modified' | 'deleted';
+    additions: number | null;
+    deletions: number | null;
+    binary: boolean;
+    original_content: string | null;
+    modified_content: string | null;
+    content_included: boolean;
+    content_truncated: boolean;
+    original_size: number;
+    modified_size: number;
+};
+
+export type ProjectGitDiff = {
+    commit: string;
+    target_commit: string;
+    parent: string | null;
+    parent_commit: string | null;
+    available_parent_commits: string[];
+    is_root: boolean;
+    path: string | null;
+    patch: string;
+    patch_truncated: boolean;
+    patch_bytes: number;
+    max_patch_bytes: number;
+    files: ProjectGitDiffFile[];
+    files_truncated: boolean;
+};
+
 const record = (value: unknown): JsonRecord => value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : {};
 const array = (value: unknown): unknown[] => Array.isArray(value) ? value : [];
 const string = (value: unknown, fallback = ''): string => typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
@@ -334,6 +364,12 @@ export const projectsApi = {
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/leader`, { method: 'PUT', body: JSON.stringify({ agent_id: agentId }) }),
     getGit: (projectId: string, limit = 100) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git?limit=${encodeURIComponent(String(limit))}`),
+    getGitDiff: (projectId: string, params: { commit: string; parent?: string; path?: string }) => {
+        const query = new URLSearchParams({ commit: params.commit });
+        if (params.parent) query.set('parent', params.parent);
+        if (params.path) query.set('path', params.path);
+        return fetchJson<ProjectGitDiff>(`/projects/${encodeURIComponent(projectId)}/git/diff?${query}`);
+    },
     async listGitRemotes(projectId: string): Promise<Array<{ name: string; url: string }>> {
         const response = record(await fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git/remotes`));
         return array(response.items).map(item => {

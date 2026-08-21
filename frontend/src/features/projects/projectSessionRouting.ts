@@ -5,7 +5,25 @@ export type ProjectSessionRoute = {
     kind: 'group' | 'session';
     agentId: string;
     intent: Exclude<ProjectSessionIntent, 'auto'> | 'work';
+    /** Durable ChatMessage id that identifies the exact turn behind the project record. */
+    anchorMessageId?: string;
 };
+
+const PROJECT_MESSAGE_ANCHOR_KEYS = [
+    'turn_anchor_id',
+    'subagent_turn_anchor_id',
+    'origin_turn_anchor_id',
+    'anchor_message_id',
+    'message_anchor_id',
+    'source_message_id',
+    'request_message_id',
+    'group_message_id',
+] as const;
+
+function routeAnchor(records: ProjectSessionRecord[]): Pick<ProjectSessionRoute, 'anchorMessageId'> | Record<string, never> {
+    const anchorMessageId = closestProjectTraceValue(records, ...PROJECT_MESSAGE_ANCHOR_KEYS);
+    return anchorMessageId ? { anchorMessageId } : {};
+}
 
 function directText(source: ProjectSessionRecord, ...keys: string[]): string {
     for (const key of keys) {
@@ -38,7 +56,7 @@ export function projectTraceRecords(source: ProjectSessionRecord): ProjectSessio
         if (!record || seen.has(record)) return;
         seen.add(record);
         records.push(record);
-        ['event_metadata', 'metadata', 'input', 'output', 'runtime', 'result', 'delivery_result', 'message_meta', 'session', 'subagent_run', 'member_snapshot', 'associations', 'relations', 'trace'].forEach((key) => visit(record[key], depth + 1));
+        ['event_metadata', 'metadata', 'input', 'dispatch', 'output', 'runtime', 'result', 'delivery_result', 'message_meta', 'session', 'subagent_run', 'member_snapshot', 'associations', 'relations', 'trace'].forEach((key) => visit(record[key], depth + 1));
         ['subagent_runs', 'related_runs', 'runs', 'sessions', 'related_sessions', 'events', 'related_events', 'commits', 'related_commits', 'files', 'related_files', 'evidence'].forEach((key) => {
             if (Array.isArray(record[key])) (record[key] as unknown[]).forEach((item) => visit(item, depth + 1));
         });
@@ -103,6 +121,7 @@ export function resolveProjectSessionRoute(
             kind,
             agentId: directText(source, 'agent_id', 'access_agent_id', 'session_agent_id'),
             intent: directSourceChannel === 'project' ? 'group' : directSourceChannel === 'agent' ? 'a2a' : 'run',
+            ...routeAnchor(records),
         };
     }
 
@@ -113,6 +132,7 @@ export function resolveProjectSessionRoute(
             kind: 'group',
             agentId: closestProjectTraceValue(records, 'access_agent_id', 'session_agent_id', 'leader_agent_id', 'agent_id'),
             intent: 'group',
+            ...routeAnchor(records),
         } : null;
     }
 
@@ -126,6 +146,7 @@ export function resolveProjectSessionRoute(
             kind: 'session',
             agentId: closestProjectTraceValue(records, 'session_agent_id', 'session_access_agent_id', 'access_agent_id', 'execution_agent_id', 'agent_id', 'to_agent_id') || fallbackOwner,
             intent: 'a2a',
+            ...routeAnchor(records),
         } : null;
     }
 
@@ -136,6 +157,7 @@ export function resolveProjectSessionRoute(
             kind: 'session',
             agentId: closestProjectTraceValue(records, 'execution_agent_id', 'subagent_agent_id', 'agent_id', 'to_agent_id', 'assignee_agent_id'),
             intent: 'run',
+            ...routeAnchor(records),
         };
     }
     if (requestedIntent === 'run') return null;
@@ -146,5 +168,6 @@ export function resolveProjectSessionRoute(
         kind: 'session',
         agentId: closestProjectTraceValue(records, 'session_agent_id', 'session_access_agent_id', 'access_agent_id', 'execution_agent_id', 'subagent_agent_id', 'agent_id', 'actor_agent_id', 'to_agent_id', 'from_agent_id'),
         intent: 'work',
+        ...routeAnchor(records),
     } : null;
 }

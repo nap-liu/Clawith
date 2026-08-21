@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.llm.caller import call_llm
+from app.services.llm.caller import _stream_with_throttle_retry, call_llm
 from app.services.llm.client import LLMError, LLMResponse
 
 
@@ -63,6 +63,11 @@ def _patch_call_llm_collaborators(monkeypatch, client):
     monkeypatch.setattr("app.services.llm.caller.record_token_usage", AsyncMock(return_value=None))
     monkeypatch.setattr(
         "app.services.llm.caller._sleep_before_throttle_retry",
+        AsyncMock(return_value=None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller._sleep_before_timeout_retry",
         AsyncMock(return_value=None),
         raising=False,
     )
@@ -128,6 +133,103 @@ async def test_provider_round_has_wall_clock_timeout(monkeypatch):
 
     assert result == "[LLM Error] Request timed out after 0.01s"
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_ttft_timeout_retries_once_before_success(monkeypatch):
+    class _TimeoutThenSuccessClient:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
+        async def stream(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            return _stop_response("retry-ok")
+
+        async def close(self):
+            self.closed = True
+
+    client = _TimeoutThenSuccessClient()
+    _patch_call_llm_collaborators(monkeypatch, client)
+
+    result = await call_llm(
+        model=_FakeModel(request_timeout=0.01),
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="测试助手",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="",
+    )
+
+    assert result == "retry-ok"
+    assert client.calls == 2
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_meaningful_stream_progress_renews_inactivity_timeout(monkeypatch):
+    class _ProgressClient:
+        closed = False
+
+        async def stream(self, **kwargs):
+            for chunk in ("a", "b", "c"):
+                await asyncio.sleep(0.008)
+                await kwargs["on_chunk"](chunk)
+            return _stop_response("done")
+
+        async def close(self):
+            self.closed = True
+
+    client = _ProgressClient()
+    _patch_call_llm_collaborators(monkeypatch, client)
+
+    result = await call_llm(
+        model=_FakeModel(request_timeout=0.01),
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="测试助手",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="",
+        on_chunk=AsyncMock(return_value=None),
+    )
+
+    assert result == "done"
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_slot_bounds_parallel_dispatch(monkeypatch):
+    active = 0
+    maximum = 0
+
+    class _ParallelClient:
+        async def stream(self, **_kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return _stop_response("done")
+
+    monkeypatch.setenv("CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT", "2")
+    model = _FakeModel(request_timeout=1)
+    await asyncio.gather(
+        *(
+            _stream_with_throttle_retry(
+                _ParallelClient(),
+                model=model,
+                round_i=1,
+                messages=[],
+            )
+            for _ in range(4)
+        )
+    )
+
+    assert maximum == 2
 
 
 @pytest.mark.asyncio

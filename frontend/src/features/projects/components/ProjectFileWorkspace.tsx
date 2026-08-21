@@ -31,6 +31,8 @@ type RecordValue = Record<string, unknown>;
 type Props = {
     projectId: string;
     files: RecordValue[];
+    selectedPath?: string;
+    onSelectedPathChange?: (path: string) => void;
     runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>;
     busyAction: string;
 };
@@ -174,9 +176,10 @@ function MediaPreview({ content, onUnavailable }: { content: ProjectFileContent;
     );
 }
 
-export default function ProjectFileWorkspace({ projectId, files, runAction, busyAction }: Props) {
+export default function ProjectFileWorkspace({ projectId, files, selectedPath: requestedPath = '', onSelectedPathChange, runAction, busyAction }: Props) {
     const firstPath = filePath(files[0] || {});
-    const [selectedPath, setSelectedPath] = useState(firstPath);
+    const initialPath = requestedPath && files.some((entry) => filePath(entry) === requestedPath) ? requestedPath : firstPath;
+    const [selectedPath, setSelectedPath] = useState(initialPath);
     const [creating, setCreating] = useState(!firstPath);
     const [draftPath, setDraftPath] = useState(firstPath);
     const [content, setContent] = useState<ProjectFileContent | null>(null);
@@ -232,15 +235,27 @@ export default function ProjectFileWorkspace({ projectId, files, runAction, busy
     const selectFile = (path: string) => {
         setCreating(false);
         setSelectedPath(path);
+        onSelectedPathChange?.(path);
         setDraftPath(path);
         setLoadError('');
         const segments = path.split('/');
         setExpanded((current) => new Set([...current, ...segments.slice(0, -1).map((_, index) => segments.slice(0, index + 1).join('/'))]));
     };
 
+    useEffect(() => {
+        if (!requestedPath || requestedPath === selectedPath || !files.some((entry) => filePath(entry) === requestedPath)) return;
+        setCreating(false);
+        setSelectedPath(requestedPath);
+        setDraftPath(requestedPath);
+        setLoadError('');
+        const segments = requestedPath.split('/');
+        setExpanded((current) => new Set([...current, ...segments.slice(0, -1).map((_, index) => segments.slice(0, index + 1).join('/'))]));
+    }, [files, requestedPath, selectedPath]);
+
     const startNewFile = () => {
         setCreating(true);
         setSelectedPath('');
+        onSelectedPathChange?.('');
         setDraftPath('');
         setDraftContent('');
         setContent(null);
@@ -255,6 +270,7 @@ export default function ProjectFileWorkspace({ projectId, files, runAction, busy
         if (ok) {
             setCreating(false);
             setSelectedPath(path);
+            onSelectedPathChange?.(path);
             setDraftPath(path);
             setReloadKey((value) => value + 1);
         }

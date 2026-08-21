@@ -30,6 +30,7 @@ from app.services.project_git_service import (
     create_branch,
     initialize_project_repo,
     list_project_files,
+    project_commit_diff,
     restore_as_new_commit,
     validate_project_remote_url,
     write_project_file,
@@ -328,6 +329,71 @@ async def test_managed_git_restore_creates_new_commit_without_rewriting(tmp_path
     )
 
 
+async def test_project_git_diff_is_bounded_path_safe_and_handles_root_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.project_git_service.get_settings",
+        lambda: SimpleNamespace(STORAGE_LOCAL_ROOT=str(tmp_path)),
+    )
+    project = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        name="Diff Project",
+        description="Provider-neutral diff",
+        goal="Inspect evidence safely",
+        success_criteria=["bounded patch"],
+        settings={"git": {"mode": "managed"}},
+    )
+    initial = await initialize_project_repo(project)
+    repo = tmp_path / "_projects" / str(project.tenant_id) / str(project.id) / "repo"
+    root_diff = await project_commit_diff(project, initial["head"], path="README.md")
+    assert root_diff["is_root"] is True
+    assert root_diff["parent_commit"] is None
+    assert [entry["path"] for entry in root_diff["files"]] == ["README.md"]
+    assert root_diff["files"][0]["status"] == "added"
+    assert root_diff["files"][0]["original_content"] == ""
+    assert root_diff["files"][0]["modified_content"].startswith("# Diff Project")
+
+    first = await write_project_file(project, "src/result.py", "print('first')\n")
+    second = await write_project_file(
+        project,
+        "src/result.py",
+        "# 中文证据\n" + "print('traceable change')\n" * 200,
+    )
+    bounded = await project_commit_diff(project, second["commit"], path="src/result.py", max_patch_bytes=128)
+    assert bounded["parent_commit"] == first["commit"]
+    assert bounded["patch_truncated"] is True
+    assert bounded["patch_bytes"] <= 128
+    assert len(bounded["patch"].encode("utf-8")) <= 128
+    assert bounded["files"][0]["original_content"] == "print('first')\n"
+    assert bounded["files"][0]["modified_content"].startswith("# 中文证据")
+    commit_wide = await project_commit_diff(project, second["commit"])
+    assert commit_wide["files"][0]["content_included"] is False
+    assert commit_wide["files"][0]["original_content"] is None
+    assert commit_wide["files"][0]["modified_content"] is None
+
+    with pytest.raises(HTTPException) as traversal:
+        await project_commit_diff(project, second["commit"], path="../secret")
+    assert traversal.value.status_code == 422
+    with pytest.raises(HTTPException) as invalid_parent:
+        await project_commit_diff(project, second["commit"], parent=initial["head"])
+    assert invalid_parent.value.status_code == 422
+
+    (repo / "asset.bin").write_bytes(b"\x00private-binary-payload\xff")
+    _git(repo, "add", "--", "asset.bin")
+    _git(repo, "commit", "-m", "Add binary evidence")
+    binary_commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    binary_diff = await project_commit_diff(project, binary_commit, path="asset.bin")
+    assert binary_diff["files"][0]["binary"] is True
+    assert binary_diff["files"][0]["modified_content"] is None
+    assert "private-binary-payload" not in binary_diff["patch"]
+
+    tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+    dangling = _git(repo, "commit-tree", tree, "-p", binary_commit, "-m", "Dangling secret").stdout.strip()
+    with pytest.raises(HTTPException) as unreachable:
+        await project_commit_diff(project, dangling)
+    assert unreachable.value.status_code == 422
+
+
 def test_project_router_exposes_closed_loop_contract():
     from app.api.projects import router
 
@@ -345,5 +411,6 @@ def test_project_router_exposes_closed_loop_contract():
         "/projects/{project_id}/settings",
         "/projects/{project_id}/files",
         "/projects/{project_id}/git/commit",
+        "/projects/{project_id}/git/diff",
         "/projects/{project_id}/git/restore",
     } <= paths

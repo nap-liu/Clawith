@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import get_settings
 from app.database import async_session
 
@@ -39,16 +40,16 @@ async def execute_tool(*args, **kwargs):
     return await _impl(*args, **kwargs)
 from app.services.token_tracker import (
     TokenUsage,
-    record_token_usage,
-    extract_token_usage,
     estimate_token_usage_from_chars,
+    extract_token_usage,
+    record_token_usage,
 )
 
 from .client import LLMError
-from .failover import classify_error, FailoverErrorType
+from .confirmation_tool import find_request_confirmation_call
+from .failover import FailoverErrorType, classify_error
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import enforce_message_budget, finalize_tool_output
-from .confirmation_tool import find_request_confirmation_call
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -100,6 +101,20 @@ def _join_visible_response_segments(*segments: str | None) -> str:
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 PROVIDER_THROTTLE_RETRY_DELAYS = (1.0, 2.0)
+PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS = (2.0,)
+# DashScope compatible endpoints can silently queue requests when several
+# project Agents wake at once.  Bound provider I/O separately from the
+# Subagent worker pool so waiting for a slot does not consume the model's
+# request timeout.  Operators with a higher provider quota can raise this
+# without changing the durable project queue semantics.
+PROVIDER_MAX_IN_FLIGHT_ENV = "CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT"
+PROVIDER_MAX_IN_FLIGHT_DEFAULT = 2
+# A request that is making meaningful streaming progress gets a sliding
+# inactivity lease, but never an unbounded lifetime.  This is deliberately
+# distinct from increasing ``request_timeout``: a silent request still fails
+# at the configured timeout, while active reasoning/tool JSON is allowed to
+# finish within a bounded absolute budget.
+PROVIDER_PROGRESS_HARD_TIMEOUT_MULTIPLIER = 3.0
 PROVIDER_THROTTLE_USER_MESSAGE = (
     "⚠️ 模型服务当前繁忙或被限流，已自动重试仍未成功，请稍后再试。"
 )
@@ -176,45 +191,91 @@ async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
 
 
+async def _sleep_before_timeout_retry(delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+
+
+_provider_slots: dict[tuple[int, str, str, int, int], asyncio.Semaphore] = {}
+
+
+def _provider_slot(model) -> asyncio.Semaphore:
+    """Return one event-loop-local slot pool for a provider endpoint."""
+    try:
+        limit = int(os.environ.get(PROVIDER_MAX_IN_FLIGHT_ENV, PROVIDER_MAX_IN_FLIGHT_DEFAULT))
+    except ValueError:
+        limit = PROVIDER_MAX_IN_FLIGHT_DEFAULT
+    limit = max(1, limit)
+    loop_id = id(asyncio.get_running_loop())
+    key = (
+        loop_id,
+        str(getattr(model, "provider", "") or "").lower(),
+        str(getattr(model, "base_url", "") or ""),
+        # Separate provider accounts without retaining or logging credential
+        # material in the slot key. Cloned models sharing one stored credential
+        # intentionally share capacity.
+        hash(str(getattr(model, "api_key_encrypted", "") or "")),
+        limit,
+    )
+    return _provider_slots.setdefault(key, asyncio.Semaphore(limit))
+
+
 async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
-    attempts = 1 + len(PROVIDER_THROTTLE_RETRY_DELAYS)
     request_timeout = _get_model_timeout(model)
+    throttle_attempt_idx = 0
+    timeout_attempt_idx = 0
+    provider_slot = _provider_slot(model)
 
-    # Per-round latency observability: wall time + time-to-first-token (first
-    # content/thinking/tool-args delta from the provider). Callbacks are wrapped
-    # to timestamp the first delta; None callbacks get a marker-only no-op
-    # (safe — clients simply invoke whatever callback is present).
-    _first_token_at: list[float] = []
-
-    def _wrap_first_token(cb):
-        async def _marked(*a, **k):
-            if not _first_token_at:
-                _first_token_at.append(perf_counter())
-            if cb is not None:
-                return await cb(*a, **k)
-        return _marked
-
-    for _cb_key in ("on_chunk", "on_thinking"):
-        stream_kwargs[_cb_key] = _wrap_first_token(stream_kwargs.get(_cb_key))
-    if stream_kwargs.get("on_tool_delta") is not None:
-        stream_kwargs["on_tool_delta"] = _wrap_first_token(stream_kwargs["on_tool_delta"])
-
-    for attempt_idx in range(attempts):
-        _first_token_at.clear()
+    while True:
+        first_progress_at: list[float] = []
         _t0 = perf_counter()
+        dispatch_started_at = _t0
+        attempt_kwargs = dict(stream_kwargs)
         try:
-            # httpx's read timeout is an inactivity timeout. Some compatible
-            # providers keep an otherwise-stalled SSE request alive with empty
-            # heartbeat lines, so it never fires and the whole Agent turn can
-            # remain in "thinking" forever. The model-level request timeout is
-            # the wall-clock budget for one provider round; tool rounds still
-            # receive their own independent budget.
-            response = await asyncio.wait_for(
-                client.stream(**stream_kwargs),
-                timeout=request_timeout,
-            )
+            # Queue outside the timeout budget.  Provider saturation should
+            # delay dispatch, not turn a healthy queued request into a false
+            # model timeout.
+            async with provider_slot:
+                dispatch_started_at = perf_counter()
+                hard_deadline = (
+                    dispatch_started_at
+                    + request_timeout * PROVIDER_PROGRESS_HARD_TIMEOUT_MULTIPLIER
+                )
+                async with asyncio.timeout(request_timeout) as progress_timeout:
+                    def _wrap_progress(
+                        cb,
+                        *,
+                        progress_marks=first_progress_at,
+                        absolute_deadline=hard_deadline,
+                        timeout_scope=progress_timeout,
+                    ):
+                        async def _marked(*args, **kwargs):
+                            now = perf_counter()
+                            if not progress_marks:
+                                progress_marks.append(now)
+                            timeout_scope.reschedule(
+                                min(absolute_deadline, now + request_timeout)
+                            )
+                            if cb is not None:
+                                return await cb(*args, **kwargs)
+                        return _marked
+
+                    # Only meaningful model deltas renew the inactivity lease;
+                    # transport heartbeat lines never reach these callbacks.
+                    for callback_key in ("on_chunk", "on_thinking"):
+                        attempt_kwargs[callback_key] = _wrap_progress(
+                            attempt_kwargs.get(callback_key)
+                        )
+                    if attempt_kwargs.get("on_tool_delta") is not None:
+                        attempt_kwargs["on_tool_delta"] = _wrap_progress(
+                            attempt_kwargs["on_tool_delta"]
+                        )
+                    response = await client.stream(**attempt_kwargs)
             _elapsed = perf_counter() - _t0
-            _ttft = f"{_first_token_at[0] - _t0:.2f}s" if _first_token_at else "n/a"
+            _ttft = (
+                f"{first_progress_at[0] - dispatch_started_at:.2f}s"
+                if first_progress_at
+                else "n/a"
+            )
             _usage = getattr(response, "usage", None)
             _out_tokens = _usage.get("completion_tokens") if isinstance(_usage, dict) else None
             _rate = f" ({_out_tokens / _elapsed:.0f} tok/s)" if _out_tokens and _elapsed > 0 else ""
@@ -224,19 +285,46 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
             )
             return response
         except TimeoutError as e:
+            phase = "stream" if first_progress_at else "ttft"
+            # A TTFT timeout has emitted no content, thinking, tool arguments,
+            # or side effects for this provider round. One bounded retry is
+            # therefore safe even when earlier tool rounds exist in history.
+            if (
+                phase == "ttft"
+                and timeout_attempt_idx < len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS)
+            ):
+                delay = PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS[timeout_attempt_idx]
+                timeout_attempt_idx += 1
+                logger.warning(
+                    f"[LLM] Provider TTFT timeout; retrying after {delay:.1f}s "
+                    f"(attempt {timeout_attempt_idx + 1}/"
+                    f"{len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS) + 1}, "
+                    f"round {round_i}, provider={getattr(model, 'provider', '?')} "
+                    f"model={getattr(model, 'model', '?')})"
+                )
+                await _sleep_before_timeout_retry(delay)
+                continue
+            logger.error(
+                f"[LLM Timing] timeout phase={phase} round={round_i} "
+                f"elapsed={perf_counter() - _t0:.2f}s "
+                f"provider={getattr(model, 'provider', '?')} "
+                f"model={getattr(model, 'model', '?')}"
+            )
             raise LLMError(
                 f"Request timed out after {request_timeout:g}s"
             ) from e
         except LLMError as e:
             if not _is_provider_throttle_error(e):
                 raise
-            if attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
+            if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
                 raise ProviderThrottleExhausted(str(e)) from e
 
-            delay = PROVIDER_THROTTLE_RETRY_DELAYS[attempt_idx]
+            delay = PROVIDER_THROTTLE_RETRY_DELAYS[throttle_attempt_idx]
+            throttle_attempt_idx += 1
             logger.warning(
                 f"[LLM] Provider throttle; retrying after {delay:.1f}s "
-                f"(attempt {attempt_idx + 2}/{attempts}, round {round_i}, "
+                f"(attempt {throttle_attempt_idx + 1}/"
+                f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
                 f"provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')}): {e}"
             )
             await _sleep_before_throttle_retry(delay)
@@ -705,8 +793,8 @@ async def _get_user_name(user_id) -> str | None:
     if not user_id:
         return None
     try:
-        from app.models.user import User as _UserModel
         from app.models.agent import Agent as _AgentModel
+        from app.models.user import User as _UserModel
 
         async with async_session() as _udb:
             _ur = await _udb.execute(select(_UserModel).where(_UserModel.id == user_id))
@@ -725,8 +813,8 @@ async def _get_user_name(user_id) -> str | None:
 
 def _convert_messages_for_vision(api_messages: list, supports_vision: bool) -> list:
     """Convert image markers to vision format if supported, or strip them."""
-    import re as _re_v
     import copy
+    import re as _re_v
 
     # Deep copy to avoid modifying the original list in place
     new_messages = copy.deepcopy(api_messages)
@@ -2134,9 +2222,9 @@ async def call_agent_llm(
     on_thinking=None,
 ) -> str:
     """Call the agent's LLM with automatic failover support."""
+    from app.core.permissions import is_agent_expired
     from app.models.agent import Agent
     from app.models.llm import LLMModel
-    from app.core.permissions import is_agent_expired
 
     # Load agent
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))

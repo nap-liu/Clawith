@@ -58,6 +58,8 @@ export type ConversationTimelineProps = {
     onToolResolved?: (message: ConversationMessage, result: string) => void;
     onOpenSubagentSession?: (data: SubagentRunCardData) => void;
     scrollerRef?: React.RefObject<HTMLElement | null>;
+    /** Exact durable ChatMessage id to reveal inside a shared/reused session. */
+    focusMessageId?: string;
     resumeMeasurementKey?: string | number | null;
     provenance?: {
         source?: string;
@@ -67,6 +69,17 @@ export type ConversationTimelineProps = {
         last_error?: string | null;
     } | null;
 };
+
+export function findConversationAnchorEntryIndex(
+    entries: ReturnType<typeof buildConversationEntries>,
+    messageId?: string,
+): number {
+    if (!messageId) return -1;
+    return entries.findIndex((entry) => (
+        (entry.type === 'message' || entry.type === 'special_render')
+        && entry.msg.id === messageId
+    ));
+}
 
 type AnalysisToolMeta = {
     title: string;
@@ -271,12 +284,14 @@ export default function ConversationTimeline({
     onToolResolved,
     onOpenSubagentSession,
     scrollerRef,
+    focusMessageId,
     resumeMeasurementKey,
     provenance,
 }: ConversationTimelineProps) {
     const { t, i18n } = useTranslation();
     const [expandedAnalysis, setExpandedAnalysis] = useState<Record<string, boolean>>({});
     const entries = useMemo(() => buildConversationEntries(messages), [messages]);
+    const focusEntryIndex = useMemo(() => findConversationAnchorEntryIndex(entries, focusMessageId), [entries, focusMessageId]);
     const provenanceTime = provenance?.finished_at || provenance?.scheduled_at;
     const status = provenance?.status || '';
     const statusText = status === 'completed'
@@ -330,6 +345,22 @@ export default function ConversationTimeline({
             if (secondFrame != null) window.cancelAnimationFrame(secondFrame);
         };
     }, [resumeMeasurementKey, rowVirtualizer, scrollerRef, virtualizeEntries]);
+    useEffect(() => {
+        if (!focusMessageId || focusEntryIndex < 0 || !scrollerRef?.current) return;
+        if (virtualizeEntries) rowVirtualizer.scrollToIndex(focusEntryIndex, { align: 'center' });
+        let secondFrame: number | null = null;
+        const firstFrame = window.requestAnimationFrame(() => {
+            secondFrame = window.requestAnimationFrame(() => {
+                const row = Array.from(scrollerRef.current?.querySelectorAll<HTMLElement>('[data-message-id]') || [])
+                    .find((element) => element.dataset.messageId === focusMessageId);
+                row?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            });
+        });
+        return () => {
+            window.cancelAnimationFrame(firstFrame);
+            if (secondFrame != null) window.cancelAnimationFrame(secondFrame);
+        };
+    }, [focusEntryIndex, focusMessageId, rowVirtualizer, scrollerRef, virtualizeEntries]);
     const renderEntry = (entry: (typeof entries)[number], index: number) => {
         if (entry.type === 'analysis_group') {
             const owner = analysisOwners.get(entry.key);
@@ -360,13 +391,17 @@ export default function ConversationTimeline({
                 {rowVirtualizer.getVirtualItems().map((virtualItem) => {
                     const entry = entries[virtualItem.index];
                     if (!entry) return null;
+                    const entryMessageId = entry.type === 'message' || entry.type === 'special_render' ? entry.msg.id : undefined;
+                    const focused = Boolean(focusMessageId && entryMessageId === focusMessageId);
                     return (
                         <div
                             key={virtualItem.key}
                             ref={rowVirtualizer.measureElement}
                             data-index={virtualItem.index}
                             data-conversation-entry-key={entry.key}
-                            className="conversation-timeline__virtual-row"
+                            data-message-id={entryMessageId}
+                            aria-current={focused ? 'true' : undefined}
+                            className={`conversation-timeline__virtual-row${focused ? ' conversation-timeline__focus-anchor' : ''}`}
                             style={{ transform: `translateY(${virtualItem.start}px)` }}
                         >
                             {renderEntry(entry, virtualItem.index)}
@@ -374,10 +409,12 @@ export default function ConversationTimeline({
                     );
                 })}
             </div>
-        ) : entries.map((entry, index) => (
-            <div key={entry.key} data-conversation-entry-key={entry.key}>
+        ) : entries.map((entry, index) => {
+            const entryMessageId = entry.type === 'message' || entry.type === 'special_render' ? entry.msg.id : undefined;
+            const focused = Boolean(focusMessageId && entryMessageId === focusMessageId);
+            return <div key={entry.key} data-conversation-entry-key={entry.key} data-message-id={entryMessageId} aria-current={focused ? 'true' : undefined} className={focused ? 'conversation-timeline__focus-anchor' : undefined}>
                 {renderEntry(entry, index)}
-            </div>
-        ))}
+            </div>;
+        })}
     </div>;
 }

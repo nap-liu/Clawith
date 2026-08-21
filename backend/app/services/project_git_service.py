@@ -13,11 +13,13 @@ import json
 import mimetypes
 import os
 import re
+import selectors
 import shutil
 import socket
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -44,6 +46,11 @@ _REPO_LOCKS: dict[Path, threading.RLock] = {}
 _REPO_LOCKS_GUARD = threading.Lock()
 PROJECT_FILE_EDIT_LIMIT_BYTES = 1024 * 1024
 PROJECT_FILE_CONTENT_MAX_CHARS = 1024 * 1024
+PROJECT_GIT_DIFF_PATCH_MAX_BYTES = 256 * 1024
+PROJECT_GIT_DIFF_PATCH_HARD_LIMIT_BYTES = 1024 * 1024
+PROJECT_GIT_DIFF_CONTENT_MAX_BYTES = 512 * 1024
+PROJECT_GIT_DIFF_FILE_LIST_MAX_BYTES = 1024 * 1024
+PROJECT_GIT_DIFF_MAX_FILES = 500
 _TEXT_MIME_BY_SUFFIX = {
     ".c": "text/x-c",
     ".cc": "text/x-c++src",
@@ -131,6 +138,70 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     if check and result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "git command failed").strip())
     return result
+
+
+def _git_stdout_prefix(repo: Path, *args: str, limit: int) -> tuple[bytes, bool]:
+    """Read bounded Git stdout and stop the process as soon as the cap is hit.
+
+    Diff output is controlled by repository contents and can be arbitrarily
+    large.  Unlike ``subprocess.run(capture_output=True)``, this helper never
+    buffers the complete output before applying the API limit.
+    """
+
+    safe_limit = max(1, min(int(limit), PROJECT_GIT_DIFF_PATCH_HARD_LIMIT_BYTES))
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes",
+    }
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            ["git", "-c", f"safe.directory={repo}", "-C", str(repo), *args],
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            env=env,
+        )
+        output = bytearray()
+        truncated = False
+        deadline = time.monotonic() + 30
+        selector = selectors.DefaultSelector()
+        assert process.stdout is not None
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.terminate()
+                    raise HTTPException(status_code=504, detail="Git diff timed out")
+                events = selector.select(timeout=min(remaining, 0.25))
+                if not events:
+                    if process.poll() is not None:
+                        break
+                    continue
+                chunk = os.read(process.stdout.fileno(), min(64 * 1024, safe_limit + 1 - len(output)))
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > safe_limit:
+                    truncated = True
+                    process.terminate()
+                    break
+        finally:
+            selector.close()
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+            try:
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait(timeout=5)
+        if not truncated and return_code != 0:
+            stderr_file.seek(0)
+            detail = stderr_file.read(8192).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(detail or "git command failed")
+        return bytes(output[:safe_limit]), truncated
 
 
 def _repo_lock(repo: Path) -> threading.RLock:
@@ -811,21 +882,28 @@ def _mime_and_kind(path: str, sample: bytes) -> tuple[str, str, bool]:
     return mime_type, "binary", False
 
 
-def _tree_entry(repo: Path, path: str) -> tuple[str, int]:
-    result = _git(repo, "ls-tree", "-l", "-z", "HEAD", "--", path, check=False)
+def _tree_entry_at(repo: Path, revision: str, path: str) -> tuple[str, int] | None:
+    result = _git(repo, "ls-tree", "-l", "-z", revision, "--", path, check=False)
     if result.returncode != 0 or not result.stdout:
-        raise HTTPException(status_code=404, detail="Project file is not committed at HEAD")
+        return None
     record = result.stdout.rstrip("\x00")
     metadata, separator, recorded_path = record.partition("\t")
     parts = metadata.split()
     if not separator or recorded_path != path or len(parts) != 4 or parts[1] != "blob":
-        raise HTTPException(status_code=404, detail="Project file is not committed at HEAD")
+        return None
     object_id = parts[2]
     try:
         size = int(parts[3])
     except ValueError as exc:
         raise RuntimeError("Git returned an invalid project blob size") from exc
     return object_id, size
+
+
+def _tree_entry(repo: Path, path: str) -> tuple[str, int]:
+    entry = _tree_entry_at(repo, "HEAD", path)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Project file is not committed at HEAD")
+    return entry
 
 
 def _file_record(repo: Path, path: str, *, preview_limit: int = 4000) -> dict:
@@ -1120,6 +1198,215 @@ async def commit_project_changes(
         milestone=milestone,
         operation_key=operation_key,
     )
+
+
+def _resolve_reachable_commit(repo: Path, raw_commit: str) -> str:
+    value = raw_commit.strip()
+    if not _COMMIT_RE.fullmatch(value):
+        raise HTTPException(status_code=422, detail="Invalid commit identifier")
+    resolved = _git(repo, "rev-parse", "--verify", f"{value}^{{commit}}", check=False)
+    if resolved.returncode != 0:
+        raise HTTPException(status_code=422, detail="Commit does not exist in this project repository")
+    commit = resolved.stdout.strip()
+    # Git can retain unreachable objects after a branch is deleted. Knowing an
+    # object id must not be enough to read repository content through this API.
+    if _git(repo, "merge-base", "--is-ancestor", commit, "HEAD", check=False).returncode != 0:
+        raise HTTPException(status_code=422, detail="Commit is not reachable from the project history")
+    return commit
+
+
+def _utf8_patch_prefix(data: bytes, *, truncated: bool) -> str:
+    text = data.decode("utf-8", errors="ignore")
+    if truncated and "\n" in text:
+        # Keep the response on a complete diff line. The response is explicitly
+        # marked truncated and is a viewer payload, never an applicable patch.
+        text = text[: text.rfind("\n") + 1]
+    return text
+
+
+def _text_blob_at(repo: Path, revision: str | None, path: str) -> dict[str, Any]:
+    if revision is None:
+        return {"content": "", "truncated": False, "binary": False, "size": 0}
+    entry = _tree_entry_at(repo, revision, path)
+    if entry is None:
+        return {"content": "", "truncated": False, "binary": False, "size": 0}
+    object_id, size = entry
+    sample = _blob_prefix(repo, object_id, PROJECT_GIT_DIFF_CONTENT_MAX_BYTES + 1)
+    _mime_type, _kind, is_text = _mime_and_kind(path, sample[:8192])
+    if not is_text:
+        return {"content": None, "truncated": False, "binary": True, "size": size}
+    prefix = sample[:PROJECT_GIT_DIFF_CONTENT_MAX_BYTES]
+    content = prefix.decode("utf-8", errors="ignore")
+    return {
+        "content": content,
+        "truncated": size > PROJECT_GIT_DIFF_CONTENT_MAX_BYTES,
+        "binary": False,
+        "size": size,
+    }
+
+
+def _parse_numstat(payload: bytes) -> tuple[list[tuple[str, int | None, int | None]], bool]:
+    records = payload.split(b"\x00")
+    complete = payload.endswith(b"\x00")
+    if complete:
+        records.pop()
+    elif records:
+        records.pop()  # Never expose a partial path/stat record.
+    parsed: list[tuple[str, int | None, int | None]] = []
+    for raw_record in records:
+        fields = raw_record.split(b"\t", 2)
+        if len(fields) != 3:
+            continue
+        additions_raw, deletions_raw, raw_path = fields
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        try:
+            additions = None if additions_raw == b"-" else int(additions_raw)
+            deletions = None if deletions_raw == b"-" else int(deletions_raw)
+        except ValueError:
+            continue
+        parsed.append((path, additions, deletions))
+        if len(parsed) >= PROJECT_GIT_DIFF_MAX_FILES:
+            return parsed, True
+    return parsed, not complete
+
+
+def _project_commit_diff(
+    project: Project,
+    commit: str,
+    parent: str | None,
+    path: str | None,
+    max_patch_bytes: int,
+) -> dict[str, Any]:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        target_commit = _resolve_reachable_commit(repo, commit)
+        revision_line = _git(repo, "rev-list", "--parents", "-n", "1", target_commit).stdout.strip().split()
+        available_parents = revision_line[1:]
+        if parent:
+            parent_commit = _resolve_reachable_commit(repo, parent)
+            if parent_commit not in available_parents:
+                raise HTTPException(status_code=422, detail="Parent must be a direct parent of the target commit")
+        else:
+            parent_commit = available_parents[0] if available_parents else None
+
+        normalized_path = _safe_relative_path(repo, path)[0] if path else None
+        common_options = [
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ]
+        if parent_commit is None:
+            base_args = ["diff-tree", "--root", "--no-commit-id", "-r"]
+            revisions = [target_commit]
+        else:
+            base_args = ["diff"]
+            revisions = [parent_commit, target_commit]
+
+        path_args = ["--", normalized_path] if normalized_path else ["--"]
+        patch_data, patch_truncated = _git_stdout_prefix(
+            repo,
+            *base_args,
+            "-p",
+            "--unified=3",
+            *common_options,
+            *revisions,
+            *path_args,
+            limit=max_patch_bytes,
+        )
+        stats_data, stats_truncated = _git_stdout_prefix(
+            repo,
+            *base_args,
+            "--numstat",
+            "-z",
+            *common_options,
+            *revisions,
+            *path_args,
+            limit=PROJECT_GIT_DIFF_FILE_LIST_MAX_BYTES,
+        )
+        stats, files_truncated = _parse_numstat(stats_data)
+        files: list[dict[str, Any]] = []
+        for changed_path, additions, deletions in stats:
+            try:
+                safe_path = _safe_relative_path(repo, changed_path)[0]
+            except HTTPException:
+                files_truncated = True
+                continue
+            original_entry = _tree_entry_at(repo, parent_commit, safe_path) if parent_commit else None
+            modified_entry = _tree_entry_at(repo, target_commit, safe_path)
+            if normalized_path:
+                original = _text_blob_at(repo, parent_commit, safe_path)
+                modified = _text_blob_at(repo, target_commit, safe_path)
+            else:
+                # Commit-wide requests remain metadata/patch bounded. Full
+                # before/after blobs are returned only for an explicitly
+                # validated path, which is what the Monaco viewer requests.
+                is_binary = additions is None or deletions is None
+                original = {
+                    "content": None,
+                    "truncated": False,
+                    "binary": is_binary,
+                    "size": original_entry[1] if original_entry else 0,
+                }
+                modified = {
+                    "content": None,
+                    "truncated": False,
+                    "binary": is_binary,
+                    "size": modified_entry[1] if modified_entry else 0,
+                }
+            if parent_commit is None or original_entry is None:
+                status = "added"
+            elif modified_entry is None:
+                status = "deleted"
+            else:
+                status = "modified"
+            files.append(
+                {
+                    "path": safe_path,
+                    "status": status,
+                    "additions": additions,
+                    "deletions": deletions,
+                    "binary": bool(original["binary"] or modified["binary"]),
+                    "original_content": original["content"],
+                    "modified_content": modified["content"],
+                    "content_included": normalized_path is not None,
+                    "content_truncated": bool(original["truncated"] or modified["truncated"]),
+                    "original_size": original["size"],
+                    "modified_size": modified["size"],
+                }
+            )
+
+        safe_patch_limit = max(1, min(int(max_patch_bytes), PROJECT_GIT_DIFF_PATCH_HARD_LIMIT_BYTES))
+        return {
+            "commit": target_commit,
+            "target_commit": target_commit,
+            "parent": parent_commit,
+            "parent_commit": parent_commit,
+            "available_parent_commits": available_parents,
+            "is_root": parent_commit is None,
+            "path": normalized_path,
+            "patch": _utf8_patch_prefix(patch_data, truncated=patch_truncated),
+            "patch_truncated": patch_truncated,
+            "patch_bytes": min(len(patch_data), safe_patch_limit),
+            "max_patch_bytes": safe_patch_limit,
+            "files": files,
+            "files_truncated": bool(files_truncated or stats_truncated),
+        }
+
+
+async def project_commit_diff(
+    project: Project,
+    commit: str,
+    parent: str | None = None,
+    path: str | None = None,
+    max_patch_bytes: int = PROJECT_GIT_DIFF_PATCH_MAX_BYTES,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_project_commit_diff, project, commit, parent, path, max_patch_bytes)
 
 
 def _repository_state(project: Project, limit: int) -> dict:

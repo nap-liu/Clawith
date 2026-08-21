@@ -10,6 +10,10 @@
     "projectAgent": "Project Agent",
     "projectUser": "Project user",
     "projectSystem": "Project system",
+    "eventFallback": "Project event",
+    "noDetails": "This event has no additional details.",
+    "expandDetails": "Show full content",
+    "riskEventHint": "The failure remains traceable in the project audit log with its full context.",
     "events": {
       "project": {
         "created": "Project created",
@@ -43,15 +47,67 @@
         "failed": "Run failed",
         "cancelled": "Run cancelled"
       },
-      "a2a": { "queued": "A2A request queued", "delivered": "A2A message delivered", "completed": "A2A collaboration completed", "delivery_failed": "A2A delivery failed" },
+      "a2a": { "queued": "A2A request queued", "delivered": "A2A message delivered", "completed": "A2A collaboration completed", "cancelled": "A2A collaboration cancelled", "delivery_failed": "A2A delivery failed" },
       "group": { "message": { "created": "Project group message created" } },
       "git": {
         "commit": { "created": "Git commit created" },
-        "milestone": { "created": "Delivery milestone created" },
+        "milestone": { "prepared": "Delivery milestone prepared", "created": "Delivery milestone created" },
         "branch": { "created": "Git branch created" },
         "restore_commit": { "created": "Restore commit created" },
+        "restored": "Git version restored",
         "remote": { "configured": "Git remote configured", "deleted": "Git remote deleted" },
         "repository": { "cloned": "Project repository cloned from remote" }
+      }
+    },
+    "details": {
+      "project": {
+        "created": "The project and its isolated workspace were created.",
+        "initialized": "The isolated workspace and Git baseline were initialized.",
+        "updated": "The project details were updated.",
+        "archived": "The project was archived while preserving its history.",
+        "shared": "Project visibility was shared with selected members.",
+        "unshared": "Project sharing access was revoked.",
+        "settings": { "updated": "Project runtime and governance settings were updated." },
+        "file": { "committed": "The project file was committed to its traceable Git history." },
+        "plan": { "updated": "The project plan was updated." },
+        "status": { "updated": "The project status was updated." },
+        "trace": { "repaired": "Trace links between runs, sessions, and artifacts were repaired." },
+        "agent": { "message": { "sent": "The project Agent message was sent." } },
+        "kickoff": { "confirmed": "The plan was confirmed and the Leader started autonomous execution.", "failed": "Project kickoff failed and its context remains traceable." },
+        "agent_reply_batch": { "dispatched": "Agent replies were coalesced into one Leader turn." }
+      },
+      "member": {
+        "snapshot": { "created": "The project member snapshot was created.", "updated": "The project member snapshot was updated." },
+        "departed": "The member left the project; their history remains visible and read-only.",
+        "restored": "The member rejoined with a new execution snapshot generation."
+      },
+      "leader": { "changed": "The project Leader was changed." },
+      "capability": { "bound": "A shared project capability was bound.", "updated": "Project capability availability was updated." },
+      "work_item": { "created": "The work item was created.", "updated": "The work item content, progress, or evidence was updated." },
+      "run": {
+        "queued": "The run entered the queue for an available Agent.",
+        "running": "The Agent started processing this run.",
+        "waiting": "The run is waiting for follow-up input or confirmation.",
+        "succeeded": "The run completed successfully and remains linked to its session.",
+        "failed": "The run failed and its error and session context remain traceable.",
+        "cancelled": "The run was cancelled while preserving its history."
+      },
+      "a2a": {
+        "queued": "A direct A2A request entered the target Agent queue.",
+        "delivered": "The A2A message reached the target Agent project runtime.",
+        "completed": "The target Agent completed this A2A turn.",
+        "cancelled": "This A2A turn was cancelled.",
+        "delivery_failed": "The A2A message could not be delivered; failure context was preserved."
+      },
+      "group": { "message": { "created": "The group message was recorded and only explicitly mentioned members were awakened." } },
+      "git": {
+        "commit": { "created": "Project changes were recorded in a Git commit." },
+        "milestone": { "prepared": "The delivery milestone is being prepared.", "created": "The delivery milestone and linked evidence were frozen." },
+        "branch": { "created": "The Git branch was created." },
+        "restore_commit": { "created": "The restore operation created a new commit and preserved existing history." },
+        "restored": "The selected Git version was restored through a new commit.",
+        "remote": { "configured": "The Git remote was configured.", "deleted": "The Git remote was removed." },
+        "repository": { "cloned": "The remote repository was safely cloned over the initialization baseline." }
       }
     }
   },

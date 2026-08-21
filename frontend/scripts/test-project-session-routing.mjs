@@ -19,6 +19,7 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
         id: 'project-run-domain-id',
         agent_id: 'leader-agent',
         trigger_type: 'manual',
+        input: { dispatch: { turn_anchor_id: 'run-turn-anchor' } },
         output: { subagent_session_id: 'leader-child-session' },
     }, 'run');
     assert.deepEqual(plain(route), {
@@ -26,7 +27,25 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
         kind: 'session',
         agentId: 'leader-agent',
         intent: 'run',
+        anchorMessageId: 'run-turn-anchor',
     });
+}
+
+{
+    const first = resolveProjectSessionRoute({
+        subagent_session_id: 'shared-child-session',
+        agent_id: 'worker-agent',
+        input: { dispatch: { turn_anchor_id: 'first-run-turn' } },
+    }, 'run');
+    const second = resolveProjectSessionRoute({
+        subagent_session_id: 'shared-child-session',
+        agent_id: 'worker-agent',
+        input: { dispatch: { turn_anchor_id: 'second-run-turn' } },
+    }, 'run');
+    assert.equal(first?.sessionId, second?.sessionId);
+    assert.equal(first?.anchorMessageId, 'first-run-turn');
+    assert.equal(second?.anchorMessageId, 'second-run-turn');
+    assert.notEqual(first?.anchorMessageId, second?.anchorMessageId, 'Run routing must preserve its exact turn inside a shared session');
 }
 
 assert.equal(
