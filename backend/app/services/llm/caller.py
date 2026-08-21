@@ -2243,6 +2243,10 @@ async def call_agent_llm(
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
         return "⚠️ 数字员工未找到"
+    from app.core.okr_feature import is_retired_okr_agent
+
+    if await is_retired_okr_agent(db, agent):
+        return "⚠️ 数字员工未找到"
 
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
@@ -2313,6 +2317,10 @@ async def call_agent_llm_with_tools(
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
+        return "⚠️ Agent not found"
+    from app.core.okr_feature import is_retired_okr_agent
+
+    if await is_retired_okr_agent(db, agent):
         return "⚠️ Agent not found"
 
     if execution_user_id is None:

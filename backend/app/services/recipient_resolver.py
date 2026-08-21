@@ -127,6 +127,10 @@ async def _load_source_agent(db: AsyncSession, source_agent_id: uuid.UUID) -> Ag
     source = result.scalar_one_or_none()
     if not source:
         raise RecipientResolutionError("source_agent_not_found", "Source agent not found")
+    from app.core.okr_feature import is_retired_okr_agent
+
+    if await is_retired_okr_agent(db, source):
+        raise RecipientResolutionError("source_agent_not_found", "Source agent not found")
     return source
 
 
@@ -162,6 +166,13 @@ async def resolve_agent_recipient(
             "agent_id does not identify exactly one active digital employee in this tenant",
         )
     target = targets[0]
+    from app.core.okr_feature import is_retired_okr_agent
+
+    if await is_retired_okr_agent(db, target):
+        raise RecipientResolutionError(
+            "recipient_not_found",
+            "agent_id does not identify exactly one active digital employee in this tenant",
+        )
     if project_id is not None:
         from app.models.project import Project, ProjectMemberSnapshot
 

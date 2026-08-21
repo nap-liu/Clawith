@@ -37,6 +37,7 @@ from sqlalchemy import func, select, or_
 from sqlalchemy.orm import selectinload
 
 from app.database import async_session, engine
+from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_feature_enabled
 from app.models.task import Task
 from app.models.agent import Agent as AgentModel
 from app.models.org import AgentRelationship, OrgMember, AgentAgentRelationship
@@ -2821,12 +2822,13 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 visible_clauses.append(Tool.id.in_(assigned_tool_ids))
 
             # Get all tools visible within this agent's tenant boundary.
-            all_tools_r = await db.execute(
-                select(Tool).where(
-                    or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)),
-                    or_(*visible_clauses),
-                )
-            )
+            tool_clauses = [
+                or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)),
+                or_(*visible_clauses),
+            ]
+            if not okr_feature_enabled():
+                tool_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
+            all_tools_r = await db.execute(select(Tool).where(*tool_clauses))
             all_tools = all_tools_r.scalars().all()
 
             from app.services.cli_tools.sandbox_inject import _TOOL_NAME_RE
@@ -2837,6 +2839,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             # be re-added by the _always_tools fallback below.
             explicitly_disabled_names = set()
             for t in all_tools:
+                if is_retired_okr_tool(t.name):
+                    continue
                 # Child-only protocol surface. Subagent execution appends this
                 # definition explicitly after filtering the ordinary tool set.
                 if t.name == "send_message_to_parent":
@@ -3667,6 +3671,8 @@ async def execute_tool(
         .replace("\ufeff", "")
         .strip()
     )
+    if is_retired_okr_tool(tool_name):
+        return "This tool is unavailable."
     # Defensive guard: request_confirmation must be intercepted by the caller
     # loop before reaching execute_tool. If it somehow lands here, return a
     # clear signal instead of falling through to unknown-tool handling.

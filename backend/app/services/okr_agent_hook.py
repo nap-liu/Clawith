@@ -14,6 +14,10 @@ from app.models.org import (
 
 async def hook_new_org_member(db: AsyncSession, member_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
     """When a new OrgMember is created or bound, bind them to the system OKR Agent if it exists."""
+    from app.core.okr_feature import okr_feature_enabled
+
+    if not okr_feature_enabled():
+        return
     okr_agent = await _get_okr_agent(db, tenant_id)
     if not okr_agent:
         return
@@ -57,6 +61,10 @@ async def sync_okr_agent_platform_members(db: AsyncSession, tenant_id: uuid.UUID
     startup/backfill path covers users who already existed before OKR was
     enabled or before the hook was introduced.
     """
+    from app.core.okr_feature import okr_feature_enabled
+
+    if not okr_feature_enabled():
+        return 0
     okr_agent = await _get_okr_agent(db, tenant_id)
     if not okr_agent:
         return 0
@@ -103,6 +111,10 @@ async def sync_okr_agent_platform_members(db: AsyncSession, tenant_id: uuid.UUID
 
 async def hook_new_agent(db: AsyncSession, new_agent_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
     """When a new company-visible agent is created, bind to OKR Agent."""
+    from app.core.okr_feature import okr_feature_enabled
+
+    if not okr_feature_enabled():
+        return
     agent_res = await db.execute(
         select(Agent)
         .where(Agent.id == new_agent_id)

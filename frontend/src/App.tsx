@@ -32,7 +32,6 @@ const AdminCompanies = lazy(() => import("./pages/AdminCompanies"));
 const OAuthCallback = lazy(() => import("./pages/OAuthCallback"));
 const OAuthAdminResult = lazy(() => import("./pages/OAuthAdminResult"));
 const SSOEntry = lazy(() => import("./pages/SSOEntry"));
-const OKR = lazy(() => import("./pages/OKR"));
 const H5AgentChat = lazy(() => import("./pages/h5/H5AgentChat"));
 const PublishedPages = lazy(() => import("./pages/PublishedPages"));
 const SkillMarket = lazy(() => import("./pages/SkillMarket"));
@@ -342,17 +341,108 @@ export default function App() {
 
   if (loading) {
     return (
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          height: "100vh",
-          color: "var(--text-tertiary)",
-        }}
-      >
-        加载中...
-      </div>
+      <>
+        {!isPublishedPageRoute && <PlatformWatermark />}
+        {!isH5Route && !isPublishedPageRoute && <NotificationBar />}
+        <Suspense
+          fallback={
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                height: "100vh",
+                color: "var(--text-tertiary)",
+              }}
+            >
+              加载中...
+            </div>
+          }
+        >
+          <Routes>
+            <Route path="/h5/agents/:agentId/chat" element={<H5AgentChat />} />
+            <Route path="/login" element={<Login />} />
+            <Route path="/forgot-password" element={<ForgotPassword />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
+            <Route path="/verify-email" element={<VerifyEmail />} />
+            <Route
+              path="/oauth/callback/:provider"
+              element={<OAuthCallback />}
+            />
+            <Route path="/oauth/admin-result" element={<OAuthAdminResult />} />
+            <Route path="/sso/entry" element={<SSOEntry />} />
+            <Route
+              path="/published-page-access"
+              element={<PublishedPageAccess />}
+            />
+            <Route
+              path="/published-page-unavailable"
+              element={<PublishedPageUnavailable />}
+            />
+            <Route path="/p/:shortId" element={<PublishedPageViewer />} />
+            <Route path="/setup-company" element={<CompanySetup />} />
+            <Route
+              path="/onboarding"
+              element={
+                <ProtectedRoute>
+                  <Onboarding />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/"
+              element={
+                <ProtectedRoute>
+                  <Layout />
+                </ProtectedRoute>
+              }
+            >
+              <Route index element={<Navigate to="/explore" replace />} />
+              <Route path="explore" element={<Explore />} />
+              <Route path="dashboard" element={<Dashboard />} />
+              <Route path="plaza" element={<Plaza />} />
+              <Route path="agents/new" element={<AgentCreate />} />
+              <Route
+                path="agents/:id"
+                element={<Navigate to="chat" replace />}
+              />
+              <Route path="agents/:id/chat" element={<AgentDetail />} />
+              <Route path="agents/:id/settings" element={<AgentDetail />} />
+              <Route path="messages" element={<Messages />} />
+              <Route path="published-pages" element={<PublishedPages />} />
+              <Route path="projects" element={<ProjectPortfolioPage />} />
+              <Route
+                path="projects/templates"
+                element={<ProjectTemplatesPage />}
+              />
+              <Route path="projects/new" element={<ProjectCreatePage />} />
+              <Route
+                path="projects/:projectId/planning"
+                element={<ProjectPlanningPage />}
+              />
+              <Route
+                path="projects/:projectId/*"
+                element={<ProjectWorkspacePage />}
+              />
+              <Route path="skill-market" element={<SkillMarket />} />
+              <Route
+                path="enterprise"
+                element={
+                  <CompanyAdminRoute>
+                    <EnterpriseSettings />
+                  </CompanyAdminRoute>
+                }
+              />
+              <Route path="okr" element={<Navigate to="/explore" replace />} />
+              <Route path="invitations" element={<InvitationCodes />} />
+              <Route
+                path="admin/platform-settings"
+                element={<AdminCompanies />}
+              />
+            </Route>
+          </Routes>
+        </Suspense>
+      </>
     );
   }
 
@@ -443,7 +533,7 @@ export default function App() {
                 </CompanyAdminRoute>
               }
             />
-            <Route path="okr" element={<OKR />} />
+            <Route path="okr" element={<Navigate to="/explore" replace />} />
             <Route path="invitations" element={<InvitationCodes />} />
             <Route
               path="admin/platform-settings"

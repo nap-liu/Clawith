@@ -93,6 +93,28 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
     from app.services.llm import call_llm
+    from app.core.okr_feature import partition_retired_okr_triggers
+
+    retired_triggers, active_triggers = partition_retired_okr_triggers(triggers)
+    if retired_triggers:
+        retired_execution_ids: list[uuid.UUID] = []
+        for trigger in retired_triggers:
+            execution_id = (trigger.config or {}).get("_execution_id")
+            if execution_id:
+                try:
+                    retired_execution_ids.append(uuid.UUID(str(execution_id)))
+                except (ValueError, TypeError):
+                    pass
+        if retired_execution_ids:
+            await mark_trigger_executions_completed(retired_execution_ids)
+        triggers = active_triggers
+        logger.info(
+            "Skipped %s retired system trigger(s) for agent %s",
+            len(retired_triggers),
+            agent_id,
+        )
+        if not triggers:
+            return
 
     try:
         execution_ids = [
@@ -106,6 +128,12 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             if not agent or agent.is_expired:
                 if execution_ids:
                     await mark_trigger_executions_failed(execution_ids, "Agent not found or is expired")
+                return
+            from app.core.okr_feature import is_retired_okr_agent
+
+            if await is_retired_okr_agent(db, agent):
+                if execution_ids:
+                    await mark_trigger_executions_completed(execution_ids)
                 return
 
             if not agent.primary_model_id:

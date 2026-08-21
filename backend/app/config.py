@@ -164,6 +164,9 @@ class Settings(BaseSettings):
 
     # Feature flags
     MCP_USE_LEGACY_COLLECTOR: bool = False
+    # Retired product surface. Keep the implementation and historical data
+    # available for a controlled rollback, but default every process to off.
+    OKR_FEATURE_ENABLED: bool = False
 
     # Sandbox configuration
     SANDBOX_TYPE: SandboxType = SandboxType.SUBPROCESS

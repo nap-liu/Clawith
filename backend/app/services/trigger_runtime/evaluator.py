@@ -581,6 +581,10 @@ async def handle_okr_report_trigger(
 ) -> bool:
     if trigger.name not in {"daily_okr_report", "weekly_okr_report", "monthly_okr_report"}:
         return False
+    from app.core.okr_feature import is_retired_okr_trigger
+
+    if is_retired_okr_trigger(trigger.name, trigger.agent_id):
+        return True
 
     from zoneinfo import ZoneInfo
     from app.models.okr import OKRSettings
@@ -632,6 +636,10 @@ async def handle_okr_report_trigger(
 async def handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if trigger.name != "daily_okr_collection":
         return False
+    from app.core.okr_feature import is_retired_okr_trigger
+
+    if is_retired_okr_trigger(trigger.name, trigger.agent_id):
+        return True
 
     from app.models.okr import OKRSettings
     from app.services.okr_daily_collection import trigger_daily_collection_for_tenant
@@ -676,6 +684,10 @@ def is_private_url(url: str) -> bool:
 
 
 async def evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
+    from app.core.okr_feature import is_retired_okr_trigger
+
+    if is_retired_okr_trigger(trigger.name, trigger.agent_id):
+        return False
     if not trigger.is_enabled:
         return False
     if trigger.expires_at and now >= trigger.expires_at:

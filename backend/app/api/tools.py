@@ -6,9 +6,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import String, cast, delete, or_, select
+from sqlalchemy import String, and_, cast, delete, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_feature_enabled
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.mcp_server import MCPServer
@@ -90,7 +91,22 @@ def _reject_required_tool_disable(tool: Tool, enabled: bool | None) -> None:
 
 def _globally_visible_tool_clause():
     """Include required protocol tools even if legacy data marked them disabled."""
-    return or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES))
+    enabled_clause = or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES))
+    if okr_feature_enabled():
+        return enabled_clause
+    return and_(enabled_clause, Tool.name.not_in(OKR_TOOL_NAMES))
+
+
+def _feature_visible_tool_clause():
+    if okr_feature_enabled():
+        return true()
+    return Tool.name.not_in(OKR_TOOL_NAMES)
+
+
+def _require_feature_visible_tool(tool: Tool | None) -> Tool:
+    if tool is None or is_retired_okr_tool(tool.name):
+        raise HTTPException(status_code=404, detail="Tool not found")
+    return tool
 
 
 async def _load_agent_for_tool_scope(db: AsyncSession, agent_id: uuid.UUID):
@@ -232,7 +248,7 @@ async def list_tools(
     """List platform tools scoped by tenant (builtin + tenant-specific)."""
     query = (
         select(Tool)
-        .where(Tool.source.in_(["builtin", "admin"]))
+        .where(_feature_visible_tool_clause(), Tool.source.in_(["builtin", "admin"]))
         .order_by(Tool.category, Tool.name)
     )
     # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific tools
@@ -336,7 +352,9 @@ async def update_tools_bulk(
     """Bulk update the enabled status of multiple tools."""
     _require_platform_admin(current_user)
     tool_ids = [uuid.UUID(u.tool_id) for u in updates]
-    result = await db.execute(select(Tool).where(Tool.id.in_(tool_ids)))
+    result = await db.execute(
+        select(Tool).where(Tool.id.in_(tool_ids), _feature_visible_tool_clause())
+    )
     tools_map = {str(t.id): t for t in result.scalars().all()}
 
     # Validate the complete request before mutating anything so a mixed batch
@@ -487,9 +505,7 @@ async def update_tool(
 ):
     """Update a tool."""
     result = await db.execute(select(Tool).where(Tool.id == tool_id))
-    tool = result.scalar_one_or_none()
-    if not tool:
-        raise HTTPException(status_code=404, detail="Tool not found")
+    tool = _require_feature_visible_tool(result.scalar_one_or_none())
 
     update_data = data.model_dump(exclude_unset=True)
     target_tenant_id = _resolve_target_tenant_id(current_user, update_data.pop("tenant_id", None))
@@ -534,9 +550,7 @@ async def delete_tool(
 ):
     """Delete a tool (only non-builtin)."""
     result = await db.execute(select(Tool).where(Tool.id == tool_id))
-    tool = result.scalar_one_or_none()
-    if not tool:
-        raise HTTPException(status_code=404, detail="Tool not found")
+    tool = _require_feature_visible_tool(result.scalar_one_or_none())
     if tool.type == "builtin":
         raise HTTPException(status_code=400, detail="Cannot delete builtin tools")
     if tool.tenant_id is None:
@@ -665,6 +679,7 @@ async def update_agent_tools(
         tool_r = await db.execute(
             select(Tool).where(
                 Tool.id == tool_id,
+                _feature_visible_tool_clause(),
                 _agent_visible_tool_clause(agent_obj.tenant_id, assignments),
             )
         )
@@ -891,6 +906,8 @@ async def get_agent_tool_config(
     assignments = await _load_agent_tool_assignments(db, agent_id)
     tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = tool_r.scalar_one_or_none()
+    if tool and is_retired_okr_tool(tool.name):
+        tool = None
     if not tool or not _tool_record_visible_to_agent(
         tool, agent.tenant_id, assignments
     ):
@@ -950,6 +967,8 @@ async def update_agent_tool_config(
     # Encrypt sensitive fields using the tool's config_schema for field type awareness
     tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool_for_schema = tool_r2.scalar_one_or_none()
+    if tool_for_schema and is_retired_okr_tool(tool_for_schema.name):
+        tool_for_schema = None
     assignments = await _load_agent_tool_assignments(db, agent_id)
     if not tool_for_schema or not _tool_record_visible_to_agent(
         tool_for_schema, agent.tenant_id, assignments
@@ -1147,6 +1166,9 @@ async def get_category_config(
     Sensitive fields in global_config are masked for display.
     Company-level values always take precedence at runtime.
     """
+    if not okr_feature_enabled() and category == "okr":
+        raise HTTPException(status_code=404, detail="Tool category not found")
+
     from app.core.permissions import check_agent_access
     from app.models.channel_config import ChannelConfig
 
@@ -1230,6 +1252,9 @@ async def update_category_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Update or create shared configuration for a tool category."""
+    if not okr_feature_enabled() and category == "okr":
+        raise HTTPException(status_code=404, detail="Tool category not found")
+
     from app.core.permissions import check_agent_access, is_agent_creator
     from app.models.channel_config import ChannelConfig
 
@@ -1288,6 +1313,9 @@ async def delete_category_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Remove shared configuration for a tool category."""
+    if not okr_feature_enabled() and category == "okr":
+        raise HTTPException(status_code=404, detail="Tool category not found")
+
     from app.core.permissions import check_agent_access, is_agent_creator
     from app.models.channel_config import ChannelConfig
 
@@ -1312,6 +1340,9 @@ async def test_category_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Test connectivity for a tool category."""
+    if not okr_feature_enabled() and category == "okr":
+        raise HTTPException(status_code=404, detail="Tool category not found")
+
     if category == "atlassian":
         from app.api.atlassian import test_atlassian_channel
         return await test_atlassian_channel(agent_id, current_user, db)

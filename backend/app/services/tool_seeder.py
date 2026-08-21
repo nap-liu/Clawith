@@ -4,6 +4,7 @@ from loguru import logger
 from sqlalchemy import select
 
 from app.config import get_settings
+from app.core.okr_feature import OKR_TOOL_NAMES, okr_feature_enabled
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
@@ -74,9 +75,16 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
 FORCE_DISABLED_BUILTIN_CATEGORIES = {"agentbay"}
 
 
+def builtin_tool_forced_disabled(seed: dict) -> bool:
+    return bool(
+        seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES
+        or (not okr_feature_enabled() and seed.get("name") in OKR_TOOL_NAMES)
+    )
+
+
 def builtin_tool_enabled(seed: dict) -> bool:
     """Return the canonical global enabled state for a builtin seed."""
-    if seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES:
+    if builtin_tool_forced_disabled(seed):
         return False
     return bool(seed.get("enabled", True))
 
@@ -85,7 +93,7 @@ def should_sync_builtin_default(seed: dict) -> bool:
     """Whether an existing row must follow the seed's default flag."""
     return (
         seed.get("name") in SYNC_IS_DEFAULT_TOOL_NAMES
-        or seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES
+        or builtin_tool_forced_disabled(seed)
     )
 
 
@@ -4980,6 +4988,7 @@ async def seed_builtin_tools():
         for t in BUILTIN_TOOLS:
             seed_config = _global_builtin_config(t)
             seed_enabled = builtin_tool_enabled(t)
+            seed_is_default = False if builtin_tool_forced_disabled(t) else t["is_default"]
             result = await db.execute(select(Tool).where(Tool.name == t["name"]))
             existing = result.scalar_one_or_none()
             if not existing:
@@ -4991,7 +5000,7 @@ async def seed_builtin_tools():
                     category=t["category"],
                     icon=t["icon"],
                     enabled=seed_enabled,
-                    is_default=t["is_default"],
+                    is_default=seed_is_default,
                     parameters_schema=t.get("parameters_schema", {"type": "object", "properties": {}}),
                     config=seed_config,
                     config_schema=t.get("config_schema", {}),
@@ -5001,7 +5010,7 @@ async def seed_builtin_tools():
                 await db.flush()  # get tool.id
                 if tool_is_required(t["name"]):
                     required_tool_ids.add(tool.id)
-                if t["is_default"]:
+                if seed_is_default:
                     new_tool_ids.append(tool.id)
                 logger.info(f"[ToolSeeder] Created builtin tool: {t['name']}")
             else:
@@ -5024,16 +5033,16 @@ async def seed_builtin_tools():
                 if existing.icon != t["icon"]:
                     existing.icon = t["icon"]
                     updated_fields.append("icon")
-                if should_sync_builtin_default(t) and existing.is_default != t["is_default"]:
-                    existing.is_default = t["is_default"]
+                if should_sync_builtin_default(t) and existing.is_default != seed_is_default:
+                    existing.is_default = seed_is_default
                     updated_fields.append("is_default")
                     # A builtin that becomes default-on must receive explicit
                     # assignments for existing Agents too. Existing rows,
                     # including manual opt-outs, are preserved below.
-                    if t["is_default"]:
+                    if seed_is_default:
                         new_tool_ids.append(existing.id)
                 if (
-                    t["category"] in FORCE_DISABLED_BUILTIN_CATEGORIES
+                    builtin_tool_forced_disabled(t)
                     and existing.enabled != seed_enabled
                 ):
                     existing.enabled = seed_enabled

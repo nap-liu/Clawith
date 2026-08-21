@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Tuple
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, false, or_, select
+from sqlalchemy import and_, false, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentPermission
@@ -42,6 +42,10 @@ def build_visible_agents_query(
       explicitly added to a ``custom`` roster they're on.
     """
     stmt = select(Agent).where(Agent.is_deleted.is_(False))
+    from app.core.okr_feature import hidden_okr_agent_clause, okr_feature_enabled
+
+    if not okr_feature_enabled():
+        stmt = stmt.where(not_(hidden_okr_agent_clause(Agent)))
 
     target_tenant_id = tenant_id if tenant_id is not None else user.tenant_id
     if target_tenant_id is None:
@@ -612,6 +616,13 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = result.scalar_one_or_none()
     if not agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+
+    from app.core.okr_feature import is_retired_okr_agent
+
+    if await is_retired_okr_agent(db, agent):
+        # Deliberately indistinguishable from an unknown Agent for every role,
+        # including platform administrators and stale direct links.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
     # Platform admins are the only role with intentional cross-tenant access.
