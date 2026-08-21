@@ -12,16 +12,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.models.user import Identity, User  # noqa: F401
+from app.database import async_session, engine
 from app.models.agent import Agent
-from app.models.tenant import Tenant  # noqa: F401
-from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
-from app.models.participant import Participant  # noqa: F401
 from app.models.audit import ChatMessage  # noqa: F401
 from app.models.chat_session import ChatSession
-from app.database import async_session, engine
+from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
+from app.models.participant import Participant  # noqa: F401
+from app.models.tenant import Tenant  # noqa: F401
+from app.models.user import Identity, User  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
 
@@ -268,3 +268,171 @@ async def test_p2p_session_still_visible_in_scope_mine_for_owner():
     s = matches[0]
     assert s.is_group is False
     assert s.participant_type == "user"
+
+
+async def test_other_session_pages_filter_viewer_before_offset_and_load_without_gaps():
+    from app.api.chat_sessions import list_sessions
+
+    run = uuid.uuid4().hex[:8]
+    admin = await _seed_user(f"admin_{run}", "Admin", role="org_admin")
+    other_user = await _seed_user(f"other_{run}", "Other")
+    agent_id = await _seed_agent(admin.id)
+
+    own_session_ids = [
+        await _seed_p2p_session(agent_id, admin.id, f"own_{run}_{index}")
+        for index in range(5)
+    ]
+    other_session_ids = [
+        await _seed_p2p_session(agent_id, other_user.id, f"other_{run}_{index}")
+        for index in range(5)
+    ]
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk([
+        {
+            "id": uuid.uuid4(),
+            "agent_id": agent_id,
+            "user_id": admin.id if session_id in own_session_ids else other_user.id,
+            "role": "user",
+            "content": "page me",
+            "conv_id": str(session_id),
+            "created_at": now + timedelta(seconds=index),
+        }
+        for index, session_id in enumerate([*own_session_ids, *other_session_ids])
+    ])
+
+    async with async_session() as db:
+        loaded_mine_ids: list[str] = []
+        mine_cursor = None
+        for expected_has_more in (True, True, False):
+            page = await list_sessions(
+                agent_id=agent_id,
+                scope="mine",
+                limit=2,
+                cursor=mine_cursor,
+                paginated=True,
+                current_user=admin,
+                db=db,
+            )
+            assert page.has_more is expected_has_more
+            assert page.next_offset is None
+            loaded_mine_ids.extend(item.id for item in page.items)
+            mine_cursor = page.next_cursor
+
+        loaded_ids: list[str] = []
+        cursor = None
+        for expected_has_more in (True, True, False):
+            page = await list_sessions(
+                agent_id=agent_id,
+                scope="all",
+                limit=2,
+                cursor=cursor,
+                paginated=True,
+                exclude_mine=True,
+                current_user=admin,
+                db=db,
+            )
+            assert page.has_more is expected_has_more
+            assert page.next_offset is None
+            loaded_ids.extend(item.id for item in page.items)
+            cursor = page.next_cursor
+
+    assert len(loaded_mine_ids) == 5
+    assert len(set(loaded_mine_ids)) == 5
+    assert set(loaded_mine_ids) == {str(session_id) for session_id in own_session_ids}
+    assert len(loaded_ids) == 5
+    assert len(set(loaded_ids)) == 5
+    assert set(loaded_ids) == {str(session_id) for session_id in other_session_ids}
+
+
+async def test_session_cursor_snapshot_is_stable_when_activity_changes_between_pages():
+    from app.api.chat_sessions import list_sessions
+
+    run = uuid.uuid4().hex[:8]
+    owner = await _seed_user(f"cursor_{run}", "Cursor Owner")
+    agent_id = await _seed_agent(owner.id)
+    initial_ids = [
+        await _seed_p2p_session(agent_id, owner.id, f"cursor_{run}_{index}")
+        for index in range(6)
+    ]
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk([
+        {
+            "id": uuid.uuid4(), "agent_id": agent_id, "user_id": owner.id,
+            "role": "user", "content": "cursor page", "conv_id": str(session_id),
+            "created_at": now + timedelta(seconds=index),
+        }
+        for index, session_id in enumerate(initial_ids)
+    ])
+
+    async with async_session() as db:
+        first = await list_sessions(
+            agent_id=agent_id, scope="mine", limit=2, paginated=True,
+            current_user=owner, db=db,
+        )
+        assert first.has_more is True
+        assert first.next_cursor
+        assert first.next_offset is None
+        loaded_ids = [item.id for item in first.items]
+        unseen_id = next(session_id for session_id in initial_ids if str(session_id) not in loaded_ids)
+        await db.execute(update(ChatSession).where(ChatSession.id == unseen_id).values(
+            last_message_at=now + timedelta(days=1),
+        ))
+        await db.commit()
+
+        inserted_id = await _seed_p2p_session(agent_id, owner.id, f"cursor_new_{run}")
+        await _insert_messages_bypass_fk([{
+            "id": uuid.uuid4(), "agent_id": agent_id, "user_id": owner.id,
+            "role": "user", "content": "new after snapshot", "conv_id": str(inserted_id),
+            "created_at": now + timedelta(days=2),
+        }])
+
+        cursor = first.next_cursor
+        while cursor:
+            page = await list_sessions(
+                agent_id=agent_id, scope="mine", limit=2, cursor=cursor,
+                paginated=True, current_user=owner, db=db,
+            )
+            loaded_ids.extend(item.id for item in page.items)
+            cursor = page.next_cursor
+
+    assert len(loaded_ids) == len(set(loaded_ids)) == len(initial_ids)
+    assert set(loaded_ids) == {str(session_id) for session_id in initial_ids}
+    assert str(inserted_id) not in loaded_ids
+
+
+async def test_other_sessions_exclude_groups_the_viewer_has_joined():
+    from app.api.chat_sessions import list_sessions
+
+    run = uuid.uuid4().hex[:8]
+    admin = await _seed_user(f"group_admin_{run}", "Group Admin", role="org_admin")
+    other = await _seed_user(f"group_other_{run}", "Group Other")
+    agent_id = await _seed_agent(admin.id)
+    own_group_id = await _seed_group_session(agent_id, admin.id, f"own_group_{run}")
+    other_group_id = await _seed_group_session(agent_id, other.id, f"other_group_{run}")
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk([
+        {
+            "id": uuid.uuid4(), "agent_id": agent_id, "user_id": admin.id,
+            "sender_user_id": admin.id, "role": "user", "content": "my group message",
+            "conv_id": str(own_group_id), "created_at": now,
+        },
+        {
+            "id": uuid.uuid4(), "agent_id": agent_id, "user_id": other.id,
+            "sender_user_id": other.id, "role": "user", "content": "other group message",
+            "conv_id": str(other_group_id), "created_at": now + timedelta(seconds=1),
+        },
+    ])
+
+    async with async_session() as db:
+        page = await list_sessions(
+            agent_id=agent_id,
+            scope="all",
+            limit=2,
+            offset=0,
+            paginated=True,
+            exclude_mine=True,
+            current_user=admin,
+            db=db,
+        )
+
+    assert [item.id for item in page.items] == [str(other_group_id)]

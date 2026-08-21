@@ -60,7 +60,7 @@ const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
         ),
         identity: (_context, data) => {
             const run = data as SubagentRunCardData;
-            return [run.sessionId || '', run.status, run.task || '', run.mode || '', run.model || '', String(run.fork)].join('\u0000');
+            return [run.sessionId || '', run.status, run.name || '', run.task || '', run.mode || '', run.model || '', String(run.fork), String(run.soul), String(run.memory)].join('\u0000');
         },
     },
     {

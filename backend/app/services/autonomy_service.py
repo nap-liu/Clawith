@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
@@ -25,7 +25,14 @@ class AutonomyService:
     """Enforce autonomy boundaries for agent operations."""
 
     async def check_and_enforce(
-        self, db: AsyncSession, agent: Agent, action_type: str, details: dict
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        action_type: str,
+        details: dict,
+        *,
+        forced_level: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict:
         """Check if an action is allowed under the agent's autonomy policy.
 
@@ -38,7 +45,10 @@ class AutonomyService:
             }
         """
         policy = agent.autonomy_policy or {}
-        level = policy.get(action_type, "L2")  # Default to L2
+        level = forced_level or policy.get(action_type, "L2")  # Default to L2
+        details = dict(details)
+        if idempotency_key:
+            details["idempotency_key"] = idempotency_key
 
         # Log the action regardless of level
         audit = AuditLog(
@@ -68,6 +78,29 @@ class AutonomyService:
             }
 
         elif level == "L3":
+            if idempotency_key:
+                # Serialize lookup + creation so a replayed tool call has one
+                # durable approval request across workers.
+                await db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:approval_key, 0))"),
+                    {"approval_key": idempotency_key},
+                )
+                existing = await db.scalar(
+                    select(ApprovalRequest).where(
+                        ApprovalRequest.agent_id == agent.id,
+                        ApprovalRequest.action_type == action_type,
+                        ApprovalRequest.details["idempotency_key"].as_string() == idempotency_key,
+                    )
+                )
+                if existing:
+                    return {
+                        "allowed": False,
+                        "level": "L3",
+                        "approval_id": str(existing.id),
+                        "approval_status": existing.status,
+                        "message": "Approval request already exists",
+                    }
+
             # Create approval request and block
             approval = ApprovalRequest(
                 agent_id=agent.id,

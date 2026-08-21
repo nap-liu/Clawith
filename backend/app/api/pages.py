@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import logging
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -15,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.config import get_settings
-from app.core.permissions import build_visible_agents_query
+from app.core.permissions import build_visible_agents_query, is_platform_admin_user
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
@@ -46,7 +47,9 @@ PUBLIC_VISITOR_COOKIE = "published_page_visitor"
 PUBLIC_VISITOR_COOKIE_MAX_AGE = 365 * 24 * 3600
 MAX_ANONYMOUS_VISITORS_PER_PAGE = 10_000
 ANONYMOUS_VISITOR_OVERFLOW_KEY = "0" * 64
+MAX_BULK_PAGE_ACCESS_UPDATES = 100
 PUBLISHED_PAGE_UNAVAILABLE_PATH = "/published-page-unavailable"
+logger = logging.getLogger(__name__)
 
 
 class PageSessionRequest(BaseModel):
@@ -56,6 +59,10 @@ class PageSessionRequest(BaseModel):
 class PageAccessUpdate(BaseModel):
     access_mode: str
     allowed_user_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class PageBulkAccessUpdate(PageAccessUpdate):
+    page_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=MAX_BULK_PAGE_ACCESS_UPDATES)
 
 
 class PageRequestResolution(BaseModel):
@@ -107,6 +114,27 @@ def _anonymous_visitor(request: Request, page_id: uuid.UUID) -> tuple[str, str |
         hashlib.sha256,
     ).hexdigest()
     return visitor_key, new_cookie
+
+
+def _public_watermark_text(visitor_key: str, accessed_at: datetime) -> str:
+    """Build the anonymous label rendered by the platform-owned viewer layer."""
+    accessed_at_text = accessed_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return f"匿名访客 {visitor_key[:12].upper()} · {accessed_at_text}"
+
+
+def _set_public_visitor_cookie(response: Response, value: str, request: Request) -> None:
+    response.set_cookie(
+        PUBLIC_VISITOR_COOKIE,
+        value,
+        max_age=PUBLIC_VISITOR_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
+        # The viewer context and iframe content live under /api/pages, so the
+        # opaque visitor cookie must be available outside /p/. The page-scoped
+        # HMAC remains the identifier persisted and displayed by the backend.
+        path="/",
+    )
 
 
 async def _record_anonymous_view(db: AsyncSession, page_id: uuid.UUID, visitor_key: str) -> None:
@@ -196,32 +224,74 @@ async def _record_view(
         await _record_anonymous_view(db, page.id, anonymous_visitor_key)
 
 
+async def _render_viewer_content(
+    db: AsyncSession,
+    page: PublishedPage,
+    user: User | None,
+    request: Request,
+) -> HTMLResponse:
+    storage = get_storage_backend()
+    storage_key = _page_storage_key(page)
+    html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+    anonymous_visitor_key = None
+    new_visitor_cookie = None
+    if user is None:
+        anonymous_visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+    await _record_view(db, page, user, anonymous_visitor_key)
+    await db.commit()
+    content_response = HTMLResponse(
+        html_content,
+        headers={
+            "Cache-Control": "no-store",
+            # Resource origins stay unrestricted so published reports can use
+            # third-party scripts, styles, fonts, media, and API endpoints.
+            # The frontend iframe owns the execution sandbox; this header only
+            # prevents the document from being framed off-platform.
+            "Content-Security-Policy": "frame-ancestors 'self'",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+    if new_visitor_cookie:
+        _set_public_visitor_cookie(content_response, new_visitor_cookie, request)
+    return content_response
+
+
 @public_router.get("/p/{short_id}")
 async def render_page(short_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     page = await db.scalar(select(PublishedPage).where(PublishedPage.short_id == short_id))
     if not page:
         return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
 
-    storage = get_storage_backend()
-    storage_key = _page_storage_key(page)
     if not await _page_source_exists(page):
         return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
 
-    user = await page_user_from_session(db, request.cookies.get(PAGE_SESSION_COOKIE))
+    user = (
+        None
+        if page.access_mode == "public"
+        else await page_user_from_session(db, request.cookies.get(PAGE_SESSION_COOKIE))
+    )
     if page.access_mode != "public" and user is None:
         return _access_ui_redirect(page, request)
     if not await can_view_page(db, page, user):
         return _access_ui_redirect(page, request, denied=True)
 
-    # Public pages intentionally keep the original direct-rendering path. This
-    # preserves every existing public report's URL, document context, and HTML
-    # behavior byte-for-byte. Protected pages use the frontend viewer so the
-    # platform can keep the identity watermark outside the report document.
+    # Keep the report's historical /p/<short_id> document URL inside the
+    # viewer iframe. This preserves SDK short-ID detection and relative URL
+    # resolution without allowing a top-level watermark bypass.
+    if (
+        request.query_params.get("__report_embed") == "1"
+        and request.headers.get("sec-fetch-dest", "").lower() == "iframe"
+    ):
+        return await _render_viewer_content(db, page, user, request)
+
+    # Every access mode uses the platform-owned viewer. The report runs in a
+    # sandboxed iframe, so its DOM and CSP cannot remove or corrupt the parent
+    # watermark layer. Viewer failures remain independent from content loading.
+    viewer_response = Response(headers={
+        "X-Accel-Redirect": "/__published_page_viewer",
+        "Cache-Control": "no-store",
+    })
     if page.access_mode != "public":
-        viewer_response = Response(headers={
-            "X-Accel-Redirect": "/__published_page_viewer",
-            "Cache-Control": "no-store",
-        })
         # Viewer API calls need the root-scoped cookie. Keep the token HttpOnly
         # and renew it only after this route has already authorized the viewer.
         viewer_response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
@@ -234,35 +304,11 @@ async def render_page(short_id: str, request: Request, db: AsyncSession = Depend
             secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
             path="/",
         )
-        return viewer_response
-
-    html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
-
-    anonymous_visitor_key = None
-    new_visitor_cookie = None
-    if user is None or user.tenant_id != page.tenant_id:
-        anonymous_visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
-    await _record_view(db, page, user, anonymous_visitor_key)
-    await db.commit()
-    csp = "sandbox allow-scripts allow-forms allow-popups allow-modals"
-    if "/sdk/clawith.js" in html_content:
-        csp += " allow-top-navigation"
-    page_response = HTMLResponse(content=html_content, headers={
-        "Content-Security-Policy": csp,
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "no-store" if page.access_mode != "public" else "no-cache",
-    })
-    if new_visitor_cookie:
-        page_response.set_cookie(
-            PUBLIC_VISITOR_COOKIE,
-            new_visitor_cookie,
-            max_age=PUBLIC_VISITOR_COOKIE_MAX_AGE,
-            httponly=True,
-            samesite="lax",
-            secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
-            path="/p/",
-        )
-    return page_response
+    else:
+        _visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+        if new_visitor_cookie:
+            _set_public_visitor_cookie(viewer_response, new_visitor_cookie, request)
+    return viewer_response
 
 
 @router.post("/session")
@@ -309,14 +355,16 @@ async def clear_render_session(response: Response):
     return {"ok": True}
 
 
-async def _protected_viewer_page(
+async def _viewer_page(
     short_id: str,
     request: Request,
     db: AsyncSession,
-) -> tuple[PublishedPage, User]:
+) -> tuple[PublishedPage, User | None]:
     page = await db.scalar(select(PublishedPage).where(PublishedPage.short_id == short_id))
-    if not page or page.access_mode == "public":
-        raise HTTPException(404, "Protected page not found")
+    if not page:
+        raise HTTPException(404, "Published page not found")
+    if page.access_mode == "public":
+        return page, None
     user = await page_user_from_session(db, request.cookies.get(PAGE_SESSION_COOKIE))
     if user is None:
         raise HTTPException(401, "Page session expired")
@@ -329,24 +377,39 @@ async def _protected_viewer_page(
 async def get_page_viewer_context(
     short_id: str,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    page, user = await _protected_viewer_page(short_id, request, db)
-    storage = get_storage_backend()
-    storage_key = _page_storage_key(page)
+    page, user = await _viewer_page(short_id, request, db)
     if not await _page_source_exists(page):
         raise HTTPException(status_code=404, detail="Source file no longer exists")
-    html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
-    identity = await db.get(Identity, user.identity_id) if user.identity_id else None
-    return {
-        "title": page.title or page.source_path,
-        "access_mode": page.access_mode,
-        "watermark_identity": {
+    watermark_identity = None
+    watermark_text = None
+    if user is None:
+        visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+        try:
+            watermark_text = _public_watermark_text(visitor_key, datetime.now(timezone.utc))
+        except Exception:
+            # Watermark formatting is deliberately fail-open: the viewer still
+            # receives its context and renders the independent content iframe.
+            logger.exception("Failed to build public page watermark", extra={"page_id": str(page.id)})
+        if new_visitor_cookie:
+            _set_public_visitor_cookie(response, new_visitor_cookie, request)
+    else:
+        identity = await db.get(Identity, user.identity_id) if user.identity_id else None
+        watermark_identity = {
             "display_name": user.display_name,
             "username": identity.username if identity else None,
             "primary_mobile": identity.phone if identity else None,
-        },
-        "allow_top_navigation": "/sdk/clawith.js" in html_content,
+        }
+    return {
+        "title": page.title or page.source_path,
+        "access_mode": page.access_mode,
+        "watermark_identity": watermark_identity,
+        "watermark_text": watermark_text,
+        # Published content must never replace the platform-owned viewer,
+        # regardless of whether an older report happens to reference the SDK.
+        "allow_top_navigation": False,
     }
 
 
@@ -356,26 +419,16 @@ async def get_page_viewer_content(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    page, user = await _protected_viewer_page(short_id, request, db)
-    storage = get_storage_backend()
-    storage_key = _page_storage_key(page)
+    # The raw report is an implementation detail of the platform viewer. A
+    # top-level navigation would bypass its watermark, so only a browser-owned
+    # iframe request may receive the source document. Fetch Metadata headers
+    # cannot be forged by page JavaScript in supported browsers.
+    if request.headers.get("sec-fetch-dest", "").lower() != "iframe":
+        return RedirectResponse(f"/p/{short_id}", status_code=302)
+    page, user = await _viewer_page(short_id, request, db)
     if not await _page_source_exists(page):
         raise HTTPException(status_code=404, detail="Source file no longer exists")
-    html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
-    await _record_view(db, page, user)
-    await db.commit()
-    return HTMLResponse(
-        html_content,
-        headers={
-            "Cache-Control": "no-store",
-            # Resource origins stay unrestricted so published reports can use
-            # third-party scripts, styles, fonts, media, and API endpoints.
-            # The frontend iframe owns the execution sandbox; this header only
-            # prevents the protected document from being framed off-platform.
-            "Content-Security-Policy": "frame-ancestors 'self'",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    return await _render_viewer_content(db, page, user, request)
 
 
 @router.post("/{short_id}/request-access")
@@ -576,10 +629,14 @@ async def list_page_agent_options(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    visible_agents = (await db.scalars(
-        build_visible_agents_query(current_user, tenant_id=current_user.tenant_id)
-        .order_by(Agent.name.asc(), Agent.id.asc())
-    )).all()
+    if is_platform_admin_user(current_user) or current_user.role == "org_admin":
+        query = select(Agent).where(
+            Agent.tenant_id == current_user.tenant_id,
+            Agent.is_deleted.is_(False),
+        )
+    else:
+        query = build_visible_agents_query(current_user, tenant_id=current_user.tenant_id)
+    visible_agents = (await db.scalars(query.order_by(Agent.name.asc(), Agent.id.asc()))).all()
     return [{"id": str(option.id), "name": option.name} for option in visible_agents]
 
 
@@ -593,10 +650,12 @@ async def list_my_pages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    base_conditions = [
-        or_(PublishedPage.tenant_id == current_user.tenant_id, PublishedPage.tenant_id.is_(None)),
-        or_(Agent.creator_id == current_user.id, PublishedPage.user_id == current_user.id),
-    ]
+    base_conditions = [or_(
+        PublishedPage.tenant_id == current_user.tenant_id,
+        and_(PublishedPage.tenant_id.is_(None), Agent.tenant_id == current_user.tenant_id),
+    )]
+    if not (is_platform_admin_user(current_user) or current_user.role == "org_admin"):
+        base_conditions.append(or_(Agent.creator_id == current_user.id, PublishedPage.user_id == current_user.id))
     conditions = list(base_conditions)
     selected_agent_ids = set(agent_ids)
     if agent_id:
@@ -706,7 +765,7 @@ async def list_page_visitors(
                 (
                     "其他匿名访客"
                     if row["visitor_key"] == ANONYMOUS_VISITOR_OVERFLOW_KEY
-                    else f"匿名访客 {row['visitor_key'][:6].upper()}"
+                    else f"匿名访客 {row['visitor_key'][:12].upper()}"
                 )
                 if row["visitor_type"] == "anonymous"
                 else row["display_name"]
@@ -924,29 +983,35 @@ async def get_page_directory_members(
     }
 
 
-@router.put("/{page_id}/access")
-async def update_page_access(
-    page_id: uuid.UUID,
-    payload: PageAccessUpdate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    if payload.access_mode not in {"public", "authenticated", "restricted"}:
+def _validate_access_mode(access_mode: str) -> None:
+    if access_mode not in {"public", "authenticated", "restricted"}:
         raise HTTPException(422, "Invalid access mode")
-    page = await db.get(PublishedPage, page_id)
-    if not page or not await can_manage_page(db, page, current_user):
-        raise HTTPException(404, "Page not found")
-    if page.tenant_id is None:
-        page.tenant_id = current_user.tenant_id
-    allowed_ids = set(payload.allowed_user_ids) if payload.access_mode == "restricted" else set()
-    if allowed_ids:
-        valid_ids = set((await db.scalars(select(User.id).where(
-            User.id.in_(allowed_ids), User.tenant_id == page.tenant_id, User.is_active.is_(True)
-        ))).all())
-        if valid_ids != allowed_ids:
-            raise HTTPException(422, "Allowed users must be active members of the same company")
 
-    page.access_mode = payload.access_mode
+
+async def _validated_allowed_user_ids(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    payload: PageAccessUpdate,
+) -> set[uuid.UUID]:
+    allowed_ids = set(payload.allowed_user_ids) if payload.access_mode == "restricted" else set()
+    if not allowed_ids:
+        return allowed_ids
+    valid_ids = set((await db.scalars(select(User.id).where(
+        User.id.in_(allowed_ids), User.tenant_id == tenant_id, User.is_active.is_(True)
+    ))).all())
+    if valid_ids != allowed_ids:
+        raise HTTPException(422, "Allowed users must be active members of the same company")
+    return allowed_ids
+
+
+async def _apply_page_access_update(
+    db: AsyncSession,
+    page: PublishedPage,
+    access_mode: str,
+    allowed_ids: set[uuid.UUID],
+    current_user: User,
+) -> None:
+    page.access_mode = access_mode
     existing = (await db.scalars(select(PublishedPageAccess).where(PublishedPageAccess.page_id == page.id))).all()
     by_user = {row.user_id: row for row in existing}
     now = datetime.now(timezone.utc)
@@ -964,8 +1029,56 @@ async def update_page_access(
                 page_id=page.id, user_id=user_id, status="approved", resolved_at=now, resolved_by=current_user.id
             ))
     db.add(AuditLog(user_id=current_user.id, agent_id=page.agent_id, action="published_page_access_updated", details={
-        "page_id": str(page.id), "access_mode": payload.access_mode, "allowed_user_ids": [str(i) for i in allowed_ids]
+        "page_id": str(page.id), "access_mode": access_mode,
+        "allowed_user_ids": sorted(str(value) for value in allowed_ids),
     }))
+
+
+@router.put("/batch/access")
+async def update_pages_access(
+    payload: PageBulkAccessUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _validate_access_mode(payload.access_mode)
+    page_ids = list(dict.fromkeys(payload.page_ids))
+    pages = list((await db.scalars(
+        select(PublishedPage)
+        .where(PublishedPage.id.in_(page_ids))
+        .order_by(PublishedPage.id)
+        .with_for_update()
+    )).all())
+    if len(pages) != len(page_ids):
+        raise HTTPException(404, "One or more pages were not found")
+    for page in pages:
+        if not await can_manage_page(db, page, current_user):
+            raise HTTPException(404, "One or more pages were not found")
+        if page.tenant_id is None:
+            page.tenant_id = current_user.tenant_id
+    allowed_ids = await _validated_allowed_user_ids(db, current_user.tenant_id, payload)
+    for page in pages:
+        await _apply_page_access_update(db, page, payload.access_mode, allowed_ids, current_user)
+    await db.commit()
+    return {"updated_count": len(pages)}
+
+
+@router.put("/{page_id}/access")
+async def update_page_access(
+    page_id: uuid.UUID,
+    payload: PageAccessUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _validate_access_mode(payload.access_mode)
+    page = await db.scalar(
+        select(PublishedPage).where(PublishedPage.id == page_id).with_for_update()
+    )
+    if not page or not await can_manage_page(db, page, current_user):
+        raise HTTPException(404, "Page not found")
+    if page.tenant_id is None:
+        page.tenant_id = current_user.tenant_id
+    allowed_ids = await _validated_allowed_user_ids(db, page.tenant_id, payload)
+    await _apply_page_access_update(db, page, payload.access_mode, allowed_ids, current_user)
     await db.commit()
     # PostgreSQL updates ``updated_at`` server-side. Refresh explicitly before
     # serializing so accessing the expired attribute never triggers sync IO in

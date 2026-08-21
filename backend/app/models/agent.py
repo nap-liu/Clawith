@@ -70,6 +70,8 @@ class Agent(Base):
             "delete_files": "L3",
             "create_calendar_event": "L2",
             "financial_operations": "L3",
+            "install_skill_from_market": "L3",
+            "publish_skill_to_market": "L3",
         },
     )
 

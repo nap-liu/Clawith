@@ -45,6 +45,7 @@ export default function PublishedPageFilters({
                 searchPlaceholder="搜索数字员工"
                 noOptionsLabel="暂无可筛选的数字员工"
                 noMatchesLabel="没有匹配的数字员工"
+                clearLabel="清空已选"
                 ariaLabel="筛选数字员工"
             />
 

@@ -208,6 +208,12 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
         assert {tool.name for tool in tools} == set(SUBAGENT_TOOL_NAMES)
         assert {tool.category for tool in tools} == {"subagent"}
         run_tool = next(tool for tool in tools if tool.name == "run_subagent")
+        run_schema = run_tool.parameters_schema
+        assert run_schema["required"] == ["name", "task"]
+        assert run_schema["properties"]["soul"]["default"] is True
+        assert run_schema["properties"]["memory"]["default"] is True
+        assert "load_soul" not in run_schema["properties"]
+        assert "load_memory" not in run_schema["properties"]
 
         await update_agent_tools(
             agent_id,
@@ -251,10 +257,13 @@ async def test_create_uses_one_id_readable_model_and_idempotent_fork():
         execution_user_id=user_id,
         parent_session_id=str(parent_id),
         origin_tool_call_id="call-one",
+        name="Research helper",
         task="focused child task",
         mode="async",
         model="  readable-test-model ",
         fork=True,
+        soul=False,
+        memory=False,
         turn_anchor_id=anchor_id,
     )
     replay, replay_created = await runtime.create_subagent(
@@ -262,6 +271,7 @@ async def test_create_uses_one_id_readable_model_and_idempotent_fork():
         execution_user_id=user_id,
         parent_session_id=str(parent_id),
         origin_tool_call_id="call-one",
+        name="ignored replay name",
         task="ignored replay text",
         mode="sync",
     )
@@ -282,6 +292,9 @@ async def test_create_uses_one_id_readable_model_and_idempotent_fork():
         ).scalars().all()
     assert child is not None and child.id == lifecycle.id == run.id
     assert child.source_channel == "subagent"
+    assert child.title == "Research helper"
+    assert lifecycle.soul is False
+    assert lifecycle.memory is False
     assert [row.content for row in rows][-3:] == [
         "earlier user context",
         "earlier context",

@@ -414,6 +414,29 @@ export const chatSessionApi = {
         return request<any[]>(`/agents/${agentId}/sessions?${params.toString()}`);
     },
 
+    listPage: (agentId: string, options: {
+        scope?: 'mine' | 'all';
+        source_channel?: string;
+        limit?: number;
+        offset?: number;
+        cursor?: string;
+        exclude_mine?: boolean;
+        signal?: AbortSignal;
+    } = {}) => {
+        const params = new URLSearchParams();
+        params.set('scope', options.scope || 'mine');
+        params.set('paginated', 'true');
+        if (options.source_channel) params.set('source_channel', options.source_channel);
+        if (options.limit != null) params.set('limit', String(options.limit));
+        if (options.offset != null) params.set('offset', String(options.offset));
+        if (options.cursor) params.set('cursor', options.cursor);
+        if (options.exclude_mine) params.set('exclude_mine', 'true');
+        return request<{ items: any[]; has_more: boolean; next_offset: number | null; next_cursor: string | null }>(
+            `/agents/${agentId}/sessions?${params.toString()}`,
+            { signal: options.signal },
+        );
+    },
+
     get: (agentId: string, sessionId: string) =>
         request<Record<string, any> & { view_scope: 'mine' | 'all' }>(`/agents/${agentId}/sessions/${sessionId}`),
 
@@ -704,6 +727,60 @@ export const skillApi = {
         fromUrl: (agentId: string, url: string) =>
             request<any>(`/agents/${agentId}/files/import-from-url`, { method: 'POST', body: JSON.stringify({ url }) }),
     },
+    market: {
+        list: (q = '') => request<MarketSkill[]>(`/skills/market${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+        detail: (skillId: string) => request<MarketSkill>(`/skills/market/${skillId}`),
+        mine: () => request<MarketSkill[]>('/skills/mine'),
+        publish: (agentId: string, data: PublishMarketSkillInput) =>
+            request<MarketSkill>(`/agents/${agentId}/skills/publish`, {
+                method: 'POST',
+                body: JSON.stringify(data),
+            }),
+        install: (agentId: string, skillId: string) =>
+            request<any>(`/agents/${agentId}/skills/install`, {
+                method: 'POST',
+                body: JSON.stringify({ skill_id: skillId }),
+            }),
+        uninstall: (agentId: string, skillId: string) =>
+            request<any>(`/agents/${agentId}/skills/uninstall`, {
+                method: 'POST',
+                body: JSON.stringify({ skill_id: skillId }),
+            }),
+        offline: (skillId: string) =>
+            request<MarketSkill>(`/skills/${skillId}/offline`, { method: 'POST' }),
+        relist: (skillId: string) =>
+            request<MarketSkill>(`/skills/${skillId}/relist`, { method: 'POST' }),
+        deleteOffline: (skillId: string) =>
+            request<{ status: string; skill_id: string }>(`/skills/market/${skillId}`, { method: 'DELETE' }),
+    },
+};
+
+export type MarketSkill = {
+    id: string;
+    name: string;
+    description: string;
+    category: string;
+    icon: string;
+    folder_name: string;
+    visibility: 'tenant' | 'public';
+    status: 'draft' | 'published' | 'offline';
+    version: number;
+    downloads: number;
+    is_builtin: boolean;
+    publisher_name: string;
+    publisher_user_id?: string | null;
+    publisher_agent_id?: string | null;
+    updated_at?: string | null;
+    skill_md?: string;
+    files?: Array<{ path: string; content: string }>;
+};
+
+export type PublishMarketSkillInput = {
+    path: string;
+    name: string;
+    description: string;
+    category: string;
+    visibility: 'tenant' | 'public';
 };
 
 // ─── Triggers (Aware Engine) ──────────────────────────

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { IconFileAlert, IconLoader2 } from '@tabler/icons-react';
 import { useParams } from 'react-router-dom';
 import {
@@ -10,10 +10,12 @@ import './PublishedPageViewer.css';
 
 type ViewerContext = {
     title: string;
-    access_mode: 'authenticated' | 'restricted';
-    watermark_identity: PlatformWatermarkIdentity;
-    allow_top_navigation: boolean;
+    access_mode: 'public' | 'authenticated' | 'restricted';
+    watermark_identity: PlatformWatermarkIdentity | null;
+    watermark_text: string | null;
 };
+
+const REPORT_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads';
 
 function retryThroughPublishedUrl(shortId: string) {
     window.location.replace(`/p/${encodeURIComponent(shortId)}${window.location.search}${window.location.hash}`);
@@ -37,6 +39,7 @@ function handleViewerStatus(shortId: string, status: number): boolean {
 
 export default function PublishedPageViewer() {
     const { shortId = '' } = useParams();
+    const frameRef = useRef<HTMLIFrameElement>(null);
     const [context, setContext] = useState<ViewerContext | null>(null);
     const [error, setError] = useState('');
 
@@ -68,9 +71,37 @@ export default function PublishedPageViewer() {
     }, [shortId]);
 
     const watermarkText = useMemo(
-        () => formatPlatformWatermarkText(context?.watermark_identity),
-        [context?.watermark_identity],
+        () => context?.watermark_text || formatPlatformWatermarkText(context?.watermark_identity),
+        [context?.watermark_identity, context?.watermark_text],
     );
+
+    const iframeSrc = useMemo(() => {
+        const params = new URLSearchParams(window.location.search);
+        params.set('__report_embed', '1');
+        return `/p/${encodeURIComponent(shortId)}?${params.toString()}`;
+    }, [shortId]);
+
+    useEffect(() => {
+        const handleSdkAuthStart = (event: MessageEvent) => {
+            if (
+                event.source !== frameRef.current?.contentWindow
+                || event.data?.type !== 'published-page:sdk-auth-start'
+                || !shortId
+            ) return;
+            const returnTo = `${window.location.origin}/p/${encodeURIComponent(shortId)}`;
+            window.location.assign(`/api/sdk/auth/start?return_to=${encodeURIComponent(returnTo)}`);
+        };
+        window.addEventListener('message', handleSdkAuthStart);
+        return () => window.removeEventListener('message', handleSdkAuthStart);
+    }, [shortId]);
+
+    useEffect(() => {
+        const url = new URL(window.location.href);
+        if (!url.searchParams.has('code') && !url.searchParams.has('state')) return;
+        url.searchParams.delete('code');
+        url.searchParams.delete('state');
+        window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    }, []);
 
     useEffect(() => {
         if (!watermarkText) return;
@@ -80,12 +111,6 @@ export default function PublishedPageViewer() {
             console.warn('Unable to render the published-page watermark', watermarkError);
         }
     }, [watermarkText]);
-
-    const sandbox = useMemo(() => {
-        const capabilities = ['allow-scripts', 'allow-forms', 'allow-popups', 'allow-modals', 'allow-downloads'];
-        if (context?.allow_top_navigation) capabilities.push('allow-top-navigation');
-        return capabilities.join(' ');
-    }, [context?.allow_top_navigation]);
 
     if (error) {
         return (
@@ -110,10 +135,11 @@ export default function PublishedPageViewer() {
     return (
         <main className="published-page-viewer">
             <iframe
+                ref={frameRef}
                 className="published-page-viewer-frame"
                 title={context.title || '发布页面'}
-                sandbox={sandbox}
-                src={`/api/pages/${encodeURIComponent(shortId)}/content`}
+                sandbox={REPORT_SANDBOX}
+                src={iframeSrc}
             />
         </main>
     );

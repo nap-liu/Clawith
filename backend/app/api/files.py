@@ -1256,18 +1256,40 @@ async def import_skill_to_agent(
     Copies all files from the global skill registry into
     <agent_workspace>/skills/<folder_name>/.
     """
-    await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail="Agent manage access required")
 
+    from sqlalchemy import or_
     from sqlalchemy.orm import selectinload
-    from app.models.skill import Skill, SkillFile
+
+    from app.models.skill import Skill
 
     # Load the global skill with its files
     result = await db.execute(
-        select(Skill).where(Skill.id == body.skill_id).options(selectinload(Skill.files))
+        select(Skill)
+        .where(
+            Skill.id == body.skill_id,
+            or_(Skill.tenant_id.is_(None), Skill.tenant_id == agent.tenant_id),
+        )
+        .options(selectinload(Skill.files))
     )
     skill = result.scalar_one_or_none()
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
+
+    # Market-managed Skills use one installation path so validation, visibility,
+    # conflict handling, version tracking, and unique Agent counts cannot drift.
+    # The central service also keeps an offline Skill unavailable here.
+    if skill.status != "draft":
+        from app.services.skill_market import install_market_skill
+
+        return await install_market_skill(
+            db,
+            agent=agent,
+            skill_id=skill.id,
+            actor_user_id=current_user.id,
+        )
 
     if not skill.files:
         raise HTTPException(status_code=400, detail="Skill has no files")

@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from app.models.agent import Agent, AgentPermission
 from app.services.access_relationships import ensure_access_granted_platform_relationships
@@ -46,6 +46,38 @@ class AgentProvisionInput:
     max_tokens_per_month: int | None = None
     template_id: uuid.UUID | None = None
     skill_ids: list = field(default_factory=list)
+
+
+async def validate_requested_skill_ids(db, *, tenant_id, skill_ids: list) -> set[uuid.UUID]:
+    """Allow only legacy drafts in scope; market Skills install after creation."""
+    requested: set[uuid.UUID] = set()
+    try:
+        requested = {uuid.UUID(str(skill_id)) for skill_id in (skill_ids or [])}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("One or more selected Skills are invalid") from exc
+    if not requested:
+        return set()
+
+    from app.models.skill import Skill
+
+    allowed_scope = [
+        and_(Skill.tenant_id.is_(None), Skill.status == "draft"),
+        and_(Skill.tenant_id.is_(None), Skill.is_builtin.is_(True)),
+    ]
+    if tenant_id:
+        allowed_scope.append(and_(Skill.tenant_id == tenant_id, Skill.status == "draft"))
+    rows = await db.scalars(
+        select(Skill.id).where(
+            Skill.id.in_(requested),
+            or_(*allowed_scope),
+        )
+    )
+    allowed = set(rows.all())
+    if allowed != requested:
+        raise ValueError(
+            "One or more selected Skills are unavailable; install published Skills from the Skill market after creation"
+        )
+    return allowed
 
 
 async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) -> tuple:
@@ -83,6 +115,12 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
             # Enforce heartbeat floor: new agents must respect company minimum
             if tenant.min_heartbeat_interval_minutes and tenant.min_heartbeat_interval_minutes > default_heartbeat_interval:
                 default_heartbeat_interval = tenant.min_heartbeat_interval_minutes
+
+    requested_skill_ids = await validate_requested_skill_ids(
+        db,
+        tenant_id=tenant_id,
+        skill_ids=data.skill_ids,
+    )
 
     # If the caller didn't pick a model, fall back to the tenant's default.
     effective_primary_model_id = data.primary_model_id or tenant_default_model_id
@@ -199,7 +237,7 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
     # Always include global default skills (mcp-installer, skill-creator,
     # complex-task-executor)
     default_result = await db.execute(
-        select(Skill).where(Skill.is_default)
+        select(Skill).where(Skill.is_default, Skill.tenant_id.is_(None))
     )
     default_ids = {s.id for s in default_result.scalars().all()}
 
@@ -218,12 +256,15 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
         folder_names = list((tpl.default_skills if tpl else None) or [])
         if folder_names:
             tpl_skills_r = await db.execute(
-                select(Skill).where(Skill.folder_name.in_(folder_names))
+                select(Skill).where(
+                    Skill.tenant_id.is_(None),
+                    Skill.folder_name.in_(folder_names),
+                )
             )
             template_skill_ids = {s.id for s in tpl_skills_r.scalars().all()}
 
     # Merge user-selected + global default + template-default skill IDs
-    all_skill_ids = set(data.skill_ids or []) | default_ids | template_skill_ids
+    all_skill_ids = requested_skill_ids | default_ids | template_skill_ids
 
     if all_skill_ids:
         # Write skills through the storage backend (not the local FS) so they
@@ -240,7 +281,12 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
         agent_prefix = agent_manager._agent_storage_prefix(agent.id)
 
         skills_result = await db.execute(
-            select(Skill).where(Skill.id.in_(all_skill_ids)).options(selectinload(Skill.files))
+            select(Skill)
+            .where(
+                Skill.id.in_(all_skill_ids),
+                or_(Skill.tenant_id.is_(None), Skill.tenant_id == tenant_id),
+            )
+            .options(selectinload(Skill.files))
         )
         skills = skills_result.scalars().all()
 

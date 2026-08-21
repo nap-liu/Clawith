@@ -28,17 +28,29 @@
         "status": { "updated": "Project status updated" },
         "trace": { "repaired": "Project trace links repaired" },
         "agent": { "message": { "sent": "Project Agent message sent" } },
-        "kickoff": { "confirmed": "Project plan confirmed and started", "failed": "Project kickoff failed" },
+        "kickoff": {
+          "confirmed": "Project plan confirmed and started",
+          "failed": "Project kickoff failed"
+        },
         "agent_reply_batch": { "dispatched": "Agent reply batch dispatched" }
       },
       "member": {
-        "snapshot": { "created": "Member snapshot created", "updated": "Member snapshot updated" },
+        "snapshot": {
+          "created": "Member snapshot created",
+          "updated": "Member snapshot updated"
+        },
         "departed": "Project member departed",
         "restored": "Project member restored"
       },
       "leader": { "changed": "Project Leader changed" },
-      "capability": { "bound": "Project capability bound", "updated": "Project capability updated" },
-      "work_item": { "created": "Work item created", "updated": "Work item updated" },
+      "capability": {
+        "bound": "Project capability bound",
+        "updated": "Project capability updated"
+      },
+      "work_item": {
+        "created": "Work item created",
+        "updated": "Work item updated"
+      },
       "run": {
         "queued": "Run queued",
         "running": "Run started",
@@ -47,15 +59,27 @@
         "failed": "Run failed",
         "cancelled": "Run cancelled"
       },
-      "a2a": { "queued": "A2A request queued", "delivered": "A2A message delivered", "completed": "A2A collaboration completed", "cancelled": "A2A collaboration cancelled", "delivery_failed": "A2A delivery failed" },
+      "a2a": {
+        "queued": "A2A request queued",
+        "delivered": "A2A message delivered",
+        "completed": "A2A collaboration completed",
+        "cancelled": "A2A collaboration cancelled",
+        "delivery_failed": "A2A delivery failed"
+      },
       "group": { "message": { "created": "Project group message created" } },
       "git": {
         "commit": { "created": "Git commit created" },
-        "milestone": { "prepared": "Delivery milestone prepared", "created": "Delivery milestone created" },
+        "milestone": {
+          "prepared": "Delivery milestone prepared",
+          "created": "Delivery milestone created"
+        },
         "branch": { "created": "Git branch created" },
         "restore_commit": { "created": "Restore commit created" },
         "restored": "Git version restored",
-        "remote": { "configured": "Git remote configured", "deleted": "Git remote deleted" },
+        "remote": {
+          "configured": "Git remote configured",
+          "deleted": "Git remote deleted"
+        },
         "repository": { "cloned": "Project repository cloned from remote" }
       }
     },
@@ -67,23 +91,45 @@
         "archived": "The project was archived while preserving its history.",
         "shared": "Project visibility was shared with selected members.",
         "unshared": "Project sharing access was revoked.",
-        "settings": { "updated": "Project runtime and governance settings were updated." },
-        "file": { "committed": "The project file was committed to its traceable Git history." },
+        "settings": {
+          "updated": "Project runtime and governance settings were updated."
+        },
+        "file": {
+          "committed": "The project file was committed to its traceable Git history."
+        },
         "plan": { "updated": "The project plan was updated." },
         "status": { "updated": "The project status was updated." },
-        "trace": { "repaired": "Trace links between runs, sessions, and artifacts were repaired." },
-        "agent": { "message": { "sent": "The project Agent message was sent." } },
-        "kickoff": { "confirmed": "The plan was confirmed and the Leader started autonomous execution.", "failed": "Project kickoff failed and its context remains traceable." },
-        "agent_reply_batch": { "dispatched": "Agent replies were coalesced into one Leader turn." }
+        "trace": {
+          "repaired": "Trace links between runs, sessions, and artifacts were repaired."
+        },
+        "agent": {
+          "message": { "sent": "The project Agent message was sent." }
+        },
+        "kickoff": {
+          "confirmed": "The plan was confirmed and the Leader started autonomous execution.",
+          "failed": "Project kickoff failed and its context remains traceable."
+        },
+        "agent_reply_batch": {
+          "dispatched": "Agent replies were coalesced into one Leader turn."
+        }
       },
       "member": {
-        "snapshot": { "created": "The project member snapshot was created.", "updated": "The project member snapshot was updated." },
+        "snapshot": {
+          "created": "The project member snapshot was created.",
+          "updated": "The project member snapshot was updated."
+        },
         "departed": "The member left the project; their history remains visible and read-only.",
         "restored": "The member rejoined with a new execution snapshot generation."
       },
       "leader": { "changed": "The project Leader was changed." },
-      "capability": { "bound": "A shared project capability was bound.", "updated": "Project capability availability was updated." },
-      "work_item": { "created": "The work item was created.", "updated": "The work item content, progress, or evidence was updated." },
+      "capability": {
+        "bound": "A shared project capability was bound.",
+        "updated": "Project capability availability was updated."
+      },
+      "work_item": {
+        "created": "The work item was created.",
+        "updated": "The work item content, progress, or evidence was updated."
+      },
       "run": {
         "queued": "The run entered the queue for an available Agent.",
         "running": "The Agent started processing this run.",
@@ -99,15 +145,31 @@
         "cancelled": "This A2A turn was cancelled.",
         "delivery_failed": "The A2A message could not be delivered; failure context was preserved."
       },
-      "group": { "message": { "created": "The group message was recorded and only explicitly mentioned members were awakened." } },
+      "group": {
+        "message": {
+          "created": "The group message was recorded and only explicitly mentioned members were awakened."
+        }
+      },
       "git": {
-        "commit": { "created": "Project changes were recorded in a Git commit." },
-        "milestone": { "prepared": "The delivery milestone is being prepared.", "created": "The delivery milestone and linked evidence were frozen." },
+        "commit": {
+          "created": "Project changes were recorded in a Git commit."
+        },
+        "milestone": {
+          "prepared": "The delivery milestone is being prepared.",
+          "created": "The delivery milestone and linked evidence were frozen."
+        },
         "branch": { "created": "The Git branch was created." },
-        "restore_commit": { "created": "The restore operation created a new commit and preserved existing history." },
+        "restore_commit": {
+          "created": "The restore operation created a new commit and preserved existing history."
+        },
         "restored": "The selected Git version was restored through a new commit.",
-        "remote": { "configured": "The Git remote was configured.", "deleted": "The Git remote was removed." },
-        "repository": { "cloned": "The remote repository was safely cloned over the initialization baseline." }
+        "remote": {
+          "configured": "The Git remote was configured.",
+          "deleted": "The Git remote was removed."
+        },
+        "repository": {
+          "cloned": "The remote repository was safely cloned over the initialization baseline."
+        }
       }
     }
   },
@@ -175,7 +237,88 @@
     "explore": "Explore",
     "adminCompanies": "Companies",
     "platformSettings": "Platform Settings",
-    "projects": "Projects"
+    "projects": "Projects",
+    "skillMarket": "Skill Market"
+  },
+  "sidebar": {
+    "agents": "Agents",
+    "agentSearchPlaceholder": "Search name or creator",
+    "agentSearchLabel": "Search Agents by name or creator",
+    "clearAgentSearch": "Clear Agent search",
+    "noAgentMatches": "No matching Agents"
+  },
+  "skillMarket": {
+    "eyebrow": "SKILL MARKET",
+    "title": "Skill Market",
+    "subtitle": "Discover capabilities, install them to an Agent, or publish proven ways of working.",
+    "publishSkill": "Publish Skill",
+    "publish": "Publish",
+    "details": "Details",
+    "publishFromAgent": "Publish from an Agent",
+    "tabs": {
+      "market": "Market",
+      "mine": "My published"
+    },
+    "searchPlaceholder": "Search name, description, or category",
+    "searchAria": "Search Skills",
+    "by": "By",
+    "platformPublisher": "Platform",
+    "version": "v{{version}}",
+    "generalCategory": "General",
+    "noDescription": "No description yet.",
+    "public": "Public",
+    "company": "Company",
+    "companyOnly": "Company only",
+    "platformPublic": "Public",
+    "installCount": "{{count}} Agent installs",
+    "viewDetails": "View details",
+    "working": "Working…",
+    "takeOffline": "Take offline",
+    "offlineStatus": "Offline",
+    "relist": "Relist",
+    "deleteOffline": "Delete",
+    "install": "Install",
+    "installing": "Installing…",
+    "confirmInstall": "Install",
+    "targetAgent": "Target Agent",
+    "sourceAgent": "Source Agent",
+    "skillFolder": "Skill folder",
+    "marketName": "Market name",
+    "shortDescription": "Short description",
+    "category": "Category",
+    "visibility": "Visibility",
+    "noFolders": "No folders under this Agent’s skills directory",
+    "loadingDocumentation": "Loading documentation…",
+    "preview": {
+      "package": "Skill package",
+      "fileTree": "Skill file tree",
+      "files": "Files",
+      "noFiles": "This Skill package has no files.",
+      "selectFile": "Select a file to preview"
+    },
+    "installNote": "Writes to skills/{{folder}}. Reinstalling updates the current version; each Agent is counted once.",
+    "publishNote": "Before publishing, the platform checks root SKILL.md, text format, size, and common secrets. Publishing the same folder again updates its version.",
+    "publishing": "Publishing…",
+    "offlineTitle": "Take Skill offline",
+    "offlineConfirm": "Take “{{name}}” offline? Only its market copy is hidden; the source Skill and installed copies are unaffected, and it can be relisted at any time.",
+    "deleteTitle": "Delete offline Skill",
+    "deleteConfirm": "Permanently delete “{{name}}”? Its market record and install statistics will be removed; files already installed in Agent workspaces are unaffected.",
+    "emptyMineTitle": "Nothing published yet",
+    "emptyMineHint": "Publish one from an Agent’s skills folder.",
+    "emptyMarketTitle": "No matching Skills",
+    "emptyMarketHint": "Try a shorter capability keyword.",
+    "toast": {
+      "installed": "Installed “{{name}}”",
+      "installFailed": "Install failed",
+      "published": "Published “{{name}}”",
+      "publishFailed": "Publish failed",
+      "offlineSuccess": "Skill is offline",
+      "offlineFailed": "Unable to take Skill offline",
+      "relisted": "Relisted “{{name}}”",
+      "relistFailed": "Unable to relist Skill",
+      "deleted": "Offline Skill deleted",
+      "deleteFailed": "Unable to delete Skill"
+    }
   },
   "talentMarket": {
     "title": "Talent Market",
@@ -598,6 +741,8 @@
         "async": "Asynchronous"
       },
       "forked": "Forked current context",
+      "soulOff": "Soul disabled",
+      "memoryOff": "Memory disabled",
       "model": "Model",
       "sessionId": "Session ID",
       "status": {
@@ -929,7 +1074,7 @@
     "toolTranslations": {
       "run_subagent": {
         "name": "Run Subagent",
-        "description": "Delegate a focused task to an independent child-agent session, synchronously or asynchronously, with optional model selection and context forking."
+        "description": "Name and delegate a focused task to an independent child-agent session, with sync or async execution, model selection, context forking, and optional Soul or memory loading."
       },
       "send_message_to_subagent": {
         "name": "Message Subagent",
@@ -1501,6 +1646,10 @@
         "list_published_pages": "List Published Pages",
         "search_clawhub": "Search ClawHub",
         "install_skill": "Install Skill",
+        "search_skill_market": "Search Skill Market",
+        "install_skill_from_market": "Install Market Skill",
+        "publish_skill_to_market": "Publish Skill to Market",
+        "withdraw_skill_from_market": "Withdraw Skill from Market",
         "agentbay_browser_navigate": "AgentBay: Browser Navigate",
         "agentbay_browser_screenshot": "AgentBay: Browser Screenshot",
         "agentbay_browser_click": "AgentBay: Browser Click",
@@ -1570,6 +1719,10 @@
         "list_published_pages": "List all pages published by this agent.",
         "search_clawhub": "Search the ClawHub skill registry for skills matching a query.",
         "install_skill": "Install a skill into this agent's workspace.",
+        "search_skill_market": "Search visible company and public Skills in the Skill market.",
+        "install_skill_from_market": "Install a market Skill into this Agent after L3 approval.",
+        "publish_skill_to_market": "Publish an Agent Skill folder to the company or public market after L3 approval.",
+        "withdraw_skill_from_market": "Withdraw a Skill published by this Agent after L3 approval. Existing installs remain available.",
         "agentbay_browser_navigate": "[ENV: Browser] Navigate to a URL in the AgentBay headless browser environment.",
         "agentbay_browser_screenshot": "[ENV: Browser] Take a screenshot of the current page in the headless browser.",
         "agentbay_browser_click": "[ENV: Browser] Click an element in the headless browser.",

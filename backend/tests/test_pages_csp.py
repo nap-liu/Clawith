@@ -42,22 +42,35 @@ async def _make_page(html: str, short_id: str):
     (base / "r.html").write_text(html, encoding="utf-8")
 
 
-async def test_csp_unchanged_without_sdk():
+async def test_top_level_page_uses_platform_viewer_without_sdk():
     sid = f"x{uuid.uuid4().hex[:6]}"
     await _make_page("<h1>no sdk</h1>", sid)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get(f"/p/{sid}")
     assert resp.status_code == 200
-    csp = resp.headers["Content-Security-Policy"]
-    assert "allow-top-navigation" not in csp
+    assert resp.headers["X-Accel-Redirect"] == "/__published_page_viewer"
+    assert "Content-Security-Policy" not in resp.headers
 
 
-async def test_csp_relaxed_with_sdk():
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<h1>no sdk</h1>",
+        '<script src="/sdk/clawith.js"></script>',
+    ],
+)
+async def test_embedded_report_csp_never_allows_top_navigation(html: str):
     sid = f"y{uuid.uuid4().hex[:6]}"
-    await _make_page('<script src="/sdk/clawith.js"></script>', sid)
+    await _make_page(html, sid)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get(f"/p/{sid}")
+        resp = await client.get(
+            f"/p/{sid}?__report_embed=1",
+            headers={"Sec-Fetch-Dest": "iframe"},
+        )
     assert resp.status_code == 200
-    assert "allow-top-navigation" in resp.headers["Content-Security-Policy"]
+    assert resp.text == html
+    csp = resp.headers["Content-Security-Policy"]
+    assert csp == "frame-ancestors 'self'"
+    assert "allow-top-navigation" not in csp

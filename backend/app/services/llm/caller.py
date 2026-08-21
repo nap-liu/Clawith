@@ -959,6 +959,8 @@ async def _build_turn_context(
     is_group: bool,
     session_id: str,
     channel_context: dict | None,
+    include_soul: bool = True,
+    include_memory: bool = True,
 ) -> tuple[str, str]:
     """Build the immutable static/dynamic context pair for one logical turn."""
     if current_user_name_override:
@@ -980,6 +982,8 @@ async def _build_turn_context(
         current_user_id=None if current_user_name_override else user_id,
         is_group=is_group,
         channel_context=runtime_channel_context,
+        include_soul=include_soul,
+        include_memory=include_memory,
     )
 
 
@@ -1284,6 +1288,8 @@ async def call_llm(
     context_recovery=None,
     before_round=None,
     before_tool_execution=None,
+    include_soul: bool = True,
+    include_memory: bool = True,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     supports_vision = bool(getattr(model, "supports_vision", False))
@@ -1322,6 +1328,8 @@ async def call_llm(
             is_group=is_group,
             session_id=session_id,
             channel_context=channel_context,
+            include_soul=include_soul,
+            include_memory=include_memory,
         )
     else:
         static_prompt, dynamic_prompt = prepared_turn_context
@@ -1977,6 +1985,8 @@ async def call_llm_with_failover(
     prepared_tools: list[dict] | None = None,
     before_round=None,
     before_tool_execution=None,
+    include_soul: bool = True,
+    include_memory: bool = True,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -2028,6 +2038,8 @@ async def call_llm_with_failover(
         is_group=is_group,
         session_id=session_id,
         channel_context=channel_context,
+        include_soul=include_soul,
+        include_memory=include_memory,
     )
     if prepared_tools is not None:
         prepared_tools = sorted(

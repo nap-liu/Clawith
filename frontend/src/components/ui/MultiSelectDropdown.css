@@ -52,6 +52,23 @@
     margin-bottom: 5px;
 }
 
+.ui-multi-select__actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 32px;
+    padding: 0 4px 5px 8px;
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+}
+
+.ui-multi-select__clear {
+    min-height: 28px;
+    padding: 0 7px;
+    font-size: var(--text-xs);
+}
+
 .ui-multi-select__options {
     min-height: 0;
     flex: 1;

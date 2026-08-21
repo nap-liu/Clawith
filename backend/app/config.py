@@ -117,6 +117,7 @@ class Settings(BaseSettings):
     S3_PRESIGN_TTL_SECONDS: int = 3600
     S3_MAX_POOL_CONNECTIONS: int = 50
     S3_WRITE_WORKERS: int = 32
+    MAX_SKILL_SIZE: int = 512_000
 
     # Process role
     PROCESS_ROLE: str = "all"

@@ -28,7 +28,10 @@
         "status": { "updated": "更新项目状态" },
         "trace": { "repaired": "修复项目追溯关联" },
         "agent": { "message": { "sent": "发送项目 Agent 消息" } },
-        "kickoff": { "confirmed": "确认项目方案并启动", "failed": "项目启动失败" },
+        "kickoff": {
+          "confirmed": "确认项目方案并启动",
+          "failed": "项目启动失败"
+        },
         "agent_reply_batch": { "dispatched": "派发 Agent 批量回复" }
       },
       "member": {
@@ -47,11 +50,20 @@
         "failed": "运行执行失败",
         "cancelled": "运行已取消"
       },
-      "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "completed": "A2A 协作已完成", "cancelled": "A2A 协作已取消", "delivery_failed": "A2A 消息送达失败" },
+      "a2a": {
+        "queued": "A2A 请求进入队列",
+        "delivered": "A2A 消息已送达",
+        "completed": "A2A 协作已完成",
+        "cancelled": "A2A 协作已取消",
+        "delivery_failed": "A2A 消息送达失败"
+      },
       "group": { "message": { "created": "创建项目群消息" } },
       "git": {
         "commit": { "created": "创建 Git 提交" },
-        "milestone": { "prepared": "准备交付里程碑", "created": "创建交付里程碑" },
+        "milestone": {
+          "prepared": "准备交付里程碑",
+          "created": "创建交付里程碑"
+        },
         "branch": { "created": "创建 Git 分支" },
         "restore_commit": { "created": "创建恢复提交" },
         "restored": "恢复 Git 版本",
@@ -73,17 +85,31 @@
         "status": { "updated": "项目状态已更新。" },
         "trace": { "repaired": "项目运行、会话与产物的追溯关联已修复。" },
         "agent": { "message": { "sent": "项目 Agent 消息已发送。" } },
-        "kickoff": { "confirmed": "方案已确认，Leader 已开始自驱推进。", "failed": "项目启动失败，相关上下文已保留。" },
-        "agent_reply_batch": { "dispatched": "Agent 回复已合并为一轮并交给 Leader 处理。" }
+        "kickoff": {
+          "confirmed": "方案已确认，Leader 已开始自驱推进。",
+          "failed": "项目启动失败，相关上下文已保留。"
+        },
+        "agent_reply_batch": {
+          "dispatched": "Agent 回复已合并为一轮并交给 Leader 处理。"
+        }
       },
       "member": {
-        "snapshot": { "created": "项目成员快照已创建。", "updated": "项目成员快照已更新。" },
+        "snapshot": {
+          "created": "项目成员快照已创建。",
+          "updated": "项目成员快照已更新。"
+        },
         "departed": "成员已退出项目，历史记录保持只读可见。",
         "restored": "成员已恢复参与项目，新的执行将使用新一代快照。"
       },
       "leader": { "changed": "项目 Leader 已变更。" },
-      "capability": { "bound": "项目共享能力已绑定。", "updated": "项目能力启用范围已更新。" },
-      "work_item": { "created": "工作项已创建。", "updated": "工作项内容、进度或证据已更新。" },
+      "capability": {
+        "bound": "项目共享能力已绑定。",
+        "updated": "项目能力启用范围已更新。"
+      },
+      "work_item": {
+        "created": "工作项已创建。",
+        "updated": "工作项内容、进度或证据已更新。"
+      },
       "run": {
         "queued": "运行已进入队列，等待可用 Agent 处理。",
         "running": "Agent 已开始处理本次运行。",
@@ -99,14 +125,26 @@
         "cancelled": "本轮 A2A 协作已取消。",
         "delivery_failed": "A2A 消息未能送达，失败上下文已保留。"
       },
-      "group": { "message": { "created": "项目群消息已写入共享时间线，并按 @ 提及精确唤醒成员。" } },
+      "group": {
+        "message": {
+          "created": "项目群消息已写入共享时间线，并按 @ 提及精确唤醒成员。"
+        }
+      },
       "git": {
         "commit": { "created": "项目变更已创建 Git 提交。" },
-        "milestone": { "prepared": "交付里程碑正在创建。", "created": "交付里程碑与关联证据已固化。" },
+        "milestone": {
+          "prepared": "交付里程碑正在创建。",
+          "created": "交付里程碑与关联证据已固化。"
+        },
         "branch": { "created": "Git 分支已创建。" },
-        "restore_commit": { "created": "恢复操作已创建新的 Git 提交，原历史保持不变。" },
+        "restore_commit": {
+          "created": "恢复操作已创建新的 Git 提交，原历史保持不变。"
+        },
         "restored": "指定 Git 版本已通过新提交恢复。",
-        "remote": { "configured": "Git 远端已配置。", "deleted": "Git 远端已删除。" },
+        "remote": {
+          "configured": "Git 远端已配置。",
+          "deleted": "Git 远端已删除。"
+        },
         "repository": { "cloned": "远程仓库已安全克隆并替换初始化基线。" }
       }
     }
@@ -150,7 +188,81 @@
     "plaza": "广场",
     "okr": "OKR",
     "explore": "探索",
-    "projects": "项目"
+    "projects": "项目",
+    "skillMarket": "Skill 市场"
+  },
+  "skillMarket": {
+    "eyebrow": "SKILL MARKET",
+    "title": "Skill 市场",
+    "subtitle": "发现能力，安装到智能体；也可以把成熟的工作方法发布给团队。",
+    "publishSkill": "发布 Skill",
+    "publish": "发布",
+    "details": "说明",
+    "publishFromAgent": "从智能体发布 Skill",
+    "tabs": {
+      "market": "市场",
+      "mine": "我的发布"
+    },
+    "searchPlaceholder": "搜索名称、说明或分类",
+    "searchAria": "搜索 Skill",
+    "by": "发布者",
+    "platformPublisher": "平台",
+    "version": "v{{version}}",
+    "generalCategory": "通用",
+    "noDescription": "暂无说明",
+    "public": "公开",
+    "company": "企业内",
+    "companyOnly": "仅本企业",
+    "platformPublic": "平台公开",
+    "installCount": "{{count}} 个智能体安装",
+    "viewDetails": "查看说明",
+    "working": "处理中…",
+    "takeOffline": "下架",
+    "offlineStatus": "已下架",
+    "relist": "重新上架",
+    "deleteOffline": "删除",
+    "install": "安装",
+    "installing": "安装中…",
+    "confirmInstall": "确认安装",
+    "targetAgent": "目标智能体",
+    "sourceAgent": "来源智能体",
+    "skillFolder": "Skill 文件夹",
+    "marketName": "市场名称",
+    "shortDescription": "一句话说明",
+    "category": "分类",
+    "visibility": "可见范围",
+    "noFolders": "该智能体的 skills 下没有文件夹",
+    "loadingDocumentation": "正在加载说明…",
+    "preview": {
+      "package": "Skill 文件包",
+      "fileTree": "Skill 文件目录",
+      "files": "文件",
+      "noFiles": "这个 Skill 文件包中没有文件",
+      "selectFile": "选择文件以预览内容"
+    },
+    "installNote": "将写入 skills/{{folder}}。重复安装会更新到当前版本，下载量只按智能体计一次。",
+    "publishNote": "发布前会检查根目录 SKILL.md、文本格式、大小和常见密钥内容。相同文件夹再次发布会更新版本。",
+    "publishing": "发布中…",
+    "offlineTitle": "下架 Skill",
+    "offlineConfirm": "确认从市场下架「{{name}}」？市场只会隐藏此副本，来源 Skill 和已安装副本均不受影响，可随时重新上架。",
+    "deleteTitle": "删除已下架 Skill",
+    "deleteConfirm": "确认永久删除「{{name}}」？市场记录和安装统计将被清理，已安装到智能体工作区的文件不受影响。",
+    "emptyMineTitle": "还没有发布 Skill",
+    "emptyMineHint": "从智能体的 skills 文件夹选择一个发布。",
+    "emptyMarketTitle": "没有找到匹配的 Skill",
+    "emptyMarketHint": "换一个更短的能力关键词试试。",
+    "toast": {
+      "installed": "已安装「{{name}}」",
+      "installFailed": "安装失败",
+      "published": "已发布「{{name}}」",
+      "publishFailed": "发布失败",
+      "offlineSuccess": "Skill 已下架",
+      "offlineFailed": "下架失败",
+      "relisted": "已重新上架「{{name}}」",
+      "relistFailed": "重新上架失败",
+      "deleted": "已删除下架记录",
+      "deleteFailed": "删除失败"
+    }
   },
   "talentMarket": {
     "title": "人才市场",
@@ -158,14 +270,14 @@
     "hire": "聘用",
     "hiring": "聘用中...",
     "footer": "点击聘用·可随时在设置中调整",
-    "customTitle": "自建 Agent",
+    "customTitle": "自建智能体",
     "customCategory": "自定义",
     "customDescription": "从零开始定义身份、性格、权限和工具，完全按你的需求打造。",
     "customStart": "开始",
     "empty": "这个分类下还没有模板",
-    "emptySearch": "没有匹配的 Agent",
-    "externalAgentHint": "支持 Native、OpenClaw 等外部 Agent",
-    "searchLabel": "搜索 Agent",
+    "emptySearch": "没有匹配的智能体",
+    "externalAgentHint": "支持 Native、OpenClaw 等外部智能体",
+    "searchLabel": "搜索智能体",
     "tabMarketing": "营销",
     "tabOffice": "办公通用",
     "tabPopular": "热门推荐",
@@ -339,7 +451,7 @@
       "error": "异常",
       "disconnected": "已断开",
       "24hActions": "24h 活动",
-      "24hActionsTooltip": "过去 24 小时内该 Agent 的所有操作记录，包括对话、工具调用、任务执行等",
+      "24hActionsTooltip": "过去 24 小时内该智能体的所有操作记录，包括对话、工具调用、任务执行等",
       "llmCallsToday": "今日 LLM 调用",
       "max": "上限",
       "totalToken": "总 Token",
@@ -372,7 +484,7 @@
       "createdBy": "创建者"
     },
     "profile": {
-      "title": "Agent 档案",
+      "title": "智能体档案",
       "created": "创建时间",
       "lastActive": "最后活跃",
       "timezone": "时区"
@@ -444,8 +556,8 @@
     },
     "aware": {
       "focus": "关注点",
-      "focusDesc": "Agent 当前正在关注的任务",
-      "focusEmpty": "暂无关注点。Agent 在对话中会自动创建和更新关注点。",
+      "focusDesc": "智能体当前正在关注的任务",
+      "focusEmpty": "暂无关注点。智能体在对话中会自动创建和更新关注点。",
       "viewRawMarkdown": "查看原始 Markdown",
       "standaloneTriggers": "独立触发器",
       "noTriggers": "无触发器",
@@ -455,8 +567,8 @@
       "enable": "启用",
       "deleteTriggerConfirm": "确定删除触发器 {{name}}？",
       "reflections": "内心独白",
-      "reflectionsDesc": "Agent 自主行动的思考记录",
-      "reflectionsEmpty": "暂无内心独白记录。Agent 的自主行动将显示在这里。",
+      "reflectionsDesc": "智能体自主行动的思考记录",
+      "reflectionsEmpty": "暂无内心独白记录。智能体的自主行动将显示在这里。",
       "taskHistory": "任务历史",
       "taskHistoryEmpty": "暂无归档任务。",
       "inProgress": "进行中",
@@ -481,7 +593,7 @@
     "mind": {
       "soulDesc": "核心身份、人格和行为边界。",
       "memoryDesc": "通过对话和经验积累的持久记忆。",
-      "heartbeatDesc": "定期感知检查的指令。Agent 在每次心跳时读取此文件。",
+      "heartbeatDesc": "定期感知检查的指令。智能体在每次心跳时读取此文件。",
       "heartbeatTitle": "心跳",
       "secretsTitle": "机密信息",
       "secretsDesc": "敏感凭据（密码、API 密钥、连接字符串等）。仅创建者可查看。"
@@ -589,7 +701,7 @@
       "confirmCancelled": "已取消"
     },
     "subagentRun": {
-      "title": "子 Agent",
+      "title": "子智能体",
       "taskFallback": "委派任务",
       "viewSession": "查看会话",
       "sessionPending": "子会话创建后即可查看。",
@@ -598,6 +710,8 @@
         "async": "异步"
       },
       "forked": "已复制当前上下文",
+      "soulOff": "不加载 Soul",
+      "memoryOff": "不加载记忆",
       "model": "模型",
       "sessionId": "会话 ID",
       "status": {
@@ -609,14 +723,14 @@
         "stopped": "已停止",
         "unknown": "未知状态"
       },
-      "drawerTitle": "子 Agent 会话",
+      "drawerTitle": "子智能体会话",
       "readOnly": "只读执行记录",
-      "loading": "正在加载子 Agent 会话...",
-      "loadError": "无法加载此子 Agent 会话。",
+      "loading": "正在加载子智能体会话...",
+      "loadError": "无法加载此子智能体会话。",
       "retry": "重试",
       "empty": "暂无执行消息。",
       "close": "关闭",
-      "liveRefresh": "子 Agent 执行期间自动更新",
+      "liveRefresh": "子智能体执行期间自动更新",
       "openFullSession": "打开完整会话"
     },
     "sessionViewer": {
@@ -735,7 +849,7 @@
       "expiry": {
         "renew": "续期",
         "setExpiry": "设置过期",
-        "title": "Agent 过期时间",
+        "title": "智能体过期时间",
         "expired": "已过期",
         "currentExpiry": "当前过期时间：",
         "neverExpires": "永不过期",
@@ -866,9 +980,9 @@
       },
       "triggerLimits": {
         "title": "触发器限制",
-        "description": "控制该 Agent 可以创建的触发器数量和行为限制",
+        "description": "控制该智能体可以创建的触发器数量和行为限制",
         "maxTriggers": "最大触发器数",
-        "maxTriggersDesc": "Agent 最多可同时拥有的触发器数量",
+        "maxTriggersDesc": "智能体最多可同时拥有的触发器数量",
         "minPollInterval": "Poll 最短间隔 (分钟)",
         "minPollIntervalDesc": "定时轮询外部接口的最短间隔",
         "webhookRateLimit": "Webhook 频率限制 (次/分钟)",
@@ -876,7 +990,7 @@
       },
       "welcomeMessage": {
         "title": "欢迎语",
-        "description": "当用户在网页端发起新对话时，Agent 会自动发送的欢迎语。支持 Markdown 语法。留空则不发送。",
+        "description": "当用户在网页端发起新对话时，智能体会自动发送的欢迎语。支持 Markdown 语法。留空则不发送。",
         "saved": "已保存",
         "placeholder": "例如：你好！我是你的 AI 助手，有什么可以帮你的吗？"
       },
@@ -967,7 +1081,7 @@
       "search": "搜索",
       "custom": "自定义",
       "general": "通用",
-      "subagent": "子 Agent",
+      "subagent": "子智能体",
       "email": "邮件",
       "aware": "感知与触发器",
       "social": "社交",
@@ -979,24 +1093,24 @@
       "okr": "OKR"
     },
     "toolCategoryDescriptions": {
-      "subagent": "将任务委派给子 Agent，并支持父子会话之间的多轮双向协作"
+      "subagent": "将任务委派给子智能体，并支持父子会话之间的多轮双向协作"
     },
     "toolTranslations": {
       "run_subagent": {
-        "name": "运行子 Agent",
-        "description": "把目标明确的任务委派给独立的子 Agent 会话；支持同步等待结果或异步后台执行，并可选择模型及复制当前上下文。"
+        "name": "运行子智能体",
+        "description": "为子智能体命名并把目标明确的任务委派给独立会话；支持同步或异步执行、模型选择、上下文复制，以及按需关闭 Soul 或记忆。"
       },
       "send_message_to_subagent": {
-        "name": "向子 Agent 发送消息",
-        "description": "向已创建的子 Agent 追加消息。执行中的消息会在下一轮模型循环插入；已结束的子 Agent 会沿用原会话异步恢复。"
+        "name": "向子智能体发送消息",
+        "description": "向已创建的子智能体追加消息。执行中的消息会在下一轮模型循环插入；已结束的子智能体会沿用原会话异步恢复。"
       },
       "stop_subagent": {
-        "name": "停止子 Agent",
-        "description": "停止正在排队或执行的子 Agent；已经开始的外部工具调用及其副作用不会被回滚。"
+        "name": "停止子智能体",
+        "description": "停止正在排队或执行的子智能体；已经开始的外部工具调用及其副作用不会被回滚。"
       },
       "send_message_to_parent": {
-        "name": "向父 Agent 发送消息",
-        "description": "从子 Agent 向创建它的父会话发送一次或多次阶段性消息；异步执行时会唤醒父 Agent，同步执行时会随最终结果一并返回；仅在子 Agent 会话中可用。"
+        "name": "向父智能体发送消息",
+        "description": "从子智能体向创建它的父会话发送一次或多次阶段性消息；异步执行时会唤醒父智能体，同步执行时会随最终结果一并返回；仅在子智能体会话中可用。"
       }
     },
     "upload": {
@@ -1507,10 +1621,10 @@
       "initBuiltinsHint": "请先启动后端以初始化内置工具。",
       "emptyState": "暂无数据。请先启动后端以初始化内置工具。",
       "globalTools": "全局工具",
-      "agentInstalled": "Agent 安装",
-      "agentInstalledHint": "Agent 通过 `import_mcp_server` 安装的工具。删除将从该 Agent 中移除此工具。",
-      "noAgentInstalledTools": "暂无 Agent 安装的工具。",
-      "removeFromAgent": "从 Agent 中移除 \"{{name}}\"？",
+      "agentInstalled": "智能体安装",
+      "agentInstalledHint": "智能体通过 `import_mcp_server` 安装的工具。删除将从该智能体中移除此工具。",
+      "noAgentInstalledTools": "暂无智能体安装的工具。",
+      "removeFromAgent": "从智能体中移除 \"{{name}}\"？",
       "delete": "删除",
       "addMcpServer": "添加 MCP 服务器",
       "mcpServer": "MCP 服务器",
@@ -1593,6 +1707,9 @@
         "list_published_pages": "列出已发布页面",
         "search_clawhub": "搜索 ClawHub",
         "install_skill": "安装技能",
+        "search_skill_market": "搜索 Skill 市场",
+        "install_skill_from_market": "安装市场 Skill",
+        "publish_skill_to_market": "发布 Skill 到市场",
         "agentbay_browser_navigate": "AgentBay: 浏览器访问",
         "agentbay_browser_screenshot": "AgentBay: 浏览器截图",
         "agentbay_browser_click": "AgentBay: 浏览器点击",
@@ -1623,7 +1740,8 @@
         "agentbay_computer_close_window": "AgentBay: 关闭窗口",
         "agentbay_computer_dismiss_dialog": "AgentBay: 关闭弹窗",
         "agentbay_computer_list_visible_apps": "AgentBay: 列出运行应用",
-        "atlassian_rovo": "Atlassian Rovo (Jira / Confluence / Compass)"
+        "atlassian_rovo": "Atlassian Rovo (Jira / Confluence / Compass)",
+        "withdraw_skill_from_market": "从市场下架 Skill"
       },
       "toolDescriptions": {
         "list_files": "列出工作区目录中的文件和文件夹。",
@@ -1662,6 +1780,9 @@
         "list_published_pages": "列出此数字员工发布的所有页面。",
         "search_clawhub": "在 ClawHub 技能注册表中搜索匹配查询的技能。",
         "install_skill": "将技能安装到此数字员工的工作区。",
+        "search_skill_market": "搜索当前可见的企业内和公开 Skill。",
+        "install_skill_from_market": "通过 L3 审批后，将市场 Skill 安装到此智能体。",
+        "publish_skill_to_market": "通过 L3 审批后，将智能体 Skill 文件夹发布到企业或公开市场。",
         "agentbay_browser_navigate": "[ENV: Browser] 在 AgentBay 无头浏览器环境中访问指定网址。",
         "agentbay_browser_screenshot": "[ENV: Browser] 对无头浏览器当前页面进行截图。",
         "agentbay_browser_click": "[ENV: Browser] 在无头浏览器中点击元素。",
@@ -1692,7 +1813,8 @@
         "agentbay_computer_close_window": "[ENV: Cloud Desktop] 通过明确窗口 ID 关闭整个云桌面窗口。",
         "agentbay_computer_dismiss_dialog": "[ENV: Cloud Desktop] 仅通过 Escape 安全关闭当前应用内弹窗或对话框。",
         "agentbay_computer_list_visible_apps": "[ENV: Cloud Desktop] 列出云桌面中正在运行的应用程序。",
-        "atlassian_rovo": "连接到 Atlassian Rovo MCP 服务器以访问 Jira、Confluence 和 Compass。"
+        "atlassian_rovo": "连接到 Atlassian Rovo MCP 服务器以访问 Jira、Confluence 和 Compass。",
+        "withdraw_skill_from_market": "通过 L3 审批后，下架由此智能体发布的市场副本；来源 Skill 和已安装副本不受影响，可再次上架。"
       },
       "configureSettings": "配置设置",
       "import": "导入",
@@ -1757,8 +1879,8 @@
       "title": "平台配置",
       "publicUrl": "公网地址 (PUBLIC_BASE_URL)",
       "publicUrlPlaceholder": "例：https://xxx.cpolar.top",
-      "maxRounds": "Agent 对话轮次上限",
-      "maxRoundsDesc": "两个 Agent 之间单次协作对话的最大轮次。控制 Agent 协作时可以进行多少轮消息交换。",
+      "maxRounds": "智能体对话轮次上限",
+      "maxRoundsDesc": "两个智能体之间单次协作对话的最大轮次。控制智能体协作时可以进行多少轮消息交换。",
       "maxRoundsPlaceholder": "默认 20",
       "save": "保存",
       "saved": "已保存",
@@ -1793,12 +1915,12 @@
     },
     "companyIntro": {
       "title": "公司简介",
-      "description": "描述你的公司使命、产品和文化。此信息会作为上下文包含在每次 Agent 对话中。",
-      "hint": "此内容会出现在每个 Agent 的系统提示词中"
+      "description": "描述你的公司使命、产品和文化。此信息会作为上下文包含在每次智能体对话中。",
+      "hint": "此内容会出现在每个智能体的系统提示词中"
     },
     "kb": {
       "title": "公司知识库",
-      "description": "共享文件，所有 Agent 可通过 enterprise_info/ 目录访问。",
+      "description": "共享文件，所有智能体可通过 enterprise_info/ 目录访问。",
       "rootDir": "根目录",
       "uploadFile": "上传文件",
       "newFolder": "新建文件夹",
@@ -2294,21 +2416,21 @@
     "contactAdmin": "请联系平台管理员获取邀请码。"
   },
   "openclaw": {
-    "created": "OpenClaw Agent 已创建",
-    "createdDesc2": "您的 OpenClaw Agent 已注册。复制以下指令并发送给您的 OpenClaw Agent 完成配置。",
+    "created": "OpenClaw 智能体已创建",
+    "createdDesc2": "您的 OpenClaw 智能体已注册。复制以下指令并发送给您的 OpenClaw 智能体完成配置。",
     "setupInstruction": "配置指令",
-    "setupInstructionDesc": "复制并发送给您的 OpenClaw Agent，它将自动完成配置。",
+    "setupInstructionDesc": "复制并发送给您的 OpenClaw 智能体，它将自动完成配置。",
     "keyNote": "API Key 已嵌入在上方指令中。如需手动配置可单独保存。",
-    "goToAgent": "前往 Agent 页面",
+    "goToAgent": "前往智能体页面",
     "nativeTitle": "平台托管",
-    "nativeDesc": "在 数字员工平台 上运行的完整 Agent",
+    "nativeDesc": "在 数字员工平台 上运行的完整智能体",
     "openclawTitle": "连接 OpenClaw",
-    "openclawDesc": "连接你现有的 OpenClaw Agent",
-    "basicTitle": "连接 OpenClaw Agent",
-    "basicDesc": "为你的 OpenClaw Agent 命名并添加描述。LLM 模型、人格和技能在你的 OpenClaw 实例上配置。",
+    "openclawDesc": "连接你现有的 OpenClaw 智能体",
+    "basicTitle": "连接 OpenClaw 智能体",
+    "basicDesc": "为你的 OpenClaw 智能体命名并添加描述。LLM 模型、人格和技能在你的 OpenClaw 实例上配置。",
     "namePlaceholder": "例如：我的 OpenClaw Bot",
     "rolePlaceholder": "例如：在我的 Mac 上运行的个人助手",
-    "createBtn": "连接 Agent",
+    "createBtn": "连接智能体",
     "lastSeen": "最近连接",
     "notConnected": "尚未连接",
     "connection": "OpenClaw 连接",
@@ -2344,7 +2466,7 @@
       "step4": "左侧菜单 → OAuth2 → URL Generator → Scopes 勾选 bot 和 applications.commands → Bot Permissions 勾选 Send Messages 和 Read Message History → 复制生成的 URL → 在浏览器中打开 → 选择你的服务器 → 授权",
       "step5": "将 Application ID、Bot Token、Public Key 填入上方 → 点击保存配置 → 复制出现的 Webhook URL（Interactions Endpoint URL）",
       "step6": "左侧菜单 → General Information → 将 Webhook URL 粘贴到 Interactions Endpoint URL 框 → 点击 Save Changes（Discord 会自动验证）",
-      "step7": "在 Discord 服务器中输入 /ask message:<你的问题> 即可与 Agent 对话",
+      "step7": "在 Discord 服务器中输入 /ask message:<你的问题> 即可与智能体对话",
       "note": "Discord 保存时会立即验证 Endpoint，因此保存时服务器必须处于运行状态且可公网访问。",
       "ws_step1": "打开 discord.com/developers/applications → 点击 New Application → 输入名称 → 点击 Create",
       "ws_step2": "左侧菜单 → Bot → 点击 Reset Token → 复制 Bot Token。在 Privileged Gateway Intents 下开启 Message Content Intent → Save Changes",
@@ -2558,14 +2680,14 @@
   "customAgentModal": {
     "noModelButtonHint": "需要先在公司设置中启用至少一个模型，才能创建平台托管成员。",
     "nameRequired": "请填写名称",
-    "noModelError": "公司还没有启用可用模型，请先配置模型或切换为外部 Agent。",
+    "noModelError": "公司还没有启用可用模型，请先配置模型或切换为外部智能体。",
     "modelRequired": "请选择模型",
     "nativeTitle": "创建自定义成员",
-    "externalTitle": "连接外部 Agent",
+    "externalTitle": "连接外部智能体",
     "nativeSubtitle": "先完成必要信息，其余能力之后在设置中调整。",
-    "externalSubtitle": "为 OpenClaw 或其他外部运行的 Agent 创建连接入口。",
+    "externalSubtitle": "为 OpenClaw 或其他外部运行的智能体创建连接入口。",
     "nativeMode": "平台托管",
-    "externalMode": "外部 Agent",
+    "externalMode": "外部智能体",
     "name": "名称",
     "namePlaceholderNative": "例如：客户研究员",
     "namePlaceholderExternal": "例如：OpenClaw 研究助手",
@@ -2588,15 +2710,15 @@
     "noModelsTitle": "还没有可用模型",
     "noModelsAdminHint": "启用至少一个公司模型后，才能创建平台托管的数字员工。",
     "noModelsMemberHint": "请联系公司管理员先启用模型。",
-    "noModelsExternalHint": "如果你只是接入外部运行的 Agent，可以切换到\"外部 Agent\"。",
+    "noModelsExternalHint": "如果你只是接入外部运行的智能体，可以切换到\"外部智能体\"。",
     "configureModels": "配置模型",
     "creationFailed": "创建失败",
     "externalCreated": "连接已创建",
-    "externalCreatedDesc": "把下面的连接指令交给外部 Agent，它就能通过网关收发 Clawith 消息。",
+    "externalCreatedDesc": "把下面的连接指令交给外部智能体，它就能通过网关收发 Clawith 消息。",
     "gatewayKeyEmbedded": "API Key 已包含在连接指令中",
     "copyKey": "复制 Key",
-    "noKeyReturned": "未返回 API Key，请进入 Agent 页面重新生成。",
-    "enterAgent": "进入 Agent"
+    "noKeyReturned": "未返回 API Key，请进入智能体页面重新生成。",
+    "enterAgent": "进入智能体"
   },
   "takeControl": {
     "acquiringControl": "正在获取控制权...",
@@ -2699,5 +2821,12 @@
     "scopeWrite": "可写",
     "scopeHint": "只读：查看数字员工并与其对话。可写：还可创建和配置数字员工。",
     "colScope": "范围"
+  },
+  "sidebar": {
+    "agents": "智能体",
+    "agentSearchPlaceholder": "搜索名称或创建者",
+    "agentSearchLabel": "按名称或创建者搜索智能体",
+    "clearAgentSearch": "清空智能体搜索",
+    "noAgentMatches": "没有匹配的智能体"
   }
 }

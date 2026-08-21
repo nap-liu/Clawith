@@ -109,7 +109,7 @@ BUILTIN_TOOLS = [
         "name": "run_subagent",
         "display_name": "Run Subagent",
         "description": (
-            "Delegate a focused task to a child Agent session. sync waits for the final "
+            "Delegate a named, focused task to a child Agent session. sync waits for the final "
             "result and reports any child messages with it; async returns the subagent_id "
             "immediately and supports live multi-round messages in both directions. In "
             "async mode, child messages and completion durably wake this exact session. "
@@ -122,6 +122,12 @@ BUILTIN_TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "A concise, meaningful name for this child Agent and its session.",
+                },
                 "task": {"type": "string", "minLength": 1, "maxLength": 12000},
                 "mode": {"type": "string", "enum": ["sync", "async"], "default": "sync"},
                 "model": {
@@ -133,8 +139,18 @@ BUILTIN_TOOLS = [
                     "default": False,
                     "description": "Copy the current compacted, LLM-visible context into the child once.",
                 },
+                "soul": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Load this Agent's soul.md into the child runtime context.",
+                },
+                "memory": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Load Core Memory, the memory guide, and recent Daily Memory into the child runtime context.",
+                },
             },
-            "required": ["task"],
+            "required": ["name", "task"],
         },
         "config": {},
         "config_schema": {"fields": []},
@@ -3564,7 +3580,7 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "update_published_page_access", "display_name": "Update Page Access",
-        "description": "Change an existing page published by this Agent. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
+        "description": "Change an existing published page. Company and platform administrators may change any page in their current company; other users may only change a page published by this Agent that they manage. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
         "category": "pages", "icon": "🔐", "is_default": True,
         "parameters_schema": {"type": "object", "properties": {
             "short_id": {"type": "string"},
@@ -3646,6 +3662,91 @@ BUILTIN_TOOLS = [
                 "source": {"type": "string", "description": "ClawHub skill slug (e.g. 'market-research') or GitHub URL"},
             },
             "required": ["source"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "search_skill_market",
+        "display_name": "Search Skill Market",
+        "description": (
+            "Search the first-party Skill market. Use automatically when installed Skills do not clearly cover "
+            "a specialized request. Returns visible company and public Skills with IDs, versions, publishers, and "
+            "unique Agent install counts."
+        ),
+        "category": "discovery",
+        "icon": "🔎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Short capability query."},
+            },
+            "required": ["query"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "install_skill_from_market",
+        "display_name": "Install Market Skill",
+        "description": (
+            "Install a market Skill into this Agent by Skill ID. The platform creates an L3 approval before "
+            "changing files, and the approving user must have Agent manage access."
+        ),
+        "category": "discovery",
+        "icon": "📥",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string", "description": "Skill UUID returned by search_skill_market."},
+            },
+            "required": ["skill_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "publish_skill_to_market",
+        "display_name": "Publish Skill to Market",
+        "description": (
+            "Publish skills/<folder> from this Agent to the company or public Skill market. The platform creates an "
+            "L3 approval before publication, and the approving user must have Agent manage access."
+        ),
+        "category": "discovery",
+        "icon": "📤",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Agent path such as skills/sales-analysis."},
+                "name": {"type": "string", "description": "Market display name."},
+                "description": {"type": "string", "description": "Short capability description."},
+                "category": {"type": "string", "default": "general"},
+                "visibility": {"type": "string", "enum": ["tenant", "public"], "default": "tenant"},
+            },
+            "required": ["path", "name", "description", "visibility"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "withdraw_skill_from_market",
+        "display_name": "Withdraw Skill from Market",
+        "description": (
+            "Withdraw a Skill previously published by this Agent. Existing installs remain available. The platform "
+            "creates an L3 approval before withdrawal, and the approving user must have Agent manage access."
+        ),
+        "category": "discovery",
+        "icon": "📤",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string", "description": "Skill UUID returned after publication or search."},
+            },
+            "required": ["skill_id"],
         },
         "config": {},
         "config_schema": {},

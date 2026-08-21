@@ -94,6 +94,18 @@ def _task_title(task: str) -> str:
     return (compact[:80] or "Subagent")
 
 
+def _subagent_title(name: str | None, task: str) -> str:
+    """Normalize the caller-authored child name, with old-call compatibility."""
+    if name is None:
+        return _task_title(task)
+    compact = " ".join(str(name).split())
+    if not compact:
+        raise SubagentError("name 不能为空。")
+    if len(compact) > 80:
+        raise SubagentError("name 不能超过 80 个字符。")
+    return compact
+
+
 async def _validate_execution_identity(
     db,
     run: SubagentRun,
@@ -255,10 +267,13 @@ async def create_subagent(
     execution_user_id: uuid.UUID,
     parent_session_id: str,
     origin_tool_call_id: str,
+    name: str | None = None,
     task: str,
     mode: str = "sync",
     model: str | None = None,
     fork: bool = False,
+    soul: bool = True,
+    memory: bool = True,
     turn_anchor_id: uuid.UUID | None = None,
     project_run_id: uuid.UUID | None = None,
     input_metadata: dict | None = None,
@@ -267,6 +282,7 @@ async def create_subagent(
     task_text = str(task or "").strip()
     if not task_text:
         raise SubagentError("task 不能为空。")
+    child_title = _subagent_title(name, task_text)
     normalized_mode = str(mode or "sync").strip().lower()
     if normalized_mode not in {"sync", "async"}:
         raise SubagentError("mode 只支持 sync 或 async。")
@@ -385,7 +401,7 @@ async def create_subagent(
             agent_id=agent_id,
             project_id=parent.project_id,
             user_id=child_user_id,
-            title=_task_title(task_text),
+            title=child_title,
             source_channel=SUBAGENT_CHANNEL,
             is_primary=False,
             is_group=False,
@@ -424,6 +440,8 @@ async def create_subagent(
             origin_tool_call_id=call_id,
             mode=normalized_mode,
             model=canonical_model,
+            soul=bool(soul),
+            memory=bool(memory),
             status=RUN_QUEUED,
         )
         db.add_all([child, run])
@@ -1478,6 +1496,8 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     recovery_mode=recovering,
                     turn_anchor_id=anchor.id,
                     model_name=run.model,
+                    include_soul=run.soul,
+                    include_memory=run.memory,
                     prepared_tools=tools,
                     on_thinking=_capture_thinking,
                     before_round=lambda _round, aid=anchor.id: _drain_subagent_inbox(

@@ -1,5 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { IconX } from '@tabler/icons-react';
+import { Modal } from '../Dialog/DialogProvider';
+import Button from '../ui/Button';
 import type { CliTool } from './types';
 import { cliToolsApi } from './api';
 import { BasicInfoStep } from './steps/BasicInfoStep';
@@ -9,15 +12,23 @@ import { ConfigStep } from './steps/ConfigStep';
 type Step = 1 | 2 | 3;
 
 export function CliToolWizard({
+  open,
   tool,
   onClose,
 }: {
+  open: boolean;
   tool: CliTool | null;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
   const [step, setStep] = useState<Step>(1);
   const [draft, setDraft] = useState<CliTool | null>(tool);
+
+  useEffect(() => {
+    if (!open) return;
+    setStep(1);
+    setDraft(tool);
+  }, [open, tool]);
 
   // Basic-info submission carries only name / display_name / description.
   // Binary metadata is managed separately through the upload endpoint.
@@ -52,42 +63,36 @@ export function CliToolWizard({
   const title = draft?.display_name || t('enterprise.cliTools.addButton', 'Add CLI Tool');
 
   return (
-    <div
-      style={{
-        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 2000,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}
-      onClick={onClose}
+    <Modal
+      open={open}
+      onClose={onClose}
+      closeOnBackdrop={false}
+      ariaLabelledBy="cli-tool-wizard-title"
+      className="cli-tool-wizard-modal"
+      style={{ width: 'min(480px, calc(100vw - 40px))' }}
     >
       <div
-        onClick={(e) => e.stopPropagation()}
         style={{
-          background: 'var(--bg-primary)',
-          borderRadius: '12px',
           padding: '24px',
-          width: '480px',
-          maxWidth: '95vw',
-          maxHeight: '80vh',
-          overflow: 'auto',
-          boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
         }}
       >
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
           <div>
-            <h3 style={{ margin: 0 }}>🛠️ {title}</h3>
+            <h3 id="cli-tool-wizard-title" style={{ margin: 0 }}>🛠️ {title}</h3>
             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
               {t('enterprise.cliTools.wizard.subtitle', 'Upload a binary, configure env, run a test')}
             </div>
           </div>
-          <button
+          <Button
+            type="button"
+            variant="ghost"
             onClick={onClose}
-            style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)' }}
+            aria-label={t('common.close')}
+            style={{ minWidth: '34px', padding: '7px' }}
           >
-            ✕
-          </button>
+            <IconX size={18} />
+          </Button>
         </div>
 
         {/* Step indicator — clickable once the draft has been persisted
@@ -155,6 +160,6 @@ export function CliToolWizard({
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
