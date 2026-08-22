@@ -32,6 +32,11 @@ from app.models.subagent_run import SubagentRun
 from app.models.task import Task
 from app.models.user import User
 from app.services.activity_logger import log_activity
+from app.services.active_turns import (
+    active_turn_boundary,
+    ensure_active_turn,
+    set_active_turn_cancel_task,
+)
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_history import persist_initial_assistant_message_if_pristine
@@ -263,6 +268,9 @@ async def _await_turn_with_abort(llm_task, recv_json, partial_chunks: list[str])
             # Connection dropped mid-turn — stop listening but DO NOT cancel.
             disconnected = True
             break
+
+    if llm_task.cancelled():
+        aborted = True
 
     if aborted:
         try:
@@ -1117,110 +1125,198 @@ class WebSocketChatHandler:
                 re.IGNORECASE,
             )
 
-            # Invoke LLM and stream response
-            self.client_disconnected = False
-            if effective_llm_model:
-                (
-                    assistant_response,
-                    thinking_content,
-                    _queued_messages,
-                    turn_outcome,
-                    produced_output,
-                ) = await self._run_llm_and_stream(
-                    effective_llm_model,
-                    is_onboarding_trigger,
+            turn_task = asyncio.create_task(
+                self._execute_web_turn(
+                    effective_llm_model=effective_llm_model,
+                    is_onboarding_trigger=is_onboarding_trigger,
                     onboarding_claim=onboarding_claim,
                     turn_anchor_id=turn_anchor_id,
+                    task_match=task_match,
                 )
-            else:
-                assistant_response = (
-                    f"⚠️ {self.agent_name} has no LLM model configured. "
-                    "Please select a model in the agent's Settings tab."
-                )
-                thinking_content = []
-                _queued_messages = []
-                turn_outcome = "failed"
-                produced_output = False
+            )
+            disposition = await turn_task
+            if disposition == "disconnect":
+                break
+            if disposition == "continue":
+                continue
 
-            if onboarding_claim and onboarding_claim.claimed_at:
-                # Successful greeting streams advance pending atomically on the
-                # first chunk. Errors/aborts with no output leave it pending; in
-                # that case release only this exact claim so reconnect can retry.
-                async with async_session() as _release_db:
-                    await release_onboarding_claim(
-                        _release_db,
-                        self.agent_id,
-                        self.user_id,
-                        onboarding_claim.claimed_at,
+    async def _execute_web_turn(
+        self,
+        *,
+        effective_llm_model: RuntimeLLMModel | None,
+        is_onboarding_trigger: bool,
+        onboarding_claim: OnboardingClaim | None,
+        turn_anchor_id: uuid.UUID | None,
+        task_match,
+    ) -> str:
+        """Run one web turn in its own cancellable task through persistence."""
+
+        async with active_turn_boundary():
+            current_user_content = next(
+                (
+                    str(item.get("content") or "")
+                    for item in reversed(self.conversation)
+                    if item.get("role") == "user"
+                ),
+                "",
+            )
+            await ensure_active_turn(
+                owner_user_id=self.user_id,
+                agent_id=self.agent_id,
+                session_id=self.conv_id,
+                turn_type="web",
+                turn_anchor_id=turn_anchor_id,
+                title=current_user_content.strip()[:40] or None,
+            )
+            terminal_message_id = uuid.uuid4()
+            try:
+                self.client_disconnected = False
+                if effective_llm_model:
+                    (
+                        assistant_response,
+                        thinking_content,
+                        _queued_messages,
+                        turn_outcome,
+                        produced_output,
+                    ) = await self._run_llm_and_stream(
+                        effective_llm_model,
+                        is_onboarding_trigger,
+                        onboarding_claim=onboarding_claim,
+                        turn_anchor_id=turn_anchor_id,
+                    )
+                else:
+                    assistant_response = (
+                        f"⚠️ {self.agent_name} has no LLM model configured. "
+                        "Please select a model in the agent's Settings tab."
+                    )
+                    thinking_content = []
+                    _queued_messages = []
+                    turn_outcome = "failed"
+                    produced_output = False
+
+                if onboarding_claim and onboarding_claim.claimed_at:
+                    async with async_session() as _release_db:
+                        await release_onboarding_claim(
+                            _release_db,
+                            self.agent_id,
+                            self.user_id,
+                            onboarding_claim.claimed_at,
+                        )
+
+                if (
+                    is_onboarding_trigger
+                    and not produced_output
+                    and turn_outcome in {"failed", "aborted"}
+                ):
+                    if self.conversation and self.conversation[-1].get("role") == "user":
+                        self.conversation.pop()
+                    await self._safe_send(
+                        {
+                            "type": "onboarding_skipped",
+                            "reason": (
+                                "generation_aborted"
+                                if turn_outcome == "aborted"
+                                else "generation_failed"
+                            ),
+                            "agent_id": str(self.agent_id),
+                        }
+                    )
+                    return "continue"
+
+                # request_confirmation persisted a suspended turn itself.
+                if assistant_response == "":
+                    await self._safe_send(
+                        {"type": "done", "role": "assistant", "content": ""}
+                    )
+                    if self.client_disconnected:
+                        await manager.disconnect(str(self.agent_id), self.websocket)
+                        return "disconnect"
+                    return "continue"
+
+                if task_match:
+                    assistant_response = await self._create_task_record(
+                        task_match.group(1).strip(),
+                        assistant_response,
                     )
 
-            if (
-                is_onboarding_trigger
-                and not produced_output
-                and turn_outcome in {"failed", "aborted"}
-            ):
-                # A synthetic greeting that never produced user-visible output
-                # must leave the pristine session pristine. Persisting an error
-                # or abort marker would make history-based eligibility reject a
-                # safe reconnect retry.
-                if self.conversation and self.conversation[-1].get("role") == "user":
-                    self.conversation.pop()
+                self.conversation.append(
+                    {"role": "assistant", "content": assistant_response}
+                )
+                await self._save_assistant_reply(
+                    assistant_response,
+                    thinking_content,
+                    message_id=terminal_message_id,
+                    turn_anchor_id=turn_anchor_id,
+                    turn_status=(
+                        "cancelled" if turn_outcome == "aborted" else "completed"
+                    ),
+                    complete_onboarding=(
+                        is_onboarding_trigger
+                        and produced_output
+                        and self.source_channel != "web"
+                    ),
+                )
                 await self._safe_send(
                     {
-                        "type": "onboarding_skipped",
-                        "reason": (
-                            "generation_aborted"
-                            if turn_outcome == "aborted"
-                            else "generation_failed"
-                        ),
-                        "agent_id": str(self.agent_id),
+                        "type": "done",
+                        "role": "assistant",
+                        "content": assistant_response,
                     }
                 )
-                continue
 
-            # request_confirmation suspends the turn inside the unified LLM caller
-            # and persists the intro/card rows there. Keep the turn anchor suspended:
-            # do not add an empty assistant row and do not mark the anchor completed.
-            if assistant_response == "":
-                await self._safe_send({"type": "done", "role": "assistant", "content": ""})
                 if self.client_disconnected:
+                    logger.info(
+                        "[WS] Detached turn complete after disconnect; closing handler "
+                        f"for {self.user_id or 'unknown'}"
+                    )
                     await manager.disconnect(str(self.agent_id), self.websocket)
-                    break
-                continue
-
-            # If task creation detected, create a real Task record
-            if task_match:
-                assistant_response = await self._create_task_record(task_match.group(1).strip(), assistant_response)
-
-            # Add assistant response to in-memory conversation
-            self.conversation.append({"role": "assistant", "content": assistant_response})
-
-            # Save assistant reply
-            await self._save_assistant_reply(
-                assistant_response,
-                thinking_content,
-                turn_anchor_id=turn_anchor_id,
-                complete_onboarding=(
-                    is_onboarding_trigger
-                    and produced_output
-                    and self.source_channel != "web"
-                ),
-            )
-
-            # Final 'done' packet — best-effort broadcast; a client that dropped
-            # mid-turn gets the reply via history replay on reconnect instead.
-            await self._safe_send({"type": "done", "role": "assistant", "content": assistant_response})
-
-            # The browser dropped mid-turn: we finished + persisted the reply
-            # detached. Tear down cleanly instead of looping back into receive
-            # (which would raise) — same cleanup as the WebSocketDisconnect path.
-            if self.client_disconnected:
-                logger.info(
-                    f"[WS] Detached turn complete after disconnect; closing handler for "
-                    f"{self.user_id or 'unknown'}"
-                )
-                await manager.disconnect(str(self.agent_id), self.websocket)
-                break
+                    return "disconnect"
+                return "done"
+            except asyncio.CancelledError:
+                # Cancellation during the persistence tail must not tear down the
+                # reusable WebSocket handler or leave a half-open turn. The
+                # anchor-locked save is idempotent: if a completed reply crossed
+                # the commit boundary just before cancellation, keep it instead
+                # of adding a second, contradictory cancelled terminal row.
+                stopped = "*[Generation stopped]*"
+                saved_cancelled = False
+                try:
+                    saved_cancelled = await self._save_assistant_reply(
+                        stopped,
+                        [],
+                        message_id=terminal_message_id,
+                        turn_anchor_id=turn_anchor_id,
+                        turn_status="cancelled",
+                    )
+                except Exception:
+                    logger.exception("[WS] Failed to persist externally cancelled turn")
+                if saved_cancelled:
+                    if (
+                        self.conversation
+                        and self.conversation[-1].get("role") == "assistant"
+                    ):
+                        self.conversation.pop()
+                    self.conversation.append(
+                        {"role": "assistant", "content": stopped}
+                    )
+                    await self._safe_send(
+                        {"type": "done", "role": "assistant", "content": stopped}
+                    )
+                elif (
+                    self.conversation
+                    and self.conversation[-1].get("role") == "assistant"
+                ):
+                    # The completed row won the commit race. Its streaming
+                    # chunks may already be visible, but cancellation skipped
+                    # the normal terminal event, so close the frontend state.
+                    await self._safe_send(
+                        {
+                            "type": "done",
+                            "role": "assistant",
+                            "content": self.conversation[-1].get("content", ""),
+                        }
+                    )
+                return "continue"
 
     async def _claim_onboarding_trigger(self) -> OnboardingClaim | None:
         """Revalidate and atomically claim this session's greeting turn."""
@@ -1869,6 +1965,7 @@ class WebSocketChatHandler:
                     on_code_output=code_output_to_ws,
                     channel_context=self._channel_context(),
                     turn_anchor_id=turn_anchor_id,
+                    turn_type="web",
                     context_recovery=context_recovery,
                 )
 
@@ -1880,9 +1977,13 @@ class WebSocketChatHandler:
             # replay (parity with the connection-independent IM / trigger
             # channels). Only an explicit user abort cancels.
             queued_messages: list[dict] = []
-            assistant_response, _turn_outcome = await _await_turn_with_abort(
-                llm_task, self.websocket.receive_json, partial_chunks
-            )
+            set_active_turn_cancel_task(llm_task)
+            try:
+                assistant_response, _turn_outcome = await _await_turn_with_abort(
+                    llm_task, self.websocket.receive_json, partial_chunks
+                )
+            finally:
+                set_active_turn_cancel_task(None)
             aborted = _turn_outcome == "aborted"
             self.client_disconnected = _turn_outcome == "disconnected"
             if self.client_disconnected:
@@ -2096,12 +2197,44 @@ class WebSocketChatHandler:
         assistant_response: str,
         thinking_content: list[str],
         *,
+        message_id: uuid.UUID | None = None,
         turn_anchor_id: uuid.UUID | None = None,
+        turn_status: str = "completed",
         complete_onboarding: bool = False,
-    ):
-        """Saves assistant reply to DB."""
+    ) -> bool:
+        """Save the single terminal assistant row for one web turn."""
         async with async_session() as db:
+            if message_id is not None and await db.get(ChatMessage, message_id):
+                return False
+            if turn_anchor_id is not None:
+                # Serialize completion against MCP stop_turn, which locks the
+                # same user anchor before marking it cancelled.
+                from app.services.chat_history import (
+                    lock_turn_anchor_for_finalization,
+                )
+
+                await lock_turn_anchor_for_finalization(
+                    db,
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                    turn_anchor_id=turn_anchor_id,
+                    allow_cancelled=turn_status == "cancelled",
+                )
+                existing_terminal = await db.scalar(
+                    select(ChatMessage.id)
+                    .where(
+                        ChatMessage.agent_id == self.agent_id,
+                        ChatMessage.conversation_id == self.conv_id,
+                        ChatMessage.role == "assistant",
+                        ChatMessage.message_meta["turn_anchor_id"].as_string()
+                        == str(turn_anchor_id),
+                    )
+                    .limit(1)
+                )
+                if existing_terminal is not None:
+                    return False
             assistant_msg = ChatMessage(
+                id=message_id or uuid.uuid4(),
                 agent_id=self.agent_id,
                 user_id=self.user_id,
                 role="assistant",
@@ -2111,7 +2244,7 @@ class WebSocketChatHandler:
                 message_meta=(
                     {
                         "turn_anchor_id": str(turn_anchor_id),
-                        "turn_status": "completed",
+                        "turn_status": turn_status,
                         **self._scene_message_meta(),
                     }
                     if turn_anchor_id is not None
@@ -2141,3 +2274,4 @@ class WebSocketChatHandler:
             )
             await db.commit()
         logger.info("[WS] Assistant message saved")
+        return True

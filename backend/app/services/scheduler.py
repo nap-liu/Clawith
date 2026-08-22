@@ -70,6 +70,7 @@ async def _execute_schedule(
                 max_rounds=50,
                 session_id=str(schedule_id),
                 execution_user_id=execution_user_id,
+                turn_type="schedule",
             )
 
             # Log activity

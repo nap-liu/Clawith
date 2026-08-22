@@ -116,7 +116,65 @@ async def _session_max_scope(db, user, sess: ChatSession) -> str:
 # ── Shared helper: resolve or create the MCP session (three paths) ────────────
 
 
-async def _resolve_mcp_session(db, user, agent, *, new_conversation: bool, session_id: str | None):
+_LEGACY_MCP_TITLES = frozenset({"(MCP)", "（MCP）", "【（mcp）】"})
+
+
+def _standard_session_title(message: str) -> str:
+    return message.strip()[:40] or "New Session"
+
+
+async def _resolved_mcp_session_title(
+    db,
+    session: ChatSession,
+    *,
+    current_message: str = "",
+) -> str:
+    """Resolve the standard title without requiring a write transaction."""
+
+    if session.source_channel != "mcp":
+        return session.title
+    current_title = session.title or ""
+    if current_title not in _LEGACY_MCP_TITLES and current_title != "New Session":
+        return session.title
+    historic = (
+        await db.execute(
+            select(ChatMessage.content)
+            .where(
+                ChatMessage.agent_id == session.agent_id,
+                ChatMessage.conversation_id == str(session.id),
+                ChatMessage.role == "user",
+            )
+            .order_by(ChatMessage.created_at, ChatMessage.id)
+        )
+    ).scalars()
+    first_nonblank = next((content for content in historic if (content or "").strip()), "")
+    return _standard_session_title(first_nonblank or current_message)
+
+
+async def _repair_mcp_session_title(
+    db,
+    session: ChatSession,
+    *,
+    current_message: str = "",
+) -> None:
+    """Persist an idempotent title repair inside an existing chat mutation."""
+
+    session.title = await _resolved_mcp_session_title(
+        db,
+        session,
+        current_message=current_message,
+    )
+
+
+async def _resolve_mcp_session(
+    db,
+    user,
+    agent,
+    *,
+    new_conversation: bool,
+    session_id: str | None,
+    first_message_title: str,
+):
     """Return (ChatSession, error_code | None).
 
     Path 1 — explicit session_id: pure SELECT, no find_or_create (which would
@@ -136,7 +194,11 @@ async def _resolve_mcp_session(db, user, agent, *, new_conversation: bool, sessi
         except (ValueError, TypeError):
             return None, "bad_id"
         sess = (
-            await db.execute(select(ChatSession).where(ChatSession.id == sid))
+            await db.execute(
+                select(ChatSession)
+                .where(ChatSession.id == sid)
+                .with_for_update()
+            )
         ).scalar_one_or_none()
         if sess is None:
             return None, "deny"
@@ -156,6 +218,7 @@ async def _resolve_mcp_session(db, user, agent, *, new_conversation: bool, sessi
         # Validate agent match when an explicit agent was also given.
         if agent is not None and sess.agent_id != agent.id and sess.peer_agent_id != agent.id:
             return None, "mismatch"
+        await _repair_mcp_session_title(db, sess, current_message=first_message_title)
         return sess, None
 
     if not new_conversation:
@@ -170,9 +233,11 @@ async def _resolve_mcp_session(db, user, agent, *, new_conversation: bool, sessi
                 )
                 .order_by(ChatSession.last_message_at.desc().nullslast())
                 .limit(1)
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if sess is not None:
+            await _repair_mcp_session_title(db, sess, current_message=first_message_title)
             return sess, None
 
     # Path 2 (or path 3 with no existing session): create a fresh mcp session.
@@ -182,7 +247,7 @@ async def _resolve_mcp_session(db, user, agent, *, new_conversation: bool, sessi
         user_id=user.id,
         external_conv_id=f"mcp_{_uuid.uuid4().hex}",
         source_channel="mcp",
-        first_message_title="(MCP)",
+        first_message_title=_standard_session_title(first_message_title),
         is_group=False,
     )
     return sess, None
@@ -314,6 +379,9 @@ async def list_sessions(  # noqa: D401
             offset=offset,
         )
         counts = await sq.count_messages_per_session(db, [r.id for r in rows])
+        display_titles = {
+            row.id: await _resolved_mcp_session_title(db, row) for row in rows
+        }
 
         # Build agent-name lookup for labelling.
         agent_ids = {r.agent_id for r in rows}
@@ -331,7 +399,7 @@ async def list_sessions(  # noqa: D401
         lines = [head]
         for i, s in enumerate(rows, start=offset + 1):
             cid = str(s.id)
-            title = s.group_name or s.title or "(无标题)"
+            title = s.group_name or display_titles[s.id] or "(无标题)"
             n = counts.get(cid, 0)
             last = s.last_message_at.isoformat() if s.last_message_at else "—"
             agent_label = agent_names.get(s.agent_id, str(s.agent_id))
@@ -455,6 +523,7 @@ async def chat_with_agent(  # noqa: D401
             a,
             new_conversation=new_conversation,
             session_id=session_id,
+            first_message_title=message,
         )
         if err == "deny":
             return _DENY
@@ -489,6 +558,7 @@ async def chat_with_agent(  # noqa: D401
             role="user",
             content=message,
             conversation_id=conv_id,
+            created_at=datetime.now(timezone.utc),
         )
         db.add(turn_anchor)
         await db.flush()
@@ -530,6 +600,7 @@ async def chat_with_agent(  # noqa: D401
             is_group=False,
             recovery_hint=None,
             turn_anchor_id=turn_anchor.id,
+            turn_type="mcp",
         )
 
     # Persist the assistant reply in its own session so created_at is stamped

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -493,7 +494,21 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
             stats.scanned = len(anchors)
             for anchor in anchors:
                 try:
-                    did_resume = await resume_turn(anchor)
+                    # Each recovered anchor is an independently cancellable
+                    # logical turn. Keeping them on the startup scanner task
+                    # would make one stop request cancel the entire batch.
+                    did_resume = await asyncio.create_task(resume_turn(anchor))
+                except asyncio.CancelledError:
+                    scanner_task = asyncio.current_task()
+                    if scanner_task is not None and scanner_task.cancelling():
+                        raise
+                    stats.skipped += 1
+                    logger.info(
+                        "[turn_recovery] recovery cancelled for anchor={}; "
+                        "continuing batch",
+                        anchor.id,
+                    )
+                    continue
                 except Exception as exc:
                     stats.failed += 1
                     logger.exception(f"[turn_recovery] failed to resume anchor={anchor.id}: {exc}")
@@ -562,6 +577,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             recovery_mode=True,
             turn_anchor_id=anchor.id,
             storage_agent_id=anchor.agent_id,
+            turn_type="recovery",
         )
 
     if reply and reply.strip():

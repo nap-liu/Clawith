@@ -19,6 +19,8 @@ mcp = FastMCP(
         "pass new_conversation=true to start fresh, or session_id to resume a specific session\n"
         "- list_sessions: list chat sessions for a given agent\n"
         "- get_session: retrieve the message history for a specific session\n"
+        "- list_active_turns: list all currently executing turn types visible to you\n"
+        "- stop_turn: precisely terminate one turn (write-scope PAT required; platform admins may manage all)\n"
         "\n"
         "With a write-scope PAT you can also provision and manage agents:\n"
         "- list_available_tools / list_models: discover enablable tools / pick a model\n"
@@ -73,3 +75,4 @@ from app.mcp_server import tools_mcp  # noqa: F401,E402  install/uninstall_agent
 from app.mcp_server import tools_credentials  # noqa: F401,E402  agent credentials
 from app.mcp_server import tools_schedules  # noqa: F401,E402  agent schedules
 from app.mcp_server import tools_channel  # noqa: F401,E402  agent channel config
+from app.mcp_server import tools_turns  # noqa: F401,E402  active turn control

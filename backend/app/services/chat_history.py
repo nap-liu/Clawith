@@ -25,6 +25,7 @@ original rows; only the LLM context sees the synthetic summary).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -676,6 +677,77 @@ async def mark_latest_incomplete_turn_cancelled(
     return anchor.id
 
 
+async def mark_turn_cancelled(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+    reason: str,
+) -> uuid.UUID | None:
+    """Mark one exact active user anchor cancelled without guessing latest state."""
+
+    anchor = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.id == turn_anchor_id,
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == conversation_id,
+                ChatMessage.role == "user",
+                ChatMessage.compacted_into.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if anchor is None:
+        return None
+
+    if await turn_has_completed_reply(
+        db,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        turn_anchor_id=turn_anchor_id,
+    ):
+        return None
+
+    meta = dict(anchor.message_meta or {})
+    meta.update(
+        {
+            "turn_status": "cancelled",
+            "cancel_reason": reason,
+            "cancelled_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    anchor.message_meta = meta
+    await db.flush()
+    return anchor.id
+
+
+async def turn_has_completed_reply(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+) -> bool:
+    """Return whether an exact turn anchor already has its terminal reply."""
+
+    completed = await db.scalar(
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.role == "assistant",
+            ChatMessage.message_meta["turn_anchor_id"].as_string()
+            == str(turn_anchor_id),
+            ChatMessage.message_meta["turn_status"].as_string() == "completed",
+        )
+        .limit(1)
+    )
+    return completed is not None
+
+
 def build_external_event_key(
     *,
     agent_id: uuid.UUID,
@@ -1198,6 +1270,40 @@ def cap_thinking(thinking: str | None) -> str | None:
     return thinking[:THINKING_MAX_CHARS]
 
 
+async def lock_turn_anchor_for_finalization(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+    allow_cancelled: bool = False,
+) -> ChatMessage | None:
+    """Serialize a terminal write with MCP stop and reject a won cancellation."""
+
+    from app.services.active_turns import wait_for_current_turn_stop_resolution
+
+    await wait_for_current_turn_stop_resolution(allow_cancelled=allow_cancelled)
+    anchor = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.id == turn_anchor_id,
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == conversation_id,
+                ChatMessage.role == "user",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        not allow_cancelled
+        and anchor is not None
+        and (anchor.message_meta or {}).get("turn_status") == "cancelled"
+    ):
+        raise asyncio.CancelledError
+    return anchor
+
+
 async def persist_assistant_reply(
     db_session_factory,
     *,
@@ -1252,6 +1358,13 @@ async def persist_assistant_reply_row(
     """Persist a non-empty assistant reply in the caller's transaction."""
     if not (content or "").strip():
         raise ValueError("assistant reply content must be non-empty")
+    if turn_anchor_id is not None:
+        await lock_turn_anchor_for_finalization(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=turn_anchor_id,
+        )
     final_meta = dict(message_meta or {})
     final_meta.setdefault("attachments", [])
     if turn_anchor_id is not None:

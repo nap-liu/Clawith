@@ -9,6 +9,8 @@ async def test_all_mcp_tools_registered():
     expected = {
         # read/chat
         "list_agents", "get_agent_info", "list_sessions", "get_session", "chat_with_agent",
+        # live turn control
+        "list_active_turns", "stop_turn",
         # discovery
         "list_available_tools", "list_models",
         # provisioning

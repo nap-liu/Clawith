@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -370,6 +371,67 @@ async def test_round_boundary_drains_append_and_stop_wins():
     assert stale_final is None
 
 
+async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
+    from app.services.active_turns import (
+        cancel_active_turn,
+        ensure_active_turn,
+        list_active_turns,
+        reset_active_turns_for_testing,
+    )
+    from app.services import channel_llm
+
+    await reset_active_turns_for_testing()
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-control-cancel",
+        task="long child task",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    ready = asyncio.Event()
+
+    async def fake_call(*args, **kwargs):
+        await ensure_active_turn(
+            owner_user_id=user_id,
+            agent_id=agent_id,
+            session_id=str(run.id),
+            turn_type="subagent",
+            turn_anchor_id=kwargs["turn_anchor_id"],
+        )
+        ready.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(channel_llm, "_call_agent_llm", fake_call)
+    worker = asyncio.create_task(runtime.execute_claimed_subagent(run.id))
+    await ready.wait()
+    record = (await list_active_turns(owner_user_id=user_id))[0]
+    await cancel_active_turn(record.turn_id, owner_user_id=user_id)
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    async with async_session() as db:
+        fresh = await db.get(SubagentRun, run.id)
+        input_rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(run.id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == runtime.SUBAGENT_INPUT,
+                )
+            )
+        ).scalars().all()
+    assert fresh.status == runtime.RUN_CANCELLED
+    assert all(
+        row.message_meta["subagent_input_state"] == runtime.INPUT_CANCELLED
+        for row in input_rows
+    )
+    await reset_active_turns_for_testing()
+
+
 async def test_failed_turn_continues_when_parent_input_is_pending():
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
@@ -413,6 +475,94 @@ async def test_failed_turn_continues_when_parent_input_is_pending():
     assert fresh.status == "running"
     assert first.message_meta["subagent_input_state"] == "done"
     assert first.message_meta["turn_status"] == "failed"
+
+
+async def test_subagent_finish_waits_for_reserved_stop_before_mutating_anchor():
+    from app.services.active_turns import (
+        ensure_active_turn,
+        finalize_active_turn_stop,
+        list_active_turns,
+        reserve_active_turn_stop,
+        reset_active_turns_for_testing,
+    )
+    from app.services.chat_history import mark_turn_cancelled
+
+    await reset_active_turns_for_testing()
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-stop-finish-race",
+        task="must stop cleanly",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    claimed = await runtime._load_or_start_input(run.id)
+    assert claimed is not None
+    turn_anchor, _ = claimed
+    registered = asyncio.Event()
+    finish_now = asyncio.Event()
+
+    async def finishing_turn():
+        await ensure_active_turn(
+            owner_user_id=user_id,
+            agent_id=agent_id,
+            session_id=str(run.id),
+            turn_type="subagent",
+            turn_anchor_id=turn_anchor.id,
+        )
+        registered.set()
+        await finish_now.wait()
+        await runtime._finish_subagent_turn(
+            run_id=run.id,
+            anchor_id=turn_anchor.id,
+            reply="must not be committed",
+            failed=False,
+        )
+
+    worker = asyncio.create_task(finishing_turn())
+    await registered.wait()
+    record = (await list_active_turns(owner_user_id=user_id))[0]
+    _, stop_token = await reserve_active_turn_stop(
+        record.turn_id,
+        owner_user_id=user_id,
+    )
+    assert stop_token is not None
+
+    finish_now.set()
+    await asyncio.sleep(0)
+    assert not worker.done()
+    async with async_session() as db:
+        assert await mark_turn_cancelled(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+            turn_anchor_id=turn_anchor.id,
+            reason="test control-plane stop",
+        ) == turn_anchor.id
+        await db.commit()
+    await finalize_active_turn_stop(record, stop_token)
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    async with async_session() as db:
+        fresh_anchor = await db.get(ChatMessage, turn_anchor.id)
+        terminal_reply = await db.scalar(
+            select(ChatMessage.id).where(
+                ChatMessage.conversation_id == str(run.id),
+                ChatMessage.role == "assistant",
+                ChatMessage.message_meta["turn_anchor_id"].as_string()
+                == str(turn_anchor.id),
+                ChatMessage.message_meta["turn_status"].as_string()
+                == "completed",
+            )
+        )
+    assert fresh_anchor.message_meta["turn_status"] == "cancelled"
+    assert fresh_anchor.message_meta["subagent_input_state"] == "processing"
+    assert terminal_reply is None
+    await reset_active_turns_for_testing()
 
 
 async def test_unexpected_failure_requeues_pending_input_without_lease_delay(

@@ -11699,6 +11699,34 @@ async def _send_message_to_agent(
 
             # ── Native target: branch by msg_type ──
 
+            # Resolve the effective branch before the common write. Synchronous
+            # consult joins the caller's root turn; notify/delegate remain
+            # independent durable side effects.
+            _a2a_async = False
+            if source_agent.tenant_id:
+                try:
+                    from app.models.tenant import Tenant
+                    _t_r = await db.execute(select(Tenant).where(Tenant.id == source_agent.tenant_id))
+                    _tenant = _t_r.scalar_one_or_none()
+                    if _tenant:
+                        _a2a_async = getattr(_tenant, "a2a_async_enabled", False)
+                except Exception:
+                    pass
+            if not _a2a_async and not force_async:
+                if msg_type in ("notify", "task_delegate"):
+                    msg_type = "consult"
+
+            if msg_type == "consult":
+                from app.services.active_turns import ensure_active_turn
+
+                await ensure_active_turn(
+                    owner_user_id=owner_id,
+                    agent_id=target.id,
+                    session_id=session_id,
+                    turn_type="agent",
+                    title=message_text.strip()[:40] or None,
+                )
+
             # Save source message (common to all paths)
             outbound_a2a_message = recorded_project_outbound
             if outbound_a2a_message is None:
@@ -11726,7 +11754,17 @@ async def _send_message_to_agent(
                 )
                 db.add(outbound_a2a_message)
                 chat_session.last_message_at = datetime.now(timezone.utc)
-            await db.commit()
+            if msg_type == "consult":
+                from app.services.active_turns import commit_current_turn_anchor
+
+                await commit_current_turn_anchor(
+                    db.commit,
+                    agent_id=session_agent_id,
+                    session_id=session_id,
+                    message_id=outbound_a2a_message.id,
+                )
+            else:
+                await db.commit()
 
             # Project A2A must execute in the same durable, project-scoped child
             # runtime as group mentions.  A generic trigger Session has no
@@ -11777,21 +11815,6 @@ async def _send_message_to_agent(
                     },
                     ensure_ascii=False,
                 )
-
-            # ── Feature flag: async A2A (tenant-level) ──
-            _a2a_async = False
-            if source_agent.tenant_id:
-                try:
-                    from app.models.tenant import Tenant
-                    _t_r = await db.execute(select(Tenant).where(Tenant.id == source_agent.tenant_id))
-                    _tenant = _t_r.scalar_one_or_none()
-                    if _tenant:
-                        _a2a_async = getattr(_tenant, "a2a_async_enabled", False)
-                except Exception:
-                    pass
-            if not _a2a_async and not force_async:
-                if msg_type in ("notify", "task_delegate"):
-                    msg_type = "consult"
 
             # ── notify: fire-and-forget ──
             if msg_type == "notify":
@@ -11985,6 +12008,7 @@ async def _send_message_to_agent(
                 on_tool_call=_a2a_persist,
                 on_thinking=_a2a_on_thinking,
                 turn_anchor_id=outbound_a2a_message.id,
+                turn_anchor_agent_id=session_agent_id,
                 context_recovery=_a2a_context_recovery,
             )
 
@@ -11995,7 +12019,17 @@ async def _send_message_to_agent(
             async with async_session() as db2:
                 part_r = await db2.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
                 tgt_part = part_r.scalar_one_or_none()
-                from app.services.chat_history import cap_thinking
+                from app.services.chat_history import (
+                    cap_thinking,
+                    lock_turn_anchor_for_finalization,
+                )
+
+                await lock_turn_anchor_for_finalization(
+                    db2,
+                    agent_id=session_agent_id,
+                    conversation_id=session_id,
+                    turn_anchor_id=outbound_a2a_message.id,
+                )
                 db2.add(ChatMessage(
                     agent_id=session_agent_id,
                     user_id=owner_id,

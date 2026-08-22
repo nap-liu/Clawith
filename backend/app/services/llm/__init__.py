@@ -21,7 +21,7 @@ Example:
     )
 """
 
-from .client import LLMClient, LLMResponse, LLMError, LLMMessage
+from .client import LLMClient, LLMClientCloseGuard, LLMResponse, LLMError, LLMMessage
 from .failover import classify_error, FailoverErrorType
 from .utils import create_llm_client, get_max_tokens, get_model_api_key, get_provider_base_url, get_provider_manifest
 
@@ -61,6 +61,7 @@ __all__ = [
     "FailoverErrorType",
     # Client classes
     "LLMClient",
+    "LLMClientCloseGuard",
     "LLMResponse",
     "LLMError",
     "LLMMessage",
