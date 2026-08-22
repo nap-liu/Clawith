@@ -158,11 +158,7 @@ async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(mon
     )
 
     async with async_session() as db:
-        tool = (
-            await db.execute(
-                select(Tool).where(Tool.name == "send_message_to_parent")
-            )
-        ).scalar_one()
+        tool = (await db.execute(select(Tool).where(Tool.name == "send_message_to_parent"))).scalar_one()
         tool_id = tool.id
         assignment = AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=False)
         db.add(assignment)
@@ -170,10 +166,7 @@ async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(mon
 
     # Startup seeding must preserve an explicit manual opt-out.
     await seed_builtin_tools()
-    disabled_names = {
-        item["function"]["name"]
-        for item in await runtime.prepare_subagent_tools(agent_id)
-    }
+    disabled_names = {item["function"]["name"] for item in await runtime.prepare_subagent_tools(agent_id)}
     assert disabled_names == {"ordinary_tool"}
 
     async with async_session() as db:
@@ -188,10 +181,7 @@ async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(mon
         assignment.enabled = True
         await db.commit()
 
-    enabled_names = {
-        item["function"]["name"]
-        for item in await runtime.prepare_subagent_tools(agent_id)
-    }
+    enabled_names = {item["function"]["name"] for item in await runtime.prepare_subagent_tools(agent_id)}
     assert enabled_names == {"ordinary_tool", "send_message_to_parent"}
 
 
@@ -201,11 +191,7 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
 
     async with async_session() as db:
         user = await db.get(User, user_id)
-        tools = (
-            await db.execute(
-                select(Tool).where(Tool.name.in_(SUBAGENT_TOOL_NAMES))
-            )
-        ).scalars().all()
+        tools = (await db.execute(select(Tool).where(Tool.name.in_(SUBAGENT_TOOL_NAMES)))).scalars().all()
         assert {tool.name for tool in tools} == set(SUBAGENT_TOOL_NAMES)
         assert {tool.category for tool in tools} == {"subagent"}
         run_tool = next(tool for tool in tools if tool.name == "run_subagent")
@@ -223,13 +209,17 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
             db=db,
         )
         disabled = (
-            await db.execute(
-                select(AgentTool).where(
-                    AgentTool.agent_id == agent_id,
-                    AgentTool.tool_id.in_([tool.id for tool in tools]),
+            (
+                await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == agent_id,
+                        AgentTool.tool_id.in_([tool.id for tool in tools]),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(disabled) == 4
         assert all(assignment.enabled is False for assignment in disabled)
 
@@ -240,13 +230,17 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
             db=db,
         )
         enabled = (
-            await db.execute(
-                select(AgentTool).where(
-                    AgentTool.agent_id == agent_id,
-                    AgentTool.tool_id.in_([tool.id for tool in tools]),
+            (
+                await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == agent_id,
+                        AgentTool.tool_id.in_([tool.id for tool in tools]),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(enabled) == 4
         assert all(assignment.enabled is True for assignment in enabled)
 
@@ -285,12 +279,16 @@ async def test_create_uses_one_id_readable_model_and_idempotent_fork():
         child = await db.get(ChatSession, run.id)
         lifecycle = await db.get(SubagentRun, run.id)
         rows = (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == str(run.id))
-                .order_by(ChatMessage.created_at, ChatMessage.id)
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.conversation_id == str(run.id))
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert child is not None and child.id == lifecycle.id == run.id
     assert child.source_channel == "subagent"
     assert child.title == "Research helper"
@@ -339,9 +337,7 @@ async def test_round_boundary_drains_append_and_stop_wins():
         execution_user_id=user_id,
         origin_tool_call_id="append-second",
     )
-    assert await runtime._drain_subagent_inbox(run.id, anchor.id) == [
-        {"role": "user", "content": "second"}
-    ]
+    assert await runtime._drain_subagent_inbox(run.id, anchor.id) == [{"role": "user", "content": "second"}]
     assert (
         await runtime.stop_subagent(
             agent_id=agent_id,
@@ -372,13 +368,13 @@ async def test_round_boundary_drains_append_and_stop_wins():
 
 
 async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
+    from app.services import channel_llm
     from app.services.active_turns import (
         cancel_active_turn,
         ensure_active_turn,
         list_active_turns,
         reset_active_turns_for_testing,
     )
-    from app.services import channel_llm
 
     await reset_active_turns_for_testing()
     agent_id, user_id, parent_id, anchor_id = await _make_context()
@@ -416,19 +412,19 @@ async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
     async with async_session() as db:
         fresh = await db.get(SubagentRun, run.id)
         input_rows = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == str(run.id),
-                    ChatMessage.message_meta["kind"].as_string()
-                    == runtime.SUBAGENT_INPUT,
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == str(run.id),
+                        ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_INPUT,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert fresh.status == runtime.RUN_CANCELLED
-    assert all(
-        row.message_meta["subagent_input_state"] == runtime.INPUT_CANCELLED
-        for row in input_rows
-    )
+    assert all(row.message_meta["subagent_input_state"] == runtime.INPUT_CANCELLED for row in input_rows)
     await reset_active_turns_for_testing()
 
 
@@ -535,13 +531,16 @@ async def test_subagent_finish_waits_for_reserved_stop_before_mutating_anchor():
     await asyncio.sleep(0)
     assert not worker.done()
     async with async_session() as db:
-        assert await mark_turn_cancelled(
-            db,
-            agent_id=agent_id,
-            conversation_id=str(run.id),
-            turn_anchor_id=turn_anchor.id,
-            reason="test control-plane stop",
-        ) == turn_anchor.id
+        assert (
+            await mark_turn_cancelled(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(run.id),
+                turn_anchor_id=turn_anchor.id,
+                reason="test control-plane stop",
+            )
+            == turn_anchor.id
+        )
         await db.commit()
     await finalize_active_turn_stop(record, stop_token)
     with pytest.raises(asyncio.CancelledError):
@@ -553,10 +552,8 @@ async def test_subagent_finish_waits_for_reserved_stop_before_mutating_anchor():
             select(ChatMessage.id).where(
                 ChatMessage.conversation_id == str(run.id),
                 ChatMessage.role == "assistant",
-                ChatMessage.message_meta["turn_anchor_id"].as_string()
-                == str(turn_anchor.id),
-                ChatMessage.message_meta["turn_status"].as_string()
-                == "completed",
+                ChatMessage.message_meta["turn_anchor_id"].as_string() == str(turn_anchor.id),
+                ChatMessage.message_meta["turn_status"].as_string() == "completed",
             )
         )
     assert fresh_anchor.message_meta["turn_status"] == "cancelled"
@@ -786,8 +783,7 @@ async def test_async_parent_event_is_deduplicated_and_keeps_execution_agent(monk
                 select(ChatMessage)
                 .where(
                     ChatMessage.conversation_id == str(run.id),
-                    ChatMessage.message_meta["kind"].as_string()
-                    == runtime.SUBAGENT_PARENT_MESSAGE,
+                    ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_PARENT_MESSAGE,
                 )
                 .order_by(ChatMessage.created_at.desc())
                 .limit(1)
@@ -806,13 +802,14 @@ async def test_async_parent_event_is_deduplicated_and_keeps_execution_agent(monk
 
     async with async_session() as db:
         anchors = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.external_event_key
-                    == f"subagent-parent:{child_event.id}"
+            (
+                await db.execute(
+                    select(ChatMessage).where(ChatMessage.external_event_key == f"subagent-parent:{child_event.id}")
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(anchors) == 1
     assert anchors[0].agent_id == agent_id
     assert anchors[0].sender_agent_id == agent_id
@@ -870,8 +867,7 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
                 select(ChatMessage)
                 .where(
                     ChatMessage.conversation_id == str(run.id),
-                    ChatMessage.message_meta["kind"].as_string()
-                    == runtime.SUBAGENT_COMPLETION,
+                    ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_COMPLETION,
                 )
                 .limit(1)
             )
@@ -944,8 +940,7 @@ async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypat
             await db.execute(
                 select(ChatMessage).where(
                     ChatMessage.conversation_id == str(run.id),
-                    ChatMessage.message_meta["kind"].as_string()
-                    == runtime.SUBAGENT_INPUT,
+                    ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_INPUT,
                 )
             )
         ).scalar_one()
@@ -969,8 +964,7 @@ async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypat
                 select(ChatMessage)
                 .where(
                     ChatMessage.conversation_id == str(run.id),
-                    ChatMessage.message_meta["kind"].as_string()
-                    == runtime.SUBAGENT_COMPLETION,
+                    ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_COMPLETION,
                 )
                 .limit(1)
             )
@@ -1011,8 +1005,7 @@ async def test_revoked_execution_user_fails_before_llm_or_tool_side_effect(monke
             select(ChatMessage)
             .where(
                 ChatMessage.conversation_id == str(run.id),
-                ChatMessage.message_meta["kind"].as_string()
-                == runtime.SUBAGENT_FAILURE,
+                ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_FAILURE,
             )
             .limit(1)
         )
@@ -1048,9 +1041,7 @@ async def test_child_is_hidden_from_lists_but_direct_web_detail_is_accessible():
 
     async with async_session() as db:
         user = await db.get(User, user_id)
-        _agent, direct_child, view_scope = await _load_accessible_session(
-            db, user, agent_id, run.id
-        )
+        _agent, direct_child, view_scope = await _load_accessible_session(db, user, agent_id, run.id)
         detail = await _build_session_detail_out(db, direct_child, view_scope)
         child_rows = await _get_session_messages_page(
             agent_id=agent_id,
@@ -1103,9 +1094,7 @@ async def test_nonhuman_parent_child_uses_execution_owner_for_standard_access():
     )
     from app.services.tools.session_introspection import handle_list_sessions
 
-    agent_id, user_id, parent_id, anchor_id = await _make_context(
-        parent_channel="trigger"
-    )
+    agent_id, user_id, parent_id, anchor_id = await _make_context(parent_channel="trigger")
     run, _ = await runtime.create_subagent(
         agent_id=agent_id,
         execution_user_id=user_id,
@@ -1128,9 +1117,7 @@ async def test_nonhuman_parent_child_uses_execution_owner_for_standard_access():
         user = await db.get(User, user_id)
         child = await db.get(ChatSession, run.id)
         assert child is not None and child.user_id is None
-        _agent, direct_child, view_scope = await _load_accessible_session(
-            db, user, agent_id, run.id
-        )
+        _agent, direct_child, view_scope = await _load_accessible_session(db, user, agent_id, run.id)
         assert direct_child.id == run.id
         assert view_scope == "mine"
 
@@ -1227,14 +1214,8 @@ async def test_company_delete_helper_releases_subagent_session_tree():
 
     async with async_session() as db:
         await _delete_company_subagent_runs(db, [agent_id])
-        await db.execute(
-            delete(ChatMessage).where(
-                ChatMessage.conversation_id.in_([str(run.id), str(parent_id)])
-            )
-        )
-        await db.execute(
-            delete(ChatSession).where(ChatSession.id.in_([run.id, parent_id]))
-        )
+        await db.execute(delete(ChatMessage).where(ChatMessage.conversation_id.in_([str(run.id), str(parent_id)])))
+        await db.execute(delete(ChatSession).where(ChatSession.id.in_([run.id, parent_id])))
         await db.commit()
         assert await db.get(SubagentRun, run.id) is None
         assert await db.get(ChatSession, run.id) is None
@@ -1250,9 +1231,7 @@ async def test_round_inbox_survives_first_dispatch_context_recovery(monkeypatch)
         return "system", "dynamic"
 
     async def fake_call_llm(_model, _messages, _name, _role, **kwargs):
-        assert await kwargs["before_round"](0) == [
-            {"role": "user", "content": "late message"}
-        ]
+        assert await kwargs["before_round"](0) == [{"role": "user", "content": "late message"}]
         captured["recovered"] = await kwargs["context_recovery"](_model, None)
         return "ok"
 
@@ -1354,8 +1333,7 @@ async def test_a2a_parent_wake_distinguishes_execution_and_storage_agent(monkeyp
                 select(ChatMessage)
                 .where(
                     ChatMessage.conversation_id == str(run.id),
-                    ChatMessage.message_meta["kind"].as_string()
-                    == runtime.SUBAGENT_PARENT_MESSAGE,
+                    ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_PARENT_MESSAGE,
                 )
                 .limit(1)
             )
@@ -1424,8 +1402,7 @@ async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypat
             select(ChatMessage)
             .where(
                 ChatMessage.conversation_id == str(run.id),
-                ChatMessage.message_meta["kind"].as_string()
-                == runtime.SUBAGENT_PARENT_MESSAGE,
+                ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_PARENT_MESSAGE,
             )
             .limit(1)
         )
@@ -1441,17 +1418,14 @@ async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypat
 
     async with async_session() as db:
         anchor = await db.scalar(
-            select(ChatMessage).where(
-                ChatMessage.external_event_key == f"subagent-parent:{event.id}"
-            )
+            select(ChatMessage).where(ChatMessage.external_event_key == f"subagent-parent:{event.id}")
         )
         final = await db.scalar(
             select(ChatMessage)
             .where(
                 ChatMessage.conversation_id == str(parent_id),
                 ChatMessage.role == "assistant",
-                ChatMessage.message_meta["turn_anchor_id"].as_string()
-                == str(anchor.id),
+                ChatMessage.message_meta["turn_anchor_id"].as_string() == str(anchor.id),
             )
             .limit(1)
         )
