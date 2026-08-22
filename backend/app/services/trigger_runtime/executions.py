@@ -82,7 +82,7 @@ async def claim_pending_trigger_executions(
     claimed_pairs: list[tuple[TriggerExecution, AgentTrigger]] = []
     first_claim_counts: Counter[uuid.UUID] = Counter()
     triggers_by_id: dict[uuid.UUID, AgentTrigger] = {}
-    sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message"]
+    sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message", "manual"]
     async with async_session() as db:
         result = await db.execute(
             select(TriggerExecution, AgentTrigger, Agent)
@@ -94,6 +94,7 @@ async def claim_pending_trigger_executions(
                     and_(
                         TriggerExecution.status == "pending",
                         or_(
+                            TriggerExecution.source == "manual",
                             AgentTrigger.is_enabled.is_(True),
                             # A retryable on_message execution may have disabled
                             # its one-shot base trigger on the first claim.  The

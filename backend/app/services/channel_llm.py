@@ -351,7 +351,7 @@ async def _call_agent_llm(
         context_recovery = _recover_context
 
     # Use actual user_id so the system prompt knows who it's chatting with
-    effective_user_id = user_id or agent_id
+    effective_user_id = user_id
 
     # Centralized tool-call persistence: wrap the channel callback so EVERY IM
     # channel stores completed tool calls with one canonical schema (shared

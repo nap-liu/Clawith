@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import get_agent_access_level_for_user_id, is_platform_admin_user
 from app.models.agent import Agent
-from app.models.audit import AuditLog
+from app.models.audit import AuditLog, ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.schedule import AgentSchedule
-from app.models.task import Task
-from app.models.task import TaskLog
+from app.models.task import Task, TaskLog
 from app.models.trigger import AgentTrigger
 from app.models.user import User
 
@@ -28,6 +28,35 @@ class ExecutionIdentityConflict(ExecutionIdentityError):
 
 class ExecutionIdentityPermissionError(ExecutionIdentityError):
     """The caller cannot administer the resource's execution identity."""
+
+
+async def is_human_interactive_turn(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    session_id: uuid.UUID,
+    turn_anchor_id: uuid.UUID,
+) -> bool:
+    """Return whether an Agent tool call belongs to a real human turn."""
+    from app.services.session_query import HUMAN_CHANNELS
+
+    session = await db.get(ChatSession, session_id)
+    anchor = await db.get(ChatMessage, turn_anchor_id)
+    anchor_meta = (
+        anchor.message_meta if anchor and isinstance(anchor.message_meta, dict) else {}
+    )
+    return bool(
+        session is not None
+        and session.source_channel in HUMAN_CHANNELS
+        and session.agent_id == agent_id
+        and anchor is not None
+        and anchor.conversation_id == str(session.id)
+        and anchor.role == "user"
+        and anchor.sender_user_id == actor_user_id
+        and anchor_meta.get("kind") != "on_message_event"
+        and not anchor_meta.get("trigger_execution_id")
+    )
 
 
 @dataclass(frozen=True)
@@ -106,25 +135,22 @@ _ORIGIN_UUID_RE = (
 )
 
 
-async def reassign_background_execution_user(
+async def align_background_execution_user(
     db: AsyncSession,
     *,
-    actor_user_id: uuid.UUID,
     agent_id: uuid.UUID,
     resource_type: str,
     resource_id: uuid.UUID,
     execution_user_id: uuid.UUID,
     expected_execution_user_id: uuid.UUID | None = None,
     expected_provided: bool = False,
-    audit_reason: str | None = None,
 ) -> ExecutionIdentityChange:
-    """Atomically change only a background resource's future execution user.
+    """Align a resource to its last actor while freezing already-started work.
 
-    Authorization follows the canonical Agent ``manage`` permission. The row is
-    locked, an optional compare-and-swap guard prevents lost updates, and queued
-    trigger rows without a snapshot are frozen to the old effective user before
-    the trigger is changed. Existing snapshots and every non-identity resource
-    field remain byte-for-byte untouched.
+    Callers must authorize the resource mutation itself. This function owns the
+    concurrency-sensitive identity transition shared by REST, MCP, and Agent
+    tools: lock the resource, validate the new principal, snapshot legacy queued
+    work to the old effective principal, then update future execution identity.
     """
     model = _RESOURCE_MODELS.get(resource_type)
     if model is None:
@@ -133,16 +159,6 @@ async def reassign_background_execution_user(
     agent = await db.get(Agent, agent_id)
     if agent is None:
         raise ExecutionIdentityError("Agent not found")
-    actor = await db.get(User, actor_user_id)
-    if actor is None or not actor.is_active:
-        raise ExecutionIdentityError("The administrator identity is missing or inactive")
-    if not is_platform_admin_user(actor) and actor.role != "org_admin":
-        raise ExecutionIdentityPermissionError(
-            "Only platform administrators and organization administrators may reassign execution users"
-        )
-    if await get_agent_access_level_for_user_id(db, actor_user_id, agent) != "manage":
-        raise ExecutionIdentityPermissionError("Manage access to this Agent is required")
-
     resource = (
         await db.execute(
             select(model)
@@ -160,22 +176,14 @@ async def reassign_background_execution_user(
             "Execution user changed since it was read; refresh and retry with the current value"
         )
     after = await require_assignable_execution_user(db, agent, execution_user_id)
-    if before == after:
-        return ExecutionIdentityChange(
-            resource_type=resource_type,
-            resource_id=resource.id,
-            before=before,
-            after=after,
-        )
 
     frozen_count = 0
     if resource_type == "trigger":
         old_effective_user_id = before or await legacy_trigger_execution_user_id(
             db, resource, agent
         )
-        # An old rolling instance may have queued rows without an execution
-        # snapshot. Exact on_message work owns its origin in each execution
-        # payload, which may differ from the trigger's current config.
+        # Rolling-upgrade rows may not have captured an execution identity yet.
+        # Freeze them before changing the identity used by future work.
         frozen = await db.execute(
             text(
                 f"""
@@ -211,9 +219,8 @@ async def reassign_background_execution_user(
         )
         frozen_count = int(frozen.rowcount or 0)
     elif resource_type == "task" and resource.status == "doing":
-        # TaskLog is the lightweight durable run snapshot. It is written before
-        # the executor releases its first transaction, so a later reassignment
-        # cannot change the active run's principal.
+        # TaskLog is the durable run snapshot. Preserve a legacy active run that
+        # predates the snapshot column while updating only future task runs.
         active_run_id = await db.scalar(
             select(TaskLog.id)
             .where(
@@ -226,29 +233,13 @@ async def reassign_background_execution_user(
         )
         if active_run_id is not None:
             run = await db.get(TaskLog, active_run_id)
-            run.execution_user_id = before or (
-                resource.created_by
-                if resource.type == "supervision"
-                else agent.creator_id
-            )
+            # Match task_executor's legacy source of truth exactly: a Task with
+            # no explicit execution user ran as its own creator, regardless of
+            # whether it is todo or supervision work.
+            run.execution_user_id = before or resource.created_by
             frozen_count = 1
 
     resource.execution_user_id = after
-    db.add(
-        AuditLog(
-            user_id=actor_user_id,
-            agent_id=agent_id,
-            action="background_execution_user_changed",
-            details={
-                "resource_type": resource_type,
-                "resource_id": str(resource.id),
-                "before": str(before) if before else None,
-                "after": str(after),
-                "frozen_execution_count": frozen_count,
-                "reason": (audit_reason or "")[:500],
-            },
-        )
-    )
     await db.flush()
     return ExecutionIdentityChange(
         resource_type=resource_type,
@@ -257,6 +248,69 @@ async def reassign_background_execution_user(
         after=after,
         frozen_execution_count=frozen_count,
     )
+
+
+async def reassign_background_execution_user(
+    db: AsyncSession,
+    *,
+    actor_user_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    resource_type: str,
+    resource_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    expected_execution_user_id: uuid.UUID | None = None,
+    expected_provided: bool = False,
+    audit_reason: str | None = None,
+) -> ExecutionIdentityChange:
+    """Atomically change only a background resource's future execution user.
+
+    Authorization follows the canonical Agent ``manage`` permission. The row is
+    locked, an optional compare-and-swap guard prevents lost updates, and queued
+    trigger rows without a snapshot are frozen to the old effective user before
+    the trigger is changed. Existing snapshots and every non-identity resource
+    field remain byte-for-byte untouched.
+    """
+    agent = await db.get(Agent, agent_id)
+    if agent is None:
+        raise ExecutionIdentityError("Agent not found")
+    actor = await db.get(User, actor_user_id)
+    if actor is None or not actor.is_active:
+        raise ExecutionIdentityError("The administrator identity is missing or inactive")
+    if not is_platform_admin_user(actor) and actor.role != "org_admin":
+        raise ExecutionIdentityPermissionError(
+            "Only platform administrators and organization administrators may reassign execution users"
+        )
+    if await get_agent_access_level_for_user_id(db, actor_user_id, agent) != "manage":
+        raise ExecutionIdentityPermissionError("Manage access to this Agent is required")
+
+    change = await align_background_execution_user(
+        db,
+        agent_id=agent_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        execution_user_id=execution_user_id,
+        expected_execution_user_id=expected_execution_user_id,
+        expected_provided=expected_provided,
+    )
+    if change.before == change.after:
+        return change
+    db.add(
+        AuditLog(
+            user_id=actor_user_id,
+            agent_id=agent_id,
+            action="background_execution_user_changed",
+            details={
+                "resource_type": resource_type,
+                "resource_id": str(change.resource_id),
+                "before": str(change.before) if change.before else None,
+                "after": str(change.after),
+                "frozen_execution_count": change.frozen_execution_count,
+                "reason": (audit_reason or "")[:500],
+            },
+        )
+    )
+    await db.flush()
+    return change
 
 
 async def handle_reassign_background_execution_user(
@@ -268,9 +322,7 @@ async def handle_reassign_background_execution_user(
 ) -> str:
     """Agent-tool boundary: only a manage-authorized human interaction may mutate."""
     from app.database import async_session
-    from app.models.audit import ChatMessage
-    from app.models.chat_session import ChatSession
-    from app.services.session_query import HUMAN_CHANNELS, _as_uuid
+    from app.services.session_query import _as_uuid
 
     aid = _as_uuid(agent_id)
     actor_id = _as_uuid(user_id)
@@ -292,24 +344,12 @@ async def handle_reassign_background_execution_user(
         return "❌ expected_execution_user_id must be an exact UUID or null"
 
     async with async_session() as db:
-        ctx = await db.get(ChatSession, session_uuid)
-        anchor = await db.get(ChatMessage, anchor_uuid)
-        anchor_meta = (
-            anchor.message_meta if anchor and isinstance(anchor.message_meta, dict) else {}
-        )
-        if (
-            ctx is None
-            or ctx.source_channel not in HUMAN_CHANNELS
-            or not (
-                ctx.agent_id == aid
-                or (ctx.source_channel == "agent" and ctx.peer_agent_id == aid)
-            )
-            or anchor is None
-            or anchor.conversation_id != str(ctx.id)
-            or anchor.role != "user"
-            or anchor.sender_user_id != actor_id
-            or anchor_meta.get("kind") == "on_message_event"
-            or bool(anchor_meta.get("trigger_execution_id"))
+        if not await is_human_interactive_turn(
+            db,
+            agent_id=aid,
+            actor_user_id=actor_id,
+            session_id=session_uuid,
+            turn_anchor_id=anchor_uuid,
         ):
             return "❌ This tool may only run in a human interactive session for this Agent"
         try:

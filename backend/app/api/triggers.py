@@ -257,6 +257,7 @@ async def update_trigger(
                 "System triggers can only be enabled/disabled or reassigned by an Agent manager",
             )
 
+        identity_reassigned = False
         if "execution_user_id" in changed_fields:
             if body.execution_user_id is None:
                 raise HTTPException(422, "execution_user_id cannot be null")
@@ -286,8 +287,20 @@ async def update_trigger(
                 raise HTTPException(403, str(exc)) from exc
             except ExecutionIdentityError as exc:
                 raise HTTPException(422, str(exc)) from exc
+            identity_reassigned = True
         elif "expected_execution_user_id" in changed_fields:
             raise HTTPException(422, "expected_execution_user_id requires execution_user_id")
+
+        if changed_fields and not identity_reassigned:
+            from app.services.execution_identity import align_background_execution_user
+
+            await align_background_execution_user(
+                db,
+                agent_id=agent_id,
+                resource_type="trigger",
+                resource_id=trigger.id,
+                execution_user_id=user.id,
+            )
 
         if body.config is not None:
             if _contains_private_config(body.config):

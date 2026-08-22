@@ -160,6 +160,7 @@ async def update_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
     changes = data.model_dump(exclude_unset=True)
+    identity_reassigned = False
     if "execution_user_id" in changes:
         if changes["execution_user_id"] is None:
             raise HTTPException(
@@ -198,6 +199,7 @@ async def update_task(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=str(exc),
             ) from exc
+        identity_reassigned = True
         changes.pop("execution_user_id")
         changes.pop("expected_execution_user_id", None)
     elif "expected_execution_user_id" in changes:
@@ -254,6 +256,16 @@ async def update_task(
             detail="only supervision tasks may define a supervision target",
         )
 
+    if (changes or data.model_fields_set) and not identity_reassigned:
+        from app.services.execution_identity import align_background_execution_user
+
+        await align_background_execution_user(
+            db,
+            agent_id=agent_id,
+            resource_type="task",
+            resource_id=task.id,
+            execution_user_id=current_user.id,
+        )
     for field, value in changes.items():
         setattr(task, field, value)
     await db.flush()
@@ -292,11 +304,20 @@ async def add_task_log(
     """Add a progress log entry to a task."""
     agent, _access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
-    task_exists = await db.scalar(
-        select(Task.id).where(Task.id == task_id, Task.agent_id == agent_id)
+    task = await db.scalar(
+        select(Task).where(Task.id == task_id, Task.agent_id == agent_id)
     )
-    if not task_exists:
+    if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    from app.services.execution_identity import align_background_execution_user
+
+    await align_background_execution_user(
+        db,
+        agent_id=agent_id,
+        resource_type="task",
+        resource_id=task.id,
+        execution_user_id=current_user.id,
+    )
     log = TaskLog(task_id=task_id, content=data.content)
     db.add(log)
     await db.flush()
@@ -322,8 +343,20 @@ async def trigger_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    import asyncio
-    from app.services.task_executor import execute_task
-    asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
+    from app.services.background_manual_run import (
+        BackgroundManualRunConflict,
+        run_background_resource,
+    )
+
+    try:
+        await run_background_resource(
+            db,
+            actor_user_id=current_user.id,
+            agent_id=agent_id,
+            resource_type="task",
+            resource=str(task.id),
+        )
+    except BackgroundManualRunConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {"status": "triggered", "task_id": str(task_id)}

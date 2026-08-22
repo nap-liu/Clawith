@@ -332,10 +332,10 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "set_execution_user",
+            "name": "run_background_resource",
             "description": (
-                "调整指定后台任务的执行人。用于在需要时将后续执行交由另一位有权限的用户；"
-                "已经开始的执行不受影响。"
+                "Manually queue one task, trigger, or schedule for immediate testing. "
+                "The run uses the current conversation user's permissions."
             ),
             "parameters": {
                 "type": "object",
@@ -344,10 +344,54 @@ AGENT_TOOLS = [
                         "type": "string",
                         "enum": ["trigger", "task", "schedule"],
                     },
-                    "resource_id": {"type": "string"},
-                    "execution_user_id": {"type": "string"},
-                    "expected_execution_user_id": {"type": ["string", "null"]},
-                    "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "resource": {
+                        "type": "string",
+                        "description": "Exact UUID, or an exact unique title/name.",
+                    },
+                },
+                "required": ["resource_type", "resource"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_execution_user",
+            "description": (
+                "Set the user permissions used by future runs of a background resource. "
+                "Runs that are already active or queued are not affected."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "resource_type": {
+                        "type": "string",
+                        "enum": ["trigger", "task", "schedule"],
+                    },
+                    "resource_id": {
+                        "type": "string",
+                        "description": "Exact UUID of the target background resource.",
+                    },
+                    "execution_user_id": {
+                        "type": "string",
+                        "description": (
+                            "Canonical user_id for future runs; the target user must be able "
+                            "to access the current Agent."
+                        ),
+                    },
+                    "expected_execution_user_id": {
+                        "type": ["string", "null"],
+                        "description": (
+                            "Execution user ID read before this change; pass null when it is unset."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "Human-approved reason stored in the audit trail.",
+                    },
                 },
                 "required": [
                     "resource_type",
@@ -3671,6 +3715,25 @@ async def execute_tool(
         .replace("\ufeff", "")
         .strip()
     )
+    # Normalize only the legacy Agent-UUID sentinel at the shared tool boundary.
+    # A genuine ``None`` remains anonymous/autonomous; durable background entry
+    # points resolve a missing resource execution user to its creator earlier.
+    try:
+        canonical_agent_id = uuid.UUID(str(agent_id))
+        canonical_user_id = uuid.UUID(str(user_id)) if user_id is not None else None
+    except (TypeError, ValueError, AttributeError):
+        canonical_agent_id = None
+        canonical_user_id = None
+    if canonical_agent_id is not None and canonical_user_id == canonical_agent_id:
+        from app.models.agent import Agent as AgentModel
+
+        async with async_session() as identity_db:
+            creator_id = await identity_db.scalar(
+                select(AgentModel.creator_id).where(AgentModel.id == canonical_agent_id)
+            )
+        if creator_id is not None:
+            user_id = creator_id
+
     if is_retired_okr_tool(tool_name):
         return "This tool is unavailable."
     # Defensive guard: request_confirmation must be intercepted by the caller
@@ -3983,6 +4046,15 @@ async def execute_tool(
                 turn_anchor_id,
                 arguments,
             )
+        elif tool_name == "run_background_resource":
+            from app.services.background_manual_run import handle_run_background_resource
+            return await handle_run_background_resource(
+                agent_id,
+                user_id,
+                session_id,
+                turn_anchor_id,
+                arguments,
+            )
         elif tool_name == "read_session_messages":
             from app.services.tools.session_introspection import handle_read_session_messages
             return await handle_read_session_messages(agent_id, user_id, session_id, arguments)
@@ -4068,9 +4140,17 @@ async def execute_tool(
                 turn_anchor_id=turn_anchor_id,
             )
         elif tool_name == "update_trigger":
-            result = await _handle_update_trigger(agent_id, arguments)
+            result = await _handle_update_trigger(
+                agent_id,
+                arguments,
+                user_id=user_id,
+            )
         elif tool_name == "cancel_trigger":
-            result = await _handle_cancel_trigger(agent_id, arguments)
+            result = await _handle_cancel_trigger(
+                agent_id,
+                arguments,
+                user_id=user_id,
+            )
         elif tool_name == "list_triggers":
             result = await _handle_list_triggers(agent_id)
         elif tool_name == "search_contacts":
@@ -9222,6 +9302,17 @@ async def _manage_tasks(
             task = result.scalars().first()
             if not task:
                 return f"No task found matching '{title}'"
+            # Persisted background work always follows the last conversation
+            # user who changed it. ``created_by`` remains immutable audit data.
+            from app.services.execution_identity import align_background_execution_user
+
+            await align_background_execution_user(
+                db,
+                agent_id=agent_id,
+                resource_type="task",
+                resource_id=task.id,
+                execution_user_id=user_id,
+            )
             old = task.status
             task.status = args["status"]
             if args["status"] == "done":
@@ -11208,6 +11299,16 @@ async def _create_on_message_trigger(
                         "use a distinct trigger name or cancel the existing trigger first."
                     )
             else:
+                if creator_user_id is not None:
+                    from app.services.execution_identity import align_background_execution_user
+
+                    await align_background_execution_user(
+                        db,
+                        agent_id=agent_id,
+                        resource_type="trigger",
+                        resource_id=existing.id,
+                        execution_user_id=creator_user_id,
+                    )
                 existing.type = "on_message"
                 existing.config = config
                 existing.reason = reason
@@ -13575,6 +13676,16 @@ async def _handle_set_trigger(
                     old_token = (existing.config or {}).get("token")
                     if old_token:
                         config["token"] = old_token
+                if user_id is not None:
+                    from app.services.execution_identity import align_background_execution_user
+
+                    await align_background_execution_user(
+                        db,
+                        agent_id=agent_id,
+                        resource_type="trigger",
+                        resource_id=existing.id,
+                        execution_user_id=user_id,
+                    )
                 existing.type = ttype
                 existing.config = config
                 existing.reason = reason
@@ -13682,7 +13793,12 @@ async def _handle_set_trigger(
         return f"❌ Failed to create trigger: {e}"
 
 
-async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
+async def _handle_update_trigger(
+    agent_id: uuid.UUID,
+    arguments: dict,
+    *,
+    user_id: uuid.UUID | None = None,
+) -> str:
     """Update an existing trigger's config or reason."""
     from app.models.trigger import AgentTrigger
 
@@ -13708,6 +13824,19 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             trigger = result.scalar_one_or_none()
             if not trigger:
                 return f"❌ Trigger '{name}' not found"
+
+            # Freeze already-queued work before changing config fields that can
+            # participate in legacy execution-user fallback.
+            if user_id is not None:
+                from app.services.execution_identity import align_background_execution_user
+
+                await align_background_execution_user(
+                    db,
+                    agent_id=agent_id,
+                    resource_type="trigger",
+                    resource_id=trigger.id,
+                    execution_user_id=user_id,
+                )
 
             changes = []
             if new_config is not None:
@@ -13775,7 +13904,7 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
                 changes.append(f"webhook_mode → {new_webhook_mode}")
             if new_reason is not None:
                 trigger.reason = new_reason
-                changes.append(f"reason updated")
+                changes.append("reason updated")
 
             if trigger.type == "on_message":
                 cfg = dict(trigger.config or {})
@@ -13806,7 +13935,12 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
         return f"❌ Failed to update trigger: {e}"
 
 
-async def _handle_cancel_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
+async def _handle_cancel_trigger(
+    agent_id: uuid.UUID,
+    arguments: dict,
+    *,
+    user_id: uuid.UUID | None = None,
+) -> str:
     """Cancel (disable) a trigger by name."""
     from app.models.trigger import AgentTrigger
 
@@ -13828,6 +13962,16 @@ async def _handle_cancel_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             if not trigger.is_enabled:
                 return f"ℹ️ Trigger '{name}' is already disabled"
 
+            if user_id is not None:
+                from app.services.execution_identity import align_background_execution_user
+
+                await align_background_execution_user(
+                    db,
+                    agent_id=agent_id,
+                    resource_type="trigger",
+                    resource_id=trigger.id,
+                    execution_user_id=user_id,
+                )
             trigger.is_enabled = False
             await db.commit()
 

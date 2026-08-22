@@ -729,7 +729,7 @@ async def _persist_tool_call_events_strict(
     if not events or not session_id:
         return False
     agent_uuid = _coerce_uuid(agent_id)
-    user_uuid = _coerce_uuid(user_id or agent_id)
+    user_uuid = _coerce_uuid(user_id)
     if agent_uuid is None or user_uuid is None:
         return False
 
@@ -1175,7 +1175,7 @@ async def _process_tool_call(
         tool_name,
         args,
         agent_id=agent_id,
-        user_id=user_id or agent_id,
+        user_id=user_id,
         session_id=session_id,
         tool_call_id=str(tc.get("id") or ""),
         turn_anchor_id=turn_anchor_id,
@@ -1288,6 +1288,21 @@ async def call_llm(
     include_memory: bool = True,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
+    # Normalize only the legacy Agent-UUID sentinel. A genuine ``None`` remains
+    # anonymous/fail-safe here; durable background entrypoints resolve their
+    # missing execution user to the creator before calling this shared layer.
+    agent_uuid = _coerce_uuid(agent_id)
+    viewer_uuid = _coerce_uuid(user_id)
+    if agent_uuid is not None and viewer_uuid == agent_uuid:
+        from app.models.agent import Agent as AgentModel
+
+        async with async_session() as identity_db:
+            creator_id = await identity_db.scalar(
+                select(AgentModel.creator_id).where(AgentModel.id == agent_uuid)
+            )
+        if creator_id is not None:
+            user_id = creator_id
+
     if agent_id and user_id and session_id:
         try:
             owner_uuid = uuid.UUID(str(user_id))
@@ -1322,7 +1337,7 @@ async def call_llm(
                 await persist_tool_call(
                     async_session,
                     agent_id=agent_id,
-                    user_id=user_id or agent_id,
+                    user_id=user_id,
                     conversation_id=session_id,
                     evt=data,
                     turn_anchor_id=turn_anchor_id,
@@ -2298,7 +2313,7 @@ async def call_agent_llm(
             agent_name=agent.name,
             role_description=agent.role_description or "",
             agent_id=agent_id,
-            user_id=user_id or agent_id,
+            user_id=user_id,
             session_id=session_id,
             on_chunk=on_chunk,
             on_thinking=on_thinking,
