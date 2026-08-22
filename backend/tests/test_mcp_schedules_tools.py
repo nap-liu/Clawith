@@ -1,6 +1,7 @@
 """Tests for MCP schedule tools (list/set/delete/run, creator-gated)."""
 from __future__ import annotations
 
+import asyncio
 import uuid
 from types import SimpleNamespace
 
@@ -135,6 +136,34 @@ async def test_set_schedule_creates():
     row = rows[0]
     assert row.cron_expr == "0 9 * * *"
     assert row.next_run_at is not None, "next_run_at should be set for enabled schedule"
+    assert row.execution_user_id == user.id
+
+
+async def test_set_schedule_update_aligns_execution_user_to_pat_actor():
+    """Updating an existing schedule follows the authenticated MCP user."""
+    from app.mcp_server.tools_schedules import set_agent_schedule_impl
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    org_admin = await _seed_user(tenant_id=tenant.id, role="org_admin")
+    agent = await _seed_agent(owner, access_mode="company")
+    sched = await _seed_schedule(agent, owner)
+    token = await _pat(org_admin, scope="write")
+
+    out = await set_agent_schedule_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        name=sched.name,
+        cron_expr="30 9 * * *",
+        instruction="updated by admin",
+        schedule_id=str(sched.id),
+    )
+    assert "✅" in out, f"Expected ✅ in: {out}"
+
+    row = await _reload_schedule(sched.id)
+    assert row is not None
+    assert row.instruction == "updated by admin"
+    assert row.execution_user_id == org_admin.id
 
 
 async def test_set_schedule_invalid_cron():
@@ -251,3 +280,69 @@ async def test_run_schedule_requires_confirm():
     row = await _reload_schedule(sched.id)
     assert row is not None
     assert row.run_count == 0, f"run_count should be 0 (no execution), got {row.run_count}"
+
+
+async def test_run_schedule_aligns_execution_user_to_pat_actor(monkeypatch):
+    """A confirmed manual run persists and snapshots the authenticated MCP user."""
+    from app.mcp_server.tools_schedules import run_agent_schedule_impl
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    org_admin = await _seed_user(tenant_id=tenant.id, role="org_admin")
+    agent = await _seed_agent(owner, access_mode="company")
+    sched = await _seed_schedule(agent, owner)
+    token = await _pat(org_admin, scope="write")
+    captured: dict[str, object] = {}
+
+    async def _capture(*args):
+        captured["args"] = args
+
+    monkeypatch.setattr("app.services.scheduler._execute_schedule", _capture)
+    out = await run_agent_schedule_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        schedule_id=str(sched.id),
+        confirm=True,
+    )
+
+    assert "✅" in out
+    await asyncio.sleep(0.05)
+    assert captured["args"][3] == org_admin.id
+    row = await _reload_schedule(sched.id)
+    assert row is not None
+    assert row.execution_user_id == org_admin.id
+    assert row.run_count == 1
+
+
+async def test_run_schedule_does_not_spawn_when_commit_fails(monkeypatch):
+    """A failed identity/tracking commit must not leak an asynchronous run."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.mcp_server.tools_schedules import run_agent_schedule_impl
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(owner)
+    sched = await _seed_schedule(agent, owner)
+    token = await _pat(owner, scope="write")
+    spawned = False
+
+    async def _capture(*_args):
+        nonlocal spawned
+        spawned = True
+
+    async def _fail_commit(_self):
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr("app.services.scheduler._execute_schedule", _capture)
+    monkeypatch.setattr(AsyncSession, "commit", _fail_commit)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await run_agent_schedule_impl(
+            _ctx(token),
+            agent=str(agent.id),
+            schedule_id=str(sched.id),
+            confirm=True,
+        )
+
+    await asyncio.sleep(0)
+    assert spawned is False

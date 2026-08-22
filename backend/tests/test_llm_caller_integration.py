@@ -8,10 +8,12 @@
 import json
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from app.services.llm import caller
 from app.services.llm.caller import _process_tool_call
 from app.services.llm import tool_output_store as tos
 
@@ -181,3 +183,40 @@ def test_canonicalize_tc_arguments_helper_rewrites_tc_inplace():
     import json
     parsed = json.loads(tc["function"]["arguments"])
     assert parsed == {"path": "foo.md"}
+
+
+@pytest.mark.asyncio
+async def test_call_agent_llm_keeps_genuinely_missing_user_anonymous(monkeypatch):
+    """Only durable background APIs may apply the creator fallback."""
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(
+        name="Agent",
+        role_description="",
+        creator_id=uuid.uuid4(),
+        primary_model_id=uuid.uuid4(),
+        fallback_model_id=None,
+        is_expired=False,
+        expires_at=None,
+    )
+    model = SimpleNamespace(model="test-model")
+
+    def result(value):
+        return SimpleNamespace(scalar_one_or_none=lambda: value)
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[result(agent), result(model)]))
+    monkeypatch.setattr(
+        "app.core.okr_feature.is_retired_okr_agent",
+        AsyncMock(return_value=False),
+    )
+    captured = {}
+
+    async def fake_failover(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(caller, "call_llm_with_failover", fake_failover)
+
+    reply = await caller.call_agent_llm(db, agent_id, "hello", user_id=None)
+
+    assert reply == "ok"
+    assert captured["user_id"] is None

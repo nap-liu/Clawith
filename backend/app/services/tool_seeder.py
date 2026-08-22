@@ -114,6 +114,34 @@ def _global_builtin_config(tool_data: dict) -> dict:
 BUILTIN_TOOLS = [
     REQUEST_CONFIRMATION_TOOL_SEED,
     {
+        "name": "run_background_resource",
+        "display_name": "Run Background Resource",
+        "description": (
+            "Manually queue one task, trigger, or schedule for immediate testing. "
+            "The run uses the current conversation user's permissions."
+        ),
+        "category": "general",
+        "icon": "▶️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "resource_type": {
+                    "type": "string",
+                    "enum": ["trigger", "task", "schedule"],
+                },
+                "resource": {
+                    "type": "string",
+                    "description": "Exact UUID, or an exact unique title/name.",
+                },
+            },
+            "required": ["resource_type", "resource"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
         "name": "run_subagent",
         "display_name": "Run Subagent",
         "description": (
@@ -228,10 +256,10 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "set_execution_user",
-        "display_name": "调整后台任务执行人",
+        "display_name": "Set Background Execution User",
         "description": (
-            "调整指定后台任务的执行人。用于在需要时将后续执行交由另一位有权限的用户；"
-            "已经开始的执行不受影响。"
+            "Set the user permissions used by future runs of a background resource. "
+            "Runs that are already active or queued are not affected."
         ),
         "category": "general",
         "icon": "🔐",
@@ -249,11 +277,16 @@ BUILTIN_TOOLS = [
                 },
                 "execution_user_id": {
                     "type": "string",
-                    "description": "Exact canonical user_id to use for future execution.",
+                    "description": (
+                        "Canonical user_id for future runs; the target user must be able "
+                        "to access the current Agent."
+                    ),
                 },
                 "expected_execution_user_id": {
                     "type": ["string", "null"],
-                    "description": "调整前读取到的当前执行人 ID；当前未设置时传 null。",
+                    "description": (
+                        "Execution user ID read before this change; pass null when it is unset."
+                    ),
                 },
                 "reason": {
                     "type": "string",

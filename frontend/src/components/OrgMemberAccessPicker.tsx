@@ -116,70 +116,43 @@ export default function OrgMemberAccessPicker({
     onClose,
     onSave,
 }: Props) {
-    const { i18n } = useTranslation();
-    const isChinese = i18n.language?.startsWith('zh');
-    const labels = isChinese ? {
-        title: singleSelect ? '选择执行人' : '选择可访问成员',
-        subtitle: singleSelect ? '选择后续后台执行所使用的用户权限' : '新增成员默认获得“使用”权限',
-        search: '搜索姓名、拼音或部门路径...',
-        organization: '组织架构',
-        myDepartment: '我的部门',
-        directOnly: '仅直属成员',
-        includeDescendants: '包含下级成员',
-        grantDepartment: '授权整个部门节点',
-        grantDepartmentHint: '包含所有下级部门，人员入职、离职或调岗后自动生效',
-        selectedDepartments: '已选部门',
-        selectedMembers: singleSelect ? '已选执行人' : '已选成员',
-        individualMembers: singleSelect ? '选择成员' : '单独选择成员',
-        selectDirect: '选择本部门直属成员',
-        selectPage: '选择当前页成员',
-        selected: '已选成员',
-        systemManagers: '系统保留管理者',
-        creator: '智能体创建者',
-        companyAdmins: '公司管理员',
-        use: '使用',
-        manage: '管理',
-        cancel: '取消',
-        save: singleSelect ? '确认选择' : '保存设置',
-        saving: '保存中...',
-        noDepartments: '没有匹配的部门',
-        noMembers: '没有匹配的成员',
-        loading: '加载中...',
-        previous: '上一页',
-        next: '下一页',
-        businessMembers: '名业务成员',
-        page: '页',
-    } : {
-        title: singleSelect ? 'Choose execution user' : 'Choose Members',
-        subtitle: singleSelect ? 'Choose whose permissions future background runs use' : 'New members receive Use access by default',
-        search: 'Search by name, transliteration, or department...',
-        organization: 'Organization',
-        myDepartment: 'My department',
-        directOnly: 'Direct members',
-        includeDescendants: 'Include descendants',
-        grantDepartment: 'Grant this department node',
-        grantDepartmentHint: 'Includes all descendant departments and follows future organization changes',
-        selectedDepartments: 'Selected departments',
-        selectedMembers: singleSelect ? 'Selected execution user' : 'Selected members',
-        individualMembers: singleSelect ? 'Choose a member' : 'Select individual members',
-        selectDirect: 'Select direct members',
-        selectPage: 'Select this page',
-        selected: 'Selected',
-        systemManagers: 'System managers',
-        creator: 'Agent creator',
-        companyAdmins: 'Company administrators',
-        use: 'Use',
-        manage: 'Manage',
-        cancel: 'Cancel',
-        save: singleSelect ? 'Confirm selection' : 'Save',
-        saving: 'Saving...',
-        noDepartments: 'No matching departments',
-        noMembers: 'No matching members',
-        loading: 'Loading...',
-        previous: 'Previous',
-        next: 'Next',
-        businessMembers: ' business members',
-        page: 'page',
+    const { t } = useTranslation();
+    const labels = {
+        title: t(singleSelect ? 'accessPicker.executionTitle' : 'accessPicker.title'),
+        subtitle: t(singleSelect ? 'accessPicker.executionSubtitle' : 'accessPicker.subtitle'),
+        search: t('accessPicker.search'),
+        organization: t('accessPicker.organization'),
+        myDepartment: t('accessPicker.myDepartment'),
+        directOnly: t('accessPicker.directOnly'),
+        includeDescendants: t('accessPicker.includeDescendants'),
+        grantDepartment: t('accessPicker.grantDepartment'),
+        grantDepartmentHint: t('accessPicker.grantDepartmentHint'),
+        selectedDepartments: t('accessPicker.selectedDepartments'),
+        selectedMembers: t(singleSelect ? 'accessPicker.selectedExecutionUser' : 'accessPicker.selectedMembers'),
+        individualMembers: t(singleSelect ? 'accessPicker.chooseMember' : 'accessPicker.individualMembers'),
+        selectDirect: t('accessPicker.selectDirect'),
+        selectPage: t('accessPicker.selectPage'),
+        selected: t('accessPicker.selected'),
+        systemManagers: t('accessPicker.systemManagers'),
+        creator: t('accessPicker.creator'),
+        companyAdmins: t('accessPicker.companyAdmins'),
+        use: t('accessPicker.use'),
+        manage: t('accessPicker.manage'),
+        cancel: t('common.cancel'),
+        save: t(singleSelect ? 'accessPicker.confirmSelection' : 'accessPicker.save'),
+        saving: t('common.saving'),
+        noDepartments: t('accessPicker.noDepartments'),
+        noMembers: t('accessPicker.noMembers'),
+        loading: t('common.loading'),
+        previous: t('accessPicker.previous'),
+        next: t('accessPicker.next'),
+        businessMembers: t('accessPicker.businessMembers'),
+        page: t('accessPicker.page'),
+        searchDepartments: t('accessPicker.searchDepartments'),
+        companySearchResults: t('accessPicker.companySearchResults'),
+        members: t('accessPicker.members'),
+        nickname: t('accessPicker.nickname'),
+        required: t('accessPicker.required'),
     };
 
     const directoryUrl = directoryBaseUrl || `/agents/${agentId}/permissions/directory`;
@@ -564,8 +537,8 @@ export default function OrgMemberAccessPicker({
                             <input
                                 value={departmentSearch}
                                 onChange={event => setDepartmentSearch(event.target.value)}
-                                placeholder={isChinese ? '搜索部门...' : 'Search departments...'}
-                                aria-label={isChinese ? '搜索部门' : 'Search departments'}
+                                placeholder={labels.searchDepartments}
+                                aria-label={labels.searchDepartments}
                             />
                         </div>
                         <div className="org-access-picker__tree">
@@ -597,10 +570,10 @@ export default function OrgMemberAccessPicker({
                             <div>
                                 <div className="org-access-picker__path">
                                     {debouncedMemberSearch
-                                        ? (isChinese ? '全公司搜索结果' : 'Company search results')
+                                        ? labels.companySearchResults
                                         : compactDepartmentPath(selectedDepartment?.path || myDepartment?.path)}
                                 </div>
-                                <strong>{memberData?.total ?? 0} {isChinese ? '人' : 'members'}</strong>
+                                <strong>{memberData?.total ?? 0} {labels.members}</strong>
                             </div>
                             {!singleSelect && !debouncedMemberSearch && selectedDepartmentId && (
                                 <label className="org-access-picker__descendants-toggle">
@@ -652,11 +625,11 @@ export default function OrgMemberAccessPicker({
                                                 <span className="org-access-picker__member-copy">
                                                     <strong>{member.name}</strong>
                                                     {member.nickname && member.nickname !== member.name && (
-                                                        <small>{isChinese ? '昵称' : 'Nickname'}: {member.nickname}</small>
+                                                        <small>{labels.nickname}: {member.nickname}</small>
                                                     )}
                                                     <small>{[compactDepartmentPath(member.department_path), member.title].filter(Boolean).join(' · ')}</small>
                                                 </span>
-                                                {required && <span className="badge">{isChinese ? '系统保留' : 'Required'}</span>}
+                                                {required && <span className="badge">{labels.required}</span>}
                                             </label>
                                         );
                                     }) : <div className="org-access-picker__empty">{labels.noMembers}</div>}
