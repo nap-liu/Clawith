@@ -11,7 +11,9 @@ Before inspecting or changing code:
 3. Read the additional rule for the work being performed:
    - environment, Docker, or deployment: `.agents/rules/deploy.md`
    - Git, branches, commits, or pull requests: `.agents/rules/github.md`
-   - image tags, versioning, or production release: `.agents/rules/release.md`
+   - image tags, versioning, or production release: first
+     `.agents/rules/release.md`, then the complete executable workflow in
+     `.agents/runbooks/production_release.md`
 4. Follow the architecture routing table in the workflow and read only the relevant files under `.agents/architecture/`.
 
 `ARCHITECTURE_SPEC_EN.md` is the canonical system overview. More specific rules under `.agents/rules/` win if documents conflict. User instructions for the current task win over repository defaults.

@@ -46,3 +46,8 @@ Stable production invariants are:
 - backend and frontend share one release SHA;
 - production images target `linux/amd64`;
 - frontend nginx configuration is baked from `frontend/nginx.conf.template`.
+
+The full production topology checklist, image-build path, stop-writer backup
+sequence, acceptance matrix, and rollback decision tree are canonical in
+`.agents/runbooks/production_release.md`.  Do not reconstruct a release plan
+from this architecture summary alone.

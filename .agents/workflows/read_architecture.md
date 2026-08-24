@@ -20,7 +20,7 @@ Do not treat dates, historical image tags, hostnames, credentials, line numbers,
 | IM channels, delivery, files, message lifecycle | `.agents/architecture/conversations-and-turns.md` | — |
 | builtin tools, MCP tools, CLI, sandbox, enablement | `.agents/architecture/tools-and-sandboxes.md` | — |
 | Docker, tests, local stack, browser E2E | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md` |
-| production configuration or deployment | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md` and `.agents/rules/release.md` |
+| production configuration or deployment | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md`, `.agents/rules/release.md`, and `.agents/runbooks/production_release.md` |
 | Git branch, commit, merge, or PR | — | `.agents/rules/github.md` |
 
 Read multiple rows when a change crosses boundaries.
