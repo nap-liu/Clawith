@@ -1,36 +1,31 @@
-# Clawith Project Instructions
+# Clawith Agent Instructions
 
-This file is the project-level entry point for agent instructions.
+This file is the stable entry point for every coding agent working in this repository. Detailed rules and architecture live under `.agents/`; do not duplicate or override them in tool-specific instruction files.
 
-## Primary Source of Project Rules
+## Mandatory read order
 
-For this repository, the canonical project instructions live under:
+Before inspecting or changing code:
 
-- `.agents/rules/`
-- `.agents/workflows/`
+1. Read `.agents/workflows/read_architecture.md`.
+2. Read `.agents/rules/design_and_dev.md` for every engineering task.
+3. Read the additional rule for the work being performed:
+   - environment, Docker, or deployment: `.agents/rules/deploy.md`
+   - Git, branches, commits, or pull requests: `.agents/rules/github.md`
+   - image tags, versioning, or production release: `.agents/rules/release.md`
+4. Follow the architecture routing table in the workflow and read only the relevant files under `.agents/architecture/`.
 
-When working in this project, read and follow those files first. If this file and a file under `.agents/` ever conflict, prefer the more specific file under `.agents/`.
+`ARCHITECTURE_SPEC_EN.md` is the canonical system overview. More specific rules under `.agents/rules/` win if documents conflict. User instructions for the current task win over repository defaults.
 
-## Required Read Order
+## Non-negotiable repository defaults
 
-At the start of work on Clawith, use this order:
+- Run backend commands, Python, lint, tests, build checks, integration scripts, and browser validation only in Docker. Never create or use a host venv for validation.
+- Validate code against local Docker environments, not production.
+- Preserve tenant isolation, authorization boundaries, and the shared LLM turn loop.
+- Prefer one normalized platform capability with transport adapters over channel-specific copies. Preserve real P2P/group semantic differences at adapter boundaries.
+- Tests must assert observable behavior through APIs, databases, events, or UI. Source-text/regex shape tests are not accepted.
+- Treat existing uncommitted files and unrelated worktrees as user-owned. Do not clean, reset, reformat, stop shared stacks, push, or deploy outside the authorized scope.
+- Tool schemas shown to the LLM come from the database seeded by `backend/app/services/tool_seeder.py`; an in-code fallback alone is not a completed tool change.
 
-1. `.agents/workflows/read_architecture.md`
-2. Relevant files under `.agents/rules/`
+## Collaboration preference
 
-In practice:
-
-- For general design, implementation, or feature questions, read `.agents/rules/design_and_dev.md`
-- For deployment and environment updates, read `.agents/rules/deploy.md`
-- For GitHub-related work, read `.agents/rules/github.md`
-- For versioning and release work, read `.agents/rules/release.md`
-
-## Notes
-
-- The architecture document currently present in this repository is `ARCHITECTURE_SPEC_EN.md`
-- Do not invent alternative instruction filenames when the real rules already exist under `.agents/`
-
-## Local Collaboration Preference
-
-- At the end of each completed task, play a short local completion sound on the user's machine (for example with `afplay` on macOS) so the user notices work has finished even when reading or working in another window.
-- This reminder should be treated as a default behavior for this repository across sessions unless the user explicitly asks to skip it for a specific task.
+At the end of a completed task, play a short local completion sound (for example, `afplay /System/Library/Sounds/Glass.aiff`) unless the user asks to skip it.
