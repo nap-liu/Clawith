@@ -918,6 +918,7 @@ async def _send_dingtalk_group_markdown(
     open_conversation_id: str,
     message: str,
 ) -> dict:
+    from app.services.dingtalk_service import build_dingtalk_markdown_content
     from app.services.dingtalk_token import dingtalk_token_manager
 
     access_token = await dingtalk_token_manager.get_token(app_id, app_secret)
@@ -932,7 +933,10 @@ async def _send_dingtalk_group_markdown(
         "robotCode": app_id,
         "openConversationId": open_conversation_id,
         "msgKey": "sampleMarkdown",
-        "msgParam": json.dumps({"title": "Notification", "text": message}, ensure_ascii=False),
+        "msgParam": json.dumps(
+            build_dingtalk_markdown_content(message),
+            ensure_ascii=False,
+        ),
     }
     async with httpx.AsyncClient(timeout=30) as client:
         try:

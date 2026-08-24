@@ -1,9 +1,10 @@
+import json
 import uuid
 
 import pytest
 
 from app.api import dingtalk as dingtalk_api
-from app.services import agent_tools, dingtalk_stream, im_delivery
+from app.services import agent_tools, dingtalk_service, dingtalk_stream, im_delivery, turn_runtime
 from app.services.im_delivery import (
     DeliveryReceiptPersistenceError,
     IMDeliveryPart,
@@ -111,7 +112,105 @@ def test_legacy_markdown_title_is_sanitized():
     )
 
     assert forbidden not in payload["markdown"]["title"].lower()
+    assert payload["markdown"]["title"] == "safe reply"
     assert payload["markdown"]["text"] == "safe reply"
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_markdown_transports_use_plain_text_summary_and_keep_receipt(monkeypatch):
+    calls = []
+    response = _Response({"processQueryKey": "provider-message-1", "errcode": 0})
+
+    async def get_token(_key, _secret):
+        return "token"
+
+    async def get_access_token(_key, _secret):
+        return {"access_token": "token", "expires_in": 7200}
+
+    monkeypatch.setattr(dingtalk_service, "get_dingtalk_access_token", get_access_token)
+    monkeypatch.setattr(
+        "app.services.dingtalk_token.dingtalk_token_manager.get_token",
+        get_token,
+    )
+    monkeypatch.setattr(
+        dingtalk_service.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(response, calls),
+    )
+    monkeypatch.setattr(
+        turn_runtime.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(response, calls),
+    )
+
+    person = await dingtalk_service.send_dingtalk_v1_robot_oto_message(
+        "app",
+        "secret",
+        ["staff"],
+        "## 发布结果\n\n**服务已更新**",
+        msg_type="markdown",
+    )
+    group = await turn_runtime._send_dingtalk_group_markdown(
+        app_id="app",
+        app_secret="secret",
+        open_conversation_id="conversation",
+        message="## 发布结果\n\n**服务已更新**",
+    )
+
+    assert person["processQueryKey"] == "provider-message-1"
+    assert group["processQueryKey"] == "provider-message-1"
+    assert len(calls) == 2
+    for _url, kwargs in calls:
+        payload = kwargs["json"]
+        message = json.loads(payload["msgParam"])
+        assert message == {
+            "title": "发布结果 服务已更新",
+            "text": "## 发布结果\n\n**服务已更新**",
+        }
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_work_notification_uses_plain_text_summary(monkeypatch):
+    captured = []
+
+    async def send(_app_id, _app_secret, _user_id, msg_body, _agent_id):
+        captured.append(msg_body)
+        return {"errcode": 0}
+
+    monkeypatch.setattr(dingtalk_service, "send_dingtalk_corp_conversation", send)
+
+    result = await dingtalk_service.send_dingtalk_message(
+        app_id="app",
+        app_secret="secret",
+        user_id="staff",
+        message="## 发布结果\n\n**服务已更新**",
+        agent_id="agent",
+        use_robot=False,
+        msg_type="markdown",
+    )
+
+    assert result == {"errcode": 0}
+    assert captured == [
+        {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": "发布结果 服务已更新",
+                "text": "## 发布结果\n\n**服务已更新**",
+            },
+        }
+    ]
+
+
+def test_dingtalk_markdown_preserves_nonempty_format_only_content():
+    assert dingtalk_service.build_dingtalk_markdown_content("---") == {
+        "title": "非文本消息",
+        "text": "---",
+    }
+
+
+def test_dingtalk_markdown_rejects_only_empty_content():
+    with pytest.raises(ValueError, match="must not be empty"):
+        dingtalk_service.build_dingtalk_markdown_content("  \n  ")
 
 
 @pytest.mark.asyncio

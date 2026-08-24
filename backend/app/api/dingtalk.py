@@ -51,6 +51,7 @@ from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.chat_attachments import attachment_from_workspace_path
+from app.services.dingtalk_service import build_dingtalk_markdown_content
 from app.services.user_output import sanitize_user_visible_text
 
 router = APIRouter(tags=["dingtalk"])
@@ -73,13 +74,11 @@ async def _post_dingtalk_session_webhook(
 
 def _dingtalk_markdown_payload(agent_name: str | None, text: str) -> dict:
     """Build a safe legacy webhook payload for one final reply."""
-    title = sanitize_user_visible_text(agent_name or "AI Reply").strip()[:128]
+    del agent_name
+    content = build_dingtalk_markdown_content(sanitize_user_visible_text(text))
     return {
         "msgtype": "markdown",
-        "markdown": {
-            "title": title or "AI Reply",
-            "text": text,
-        },
+        "markdown": {**content, "text": text},
     }
 
 
