@@ -1122,6 +1122,32 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "recall_message",
+        "display_name": "Recall Message",
+        "description": (
+            "Recall one message previously sent by this digital employee through any IM channel. "
+            "Use only the exact local message_id returned by send_session_message/send_channel_message "
+            "or shown by read_session_messages. Never guess a message ID. Unsupported provider paths "
+            "return a normalized unsupported result without deleting local audit history."
+        ),
+        "category": "communication",
+        "icon": "undo",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "string",
+                    "description": "Exact local ChatMessage UUID of the outbound assistant message.",
+                },
+            },
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "send_session_message",
         "display_name": "Session Message",
         "description": (

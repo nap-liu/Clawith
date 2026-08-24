@@ -103,7 +103,20 @@ from app.services.recipient_resolver import (
     resolve_human_channel_recipient,
     resolve_platform_user_recipient,
 )
-from app.services.turn_runtime import TurnRuntime, deliver_message_to_runtime
+from app.services.im_delivery import (
+    DELIVERY_LEASE,
+    IMDeliveryPart,
+    IMDeliveryResult,
+    append_delivery_part,
+    attach_delivery_to_meta,
+    recall_message,
+    register_delivery,
+)
+from app.services.turn_runtime import (
+    TurnRuntime,
+    deliver_message_to_runtime,
+    deliver_message_with_receipt,
+)
 
 
 _settings = get_settings()
@@ -1002,6 +1015,29 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["session_id", "message"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_message",
+            "description": (
+                "Recall one message previously sent by this digital employee through any IM channel. "
+                "Use only the exact local message_id returned by send_session_message/send_channel_message "
+                "or shown by read_session_messages. Never guess a message ID. Unsupported provider paths "
+                "return a normalized unsupported result without deleting local audit history."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Exact local ChatMessage UUID of the outbound assistant message.",
+                    },
+                },
+                "required": ["message_id"],
                 "additionalProperties": False,
             },
         },
@@ -2562,6 +2598,7 @@ _ALWAYS_INCLUDE_CORE = {
 }
 # Channel message tool - available when any channel (Feishu/DingTalk/WeCom) is configured
 _CHANNEL_MESSAGE_TOOL_NAMES = {
+    "recall_message",
     "send_channel_message",
     "send_group_session_message",
     "send_session_message",
@@ -3925,6 +3962,45 @@ async def execute_tool(
             ):
                 target = str(cached_meta.get("target_name") or "the recipient")
                 channel = str(cached_meta.get("source_channel") or "the selected channel")
+                delivery = (
+                    cached_meta.get("delivery")
+                    if isinstance(cached_meta.get("delivery"), dict)
+                    else {}
+                )
+                delivery_status = str(
+                    delivery.get("status") or cached_meta.get("delivery_status") or "sent"
+                )
+                if delivery_status == "pending":
+                    try:
+                        updated_at = datetime.fromisoformat(str(delivery.get("updated_at") or ""))
+                        if updated_at.tzinfo is None:
+                            updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        updated_at = None
+                    if updated_at and datetime.now(timezone.utc) - updated_at >= DELIVERY_LEASE:
+                        await register_delivery(
+                            cached_outbound.id,
+                            IMDeliveryResult.unknown(channel, "delivery_lease_expired"),
+                        )
+                        return (
+                            f"❌ The previous delivery to {target} via {channel} is unknown "
+                            f"(message_id: {cached_outbound.id}). It was not retried to avoid duplication."
+                        )
+                    return (
+                        f"⏳ A previous delivery to {target} via {channel} is still pending "
+                        f"(message_id: {cached_outbound.id}). It will not be sent twice."
+                    )
+                if delivery_status in {"failed", "unknown"}:
+                    return (
+                        f"❌ The previous delivery to {target} via {channel} is {delivery_status} "
+                        f"(message_id: {cached_outbound.id}). It was not retried to avoid duplication."
+                    )
+                if delivery_status == "partial":
+                    return (
+                        f"⚠️ The previous delivery to {target} via {channel} was only partially sent "
+                        f"(message_id: {cached_outbound.id}). It was not retried to avoid duplication; "
+                        "known delivered parts can still be recalled."
+                    )
                 return f"✅ Message already sent to {target} via {channel} (idempotent replay)."
 
     # Pre-inject session_id into arguments for AgentBay tools so each
@@ -4178,6 +4254,23 @@ async def execute_tool(
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=turn_anchor_id,
             )
+        elif tool_name == "recall_message":
+            raw_message_id = str(arguments.get("message_id") or "").strip()
+            if not raw_message_id:
+                result = json.dumps(
+                    {"status": "invalid_request", "reason": "message_id_required"},
+                    ensure_ascii=False,
+                )
+            else:
+                result = json.dumps(
+                    await recall_message(
+                        agent_id=agent_id,
+                        message_id=raw_message_id,
+                        user_id=user_id,
+                        current_session_id=session_id,
+                    ),
+                    ensure_ascii=False,
+                )
         elif tool_name == "start_dingtalk_channel_provisioning":
             result = await _start_dingtalk_channel_provisioning_tool(agent_id, user_id, arguments)
         elif tool_name == "get_dingtalk_channel_provisioning_status":
@@ -9522,20 +9615,6 @@ async def _send_feishu_message(
                 return RecipientResolutionError(
                     "recipient_unreachable", "Canonical user has no usable Feishu endpoint"
                 ).as_json()
-            try:
-                resp = await feishu_service.send_message(
-                    config.app_id,
-                    config.app_secret,
-                    receive_id=receive_id,
-                    msg_type="text",
-                    content=json.dumps({"text": message_text}, ensure_ascii=False),
-                    receive_id_type=receive_id_type,
-                )
-            except FeishuAPIError as exc:
-                return f"❌ Feishu send failed: {exc.user_message}"
-            if resp.get("code") != 0:
-                return f"❌ Feishu send failed: {resp.get('msg')} (code {resp.get('code')})"
-
             session = await find_or_create_channel_session(
                 db=db,
                 agent_id=agent_id,
@@ -9544,12 +9623,7 @@ async def _send_feishu_message(
                 source_channel="feishu",
                 first_message_title=f"[Agent → {route.user.display_name}]",
             )
-            external_message_id = str(
-                ((resp.get("data") or {}).get("message_id"))
-                or resp.get("message_id")
-                or ""
-            ) or None
-            await _persist_outbound_channel_message(
+            receipt = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=route.user.id,
@@ -9562,10 +9636,53 @@ async def _send_feishu_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
-                external_message_id=external_message_id,
+                delivery_result=IMDeliveryResult.pending("feishu"),
             )
+            receipt_id = receipt.id
             await db.commit()
-            return f"✅ Message sent to {route.user.display_name} via Feishu"
+            try:
+                resp = await feishu_service.send_message(
+                    config.app_id,
+                    config.app_secret,
+                    receive_id=receive_id,
+                    msg_type="text",
+                    content=json.dumps({"text": message_text}, ensure_ascii=False),
+                    receive_id_type=receive_id_type,
+                )
+            except FeishuAPIError as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("feishu", exc),
+                )
+                return f"❌ Feishu send failed: {exc.user_message}"
+            if resp.get("code") != 0:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.failed("feishu", str(resp.get("code") or "send_failed")),
+                )
+                return f"❌ Feishu send failed: {resp.get('msg')} (code {resp.get('code')})"
+
+            external_message_id = str(
+                ((resp.get("data") or {}).get("message_id"))
+                or resp.get("message_id")
+                or ""
+            ) or None
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "feishu",
+                    IMDeliveryPart(
+                        transport="feishu_message",
+                        provider_message_id=external_message_id,
+                        conversation_ref=receive_id,
+                        recallable=bool(external_message_id),
+                    ),
+                ),
+            )
+            return (
+                f"✅ Message sent to {route.user.display_name} via Feishu\n"
+                f"message_id: {receipt_id}"
+            )
     except Exception as e:
         logger.exception("[Feishu] canonical send failed")
         return f"❌ Message send error: {str(e)[:200]}"
@@ -9844,6 +9961,7 @@ async def _persist_outbound_channel_message(
     origin_turn_anchor_id: uuid.UUID | None,
     external_message_id: str | None = None,
     delivery_status: str = "sent",
+    delivery_result: IMDeliveryResult | None = None,
 ) -> ChatMessage:
     """Append/reuse the outbound receipt used by strict on_message binding."""
     operation_key = _build_outbound_operation_key(
@@ -9867,6 +9985,55 @@ async def _persist_outbound_channel_message(
         if origin is not None:
             origin_source_channel = origin.source_channel
 
+    message_meta = {
+        "direction": "outbound",
+        "source_channel": source_channel,
+        "actor_ref": str(actor_ref),
+        "target_user_id": str(user_id or ""),
+        "target_session_id": str(session.id),
+        "target_name": str(target_name),
+        "origin_session_id": str(origin_session_id or ""),
+        "origin_source_channel": str(origin_source_channel or ""),
+        "tool_call_id": str(tool_call_id or ""),
+        "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+        "external_message_id": str(external_message_id or ""),
+        "delivery_status": delivery_status,
+    }
+    if delivery_result is None:
+        transport_by_channel = {
+            "dingtalk": "dingtalk_openapi_oto",
+            "feishu": "feishu_message",
+            "wecom": "wecom_app",
+            "slack": "slack",
+            "discord": "discord_gateway",
+            "teams": "microsoft_teams",
+            "microsoft_teams": "microsoft_teams",
+            "whatsapp": "whatsapp_cloud",
+            "wechat": "wechat_ilink",
+            "web": "websocket",
+            "miniprogram": "websocket",
+            "wechat_miniprogram": "websocket",
+        }
+        transport = transport_by_channel.get(source_channel, "websocket")
+        recallable_transports = {
+            "dingtalk_openapi_oto",
+            "feishu_message",
+            "wecom_app",
+            "slack",
+            "discord_gateway",
+            "microsoft_teams",
+        }
+        delivery_result = IMDeliveryResult.sent(
+            source_channel,
+            IMDeliveryPart(
+                transport=transport,
+                provider_message_id=external_message_id,
+                conversation_ref=str(actor_ref),
+                recallable=bool(external_message_id) and transport in recallable_transports,
+            ),
+        )
+    message_meta = attach_delivery_to_meta(message_meta, delivery_result)
+
     row = ChatMessage(
         agent_id=agent_id,
         user_id=user_id,
@@ -9874,20 +10041,7 @@ async def _persist_outbound_channel_message(
         content=content,
         conversation_id=str(session.id),
         external_event_key=operation_key,
-        message_meta={
-            "direction": "outbound",
-            "source_channel": source_channel,
-            "actor_ref": str(actor_ref),
-            "target_user_id": str(user_id or ""),
-            "target_session_id": str(session.id),
-            "target_name": str(target_name),
-            "origin_session_id": str(origin_session_id or ""),
-            "origin_source_channel": str(origin_source_channel or ""),
-            "tool_call_id": str(tool_call_id or ""),
-            "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
-            "external_message_id": str(external_message_id or ""),
-            "delivery_status": delivery_status,
-        },
+        message_meta=message_meta,
     )
     db.add(row)
     session.last_message_at = datetime.now(timezone.utc)
@@ -9926,6 +10080,7 @@ def _session_message_result(
     is_group: bool,
     legacy_group_contract: bool,
     mentioned_users: list[str] | None = None,
+    message_id: str | None = None,
 ) -> str:
     if legacy_group_contract:
         payload = {
@@ -9944,6 +10099,8 @@ def _session_message_result(
         }
     if mentioned_users:
         payload["mentioned_users"] = mentioned_users
+    if message_id:
+        payload["message_id"] = message_id
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -10015,6 +10172,7 @@ async def _send_exact_session_message(
                         is_group=bool(meta.get("target_is_group", require_group)),
                         legacy_group_contract=legacy_group_contract,
                         mentioned_users=list(meta.get("mentioned_users") or []),
+                        message_id=str(existing.id),
                     )
 
             conditions = [
@@ -10111,7 +10269,6 @@ async def _send_exact_session_message(
                 "agent_id": agent_id,
                 "runtime": runtime,
                 "message": message_for_delivery,
-                "require_transport": True,
                 "allow_wecom_group_actor_fallback": False,
             }
             if dingtalk_at_user_ids:
@@ -10121,13 +10278,6 @@ async def _send_exact_session_message(
                         "dingtalk_session_webhook": dingtalk_session_webhook,
                     }
                 )
-            delivered = await deliver_message_to_runtime(
-                **delivery_kwargs,
-            )
-            if not delivered:
-                label = "Group message" if target_is_group else "Session message"
-                return f"❌ {label} delivery failed via {target_channel}; no receipt was persisted."
-
             receipt = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
@@ -10141,6 +10291,7 @@ async def _send_exact_session_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending(target_channel),
             )
             receipt_meta = dict(receipt.message_meta or {})
             receipt_meta["target_is_group"] = target_is_group
@@ -10148,7 +10299,21 @@ async def _send_exact_session_message(
                 receipt_meta["mention_user_ids"] = mention_user_ids
                 receipt_meta["mentioned_users"] = mentioned_names
             receipt.message_meta = receipt_meta
+            receipt_id = receipt.id
             await db.commit()
+
+        # The provider call runs outside the row/advisory lock. The pending
+        # receipt above is the durable idempotency claim and crash marker.
+        async def _record_part(part: IMDeliveryPart) -> None:
+            if not await append_delivery_part(receipt_id, part):
+                raise RuntimeError("delivery_part_persistence_failed")
+
+        delivery_kwargs["on_part"] = _record_part
+        delivery_result = await deliver_message_with_receipt(**delivery_kwargs)
+        await register_delivery(receipt_id, delivery_result)
+        if not delivery_result.ok:
+            label = "Group message" if target_is_group else "Session message"
+            return f"❌ {label} delivery failed via {target_channel}; receipt status is failed."
 
         if target_channel not in _PLATFORM_SESSION_CHANNELS:
             try:
@@ -10177,6 +10342,7 @@ async def _send_exact_session_message(
             is_group=target_is_group,
             legacy_group_contract=legacy_group_contract,
             mentioned_users=mentioned_names,
+            message_id=str(receipt_id),
         )
     except Exception as exc:
         logger.opt(exception=True).error(
@@ -10363,6 +10529,40 @@ async def _send_dingtalk_message(
             # Get agent_id from extra_config (required for DingTalk API)
             agent_id_dingtalk = config.extra_config.get("agent_id") if config.extra_config else None
 
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_r.scalar_one_or_none()
+            platform_user = await get_platform_user_by_org_member(
+                db=db,
+                org_member=target_member,
+                agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+            )
+            conv_id = f"dingtalk_p2p_{user_id}"
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                external_conv_id=conv_id,
+                source_channel="dingtalk",
+                first_message_title=message_text[:30],
+            )
+            receipt = await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                session=sess,
+                content=message_text,
+                source_channel="dingtalk",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("dingtalk"),
+            )
+            receipt_id = receipt.id
+            await db.commit()
+
             # 3. Send message via DingTalk service
             result = await send_dingtalk_message(
                 app_id=config.app_id,
@@ -10373,60 +10573,28 @@ async def _send_dingtalk_message(
             )
 
             if result.get("errcode") == 0:
-                try:
-                    # Get agent tenant context
-                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                    agent_obj = agent_r.scalar_one_or_none()
-
-
-                    # Get or create platform user from OrgMember (unified logic)
-                    platform_user = await get_platform_user_by_org_member(
-                        db=db,
-                        org_member=target_member,
-                        agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
-                    )
-
-
-                    conv_id = f"dingtalk_p2p_{user_id}"
-                    # 2. Get/Create session
-                    sess = await find_or_create_channel_session(
-                        db=db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        external_conv_id=conv_id,
-                        source_channel="dingtalk",
-                        first_message_title=message_text[:30],
-                    )
-                    await _persist_outbound_channel_message(
-                        db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        session=sess,
-                        content=message_text,
-                        source_channel="dingtalk",
-                        actor_ref=str(user_id),
-                        target_name=member_name,
-                        origin_session_id=origin_session_id,
-                        origin_source_channel=None,
-                        tool_call_id=tool_call_id,
-                        origin_turn_anchor_id=origin_turn_anchor_id,
-                        external_message_id=str(
-                            result.get("task_id") or result.get("processQueryKey") or ""
-                        ) or None,
-                    )
-                    await db.commit()
-                    logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
-                except Exception as ex:
-                    logger.error(f"[DingTalk] Failed to save proactive message to session: {ex}")
-                    return (
-                        f"❌ The message reached {member_name}, but its platform routing "
-                        "receipt was not persisted. No exact on_message subscription was armed."
-                    )
-
-                return f"✅ Message sent to {member_name} via DingTalk"
+                process_key = str(result.get("processQueryKey") or "") or None
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.sent(
+                        "dingtalk",
+                        IMDeliveryPart(
+                            transport="dingtalk_openapi_oto",
+                            provider_message_id=process_key,
+                            conversation_ref=str(user_id),
+                            recallable=bool(process_key),
+                        ),
+                    ),
+                )
+                logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
+                return f"✅ Message sent to {member_name} via DingTalk\nmessage_id: {receipt_id}"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
                 logger.error(f"[DingTalk] Send failed: {result}")
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.failed("dingtalk", str(result.get("errcode") or errmsg)),
+                )
                 return f"❌ DingTalk send failed: {errmsg}"
 
     except Exception as e:
@@ -10472,6 +10640,40 @@ async def _send_wecom_message(
 
             logger.info(f"[WeCom] Sending to user_id: {user_id}")
 
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent = agent_r.scalar_one_or_none()
+            platform_user = await get_platform_user_by_org_member(
+                db=db,
+                org_member=target_member,
+                agent_tenant_id=agent.tenant_id if agent else None,
+            )
+            conv_id = f"wecom_p2p_{user_id}"
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                external_conv_id=conv_id,
+                source_channel="wecom",
+                first_message_title=message_text[:30],
+            )
+            receipt = await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                session=sess,
+                content=message_text,
+                source_channel="wecom",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("wecom"),
+            )
+            receipt_id = receipt.id
+            await db.commit()
+
             # 3. Send message via WeCom service
             result = await send_wecom_message(
                 config.app_id,
@@ -10482,58 +10684,28 @@ async def _send_wecom_message(
             )
 
             if result.get("errcode") == 0:
-                # Save proactive message to session so it appears in UI
-                try:
-
-                    # Get agent tenant context
-                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                    agent = agent_r.scalar_one_or_none()
-
-
-                    # Get or create platform user from OrgMember (unified logic)
-                    platform_user = await get_platform_user_by_org_member(
-                        db=db,
-                        org_member=target_member,
-                        agent_tenant_id=agent.tenant_id if agent else None,
-                    )
-
-                    conv_id = f"wecom_p2p_{user_id}"
-                    sess = await find_or_create_channel_session(
-                        db=db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        external_conv_id=conv_id,
-                        source_channel="wecom",
-                        first_message_title=message_text[:30],
-                    )
-                    await _persist_outbound_channel_message(
-                        db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        session=sess,
-                        content=message_text,
-                        source_channel="wecom",
-                        actor_ref=str(user_id),
-                        target_name=member_name,
-                        origin_session_id=origin_session_id,
-                        origin_source_channel=None,
-                        tool_call_id=tool_call_id,
-                        origin_turn_anchor_id=origin_turn_anchor_id,
-                        external_message_id=str(result.get("msgid") or "") or None,
-                    )
-                    await db.commit()
-                    logger.info(f"[WeCom] Proactive message saved to session {sess.id}")
-                except Exception as ex:
-                    logger.error(f"[WeCom] Failed to save proactive message to session: {ex}")
-                    return (
-                        f"❌ The message reached {member_name}, but its platform routing "
-                        "receipt was not persisted. No exact on_message subscription was armed."
-                    )
-
-                return f"✅ Message sent to {member_name} via WeCom"
+                msgid = str(result.get("msgid") or "") or None
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.sent(
+                        "wecom",
+                        IMDeliveryPart(
+                            transport="wecom_app",
+                            provider_message_id=msgid,
+                            conversation_ref=str(user_id),
+                            recallable=bool(msgid),
+                        ),
+                    ),
+                )
+                logger.info(f"[WeCom] Proactive message saved to session {sess.id}")
+                return f"✅ Message sent to {member_name} via WeCom\nmessage_id: {receipt_id}"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
                 logger.error(f"[WeCom] Send failed: {result}")
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.failed("wecom", str(result.get("errcode") or errmsg)),
+                )
                 return f"❌ WeCom send failed: {errmsg}"
 
     except Exception as e:
@@ -10592,49 +10764,81 @@ async def _send_slack_message(
             if not channel_id:
                 return f"❌ Slack DM channel unavailable for {member_name}"
 
-            await _send_slack_messages(bot_token, channel_id, message_text)
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_r.scalar_one_or_none()
+            platform_user = await get_platform_user_by_org_member(
+                db=db,
+                org_member=target_member,
+                agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+            )
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                external_conv_id=f"slack_{channel_id}",
+                source_channel="slack",
+                first_message_title=message_text[:30],
+            )
+            receipt = await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                session=sess,
+                content=message_text,
+                source_channel="slack",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("slack"),
+            )
+            receipt_id = receipt.id
+            await db.commit()
+
+            async def _record_slack_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="slack",
+                    provider_message_id=str(response.get("ts") or "") or None,
+                    conversation_ref=str(response.get("channel") or channel_id),
+                    artifact_role="chunk",
+                    recallable=bool(response.get("ts")),
+                )
+                if not await append_delivery_part(receipt_id, part):
+                    raise RuntimeError("delivery_part_persistence_failed")
 
             try:
-                agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                agent_obj = agent_r.scalar_one_or_none()
-                platform_user = await get_platform_user_by_org_member(
-                    db=db,
-                    org_member=target_member,
-                    agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+                slack_responses = await _send_slack_messages(
+                    bot_token,
+                    channel_id,
+                    message_text,
+                    on_result=_record_slack_part,
                 )
-                conv_id = f"slack_{channel_id}"
-                sess = await find_or_create_channel_session(
-                    db=db,
-                    agent_id=agent_id,
-                    user_id=platform_user.id,
-                    external_conv_id=conv_id,
-                    source_channel="slack",
-                    first_message_title=message_text[:30],
+            except Exception as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("slack", exc),
                 )
-                await _persist_outbound_channel_message(
-                    db,
-                    agent_id=agent_id,
-                    user_id=platform_user.id,
-                    session=sess,
-                    content=message_text,
-                    source_channel="slack",
-                    actor_ref=str(user_id),
-                    target_name=member_name,
-                    origin_session_id=origin_session_id,
-                    origin_source_channel=None,
-                    tool_call_id=tool_call_id,
-                    origin_turn_anchor_id=origin_turn_anchor_id,
-                )
-                await db.commit()
-                logger.info(f"[Slack] Proactive message saved to session {sess.id}")
-            except Exception as ex:
-                logger.error(f"[Slack] Failed to save proactive message to session: {ex}")
-                return (
-                    f"❌ The message reached {member_name}, but its platform routing "
-                    "receipt was not persisted. No exact on_message subscription was armed."
-                )
-
-            return f"✅ Message sent to {member_name} via Slack"
+                raise
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "slack",
+                    *(
+                        IMDeliveryPart(
+                            transport="slack",
+                            provider_message_id=str(response.get("ts") or "") or None,
+                            conversation_ref=str(response.get("channel") or channel_id),
+                            artifact_role="chunk",
+                            recallable=bool(response.get("ts")),
+                        )
+                        for response in slack_responses
+                    ),
+                ),
+            )
+            logger.info(f"[Slack] Proactive message saved to session {sess.id}")
+            return f"✅ Message sent to {member_name} via Slack\nmessage_id: {receipt_id}"
     except Exception as e:
         logger.exception("[Slack] Error")
         return f"❌ Slack message error: {str(e)[:200]}"
@@ -10695,18 +10899,8 @@ async def _send_teams_channel_message(
             if not conversation_id:
                 return f"❌ Teams proactive send to {member_name} requires them to message the bot first"
 
-            await _send_teams_message(
-                config,
-                conversation_id,
-                {
-                    "type": "message",
-                    "text": message_text,
-                    "conversation": {"id": conversation_id},
-                },
-            )
-
             actor_ref = str(target_member.external_id or target_member.open_id or platform_user.id)
-            await _persist_outbound_channel_message(
+            receipt = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -10719,10 +10913,59 @@ async def _send_teams_channel_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("microsoft_teams"),
             )
+            receipt_id = receipt.id
             await db.commit()
+
+            async def _record_teams_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="microsoft_teams",
+                    provider_message_id=str(response.get("id") or "") or None,
+                    conversation_ref=conversation_id,
+                    artifact_role="chunk",
+                    recallable=bool(response.get("id")),
+                    metadata={"service_url": service_url},
+                )
+                if not await append_delivery_part(receipt_id, part):
+                    raise RuntimeError("delivery_part_persistence_failed")
+
+            try:
+                teams_responses = await _send_teams_message(
+                    config,
+                    conversation_id,
+                    {
+                        "type": "message",
+                        "text": message_text,
+                        "conversation": {"id": conversation_id},
+                    },
+                    on_result=_record_teams_part,
+                )
+            except Exception as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("microsoft_teams", exc),
+                )
+                raise
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "microsoft_teams",
+                    *(
+                        IMDeliveryPart(
+                            transport="microsoft_teams",
+                            provider_message_id=str(response.get("id") or "") or None,
+                            conversation_ref=conversation_id,
+                            artifact_role="chunk",
+                            recallable=bool(response.get("id")),
+                            metadata={"service_url": service_url},
+                        )
+                        for response in teams_responses
+                    ),
+                ),
+            )
             logger.info(f"[Teams] Proactive message saved to session {session.id}")
-            return f"✅ Message sent to {member_name} via Teams"
+            return f"✅ Message sent to {member_name} via Teams\nmessage_id: {receipt_id}"
     except Exception as e:
         logger.exception("[Teams] Error")
         return f"❌ Teams message error: {str(e)[:200]}"
@@ -10775,15 +11018,6 @@ async def _send_wechat_channel_message(
             if not token:
                 return "❌ WeChat bot token is missing"
 
-            await send_wechat_text_message(
-                token=token,
-                base_url=base_url,
-                to_user_id=user_id,
-                context_token=context_token,
-                text=message_text,
-                route_tag=route_tag,
-            )
-
             agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent_obj = agent_r.scalar_one_or_none()
             platform_user = await get_platform_user_by_org_member(
@@ -10799,7 +11033,7 @@ async def _send_wechat_channel_message(
                 source_channel="wechat",
                 first_message_title=message_text[:30],
             )
-            await _persist_outbound_channel_message(
+            receipt = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -10812,10 +11046,56 @@ async def _send_wechat_channel_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("wechat"),
             )
+            receipt_id = receipt.id
             await db.commit()
+
+            async def _record_wechat_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="wechat_ilink",
+                    provider_message_id=str(response.get("client_id") or "") or None,
+                    conversation_ref=user_id,
+                    artifact_role="chunk",
+                    recallable=False,
+                )
+                if not await append_delivery_part(receipt_id, part):
+                    raise RuntimeError("delivery_part_persistence_failed")
+
+            try:
+                wechat_responses = await send_wechat_text_message(
+                    token=token,
+                    base_url=base_url,
+                    to_user_id=user_id,
+                    context_token=context_token,
+                    text=message_text,
+                    route_tag=route_tag,
+                    on_result=_record_wechat_part,
+                )
+            except Exception as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("wechat", exc),
+                )
+                raise
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "wechat",
+                    *(
+                        IMDeliveryPart(
+                            transport="wechat_ilink",
+                            provider_message_id=str(response.get("client_id") or "") or None,
+                            conversation_ref=user_id,
+                            artifact_role="chunk",
+                            recallable=False,
+                        )
+                        for response in wechat_responses
+                    ),
+                ),
+            )
             logger.info(f"[WeChat] Proactive message saved to session {sess.id}")
-            return f"✅ Message sent to {member_name} via WeChat"
+            return f"✅ Message sent to {member_name} via WeChat\nmessage_id: {receipt_id}"
     except Exception as e:
         logger.exception("[WeChat] Error")
         return f"❌ WeChat message error: {str(e)[:200]}"

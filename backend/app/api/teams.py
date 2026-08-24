@@ -19,7 +19,6 @@ from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent as AgentModel
-from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
@@ -141,7 +140,13 @@ async def _get_teams_access_token(config: ChannelConfig) -> str | None:
         return None
 
 
-async def _send_teams_message(config: ChannelConfig, conversation_id: str, activity: dict) -> None:
+async def _send_teams_message(
+    config: ChannelConfig,
+    conversation_id: str,
+    activity: dict,
+    *,
+    on_result=None,
+) -> list[dict]:
     """Send an activity (message) to Microsoft Teams."""
     access_token = await _get_teams_access_token(config)
     if not access_token:
@@ -166,18 +171,35 @@ async def _send_teams_message(config: ChannelConfig, conversation_id: str, activ
 
     # Teams has a 28KB limit for message activities. Chunk if needed.
     text_content = activity.get("text", "")
+    results: list[dict] = []
     if len(text_content.encode("utf-8")) > TEAMS_MSG_LIMIT:
         chunks = [text_content[i:i + TEAMS_MSG_LIMIT] for i in range(0, len(text_content), TEAMS_MSG_LIMIT)]
         for i, chunk in enumerate(chunks):
             chunk_activity = {**activity, "text": chunk}
             if i > 0:  # Only the first chunk is a direct reply, subsequent are new messages
                 chunk_activity.pop("replyToId", None)
-            await _send_teams_message_single_chunk(access_token, service_url, conversation_id, chunk_activity)
+            result = await _send_teams_message_single_chunk(
+                access_token, service_url, conversation_id, chunk_activity
+            )
+            results.append(result)
+            if on_result is not None:
+                await on_result(result)
     else:
-        await _send_teams_message_single_chunk(access_token, service_url, conversation_id, activity)
+        result = await _send_teams_message_single_chunk(
+            access_token, service_url, conversation_id, activity
+        )
+        results.append(result)
+        if on_result is not None:
+            await on_result(result)
+    return results
 
 
-async def _send_teams_message_single_chunk(access_token: str, service_url: str, conversation_id: str, activity: dict) -> None:
+async def _send_teams_message_single_chunk(
+    access_token: str,
+    service_url: str,
+    conversation_id: str,
+    activity: dict,
+) -> dict:
     """Send a single chunked message to Microsoft Teams."""
     # Ensure service_url doesn't have trailing slash to avoid double slashes
     service_url_clean = service_url.rstrip("/")
@@ -201,6 +223,10 @@ async def _send_teams_message_single_chunk(access_token: str, service_url: str, 
                 logger.error(f"Teams: POST URL={post_url}, conversation_id={conversation_id}, service_url={service_url}")
             resp.raise_for_status()
             logger.info(f"Teams: Sent message to conversation {conversation_id}")
+            try:
+                return resp.json()
+            except ValueError:
+                return {}
     except httpx.HTTPStatusError as e:
         error_body = e.response.text if hasattr(e, 'response') and e.response else "No response body"
         try:
@@ -642,6 +668,15 @@ async def teams_event_webhook(
                 _cfs_s.reset(_cfs_s_token)
 
             # Save reply
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                IMDeliveryResult,
+                append_delivery_part,
+                attach_delivery_to_meta,
+                register_delivery,
+            )
+
+            assistant_message_id = None
             try:
                 # Save assistant reply via the shared writer. Its own session stamps
                 # created_at at save time (after the tool loop), so the reply orders
@@ -649,11 +684,16 @@ async def teams_event_webhook(
                 # analysis card.
                 from app.services.chat_history import persist_assistant_reply
                 from app.database import async_session as _areply_session
-                await persist_assistant_reply(
+                assistant_message_id = await persist_assistant_reply(
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending("microsoft_teams"),
+                    ),
                     turn_anchor_id=ingested.message.id,
+                    required=True,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()
@@ -661,8 +701,10 @@ async def teams_event_webhook(
             except Exception as e:
                 logger.exception(f"Teams: Failed to save reply to database: {e}")
                 await db.rollback()
+                raise
 
             # Send to Teams
+            delivery_result = IMDeliveryResult.failed("microsoft_teams", "channel_config_unavailable")
             use_managed_identity = config.extra_config.get("use_managed_identity", False)
             has_credentials = (config.app_id and config.app_secret) or use_managed_identity
             if has_credentials and conversation_id:
@@ -692,13 +734,49 @@ async def teams_event_webhook(
                         "text": reply_text,
                     }
                     logger.info(f"Teams: Attempting to send reply to conversation {conversation_id}, from={bot_channel_account.get('id')}, recipient={user_account.get('id')}")
-                    await _send_teams_message(config, conversation_id, reply_activity)
+                    service_url = str((config.extra_config or {}).get("service_url") or "")
+
+                    async def _record_teams_part(response: dict) -> None:
+                        part = IMDeliveryPart(
+                            transport="microsoft_teams",
+                            provider_message_id=str(response.get("id") or "") or None,
+                            conversation_ref=conversation_id,
+                            artifact_role="chunk",
+                            recallable=bool(response.get("id")),
+                            metadata={"service_url": service_url},
+                        )
+                        if not await append_delivery_part(assistant_message_id, part):
+                            raise RuntimeError("delivery_part_persistence_failed")
+
+                    responses = await _send_teams_message(
+                        config,
+                        conversation_id,
+                        reply_activity,
+                        on_result=_record_teams_part,
+                    )
+                    delivery_result = IMDeliveryResult.sent(
+                        "microsoft_teams",
+                        *(
+                            IMDeliveryPart(
+                                transport="microsoft_teams",
+                                provider_message_id=str(response.get("id") or "") or None,
+                                conversation_ref=conversation_id,
+                                artifact_role="chunk",
+                                recallable=bool(response.get("id")),
+                                metadata={"service_url": service_url},
+                            )
+                            for response in responses
+                        ),
+                    )
                     logger.info(f"Teams: Successfully sent reply to Teams")
                 except Exception as e:
                     logger.exception(f"Teams: Failed to send message to Teams: {e}")
+                    delivery_result = IMDeliveryResult.from_exception("microsoft_teams", e)
             else:
                 use_mi = config.extra_config.get("use_managed_identity", False)
                 logger.warning(f"Teams: Cannot send reply - missing credentials (managed_identity={use_mi}, app_id={bool(config.app_id)}, app_secret={bool(config.app_secret)}), conversation_id={bool(conversation_id)}")
+            if assistant_message_id is not None:
+                await register_delivery(assistant_message_id, delivery_result)
 
             return reply_text
 

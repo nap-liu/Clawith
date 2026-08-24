@@ -809,7 +809,6 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
         load_recoverable_history_for_turn,
         persist_assistant_reply_row,
     )
-    from app.services.turn_runtime import deliver_recovered_reply_to_origin
 
     cfg = trigger.config if isinstance(trigger.config, dict) else {}
     execution_id = uuid.UUID(str(cfg["_execution_id"]))
@@ -972,6 +971,15 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
                     "trigger_execution_id": str(execution_id),
                     "matched_message_id": str(matched_id),
                 }
+                from app.services.im_delivery import (
+                    IMDeliveryResult,
+                    attach_delivery_to_meta,
+                )
+
+                final_meta = attach_delivery_to_meta(
+                    final_meta,
+                    IMDeliveryResult.pending(str(origin.source_channel or "web")),
+                )
                 origin_agent_participant = None
                 if origin.source_channel == "agent":
                     from app.models.participant import Participant
@@ -1037,6 +1045,23 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
             if final_meta.get("origin_delivery_status") == "delivered":
                 return reply
 
+        from app.services.turn_runtime import (
+            deliver_recovered_reply_to_origin,
+            load_turn_runtime,
+        )
+
+        runtime = await load_turn_runtime(
+            agent_id=agent_id,
+            conversation_id=str(origin_id),
+        )
+        if (
+            runtime.source_channel != str(cfg.get("_origin_source_channel") or "")
+            or (
+                "_origin_external_conv_id" in cfg
+                and runtime.external_conv_id != cfg.get("_origin_external_conv_id")
+            )
+        ):
+            raise RetryableOnMessageError("on_message origin generation changed")
         delivered = await deliver_recovered_reply_to_origin(
             agent_id=agent_id,
             conversation_id=str(origin_id),
@@ -1047,6 +1072,7 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
             expected_source_channel=str(cfg.get("_origin_source_channel") or "") or None,
             expected_external_conv_id=cfg.get("_origin_external_conv_id"),
             validate_external_conv_id="_origin_external_conv_id" in cfg,
+            message_id=final_id,
         )
         if not delivered:
             raise RetryableOnMessageError("on_message origin delivery failed")

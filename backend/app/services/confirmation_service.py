@@ -593,28 +593,45 @@ async def _reenter_loop(
         # An empty reply means the agent suspended AGAIN (chained confirmation) and the new
         # suspend already persisted/delivered everything — nothing to add here.
         if reply and reply.strip():
+            from app.services.im_delivery import (
+                IMDeliveryResult,
+                attach_delivery_to_meta,
+            )
+
+            runtime = await load_turn_runtime(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+            )
+            pending_meta = attach_delivery_to_meta(
+                {},
+                IMDeliveryResult.pending(runtime.source_channel),
+            )
             if turn_anchor_id is not None:
-                await persist_assistant_reply_and_complete_turn(
+                assistant_message_id = await persist_assistant_reply_and_complete_turn(
                     async_session,
                     agent_id=agent_id,
                     user_id=resolving_user_id,
                     conversation_id=conversation_id,
                     content=reply,
                     turn_anchor_id=turn_anchor_id,
+                    message_meta=pending_meta,
                 )
             else:
-                await persist_assistant_reply(
+                assistant_message_id = await persist_assistant_reply(
                     async_session,
                     agent_id=agent_id,
                     user_id=resolving_user_id,
                     conversation_id=conversation_id,
                     content=reply,
+                    message_meta=pending_meta,
+                    required=True,
                 )
             delivered = await deliver_reply_to_origin(
                 agent_id=agent_id,
                 conversation_id=conversation_id,
                 reply=reply,
                 require_transport=True,
+                message_id=assistant_message_id,
             )
             if not delivered:
                 logger.warning(

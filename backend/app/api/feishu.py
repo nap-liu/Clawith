@@ -1111,6 +1111,37 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     agent_name=_agent_name,
                 )
 
+                # Persist the local lifecycle anchor before the final external
+                # side effect, then attach every provider-visible artifact.
+                from app.services.chat_history import persist_assistant_reply
+                from app.database import async_session as _areply_session
+                from app.services.im_delivery import (
+                    IMDeliveryPart,
+                    IMDeliveryResult,
+                    append_delivery_part,
+                    attach_delivery_to_meta,
+                    register_delivery,
+                )
+
+                assistant_message_id = await persist_assistant_reply(
+                    _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                    conversation_id=session_conv_id, content=final_reply_text,
+                    thinking="".join(_thinking_buffer) or None,
+                    message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("feishu")),
+                    turn_anchor_id=ingested.message.id,
+                    required=True,
+                )
+                delivery_parts: list[IMDeliveryPart] = []
+                if _patch_msg_id:
+                    card_part = IMDeliveryPart(
+                        transport="feishu_message",
+                        provider_message_id=_patch_msg_id,
+                        conversation_ref=_reply_target,
+                        artifact_role="card",
+                    )
+                    delivery_parts.append(card_part)
+                    await append_delivery_part(assistant_message_id, card_part)
+
                 if _patch_msg_id:
                     try:
                         await _patch_queue.drain()
@@ -1127,7 +1158,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     except Exception as e:
                         logger.error(f"[Feishu] Failed to patch final interactive reply: {e}")
                         try:
-                            await feishu_service.send_message(
+                            fallback_response = await feishu_service.send_message(
                                 config.app_id,
                                 config.app_secret,
                                 _reply_target,
@@ -1136,11 +1167,23 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                 receive_id_type=_reply_rid_type,
                                 stage="final_after_task_fallback_text",
                             )
+                            fallback_message_id = str(
+                                ((fallback_response.get("data") or {}).get("message_id")) or ""
+                            )
+                            if fallback_message_id:
+                                fallback_part = IMDeliveryPart(
+                                    transport="feishu_message",
+                                    provider_message_id=fallback_message_id,
+                                    conversation_ref=_reply_target,
+                                    artifact_role="fallback",
+                                )
+                                delivery_parts.append(fallback_part)
+                                await append_delivery_part(assistant_message_id, fallback_part)
                         except Exception as e2:
                             logger.error(f"[Feishu] Failed to send fallback text reply: {e2}")
                 else:
                     try:
-                        await feishu_service.send_message(
+                        final_response = await feishu_service.send_message(
                             config.app_id,
                             config.app_secret,
                             _reply_target,
@@ -1149,10 +1192,22 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             receive_id_type=_reply_rid_type,
                             stage="final_after_task",
                         )
+                        final_message_id = str(
+                            ((final_response.get("data") or {}).get("message_id")) or ""
+                        )
+                        if final_message_id:
+                            final_part = IMDeliveryPart(
+                                transport="feishu_message",
+                                provider_message_id=final_message_id,
+                                conversation_ref=_reply_target,
+                                artifact_role="card",
+                            )
+                            delivery_parts.append(final_part)
+                            await append_delivery_part(assistant_message_id, final_part)
                     except Exception as e:
                         logger.error(f"[Feishu] Failed to send final interactive reply: {e}")
                         try:
-                            await feishu_service.send_message(
+                            fallback_response = await feishu_service.send_message(
                                 config.app_id,
                                 config.app_secret,
                                 _reply_target,
@@ -1161,25 +1216,33 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                 receive_id_type=_reply_rid_type,
                                 stage="final_after_task_fallback_text",
                             )
+                            fallback_message_id = str(
+                                ((fallback_response.get("data") or {}).get("message_id")) or ""
+                            )
+                            if fallback_message_id:
+                                fallback_part = IMDeliveryPart(
+                                    transport="feishu_message",
+                                    provider_message_id=fallback_message_id,
+                                    conversation_ref=_reply_target,
+                                    artifact_role="fallback",
+                                )
+                                delivery_parts.append(fallback_part)
+                                await append_delivery_part(assistant_message_id, fallback_part)
                         except Exception as e2:
                             logger.error(f"[Feishu] Failed to send fallback text reply: {e2}")
+
+                if assistant_message_id is not None:
+                    delivery_result = (
+                        IMDeliveryResult.sent("feishu", *delivery_parts)
+                        if delivery_parts
+                        else IMDeliveryResult.failed("feishu", "send_failed")
+                    )
+                    await register_delivery(assistant_message_id, delivery_result)
 
                 # Log activity
                 from app.services.activity_logger import log_activity
                 await log_activity(agent_id, "chat_reply", f"回复了飞书消息: {final_reply_text[:80]}", detail={"channel": "feishu", "user_text": user_text[:200], "reply": final_reply_text[:500]})
 
-                # Save assistant reply via the shared writer. Its own session stamps
-                # created_at at save time (after the tool loop), so the reply orders
-                # AFTER the turn's tool calls instead of being folded into the web
-                # UI's analysis card.
-                from app.services.chat_history import persist_assistant_reply
-                from app.database import async_session as _areply_session
-                await persist_assistant_reply(
-                    _areply_session, agent_id=agent_id, user_id=platform_user_id,
-                    conversation_id=session_conv_id, content=final_reply_text,
-                    thinking="".join(_thinking_buffer) or None,
-                    turn_anchor_id=ingested.message.id,
-                )
                 _sess.last_message_at = _dt.now(_tz.utc)
                 await db.commit()
 
@@ -1565,35 +1628,79 @@ async def _handle_feishu_file(
 
             logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
 
+            from app.services.chat_history import persist_assistant_reply
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                IMDeliveryResult,
+                append_delivery_part,
+                attach_delivery_to_meta,
+                register_delivery,
+            )
+
+            assistant_message_id = await persist_assistant_reply(
+                _async_session, agent_id=agent_id, user_id=platform_user_id,
+                conversation_id=session_conv_id_img, content=reply_text,
+                thinking="".join(_img_thinking_chunks) or None,
+                message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("feishu")),
+                turn_anchor_id=_image_ingested.message.id,
+                required=True,
+            )
+
             # ── Send final card / fallback ──
+            delivery_result = IMDeliveryResult.failed("feishu", "send_failed")
             if _patch_msg_id:
+                card_part = IMDeliveryPart(
+                    transport="feishu_message",
+                    provider_message_id=_patch_msg_id,
+                    conversation_ref=_reply_to,
+                    artifact_role="card",
+                )
+                await append_delivery_part(assistant_message_id, card_part)
                 try:
                     await _img_patch_queue.drain()
                 except Exception as _e_drain:
                     logger.warning(f"[Feishu] Image patch queue drain failed: {_e_drain}")
                 _final_card = _build_card(reply_text or "...", streaming=False, agent_name=_agent_name_img)
-                await feishu_service.patch_message(
-                    config.app_id, config.app_secret, _patch_msg_id,
-                    _json_card_img.dumps(_final_card), stage="image_stream_final"
-                )
+                try:
+                    await feishu_service.patch_message(
+                        config.app_id, config.app_secret, _patch_msg_id,
+                        _json_card_img.dumps(_final_card), stage="image_stream_final"
+                    )
+                    delivery_result = IMDeliveryResult.sent(
+                        "feishu",
+                        card_part,
+                    )
+                except Exception as _e_final_patch:
+                    logger.error(f"[Feishu] Failed to patch final image reply: {_e_final_patch}")
             else:
                 try:
-                    await feishu_service.send_message(
+                    fallback_response = await feishu_service.send_message(
                         config.app_id, config.app_secret, _reply_to, "text",
                         json.dumps({"text": reply_text}), receive_id_type=_rid_type_img,
                         stage="image_stream_fallback_text",
                     )
+                    fallback_message_id = str(
+                        ((fallback_response.get("data") or {}).get("message_id")) or ""
+                    )
+                    if fallback_message_id:
+                        fallback_part = IMDeliveryPart(
+                            transport="feishu_message",
+                            provider_message_id=fallback_message_id,
+                            conversation_ref=_reply_to,
+                            artifact_role="fallback",
+                        )
+                        await append_delivery_part(assistant_message_id, fallback_part)
+                        delivery_result = IMDeliveryResult.sent(
+                            "feishu",
+                            fallback_part,
+                        )
                 except Exception as _e_fb:
                     logger.error(f"[Feishu] Failed to send image reply: {_e_fb}")
 
-            # ── Persist reply + log ──
-            from app.services.chat_history import persist_assistant_reply
-            await persist_assistant_reply(
-                _async_session, agent_id=agent_id, user_id=platform_user_id,
-                conversation_id=session_conv_id_img, content=reply_text,
-                thinking="".join(_img_thinking_chunks) or None,
-                turn_anchor_id=_image_ingested.message.id,
-            )
+            if assistant_message_id is not None:
+                await register_delivery(assistant_message_id, delivery_result)
+
+            # ── Log ──
             from app.services.activity_logger import log_activity
             await log_activity(agent_id, "chat_reply", f"回复了飞书图片消息: {reply_text[:80]}",
                                detail={"channel": "feishu", "type": "image"})

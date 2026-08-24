@@ -27,7 +27,6 @@ from app.core.security import create_access_token, get_current_user
 from app.database import async_session, get_db
 from app.models.agent import Agent as AgentModel
 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.identity import IdentityProvider, SSOScanSession
 from app.models.user import User
@@ -677,10 +676,10 @@ async def _process_wecom_text(
 
             wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
 
-            async def _send_wecom_text(text: str) -> None:
+            async def _send_wecom_text(text: str) -> dict:
                 access_token = await _get_wecom_token_cached(config.app_id, config.app_secret)
                 if not access_token:
-                    return
+                    raise RuntimeError("WeCom access token unavailable")
                 async with httpx.AsyncClient(timeout=10) as client:
                     if is_kf and open_kfid:
                         # KF 消息需先转接状态再发送
@@ -693,10 +692,11 @@ async def _process_wecom_text(
                             f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}",
                             json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": text}},
                         )
-                        logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
+                        data = res_send.json()
+                        logger.info(f"[WeCom KF] send_msg result: {data}")
                     else:
                         # 默认发送文本消息
-                        await client.post(
+                        response = await client.post(
                             f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
                             json={
                                 "touser": from_user,
@@ -705,6 +705,10 @@ async def _process_wecom_text(
                                 "text": {"content": text},
                             },
                         )
+                        data = response.json()
+                if data.get("errcode") != 0:
+                    raise RuntimeError(str(data.get("errmsg") or data.get("errcode") or "WeCom send failed"))
+                return data
 
             # 调用 LLM
             _thinking_chunks: list[str] = []
@@ -729,21 +733,44 @@ async def _process_wecom_text(
                 await _thinking_sender.flush()
             logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
 
-            # 通过企微 API 发送回复
-            try:
-                await _send_wecom_text(reply_text)
-            except Exception as e:
-                logger.error(f"[WeCom] Failed to send reply: {e}")
-
-            # 持久化助手回复(独立 session 保证时序在工具调用记录之后)
+            # Persist the local lifecycle anchor before the external side effect.
             from app.services.chat_history import persist_assistant_reply
             from app.database import async_session as _areply_session
-            await persist_assistant_reply(
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                IMDeliveryResult,
+                attach_delivery_to_meta,
+                register_delivery,
+            )
+
+            assistant_message_id = await persist_assistant_reply(
                 _areply_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id, content=reply_text,
                 thinking="".join(_thinking_chunks) or None,
+                message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("wecom")),
                 turn_anchor_id=ingested.message.id,
+                required=True,
             )
+
+            # 通过企微 API 发送回复
+            try:
+                send_result = await _send_wecom_text(reply_text)
+                msgid = str(send_result.get("msgid") or "")
+                transport = "wecom_kf" if is_kf else "wecom_app"
+                delivery_result = IMDeliveryResult.sent(
+                    "wecom",
+                    IMDeliveryPart(
+                        transport=transport,
+                        provider_message_id=msgid or None,
+                        conversation_ref=from_user,
+                        recallable=bool(msgid) and not is_kf,
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"[WeCom] Failed to send reply: {e}")
+                delivery_result = IMDeliveryResult.from_exception("wecom", e)
+            if assistant_message_id is not None:
+                await register_delivery(assistant_message_id, delivery_result)
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
