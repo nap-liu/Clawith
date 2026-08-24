@@ -4323,10 +4323,10 @@
     "colScope": "范围"
   },
   "sidebar": {
-    "agents": "智能体",
-    "agentSearchPlaceholder": "搜索名称或创建者",
-    "agentSearchLabel": "按名称或创建者搜索智能体",
-    "clearAgentSearch": "清空智能体搜索",
-    "noAgentMatches": "没有匹配的智能体"
+    "agents": "数字员工",
+    "agentSearchPlaceholder": "搜索数字员工名称或创建者",
+    "agentSearchLabel": "按名称或创建者搜索数字员工",
+    "clearAgentSearch": "清空数字员工搜索",
+    "noAgentMatches": "没有匹配的数字员工"
   }
 }

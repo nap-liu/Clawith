@@ -1507,7 +1507,7 @@ export default function Layout() {
         onMouseLeave={scheduleCloseAgentDrawer}
       >
         <div className="sidebar-agent-drawer-header">
-          <span>{isChinese ? "智能体" : "Agents"}</span>
+          <span>{t("sidebar.agents")}</span>
           <button
             type="button"
             onClick={() => {

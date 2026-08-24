@@ -1629,6 +1629,7 @@ export default function ProjectWorkspacePage() {
                   key={domain.id}
                   className={isActive ? "is-active" : ""}
                   aria-current={isActive ? "page" : undefined}
+                  title={t(domain.labelKey)}
                   onClick={() => navigateWorkspace(domain.defaultTab)}
                 >
                   <Icon size={17} />

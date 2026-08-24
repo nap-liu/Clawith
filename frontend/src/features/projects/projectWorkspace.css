@@ -3858,8 +3858,10 @@
     padding-inline: 7px;
   }
   .project-workspace__nav h2,
-  .project-workspace__nav button span,
-  .project-workspace__nav button em,
+  .project-workspace__nav section > button > span,
+  .project-workspace__nav section > button > em {
+    display: none;
+  }
   .project-workspace__nav section > button {
     justify-content: center;
     padding: 0;

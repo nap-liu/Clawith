@@ -85,8 +85,8 @@ assert.match(
 );
 assert.match(
   workspace,
-  /ProjectMarkdownPreview[\s\S]*markdownPreview[\s\S]*selectedView/,
-  "Markdown files must provide distinct rendered preview and source modes",
+  /markdownPreview[\s\S]*ProjectCodeEditor[\s\S]*readOnly/,
+  "Markdown preview and source modes must share Monaco instead of a second renderer",
 );
 assert.match(
   workspaceRouting,

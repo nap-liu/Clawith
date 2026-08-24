@@ -42,7 +42,6 @@ import { Button, TextInput } from "./ProjectUI";
 import "./ProjectFileWorkspace.css";
 
 const ProjectCodeEditor = lazy(() => import("./ProjectCodeEditor"));
-const ProjectMarkdownPreview = lazy(() => import("./ProjectMarkdownPreview"));
 
 type RecordValue = Record<string, unknown>;
 
@@ -945,12 +944,14 @@ export default function ProjectFileWorkspace({
                     className="project-workspace__spinner"
                     size={20}
                   />
-                  <span>{t("projectWorkspaceFiles.loadingPreview")}</span>
+                  <span>{t("projectWorkspaceFiles.loadingEditor")}</span>
                 </div>
               }
             >
-              <ProjectMarkdownPreview
+              <ProjectCodeEditor
+                path={draftPath || content?.path || "README.md"}
                 value={draftContent}
+                readOnly
                 ariaLabel={t("projectWorkspaceFiles.markdownPreviewAria", {
                   name: content?.name || draftPath,
                 })}
