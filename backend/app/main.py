@@ -1,4 +1,4 @@
-"""Clawith Backend — FastAPI Application Entry Point."""
+"""Digital employee platform FastAPI application entry point."""
 
 import asyncio
 import os
@@ -612,5 +612,5 @@ _version_cache = _load_version_info()
 
 @app.get("/api/version", tags=["system"])
 async def get_version():
-    """Return current Clawith version and commit hash."""
+    """Return the current platform version and commit hash."""
     return _version_cache

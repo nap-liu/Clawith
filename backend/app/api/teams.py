@@ -494,7 +494,7 @@ async def teams_event_webhook(
             channel_session_lock_key,
             run_channel_message,
         )
-        from app.services.channel_commands import is_channel_command, handle_channel_command
+        from app.services.channel_commands import is_channel_command, prepare_channel_command_reply
 
         lock_key = channel_session_lock_key(
             agent_id,
@@ -505,16 +505,17 @@ async def teams_event_webhook(
         # Early-return for channel commands (/new, /reset):
         # archive the session and send a canned reply — no LLM, no lock needed.
         if is_channel_command(user_text):
-            from app.services.webhook_security import claim_command_event
-            if not await claim_command_event("teams", config.id, activity_id):
-                return {"ok": True}
-            cmd_result = await handle_channel_command(
+            cmd_result = await prepare_channel_command_reply(
                 db=db, command=user_text, agent_id=agent_id,
                 user_id=platform_user_id, external_conv_id=conversation_id,
+                external_user_id=sender_id,
                 source_channel="microsoft_teams",
+                provider_event_id=activity_id,
                 is_group=_is_group_teams,
             )
             await db.commit()
+            if not cmd_result["should_deliver"]:
+                return {"ok": True}
             use_mi_cmd = config.extra_config.get("use_managed_identity", False)
             has_creds_cmd = (config.app_id and config.app_secret) or use_mi_cmd
             if has_creds_cmd:
@@ -532,10 +533,43 @@ async def teams_event_webhook(
                     "replyToId": reply_to_id,
                     "text": cmd_result["message"],
                 }
+                from app.services.im_delivery import (
+                    IMDeliveryPart,
+                    PersistedDeliveryRecorder,
+                )
+                _cmd_recorder = PersistedDeliveryRecorder(
+                    cmd_result["message_id"],
+                    "microsoft_teams",
+                )
+                _cmd_service_url = str(config.extra_config.get("service_url") or "")
+
+                async def _record_command_part(item: dict) -> None:
+                    await _cmd_recorder.append(IMDeliveryPart(
+                        transport="microsoft_teams",
+                        provider_message_id=str(item.get("id") or "") or None,
+                        conversation_ref=conversation_id,
+                        artifact_role="command_reply",
+                        recallable=bool(item.get("id")),
+                        metadata={"service_url": _cmd_service_url},
+                    ))
+
                 try:
-                    await _send_teams_message(config, conversation_id, cmd_reply_activity)
+                    await _send_teams_message(
+                        config,
+                        conversation_id,
+                        cmd_reply_activity,
+                        on_result=_record_command_part,
+                    )
+                    await _cmd_recorder.sent()
                 except Exception as _cmd_e:
+                    await _cmd_recorder.failed(_cmd_e)
                     logger.error(f"Teams: Failed to send command reply: {_cmd_e}")
+            else:
+                from app.services.im_delivery import IMDeliveryResult, register_delivery
+                await register_delivery(
+                    cmd_result["message_id"],
+                    IMDeliveryResult.failed("teams", "command_route_unavailable"),
+                )
             return {"ok": True}
 
         async def _work() -> str:
@@ -597,6 +631,9 @@ async def teams_event_webhook(
 
             # Set channel_file_sender contextvar for agent → user file delivery
             async def _teams_file_sender(file_path, msg: str = ""):
+                from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
+                from app.services.agent_tools import record_channel_file_part
+
                 _fp = _Path(file_path)
                 use_mi = config.extra_config.get("use_managed_identity", False)
                 has_creds = (config.app_id and config.app_secret) or use_mi
@@ -609,43 +646,49 @@ async def teams_event_webhook(
                     "replyToId": reply_to_id,
                     "text": f"Agent sent file: {_fp.name} (Note: file content not directly supported yet, but I can tell you about it: {msg})",
                 }
-                await _send_teams_message(config, conversation_id, file_msg_activity)
+                parts = []
+
+                async def _record_result(result: dict) -> None:
+                    part = IMDeliveryPart(
+                        transport="microsoft_teams",
+                        provider_message_id=str(result.get("id") or "") or None,
+                        conversation_ref=conversation_id,
+                        artifact_role="file_fallback",
+                        recallable=bool(result.get("id")),
+                        metadata={"service_url": str(config.extra_config.get("service_url") or "")},
+                    )
+                    parts.append(part)
+                    await record_channel_file_part(part)
+
+                await _send_teams_message(
+                    config,
+                    conversation_id,
+                    file_msg_activity,
+                    on_result=_record_result,
+                )
+                if not parts:
+                    part = IMDeliveryPart(
+                        transport="microsoft_teams",
+                        conversation_ref=conversation_id,
+                        artifact_role="file_fallback",
+                        recallable=False,
+                        metadata={"service_url": str(config.extra_config.get("service_url") or "")},
+                    )
+                    parts.append(part)
+                    await record_channel_file_part(part)
+                return IMDeliveryResult.sent("teams", *parts)
 
             _cfs_s_token = _cfs_s.set(_teams_file_sender)
 
             # Call LLM
             _thinking_chunks: list[str] = []
 
-            async def _send_thinking_text(text: str) -> None:
-                use_managed_identity = config.extra_config.get("use_managed_identity", False)
-                has_credentials = (config.app_id and config.app_secret) or use_managed_identity
-                if not has_credentials or not conversation_id:
-                    return
-                bot_channel_account = activity.get("recipient", {})
-                if not bot_channel_account.get("id"):
-                    if config.app_id:
-                        bot_channel_account = {"id": config.app_id}
-                    else:
-                        return
-                user_account = activity.get("from", {})
-                if not user_account.get("id"):
-                    user_account = {"id": sender_id, "name": sender_name}
-                await _send_teams_message(
-                    config,
-                    conversation_id,
-                    {
-                        "type": "message",
-                        "from": bot_channel_account,
-                        "conversation": {"id": conversation_id},
-                        "recipient": user_account,
-                        "replyToId": reply_to_id,
-                        "text": text,
-                    },
-                )
-
-            _thinking_sender = BufferedIMThinkingSender(
+            _thinking_sender = BufferedIMThinkingSender.for_runtime(
                 enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                send_text=_send_thinking_text,
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                conversation_id=session_conv_id,
+                turn_anchor_id=ingested.message.id,
             )
 
             async def _collect_thinking(text: str):

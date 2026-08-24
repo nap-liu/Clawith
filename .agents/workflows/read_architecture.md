@@ -1,6 +1,6 @@
 # Read architecture workflow
 
-Use this workflow at the beginning of every Clawith task.
+Use this workflow at the beginning of every repository task.
 
 ## 1. Establish the baseline
 

@@ -27,7 +27,7 @@ from app.services.channel_dispatch import (
     channel_session_lock_key,
     run_channel_message,
 )
-from app.services.channel_commands import is_channel_command, handle_channel_command
+from app.services.channel_commands import is_channel_command
 from app.services.chat_attachments import (
     attachment_from_workspace_path,
     normalize_attachment_metadata,
@@ -48,6 +48,86 @@ _USER_RESOLUTION_ERROR_TIP = (
 )
 
 
+async def _persist_feishu_control_reply(
+    *,
+    agent_id: uuid.UUID,
+    config: ChannelConfig,
+    sender_open_id: str,
+    chat_type: str,
+    chat_id: str,
+    message: str,
+    artifact_role: str,
+) -> None:
+    """Persist and deliver an early Feishu ACK before canonical identity exists."""
+    from app.database import async_session
+    from app.models.agent import Agent
+    from app.services.channel_session import find_or_create_channel_session
+    from app.services.im_delivery import (
+        IMDeliveryPart,
+        IMDeliveryResult,
+        persist_and_deliver_message,
+    )
+
+    is_group = chat_type == "group" and bool(chat_id)
+    receive_id = chat_id if is_group else sender_open_id
+    receive_id_type = "chat_id" if is_group else "open_id"
+    if not receive_id:
+        raise RuntimeError("feishu_control_recipient_missing")
+    control_route = f"__control_feishu_{'group' if is_group else 'p2p'}_{receive_id}"
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        if agent is None:
+            raise RuntimeError("feishu_control_agent_not_found")
+        session = await find_or_create_channel_session(
+            db=db,
+            agent_id=agent_id,
+            user_id=agent.creator_id,
+            external_conv_id=control_route,
+            source_channel="feishu",
+            first_message_title=message,
+            is_group=is_group,
+            group_name=f"Feishu Group {chat_id[:12]}" if is_group else None,
+        )
+        session_id = str(session.id)
+        await db.commit()
+
+    async def _deliver(delivery_message: str, on_part) -> IMDeliveryResult:
+        import json
+
+        response = await feishu_service.send_message(
+            config.app_id,
+            config.app_secret,
+            receive_id,
+            "text",
+            json.dumps({"text": delivery_message}, ensure_ascii=False),
+            receive_id_type=receive_id_type,
+        )
+        message_id = str(
+            ((response.get("data") or {}).get("message_id"))
+            or response.get("message_id")
+            or ""
+        )
+        part = IMDeliveryPart(
+            transport="feishu_message",
+            provider_message_id=message_id or None,
+            conversation_ref=receive_id,
+            artifact_role=artifact_role,
+            recallable=bool(message_id),
+        )
+        await on_part(part)
+        return IMDeliveryResult.sent("feishu", part)
+
+    await persist_and_deliver_message(
+        agent_id=agent_id,
+        user_id=agent.creator_id,
+        conversation_id=session_id,
+        channel="feishu",
+        message=message,
+        artifact_role=artifact_role,
+        deliver=_deliver,
+    )
+
+
 def _build_card(
     answer_text: str,
     thinking_text: str = "",
@@ -56,6 +136,15 @@ def _build_card(
     agent_name: str = "AI 回复",
 ) -> dict:
     """Build a Feishu interactive card for streaming replies."""
+    from app.services.user_output import sanitize_user_visible_text
+
+    answer_text = sanitize_user_visible_text(answer_text or "")
+    thinking_text = sanitize_user_visible_text(thinking_text or "")
+    agent_name = sanitize_user_visible_text(agent_name or "") or "AI"
+    sanitized_status_lines = [
+        sanitize_user_visible_text(line) for line in (tool_status_lines or [])
+    ]
+    tool_status_lines = [line for line in sanitized_status_lines if line.strip()]
     elements = []
 
     if tool_status_lines:
@@ -551,29 +640,59 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             # Must run BEFORE find_or_create_channel_session to avoid creating a
             # ghost session that is immediately archived.
             if is_channel_command(user_text):
-                from app.services.webhook_security import claim_command_event
                 command_event_id = event_id or message.get("message_id") or None
-                if not await claim_command_event("feishu", config.id, command_event_id):
-                    return {"code": 0, "msg": "duplicate"}
                 from app.database import async_session as _async_session
                 async with _async_session() as _cmd_db:
-                    cmd_result = await handle_channel_command(
+                    from app.services.channel_commands import prepare_channel_command_reply
+                    cmd_result = await prepare_channel_command_reply(
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id,
+                        external_user_id=sender_user_id_from_event or sender_open_id,
                         source_channel="feishu",
+                        provider_event_id=command_event_id,
                         is_group=chat_type == "group",
+                        external_user_info={"open_id": sender_open_id},
                     )
                     await _cmd_db.commit()
+                if not cmd_result["should_deliver"]:
+                    return {"code": 0, "msg": "duplicate"}
                 _cmd_reply_to = chat_id if chat_type == "group" and chat_id else sender_open_id
                 _cmd_rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
+                from app.services.im_delivery import (
+                    IMDeliveryPart,
+                    IMDeliveryResult,
+                    register_delivery,
+                )
                 try:
-                    await feishu_service.send_message(
+                    _cmd_send_result = await feishu_service.send_message(
                         config.app_id, config.app_secret,
                         _cmd_reply_to, "text",
                         json.dumps({"text": cmd_result["message"]}),
                         receive_id_type=_cmd_rid_type,
                     )
+                    _cmd_provider_id = str(
+                        (_cmd_send_result.get("data") or {}).get("message_id")
+                        or _cmd_send_result.get("message_id")
+                        or ""
+                    ) or None
+                    await register_delivery(
+                        cmd_result["message_id"],
+                        IMDeliveryResult.sent(
+                            "feishu",
+                            IMDeliveryPart(
+                                transport="feishu_message",
+                                provider_message_id=_cmd_provider_id,
+                                conversation_ref=_cmd_reply_to,
+                                artifact_role="command_reply",
+                                recallable=bool(_cmd_provider_id),
+                            ),
+                        ),
+                    )
                 except Exception as _cmd_e:
+                    await register_delivery(
+                        cmd_result["message_id"],
+                        IMDeliveryResult.from_exception("feishu", _cmd_e),
+                    )
                     logger.error(f"[Feishu] Failed to send command reply: {_cmd_e}")
                 return {"code": 0, "msg": "ok"}
 
@@ -659,15 +778,14 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
 
                 if isinstance(e, ChannelUserResolutionError):
                     logger.warning(f"[Feishu] Sender resolution refused: {e}")
-                    _reply_to = chat_id if chat_type == "group" else sender_open_id
-                    _rid_type = "chat_id" if chat_type == "group" else "open_id"
-                    await feishu_service.send_message(
-                        config.app_id,
-                        config.app_secret,
-                        _reply_to,
-                        "text",
-                        json.dumps({"text": _USER_RESOLUTION_ERROR_TIP}),
-                        receive_id_type=_rid_type,
+                    await _persist_feishu_control_reply(
+                        agent_id=agent_id,
+                        config=config,
+                        sender_open_id=sender_open_id,
+                        chat_type=chat_type,
+                        chat_id=chat_id,
+                        message=_USER_RESOLUTION_ERROR_TIP,
+                        artifact_role="identity_error_ack",
                     )
                     return {"code": 0, "msg": "user_resolution_skipped"}
                 raise
@@ -842,18 +960,59 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 _rid_type = "chat_id" if chat_type == "group" else "open_id"
 
                 async def _feishu_file_sender(file_path, msg: str = ""):
+                    from app.services.im_delivery import (
+                        DeliveryReceiptPersistenceError,
+                        IMDeliveryPart,
+                        IMDeliveryResult,
+                    )
+                    from app.services.agent_tools import record_channel_file_part
+
+                    _delivery_parts = []
+
+                    async def _record_file_result(artifact_role: str, provider_result: dict):
+                        _provider_id = str(
+                            (provider_result.get("data") or {}).get("message_id")
+                            or provider_result.get("message_id")
+                            or ""
+                        ) or None
+                        part = IMDeliveryPart(
+                            transport="feishu_message",
+                            provider_message_id=_provider_id,
+                            conversation_ref=_reply_to_id,
+                            artifact_role=artifact_role,
+                            recallable=bool(_provider_id),
+                        )
+                        _delivery_parts.append(part)
+                        await record_channel_file_part(part)
                     try:
                         await feishu_service.upload_and_send_file(
                             config.app_id, config.app_secret,
                             _reply_to_id, file_path,
                             receive_id_type=_rid_type,
                             accompany_msg=msg,
+                            on_result=_record_file_result,
                         )
+                        if not _delivery_parts:
+                            part = IMDeliveryPart(
+                                transport="feishu_message",
+                                conversation_ref=_reply_to_id,
+                                artifact_role="channel_file",
+                                recallable=False,
+                            )
+                            _delivery_parts.append(part)
+                            await record_channel_file_part(part)
+                        return IMDeliveryResult.sent("feishu", *_delivery_parts)
+                    except DeliveryReceiptPersistenceError:
+                        raise
                     except Exception as _upload_err:
                         # Fallback: send a download link when upload permission is not granted
                         from pathlib import Path as _P
                         from app.config import get_settings as _gs_fallback
+                        from app.services.user_output import sanitize_user_visible_text
                         _fs = _gs_fallback()
+                        _safe_upload_error = sanitize_user_visible_text(
+                            str(_upload_err)
+                        ).strip()[:200] or type(_upload_err).__name__
                         _base_url = getattr(_fs, 'BASE_URL', '').rstrip('/') or ''
                         _fp = _P(file_path)
                         # Resolve a workspace-relative path for the download link.
@@ -876,16 +1035,30 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             _dl_url = f"{_base_url}/api/agents/{agent_id}/files/download?path={_rel}"
                             _fallback_parts.append(f"📎 {_fp.name}\n🔗 {_dl_url}")
                         _fallback_parts.append(
-                            f"⚠️ 文件直接发送失败（{_upload_err}）\n"
+                            f"⚠️ 文件直接发送失败（{_safe_upload_error}）\n"
                             "如需 Agent 直接发飞书文件，请在飞书开放平台为应用开启 "
                             "`im:resource`（即 `im:resource:upload`）权限并发布版本。"
                         )
-                        await feishu_service.send_message(
+                        _fallback_result = await feishu_service.send_message(
                             config.app_id, config.app_secret,
                             _reply_to_id, "text",
                             _json.dumps({"text": "\n\n".join(_fallback_parts)}),
                             receive_id_type=_rid_type,
                         )
+                        _provider_id = str(
+                            (_fallback_result.get("data") or {}).get("message_id")
+                            or _fallback_result.get("message_id")
+                            or ""
+                        ) or None
+                        part = IMDeliveryPart(
+                            transport="feishu_message",
+                            provider_message_id=_provider_id,
+                            conversation_ref=_reply_to_id,
+                            artifact_role="file_fallback",
+                            recallable=bool(_provider_id),
+                        )
+                        await record_channel_file_part(part)
+                        return IMDeliveryResult.sent("feishu", part)
 
                 _cfs_token = _cfs.set(_feishu_file_sender)
 
@@ -914,6 +1087,18 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 _flush_interval = 1.0
                 _patch_msg_id: str | None = None
                 _flush_lock = asyncio.Lock()
+
+                from app.services.im_delivery import persist_delivery_anchor
+
+                assistant_message_id = await persist_delivery_anchor(
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    conversation_id=session_conv_id,
+                    channel="feishu",
+                    message="正在处理…",
+                    turn_anchor_id=ingested.message.id,
+                    artifact_role="streaming_card",
+                )
 
                 def _visible_tool_status_lines() -> list[str]:
                     done_visible = _tool_status_done[-_TOOL_STATUS_KEEP_LINES:]
@@ -956,6 +1141,18 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         reply_to_message_id=_reply_to_user_msg_id or None,
                     )
                     _patch_msg_id = _init_resp.get("data", {}).get("message_id")
+                    if _patch_msg_id:
+                        from app.services.im_delivery import append_delivery_part, IMDeliveryPart
+
+                        await append_delivery_part(
+                            assistant_message_id,
+                            IMDeliveryPart(
+                                transport="feishu_message",
+                                provider_message_id=_patch_msg_id,
+                                conversation_ref=_reply_target,
+                                artifact_role="card",
+                            ),
+                        )
                 except Exception as e:
                     logger.error(f"[Feishu] Failed to send init streaming card: {e}")
 
@@ -1111,26 +1308,22 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     agent_name=_agent_name,
                 )
 
-                # Persist the local lifecycle anchor before the final external
-                # side effect, then attach every provider-visible artifact.
-                from app.services.chat_history import persist_assistant_reply
-                from app.database import async_session as _areply_session
                 from app.services.im_delivery import (
                     IMDeliveryPart,
                     IMDeliveryResult,
                     append_delivery_part,
-                    attach_delivery_to_meta,
                     register_delivery,
+                    update_delivery_message_content,
                 )
 
-                assistant_message_id = await persist_assistant_reply(
-                    _areply_session, agent_id=agent_id, user_id=platform_user_id,
-                    conversation_id=session_conv_id, content=final_reply_text,
+                if not await update_delivery_message_content(
+                    assistant_message_id,
+                    agent_id=agent_id,
+                    content=final_reply_text or "…",
                     thinking="".join(_thinking_buffer) or None,
-                    message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("feishu")),
-                    turn_anchor_id=ingested.message.id,
-                    required=True,
-                )
+                    complete_turn=True,
+                ):
+                    raise RuntimeError("feishu_stream_anchor_missing")
                 delivery_parts: list[IMDeliveryPart] = []
                 if _patch_msg_id:
                     card_part = IMDeliveryPart(
@@ -1140,7 +1333,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         artifact_role="card",
                     )
                     delivery_parts.append(card_part)
-                    await append_delivery_part(assistant_message_id, card_part)
 
                 if _patch_msg_id:
                     try:
@@ -1319,11 +1511,15 @@ async def _handle_feishu_file(
         logger.error(f"[Feishu] Failed to download {msg_type}: {e}")
         err_tip = "抱歉，文件下载失败。可能原因：机器人缺少 `im:resource` 权限（文件读取）。\n请在飞书开放平台 → 权限管理 → 批量导入权限 JSON → 重新发布机器人版本后重试。"
         try:
-            import json as _j
-            if chat_type == "group" and chat_id:
-                await feishu_service.send_message(config.app_id, config.app_secret, chat_id, "text", _j.dumps({"text": err_tip}), receive_id_type="chat_id")
-            else:
-                await feishu_service.send_message(config.app_id, config.app_secret, sender_open_id, "text", _j.dumps({"text": err_tip}))
+            await _persist_feishu_control_reply(
+                agent_id=agent_id,
+                config=config,
+                sender_open_id=sender_open_id,
+                chat_type=chat_type,
+                chat_id=chat_id,
+                message=err_tip,
+                artifact_role="download_error_ack",
+            )
         except Exception as e2:
             logger.error(f"[Feishu] Also failed to send error tip: {e2}")
         raise RuntimeError(f"Feishu {msg_type} event was not durably ingested") from e
@@ -1397,15 +1593,14 @@ async def _handle_feishu_file(
 
             if isinstance(e, ChannelUserResolutionError):
                 logger.warning(f"[Feishu] File sender resolution refused: {e}")
-                _reply_to = chat_id if chat_type == "group" else sender_open_id
-                _rid_type = "chat_id" if chat_type == "group" else "open_id"
-                await feishu_service.send_message(
-                    config.app_id,
-                    config.app_secret,
-                    _reply_to,
-                    "text",
-                    json.dumps({"text": _USER_RESOLUTION_ERROR_TIP}),
-                    receive_id_type=_rid_type,
+                await _persist_feishu_control_reply(
+                    agent_id=agent_id,
+                    config=config,
+                    sender_open_id=sender_open_id,
+                    chat_type=chat_type,
+                    chat_id=chat_id,
+                    message=_USER_RESOLUTION_ERROR_TIP,
+                    artifact_role="identity_error_ack",
                 )
                 return
             raise
@@ -1518,6 +1713,17 @@ async def _handle_feishu_file(
                 "header": {"template": "blue", "title": {"content": "识别图片中...", "tag": "plain_text"}},
                 "elements": [{"tag": "markdown", "content": "..."}]
             }
+            from app.services.im_delivery import persist_delivery_anchor
+
+            assistant_message_id = await persist_delivery_anchor(
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                conversation_id=session_conv_id_img,
+                channel="feishu",
+                message="识别图片中…",
+                turn_anchor_id=_image_ingested.message.id,
+                artifact_role="streaming_card",
+            )
             _patch_msg_id = None
             try:
                 _init_resp = await feishu_service.send_message(
@@ -1527,6 +1733,18 @@ async def _handle_feishu_file(
                     reply_to_message_id=_img_reply_to_user_msg_id or None,
                 )
                 _patch_msg_id = _init_resp.get("data", {}).get("message_id")
+                if _patch_msg_id:
+                    from app.services.im_delivery import append_delivery_part, IMDeliveryPart
+
+                    await append_delivery_part(
+                        assistant_message_id,
+                        IMDeliveryPart(
+                            transport="feishu_message",
+                            provider_message_id=_patch_msg_id,
+                            conversation_ref=_reply_to,
+                            artifact_role="card",
+                        ),
+                    )
             except Exception as _e_init:
                 logger.error(f"[Feishu] Failed to send init card for image: {_e_init}")
 
@@ -1628,23 +1846,22 @@ async def _handle_feishu_file(
 
             logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
 
-            from app.services.chat_history import persist_assistant_reply
             from app.services.im_delivery import (
                 IMDeliveryPart,
                 IMDeliveryResult,
                 append_delivery_part,
-                attach_delivery_to_meta,
                 register_delivery,
+                update_delivery_message_content,
             )
 
-            assistant_message_id = await persist_assistant_reply(
-                _async_session, agent_id=agent_id, user_id=platform_user_id,
-                conversation_id=session_conv_id_img, content=reply_text,
+            if not await update_delivery_message_content(
+                assistant_message_id,
+                agent_id=agent_id,
+                content=reply_text or "…",
                 thinking="".join(_img_thinking_chunks) or None,
-                message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("feishu")),
-                turn_anchor_id=_image_ingested.message.id,
-                required=True,
-            )
+                complete_turn=True,
+            ):
+                raise RuntimeError("feishu_image_stream_anchor_missing")
 
             # ── Send final card / fallback ──
             delivery_result = IMDeliveryResult.failed("feishu", "send_failed")
@@ -1655,7 +1872,6 @@ async def _handle_feishu_file(
                     conversation_ref=_reply_to,
                     artifact_role="card",
                 )
-                await append_delivery_part(assistant_message_id, card_part)
                 try:
                     await _img_patch_queue.drain()
                 except Exception as _e_drain:
@@ -1775,27 +1991,27 @@ async def _handle_feishu_file(
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
     ack = random.choice(_FILE_ACK_MESSAGES)
-    try:
-        if chat_type == "group" and chat_id:
-            await feishu_service.send_message(
-                config.app_id, config.app_secret, chat_id, "text",
-                json.dumps({"text": ack}), receive_id_type="chat_id",
-            )
-        else:
-            await feishu_service.send_message(
-                config.app_id, config.app_secret, sender_open_id, "text",
-                json.dumps({"text": ack}),
-            )
-    except Exception as e:
-        logger.error(f"[Feishu] Failed to send ack: {e}")
+    from app.services.im_delivery import persist_and_deliver_runtime_message
+    from app.services.turn_runtime import TurnRuntime
 
-    # Store ack via the shared writer (consistent with every channel).
-    from app.services.chat_history import persist_assistant_reply
-    await persist_assistant_reply(
-        _async_session, agent_id=agent_id, user_id=platform_user_id,
-        conversation_id=session_conv_id_ack, content=ack,
+    _ack_id, _ack_result = await persist_and_deliver_runtime_message(
+        agent_id=agent_id,
+        user_id=platform_user_id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="feishu",
+            conversation_id=session_conv_id_ack,
+            external_conv_id=conv_id,
+            is_group=_is_group_file,
+        ),
+        message=ack,
         turn_anchor_id=_file_ingested.message.id,
+        artifact_role="file_ack",
+        origin_actor_ref=sender_open_id if not _is_group_file else None,
+        origin_actor_ref_type="open_id" if not _is_group_file else None,
     )
+    if not _ack_result.ok:
+        logger.error(f"[Feishu] Failed to send ack: {_ack_result.error}")
 
 
 

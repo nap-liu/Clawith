@@ -284,7 +284,7 @@ async def whatsapp_event_webhook(
                     channel_session_lock_key,
                     run_channel_message,
                 )
-                from app.services.channel_commands import is_channel_command, handle_channel_command
+                from app.services.channel_commands import is_channel_command
 
                 agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 agent_obj = agent_r.scalar_one_or_none()
@@ -311,22 +311,47 @@ async def whatsapp_event_webhook(
                 # Early-return for channel commands (/new, /reset):
                 # archive the session and send a canned reply — no LLM, no lock needed.
                 if is_channel_command(user_text):
-                    if message_id and message_id in _processed_whatsapp_messages:
-                        continue
-                    if message_id:
-                        _processed_whatsapp_messages.add(message_id)
-                        if len(_processed_whatsapp_messages) > 2000:
-                            _processed_whatsapp_messages.clear()
-                    cmd_result = await handle_channel_command(
+                    from app.services.channel_commands import prepare_channel_command_reply
+                    cmd_result = await prepare_channel_command_reply(
                         db=db, command=user_text, agent_id=agent_id,
                         user_id=platform_user_id, external_conv_id=conv_id,
+                        external_user_id=sender_phone,
                         source_channel="whatsapp",
+                        provider_event_id=message_id,
                         is_group=False,
                     )
                     await db.commit()
+                    if not cmd_result["should_deliver"]:
+                        continue
+                    from app.services.im_delivery import (
+                        IMDeliveryPart,
+                        PersistedDeliveryRecorder,
+                    )
+                    _cmd_recorder = PersistedDeliveryRecorder(
+                        cmd_result["message_id"],
+                        "whatsapp",
+                    )
+
+                    async def _record_command_part(item: dict) -> None:
+                        for sent_message in item.get("messages") or []:
+                            await _cmd_recorder.append(IMDeliveryPart(
+                                transport="whatsapp_cloud",
+                                provider_message_id=str(sent_message.get("id") or "") or None,
+                                conversation_ref=sender_phone,
+                                artifact_role="command_reply",
+                                recallable=False,
+                            ))
+
                     try:
-                        await _send_whatsapp_messages(config, sender_phone, cmd_result["message"])
+                        await _send_whatsapp_messages(
+                            config,
+                            sender_phone,
+                            cmd_result["message"],
+                            on_result=_record_command_part,
+                        )
+                        await _cmd_recorder.sent()
                     except Exception as _cmd_e:
+                        await _cmd_recorder.failed(_cmd_e)
                         logger.error(f"[WhatsApp] Failed to send command reply: {_cmd_e}")
                     continue
 
@@ -388,9 +413,12 @@ async def whatsapp_event_webhook(
                         return ""
 
                     _thinking_chunks: list[str] = []
-                    _thinking_sender = BufferedIMThinkingSender(
+                    _thinking_sender = BufferedIMThinkingSender.for_runtime(
                         enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                        send_text=lambda text: _send_whatsapp_messages(config, _sender_phone, text),
+                        agent_id=agent_id,
+                        user_id=platform_user_id,
+                        conversation_id=session_conv_id,
+                        turn_anchor_id=ingested.message.id,
                     )
 
                     async def _collect_thinking(text: str):

@@ -392,9 +392,13 @@ def serialize_span_for_summary(rows: list[ChatMessage]) -> str:
     chunks: list[str] = []
     for r in rows:
         body = r.content or ""
+        raw_meta = getattr(r, "message_meta", None)
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+        recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
+        if r.role in {"assistant", "tool_call"} and recall.get("status") == "recalled":
+            body = "[该消息已撤回，不应视为仍对用户可见]"
         if r.role == "user":
-            raw_meta = getattr(r, "message_meta", None)
-            meta = raw_meta if isinstance(raw_meta, dict) else {}
             body, attachments = normalize_chat_message_attachments(
                 body,
                 meta,

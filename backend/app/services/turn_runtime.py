@@ -137,6 +137,20 @@ async def deliver_reply_to_origin(
                     message_id = candidate.id
                     break
         if message_id is not None:
+            if not runtime.session_found:
+                if require_transport:
+                    return False
+                from app.services.im_delivery import register_delivery
+
+                await register_delivery(
+                    message_id,
+                    IMDeliveryResult.unsupported_delivery(
+                        runtime.source_channel or "web",
+                        "websocket",
+                        conversation_ref=str(conversation_id),
+                    ),
+                )
+                return True
             from app.services.im_delivery import deliver_persisted_message
 
             result = await deliver_persisted_message(
@@ -248,6 +262,7 @@ async def deliver_message_with_receipt(
     allow_wecom_group_actor_fallback: bool = True,
     dingtalk_at_user_ids: list[str] | None = None,
     dingtalk_session_webhook: str | None = None,
+    dingtalk_lock_held: bool = False,
     on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     """Deliver through one exact Session route and preserve provider receipts."""
@@ -257,6 +272,14 @@ async def deliver_message_with_receipt(
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
+        if dingtalk_lock_held:
+            return await _deliver_dingtalk_unlocked(
+                agent_id,
+                runtime,
+                message,
+                at_user_ids=dingtalk_at_user_ids,
+                session_webhook=dingtalk_session_webhook,
+            )
         return await _deliver_dingtalk(
             agent_id,
             runtime,

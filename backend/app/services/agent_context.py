@@ -834,7 +834,7 @@ Default visual style for generated HTML or rich visual documents:
    - For exact-Session delivery, `session_id` is the only address. Never pass, derive, or substitute a channel name, person/group name, external conversation ID, or human `user_id`. If no suitable Session exists, use `send_channel_message` or `send_platform_message` according to the relationship type.
    - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.
    - `send_channel_message` is for a person; do **NOT** use it as a fallback when group Session delivery fails.
-   - `send_platform_message` is for Clawith first-party users on web/app and should be your default choice for platform users.
+   - `send_platform_message` is for first-party users on web/app and should be your default choice for platform users.
    - If a person exists in multiple channels, you must choose one of the available channels. The platform will not choose a first route.
    - If you need to send to a specific channel directly, you can also use `send_feishu_message` or `send_dingtalk_message`.
    - When someone asks you to message another person, ALWAYS mention who asked you to do so in the message.

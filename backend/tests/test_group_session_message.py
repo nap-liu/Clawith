@@ -776,10 +776,11 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
             "conversation_type": conversation_type,
             "cover": kwargs.get("cover_image_path"),
         })
+        await kwargs["on_result"]({"processQueryKey": "group-video-process-key"})
         return True, "MEDIA_SENT"
 
     async def fake_caption(**_kwargs):
-        return True
+        return IMDeliveryResult.sent("dingtalk")
 
     live_events = []
 
@@ -790,7 +791,7 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
         "app.services.dingtalk_stream._send_dingtalk_native_video",
         fake_video,
     )
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_caption)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_caption)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     kwargs = {
         "agent_id": owner.id,
@@ -863,6 +864,11 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
     assert receipt.message_meta["target_is_group"] is True
     assert receipt.message_meta["display_title"] == "示例媒体标题"
     assert receipt.message_meta["delivery_claim"] is True
+    assert receipt.message_meta["delivery"]["status"] == "sent"
+    assert receipt.message_meta["delivery"]["parts"][0]["provider_message_id"] == (
+        "group-video-process-key"
+    )
+    assert receipt.message_meta["delivery"]["parts"][0]["recall_status"] == "available"
     assert "delivery_claim" not in caption_row.message_meta
     stored_render = json.loads(json.loads(receipt.content)["result"])
     assert stored_render["message_id"] == str(receipt.id)
@@ -897,7 +903,7 @@ async def test_send_media_caption_failure_is_preserved_on_replay(tmp_path, monke
         return True, "MEDIA_SENT"
 
     async def fail_caption(**_kwargs):
-        return False
+        return IMDeliveryResult.failed("dingtalk", "caption_failed")
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
@@ -906,7 +912,7 @@ async def test_send_media_caption_failure_is_preserved_on_replay(tmp_path, monke
         "app.services.dingtalk_stream._send_dingtalk_native_video",
         fake_video,
     )
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_caption)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_caption)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     kwargs = {
         "agent_id": owner.id,
@@ -1050,13 +1056,14 @@ async def test_live_media_delivery_holds_replay_until_one_sent_terminal(
     provider_calls = []
     live_events = []
 
-    async def blocked_provider(*_args, **_kwargs):
+    async def blocked_provider(*_args, **kwargs):
         lifecycle_connection = agent_tools._outbound_media_connection.get()
         assert lifecycle_connection is not None
         assert lifecycle_connection.in_transaction() is False
         provider_calls.append(True)
         provider_started.set()
         await release_provider.wait()
+        await kwargs["on_result"]({"processQueryKey": "live-lock-process-key"})
         return True, "MEDIA_SENT"
 
     async def fake_live_mirror(*args, **_kwargs):
@@ -1151,7 +1158,7 @@ async def test_media_lifecycle_reuses_one_connection_and_leaves_pool_capacity(
     release_provider = asyncio.Event()
     provider_count = 0
 
-    async def blocked_provider(*_args, **_kwargs):
+    async def blocked_provider(*_args, **kwargs):
         nonlocal provider_count
         lifecycle_connection = agent_tools._outbound_media_connection.get()
         assert lifecycle_connection is not None
@@ -1160,6 +1167,9 @@ async def test_media_lifecycle_reuses_one_connection_and_leaves_pool_capacity(
         if provider_count == 2:
             both_in_provider.set()
         await release_provider.wait()
+        await kwargs["on_result"](
+            {"processQueryKey": f"pool-process-key-{provider_count}"}
+        )
         return True, "MEDIA_SENT"
 
     async def fake_live_mirror(*_args, **_kwargs):
@@ -1462,6 +1472,140 @@ async def test_send_media_pending_claim_replay_never_calls_provider(tmp_path, mo
             )
         ).scalar_one()
     assert receipt.message_meta["delivery_status"] == "unknown"
+
+
+async def test_send_channel_file_terminal_receipt_replay_never_calls_provider(
+    tmp_path, monkeypatch
+):
+    owner, _ = await _seed_agents()
+    origin = await _seed_session(owner.id, channel="web", is_group=True)
+    call_id = "file-terminal-replay"
+    turn_anchor_id = uuid.uuid4()
+    async with async_session() as db:
+        row = ChatMessage(
+            agent_id=owner.id,
+            user_id=origin.user_id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_channel_file",
+                "call_id": call_id,
+                "args": {"file_path": "workspace/report.pdf"},
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(origin.id),
+            message_meta={"turn_anchor_id": str(turn_anchor_id)},
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    claimed = await agent_tools._claim_channel_file_receipt(
+        agent_id=owner.id,
+        tool_call_id=call_id,
+        origin_session_id=str(origin.id),
+        origin_turn_anchor_id=turn_anchor_id,
+    )
+    assert claimed == row_id
+    assert await agent_tools.register_delivery(
+        row_id,
+        IMDeliveryResult.unsupported_delivery("slack", "slack_file"),
+    )
+
+    workspace = tmp_path / str(owner.id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 test")
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    provider_calls = []
+
+    async def should_not_send(*_args, **_kwargs):
+        provider_calls.append(True)
+        return IMDeliveryResult.unsupported_delivery("slack", "slack_file")
+
+    token = agent_tools.channel_file_sender.set(should_not_send)
+    try:
+        result = await agent_tools._send_channel_file(
+            owner.id,
+            workspace,
+            {"file_path": "workspace/report.pdf"},
+            tool_call_id=call_id,
+            origin_session_id=str(origin.id),
+            origin_turn_anchor_id=turn_anchor_id,
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert "receipt unavailable" in result
+    assert provider_calls == []
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row_id)
+    assert stored.message_meta["delivery"]["status"] == "sent"
+
+
+async def test_send_channel_file_persists_first_part_before_later_timeout(
+    tmp_path, monkeypatch
+):
+    owner, _ = await _seed_agents()
+    origin = await _seed_session(owner.id, channel="web", is_group=True)
+    call_id = "file-partial-timeout"
+    turn_anchor_id = uuid.uuid4()
+    async with async_session() as db:
+        row = ChatMessage(
+            agent_id=owner.id,
+            user_id=origin.user_id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_channel_file",
+                "call_id": call_id,
+                "args": {"file_path": "workspace/report.pdf"},
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(origin.id),
+            message_meta={"turn_anchor_id": str(turn_anchor_id)},
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    workspace = tmp_path / str(owner.id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 test")
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+
+    async def partial_sender(*_args, **_kwargs):
+        await agent_tools.record_channel_file_part(IMDeliveryPart(
+            transport="dingtalk_openapi_oto",
+            provider_message_id="first-provider-part",
+            conversation_ref="staff-1",
+            artifact_role="channel_file",
+        ))
+        raise TimeoutError("second part timed out")
+
+    token = agent_tools.channel_file_sender.set(partial_sender)
+    try:
+        result = await agent_tools._send_channel_file(
+            owner.id,
+            workspace,
+            {"file_path": "workspace/report.pdf"},
+            tool_call_id=call_id,
+            origin_session_id=str(origin.id),
+            origin_turn_anchor_id=turn_anchor_id,
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert "Failed to send file" in result
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row_id)
+    delivery = stored.message_meta["delivery"]
+    assert delivery["status"] == "partial"
+    assert delivery["uncertain"] is True
+    assert [part["provider_message_id"] for part in delivery["parts"]] == [
+        "first-provider-part"
+    ]
 
 
 async def test_send_media_pending_standard_tool_call_replay_becomes_visible_unknown_error(

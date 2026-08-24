@@ -1,8 +1,8 @@
-# Clawith Architecture Specification
+# Digital Employee Platform Architecture Specification
 
 ## Purpose
 
-Clawith is a multi-tenant digital-employee platform. Agents have durable identity and workspace state, run a shared tool-capable LLM loop, and communicate through Web, IM, A2A, triggers, tasks, and MCP-facing entry points.
+This is a multi-tenant digital-employee platform. Agents have durable identity and workspace state, run a shared tool-capable LLM loop, and communicate through Web, IM, A2A, triggers, tasks, and MCP-facing entry points.
 
 This document defines stable system boundaries. Operational recipes and engineering rules are routed from `.agents/workflows/read_architecture.md`.
 
@@ -62,7 +62,9 @@ Production nginx configuration is built from `frontend/nginx.conf.template`; a s
 
 ## Channel delivery
 
-All outbound visible artifacts should produce one normalized delivery receipt attached to the local `ChatMessage`. A receipt may contain multiple transport parts because one logical response can produce multiple remote messages.
+All durable outbound visible artifacts produce one normalized delivery receipt attached to a local `ChatMessage`. Ordinary text uses an assistant row; tool-created files/media may reuse the exact outbound tool-call row so the provider side effect and its idempotency intent have one lifecycle anchor. A receipt may contain multiple transport parts because one logical response can produce multiple remote messages.
+
+The pending anchor commits before provider I/O. Commands, acknowledgements, welcome messages, background notifications, files, media, and confirmation artifacts use the same lifecycle; channel code only adapts provider results into parts. Ephemeral protocol indicators such as typing and reactions are explicitly control-plane state, not durable messages.
 
 Provider operations such as recall act through transport adapters over receipt parts. Unsupported capability is explicit data, not a silent success. Provider-native P2P/group mechanics can differ while sharing the same lifecycle contract.
 

@@ -6,8 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database import Base
-from app.models.audit import ChatMessage
 from app.models.agent import Agent, AgentTemplate
+from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.chat_compaction import ChatCompaction
 from app.models.chat_session import ChatSession
@@ -40,6 +40,7 @@ from app.services.dingtalk_provisioning import (
     retry_due_dingtalk_welcome_messages,
     start_dingtalk_channel_provisioning,
 )
+from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
 
 
 class FakeRegistrationClient:
@@ -1299,8 +1300,17 @@ async def test_poll_success_replaces_existing_dingtalk_robot_binding_on_other_di
 
 
 @pytest.mark.asyncio
-async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_session):
+@pytest.mark.parametrize(
+    "agent_name",
+    ["销售数字员工", "【cLaWiTh】销售数字员工"],
+    ids=["ordinary-name", "mixed-case-forbidden-keyword"],
+)
+async def test_poll_success_sanitizes_and_sends_welcome_message_to_bound_dingtalk_user(
+    db_session,
+    agent_name,
+):
     _, user, agent = await _seed_digital_employee(db_session)
+    agent.name = agent_name
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     provider = IdentityProvider(
         id=uuid.uuid4(),
@@ -1342,8 +1352,18 @@ async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_sess
         ]
     )
     sent_messages = []
+    pending_receipts = []
 
     async def fake_welcome_sender(app_id, app_secret, user_id, message):
+        pending_row = (
+            await db_session.execute(
+                select(ChatMessage).where(
+                    ChatMessage.external_event_key
+                    == f"dingtalk-provisioning-welcome:{session.id}"
+                )
+            )
+        ).scalar_one()
+        pending_receipts.append(dict(pending_row.message_meta["delivery"]))
         sent_messages.append((app_id, app_secret, user_id, message))
         return {"errcode": 0, "processQueryKey": "welcome-process-key"}
 
@@ -1387,6 +1407,9 @@ async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_sess
             "你好，我是销售数字员工。钉钉通道已配置完成，之后可以直接在这里和我对话。",
         )
     ]
+    assert len(pending_receipts) == 1
+    assert pending_receipts[0]["status"] == "pending"
+    assert pending_receipts[0]["attempt_id"]
     assert session.registration_result == {
         "client_id": "ding-client-id",
         "welcome_message": {
@@ -1417,6 +1440,20 @@ async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_sess
     ).scalar_one()
     assert chat_message.role == "assistant"
     assert chat_message.content == "你好，我是销售数字员工。钉钉通道已配置完成，之后可以直接在这里和我对话。"
+    assert chat_message.message_meta["delivery"]["status"] == "sent"
+    assert "attempt_id" not in chat_message.message_meta["delivery"]
+    assert chat_message.message_meta["delivery"]["parts"] == [
+        {
+            "part_id": "0",
+            "transport": "dingtalk_openapi_oto",
+            "artifact_role": "channel_welcome",
+            "provider_message_id": "welcome-process-key",
+            "conversation_ref": "632277911",
+            "send_status": "sent",
+            "recall_status": "available",
+            "metadata": {},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1543,6 +1580,176 @@ async def test_poll_success_retries_welcome_after_permission_propagates(db_sessi
     assert [message.content for message in messages] == [
         "你好，我是销售数字员工。钉钉通道已配置完成，之后可以直接在这里和我对话。"
     ]
+
+
+@pytest.mark.asyncio
+async def test_welcome_timeout_is_unknown_and_is_never_sent_again(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    provider = IdentityProvider(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_type="dingtalk",
+        name="DingTalk",
+        is_active=True,
+    )
+    member = OrgMember(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_id=provider.id,
+        user_id=user.id,
+        external_id="632277911",
+        name="刘喜",
+        status="active",
+    )
+    provisioning = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_CONFIGURED,
+        device_code="device-timeout",
+        authorization_url="https://auth.example",
+        registration_result={"client_id": "ding-client-id"},
+        expires_at=now + timedelta(minutes=5),
+        poll_interval_seconds=2,
+        max_poll_attempts=10,
+        welcome_status=DINGTALK_WELCOME_STATUS_PENDING,
+        welcome_next_retry_at=now,
+    )
+    channel = ChannelConfig(
+        agent_id=agent.id,
+        channel_type="dingtalk",
+        app_id="ding-client-id",
+        app_secret="ding-client-secret",
+        is_configured=True,
+    )
+    db_session.add_all([provider, member, provisioning, channel])
+    await db_session.commit()
+    send_count = 0
+
+    async def timeout_sender(app_id, app_secret, user_id, message):
+        nonlocal send_count
+        send_count += 1
+        raise TimeoutError
+
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=timeout_sender,
+        now=now,
+    )
+
+    assert count == 1
+    assert send_count == 1
+    assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_FAILED
+    assert provisioning.welcome_next_retry_at is None
+    assert provisioning.welcome_attempt_count == 1
+    message = (
+        await db_session.execute(
+            select(ChatMessage).where(
+                ChatMessage.external_event_key
+                == f"dingtalk-provisioning-welcome:{provisioning.id}"
+            )
+        )
+    ).scalar_one()
+    assert message.message_meta["delivery"]["status"] == "unknown"
+
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=timeout_sender,
+        now=now + timedelta(minutes=5),
+    )
+    assert count == 0
+    assert send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_welcome_lease_becomes_unknown_without_duplicate_send(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    provider = IdentityProvider(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_type="dingtalk",
+        name="DingTalk",
+        is_active=True,
+    )
+    member = OrgMember(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_id=provider.id,
+        user_id=user.id,
+        external_id="632277911",
+        name="刘喜",
+        status="active",
+    )
+    provisioning = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_CONFIGURED,
+        device_code="device-crashed-send",
+        authorization_url="https://auth.example",
+        registration_result={"client_id": "ding-client-id"},
+        expires_at=now + timedelta(minutes=5),
+        poll_interval_seconds=2,
+        max_poll_attempts=10,
+        welcome_status=DINGTALK_WELCOME_STATUS_PENDING,
+        welcome_next_retry_at=now,
+    )
+    channel = ChannelConfig(
+        agent_id=agent.id,
+        channel_type="dingtalk",
+        app_id="ding-client-id",
+        app_secret="ding-client-secret",
+        is_configured=True,
+    )
+    chat_session = ChatSession(
+        agent_id=agent.id,
+        user_id=user.id,
+        title="欢迎消息",
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_p2p_632277911",
+    )
+    db_session.add_all([provider, member, provisioning, channel, chat_session])
+    await db_session.flush()
+    pending_meta = attach_delivery_to_meta(
+        {"artifact_role": "channel_welcome"},
+        IMDeliveryResult.pending("dingtalk"),
+    )
+    pending_meta["delivery"]["attempt_id"] = str(uuid.uuid4())
+    pending_meta["delivery"]["attempt_started_at"] = (
+        now - timedelta(minutes=3)
+    ).isoformat()
+    message = ChatMessage(
+        agent_id=agent.id,
+        user_id=user.id,
+        role="assistant",
+        content="你好，我是销售数字员工。钉钉通道已配置完成，之后可以直接在这里和我对话。",
+        conversation_id=str(chat_session.id),
+        external_event_key=f"dingtalk-provisioning-welcome:{provisioning.id}",
+        message_meta=pending_meta,
+    )
+    db_session.add(message)
+    await db_session.commit()
+    send_count = 0
+
+    async def must_not_send(app_id, app_secret, user_id, text):
+        nonlocal send_count
+        send_count += 1
+        return {"errcode": 0, "processQueryKey": "duplicate"}
+
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=must_not_send,
+        now=now,
+    )
+
+    assert count == 1
+    assert send_count == 0
+    assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_FAILED
+    assert provisioning.welcome_next_retry_at is None
+    assert provisioning.registration_result["welcome_message"]["error_code"] == "delivery_unknown"
+    assert message.message_meta["delivery"]["status"] == "unknown"
 
 
 @pytest.mark.asyncio

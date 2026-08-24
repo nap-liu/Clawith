@@ -38,7 +38,9 @@ def serialize_chat_message_for_client(
         delivery_status = meta.get("delivery_status") if isinstance(meta, dict) else None
         attachments = (
             normalize_attachment_metadata(meta.get("attachments"))
-            if isinstance(meta, dict) and delivery_status in {None, "sent"}
+            if isinstance(meta, dict)
+            and recall_status != "recalled"
+            and delivery_status in {None, "sent"}
             else []
         )
 
@@ -47,7 +49,7 @@ def serialize_chat_message_for_client(
     entry: dict[str, Any] = {
         "id": str(message_id) if message_id is not None else None,
         "role": role,
-        "content": display_content,
+        "content": raw_content if role == "user" else display_content,
         "display_content": display_content,
         "attachments": attachments,
         "created_at": created_at.isoformat() if created_at else None,

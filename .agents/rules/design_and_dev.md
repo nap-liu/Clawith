@@ -8,11 +8,28 @@
 
 ## Architecture first
 
+- Product-complete delivery is the first priority. Prefer the smallest shared
+  lifecycle contract that closes the end-to-end path; keep channel code as thin
+  adapters and do not add parallel mechanisms for the same behavior.
 - Fix the authoritative source instead of layering prompt or channel-specific patches.
 - When behavior appears in two or more places, extract a shared service/component and keep provider or UI differences in adapters.
 - Normalize contracts and lifecycle states, not genuine semantics. P2P and group conversations have different identity and provider behavior.
 - Keep transport, domain lifecycle, persistence, and presentation boundaries explicit.
 - Platform code, UI, fixtures, and examples must not hard-code tenant-specific tool names.
+- The legacy product keyword defined by the central user-output sanitizer is
+  forbidden case-insensitively in product messages, notifications, user-facing
+  copy, fixtures, and new engineering documentation. Apply the shared sanitizer
+  at persistence and transport boundaries; do not leave empty ASCII or CJK
+  wrappers behind. Do not mechanically rename infrastructure identifiers,
+  repository paths, protocols, or compatibility contracts.
+- Compatibility exceptions must be explicit and narrow. They currently cover:
+  repository URLs and checkout-directory names; existing public SDK/window,
+  browser storage/event, and audio-worklet identifiers; environment variables;
+  persisted filesystem paths, database roles/names, Redis namespaces, and
+  container/network names; Helm chart/release/namespace, image, service, PVC,
+  secret, and example command identifiers; and immutable historical provenance.
+  These identifiers may appear only where required for installation, operation,
+  migration, or existing-client compatibility, never as product prose or labels.
 
 ## Conversation and security invariants
 

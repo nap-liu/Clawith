@@ -346,15 +346,33 @@ async def _call_agent_llm(
         if broadcast_web:
             await _broadcast_to_web_session(history_agent_id, session_id, payload)
 
-    async def _on_chunk_bridged(text: str):
+    from app.services.user_output import (
+        UserOutputStreamSanitizer,
+        sanitize_user_visible_text,
+    )
+
+    chunk_guard = UserOutputStreamSanitizer()
+    thinking_guard = UserOutputStreamSanitizer()
+
+    async def _emit_chunk(text: str) -> None:
+        if not text:
+            return
         await _web_broadcast({"type": "chunk", "content": text})
         if on_chunk is not None:
             await on_chunk(text)
 
-    async def _on_thinking_bridged(text: str):
+    async def _emit_thinking(text: str) -> None:
+        if not text:
+            return
         await _web_broadcast({"type": "thinking", "content": text})
         if on_thinking is not None:
             await on_thinking(text)
+
+    async def _on_chunk_bridged(text: str):
+        await _emit_chunk(chunk_guard.feed(text))
+
+    async def _on_thinking_bridged(text: str):
+        await _emit_thinking(thinking_guard.feed(text))
 
     async def _on_tool_call_persisted(evt: dict):
         public_evt = {k: v for k, v in evt.items() if not k.startswith("_")}
@@ -435,7 +453,9 @@ async def _call_agent_llm(
             )
         except Exception as exc:
             logger.warning(f"[Channel] session token usage persistence failed: {exc}")
-    reply = _context_reply(reply)
+    await _emit_chunk(chunk_guard.flush())
+    await _emit_thinking(thinking_guard.flush())
+    reply = sanitize_user_visible_text(_context_reply(reply))
 
     # Finalize the streamed bubble for any web client watching this session, so
     # an IM-driven conversation updates live in the web UI (not only on reload).
@@ -449,4 +469,4 @@ async def _call_agent_llm(
             f"[Channel] LLM error surfaced on IM channel "
             f"(agent_id={agent_id}, model={getattr(model, 'model', 'unknown')}): {reply[:200]}"
         )
-    return _apply_recovery_hint(reply, recovery_hint)
+    return sanitize_user_visible_text(_apply_recovery_hint(reply, recovery_hint))

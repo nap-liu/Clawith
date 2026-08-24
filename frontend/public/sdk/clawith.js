@@ -1,4 +1,4 @@
-/*! Clawith SDK — 中立平台能力层：身份(OAuth) + 触发(webhook hook) + 水印。零依赖。 */
+/*! Platform SDK — 中立平台能力层：身份(OAuth) + 触发(webhook hook) + 水印。零依赖。 */
 (function () {
   "use strict";
 
@@ -29,7 +29,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code: code, state: st })
     }).then(function (r) {
-      if (!r.ok) throw new Error("clawith: exchange failed " + r.status);
+      if (!r.ok) throw new Error("platform: exchange failed " + r.status);
       return r.json();
     }).then(function (info) {
       state.user = { userId: info.userId, userName: info.userName, mobile: info.mobile };

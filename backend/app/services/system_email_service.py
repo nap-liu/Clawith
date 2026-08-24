@@ -21,6 +21,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid
 
 from app.core.email import force_ipv4, send_smtp_email
+from app.services.user_output import sanitize_user_visible_text
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,12 @@ async def resolve_email_config_async(db, *, include_disabled: bool = False) -> S
             if v.get("SYSTEM_EMAIL_FROM_ADDRESS") and v.get("SYSTEM_SMTP_HOST"):
                 return SystemEmailConfig(
                     from_address=str(v.get("SYSTEM_EMAIL_FROM_ADDRESS", "")).strip(),
-                    from_name=str(v.get("SYSTEM_EMAIL_FROM_NAME", "Clawith")).strip() or "Clawith",
+                    from_name=(
+                        sanitize_user_visible_text(
+                            str(v.get("SYSTEM_EMAIL_FROM_NAME", "Digital Employee Platform"))
+                        ).strip()
+                        or "Digital Employee Platform"
+                    ),
                     smtp_host=str(v.get("SYSTEM_SMTP_HOST", "")).strip(),
                     smtp_port=int(v.get("SYSTEM_SMTP_PORT", 465)),
                     smtp_username=str(v.get("SYSTEM_SMTP_USERNAME", "")).strip() or str(v.get("SYSTEM_EMAIL_FROM_ADDRESS", "")).strip(),
@@ -108,8 +114,11 @@ async def send_system_email(to: str, subject: str, body: str, db=None) -> None:
 
 def _send_email_with_config_sync(config: SystemEmailConfig, to: str, subject: str, body: str) -> None:
     """Send email with provided config."""
+    from_name = sanitize_user_visible_text(config.from_name).strip() or "Digital Employee Platform"
+    subject = sanitize_user_visible_text(subject)
+    body = sanitize_user_visible_text(body)
     msg = MIMEMultipart()
-    msg["From"] = formataddr((config.from_name, config.from_address))
+    msg["From"] = formataddr((from_name, config.from_address))
     msg["To"] = to
     msg["Subject"] = subject
     msg["Message-ID"] = make_msgid()
@@ -194,30 +203,30 @@ async def deliver_broadcast_emails(recipients: Iterable[BroadcastEmailRecipient]
 # Each scenario has a fixed set of available variables (using {{variable}} syntax).
 DEFAULT_EMAIL_TEMPLATES: dict[str, dict[str, str]] = {
     "email_verification": {
-        "subject": "Verify your Clawith email address",
+        "subject": "Verify your platform email address",
         "body": (
             "Hello {{display_name}},\n\n"
-            "Welcome to Clawith! Please use the following 6-digit code to verify your email address:\n\n"
+            "Welcome! Please use the following 6-digit code to verify your email address:\n\n"
             "Verification code: {{verification_code}}\n\n"
             "This code expires in {{expiry_minutes}} minutes. "
             "If you did not create an account, you can ignore this email."
         ),
     },
     "password_reset": {
-        "subject": "Reset your Clawith password",
+        "subject": "Reset your platform password",
         "body": (
             "Hello {{display_name}},\n\n"
-            "We received a request to reset your Clawith password.\n\n"
+            "We received a request to reset your platform password.\n\n"
             "Reset link: {{reset_url}}\n\n"
             "This link expires in {{expiry_minutes}} minutes. "
             "If you did not request this, you can ignore this email."
         ),
     },
     "company_invitation": {
-        "subject": "{{inviter_name}} invited you to join {{company_name}} on Clawith",
+        "subject": "{{inviter_name}} invited you to join {{company_name}}",
         "body": (
             "Hello,\n\n"
-            "{{inviter_name}} has invited you to join their team '{{company_name}}' on Clawith.\n\n"
+            "{{inviter_name}} has invited you to join their team '{{company_name}}' on the platform.\n\n"
             "To accept the invitation and create your account, please click the link below:\n\n"
             "{{invite_url}}\n\n"
             "If you don't want to join this team or didn't expect this invitation, you can ignore this email."
@@ -325,10 +334,10 @@ async def send_test_email(to: str, db=None) -> None:
     if not config:
         raise RuntimeError("System email SMTP settings are not configured.")
 
-    subject = "Clawith Test Email"
+    subject = "Platform Test Email"
     body = (
-        "This is a test email from your Clawith platform.\n\n"
+        "This is a test email from your digital employee platform.\n\n"
         "If you received this email, your SMTP configuration is working correctly.\n\n"
-        "-- Clawith System"
+        "-- Platform System"
     )
     await asyncio.to_thread(_send_email_with_config_sync, config, to, subject, body)

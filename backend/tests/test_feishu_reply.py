@@ -5,9 +5,67 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.services.feishu_service import feishu_service
+from app.services.feishu_service import FeishuAPIError, feishu_service
+from app.api.feishu import _build_card
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_streaming_card_sanitizes_every_user_visible_field():
+    forbidden = "cla" + "with"
+    card = _build_card(
+        f"answer {forbidden}",
+        thinking_text=f"thinking {forbidden.upper()}",
+        tool_status_lines=[f"tool {forbidden}"],
+        agent_name=f"agent {forbidden}",
+    )
+
+    assert forbidden.lower() not in str(card).lower()
+
+
+async def test_file_send_records_only_business_success_before_later_failure(
+    tmp_path,
+    monkeypatch,
+):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        url = str(request.url)
+        if url.endswith("/auth/v3/app_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "app_access_token": "token"})
+        if url.endswith("/im/v1/files"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"file_key": "file-key"}},
+            )
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"message_id": "caption-id"}},
+            )
+        return httpx.Response(200, json={"code": 230001, "msg": "file rejected"})
+
+    _make_patched_client(monkeypatch, handler)
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 test")
+    recorded = []
+
+    async def on_result(role, result):
+        recorded.append((role, result["data"]["message_id"]))
+
+    with pytest.raises(FeishuAPIError, match="file_message"):
+        await feishu_service.upload_and_send_file(
+            "app",
+            "secret",
+            "recipient",
+            report,
+            accompany_msg="caption",
+            on_result=on_result,
+        )
+
+    assert recorded == [("file_caption", "caption-id")]
 
 
 def _make_patched_client(monkeypatch, handler):

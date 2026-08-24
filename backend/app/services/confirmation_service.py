@@ -29,7 +29,6 @@ from app.database import async_session
 from app.services.channel_dispatch import run_channel_send
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.turn_runtime import (
-    _deliver_dingtalk_unlocked,
     deliver_reply_to_origin,
     load_turn_runtime,
 )
@@ -275,12 +274,16 @@ async def suspend_for_confirmation(
     resolved_channel, ext_conv_id, is_group = await _resolve_session_channel(
         conversation_id, chat_session_id, source_channel
     )
+    from app.services.user_output import sanitize_user_visible_text
+
+    intro_text = sanitize_user_visible_text(intro_text or "").strip() or None
 
     # Intro text first (live web already streamed it; persisted here so it precedes the
     # card on reload). The pending tool_call row is the durable suspended state;
     # startup recovery sees it and leaves the turn waiting for the user's click.
     has_intro = bool(intro_text and intro_text.strip())
     created_at = datetime.now(timezone.utc)
+    intro_message_id: uuid.UUID | None = None
     async with async_session() as db:
         # The session row is the cross-process serialization boundary shared with
         # inbound message ingestion and confirmation resolution.  Either the user
@@ -320,14 +323,27 @@ async def suspend_for_confirmation(
             )
             return existing.row_id
         if has_intro:
+            from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+            intro_message_id = uuid.uuid4()
+            intro_delivery = (
+                IMDeliveryResult.pending("dingtalk")
+                if resolved_channel == "dingtalk"
+                else IMDeliveryResult.unsupported_delivery("web", "websocket")
+            )
             db.add(
                 ChatMessage(
+                    id=intro_message_id,
                     agent_id=agent_id,
                     user_id=user_id,
                     role="assistant",
                     content=intro_text,
                     conversation_id=str(conversation_id),
                     created_at=created_at,
+                    message_meta=attach_delivery_to_meta(
+                        {"artifact_role": "confirmation_intro"},
+                        intro_delivery,
+                    ),
                 )
             )
         row_id = await persist_pending_confirmation_row(
@@ -344,22 +360,46 @@ async def suspend_for_confirmation(
                 else None
             ),
         )
+        from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+        confirmation_row = await db.get(ChatMessage, row_id)
+        if confirmation_row is None:
+            raise RuntimeError("confirmation row disappeared before delivery")
+        confirmation_row.message_meta = attach_delivery_to_meta(
+            confirmation_row.message_meta,
+            IMDeliveryResult.pending("dingtalk" if resolved_channel == "dingtalk" else "web"),
+        )
         await db.commit()
 
     # ALWAYS mirror the card to live web viewers — the card IS a tool_call, so broadcast it
     # as one regardless of origin channel (a web viewer watching a DingTalk session sees it
     # live, keyed on the row id so the later resolve flips this same card in place).
-    await _broadcast(
-        agent_id,
-        conversation_id,
-        {
-            "type": "tool_call",
-            "name": REQUEST_CONFIRMATION_TOOL_NAME,
-            "call_id": str(row_id),
-            "args": args,
-            "status": "running",
-        },
-    )
+    from app.services.im_delivery import IMDeliveryResult, register_delivery
+
+    try:
+        await _broadcast(
+            agent_id,
+            conversation_id,
+            {
+                "type": "tool_call",
+                "name": REQUEST_CONFIRMATION_TOOL_NAME,
+                "call_id": str(row_id),
+                "args": args,
+                "status": "running",
+            },
+        )
+        if resolved_channel != "dingtalk":
+            await register_delivery(
+                row_id,
+                IMDeliveryResult.unsupported_delivery("web", "websocket"),
+            )
+    except Exception as exc:
+        if resolved_channel != "dingtalk":
+            await register_delivery(
+                row_id,
+                IMDeliveryResult.from_exception("web", exc),
+            )
+        raise
     # Additionally deliver to the originating IM channel. DingTalk doesn't stream, so send
     # the intro text as a message first, then the interactive card.
     if resolved_channel == "dingtalk":
@@ -369,25 +409,66 @@ async def suspend_for_confirmation(
         )
 
         async def _send_intro_then_card() -> bool:
-            if has_intro:
-                intro_delivered = await _deliver_dingtalk_unlocked(
-                    agent_id,
-                    runtime,
-                    intro_text or "",
+            if has_intro and intro_message_id is not None:
+                from app.services.im_delivery import deliver_persisted_message
+
+                intro_result = await deliver_persisted_message(
+                    message_id=intro_message_id,
+                    agent_id=agent_id,
+                    runtime=runtime,
+                    message=intro_text or "",
+                    dingtalk_lock_held=True,
                 )
-                if not intro_delivered:
+                if not intro_result.ok:
                     logger.warning(
                         "Confirmation %s: intro delivery failed; card suppressed",
                         row_id,
                     )
                     return False
-            return await _deliver_channel_card_unlocked(
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                IMDeliveryResult,
+                append_delivery_part,
+                register_delivery,
+            )
+
+            pending_card_part = IMDeliveryPart(
+                transport="dingtalk_interactive_card",
+                provider_message_id=str(row_id),
+                conversation_ref=ext_conv_id,
+                artifact_role="confirmation_card",
+                recallable=False,
+                send_status="pending",
+            )
+            if not await append_delivery_part(row_id, pending_card_part):
+                return False
+            card_delivered = await _deliver_channel_card_unlocked(
                 agent_id=agent_id,
                 out_track_id=str(row_id),
                 args=args,
                 external_conv_id=ext_conv_id,
                 is_group=is_group,
             )
+            if card_delivered:
+                await register_delivery(
+                    row_id,
+                    IMDeliveryResult.sent(
+                        "dingtalk",
+                        IMDeliveryPart(
+                            transport="dingtalk_interactive_card",
+                            provider_message_id=str(row_id),
+                            conversation_ref=ext_conv_id,
+                            artifact_role="confirmation_card",
+                            recallable=False,
+                        ),
+                    ),
+                )
+            else:
+                await register_delivery(
+                    row_id,
+                    IMDeliveryResult.failed("dingtalk", "confirmation_card_send_failed"),
+                )
+            return card_delivered
 
         await run_channel_send(
             _im_send_lock_key(str(conversation_id)),
@@ -807,6 +888,23 @@ async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
             status="pending",
             buttons=pending.args.get("buttons"),
         )
+        from app.services.im_delivery import (
+            IMDeliveryPart,
+            IMDeliveryResult,
+            append_delivery_part,
+            register_delivery,
+        )
+
+        pending_part = IMDeliveryPart(
+            transport="dingtalk_interactive_card",
+            provider_message_id=delivery_id,
+            conversation_ref=external_conv_id,
+            artifact_role="confirmation_card_redelivery",
+            recallable=False,
+            send_status="pending",
+        )
+        if not await append_delivery_part(pending.row_id, pending_part):
+            return False
         sent = await run_channel_send(
             _im_send_lock_key(pending.conversation_id),
             lambda: send_confirmation_card(
@@ -820,7 +918,24 @@ async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
             ),
         )
         if not sent:
+            await register_delivery(
+                pending.row_id,
+                IMDeliveryResult.failed("dingtalk", "confirmation_card_redelivery_failed"),
+            )
             return False
+        await register_delivery(
+            pending.row_id,
+            IMDeliveryResult.sent(
+                "dingtalk",
+                IMDeliveryPart(
+                    transport="dingtalk_interactive_card",
+                    provider_message_id=delivery_id,
+                    conversation_ref=external_conv_id,
+                    artifact_role="confirmation_card_redelivery",
+                    recallable=False,
+                ),
+            ),
+        )
 
         async with async_session() as db:
             # Serialize the post-send state check with resolve_confirmation. If

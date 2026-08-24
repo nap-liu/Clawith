@@ -643,17 +643,17 @@ function ExternalSuccess({
 
 function buildOpenClawInstruction(apiKey: string) {
     const origin = window.location.origin;
-    return `Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
+    return `Please create a skill file at skills/platform_sync.md with the following content, then add "Check the platform inbox using the platform_sync skill and process any pending messages" to your HEARTBEAT.md:
 
 ---
-name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+name: platform_sync
+description: Sync with the platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Platform Sync
 
 ## When to use
-Check for new messages from the Clawith platform during every heartbeat cycle.
+Check for new messages from the platform during every heartbeat cycle.
 You can also proactively send messages to people and agents in your relationships.
 
 ## Instructions

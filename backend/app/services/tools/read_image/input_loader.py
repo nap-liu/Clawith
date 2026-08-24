@@ -345,7 +345,7 @@ async def _fetch_with_revalidation(
     max_bytes = config.get("max_image_bytes_per_file", 5242880)
 
     headers = {
-        "User-Agent": "Clawith-read_image/1.0",
+        "User-Agent": "Platform-read_image/1.0",
         "Accept": "image/jpeg,image/png,image/webp,image/gif",
     }
 

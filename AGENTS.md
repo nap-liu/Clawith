@@ -1,4 +1,4 @@
-# Clawith Agent Instructions
+# Digital Employee Platform Agent Instructions
 
 This file is the stable entry point for every coding agent working in this repository. Detailed rules and architecture live under `.agents/`; do not duplicate or override them in tool-specific instruction files.
 
