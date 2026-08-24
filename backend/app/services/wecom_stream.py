@@ -192,7 +192,7 @@ class WeComStreamManager:
                         async def _send_thinking_text(text: str) -> None:
                             await client.reply_stream(frame, _stream_id, text, finish=False)
 
-                        reply_text = await _process_wecom_stream_message(
+                        reply_text, assistant_message_id = await _process_wecom_stream_message(
                             agent_id=agent_id,
                             sender_id=sender_id,
                             user_text=user_text,
@@ -207,7 +207,24 @@ class WeComStreamManager:
                             )
                             or None,
                         )
-                        await client.reply_stream(frame, _stream_id, reply_text, finish=True)
+                        from app.services.im_delivery import (
+                            IMDeliveryResult,
+                            register_delivery,
+                        )
+
+                        try:
+                            await client.reply_stream(frame, _stream_id, reply_text, finish=True)
+                            delivery_result = IMDeliveryResult.unsupported_delivery(
+                                "wecom",
+                                "wecom_aibot_stream",
+                                conversation_ref=sender_id,
+                            )
+                        except Exception as exc:
+                            delivery_result = IMDeliveryResult.from_exception("wecom", exc)
+                            raise
+                        finally:
+                            if assistant_message_id is not None:
+                                await register_delivery(assistant_message_id, delivery_result)
                         logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
                         return reply_text or ""
 
@@ -479,7 +496,7 @@ async def _process_wecom_stream_message(
                 provider_event_id,
                 len(ingested.execution_ids),
             )
-            return ""
+            return "", None
 
         # Call LLM
         _thinking_chunks: list[str] = []
@@ -514,11 +531,15 @@ async def _process_wecom_stream_message(
         # analysis card.
         from app.services.chat_history import persist_assistant_reply
         from app.database import async_session as _areply_session
-        await persist_assistant_reply(
+        from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+        assistant_message_id = await persist_assistant_reply(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
             thinking="".join(_thinking_chunks) or None,
+            message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("wecom")),
             turn_anchor_id=ingested.message.id,
+            required=True,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
@@ -531,7 +552,7 @@ async def _process_wecom_stream_message(
             detail={"channel": "wecom", "user_text": user_text[:200], "reply": reply_text[:500]},
         )
 
-    return reply_text
+    return reply_text, assistant_message_id
 
 
 wecom_stream_manager = WeComStreamManager()

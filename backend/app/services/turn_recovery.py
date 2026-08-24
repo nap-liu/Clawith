@@ -25,7 +25,7 @@ from app.services.chat_history import (
 )
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
-from app.services.turn_runtime import deliver_recovered_reply_to_origin
+from app.services.turn_runtime import deliver_recovered_reply_to_origin, load_turn_runtime
 
 RECOVERY_ADVISORY_LOCK_KEY = 2026070801
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
@@ -342,21 +342,18 @@ async def _deliver_recovered_reply(
     expected_origin: _RecoveryOrigin,
     reply: str,
     execution_agent_id: uuid.UUID,
+    message_id: uuid.UUID | str | None = None,
 ) -> bool:
     """Validate the turn generation and deliver while its rows stay locked."""
     async with async_session() as db:
-        current_origin = await _load_recovery_origin(
-            db,
-            anchor,
-            for_update=True,
-        )
+        current_origin = await _load_recovery_origin(db, anchor, for_update=True)
         if current_origin != expected_origin:
             return False
-
         delivery_kwargs = {
             "agent_id": execution_agent_id,
             "conversation_id": anchor.conversation_id,
             "reply": reply,
+            "message_id": message_id,
         }
         if expected_origin.session_found:
             delivery_kwargs.update(
@@ -583,13 +580,23 @@ async def resume_turn(anchor: ChatMessage) -> bool:
     if reply and reply.strip():
         if not await _recovery_origin_matches(anchor, expected_origin):
             return False
+        from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+        runtime = await load_turn_runtime(
+            agent_id=anchor.agent_id,
+            conversation_id=anchor.conversation_id,
+        )
         async with async_session() as db:
-            await persist_assistant_reply_row(
+            assistant_message_id = await persist_assistant_reply_row(
                 db,
                 agent_id=anchor.agent_id,
                 user_id=anchor.user_id,
                 conversation_id=anchor.conversation_id,
                 content=reply,
+                message_meta=attach_delivery_to_meta(
+                    {},
+                    IMDeliveryResult.pending(runtime.source_channel),
+                ),
                 turn_anchor_id=anchor.id,
                 sender_agent_id=execution_agent_id,
             )
@@ -599,6 +606,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             expected_origin=expected_origin,
             reply=reply,
             execution_agent_id=execution_agent_id,
+            message_id=assistant_message_id,
         )
         if not delivered:
             logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")

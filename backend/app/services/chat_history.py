@@ -126,6 +126,73 @@ async def _load_active_compaction_marker(
     return result.scalar_one_or_none()
 
 
+async def _build_compacted_recall_correction(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    created_at: datetime,
+) -> _SyntheticSummaryMessage | None:
+    """Tell the model which summarized assistant rows were later recalled."""
+    result = await db.execute(
+        select(ChatMessage.id, ChatMessage.message_meta).where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.role == "assistant",
+            ChatMessage.compacted_into.is_not(None),
+        )
+    )
+    recalled_ids = []
+    for message_id, message_meta in result.all():
+        delivery = message_meta.get("delivery") if isinstance(message_meta, dict) else {}
+        recall = delivery.get("recall") if isinstance(delivery, dict) else {}
+        if isinstance(recall, dict) and recall.get("status") == "recalled":
+            recalled_ids.append(str(message_id))
+    if not recalled_ids:
+        return None
+    body = (
+        "<delivery-corrections>\n"
+        "The following earlier assistant messages were recalled after the conversation summary was "
+        "created. Their content remains audit history but was later withdrawn and is no longer visible "
+        "to the human; do not rely on it as current delivered context:\n"
+        + "\n".join(f"- {message_id}" for message_id in recalled_ids)
+        + "\n</delivery-corrections>"
+    )
+    return _SyntheticSummaryMessage(
+        role="user",
+        content=body,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        created_at=created_at,
+    )
+
+
+async def _prepend_compaction_context(
+    db: AsyncSession,
+    rows: list[Any],
+    *,
+    marker: ChatCompaction,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> None:
+    prefix: list[Any] = [
+        _build_summary_message(
+            marker=marker,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+    ]
+    correction = await _build_compacted_recall_correction(
+        db,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        created_at=marker.created_at,
+    )
+    if correction is not None:
+        prefix.append(correction)
+    rows[0:0] = prefix
+
+
 async def _batch_load_display_names(
     db: AsyncSession,
     user_ids: set[uuid.UUID],
@@ -196,13 +263,12 @@ async def load_messages_for_session(
     rows = all_active_rows
 
     if marker is not None:
-        rows.insert(
-            0,
-            _build_summary_message(
-                marker=marker,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-            ),
+        await _prepend_compaction_context(
+            db,
+            rows,
+            marker=marker,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
         )
 
     return rows
@@ -280,13 +346,12 @@ async def load_recoverable_messages_for_turn(
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
     if marker is not None:
-        rows.insert(
-            0,
-            _build_summary_message(
-                marker=marker,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-            ),
+        await _prepend_compaction_context(
+            db,
+            rows,
+            marker=marker,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
         )
 
     return rows
@@ -457,13 +522,22 @@ def build_llm_message_from_row(
 ) -> dict[str, Any]:
     """Build one provider-neutral message with structured attachment metadata."""
     content = message.content
+    meta = (
+        message.message_meta
+        if isinstance(getattr(message, "message_meta", None), dict)
+        else {}
+    )
+    delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+    recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
+    recalled = message.role == "assistant" and recall.get("status") == "recalled"
+    if recalled:
+        content = "[该消息已撤回，不应视为仍对用户可见]"
     attachments: list[dict[str, Any]] = []
     has_attachment_protocol = False
     if message.role == "user":
         from app.services.chat_attachments import extract_image_data_markers
 
-        meta = getattr(message, "message_meta", None)
-        has_attachment_protocol = isinstance(meta, dict) and "attachments" in meta
+        has_attachment_protocol = "attachments" in meta
         source_channel = meta.get("source_channel") if isinstance(meta, dict) else None
         content, attachments = normalize_chat_message_attachments(
             message.content,
@@ -488,7 +562,7 @@ def build_llm_message_from_row(
     entry: dict[str, Any] = {"role": message.role, "content": content}
     if attachments or has_attachment_protocol:
         entry["attachments"] = attachments
-    if include_thinking and getattr(message, "thinking", None):
+    if include_thinking and not recalled and getattr(message, "thinking", None):
         entry["thinking"] = message.thinking
     return entry
 
@@ -1312,8 +1386,10 @@ async def persist_assistant_reply(
     conversation_id: str,
     content: str,
     thinking: str | None = None,
+    message_meta: dict[str, Any] | None = None,
     turn_anchor_id: uuid.UUID | None = None,
-) -> None:
+    required: bool = False,
+) -> uuid.UUID | None:
     """Persist a channel agent's final assistant reply.
 
     Uses its OWN session (mirroring ``persist_tool_call``) so ``created_at`` is
@@ -1322,24 +1398,33 @@ async def persist_assistant_reply(
     request transaction would instead stamp it with the transaction-start time
     (PostgreSQL ``now()``), placing the reply BEFORE the tool calls; the web UI
     then folds it into the "ran N tools" analysis card and the reply bubble
-    disappears. No-op for blank content. Failures are swallowed.
+    disappears. No-op for blank content. Failures are swallowed unless
+    ``required`` is set for a delivery lifecycle that must persist its anchor
+    before creating a provider-visible side effect.
     """
     if not (content or "").strip():
-        return
+        if required:
+            raise ValueError("required assistant reply content must be non-empty")
+        return None
     try:
         async with db_session_factory() as db:
-            await persist_assistant_reply_row(
+            message_id = await persist_assistant_reply_row(
                 db,
                 agent_id=agent_id,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 content=content,
                 thinking=thinking,
+                message_meta=message_meta,
                 turn_anchor_id=turn_anchor_id,
             )
             await db.commit()
+            return message_id
     except Exception as e:
+        if required:
+            raise
         logger.warning(f"[chat_history] persist_assistant_reply failed (non-fatal): {e}")
+        return None
 
 
 async def persist_assistant_reply_row(
@@ -1438,6 +1523,7 @@ async def persist_assistant_reply_and_complete_turn(
     content: str,
     turn_anchor_id: uuid.UUID,
     thinking: str | None = None,
+    message_meta: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     """Persist final assistant reply.
 
@@ -1452,6 +1538,7 @@ async def persist_assistant_reply_and_complete_turn(
             conversation_id=conversation_id,
             content=content,
             thinking=thinking,
+            message_meta=message_meta,
             turn_anchor_id=turn_anchor_id,
         )
         await db.commit()

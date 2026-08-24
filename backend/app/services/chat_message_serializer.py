@@ -21,6 +21,9 @@ def serialize_chat_message_for_client(
     raw_content = str(getattr(message, "content", "") or "")
     role = str(getattr(message, "role", "") or "")
     meta = getattr(message, "message_meta", None)
+    delivery = meta.get("delivery") if isinstance(meta, dict) and isinstance(meta.get("delivery"), dict) else {}
+    recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
+    recall_status = str(recall.get("status") or "")
     resolved_source = source_channel or (
         meta.get("source_channel") if isinstance(meta, dict) else None
     )
@@ -31,7 +34,7 @@ def serialize_chat_message_for_client(
             resolved_source,
         )
     else:
-        display_content = raw_content
+        display_content = "该消息已撤回" if recall_status == "recalled" else raw_content
         delivery_status = meta.get("delivery_status") if isinstance(meta, dict) else None
         attachments = (
             normalize_attachment_metadata(meta.get("attachments"))
@@ -44,14 +47,16 @@ def serialize_chat_message_for_client(
     entry: dict[str, Any] = {
         "id": str(message_id) if message_id is not None else None,
         "role": role,
-        "content": raw_content,
+        "content": display_content,
         "display_content": display_content,
         "attachments": attachments,
         "created_at": created_at.isoformat() if created_at else None,
     }
     thinking = getattr(message, "thinking", None)
-    if thinking:
+    if thinking and recall_status != "recalled":
         entry["thinking"] = thinking
+    if recall_status:
+        entry["recall_status"] = recall_status
     if sender_name:
         entry["sender_name"] = sender_name
     if sender_user_id:

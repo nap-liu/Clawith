@@ -23,6 +23,7 @@ from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
 from app.services import agent_tools, turn_runtime
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
 from app.services.tool_seeder import seed_builtin_tools
 from app.services.turn_runtime import TurnRuntime
 
@@ -240,12 +241,19 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return True
+        return IMDeliveryResult.sent(
+            kwargs["runtime"].source_channel,
+            IMDeliveryPart(
+                transport="dingtalk_openapi_group",
+                provider_message_id="provider-group-1",
+                conversation_ref=kwargs["runtime"].external_conv_id,
+            ),
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
     result = await agent_tools._send_group_session_message(
@@ -257,6 +265,8 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
     )
 
     payload = json.loads(result)
+    message_id = payload.pop("message_id")
+    assert uuid.UUID(message_id)
     assert payload == {
         "status": "sent",
         "session_id": str(target.id),
@@ -273,7 +283,6 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
         is_group=True,
     )
     assert delivered[0]["message"] == "版本今晚发布"
-    assert delivered[0]["require_transport"] is True
     assert delivered[0]["allow_wecom_group_actor_fallback"] is False
 
     async with async_session() as db:
@@ -309,12 +318,19 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return True
+        return IMDeliveryResult.sent(
+            kwargs["runtime"].source_channel,
+            IMDeliveryPart(
+                transport=f"{channel}_test",
+                provider_message_id="provider-person-1",
+                conversation_ref=kwargs["runtime"].external_conv_id,
+            ),
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
     result = await agent_tools._send_session_message(
@@ -325,7 +341,10 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
         origin_turn_anchor_id=uuid.uuid4(),
     )
 
-    assert json.loads(result) == {
+    payload = json.loads(result)
+    message_id = payload.pop("message_id")
+    assert uuid.UUID(message_id)
+    assert payload == {
         "status": "sent",
         "session_id": str(target.id),
         "channel": channel,
@@ -376,7 +395,7 @@ async def test_send_session_message_rejects_person_session_after_relationship_re
     async def fail_if_delivered(**_kwargs):
         raise AssertionError("revoked relationship must block exact-Session delivery")
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_delivered)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_delivered)
     result = await agent_tools._send_session_message(
         owner.id,
         {"session_id": str(target.id), "message": "should not send"},
@@ -413,7 +432,7 @@ async def test_send_group_session_message_rejects_invalid_target_boundaries(monk
         calls += 1
         return True
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_delivered)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_delivered)
 
     result = await agent_tools._send_group_session_message(
         owner.id,
@@ -438,12 +457,18 @@ async def test_send_group_session_message_replay_is_idempotent(monkeypatch):
     async def fake_deliver(**_kwargs):
         nonlocal call_count
         call_count += 1
-        return True
+        return IMDeliveryResult.sent(
+            "dingtalk",
+            IMDeliveryPart(
+                transport="dingtalk_openapi_group",
+                provider_message_id="provider-idempotent-1",
+            ),
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     kwargs = {
         "origin_session_id": str(uuid.uuid4()),
@@ -468,14 +493,14 @@ async def test_send_group_session_message_replay_is_idempotent(monkeypatch):
     assert len(receipts) == 1
 
 
-async def test_failed_transport_does_not_persist_target_receipt(monkeypatch):
+async def test_failed_transport_persists_failed_lifecycle_receipt(monkeypatch):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
 
     async def fake_failure(**_kwargs):
-        return False
+        return IMDeliveryResult.failed("dingtalk", "provider_rejected")
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_failure)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_failure)
     result = await agent_tools._send_group_session_message(
         owner.id,
         {"session_id": str(target.id), "message": "provider rejects this"},
@@ -489,7 +514,8 @@ async def test_failed_transport_does_not_persist_target_receipt(monkeypatch):
         receipts = (
             (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == str(target.id)))).scalars().all()
         )
-    assert receipts == []
+    assert len(receipts) == 1
+    assert receipts[0].message_meta["delivery"]["status"] == "failed"
 
 
 async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypatch):
@@ -525,13 +551,17 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return True
+        return IMDeliveryResult.unsupported_delivery(
+            "dingtalk",
+            "dingtalk_session_webhook",
+            conversation_ref=kwargs["runtime"].external_conv_id,
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr(agent_tools, "resolve_human_channel_recipient", fake_resolve)
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
     result = await agent_tools._send_group_session_message(
@@ -654,7 +684,7 @@ async def test_dingtalk_group_mention_requires_recent_group_webhook(monkeypatch)
     async def fail_if_called(**_kwargs):
         raise AssertionError("delivery must not run without a temporary group webhook")
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_called)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_called)
     result = await agent_tools._send_group_session_message(
         owner.id,
         {
@@ -1850,12 +1880,16 @@ async def test_wecom_group_failure_never_falls_back_to_personal_message(monkeypa
 async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
     owner, _ = await _seed_agents()
     async with async_session() as db:
-        existing_tool_id = (
-            await db.execute(select(Tool.id).where(Tool.name == "send_group_session_message"))
-        ).scalar_one_or_none()
-        if existing_tool_id is not None:
-            await db.execute(delete(AgentTool).where(AgentTool.tool_id == existing_tool_id))
-            await db.execute(delete(Tool).where(Tool.id == existing_tool_id))
+        existing_tool_ids = (
+            await db.execute(
+                select(Tool.id).where(
+                    Tool.name.in_({"send_group_session_message", "recall_message"})
+                )
+            )
+        ).scalars().all()
+        if existing_tool_ids:
+            await db.execute(delete(AgentTool).where(AgentTool.tool_id.in_(existing_tool_ids)))
+            await db.execute(delete(Tool).where(Tool.id.in_(existing_tool_ids)))
         db.add(
             ChannelConfig(
                 agent_id=owner.id,
@@ -1869,18 +1903,21 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
 
     await seed_builtin_tools()
     async with async_session() as db:
-        assignment = (
-            await db.execute(
-                select(AgentTool)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id == owner.id,
-                    AgentTool.enabled.is_(True),
-                    Tool.name == "send_group_session_message",
+        assigned_names = set(
+            (
+                await db.execute(
+                    select(Tool.name)
+                    .select_from(AgentTool)
+                    .join(Tool, Tool.id == AgentTool.tool_id)
+                    .where(
+                        AgentTool.agent_id == owner.id,
+                        AgentTool.enabled.is_(True),
+                        Tool.name.in_({"send_group_session_message", "recall_message"}),
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-    assert assignment is not None
+            ).scalars().all()
+        )
+    assert assigned_names == {"send_group_session_message", "recall_message"}
 
     tools = await agent_tools.get_agent_tools_for_llm(owner.id)
     runtime_tool = next(tool for tool in tools if tool["function"]["name"] == "send_group_session_message")
@@ -1939,5 +1976,17 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             },
         },
         "required": ["session_id", "message"],
+        "additionalProperties": False,
+    }
+    recall_tool = next(tool for tool in tools if tool["function"]["name"] == "recall_message")
+    assert recall_tool["function"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "string",
+                "description": "Exact local ChatMessage UUID of the outbound assistant message.",
+            },
+        },
+        "required": ["message_id"],
         "additionalProperties": False,
     }

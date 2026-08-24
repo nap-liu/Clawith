@@ -1133,57 +1133,79 @@ async def process_dingtalk_message(
             # append-only message turn.
             from app.database import async_session as _reply_session_factory
             from app.services.chat_history import persist_assistant_reply_row
+            from app.services.im_delivery import (
+                IMDeliveryResult,
+                attach_delivery_to_meta,
+                register_delivery,
+            )
 
             async with _reply_session_factory() as reply_db:
-                await persist_assistant_reply_row(
+                assistant_message_id = await persist_assistant_reply_row(
                     reply_db,
                     agent_id=agent_id,
                     user_id=platform_user_id,
                     conversation_id=session_conv_id,
                     content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending("dingtalk"),
+                    ),
                     turn_anchor_id=turn_anchor_id,
                 )
                 await reply_db.commit()
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
-            # Reply via session webhook (markdown). File/image sending is handled by the
-            # channel_file_sender ContextVar above.
-            try:
-                from app.services.channel_dispatch import run_channel_send
+            # Ordinary final replies use the durable OpenAPI route so DingTalk
+            # returns a processQueryKey that can later be recalled. Native @
+            # messages remain on the temporary sessionWebhook path in the
+            # explicit send_session_message tool and are marked unsupported.
+            from app.services.turn_runtime import TurnRuntime, deliver_message_with_receipt
 
-                async def _send_reply():
+            try:
+                delivery_result = await deliver_message_with_receipt(
+                    agent_id=agent_id,
+                    runtime=TurnRuntime(
+                        session_found=True,
+                        source_channel="dingtalk",
+                        conversation_id=session_conv_id,
+                        external_conv_id=sess.external_conv_id,
+                        is_group=bool(sess.is_group),
+                    ),
+                    message=reply_text,
+                )
+                if (
+                    not delivery_result.ok
+                    and delivery_result.error == "channel_config_unavailable"
+                    and session_webhook
+                ):
+                    # Legacy/imported bindings can briefly lack OpenAPI credentials.
+                    # Preserve reply availability through the temporary webhook,
+                    # but record that this transport cannot be recalled.
                     async with httpx.AsyncClient(timeout=10) as client:
-                        try:
-                            response = await client.post(session_webhook, json={
+                        response = await client.post(
+                            session_webhook,
+                            json={
                                 "msgtype": "markdown",
                                 "markdown": {
                                     "title": agent_obj.name or "AI Reply",
                                     "text": reply_text,
                                 },
-                            })
-                            response.raise_for_status()
-                            return response
-                        except Exception as markdown_error:
-                            logger.warning(
-                                "[DingTalk] Markdown reply failed; trying text fallback: %s",
-                                type(markdown_error).__name__,
-                            )
-                            response = await client.post(session_webhook, json={
-                                "msgtype": "text",
-                                "text": {"content": reply_text},
-                            })
-                            response.raise_for_status()
-                            return response
-
-                await run_channel_send(
-                    f"im-send:{session_conv_id}",
-                    _send_reply,
-                )
+                            },
+                        )
+                        response.raise_for_status()
+                    delivery_result = IMDeliveryResult.unsupported_delivery(
+                        "dingtalk",
+                        "dingtalk_session_webhook",
+                        conversation_ref=str(sess.external_conv_id or ""),
+                    )
+                await register_delivery(assistant_message_id, delivery_result)
             except Exception as e:
-                logger.error(
-                    f"[DingTalk] Markdown and fallback text reply failed: {type(e).__name__}"
+                logger.error(f"[DingTalk] OpenAPI reply failed: {type(e).__name__}")
+                await register_delivery(
+                    assistant_message_id,
+                    IMDeliveryResult.from_exception("dingtalk", e),
                 )
 
         # Log activity

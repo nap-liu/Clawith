@@ -137,17 +137,31 @@ def _verify_slack_signature(signing_secret: str, body: bytes, headers: dict) -> 
     return hmac.compare_digest(expected, sig)
 
 
-async def _send_slack_messages(bot_token: str, channel: str, text: str) -> None:
+async def _send_slack_messages(
+    bot_token: str,
+    channel: str,
+    text: str,
+    *,
+    on_result=None,
+) -> list[dict]:
     """Send text to Slack, splitting into SLACK_MSG_LIMIT chunks if needed."""
     import httpx
     chunks = [text[i:i + SLACK_MSG_LIMIT] for i in range(0, len(text), SLACK_MSG_LIMIT)]
+    results: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
         for chunk in chunks:
-            await client.post(
+            response = await client.post(
                 "https://slack.com/api/chat.postMessage",
                 headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
                 json={"channel": channel, "text": chunk},
             )
+            data = response.json()
+            if response.status_code >= 400 or not data.get("ok"):
+                raise RuntimeError(str(data.get("error") or response.status_code))
+            results.append(data)
+            if on_result is not None:
+                await on_result(data)
+    return results
 
 
 @router.post("/channel/slack/{agent_id}/webhook")
@@ -579,11 +593,20 @@ async def slack_event_webhook(
         # analysis card.
         from app.services.chat_history import persist_assistant_reply
         from app.database import async_session as _areply_session
-        await persist_assistant_reply(
+        from app.services.im_delivery import (
+            IMDeliveryPart,
+            IMDeliveryResult,
+            append_delivery_part,
+            attach_delivery_to_meta,
+            register_delivery,
+        )
+        assistant_message_id = await persist_assistant_reply(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
             thinking="".join(_thinking_chunks) or None,
+            message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("slack")),
             turn_anchor_id=ingested.message.id,
+            required=True,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
@@ -591,10 +614,44 @@ async def slack_event_webhook(
         # Send to Slack (chunked)
         bot_token = config.app_secret or ""
         if bot_token and channel_id:
+            async def _record_slack_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="slack",
+                    provider_message_id=str(response.get("ts") or "") or None,
+                    conversation_ref=str(response.get("channel") or channel_id),
+                    artifact_role="chunk",
+                    recallable=bool(response.get("ts")),
+                )
+                if not await append_delivery_part(assistant_message_id, part):
+                    raise RuntimeError("delivery_part_persistence_failed")
+
             try:
-                await _send_slack_messages(bot_token, channel_id, reply_text)
+                responses = await _send_slack_messages(
+                    bot_token,
+                    channel_id,
+                    reply_text,
+                    on_result=_record_slack_part,
+                )
+                delivery_result = IMDeliveryResult.sent(
+                    "slack",
+                    *(
+                        IMDeliveryPart(
+                            transport="slack",
+                            provider_message_id=str(response.get("ts") or "") or None,
+                            conversation_ref=str(response.get("channel") or channel_id),
+                            artifact_role="chunk",
+                            recallable=bool(response.get("ts")),
+                        )
+                        for response in responses
+                    ),
+                )
             except Exception as e:
                 logger.error(f"[Slack] Failed to send: {e}")
+                delivery_result = IMDeliveryResult.from_exception("slack", e)
+        else:
+            delivery_result = IMDeliveryResult.failed("slack", "channel_config_unavailable")
+        if assistant_message_id is not None:
+            await register_delivery(assistant_message_id, delivery_result)
 
         return reply_text
 

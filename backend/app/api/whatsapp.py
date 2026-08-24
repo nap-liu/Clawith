@@ -65,7 +65,13 @@ def _extract_message_text(message: dict) -> str:
     return ""
 
 
-async def _send_whatsapp_messages(config: ChannelConfig, to_phone: str, text: str) -> None:
+async def _send_whatsapp_messages(
+    config: ChannelConfig,
+    to_phone: str,
+    text: str,
+    *,
+    on_result=None,
+) -> list[dict]:
     token = (config.app_secret or "").strip()
     phone_number_id = (config.app_id or "").strip()
     if not token or not phone_number_id:
@@ -74,6 +80,7 @@ async def _send_whatsapp_messages(config: ChannelConfig, to_phone: str, text: st
     api_version = str((config.extra_config or {}).get("api_version") or DEFAULT_WHATSAPP_API_VERSION).strip()
     url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
 
+    results: list[dict] = []
     async with httpx.AsyncClient(timeout=20) as client:
         for chunk in _split_text(text):
             resp = await client.post(
@@ -92,6 +99,14 @@ async def _send_whatsapp_messages(config: ChannelConfig, to_phone: str, text: st
             )
             if resp.status_code >= 400:
                 raise RuntimeError(f"WhatsApp send failed: {resp.text[:300]}")
+            try:
+                result = resp.json()
+            except ValueError:
+                result = {}
+            results.append(result)
+            if on_result is not None:
+                await on_result(result)
+    return results
 
 
 @router.post("/agents/{agent_id}/whatsapp-channel", response_model=ChannelConfigOut, status_code=201)
@@ -395,27 +410,71 @@ async def whatsapp_event_webhook(
                     finally:
                         await _thinking_sender.flush()
 
+                    from app.services.chat_history import persist_assistant_reply
+                    from app.database import async_session as _areply_session
+                    from app.services.im_delivery import (
+                        IMDeliveryPart,
+                        IMDeliveryResult,
+                        append_delivery_part,
+                        attach_delivery_to_meta,
+                        register_delivery,
+                    )
+
+                    assistant_message_id = await persist_assistant_reply(
+                        _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                        conversation_id=session_conv_id, content=reply_text,
+                        thinking="".join(_thinking_chunks) or None,
+                        message_meta=attach_delivery_to_meta(
+                            {},
+                            IMDeliveryResult.pending("whatsapp"),
+                        ),
+                        turn_anchor_id=ingested.message.id,
+                        required=True,
+                    )
+                    async def _record_whatsapp_part(response: dict) -> None:
+                        wamid = str((((response.get("messages") or [{}])[0]).get("id")) or "")
+                        part = IMDeliveryPart(
+                            transport="whatsapp_cloud",
+                            provider_message_id=wamid or None,
+                            conversation_ref=_sender_phone,
+                            artifact_role="chunk",
+                            recallable=False,
+                        )
+                        if not await append_delivery_part(assistant_message_id, part):
+                            raise RuntimeError("delivery_part_persistence_failed")
+
                     try:
-                        await _send_whatsapp_messages(config, _sender_phone, reply_text)
+                        responses = await _send_whatsapp_messages(
+                            config,
+                            _sender_phone,
+                            reply_text,
+                            on_result=_record_whatsapp_part,
+                        )
                         config.is_connected = True
-                        # Save assistant reply via the shared writer. Its own session stamps
-                        # created_at at save time (after the tool loop), so the reply orders
-                        # AFTER the turn's tool calls instead of being folded into the web UI's
-                        # analysis card.
-                        from app.services.chat_history import persist_assistant_reply
-                        from app.database import async_session as _areply_session
-                        await persist_assistant_reply(
-                            _areply_session, agent_id=agent_id, user_id=platform_user_id,
-                            conversation_id=session_conv_id, content=reply_text,
-                            thinking="".join(_thinking_chunks) or None,
-                            turn_anchor_id=ingested.message.id,
+                        delivery_result = IMDeliveryResult.sent(
+                            "whatsapp",
+                            *(
+                                IMDeliveryPart(
+                                    transport="whatsapp_cloud",
+                                    provider_message_id=str(
+                                        (((response.get("messages") or [{}])[0]).get("id")) or ""
+                                    ) or None,
+                                    conversation_ref=_sender_phone,
+                                    artifact_role="chunk",
+                                    recallable=False,
+                                )
+                                for response in responses
+                            ),
                         )
                         sess.last_message_at = datetime.now(timezone.utc)
                         await db.commit()
                     except Exception as exc:
                         logger.exception(f"[WhatsApp] Send failed for agent {agent_id}: {exc}")
                         config.is_connected = False
+                        delivery_result = IMDeliveryResult.from_exception("whatsapp", exc)
                         await db.commit()
+                    if assistant_message_id is not None:
+                        await register_delivery(assistant_message_id, delivery_result)
 
                     return reply_text
 

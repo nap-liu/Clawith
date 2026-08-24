@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -19,6 +20,9 @@ from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
 from app.services.channel_dispatch import run_channel_send
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
+
+DeliveryPartObserver = Callable[[IMDeliveryPart], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,7 @@ async def deliver_reply_to_origin(
     expected_source_channel: str | None = None,
     expected_external_conv_id: str | None = None,
     validate_external_conv_id: bool = False,
+    message_id: uuid.UUID | str | None = None,
 ) -> bool:
     """Deliver a reply through the channel runtime persisted on its ChatSession."""
     if not (reply or "").strip():
@@ -110,6 +115,45 @@ async def deliver_reply_to_origin(
                 runtime.external_conv_id,
             )
             return False
+        if message_id is None:
+            from app.models.audit import ChatMessage
+
+            async with async_session() as db:
+                candidates = (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.conversation_id == str(conversation_id),
+                            ChatMessage.role == "assistant",
+                        )
+                        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                        .limit(10)
+                    )
+                ).scalars().all()
+            for candidate in candidates:
+                meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
+                delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+                if delivery.get("status") == "pending":
+                    message_id = candidate.id
+                    break
+        if message_id is not None:
+            from app.services.im_delivery import deliver_persisted_message
+
+            result = await deliver_persisted_message(
+                message_id=message_id,
+                agent_id=agent_id,
+                runtime=runtime,
+                message=reply,
+                origin_actor_ref=origin_actor_ref,
+                origin_actor_ref_type=origin_actor_ref_type,
+            )
+            return result.ok or not require_transport
+        if require_transport:
+            logger.warning(
+                "[turn_runtime] persisted pending reply not found before required delivery: {}",
+                conversation_id,
+            )
+            return False
         return await deliver_message_to_runtime(
             agent_id=agent_id,
             runtime=runtime,
@@ -138,6 +182,7 @@ async def deliver_recovered_reply_to_origin(
     expected_source_channel: str | None = None,
     expected_external_conv_id: str | None = None,
     validate_external_conv_id: bool = False,
+    message_id: uuid.UUID | str | None = None,
 ) -> bool:
     """Backward-compatible recovery entry point for the unified origin delivery."""
     return await deliver_reply_to_origin(
@@ -150,6 +195,7 @@ async def deliver_recovered_reply_to_origin(
         expected_source_channel=expected_source_channel,
         expected_external_conv_id=expected_external_conv_id,
         validate_external_conv_id=validate_external_conv_id,
+        message_id=message_id,
     )
 
 
@@ -171,8 +217,42 @@ async def deliver_message_to_runtime(
     Session delivery. Callers remain responsible for authorizing the Session;
     this function never selects a different Session or channel.
     """
-    if not (message or "").strip():
+    result = await deliver_message_with_receipt(
+        agent_id=agent_id,
+        runtime=runtime,
+        message=message,
+        origin_actor_ref=origin_actor_ref,
+        origin_actor_ref_type=origin_actor_ref_type,
+        allow_wecom_group_actor_fallback=allow_wecom_group_actor_fallback,
+        dingtalk_at_user_ids=dingtalk_at_user_ids,
+        dingtalk_session_webhook=dingtalk_session_webhook,
+    )
+    if result.ok:
         return True
+    if not require_transport:
+        logger.warning(
+            "[turn_runtime] channel redelivery failed for %s; DB history remains authoritative",
+            runtime.source_channel,
+        )
+        return True
+    return False
+
+
+async def deliver_message_with_receipt(
+    *,
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    message: str,
+    origin_actor_ref: str | None = None,
+    origin_actor_ref_type: str | None = None,
+    allow_wecom_group_actor_fallback: bool = True,
+    dingtalk_at_user_ids: list[str] | None = None,
+    dingtalk_session_webhook: str | None = None,
+    on_part: DeliveryPartObserver | None = None,
+) -> IMDeliveryResult:
+    """Deliver through one exact Session route and preserve provider receipts."""
+    if not (message or "").strip():
+        return IMDeliveryResult.sent(runtime.source_channel)
     channel = runtime.source_channel
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
@@ -185,7 +265,7 @@ async def deliver_message_to_runtime(
             session_webhook=dingtalk_session_webhook,
         )
 
-    delivered: bool | None = None
+    delivered: IMDeliveryResult | None = None
     if channel == "feishu":
         delivered = await _deliver_feishu(
             agent_id,
@@ -195,7 +275,7 @@ async def deliver_message_to_runtime(
             origin_actor_ref_type=origin_actor_ref_type,
         )
     elif channel == "slack":
-        delivered = await _deliver_slack(agent_id, runtime, message)
+        delivered = await _deliver_slack(agent_id, runtime, message, on_part=on_part)
     elif channel == "wecom":
         delivered = await _deliver_wecom(
             agent_id,
@@ -205,24 +285,18 @@ async def deliver_message_to_runtime(
             allow_group_actor_fallback=allow_wecom_group_actor_fallback,
         )
     elif channel in {"teams", "microsoft_teams"}:
-        delivered = await _deliver_teams(agent_id, runtime, message)
+        delivered = await _deliver_teams(agent_id, runtime, message, on_part=on_part)
     elif channel == "whatsapp":
-        delivered = await _deliver_whatsapp(agent_id, runtime, message)
+        delivered = await _deliver_whatsapp(agent_id, runtime, message, on_part=on_part)
     elif channel == "wechat":
-        delivered = await _deliver_wechat(agent_id, runtime, message)
+        delivered = await _deliver_wechat(agent_id, runtime, message, on_part=on_part)
     elif channel == "discord":
         delivered = await _deliver_discord(agent_id, runtime, message)
     elif channel in {"agent", "trigger"}:
         return await _deliver_web(agent_id, runtime, message)
 
     if delivered is not None:
-        if delivered or require_transport:
-            return delivered
-        logger.warning(
-            "[turn_runtime] channel redelivery failed for %s; DB history remains authoritative",
-            channel,
-        )
-        return True
+        return delivered
 
     logger.warning(
         "[turn_runtime] no restart delivery adapter for channel=%s conversation=%s; "
@@ -230,10 +304,14 @@ async def deliver_message_to_runtime(
         channel,
         runtime.conversation_id,
     )
-    return not require_transport
+    return IMDeliveryResult.failed(channel, "transport_unavailable")
 
 
-async def _deliver_web(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_web(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+) -> IMDeliveryResult:
     """Mirror the recovered reply to live web viewers; DB history is authoritative."""
     try:
         from app.api.websocket import manager
@@ -247,7 +325,11 @@ async def _deliver_web(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) ->
         logger.opt(exception=True).warning(
             "[turn_runtime] web live delivery failed; DB history remains authoritative"
         )
-    return True
+    return IMDeliveryResult.unsupported_delivery(
+        runtime.source_channel,
+        "websocket",
+        conversation_ref=runtime.conversation_id,
+    )
 
 
 async def _load_channel_config(agent_id: uuid.UUID, channel_type: str) -> ChannelConfig | None:
@@ -270,7 +352,7 @@ async def _deliver_dingtalk(
     *,
     at_user_ids: list[str] | None = None,
     session_webhook: str | None = None,
-) -> bool:
+) -> IMDeliveryResult:
     return await run_channel_send(
         f"im-send:{runtime.conversation_id}",
         lambda: _deliver_dingtalk_unlocked(
@@ -290,15 +372,15 @@ async def _deliver_dingtalk_unlocked(
     *,
     at_user_ids: list[str] | None = None,
     session_webhook: str | None = None,
-) -> bool:
+) -> IMDeliveryResult:
     """Send one DingTalk message while the caller owns the conversation send lock."""
     if not runtime.external_conv_id:
         logger.warning("[turn_runtime] DingTalk runtime missing external_conv_id: %s", runtime.conversation_id)
-        return False
+        return IMDeliveryResult.failed("dingtalk", "missing_external_conversation")
     cfg = await _load_channel_config(agent_id, "dingtalk")
     if cfg is None or not cfg.app_id or not cfg.app_secret:
         logger.warning("[turn_runtime] DingTalk channel config missing for agent=%s", agent_id)
-        return False
+        return IMDeliveryResult.failed("dingtalk", "channel_config_unavailable")
 
     from app.services.dingtalk_card import _parse_target
     from app.services.dingtalk_service import send_dingtalk_v1_robot_oto_message
@@ -306,7 +388,7 @@ async def _deliver_dingtalk_unlocked(
     space_type, space_id = _parse_target(runtime.external_conv_id, runtime.is_group)
     if not space_id:
         logger.warning("[turn_runtime] DingTalk runtime has empty target: %s", runtime.external_conv_id)
-        return False
+        return IMDeliveryResult.failed("dingtalk", "empty_target")
 
     async def _send() -> dict:
         if space_type == "IM_ROBOT":
@@ -340,7 +422,24 @@ async def _deliver_dingtalk_unlocked(
     ok = result.get("errcode") == 0
     if not ok:
         logger.warning("[turn_runtime] DingTalk recovered reply delivery failed: %s", result)
-    return ok
+        return IMDeliveryResult.failed("dingtalk", str(result.get("errmsg") or result.get("errcode") or "send_failed"))
+    if at_user_ids:
+        return IMDeliveryResult.unsupported_delivery(
+            "dingtalk",
+            "dingtalk_session_webhook",
+            conversation_ref=space_id,
+        )
+    process_key = str(result.get("processQueryKey") or "")
+    transport = "dingtalk_openapi_oto" if space_type == "IM_ROBOT" else "dingtalk_openapi_group"
+    return IMDeliveryResult.sent(
+        "dingtalk",
+        IMDeliveryPart(
+            transport=transport,
+            provider_message_id=process_key or None,
+            conversation_ref=space_id,
+            recallable=bool(process_key),
+        ),
+    )
 
 
 async def _send_dingtalk_group_mention(
@@ -384,13 +483,13 @@ async def _deliver_feishu(
     *,
     origin_actor_ref: str | None = None,
     origin_actor_ref_type: str | None = None,
-) -> bool:
+) -> IMDeliveryResult:
     target = str(runtime.external_conv_id or "")
     if not target:
-        return False
+        return IMDeliveryResult.failed("feishu", "missing_target")
     cfg = await _load_channel_config(agent_id, "feishu")
     if cfg is None or not cfg.app_id or not cfg.app_secret:
-        return False
+        return IMDeliveryResult.failed("feishu", "channel_config_unavailable")
 
     if target.startswith("feishu_group_"):
         receive_id = target.removeprefix("feishu_group_")
@@ -403,7 +502,7 @@ async def _deliver_feishu(
             else "user_id"
         )
     else:
-        return False
+        return IMDeliveryResult.failed("feishu", "invalid_target")
 
     from app.services.feishu_service import feishu_service
 
@@ -416,26 +515,70 @@ async def _deliver_feishu(
             json.dumps({"text": reply}, ensure_ascii=False),
             receive_id_type=receive_id_type,
         )
-    except Exception:
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] Feishu origin delivery failed")
-        return False
-    return result.get("code") == 0
+        return IMDeliveryResult.from_exception("feishu", exc)
+    if result.get("code") != 0:
+        return IMDeliveryResult.failed("feishu", str(result.get("msg") or result.get("code") or "send_failed"))
+    message_id = str(((result.get("data") or {}).get("message_id")) or result.get("message_id") or "")
+    return IMDeliveryResult.sent(
+        "feishu",
+        IMDeliveryPart(
+            transport="feishu_message",
+            provider_message_id=message_id or None,
+            conversation_ref=receive_id,
+            recallable=bool(message_id),
+        ),
+    )
 
 
-async def _deliver_slack(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_slack(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+    *,
+    on_part: DeliveryPartObserver | None = None,
+) -> IMDeliveryResult:
     target = str(runtime.external_conv_id or "")
     channel_id = target.removeprefix("slack_") if target.startswith("slack_") else ""
     cfg = await _load_channel_config(agent_id, "slack")
     if not channel_id or cfg is None or not cfg.app_secret:
-        return False
+        return IMDeliveryResult.failed("slack", "channel_config_unavailable")
     try:
         from app.api.slack import _send_slack_messages
 
-        await _send_slack_messages(cfg.app_secret, channel_id, reply)
-        return True
-    except Exception:
+        async def _observe(response: dict) -> None:
+            if on_part is not None:
+                await on_part(
+                    IMDeliveryPart(
+                        transport="slack",
+                        provider_message_id=str(response.get("ts") or "") or None,
+                        conversation_ref=str(response.get("channel") or channel_id),
+                        artifact_role="chunk",
+                        recallable=bool(response.get("ts")),
+                    )
+                )
+
+        responses = await _send_slack_messages(
+            cfg.app_secret,
+            channel_id,
+            reply,
+            on_result=_observe,
+        )
+        parts = tuple(
+            IMDeliveryPart(
+                transport="slack",
+                provider_message_id=str(response.get("ts") or "") or None,
+                conversation_ref=str(response.get("channel") or channel_id),
+                artifact_role="chunk",
+                recallable=bool(response.get("ts")),
+            )
+            for response in responses
+        )
+        return IMDeliveryResult.sent("slack", *parts)
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] Slack origin delivery failed")
-        return False
+        return IMDeliveryResult.from_exception("slack", exc)
 
 
 async def _deliver_wecom(
@@ -445,11 +588,11 @@ async def _deliver_wecom(
     *,
     origin_actor_ref: str | None = None,
     allow_group_actor_fallback: bool = True,
-) -> bool:
+) -> IMDeliveryResult:
     target = str(runtime.external_conv_id or "")
     cfg = await _load_channel_config(agent_id, "wecom")
     if cfg is None or not cfg.app_id or not cfg.app_secret:
-        return False
+        return IMDeliveryResult.failed("wecom", "channel_config_unavailable")
     wecom_agent_id = str((cfg.extra_config or {}).get("wecom_agent_id") or "") or None
 
     if target.startswith("wecom_group_"):
@@ -473,7 +616,11 @@ async def _deliver_wecom(
                     )
                 data = response.json()
                 if data.get("errcode") == 0:
-                    return True
+                    return IMDeliveryResult.unsupported_delivery(
+                        "wecom",
+                        "wecom_appchat",
+                        conversation_ref=chat_id,
+                    )
                 logger.warning("[turn_runtime] WeCom group delivery failed: %s", data)
             except Exception:
                 logger.opt(exception=True).warning("[turn_runtime] WeCom group origin delivery failed")
@@ -482,14 +629,14 @@ async def _deliver_wecom(
         # Preserve the current platform behavior by falling back to the exact
         # human actor who created the originating turn, never an arbitrary user.
         if not allow_group_actor_fallback:
-            return False
+            return IMDeliveryResult.failed("wecom", "group_send_failed")
         user_id = str(origin_actor_ref or "").strip()
     elif target.startswith("wecom_p2p_"):
         user_id = target.removeprefix("wecom_p2p_")
     else:
-        return False
+        return IMDeliveryResult.failed("wecom", "invalid_target")
     if not user_id:
-        return False
+        return IMDeliveryResult.failed("wecom", "missing_user")
     try:
         from app.services.wecom_service import send_wecom_message
 
@@ -500,21 +647,53 @@ async def _deliver_wecom(
             reply,
             agent_id=wecom_agent_id,
         )
-    except Exception:
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] WeCom origin delivery failed")
-        return False
-    return result.get("errcode") == 0
+        return IMDeliveryResult.from_exception("wecom", exc)
+    if result.get("errcode") != 0:
+        return IMDeliveryResult.failed("wecom", str(result.get("errmsg") or result.get("errcode") or "send_failed"))
+    msgid = str(result.get("msgid") or "")
+    return IMDeliveryResult.sent(
+        "wecom",
+        IMDeliveryPart(
+            transport="wecom_app",
+            provider_message_id=msgid or None,
+            conversation_ref=user_id,
+            recallable=bool(msgid),
+        ),
+    )
 
 
-async def _deliver_teams(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_teams(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+    *,
+    on_part: DeliveryPartObserver | None = None,
+) -> IMDeliveryResult:
     conversation_id = str(runtime.external_conv_id or "")
     cfg = await _load_channel_config(agent_id, "microsoft_teams")
     if not conversation_id or cfg is None:
-        return False
+        return IMDeliveryResult.failed("microsoft_teams", "channel_config_unavailable")
     try:
         from app.api.teams import _send_teams_message
 
-        await _send_teams_message(
+        service_url = str((cfg.extra_config or {}).get("service_url") or "")
+
+        async def _observe(response: dict) -> None:
+            if on_part is not None:
+                await on_part(
+                    IMDeliveryPart(
+                        transport="microsoft_teams",
+                        provider_message_id=str(response.get("id") or "") or None,
+                        conversation_ref=conversation_id,
+                        artifact_role="chunk",
+                        recallable=bool(response.get("id")),
+                        metadata={"service_url": service_url},
+                    )
+                )
+
+        responses = await _send_teams_message(
             cfg,
             conversation_id,
             {
@@ -522,35 +701,86 @@ async def _deliver_teams(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) 
                 "text": reply,
                 "conversation": {"id": conversation_id},
             },
+            on_result=_observe,
         )
-        return True
-    except Exception:
+        parts = tuple(
+            IMDeliveryPart(
+                transport="microsoft_teams",
+                provider_message_id=str(response.get("id") or "") or None,
+                conversation_ref=conversation_id,
+                artifact_role="chunk",
+                recallable=bool(response.get("id")),
+                metadata={"service_url": service_url},
+            )
+            for response in responses
+        )
+        return IMDeliveryResult.sent("microsoft_teams", *parts)
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] Teams origin delivery failed")
-        return False
+        return IMDeliveryResult.from_exception("microsoft_teams", exc)
 
 
-async def _deliver_whatsapp(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_whatsapp(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+    *,
+    on_part: DeliveryPartObserver | None = None,
+) -> IMDeliveryResult:
     target = str(runtime.external_conv_id or "")
     phone = target.removeprefix("whatsapp_") if target.startswith("whatsapp_") else ""
     cfg = await _load_channel_config(agent_id, "whatsapp")
     if not phone or cfg is None:
-        return False
+        return IMDeliveryResult.failed("whatsapp", "channel_config_unavailable")
     try:
         from app.api.whatsapp import _send_whatsapp_messages
 
-        await _send_whatsapp_messages(cfg, phone, reply)
-        return True
-    except Exception:
+        async def _observe(response: dict) -> None:
+            message_rows = response.get("messages") or []
+            wamid = str((message_rows[0] if message_rows else {}).get("id") or "")
+            if on_part is not None:
+                await on_part(
+                    IMDeliveryPart(
+                        transport="whatsapp_cloud",
+                        provider_message_id=wamid or None,
+                        conversation_ref=phone,
+                        artifact_role="chunk",
+                        recallable=False,
+                    )
+                )
+
+        responses = await _send_whatsapp_messages(cfg, phone, reply, on_result=_observe)
+        parts = []
+        for response in responses:
+            message_rows = response.get("messages") or []
+            wamid = str((message_rows[0] if message_rows else {}).get("id") or "")
+            parts.append(
+                IMDeliveryPart(
+                    transport="whatsapp_cloud",
+                    provider_message_id=wamid or None,
+                    conversation_ref=phone,
+                    artifact_role="chunk",
+                    recallable=False,
+                )
+            )
+        return IMDeliveryResult.sent("whatsapp", *parts)
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] WhatsApp origin delivery failed")
-        return False
+        return IMDeliveryResult.from_exception("whatsapp", exc)
 
 
-async def _deliver_wechat(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_wechat(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+    *,
+    on_part: DeliveryPartObserver | None = None,
+) -> IMDeliveryResult:
     target = str(runtime.external_conv_id or "")
     user_id = target.removeprefix("wechat_") if target.startswith("wechat_") else ""
     cfg = await _load_channel_config(agent_id, "wechat")
     if not user_id or cfg is None:
-        return False
+        return IMDeliveryResult.failed("wechat", "channel_config_unavailable")
     try:
         from app.services.wechat_channel import (
             WECHAT_ILINK_BASE_URL,
@@ -562,22 +792,51 @@ async def _deliver_wechat(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str)
         context_token = str((entry or {}).get("context_token") or "")
         token = str((cfg.extra_config or {}).get("bot_token") or "")
         if not context_token or not token:
-            return False
-        await send_wechat_text_message(
+            return IMDeliveryResult.failed("wechat", "context_unavailable")
+        async def _observe(response: dict) -> None:
+            if on_part is not None:
+                await on_part(
+                    IMDeliveryPart(
+                        transport="wechat_ilink",
+                        provider_message_id=str(response.get("client_id") or "") or None,
+                        conversation_ref=user_id,
+                        artifact_role="chunk",
+                        recallable=False,
+                    )
+                )
+
+        responses = await send_wechat_text_message(
             token=token,
             base_url=str((cfg.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL),
             to_user_id=user_id,
             context_token=context_token,
             text=reply,
             route_tag=str((cfg.extra_config or {}).get("route_tag") or "") or None,
+            on_result=_observe,
         )
-        return True
-    except Exception:
+        return IMDeliveryResult.sent(
+            "wechat",
+            *(
+                IMDeliveryPart(
+                    transport="wechat_ilink",
+                    provider_message_id=str(response.get("client_id") or "") or None,
+                    conversation_ref=user_id,
+                    artifact_role="chunk",
+                    recallable=False,
+                )
+                for response in responses
+            ),
+        )
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] WeChat origin delivery failed")
-        return False
+        return IMDeliveryResult.from_exception("wechat", exc)
 
 
-async def _deliver_discord(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_discord(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+) -> IMDeliveryResult:
     target = str(runtime.external_conv_id or "")
     if target.startswith("discord_dm_"):
         channel_id = ""
@@ -587,10 +846,10 @@ async def _deliver_discord(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str
         channel_id = tail.split("_", 1)[0]
         user_id = ""
     else:
-        return False
+        return IMDeliveryResult.failed("discord", "invalid_target")
     cfg = await _load_channel_config(agent_id, "discord")
     if cfg is None or not cfg.app_secret:
-        return False
+        return IMDeliveryResult.failed("discord", "channel_config_unavailable")
     headers = {
         "Authorization": f"Bot {cfg.app_secret}",
         "Content-Type": "application/json",
@@ -604,17 +863,29 @@ async def _deliver_discord(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str
                     json={"recipient_id": user_id},
                 )
                 if dm.status_code >= 400:
-                    return False
+                    return IMDeliveryResult.failed("discord", "dm_open_failed")
                 channel_id = str(dm.json().get("id") or "")
             response = await client.post(
                 f"https://discord.com/api/v10/channels/{channel_id}/messages",
                 headers=headers,
                 json={"content": reply[:2000]},
             )
-        return response.status_code < 400
-    except Exception:
+        if response.status_code >= 400:
+            return IMDeliveryResult.failed("discord", str(response.status_code))
+        data = response.json()
+        message_id = str(data.get("id") or "")
+        return IMDeliveryResult.sent(
+            "discord",
+            IMDeliveryPart(
+                transport="discord_gateway",
+                provider_message_id=message_id or None,
+                conversation_ref=channel_id,
+                recallable=bool(message_id),
+            ),
+        )
+    except Exception as exc:
         logger.opt(exception=True).warning("[turn_runtime] Discord origin delivery failed")
-        return False
+        return IMDeliveryResult.from_exception("discord", exc)
 
 
 async def _send_dingtalk_group_markdown(

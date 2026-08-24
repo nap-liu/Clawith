@@ -147,12 +147,52 @@ class DiscordGatewayManager:
             async def _work() -> str:
                 # typing 指示器 + 完整处理（用户行写入 → LLM → 回复持久化）包在锁内
                 async with message.channel.typing():
-                    reply = await self._handle_message(agent_id, message, user_text)
+                    handled = await self._handle_message(agent_id, message, user_text)
+                if handled is None:
+                    return ""
+                reply, assistant_message_id = handled
                 # Send reply, chunked if needed
+                from app.services.im_delivery import (
+                    IMDeliveryPart,
+                    IMDeliveryResult,
+                    append_delivery_part,
+                    register_delivery,
+                )
+
+                delivery_result = IMDeliveryResult.failed("discord", "send_failed")
                 if reply:
-                    chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
-                    for chunk in chunks:
-                        await message.reply(chunk, mention_author=False)
+                    try:
+                        chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
+                        sent_messages = []
+                        for chunk in chunks:
+                            sent = await message.reply(chunk, mention_author=False)
+                            sent_messages.append(sent)
+                            part = IMDeliveryPart(
+                                transport="discord_gateway",
+                                provider_message_id=str(sent.id),
+                                conversation_ref=str(sent.channel.id),
+                                artifact_role="chunk",
+                            )
+                            if not await append_delivery_part(assistant_message_id, part):
+                                raise RuntimeError("delivery_part_persistence_failed")
+                        delivery_result = IMDeliveryResult.sent(
+                            "discord",
+                            *(
+                                IMDeliveryPart(
+                                    transport="discord_gateway",
+                                    provider_message_id=str(sent.id),
+                                    conversation_ref=str(sent.channel.id),
+                                    artifact_role="chunk",
+                                )
+                                for sent in sent_messages
+                            ),
+                        )
+                    except Exception as exc:
+                        delivery_result = IMDeliveryResult.from_exception("discord", exc)
+                        raise
+                    finally:
+                        if assistant_message_id is not None:
+                            await register_delivery(assistant_message_id, delivery_result)
                 return reply or ""
 
             # Discord gateway 无 emoji reaction，ChannelReactions 保持空
@@ -185,7 +225,7 @@ class DiscordGatewayManager:
         agent_id: uuid.UUID,
         message: "discord.Message",
         user_text: str,
-    ) -> Optional[str]:
+    ) -> Optional[tuple[str, uuid.UUID | None]]:
         """Process an incoming Discord message through the agent LLM."""
         try:
             from app.models.audit import ChatMessage
@@ -213,7 +253,7 @@ class DiscordGatewayManager:
                 )
                 agent_obj = agent_r.scalar_one_or_none()
                 if not agent_obj:
-                    return "Agent not found."
+                    return "Agent not found.", None
                 creator_id = agent_obj.creator_id
                 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
                 ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
@@ -336,22 +376,28 @@ class DiscordGatewayManager:
                 # analysis card.
                 from app.services.chat_history import persist_assistant_reply
                 from app.database import async_session as _areply_session
-                await persist_assistant_reply(
+                from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+                assistant_message_id = await persist_assistant_reply(
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending("discord"),
+                    ),
                     turn_anchor_id=ingested.message.id,
+                    required=True,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()
 
-                return reply_text
+                return reply_text, assistant_message_id
 
         except Exception as e:
             logger.exception(
                 f"[Discord GW] Error handling message for {agent_id}: {e}"
             )
-            return f"An error occurred while processing your message: {str(e)[:100]}"
+            return None
 
     async def stop_client(self, agent_id: uuid.UUID):
         """Stop a running Discord Gateway client."""

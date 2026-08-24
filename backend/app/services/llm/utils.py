@@ -161,8 +161,15 @@ def convert_chat_messages_to_llm_format(messages) -> list[dict]:
             except Exception:
                 continue  # Skip malformed tool_call records
         else:
-            entry: dict = {"role": msg.role, "content": msg.content}
-            if hasattr(msg, "thinking") and msg.thinking:
+            meta = msg.message_meta if isinstance(getattr(msg, "message_meta", None), dict) else {}
+            delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+            recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
+            recalled = msg.role == "assistant" and recall.get("status") == "recalled"
+            entry: dict = {
+                "role": msg.role,
+                "content": "[该消息已撤回，不应视为仍对用户可见]" if recalled else msg.content,
+            }
+            if not recalled and hasattr(msg, "thinking") and msg.thinking:
                 entry["thinking"] = msg.thinking
             result.append(entry)
 
