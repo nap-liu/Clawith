@@ -24,6 +24,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from app.api.websocket import WebSocketChatHandler, _await_turn_with_abort
+from app.services.workload_capacity import WorkloadCapacity, WorkloadKind
 
 pytestmark = pytest.mark.asyncio
 
@@ -131,11 +132,25 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
         session_id=str(uuid.uuid4()),
     )
     handler.user_id = uuid.uuid4()
+    handler.tenant_id = uuid.uuid4()
     handler.conv_id = handler.session_id_param
     handler.conversation = [{"role": "user", "content": "hello"}]
-    handler._run_llm_and_stream = AsyncMock(
-        return_value=("completed reply", [], [], "completed", True)
+    capacity = WorkloadCapacity(
+        global_limit=1,
+        tenant_limit=1,
+        category_limits={kind: 1 for kind in WorkloadKind},
+        default_timeout_seconds=0.01,
+        instance_id="websocket-test",
     )
+    monkeypatch.setattr("app.api.websocket.get_workload_capacity", lambda: capacity)
+
+    async def run_llm_inside_capacity(*_args, **_kwargs):
+        snapshot = await capacity.snapshot()
+        assert snapshot.categories["interactive"].active == 1
+        assert snapshot.tenants[str(handler.tenant_id)].active == 1
+        return "completed reply", [], [], "completed", True
+
+    handler._run_llm_and_stream = run_llm_inside_capacity
     handler._safe_send = AsyncMock()
     save_calls: list[uuid.UUID] = []
 
@@ -163,6 +178,4 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
         "role": "assistant",
         "content": "completed reply",
     }
-    handler._safe_send.assert_awaited_once_with(
-        {"type": "done", "role": "assistant", "content": "completed reply"}
-    )
+    handler._safe_send.assert_awaited_once_with({"type": "done", "role": "assistant", "content": "completed reply"})

@@ -1313,7 +1313,7 @@ async def delete_agent(
     if subagent_audit is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Agents referenced by Subagent audit records cannot be deleted.",
+            detail="被 Subagent 审计记录引用的数字员工不能删除。",
         )
 
     # Stop container and archive files (best effort)

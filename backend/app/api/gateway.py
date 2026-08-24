@@ -10,20 +10,30 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, HTTPException, Depends, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db, async_session
 from app.core.permissions import evaluate_agent_relationship_status
+from app.database import async_session, get_db
 from app.models.agent import Agent
 from app.models.gateway_message import GatewayMessage, GatewaySendReceipt
 from app.models.user import User
 from app.schemas.schemas import (
-    GatewayPollResponse, GatewayMessageOut, GatewayReportRequest,
-    GatewayHistoryItem, GatewayRelationshipItem, GatewaySendMessageRequest,
+    GatewayHistoryItem,
+    GatewayMessageOut,
+    GatewayPollResponse,
+    GatewayRelationshipItem,
+    GatewayReportRequest,
+    GatewaySendMessageRequest,
+)
+from app.services.workload_capacity import (
+    WorkloadKind,
+    WorkloadLease,
+    WorkloadOverloadedError,
+    get_workload_capacity,
 )
 
 router = APIRouter(prefix="/gateway", tags=["gateway"])
@@ -95,9 +105,7 @@ async def _claim_gateway_send(
             request_hash=request_hash,
             status="pending",
         )
-        .on_conflict_do_nothing(
-            index_elements=["source_agent_id", "idempotency_key"]
-        )
+        .on_conflict_do_nothing(index_elements=["source_agent_id", "idempotency_key"])
     )
     # Persist the claim before any external side effect. A crash can therefore
     # leave an explicit in-progress/unknown receipt, but can never silently
@@ -161,6 +169,7 @@ async def _complete_gateway_send_error(
 
 # ─── Poll for messages ──────────────────────────────────
 
+
 @router.get("/poll", response_model=GatewayPollResponse)
 async def poll_messages(
     x_api_key: str = Header(..., alias="X-Api-Key"),
@@ -208,6 +217,7 @@ async def poll_messages(
         history = []
         if msg.conversation_id:
             from app.models.audit import ChatMessage
+
             hist_result = await db.execute(
                 select(ChatMessage)
                 .where(ChatMessage.conversation_id == msg.conversation_id)
@@ -219,49 +229,47 @@ async def poll_messages(
                 # Resolve sender name for each history message
                 h_sender = None
                 if getattr(h, "sender_user_id", None):
-                    r = await db.execute(
-                        select(User.display_name).where(User.id == h.sender_user_id)
-                    )
+                    r = await db.execute(select(User.display_name).where(User.id == h.sender_user_id))
                     h_sender = r.scalar_one_or_none()
                 elif getattr(h, "sender_agent_id", None):
-                    r = await db.execute(
-                        select(Agent.name).where(Agent.id == h.sender_agent_id)
-                    )
+                    r = await db.execute(select(Agent.name).where(Agent.id == h.sender_agent_id))
                     h_sender = r.scalar_one_or_none()
-                history.append(GatewayHistoryItem(
-                    role=h.role,
-                    content=h.content or "",
-                    sender_name=h_sender,
-                    sender_user_id=getattr(h, "sender_user_id", None),
-                    sender_agent_id=getattr(h, "sender_agent_id", None),
-                    created_at=h.created_at,
-                ))
+                history.append(
+                    GatewayHistoryItem(
+                        role=h.role,
+                        content=h.content or "",
+                        sender_name=h_sender,
+                        sender_user_id=getattr(h, "sender_user_id", None),
+                        sender_agent_id=getattr(h, "sender_agent_id", None),
+                        created_at=h.created_at,
+                    )
+                )
 
-        out.append(GatewayMessageOut(
-            id=msg.id,
-            conversation_id=msg.conversation_id,
-            sender_agent_name=sender_agent_name,
-            sender_agent_id=msg.sender_agent_id,
-            sender_user_name=sender_user_name,
-            sender_user_id=str(msg.sender_user_id) if msg.sender_user_id else None,
-            content=msg.content,
-            created_at=msg.created_at,
-            history=history,
-        ))
+        out.append(
+            GatewayMessageOut(
+                id=msg.id,
+                conversation_id=msg.conversation_id,
+                sender_agent_name=sender_agent_name,
+                sender_agent_id=msg.sender_agent_id,
+                sender_user_name=sender_user_name,
+                sender_user_id=str(msg.sender_user_id) if msg.sender_user_id else None,
+                content=msg.content,
+                created_at=msg.created_at,
+                history=history,
+            )
+        )
 
     # Fetch agent relationships for context
-    from app.models.org import AgentRelationship, AgentAgentRelationship
-    from app.services.recipient_resolver import load_human_recipient_profiles
     from sqlalchemy.orm import selectinload
+
+    from app.models.org import AgentAgentRelationship, AgentRelationship
+    from app.services.recipient_resolver import load_human_recipient_profiles
 
     rel_items = []
     human_items: dict[uuid.UUID, GatewayRelationshipItem] = {}
 
     # Human relationships (with available channels)
-    h_result = await db.execute(
-        select(AgentRelationship)
-        .where(AgentRelationship.agent_id == agent.id)
-    )
+    h_result = await db.execute(select(AgentRelationship).where(AgentRelationship.agent_id == agent.id))
     human_relationships = list(h_result.scalars().all())
     profiles = await load_human_recipient_profiles(db, agent, human_relationships)
     for r in human_relationships:
@@ -291,19 +299,22 @@ async def poll_messages(
     for r in a_result.scalars().all():
         status_info = await evaluate_agent_relationship_status(db, r)
         if r.target_agent and status_info["access_status"] == "active":
-            rel_items.append(GatewayRelationshipItem(
-                display_name=r.target_agent.name,
-                agent_id=r.target_agent.id,
-                role=r.relation,
-                description=r.description or None,
-                channels=["agent"],
-            ))
+            rel_items.append(
+                GatewayRelationshipItem(
+                    display_name=r.target_agent.name,
+                    agent_id=r.target_agent.id,
+                    role=r.relation,
+                    description=r.description or None,
+                    channels=["agent"],
+                )
+            )
 
     await db.commit()
     return GatewayPollResponse(messages=out, relationships=rel_items)
 
 
 # ─── Report results ─────────────────────────────────────
+
 
 @router.post("/report")
 async def report_result(
@@ -318,10 +329,12 @@ async def report_result(
     agent = await _get_agent_by_key(x_api_key, db)
 
     result = await db.execute(
-        select(GatewayMessage).where(
+        select(GatewayMessage)
+        .where(
             GatewayMessage.id == body.message_id,
             GatewayMessage.agent_id == agent.id,
-        ).with_for_update()
+        )
+        .with_for_update()
     )
     msg = result.scalar_one_or_none()
     if not msg:
@@ -341,19 +354,18 @@ async def report_result(
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
         from app.models.participant import Participant
+
         # Look up OpenClaw agent's participant_id
-        part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == agent.id))
+        part_r = await db.execute(
+            select(Participant).where(Participant.type == "agent", Participant.ref_id == agent.id)
+        )
         participant = part_r.scalar_one_or_none()
 
         # A gateway client may retry /report. Persist one stable reply row so
         # the same remote event cannot enqueue a second on_message execution.
         report_event_key = f"gateway-report:{msg.id}"
         assistant_msg = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.external_event_key == report_event_key
-                )
-            )
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == report_event_key))
         ).scalar_one_or_none()
         if assistant_msg is None:
             assistant_msg = ChatMessage(
@@ -394,8 +406,7 @@ async def report_result(
                 sender_agent_id=agent.id,
                 content=body.result,
                 status="pending",
-                conversation_id=msg.conversation_id
-                or f"gw_agent_{msg.sender_agent_id}_{agent.id}",
+                conversation_id=msg.conversation_id or f"gw_agent_{msg.sender_agent_id}_{agent.id}",
             )
         )
 
@@ -405,11 +416,15 @@ async def report_result(
     if body.result and msg.conversation_id and msg.sender_user_id:
         try:
             from app.api.websocket import manager
-            await manager.send_message(str(agent.id), {
-                "type": "done",
-                "role": "assistant",
-                "content": body.result,
-            })
+
+            await manager.send_message(
+                str(agent.id),
+                {
+                    "type": "done",
+                    "role": "assistant",
+                    "content": body.result,
+                },
+            )
         except Exception:
             pass  # User may have disconnected
 
@@ -420,6 +435,7 @@ async def report_result(
 
 
 # ─── Heartbeat ──────────────────────────────────────────
+
 
 @router.post("/heartbeat")
 async def heartbeat(
@@ -439,6 +455,28 @@ async def heartbeat(
 # Track background tasks to prevent garbage collection
 _background_tasks: set = set()
 
+
+async def _gateway_native_tenant_id(target_agent_id: str) -> uuid.UUID:
+    """Resolve one durable tenant key without retaining a database session."""
+
+    target_id = uuid.UUID(str(target_agent_id))
+    async with async_session() as db:
+        tenant_id = await db.scalar(select(Agent.tenant_id).where(Agent.id == target_id))
+    return tenant_id or target_id
+
+
+async def _run_gateway_native_turn_with_lease(
+    lease: WorkloadLease,
+    *args,
+) -> None:
+    """Keep an already-admitted permit for exactly one native Gateway turn."""
+
+    try:
+        await _send_to_agent_background(*args)
+    finally:
+        await lease.release()
+
+
 async def _send_to_agent_background(
     source_agent_id: str,
     source_agent_name: str,
@@ -451,16 +489,16 @@ async def _send_to_agent_background(
     source_event_id: str,
 ):
     """Background task: invoke target agent LLM and write reply to gateway_messages.
-    
+
     Accepts plain values (not ORM objects) to avoid stale session references
     since this runs after the request's DB session has closed.
     """
     logger.info(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
     try:
-        from app.services.llm import call_llm
-        from app.models.llm import LLMModel
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
+        from app.models.llm import LLMModel
+        from app.services.llm import call_llm
 
         async with async_session() as db:
             # Load target agent's LLM model
@@ -479,6 +517,7 @@ async def _send_to_agent_background(
             # Create or find a ChatSession for this agent pair
             # Use deterministic UUID so the same pair always gets the same session
             import uuid as _uuid
+
             _ns = _uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
             # Sort IDs so session is the same regardless of who initiates
             session_agent_id = min(source_agent_id, target_agent_id, key=str)
@@ -487,12 +526,11 @@ async def _send_to_agent_background(
             conv_id = str(session_uuid)
 
             # Find or create the ChatSession
-            existing = await db.execute(
-                select(ChatSession).where(ChatSession.id == session_uuid)
-            )
+            existing = await db.execute(select(ChatSession).where(ChatSession.id == session_uuid))
             session = existing.scalar_one_or_none()
             if not session:
                 from datetime import datetime, timezone
+
                 session = ChatSession(
                     id=session_uuid,
                     agent_id=session_agent_id,
@@ -509,6 +547,7 @@ async def _send_to_agent_background(
                 # Migrate any existing messages from old gw_agent_ format
                 old_conv_id = f"gw_agent_{source_agent_id}_{target_agent_id}"
                 from sqlalchemy import update
+
                 await db.execute(
                     update(ChatMessage)
                     .where(ChatMessage.conversation_id == old_conv_id)
@@ -518,8 +557,8 @@ async def _send_to_agent_background(
 
             # Update last_message_at
             from datetime import datetime, timezone
-            session.last_message_at = datetime.now(timezone.utc)
 
+            session.last_message_at = datetime.now(timezone.utc)
 
             # Agent-to-agent communication context (injected as prefix to user message
             # since call_llm builds the full system prompt internally)
@@ -541,6 +580,7 @@ async def _send_to_agent_background(
             hist_msgs = list(reversed(hist_result.scalars().all()))
 
             from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
+
             messages = _conv(hist_msgs)
 
             # Add the new message with agent communication context
@@ -548,13 +588,17 @@ async def _send_to_agent_background(
             messages.append({"role": "user", "content": user_msg})
 
             from app.models.participant import Participant
-            
+
             # Lookup participants for both agents
-            src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == source_agent_id))
-            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
+            src_part_r = await db.execute(
+                select(Participant).where(Participant.type == "agent", Participant.ref_id == source_agent_id)
+            )
+            tgt_part_r = await db.execute(
+                select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id)
+            )
             src_participant = src_part_r.scalar_one_or_none()
             tgt_participant = tgt_part_r.scalar_one_or_none()
-            
+
             from app.services.chat_history import ingest_incoming_chat_message
 
             ingested = await ingest_incoming_chat_message(
@@ -579,6 +623,7 @@ async def _send_to_agent_background(
 
         # Call LLM
         collected = []
+
         async def on_chunk(text):
             collected.append(text)
 
@@ -601,7 +646,9 @@ async def _send_to_agent_background(
             from app.models.participant import Participant
             from app.services.chat_history import lock_turn_anchor_for_finalization
 
-            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
+            tgt_part_r = await db.execute(
+                select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id)
+            )
             tgt_participant = tgt_part_r.scalar_one_or_none()
             await lock_turn_anchor_for_finalization(
                 db,
@@ -649,6 +696,7 @@ async def _send_to_agent_background(
     except Exception as e:
         logger.error(f"[Gateway] send_to_agent_background failed: {e}")
         import traceback
+
         traceback.print_exc()
 
 
@@ -667,8 +715,9 @@ async def send_message(
     channel_hint = (body.channel or "").strip().lower()
 
     # 1. Try to find target as another Agent, limited to active relationships.
-    from app.models.org import AgentAgentRelationship
     from sqlalchemy.orm import selectinload
+
+    from app.models.org import AgentAgentRelationship
 
     target_agent = None
     if body.agent_id:
@@ -700,14 +749,12 @@ async def send_message(
 
     receipt_id = None
     if target_agent:
-        receipt_id, replay = await _claim_gateway_send(
-            db, agent.id, body, x_idempotency_key
-        )
+        receipt_id, replay = await _claim_gateway_send(db, agent.id, body, x_idempotency_key)
         if replay is not None:
             return replay
         conv_id = f"gw_agent_{agent.id}_{target_agent.id}"
 
-        if getattr(target_agent, 'agent_type', None) == 'openclaw':
+        if getattr(target_agent, "agent_type", None) == "openclaw":
             # OpenClaw-to-OpenClaw: write to gateway_messages directly
             gw_msg = GatewayMessage(
                 agent_id=target_agent.id,
@@ -736,15 +783,39 @@ async def send_message(
             _tgt_role = target_agent.role_description or ""
             _tgt_creator = str(target_agent.creator_id) if target_agent.creator_id else ""
             await db.commit()
-            source_event_id = (
-                f"{agent.id}:{x_idempotency_key}"[:500]
-                if x_idempotency_key
-                else str(uuid.uuid4())
+            tenant_id = await _gateway_native_tenant_id(_tgt_id)
+            try:
+                capacity_lease = await get_workload_capacity().acquire(
+                    WorkloadKind.PROJECT,
+                    tenant_id,
+                )
+            except WorkloadOverloadedError as exc:
+                detail = {
+                    "code": "gateway_capacity_busy",
+                    "retryable": True,
+                    "message": "Gateway agent capacity is busy. Please retry shortly.",
+                }
+                await _complete_gateway_send_error(db, receipt_id, 503, detail)
+                raise HTTPException(
+                    status_code=503,
+                    detail=detail,
+                    headers={"Retry-After": str(max(1, round(exc.timeout_seconds)))},
+                ) from exc
+            source_event_id = f"{agent.id}:{x_idempotency_key}"[:500] if x_idempotency_key else str(uuid.uuid4())
+            task = asyncio.create_task(
+                _run_gateway_native_turn_with_lease(
+                    capacity_lease,
+                    _src_id,
+                    _src_name,
+                    _tgt_id,
+                    _tgt_name,
+                    _tgt_model,
+                    _tgt_role,
+                    _tgt_creator,
+                    content,
+                    source_event_id,
+                )
             )
-            task = asyncio.create_task(_send_to_agent_background(
-                _src_id, _src_name, _tgt_id, _tgt_name,
-                _tgt_model, _tgt_role, _tgt_creator, content, source_event_id,
-            ))
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
             response = {
@@ -759,24 +830,18 @@ async def send_message(
     if not body.user_id:
         raise HTTPException(status_code=422, detail="user_id or agent_id is required")
 
-    user_result = await db.execute(
-        select(User).where(User.id == body.user_id, User.tenant_id == agent.tenant_id)
-    )
+    user_result = await db.execute(select(User).where(User.id == body.user_id, User.tenant_id == agent.tenant_id))
     target_user = user_result.scalar_one_or_none()
     if not target_user:
         raise HTTPException(status_code=404, detail="user_id not found in agent tenant")
-    receipt_id, replay = await _claim_gateway_send(
-        db, agent.id, body, x_idempotency_key
-    )
+    receipt_id, replay = await _claim_gateway_send(db, agent.id, body, x_idempotency_key)
     if replay is not None:
         return replay
 
     from app.services.agent_tools import _send_channel_message, _send_platform_message
 
     if channel_hint in {"platform", "web"}:
-        send_result = await _send_platform_message(
-            agent.id, {"user_id": str(body.user_id), "message": content}
-        )
+        send_result = await _send_platform_message(agent.id, {"user_id": str(body.user_id), "message": content})
         selected_channel = "platform"
     else:
         send_args = {"user_id": str(body.user_id), "message": content}
@@ -790,6 +855,7 @@ async def send_message(
         raise HTTPException(status_code=400, detail=send_result)
     if send_result.startswith("{"):
         import json as _json
+
         try:
             structured = _json.loads(send_result)
         except ValueError:
@@ -809,6 +875,7 @@ async def send_message(
 
 # ─── Setup guide ────────────────────────────────────────
 
+
 @router.get("/setup-guide/{agent_id}")
 async def get_setup_guide(
     agent_id: uuid.UUID,
@@ -823,9 +890,11 @@ async def get_setup_guide(
 
     # Resolve base URL dynamically using tenant fallback chain
     from app.core.domain import resolve_base_url
+
     base_url = await resolve_base_url(db, request=request, tenant_id=str(agent.tenant_id))
 
     from app.config import get_settings as _gs
+
     platform_name = _gs().PLATFORM_NAME
 
     skill_content = f"""---

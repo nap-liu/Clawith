@@ -141,7 +141,12 @@ async def test_resolve_admits_privileged_viewer_as_read_only():
     viewer_id = uuid.uuid4()
     session_id = uuid.uuid4()
     agent = SimpleNamespace(id=uuid.uuid4(), creator_id=uuid.uuid4())
-    other_session = SimpleNamespace(id=session_id, source_channel="dingtalk", user_id=owner_id)
+    other_session = SimpleNamespace(
+        id=session_id,
+        source_channel="dingtalk",
+        user_id=owner_id,
+        im_config={},
+    )
 
     h = _handler()
     h.session_id_param = str(session_id)
@@ -167,7 +172,12 @@ async def test_resolve_rejects_unprivileged_viewer():
     viewer_id = uuid.uuid4()
     session_id = uuid.uuid4()
     agent = SimpleNamespace(id=uuid.uuid4(), creator_id=uuid.uuid4())
-    other_session = SimpleNamespace(id=session_id, source_channel="dingtalk", user_id=owner_id)
+    other_session = SimpleNamespace(
+        id=session_id,
+        source_channel="dingtalk",
+        user_id=owner_id,
+        im_config={},
+    )
 
     h = _handler()
     h.session_id_param = str(session_id)
@@ -192,7 +202,12 @@ async def test_resolve_owner_is_writable_not_read_only():
     owner_id = uuid.uuid4()
     session_id = uuid.uuid4()
     agent = SimpleNamespace(id=uuid.uuid4(), creator_id=uuid.uuid4())
-    own_session = SimpleNamespace(id=session_id, source_channel="dingtalk", user_id=owner_id)
+    own_session = SimpleNamespace(
+        id=session_id,
+        source_channel="dingtalk",
+        user_id=owner_id,
+        im_config={},
+    )
 
     h = _handler()
     h.session_id_param = str(session_id)
@@ -212,6 +227,34 @@ async def test_resolve_owner_is_writable_not_read_only():
     assert h.read_only is False, "the owner keeps full read/write access"
 
 
+async def test_resolve_honors_session_level_read_only_for_owner():
+    owner_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    agent = SimpleNamespace(id=uuid.uuid4(), creator_id=owner_id)
+    planning_session = SimpleNamespace(
+        id=session_id,
+        source_channel="web",
+        user_id=owner_id,
+        im_config={"read_only": True, "planning_transport": "project_group"},
+    )
+
+    h = _handler()
+    h.session_id_param = str(session_id)
+    h.agent_id = agent.id
+    h.read_only = False
+    h.websocket = _FakeWS()
+
+    conv = await h._resolve_chat_session(
+        _db_returning(planning_session),
+        owner_id,
+        viewer=SimpleNamespace(id=owner_id, role="member"),
+        agent=agent,
+    )
+
+    assert conv == str(session_id)
+    assert h.read_only is True
+
+
 # ── 3. message_loop blocks sends from a read-only monitor ─────────────────────
 
 
@@ -225,6 +268,6 @@ async def test_read_only_monitor_send_is_refused():
     with pytest.raises(WebSocketDisconnect):
         await h.message_loop()
 
-    assert any(
-        m.get("type") == "error" and "只读" in (m.get("content") or "") for m in h.websocket.sent
-    ), "a read-only monitor that tries to send must get refused, never drive a turn"
+    assert any(m.get("type") == "error" and "只读" in (m.get("content") or "") for m in h.websocket.sent), (
+        "a read-only monitor that tries to send must get refused, never drive a turn"
+    )

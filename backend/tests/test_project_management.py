@@ -29,6 +29,7 @@ from app.services.project_git_service import (
     commit_project_changes,
     create_branch,
     initialize_project_repo,
+    inspect_project_directory,
     list_project_files,
     project_commit_diff,
     restore_as_new_commit,
@@ -184,7 +185,7 @@ def test_git_commands_trust_only_the_exact_managed_repository(tmp_path, monkeypa
 
 
 async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatch):
-    async def fake_git(_project):
+    async def fake_git(_project, **_kwargs):
         return {"mode": "managed", "head": "a" * 40, "default_branch": "main"}
 
     monkeypatch.setattr("app.services.project_git_service.initialize_project_repo", fake_git)
@@ -217,7 +218,7 @@ async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatc
 
 
 async def test_run_freezes_member_and_effective_capability_snapshots(db, monkeypatch):
-    async def fake_git(_project):
+    async def fake_git(_project, **_kwargs):
         return {"mode": "managed", "head": "b" * 40, "default_branch": "main"}
 
     monkeypatch.setattr("app.services.project_git_service.initialize_project_repo", fake_git)
@@ -297,9 +298,19 @@ async def test_managed_git_restore_creates_new_commit_without_rewriting(tmp_path
         success_criteria=["restore commit"],
         settings={"git": {"mode": "managed"}},
     )
-    initial = await initialize_project_repo(project)
+    initial = await initialize_project_repo(
+        project,
+        author_name="Project Owner",
+        author_email="user-owner@project.local",
+    )
     repo = tmp_path / "_projects" / str(project.tenant_id) / str(project.id) / "repo"
-    written = await write_project_file(project, "deliverables/result.md", "# Result\n\nTraceable.\n")
+    written = await write_project_file(
+        project,
+        "deliverables/result.md",
+        "# Result\n\nTraceable.\n",
+        author_name="Research Agent",
+        author_email="agent-research@project.local",
+    )
     assert written["commit"] != initial["head"]
     files = await list_project_files(project)
     assert next(item for item in files if item["path"] == "deliverables/result.md")["preview"].startswith("# Result")
@@ -311,14 +322,60 @@ async def test_managed_git_restore_creates_new_commit_without_rewriting(tmp_path
     assert git_metadata.value.status_code == 422
 
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
-    changed = await commit_project_changes(project, "Change README", ["README.md"])
+    changed = await commit_project_changes(
+        project,
+        "Change README",
+        ["README.md"],
+        author_name="Architecture Agent",
+        author_email="agent-architecture@project.local",
+    )
     changed_head = changed["commit"]
 
-    milestone = await commit_project_changes(project, "Delivery milestone", milestone=True)
+    milestone = await commit_project_changes(
+        project,
+        "Delivery milestone",
+        milestone=True,
+        operation_key="delivery-v1",
+        author_name="QA Agent",
+        author_email="agent-qa@project.local",
+    )
     assert milestone["commit"] != changed_head
     assert milestone["changed"] is False
 
-    restored = await restore_as_new_commit(project, initial["head"])
+    subprocess.check_call(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Legacy milestone",
+            "-m",
+            "Clawith-Milestone-Operation: legacy-delivery-v1",
+        ]
+    )
+    legacy_commit = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    legacy_replay = await commit_project_changes(
+        project,
+        "Legacy milestone replay",
+        milestone=True,
+        operation_key="legacy-delivery-v1",
+        author_name="QA Agent",
+        author_email="agent-qa@project.local",
+    )
+    assert legacy_replay["idempotent_replay"] is True
+    assert legacy_replay["commit"] == legacy_commit
+
+    restored = await restore_as_new_commit(
+        project,
+        initial["head"],
+        author_name="Project Owner",
+        author_email="user-owner@project.local",
+    )
     assert restored["commit"] not in {initial["head"], changed_head, milestone["commit"]}
     assert (repo / "README.md").read_text(encoding="utf-8").startswith("# Git Project")
     branch = await create_branch(project, "review/restore", initial["head"])
@@ -327,6 +384,41 @@ async def test_managed_git_restore_creates_new_commit_without_rewriting(tmp_path
         subprocess.check_output(["git", "-C", str(repo), "rev-parse", "review/restore"], text=True).strip()
         == initial["head"]
     )
+    expected_authors = {
+        initial["head"]: "Project Owner <user-owner@project.local>",
+        written["commit"]: "Research Agent <agent-research@project.local>",
+        changed["commit"]: "Architecture Agent <agent-architecture@project.local>",
+        milestone["commit"]: "QA Agent <agent-qa@project.local>",
+        restored["commit"]: "Project Owner <user-owner@project.local>",
+    }
+    for commit, expected_author in expected_authors.items():
+        assert (
+            subprocess.check_output(
+                ["git", "-C", str(repo), "show", "-s", "--format=%an <%ae>", commit],
+                text=True,
+            ).strip()
+            == expected_author
+        )
+    assert (
+        subprocess.check_output(
+            ["git", "-C", str(repo), "config", "user.name"],
+            text=True,
+        ).strip()
+        == "项目负责人"
+    )
+    assert (
+        subprocess.check_output(
+            ["git", "-C", str(repo), "config", "user.email"],
+            text=True,
+        ).strip()
+        == "project@project.local"
+    )
+    milestone_body = subprocess.check_output(
+        ["git", "-C", str(repo), "show", "-s", "--format=%B", milestone["commit"]],
+        text=True,
+    )
+    assert "Project-Milestone-Operation: delivery-v1" in milestone_body
+    assert "Clawith-Milestone-Operation" not in milestone_body
 
 
 async def test_project_git_diff_is_bounded_path_safe_and_handles_root_commit(tmp_path, monkeypatch):
@@ -394,6 +486,47 @@ async def test_project_git_diff_is_bounded_path_safe_and_handles_root_commit(tmp
     assert unreachable.value.status_code == 422
 
 
+async def test_project_directory_archive_rejects_limits_traversal_and_symlinks(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.project_git_service.get_settings",
+        lambda: SimpleNamespace(STORAGE_LOCAL_ROOT=str(tmp_path)),
+    )
+    project = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        name="Archive Project",
+        description="Safe ZIP",
+        goal="Download tracked evidence",
+        success_criteria=[],
+        settings={"git": {"mode": "managed"}},
+    )
+    await initialize_project_repo(project)
+    repo = tmp_path / "_projects" / str(project.tenant_id) / str(project.id) / "repo"
+    (repo / "deliverables").mkdir()
+    (repo / "deliverables" / "report.txt").write_text("tracked evidence", encoding="utf-8")
+    _git(repo, "add", "--", "deliverables/report.txt")
+    _git(repo, "commit", "-m", "Add archive evidence")
+    snapshot = await inspect_project_directory(project, "deliverables")
+    assert snapshot["file_count"] == 1
+    assert snapshot["total_size"] == len("tracked evidence")
+
+    with pytest.raises(HTTPException) as traversal:
+        await inspect_project_directory(project, "../deliverables")
+    assert traversal.value.status_code == 422
+    monkeypatch.setattr("app.services.project_git_service.PROJECT_DIRECTORY_ARCHIVE_MAX_BYTES", 4)
+    with pytest.raises(HTTPException) as too_large:
+        await inspect_project_directory(project, "deliverables")
+    assert too_large.value.status_code == 413
+    monkeypatch.setattr("app.services.project_git_service.PROJECT_DIRECTORY_ARCHIVE_MAX_BYTES", 100 * 1024 * 1024)
+
+    (repo / "deliverables" / "linked-secret").symlink_to("../README.md")
+    _git(repo, "add", "--", "deliverables/linked-secret")
+    _git(repo, "commit", "-m", "Add unsafe symlink fixture")
+    with pytest.raises(HTTPException) as symlink:
+        await inspect_project_directory(project, "deliverables")
+    assert symlink.value.status_code == 422
+
+
 def test_project_router_exposes_closed_loop_contract():
     from app.api.projects import router
 
@@ -410,6 +543,9 @@ def test_project_router_exposes_closed_loop_contract():
         "/projects/{project_id}/a2a",
         "/projects/{project_id}/settings",
         "/projects/{project_id}/files",
+        "/projects/{project_id}/files/archive",
+        "/projects/{project_id}/files/archive/raw",
+        "/projects/{project_id}/files/preview/{ticket}/{path:path}",
         "/projects/{project_id}/git/commit",
         "/projects/{project_id}/git/diff",
         "/projects/{project_id}/git/restore",

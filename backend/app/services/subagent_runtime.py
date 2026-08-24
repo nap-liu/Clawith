@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import uuid
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
@@ -19,6 +20,11 @@ from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE, Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.subagent_run import SubagentRun
+from app.services.workload_capacity import (
+    WorkloadKind,
+    WorkloadOverloadedError,
+    get_workload_capacity,
+)
 
 SUBAGENT_CHANNEL = "subagent"
 SUBAGENT_INPUT = "subagent_input"
@@ -43,6 +49,8 @@ TERMINAL_STATUSES = frozenset({RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED})
 
 LEASE_SECONDS = 60
 WORKER_CONCURRENCY = 4
+PROJECT_LEADER_BATCH_MAX_REPLIES = 12
+PROJECT_LEADER_BATCH_MAX_BYTES = 24 * 1024
 
 settings = get_settings()
 _running_tasks: dict[uuid.UUID, asyncio.Task] = {}
@@ -66,6 +74,81 @@ def _message_meta(row: ChatMessage) -> dict:
 
 def _run_owned_by_parent(run: SubagentRun, parent_session_id: uuid.UUID) -> bool:
     return run.parent_session_id == parent_session_id
+
+
+async def _project_accepts_new_subagent_anchor(
+    db,
+    run: SubagentRun,
+    *,
+    initializing_project_run_id: uuid.UUID | None = None,
+) -> bool:
+    """Lock and check the authoritative project switch before new work starts.
+
+    An already-processing anchor may finish after a project is paused.  Every
+    pending anchor, however, must cross this project-row lock before becoming
+    processing so the pause transaction has one deterministic boundary.
+    """
+    if run.project_id is None:
+        return True
+
+    from app.models.project import Project, ProjectRun
+
+    project = await db.get(Project, run.project_id, with_for_update=True)
+    if project is None:
+        return False
+    if project.status == "running":
+        return True
+    if project.status != "initializing" or initializing_project_run_id is None:
+        return False
+    trigger_type = await db.scalar(
+        select(ProjectRun.trigger_type).where(
+            ProjectRun.id == initializing_project_run_id,
+            ProjectRun.project_id == run.project_id,
+        )
+    )
+    return trigger_type == "leader_kickoff"
+
+
+async def _subagent_workload_tenant_id(run_id: uuid.UUID) -> str:
+    """Resolve project-first admission scope without retaining a DB session."""
+    from app.models.project import Project
+
+    async with async_session() as db:
+        run = await db.get(SubagentRun, run_id)
+        child = await db.get(ChatSession, run_id)
+        if run is None or child is None:
+            return str(run_id)
+        project = await db.get(Project, run.project_id) if run.project_id else None
+        agent = await db.get(Agent, child.agent_id) if child.agent_id else None
+        for owner in (project, agent):
+            if owner is None:
+                continue
+            for field in ("company_id", "tenant_id"):
+                value = getattr(owner, field, None)
+                if value:
+                    return str(value)
+        return str(run.project_id or child.agent_id or run_id)
+
+
+async def _requeue_capacity_blocked_subagent(
+    run_id: uuid.UUID,
+    anchor_id: uuid.UUID,
+) -> None:
+    """Return a claimed turn to the durable queue after admission times out."""
+    async with async_session() as db:
+        run = await db.get(SubagentRun, run_id, with_for_update=True)
+        anchor = await db.get(ChatMessage, anchor_id, with_for_update=True)
+        if run is None or anchor is None or run.status != RUN_RUNNING or run.lease_owner != settings.INSTANCE_ID:
+            return
+        meta = _message_meta(anchor)
+        if meta.get("subagent_input_state") == INPUT_PROCESSING:
+            meta["subagent_input_state"] = INPUT_PENDING
+            meta["turn_status"] = "pending"
+            anchor.message_meta = meta
+        run.status = RUN_QUEUED
+        run.lease_owner = None
+        run.lease_expires_at = None
+        await db.commit()
 
 
 async def _agent_participates(db, session: ChatSession, agent_id: uuid.UUID) -> bool:
@@ -341,6 +424,7 @@ async def create_subagent(
         project_member = None
         project_capabilities: list[dict] = []
         project_tool_policy_snapshot: dict = {}
+        agent_runtime_workspace_snapshot: dict[str, str] = {}
         if parent.project_id is not None:
             from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 
@@ -389,6 +473,18 @@ async def create_subagent(
                 if project is not None
                 else {}
             )
+            if str(getattr(agent, "scope", "") or "").strip().lower() == "project":
+                from app.services.agent_runtime_workspace import (
+                    project_agent_runtime_workspace,
+                )
+
+                if project is None or getattr(agent, "project_id", None) != project.id:
+                    raise SubagentError("项目专用 Agent 不能在其他项目中运行。")
+                agent_runtime_workspace_snapshot = project_agent_runtime_workspace(
+                    agent_id=agent.id,
+                    tenant_id=project.tenant_id,
+                    project_id=project.id,
+                ).as_session_config()
 
         task_metadata = dict(input_metadata or {})
         if project is not None and canonical_model is None and not task_metadata.get("model_id"):
@@ -420,9 +516,17 @@ async def create_subagent(
                 ),
                 "membership_revoked": False,
                 "project_role_snapshot": "leader" if project_member and project_member.is_leader else "participant",
+                "project_name_snapshot": project.name if project is not None else "",
+                "project_goal_snapshot": project.goal if project is not None else "",
+                "project_success_criteria_snapshot": list(project.success_criteria or [])
+                if project is not None
+                else [],
+                "project_member_name_snapshot": project_member.name_snapshot if project_member else agent.name,
+                "project_member_role_snapshot": project_member.role_snapshot if project_member else "",
                 "project_tool_policy_snapshot": project_tool_policy_snapshot,
                 "member_config_snapshot": dict(project_member.config_snapshot or {}) if project_member else {},
                 "capability_snapshot": project_capabilities,
+                "agent_runtime_workspace": agent_runtime_workspace_snapshot,
             },
             created_at=now,
             last_message_at=now,
@@ -533,6 +637,13 @@ async def append_subagent_message(
         ).scalar_one_or_none()
         if existing is not None:
             return run.status
+        supplied_metadata = dict(input_metadata or {})
+        if not await _project_accepts_new_subagent_anchor(
+            db,
+            run,
+            initializing_project_run_id=(project_run_id if supplied_metadata.get("project_dispatch") else None),
+        ):
+            raise SubagentError("项目已暂停；恢复项目后才能继续这个工作会话。")
         from app.services.confirmation_service import (
             find_pending_confirmation,
             ignore_pending_confirmation_for_new_input,
@@ -552,7 +663,6 @@ async def append_subagent_message(
                 pending_confirmation,
             )
         now = datetime.now(UTC)
-        supplied_metadata = dict(input_metadata or {})
         if run.project_id is not None and not run.model and not supplied_metadata.get("model_id"):
             from app.models.project import Project
 
@@ -750,9 +860,11 @@ async def prepare_subagent_tools(
     }
     child_tools = [tool for tool in tools if tool.get("function", {}).get("name") not in hidden]
     project_tools: list[dict] = []
+    is_project_runtime = False
     async with async_session() as db:
         child = await db.get(ChatSession, session_id) if session_id else None
         if child is not None and child.source_channel == SUBAGENT_CHANNEL and child.project_id is not None:
+            is_project_runtime = True
             if execution_user_id is None:
                 raise ValueError("Project Subagent tool preparation requires its execution user identity")
             from app.services.project_runtime_tools import (
@@ -796,6 +908,22 @@ async def prepare_subagent_tools(
                 if item.get("function", {}).get("name") not in all_mcp_names
                 or item.get("function", {}).get("name") in allowed_mcp_names
             ]
+            # Project collaboration has one durable, scoped path. Generic
+            # Agent/session messaging bypasses the project member snapshot,
+            # role contract, A2A causality, and project audit trail; exposing
+            # it here caused cross-session delivery failures and mechanical
+            # status notifications instead of professional collaboration.
+            project_collaboration_bypass_tools = {
+                "send_message_to_agent",
+                "send_file_to_agent",
+                "send_message_to_parent",
+                "send_session_message",
+            }
+            child_tools = [
+                item
+                for item in child_tools
+                if item.get("function", {}).get("name") not in project_collaboration_bypass_tools
+            ]
             project_tools = project_runtime_tool_schemas(project, member)
         row = (
             await db.execute(
@@ -805,11 +933,14 @@ async def prepare_subagent_tools(
                     (AgentTool.tool_id == Tool.id) & (AgentTool.agent_id == agent_id),
                 )
                 .where(Tool.name == "send_message_to_parent")
+                .limit(1)
             )
-        ).one_or_none()
+        ).first()
     if project_tools:
         projected_names = {item["function"]["name"] for item in project_tools}
         child_tools = [item for item in child_tools if item.get("function", {}).get("name") not in projected_names]
+    if is_project_runtime:
+        return [*child_tools, *project_tools]
     parent_tool = row[0] if row else None
     if parent_tool is None:
         raise RuntimeError("send_message_to_parent builtin tool is not seeded")
@@ -834,6 +965,8 @@ async def prepare_subagent_tools(
 
 
 async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
+    from app.models.project import Project
+
     now = datetime.now(UTC)
     async with async_session() as db:
         conditions = [
@@ -843,7 +976,16 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
                     SubagentRun.status == RUN_RUNNING,
                     SubagentRun.lease_expires_at < now,
                 ),
-            )
+            ),
+            or_(
+                SubagentRun.project_id.is_(None),
+                exists(
+                    select(Project.id).where(
+                        Project.id == SubagentRun.project_id,
+                        Project.status == "running",
+                    )
+                ),
+            ),
         ]
         if run_id is not None:
             conditions.append(SubagentRun.id == run_id)
@@ -857,6 +999,8 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
             )
         ).scalar_one_or_none()
         if run is None:
+            return None
+        if not await _project_accepts_new_subagent_anchor(db, run):
             return None
         run.status = RUN_RUNNING
         run.lease_owner = settings.INSTANCE_ID
@@ -958,6 +1102,14 @@ async def _load_or_start_input(
             ).scalar_one_or_none()
         if anchor is None:
             run.status = RUN_COMPLETED
+            run.lease_owner = None
+            run.lease_expires_at = None
+            await db.commit()
+            return None
+        if not recovering and not await _project_accepts_new_subagent_anchor(db, run):
+            # Keep the pending input durable and release this worker.  The
+            # canonical claim query will pick it up after the project resumes.
+            run.status = RUN_QUEUED
             run.lease_owner = None
             run.lease_expires_at = None
             await db.commit()
@@ -1178,7 +1330,7 @@ async def _park_subagent_confirmation(
 
 
 async def resume_subagent_after_confirmation(run_id: uuid.UUID) -> bool:
-    """Re-queue and execute one resolved durable child confirmation turn."""
+    """Persist a resolved child confirmation and run it when its project allows."""
     async with async_session() as db:
         run = await db.get(SubagentRun, run_id, with_for_update=True)
         if run is None or run.status in TERMINAL_STATUSES:
@@ -1192,6 +1344,8 @@ async def resume_subagent_after_confirmation(run_id: uuid.UUID) -> bool:
             # The original worker will observe the resolved tool row and queue
             # restart recovery after the caller returns.
             return True
+    # Confirmation resolution is durable even while the project is paused.
+    # The canonical claim boundary leaves it queued until runtime resumes.
     claimed = await _claim_subagent(run_id)
     if claimed is not None:
         await execute_claimed_subagent(claimed)
@@ -1205,9 +1359,16 @@ async def _finish_subagent_turn(
     reply: str,
     failed: bool,
     thinking: str | None = None,
+    reply_quality: dict | None = None,
 ) -> bool:
     """Persist the reply and lifecycle transition behind the same Run lock."""
+    from app.services.active_turns import wait_for_current_turn_stop_resolution
     from app.services.chat_history import persist_assistant_reply_row
+
+    # Resolve a concurrent stop before opening a transaction. Waiting after the
+    # input rows have been mutated can autoflush the anchor and deadlock the
+    # stop transaction that must mark that same row as cancelled.
+    await wait_for_current_turn_stop_resolution()
 
     async with async_session() as db:
         run = await db.get(SubagentRun, run_id, with_for_update=True)
@@ -1230,6 +1391,12 @@ async def _finish_subagent_turn(
             .scalars()
             .all()
         )
+        for row in processed:
+            meta = _message_meta(row)
+            meta["subagent_input_state"] = INPUT_DONE
+            meta["turn_status"] = "completed" if not failed else "failed"
+            row.message_meta = meta
+
         pending_exists = bool(
             (
                 await db.execute(
@@ -1296,6 +1463,7 @@ async def _finish_subagent_turn(
                     "subagent_run_id": str(run.id),
                     "subagent_session_id": str(run.id),
                     "result": content,
+                    **({"reply_quality": reply_quality} if reply_quality else {}),
                 }
                 project_run.error = content if failed else None
                 terminal_event_type = "run.failed" if failed else "run.succeeded"
@@ -1338,6 +1506,7 @@ async def _finish_subagent_turn(
                 "subagent_wake": terminal and run.mode == "async",
                 "attachments": [],
                 "project_run_ids": [str(value) for value in sorted(project_run_ids, key=str)],
+                **({"reply_quality": reply_quality} if reply_quality else {}),
             },
             turn_anchor_id=anchor_id,
         )
@@ -1401,6 +1570,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
         async with _running_tasks_guard:
             _running_tasks[run_id] = current
     current_anchor_id: uuid.UUID | None = None
+    active_turn_capacity: AsyncExitStack | None = None
     try:
         while True:
             claimed_input = await _load_or_start_input(run_id)
@@ -1408,10 +1578,26 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                 return
             anchor, recovering = claimed_input
             current_anchor_id = anchor.id
+            anchor_id = anchor.id
+            anchor_content = anchor.content
+            tenant_id = await _subagent_workload_tenant_id(run_id)
+            active_turn_capacity = AsyncExitStack()
+            try:
+                await active_turn_capacity.enter_async_context(
+                    get_workload_capacity().slot(WorkloadKind.PROJECT, tenant_id)
+                )
+            except WorkloadOverloadedError:
+                await active_turn_capacity.aclose()
+                active_turn_capacity = None
+                await _requeue_capacity_blocked_subagent(run_id, anchor_id)
+                current_anchor_id = None
+                return
             async with async_session() as db:
                 run = await db.get(SubagentRun, run_id)
                 child = await db.get(ChatSession, run_id)
                 if run is None or child is None:
+                    await active_turn_capacity.aclose()
+                    active_turn_capacity = None
                     return
                 agent = await _validate_execution_identity(db, run, child)
                 ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
@@ -1438,52 +1624,90 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     )
                     if history is None:
                         raise RuntimeError("Subagent fresh turn prefix changed")
-                tools = await prepare_subagent_tools(
-                    child.agent_id,
-                    child.id,
-                    execution_user_id=run.execution_user_id,
-                )
-                thinking_parts: list[str] = []
+                child_agent_id = child.agent_id
+                child_session_id = child.id
+                execution_user_id = run.execution_user_id
+                model_name = run.model
+                include_soul = run.soul
+                include_memory = run.memory
+                from app.services.agent_runtime_workspace import resolve_agent_runtime_workspace
 
-                async def _capture_thinking(
-                    text: str,
-                    parts: list[str] = thinking_parts,
-                ) -> None:
-                    if text:
-                        parts.append(str(text))
+                runtime_workspace = resolve_agent_runtime_workspace(
+                    agent_id=agent.id,
+                    agent_scope=getattr(agent, "scope", None),
+                    agent_project_id=getattr(agent, "project_id", None),
+                    tenant_id=agent.tenant_id,
+                    session_project_id=child.project_id,
+                    session_config=dict(child.im_config or {}),
+                )
+
+            tools = await prepare_subagent_tools(
+                child_agent_id,
+                child_session_id,
+                execution_user_id=execution_user_id,
+            )
+            thinking_parts: list[str] = []
+
+            async def _capture_thinking(
+                text: str,
+                parts: list[str] = thinking_parts,
+            ) -> None:
+                if text:
+                    parts.append(str(text))
+
+            async with async_session() as llm_db:
+
+                async def _before_round(
+                    _round: int,
+                    active_anchor_id: uuid.UUID = anchor_id,
+                ) -> list[dict]:
+                    # ``_call_agent_llm`` resolves the Agent, model, scene, and
+                    # anchor through this session before entering the provider
+                    # loop. End that read transaction immediately before every
+                    # network dispatch so concurrent long-running Subagents do
+                    # not pin one database-pool connection each. The session
+                    # factory uses ``expire_on_commit=False``, so the resolved
+                    # ORM values remain valid for the provider call.
+                    if llm_db.in_transaction():
+                        await llm_db.commit()
+                    return await _drain_subagent_inbox(run_id, active_anchor_id)
 
                 reply = await _call_agent_llm(
-                    db,
-                    child.agent_id,
-                    "" if recovering else anchor.content,
+                    llm_db,
+                    child_agent_id,
+                    "" if recovering else anchor_content,
                     session_id=str(run_id),
-                    user_id=run.execution_user_id,
+                    user_id=execution_user_id,
                     history=history,
                     recovery_hint=None,
                     continue_turn=recovering,
                     recovery_mode=recovering,
-                    turn_anchor_id=anchor.id,
+                    turn_anchor_id=anchor_id,
                     turn_type="subagent",
-                    model_name=run.model,
-                    include_soul=run.soul,
-                    include_memory=run.memory,
+                    model_name=model_name,
+                    include_soul=include_soul,
+                    include_memory=include_memory,
                     prepared_tools=tools,
                     on_thinking=_capture_thinking,
-                    before_round=lambda _round, aid=anchor.id: _drain_subagent_inbox(run_id, aid),
+                    before_round=_before_round,
                     before_tool_execution=lambda: _assert_subagent_running(run_id),
                     # Exact-session drawers are subscribers, never a second
                     # execution runtime.  Reuse the unified channel bridge for
                     # standard thinking/chunk/tool/done packets while this
                     # durable worker remains the sole model caller.
                     broadcast_web=True,
+                    runtime_session=child,
+                    runtime_workspace=runtime_workspace,
                 )
             if not str(reply or "").strip() and await _park_subagent_confirmation(
                 run_id,
-                anchor.id,
+                anchor_id,
             ):
                 # ``request_confirmation`` is a standard suspended tool call.
                 # Its ChatMessage row is the durable continuation point; this
                 # worker only releases the child lease.
+                await active_turn_capacity.aclose()
+                active_turn_capacity = None
                 return
             reply_text = str(reply or "")
             failed = (
@@ -1496,13 +1720,77 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                 )
                 or (reply_text.startswith("⚠️ ") and "未配置 LLM 模型" in reply_text)
             )
+            reply_quality: dict | None = None
+            if child.project_id is not None and not failed:
+                from app.services.project_reply_quality import (
+                    assess_project_reply,
+                    build_project_reply_correction_prompt,
+                )
+
+                assessment = assess_project_reply(reply_text)
+                if assessment.needs_correction:
+                    correction_history = [dict(message) for message in history]
+                    if not recovering:
+                        correction_history.append({"role": "user", "content": anchor_content})
+                    correction_history.append({"role": "assistant", "content": reply_text})
+                    project_runtime = dict(child.im_config or {})
+                    correction_prompt = build_project_reply_correction_prompt(
+                        reply_text,
+                        role=project_runtime.get("project_member_role_snapshot"),
+                        is_owner=project_runtime.get("project_role_snapshot") == "leader",
+                    )
+                    async with async_session() as correction_db:
+                        corrected_reply = await _call_agent_llm(
+                            correction_db,
+                            child_agent_id,
+                            correction_prompt,
+                            session_id=str(run_id),
+                            user_id=execution_user_id,
+                            history=correction_history,
+                            recovery_hint=None,
+                            continue_turn=False,
+                            # This synthetic correction is already bounded by
+                            # the original frozen context and must not trigger a
+                            # second compaction/recovery branch.
+                            recovery_mode=True,
+                            turn_anchor_id=anchor_id,
+                            turn_type="subagent",
+                            model_name=model_name,
+                            include_soul=include_soul,
+                            include_memory=include_memory,
+                            # Correction may improve prose only. It cannot replay
+                            # tools, drain new inbox input, broadcast another
+                            # stream, or create any project/A2A wake-up.
+                            prepared_tools=[],
+                            on_thinking=_capture_thinking,
+                            before_tool_execution=lambda: _assert_subagent_running(run_id),
+                            broadcast_web=False,
+                            runtime_session=child,
+                            runtime_workspace=runtime_workspace,
+                        )
+                    corrected_text = str(corrected_reply or "").strip()
+                    corrected_failed = (
+                        not corrected_text or is_error_result(corrected_text) or corrected_text.startswith("⚠️ ")
+                    )
+                    if not corrected_failed:
+                        reply = corrected_reply
+                        reply_text = corrected_text
+                    reply_quality = {
+                        "correction_attempted": True,
+                        "correction_applied": not corrected_failed,
+                        "initial_reasons": list(assessment.reasons),
+                        "final_needs_correction": assess_project_reply(reply_text).needs_correction,
+                    }
             terminal = await _finish_subagent_turn(
                 run_id=run_id,
-                anchor_id=anchor.id,
+                anchor_id=anchor_id,
                 reply=reply,
                 failed=failed,
                 thinking="".join(thinking_parts) or None,
+                reply_quality=reply_quality,
             )
+            await active_turn_capacity.aclose()
+            active_turn_capacity = None
             if terminal:
                 return
     except asyncio.CancelledError:
@@ -1585,6 +1873,8 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                         owned.lease_expires_at = None
                         await retry_db.commit()
     finally:
+        if active_turn_capacity is not None:
+            await active_turn_capacity.aclose()
         heartbeat.cancel()
         await asyncio.gather(heartbeat, return_exceptions=True)
         async with _running_tasks_guard:
@@ -1777,6 +2067,34 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
         return list(dict.fromkeys([*rows, *a2a_handoffs]))[:limit]
 
 
+async def _a2a_completion_leader_policy(
+    db,
+    *,
+    project_run,
+    leader_agent_id: uuid.UUID | None,
+    failed: bool,
+) -> tuple[bool, str]:
+    """Wake the owner only for owner-originated work or explicit escalation."""
+    from app.models.project import ProjectWorkItem
+
+    a2a = dict(dict((project_run.input or {}).get("dispatch") or {}).get("a2a") or {})
+    try:
+        from_agent_id = uuid.UUID(str(a2a.get("from_agent_id")))
+    except (TypeError, ValueError):
+        from_agent_id = None
+    if leader_agent_id is not None and from_agent_id == leader_agent_id:
+        return True, "owner_requested_completion"
+    if failed:
+        return True, "failed_completion"
+    if str(a2a.get("mode") or "").strip() == "consult":
+        return True, "decision_consult"
+    if project_run.work_item_id is not None:
+        work_item = await db.get(ProjectWorkItem, project_run.work_item_id)
+        if work_item is not None and work_item.status in {"blocked", "review"}:
+            return True, f"work_item_{work_item.status}"
+    return False, "peer_completion_recorded"
+
+
 async def _materialize_project_a2a_turn(
     *,
     event: ChatMessage,
@@ -1931,9 +2249,9 @@ async def _materialize_project_a2a_turn(
         # Exact A2A is the visible peer-to-peer conversation, but its durable
         # completion must also re-enter the project's coordination loop.  The
         # project group is deliberately append-only: we mirror one final reply
-        # there and mark it pending for the existing coalesced Leader inbox.
-        # This does not resume or broadcast from the A2A Session; several Agent
-        # replies are still consumed by one Leader batch turn.
+        # there. Owner-originated work and explicit decision/blocking gates enter
+        # the coalesced owner inbox; ordinary peer completion stays observable
+        # without creating an unnecessary owner turn.
         group = (
             await db.execute(
                 select(ChatSession)
@@ -1963,6 +2281,19 @@ async def _materialize_project_a2a_turn(
                     )
                 ).scalar_one_or_none()
                 is_leader_reply = leader_agent_id == child.agent_id
+                should_wake_leader, completion_policy = await _a2a_completion_leader_policy(
+                    db,
+                    project_run=project_run,
+                    leader_agent_id=leader_agent_id,
+                    failed=event_meta.get("kind") == SUBAGENT_FAILURE,
+                )
+                leader_batch_state = (
+                    "ignored_leader_self"
+                    if is_leader_reply
+                    else "pending"
+                    if should_wake_leader
+                    else "observed_peer_completion"
+                )
                 db.add(
                     ChatMessage(
                         agent_id=group.agent_id,
@@ -1982,8 +2313,15 @@ async def _materialize_project_a2a_turn(
                             "source_project_run_ids": [str(value) for value in project_run_ids],
                             "source_a2a_session_id": str(parent.id),
                             "attachments": event_meta.get("attachments", []),
-                            "wake_policy": ("leader_self_no_wake" if is_leader_reply else "leader_batch_pending"),
-                            "leader_batch_state": ("ignored_leader_self" if is_leader_reply else "pending"),
+                            "wake_policy": (
+                                "leader_self_no_wake"
+                                if is_leader_reply
+                                else "leader_batch_pending"
+                                if should_wake_leader
+                                else "peer_completion_no_owner_wake"
+                            ),
+                            "leader_batch_state": leader_batch_state,
+                            "leader_escalation_reason": completion_policy,
                             "default_leader_agent_id": (str(leader_agent_id) if leader_agent_id else None),
                         },
                         created_at=event.created_at,
@@ -2234,6 +2572,8 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         reactions=ChannelReactions(),
         work=_work,
         distributed=True,
+        workload_kind=WorkloadKind.PROJECT,
+        tenant_id=await _subagent_workload_tenant_id(child.id),
     )
     return result != "busy"
 
@@ -2271,6 +2611,371 @@ async def _pending_project_leader_groups(
     return groups
 
 
+async def _resolve_batch_work_item_lineage(
+    db,
+    project_id: uuid.UUID,
+    source_rows: list[ChatMessage],
+) -> tuple[uuid.UUID | None, list[uuid.UUID]]:
+    """Resolve only exact structured Run lineage for a coalesced reply batch.
+
+    A batch receives one ``work_item_id`` only when every source reply maps to
+    the same single project work item. Mixed, missing, malformed, or
+    cross-project references remain deliberately unbound; their valid related
+    work items are still retained as a set for traceability.
+    """
+    from app.models.project import ProjectRun
+
+    row_run_ids: list[list[uuid.UUID] | None] = []
+    all_run_ids: set[uuid.UUID] = set()
+    for row in source_rows:
+        raw_ids = _message_meta(row).get("source_project_run_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            row_run_ids.append(None)
+            continue
+        parsed: list[uuid.UUID] = []
+        malformed = False
+        for raw_id in raw_ids:
+            try:
+                parsed.append(uuid.UUID(str(raw_id)))
+            except (TypeError, ValueError):
+                malformed = True
+                break
+        if malformed or not parsed:
+            row_run_ids.append(None)
+            continue
+        row_run_ids.append(parsed)
+        all_run_ids.update(parsed)
+
+    runs = (
+        (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.id.in_(all_run_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if all_run_ids
+        else []
+    )
+    run_by_id = {run.id: run for run in runs}
+    related_work_item_ids = sorted(
+        {run.work_item_id for run in runs if run.work_item_id is not None},
+        key=str,
+    )
+    row_work_item_ids: list[uuid.UUID] = []
+    for run_ids in row_run_ids:
+        if run_ids is None or any(run_id not in run_by_id for run_id in run_ids):
+            return None, related_work_item_ids
+        work_item_ids = {run_by_id[run_id].work_item_id for run_id in run_ids}
+        if None in work_item_ids or len(work_item_ids) != 1:
+            return None, related_work_item_ids
+        row_work_item_ids.append(next(iter(work_item_ids)))
+    exact_work_item_ids = set(row_work_item_ids)
+    return (
+        next(iter(exact_work_item_ids)) if len(exact_work_item_ids) == 1 else None,
+        related_work_item_ids,
+    )
+
+
+def _batch_row_run_ids(row: ChatMessage) -> list[uuid.UUID]:
+    parsed: list[uuid.UUID] = []
+    raw_ids = _message_meta(row).get("source_project_run_ids")
+    if not isinstance(raw_ids, list):
+        return parsed
+    for raw_id in raw_ids:
+        try:
+            parsed.append(uuid.UUID(str(raw_id)))
+        except (TypeError, ValueError):
+            return []
+    return parsed
+
+
+async def _leader_batch_causal_keys(
+    db,
+    project_id: uuid.UUID,
+    rows: list[ChatMessage],
+) -> dict[uuid.UUID, str]:
+    """Keep unrelated work items and request chains out of one owner turn."""
+    from app.models.project import ProjectRun
+
+    run_ids = {run_id for row in rows for run_id in _batch_row_run_ids(row)}
+    runs = (
+        (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.id.in_(run_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if run_ids
+        else []
+    )
+    run_by_id = {run.id: run for run in runs}
+    keys: dict[uuid.UUID, str] = {}
+    for row in rows:
+        related = [run_by_id[run_id] for run_id in _batch_row_run_ids(row) if run_id in run_by_id]
+        work_item_ids = {run.work_item_id for run in related if run.work_item_id is not None}
+        if len(work_item_ids) == 1:
+            keys[row.id] = f"work-item:{next(iter(work_item_ids))}"
+            continue
+
+        causes: set[str] = set()
+        for run in related:
+            payload = dict(run.input or {})
+            dispatch = dict(payload.get("dispatch") or {})
+            cause = (
+                payload.get("parent_project_run_id")
+                or payload.get("group_message_id")
+                or dispatch.get("turn_anchor_id")
+            )
+            if cause:
+                causes.add(str(cause))
+        if len(causes) == 1:
+            keys[row.id] = f"cause:{next(iter(causes))}"
+            continue
+
+        a2a_session_id = _message_meta(row).get("source_a2a_session_id")
+        keys[row.id] = f"a2a:{a2a_session_id}" if a2a_session_id else f"reply:{row.id}"
+    return keys
+
+
+def _select_leader_batch_rows(
+    rows: list[ChatMessage],
+    causal_keys: dict[uuid.UUID, str],
+) -> list[ChatMessage]:
+    """Select one bounded causal slice while leaving the remainder pending."""
+    if not rows:
+        return []
+    selected: list[ChatMessage] = []
+    selected_bytes = 0
+    first_key = causal_keys[rows[0].id]
+    for row in rows:
+        if causal_keys[row.id] != first_key:
+            continue
+        row_bytes = len(str(row.content or "").encode("utf-8")) + 512
+        if selected and (
+            len(selected) >= PROJECT_LEADER_BATCH_MAX_REPLIES
+            or selected_bytes + row_bytes > PROJECT_LEADER_BATCH_MAX_BYTES
+        ):
+            break
+        selected.append(row)
+        selected_bytes += min(row_bytes, PROJECT_LEADER_BATCH_MAX_BYTES)
+    return selected
+
+
+def _truncate_batch_content(content: str, *, limit: int = PROJECT_LEADER_BATCH_MAX_BYTES) -> str:
+    raw = str(content or "").encode("utf-8")
+    if len(raw) <= limit:
+        return str(content or "")
+    marker = "\n\n[内容已截断；完整记录保留在原会话]"
+    marker_bytes = marker.encode("utf-8")
+    return raw[: max(0, limit - len(marker_bytes))].decode("utf-8", errors="ignore") + marker
+
+
+def _batch_attachment_refs(value) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    refs: list[dict] = []
+    for attachment in value[:8]:
+        if not isinstance(attachment, dict):
+            continue
+        ref = {
+            key: str(attachment[key])[:256]
+            for key in ("id", "name", "path", "type", "mime_type")
+            if attachment.get(key) is not None
+        }
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+async def _project_work_item_snapshots(
+    db,
+    project_id: uuid.UUID,
+    work_item_ids: list[uuid.UUID],
+) -> list[dict]:
+    """Freeze bounded work-item context for one collaboration dispatch."""
+
+    from app.models.project import ProjectEvent, ProjectWorkItem
+    from app.services.project_collaboration_prompt import normalize_project_work_item_snapshot
+
+    ordered_ids = list(dict.fromkeys(work_item_ids))
+    if not ordered_ids:
+        return []
+    work_items = (
+        (
+            await db.execute(
+                select(ProjectWorkItem).where(
+                    ProjectWorkItem.project_id == project_id,
+                    ProjectWorkItem.id.in_(ordered_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    item_by_id = {item.id: item for item in work_items}
+    dependency_ids: set[uuid.UUID] = set()
+    for item in work_items:
+        for raw_id in list(item.dependency_ids or [])[:12]:
+            try:
+                dependency_ids.add(uuid.UUID(str(raw_id)))
+            except (TypeError, ValueError):
+                continue
+    dependencies = (
+        (
+            await db.execute(
+                select(ProjectWorkItem).where(
+                    ProjectWorkItem.project_id == project_id,
+                    ProjectWorkItem.id.in_(dependency_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if dependency_ids
+        else []
+    )
+    dependency_by_id = {item.id: item for item in dependencies}
+    events = (
+        (
+            await db.execute(
+                select(ProjectEvent)
+                .where(
+                    ProjectEvent.project_id == project_id,
+                    ProjectEvent.work_item_id.in_(ordered_ids),
+                    ProjectEvent.event_type == "work_item.updated",
+                )
+                .order_by(ProjectEvent.created_at.desc(), ProjectEvent.id.desc())
+                .limit(max(32, len(ordered_ids) * 24))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    evidence_by_item: dict[uuid.UUID, list[object]] = {item_id: [] for item_id in ordered_ids}
+    for event in events:
+        if event.work_item_id not in evidence_by_item:
+            continue
+        evidence = dict(event.event_metadata or {}).get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for value in evidence:
+            if value not in evidence_by_item[event.work_item_id]:
+                evidence_by_item[event.work_item_id].append(value)
+
+    snapshots: list[dict] = []
+    for item_id in ordered_ids:
+        item = item_by_id.get(item_id)
+        if item is None:
+            continue
+        item_dependencies: list[dict[str, str]] = []
+        for raw_id in list(item.dependency_ids or [])[:12]:
+            try:
+                dependency_id = uuid.UUID(str(raw_id))
+            except (TypeError, ValueError):
+                continue
+            dependency = dependency_by_id.get(dependency_id)
+            item_dependencies.append(
+                {
+                    "id": str(dependency_id),
+                    "title": dependency.title if dependency else "",
+                    "status": dependency.status if dependency else "unknown",
+                }
+            )
+        normalized = normalize_project_work_item_snapshot(
+            {
+                "id": str(item.id),
+                "title": item.title,
+                "description": item.description,
+                "status": item.status,
+                "acceptance_criteria": list(item.acceptance_criteria or []),
+                "dependencies": item_dependencies,
+                "evidence": evidence_by_item.get(item.id, []),
+            }
+        )
+        if normalized is not None:
+            snapshots.append(normalized)
+    return snapshots
+
+
+async def _batch_original_human_request(
+    db,
+    project_id: uuid.UUID,
+    group_session_id: uuid.UUID,
+    source_rows: list[ChatMessage],
+) -> dict[str, str] | None:
+    """Resolve the bounded Human request at the root of a reply batch."""
+
+    from app.models.project import ProjectRun
+    from app.services.project_collaboration_prompt import (
+        PROJECT_HUMAN_REQUEST_MAX_CHARS,
+        bounded_project_text,
+    )
+
+    frontier = {run_id for row in source_rows for run_id in _batch_row_run_ids(row)}
+    visited: set[uuid.UUID] = set()
+    message_ids: set[uuid.UUID] = set()
+    for _depth in range(8):
+        current = frontier - visited
+        if not current:
+            break
+        visited.update(current)
+        runs = (
+            (
+                await db.execute(
+                    select(ProjectRun).where(
+                        ProjectRun.project_id == project_id,
+                        ProjectRun.id.in_(current),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        frontier = set()
+        for run in runs:
+            payload = dict(run.input or {})
+            dispatch = dict(payload.get("dispatch") or {})
+            for raw_message_id in (payload.get("group_message_id"), dispatch.get("turn_anchor_id")):
+                try:
+                    message_ids.add(uuid.UUID(str(raw_message_id)))
+                except (TypeError, ValueError):
+                    continue
+            try:
+                frontier.add(uuid.UUID(str(payload.get("parent_project_run_id"))))
+            except (TypeError, ValueError):
+                continue
+
+    if not message_ids:
+        return None
+    request = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.id.in_(message_ids),
+                ChatMessage.conversation_id == str(group_session_id),
+                ChatMessage.role == "user",
+                ChatMessage.sender_user_id.is_not(None),
+            )
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if request is None:
+        return None
+    return {
+        "message_id": str(request.id),
+        "content": bounded_project_text(request.content, PROJECT_HUMAN_REQUEST_MAX_CHARS),
+    }
+
+
 async def _dispatch_project_leader_batch(
     group_session_id: uuid.UUID,
     *,
@@ -2290,7 +2995,7 @@ async def _dispatch_project_leader_batch(
         group = await db.get(ChatSession, group_session_id, with_for_update=True)
         if group is None or group.source_channel != "project" or group.project_id is None:
             return True
-        project = await db.get(Project, group.project_id)
+        project = await db.get(Project, group.project_id, with_for_update=True)
         leader = (
             await db.execute(
                 select(ProjectMemberSnapshot).where(
@@ -2301,6 +3006,8 @@ async def _dispatch_project_leader_batch(
             )
         ).scalar_one_or_none()
         if project is None or leader is None:
+            return False
+        if project.status != "running":
             return False
 
         claimed = (
@@ -2329,8 +3036,15 @@ async def _dispatch_project_leader_batch(
             project_run = await db.get(ProjectRun, project_run_id)
             if project_run is None:
                 return False
+            persisted_batch_input = dict(project_run.input or {})
+            original_human_request = persisted_batch_input.get("original_human_request")
+            if not isinstance(original_human_request, dict):
+                original_human_request = None
+            work_item_snapshots = persisted_batch_input.get("work_item_snapshots")
+            if not isinstance(work_item_snapshots, list):
+                work_item_snapshots = []
         else:
-            source_rows = (
+            pending_rows = (
                 (
                     await db.execute(
                         select(ChatMessage)
@@ -2348,23 +3062,54 @@ async def _dispatch_project_leader_batch(
                 .scalars()
                 .all()
             )
-            if not source_rows:
+            if not pending_rows:
                 return False
+            causal_keys = await _leader_batch_causal_keys(db, project.id, pending_rows)
+            source_rows = _select_leader_batch_rows(pending_rows, causal_keys)
             batch_id = str(uuid.uuid4())
+            work_item_id, related_work_item_ids = await _resolve_batch_work_item_lineage(
+                db,
+                project.id,
+                source_rows,
+            )
+            original_human_request = await _batch_original_human_request(
+                db,
+                project.id,
+                group.id,
+                source_rows,
+            )
+            work_item_snapshots = await _project_work_item_snapshots(
+                db,
+                project.id,
+                related_work_item_ids,
+            )
             project_run = ProjectRun(
                 tenant_id=project.tenant_id,
                 project_id=project.id,
+                work_item_id=work_item_id,
                 agent_id=leader.agent_id,
                 initiated_by_user_id=project.owner_user_id,
                 status="queued",
                 trigger_type="leader_reply_batch",
                 input={
+                    "title": f"汇总 {len(source_rows)} 条成员回复并推进项目",
                     "group_session_id": str(group.id),
                     "leader_agent_id": str(leader.agent_id),
                     "leader_batch_id": batch_id,
                     "source_group_message_ids": [str(row.id) for row in source_rows],
+                    "related_work_item_ids": [str(value) for value in related_work_item_ids],
+                    "original_human_request": original_human_request,
+                    "work_item_snapshots": work_item_snapshots,
+                    "batch_limits": {
+                        "max_replies": PROJECT_LEADER_BATCH_MAX_REPLIES,
+                        "max_bytes": PROJECT_LEADER_BATCH_MAX_BYTES,
+                    },
                 },
-                output={"group_session_id": str(group.id), "leader_batch_id": batch_id},
+                output={
+                    "group_session_id": str(group.id),
+                    "leader_batch_id": batch_id,
+                    "related_work_item_ids": [str(value) for value in related_work_item_ids],
+                },
             )
             db.add(project_run)
             await db.flush()
@@ -2377,29 +3122,83 @@ async def _dispatch_project_leader_batch(
                     "leader_batch_project_run_id": str(project_run.id),
                     "leader_batch_claimed_at": datetime.now(UTC).isoformat(),
                 }
+        source_agent_ids = {row.sender_agent_id for row in source_rows if row.sender_agent_id is not None}
+        source_members = (
+            (
+                await db.execute(
+                    select(ProjectMemberSnapshot).where(
+                        ProjectMemberSnapshot.project_id == project.id,
+                        ProjectMemberSnapshot.agent_id.in_(source_agent_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if source_agent_ids
+            else []
+        )
+        source_member_by_agent = {member.agent_id: member for member in source_members}
         await db.commit()
 
+    async with async_session() as db:
+        resumed_project = await db.get(Project, project.id)
+        if resumed_project is None or resumed_project.status != "running":
+            return False
+
+    source_content_limit = max(
+        512,
+        (PROJECT_LEADER_BATCH_MAX_BYTES - 8 * 1024) // max(1, len(source_rows)),
+    )
     sources = [
         {
             "group_message_id": str(row.id),
             "source_agent_id": str(row.sender_agent_id) if row.sender_agent_id else None,
+            "source_agent_name": (
+                source_member_by_agent[row.sender_agent_id].name_snapshot
+                if row.sender_agent_id in source_member_by_agent
+                else None
+            ),
+            "source_role_snapshot": (
+                source_member_by_agent[row.sender_agent_id].role_snapshot
+                if row.sender_agent_id in source_member_by_agent
+                else None
+            ),
             "child_message_id": _message_meta(row).get("child_message_id"),
             "subagent_session_id": _message_meta(row).get("subagent_id"),
             "subagent_run_id": _message_meta(row).get("subagent_id"),
             "project_run_ids": _message_meta(row).get("source_project_run_ids", []),
-            "content": row.content,
-            "attachments": _message_meta(row).get("attachments", []),
+            "content": _truncate_batch_content(row.content, limit=source_content_limit),
+            "attachments": _batch_attachment_refs(_message_meta(row).get("attachments", [])),
         }
         for row in source_rows
     ]
-    task = (
-        "Process this coalesced batch of project Agent replies in one Leader turn. "
-        "Update project coordination as needed; do not broadcast or wake anyone unless you explicitly target them.\n"
-        + json.dumps(
-            {"leader_batch_id": batch_id, "group_session_id": str(group_session_id), "replies": sources},
-            ensure_ascii=False,
-        )
+    from app.services.project_collaboration_prompt import build_project_owner_batch_task
+
+    task = build_project_owner_batch_task(
+        batch_id=batch_id,
+        group_session_id=str(group_session_id),
+        replies=sources,
+        original_human_request=original_human_request,
+        work_item_snapshots=work_item_snapshots,
     )
+    if len(task.encode("utf-8")) > PROJECT_LEADER_BATCH_MAX_BYTES:
+        sources = [
+            {
+                **source,
+                "content": _truncate_batch_content(str(source.get("content") or ""), limit=256),
+                "attachments": [],
+            }
+            for source in sources
+        ]
+        task = build_project_owner_batch_task(
+            batch_id=batch_id,
+            group_session_id=str(group_session_id),
+            replies=sources,
+            original_human_request=original_human_request,
+            work_item_snapshots=work_item_snapshots,
+        )
+    if len(task.encode("utf-8")) > PROJECT_LEADER_BATCH_MAX_BYTES:
+        task = _truncate_batch_content(task, limit=PROJECT_LEADER_BATCH_MAX_BYTES)
     async with async_session() as db:
         existing_child = (
             await db.execute(
@@ -2418,6 +3217,15 @@ async def _dispatch_project_leader_batch(
         "leader_batch_id": batch_id,
         "source_group_message_ids": [str(row.id) for row in source_rows],
         "source_replies": sources,
+        "work_item_id": str(project_run.work_item_id) if project_run.work_item_id else None,
+        "related_work_item_ids": list(dict(project_run.input or {}).get("related_work_item_ids") or []),
+        "original_human_request": original_human_request,
+        "work_item_snapshots": work_item_snapshots,
+        "batch_limits": {
+            "max_replies": PROJECT_LEADER_BATCH_MAX_REPLIES,
+            "max_bytes": PROJECT_LEADER_BATCH_MAX_BYTES,
+        },
+        "batch_input_bytes": len(task.encode("utf-8")),
     }
     if existing_child is None:
         durable_run, created = await create_subagent(
@@ -2500,6 +3308,10 @@ async def _dispatch_project_leader_batch(
                 "subagent_session_id": str(child_id),
                 "leader_batch_input_id": str(batch_input.id) if batch_input else None,
                 "source_count": len(delivered_rows),
+                "batch_limits": {
+                    "max_replies": PROJECT_LEADER_BATCH_MAX_REPLIES,
+                    "max_bytes": PROJECT_LEADER_BATCH_MAX_BYTES,
+                },
             }
         attached_project = await db.get(Project, project.id)
         if attached_project is not None:
@@ -2509,6 +3321,7 @@ async def _dispatch_project_leader_batch(
                 "project.agent_reply_batch.dispatched",
                 f"Coalesced {len(delivered_rows)} Agent replies into one Leader turn",
                 actor_agent_id=leader.agent_id,
+                work_item_id=project_run.work_item_id if project_run else None,
                 run_id=project_run.id if project_run else None,
                 metadata={
                     "leader_batch_id": batch_id,
@@ -2517,6 +3330,13 @@ async def _dispatch_project_leader_batch(
                     "leader_batch_input_id": str(batch_input.id) if batch_input else None,
                     "source_group_message_ids": [str(row.id) for row in delivered_rows],
                     "source_count": len(delivered_rows),
+                    "batch_limits": {
+                        "max_replies": PROJECT_LEADER_BATCH_MAX_REPLIES,
+                        "max_bytes": PROJECT_LEADER_BATCH_MAX_BYTES,
+                    },
+                    "related_work_item_ids": (
+                        list(dict(project_run.input or {}).get("related_work_item_ids") or []) if project_run else []
+                    ),
                 },
             )
         await db.commit()
@@ -2535,6 +3355,8 @@ PROJECT_DISPATCH_TRIGGERS = frozenset(
         "retry",
     }
 )
+PROJECT_DISPATCH_BATCH_SIZE = 50
+ProjectDispatchCursor = tuple[datetime, uuid.UUID]
 
 
 async def enqueue_project_a2a_run(
@@ -2548,6 +3370,9 @@ async def enqueue_project_a2a_run(
     message: str,
     mode: str,
     project_run_id: uuid.UUID | None = None,
+    parent_project_run_id: uuid.UUID | None = None,
+    work_item_id: uuid.UUID | None = None,
+    run_title: str | None = None,
 ) -> dict:
     """Queue one exact, project-scoped Agent-to-Agent wake.
 
@@ -2556,7 +3381,13 @@ async def enqueue_project_a2a_run(
     tools, frozen capability policy, membership revocation and durable recovery
     are identical to project-group execution.  No other member is awakened.
     """
-    from app.models.project import Project, ProjectEvent, ProjectMemberSnapshot, ProjectRun
+    from app.models.project import (
+        Project,
+        ProjectEvent,
+        ProjectMemberSnapshot,
+        ProjectRun,
+        ProjectWorkItem,
+    )
     from app.services.project_service import add_event, freeze_run_members
 
     task_text = str(message or "").strip()
@@ -2567,7 +3398,12 @@ async def enqueue_project_a2a_run(
 
     async with async_session() as db:
         project = await db.get(Project, project_id)
+        if project is None:
+            raise SubagentError("项目 A2A 会话或成员作用域已经失效。")
+        if project.status != "running":
+            raise SubagentError("项目已暂停；恢复项目后才能唤醒数字员工。")
         parent = await db.get(ChatSession, a2a_session_id)
+        outbound = await db.get(ChatMessage, outbound_message_id, with_for_update=True)
         members = (
             (
                 await db.execute(
@@ -2582,14 +3418,18 @@ async def enqueue_project_a2a_run(
             .all()
         )
         member_by_agent = {member.agent_id: member for member in members}
+        source_member = member_by_agent.get(from_agent_id)
         target_member = member_by_agent.get(to_agent_id)
         if (
-            project is None
-            or parent is None
+            parent is None
             or parent.project_id != project_id
             or parent.source_channel != "agent"
+            or outbound is None
+            or outbound.conversation_id != str(parent.id)
+            or outbound.sender_agent_id != from_agent_id
             or {parent.agent_id, parent.peer_agent_id} != {from_agent_id, to_agent_id}
             or set(member_by_agent) != {from_agent_id, to_agent_id}
+            or source_member is None
             or target_member is None
         ):
             raise SubagentError("项目 A2A 会话或成员作用域已经失效。")
@@ -2599,21 +3439,61 @@ async def enqueue_project_a2a_run(
             run is None or run.project_id != project_id or run.agent_id != to_agent_id or run.trigger_type != "a2a"
         ):
             raise SubagentError("项目 A2A Run 与当前消息不匹配。")
+        parent_run = await db.get(ProjectRun, parent_project_run_id) if parent_project_run_id else None
+        if parent_project_run_id is not None and (
+            parent_run is None or parent_run.project_id != project_id or parent_run.agent_id != from_agent_id
+        ):
+            raise SubagentError("项目 A2A 父 Run 与当前发送方不匹配。")
+
+        parent_work_item_id = parent_run.work_item_id if parent_run else None
+        resolved_work_item_id = work_item_id or parent_work_item_id or (run.work_item_id if run else None)
+        work_item_title = None
+        work_item_snapshot = None
+        if resolved_work_item_id is not None:
+            work_item = await db.get(ProjectWorkItem, resolved_work_item_id)
+            if work_item is None or work_item.project_id != project_id:
+                raise SubagentError("项目 A2A 工作项不属于当前项目。")
+            work_item_title = work_item.title
+            persisted_snapshot = dict(run.input or {}).get("work_item_snapshot") if run else None
+            if isinstance(persisted_snapshot, dict):
+                work_item_snapshot = persisted_snapshot
+            else:
+                snapshots = await _project_work_item_snapshots(
+                    db,
+                    project_id,
+                    [resolved_work_item_id],
+                )
+                work_item_snapshot = snapshots[0] if snapshots else None
+        if run is not None and work_item_id is not None and run.work_item_id not in {None, work_item_id}:
+            raise SubagentError("项目 A2A Run 与显式工作项不匹配。")
+        parent_title = str(dict(parent_run.input or {}).get("title") or "").strip() if parent_run else ""
+        persisted_title = (
+            str(run_title or "").strip() or parent_title or str(work_item_title or "").strip() or "处理 Agent 协作请求"
+        )[:120]
+        from app.services.project_collaboration_prompt import build_project_a2a_task
+
         dispatch = {
             "group_session_id": str(parent.id),
             "project_member_id": str(target_member.id),
             "turn_anchor_id": str(outbound_message_id),
-            "task": (
-                "You received one explicit project A2A message from another enabled member. "
-                "Handle only this target request. Use project tools for project-scoped changes, "
-                "and never broadcast or wake unrelated Agents.\n\n"
-                f"Message:\n{task_text}"
+            "task": build_project_a2a_task(
+                task_text,
+                source_name=source_member.name_snapshot,
+                source_role=source_member.role_snapshot,
+                target_name=target_member.name_snapshot,
+                target_role=target_member.role_snapshot,
+                work_item_title=str(work_item_title or ""),
+                work_item_snapshot=work_item_snapshot,
             ),
             "a2a": {
                 "session_id": str(parent.id),
                 "message_id": str(outbound_message_id),
                 "from_agent_id": str(from_agent_id),
                 "to_agent_id": str(to_agent_id),
+                "from_agent_name_snapshot": source_member.name_snapshot,
+                "from_agent_role_snapshot": source_member.role_snapshot,
+                "to_agent_name_snapshot": target_member.name_snapshot,
+                "to_agent_role_snapshot": target_member.role_snapshot,
                 "mode": str(mode or "notify"),
             },
         }
@@ -2621,11 +3501,16 @@ async def enqueue_project_a2a_run(
             run = ProjectRun(
                 tenant_id=project.tenant_id,
                 project_id=project.id,
+                work_item_id=resolved_work_item_id,
                 agent_id=to_agent_id,
                 initiated_by_user_id=execution_user_id,
                 status="queued",
                 trigger_type="a2a",
                 input={
+                    "title": persisted_title,
+                    "parent_project_run_id": (str(parent_project_run_id) if parent_project_run_id else None),
+                    "work_item_id": str(resolved_work_item_id) if resolved_work_item_id else None,
+                    "work_item_snapshot": work_item_snapshot,
                     "from_agent_id": str(from_agent_id),
                     "to_agent_id": str(to_agent_id),
                     "message": task_text,
@@ -2644,7 +3529,19 @@ async def enqueue_project_a2a_run(
             await db.flush()
             await freeze_run_members(db, project, run)
         else:
-            run.input = {**dict(run.input or {}), "session_id": str(parent.id), "dispatch": dispatch}
+            run.input = {
+                **dict(run.input or {}),
+                "title": str(dict(run.input or {}).get("title") or persisted_title),
+                "parent_project_run_id": (str(parent_project_run_id) if parent_project_run_id else None),
+                "work_item_id": str(resolved_work_item_id) if resolved_work_item_id else None,
+                "work_item_snapshot": work_item_snapshot,
+                "session_id": str(parent.id),
+                "dispatch": dispatch,
+            }
+            # An explicit work-item reference is the source of truth. Otherwise
+            # inherit the exact parent Run lineage, while preserving a
+            # pre-created API Run's existing work-item association.
+            run.work_item_id = resolved_work_item_id
             run.output = {
                 **dict(run.output or {}),
                 "session_id": str(parent.id),
@@ -2652,6 +3549,11 @@ async def enqueue_project_a2a_run(
                 "session_access_agent_id": str(parent.agent_id),
                 "session_title": parent.title,
             }
+        outbound.message_meta = {
+            **_message_meta(outbound),
+            "project_run_id": str(run.id),
+            "work_item_id": str(run.work_item_id) if run.work_item_id else None,
+        }
         existing_event = (
             await db.execute(
                 select(ProjectEvent.id).where(
@@ -2670,6 +3572,7 @@ async def enqueue_project_a2a_run(
                 actor_agent_id=from_agent_id,
                 from_agent_id=from_agent_id,
                 to_agent_id=to_agent_id,
+                work_item_id=run.work_item_id,
                 run_id=run.id,
                 metadata={
                     "mode": str(mode or "notify"),
@@ -2677,6 +3580,8 @@ async def enqueue_project_a2a_run(
                     "message_id": str(outbound_message_id),
                     "awakened_agent_ids": [str(to_agent_id)],
                     "broadcast": False,
+                    "parent_project_run_id": (str(parent_project_run_id) if parent_project_run_id else None),
+                    "work_item_id": str(run.work_item_id) if run.work_item_id else None,
                 },
             )
         await db.commit()
@@ -2719,7 +3624,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
     )
 
     async with async_session() as db:
-        project_run = await db.get(ProjectRun, project_run_id)
+        project_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
         if project_run is None or project_run.trigger_type not in PROJECT_DISPATCH_TRIGGERS:
             return {"status": "gone"}
         repaired = reconcile_project_run_terminal_state(project_run)
@@ -2738,9 +3643,15 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         task = str(dispatch.get("task") or "").strip()
         if not task:
             return {"status": "not_dispatchable"}
-        project = await db.get(Project, project_run.project_id)
+        project = await db.get(Project, project_run.project_id, with_for_update=True)
         parent = await db.get(ChatSession, group_session_id)
         member = await db.get(ProjectMemberSnapshot, member_id)
+        runtime_ready = project is not None and (
+            project.status == "running"
+            or (project_run.trigger_type == "leader_kickoff" and project.status == "initializing")
+        )
+        if project is not None and not runtime_ready:
+            return {"status": "paused"}
         if (
             project is None
             or parent is None
@@ -2760,6 +3671,29 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
             return {"status": "failed", "error": project_run.error}
         agent_id = member.agent_id
         execution_user_id = project.owner_user_id
+        if project_run.trigger_type == "group_leader_message":
+            group_anchor = await db.get(ChatMessage, anchor_id)
+            explicit_mentions = (
+                {str(value) for value in _message_meta(group_anchor).get("mentions", [])}
+                if group_anchor is not None
+                else set()
+            )
+            if explicit_mentions and str(agent_id) not in explicit_mentions:
+                project_run.status = "cancelled"
+                project_run.finished_at = datetime.now(UTC)
+                project_run.output = {
+                    **dict(project_run.output or {}),
+                    "status": "skipped",
+                    "skip_reason": "explicit_mentions_route_to_specialists",
+                }
+                if group_anchor is not None:
+                    group_anchor.message_meta = {
+                        **_message_meta(group_anchor),
+                        "wake_policy": "structured_mentions_only",
+                        "owner_deferred_until_specialist_result": True,
+                    }
+                await db.commit()
+                return dict(project_run.output)
         existing_child = (
             await db.execute(
                 select(SubagentRun)
@@ -2772,6 +3706,24 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 .limit(1)
             )
         ).scalar_one_or_none()
+        if project_run.status not in TERMINAL_PROJECT_RUN_STATUSES:
+            project_run.status = "running"
+            project_run.started_at = project_run.started_at or datetime.now(UTC)
+            project_run.output = {
+                **dict(project_run.output or {}),
+                "dispatch_claimed_at": dict(project_run.output or {}).get("dispatch_claimed_at")
+                or datetime.now(UTC).isoformat(),
+            }
+        await db.commit()
+
+    async with async_session() as db:
+        current_project = await db.get(Project, project_run.project_id)
+        runtime_ready = current_project is not None and (
+            current_project.status == "running"
+            or (project_run.trigger_type == "leader_kickoff" and current_project.status == "initializing")
+        )
+        if not runtime_ready:
+            return {"status": "paused" if current_project is not None else "gone"}
 
     try:
         created = False
@@ -3011,35 +3963,103 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         return {**dict(project_run.output or {}), "status": project_run.status}
 
 
-async def _pending_project_dispatch_runs() -> list[uuid.UUID]:
-    from app.models.project import ProjectRun
+async def _pending_project_dispatch_batch(
+    *,
+    after: ProjectDispatchCursor | None = None,
+) -> tuple[list[uuid.UUID], ProjectDispatchCursor | None]:
+    from app.models.project import Project, ProjectRun
     from app.services.project_service import reconcile_project_run_terminal_state
 
     async with async_session() as db:
-        rows = (
+        # Repair terminal timestamps independently so stale completed rows can
+        # never consume capacity from the durable dispatch outbox query.
+        repair_rows = (
             (
                 await db.execute(
                     select(ProjectRun)
                     .where(
                         ProjectRun.status.in_(["queued", "running"]),
                         ProjectRun.trigger_type.in_(PROJECT_DISPATCH_TRIGGERS),
+                        ProjectRun.finished_at.is_not(None),
                     )
                     .order_by(ProjectRun.created_at, ProjectRun.id)
-                    .limit(50)
+                    .limit(PROJECT_DISPATCH_BATCH_SIZE)
                 )
             )
             .scalars()
             .all()
         )
-        repaired = sum(reconcile_project_run_terminal_state(row) for row in rows)
+        repaired = sum(reconcile_project_run_terminal_state(row) for row in repair_rows)
         if repaired:
             await db.commit()
-        return [
-            row.id
-            for row in rows
-            if row.finished_at is None
-            if dict((row.input or {}).get("dispatch") or {}) and not dict(row.output or {}).get("subagent_run_id")
-        ]
+
+        # JSON ``as_string`` compiles to JSON_EXTRACT on SQLite and ->> on
+        # PostgreSQL. Applying every durable marker in SQL ensures an arbitrary
+        # number of active, already-dispatched Runs cannot starve newer work.
+        query = (
+            select(ProjectRun.id, ProjectRun.created_at)
+            .join(Project, Project.id == ProjectRun.project_id)
+            .where(
+                or_(
+                    Project.status == "running",
+                    and_(
+                        Project.status == "initializing",
+                        ProjectRun.trigger_type == "leader_kickoff",
+                    ),
+                ),
+                ProjectRun.status.in_(["queued", "running"]),
+                ProjectRun.trigger_type.in_(PROJECT_DISPATCH_TRIGGERS),
+                ProjectRun.finished_at.is_(None),
+                ProjectRun.input["dispatch"]["group_session_id"].as_string().is_not(None),
+                ProjectRun.input["dispatch"]["project_member_id"].as_string().is_not(None),
+                ProjectRun.input["dispatch"]["turn_anchor_id"].as_string().is_not(None),
+                ProjectRun.input["dispatch"]["task"].as_string().is_not(None),
+                ProjectRun.output["subagent_run_id"].as_string().is_(None),
+            )
+        )
+        if after is not None:
+            created_at, run_id = after
+            query = query.where(
+                or_(
+                    ProjectRun.created_at > created_at,
+                    and_(ProjectRun.created_at == created_at, ProjectRun.id > run_id),
+                )
+            )
+        rows = (
+            await db.execute(query.order_by(ProjectRun.created_at, ProjectRun.id).limit(PROJECT_DISPATCH_BATCH_SIZE))
+        ).all()
+        if not rows:
+            return [], None
+        last = rows[-1]
+        return [row.id for row in rows], (last.created_at, last.id)
+
+
+async def _pending_project_dispatch_runs() -> list[uuid.UUID]:
+    pending, _cursor = await _pending_project_dispatch_batch()
+    return pending
+
+
+async def _recover_project_dispatch_outbox_once() -> bool:
+    """Visit every queued dispatch once without retaining a database session."""
+
+    cursor: ProjectDispatchCursor | None = None
+    made_progress = False
+    while True:
+        pending, next_cursor = await _pending_project_dispatch_batch(after=cursor)
+        if not pending:
+            return made_progress
+        for project_run_id in pending:
+            try:
+                result = await dispatch_project_run(project_run_id)
+                made_progress = result.get("status") not in {"gone", "not_dispatchable"} or made_progress
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate each durable outbox row
+                logger.exception(f"[subagent] project dispatch recovery failed run={project_run_id}: {exc}")
+        if len(pending) < PROJECT_DISPATCH_BATCH_SIZE or next_cursor is None:
+            return made_progress
+        cursor = next_cursor
+        await asyncio.sleep(0)
 
 
 async def _subagent_parent_dispatch_loop() -> None:
@@ -3069,13 +4089,11 @@ async def _subagent_parent_dispatch_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - durable claimed batches retry on the next scan
             logger.exception(f"[subagent] project Leader batch dispatch failed: {exc}")
         try:
-            for project_run_id in await _pending_project_dispatch_runs():
-                result = await dispatch_project_run(project_run_id)
-                made_progress = result.get("status") not in {"gone", "not_dispatchable"} or made_progress
+            made_progress = await _recover_project_dispatch_outbox_once() or made_progress
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - queued outbox rows remain retryable
-            logger.exception(f"[subagent] project dispatch recovery failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - daemon must survive transient scan faults
+            logger.exception(f"[subagent] project dispatch scan failed: {exc}")
         if not made_progress:
             await asyncio.sleep(0.5)
 

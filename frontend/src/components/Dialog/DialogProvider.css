@@ -8,7 +8,7 @@
     align-items: center;
     justify-content: center;
     padding: 20px;
-    background: rgba(9, 14, 24, .56);
+    background: var(--overlay-backdrop);
     opacity: 0;
     transition: opacity var(--app-overlay-duration) var(--app-overlay-ease);
 }
@@ -50,7 +50,7 @@
     z-index: 10000;
     display: flex;
     justify-content: flex-end;
-    background: rgba(9, 14, 24, .52);
+    background: var(--overlay-backdrop);
     opacity: 0;
     transition: opacity var(--app-overlay-duration) var(--app-overlay-ease);
 }

@@ -116,6 +116,37 @@ async def test_call_agent_llm_recovery_mode_keeps_supplied_history_and_appends_n
     assert captured["messages"] == history
 
 
+async def test_call_agent_llm_releases_database_before_recovery_dispatch(monkeypatch):
+    """Detached recovery does not reserve a pool connection during provider I/O."""
+    import app.services.llm as llm_module
+    from app.services.channel_llm import _call_agent_llm
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=2)
+    observed: dict[str, bool] = {}
+
+    async with async_session() as db:
+
+        async def fake_failover(**_kwargs):
+            observed["in_transaction"] = db.in_transaction()
+            return "done"
+
+        monkeypatch.setattr(llm_module, "call_llm_with_failover", fake_failover)
+        reply = await _call_agent_llm(
+            db,
+            agent_id=agent_id,
+            user_text="",
+            session_id="",
+            user_id=user_id,
+            history=[{"role": "user", "content": "interrupted"}],
+            continue_turn=True,
+            recovery_mode=True,
+            release_db_before_dispatch=True,
+        )
+
+    assert reply == "done"
+    assert observed == {"in_transaction": False}
+
+
 async def test_call_agent_llm_recovery_mode_never_compacts_or_reloads(monkeypatch):
     """An interrupted turn is never rewritten or replayed during recovery."""
     import app.services.llm as llm_module
@@ -275,12 +306,16 @@ async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(
     assert deliveries == [(agent_id, conv, "markerless recovered")]
     async with async_session() as db:
         rows = (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == conv)
-                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.conversation_id == conv)
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert [row.role for row in rows] == ["user", "assistant"]
     assert rows[-1].content == "markerless recovered"
 
@@ -791,14 +826,18 @@ async def test_resume_turn_continues_from_recoverable_history_and_marks_complete
     }
     async with async_session() as db:
         replies = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == conv,
-                    ChatMessage.role == "assistant",
-                    ChatMessage.content == "resumed reply",
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == conv,
+                        ChatMessage.role == "assistant",
+                        ChatMessage.content == "resumed reply",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(replies) == 1
 
 
@@ -1164,14 +1203,18 @@ async def test_resume_turn_continues_after_completed_tool_call_tail(monkeypatch)
     assert len(delivered) == 1
     async with async_session() as db:
         replies = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == conv,
-                    ChatMessage.role == "assistant",
-                    ChatMessage.content == "final reply after tool",
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == conv,
+                        ChatMessage.role == "assistant",
+                        ChatMessage.content == "final reply after tool",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(replies) == 1
 
 
@@ -1263,10 +1306,7 @@ async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(mo
         )
     ]
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
-    assert (
-        captured["history"][1]["tool_calls"][0]["function"]["name"]
-        == "execute_code_aio"
-    )
+    assert captured["history"][1]["tool_calls"][0]["function"]["name"] == "execute_code_aio"
     assert captured["history"][1]["tool_calls"][0]["id"] == call_id
     assert captured["history"][2]["content"] == "recovered\n"
 
@@ -1279,21 +1319,27 @@ async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(mo
                     .where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
                     .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         ]
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
     assert payloads[1]["result"] == "recovered\n"
     async with async_session() as db:
         replies = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == conv,
-                    ChatMessage.role == "assistant",
-                    ChatMessage.content == "reply after recovered tool",
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == conv,
+                        ChatMessage.role == "assistant",
+                        ChatMessage.content == "reply after recovered tool",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(replies) == 1
 
 
@@ -1387,12 +1433,16 @@ async def test_resume_turn_replays_only_tools_after_current_anchor(monkeypatch):
 
     async with async_session() as db:
         tool_rows = (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
-                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     done_rows = [row for row in tool_rows if json.loads(row.content)["status"] == "done"]
     assert len(done_rows) == 1
     assert json.loads(done_rows[0].content)["call_id"] == "current_call"
@@ -1467,14 +1517,14 @@ async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_me
         (
             "send_feishu_message",
             {"open_id": "ou_x", "text": "hello"},
-                {
-                    "agent_id": agent_id,
-                    "user_id": user_id,
-                    "session_id": conv,
-                    "tool_call_id": call_id,
-                    "turn_anchor_id": anchor_id,
-                    "on_output": None,
-                },
+            {
+                "agent_id": agent_id,
+                "user_id": user_id,
+                "session_id": conv,
+                "tool_call_id": call_id,
+                "turn_anchor_id": anchor_id,
+                "on_output": None,
+            },
         )
     ]
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
@@ -1491,7 +1541,9 @@ async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_me
                     .where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
                     .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         ]
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
@@ -1558,8 +1610,14 @@ async def test_resume_turn_does_not_continue_when_recovered_tool_result_persist_
 
     async with async_session() as db:
         tool_rows = (
-            await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call"))
-        ).scalars().all()
+            (
+                await db.execute(
+                    select(ChatMessage).where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     assert [json.loads(row.content)["status"] for row in tool_rows] == ["running"]
 
@@ -1635,11 +1693,13 @@ async def test_resume_turn_does_not_execute_running_tool_call_from_later_turn(mo
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
-    assert captured["history"] == [{
-        "role": "user",
-        "content": "old interrupted",
-        "attachments": [],
-    }]
+    assert captured["history"] == [
+        {
+            "role": "user",
+            "content": "old interrupted",
+            "attachments": [],
+        }
+    ]
 
 
 async def test_resume_turn_skips_existing_assistant_without_redelivery(monkeypatch):
@@ -1702,14 +1762,18 @@ async def test_resume_turn_skips_existing_assistant_without_redelivery(monkeypat
     assert deliveries == []
     async with async_session() as db:
         assistant_rows = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == conv,
-                    ChatMessage.role == "assistant",
-                    ChatMessage.content == "reply persisted before crash",
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == conv,
+                        ChatMessage.role == "assistant",
+                        ChatMessage.content == "reply persisted before crash",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(assistant_rows) == 1
 
 
@@ -1873,12 +1937,16 @@ async def test_dingtalk_cancelled_turn_preserves_recovery_anchor(monkeypatch):
             )
         ).scalar_one()
         rows = (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == str(session.id))
-                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.conversation_id == str(session.id))
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     assert [(row.role, row.content) for row in rows] == [("user", "recover me after shutdown")]
 
@@ -1918,8 +1986,14 @@ async def test_resume_turn_keeps_processing_when_final_persist_fails(monkeypatch
 
     async with async_session() as db:
         assistant_rows = (
-            await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv, ChatMessage.role == "assistant"))
-        ).scalars().all()
+            (
+                await db.execute(
+                    select(ChatMessage).where(ChatMessage.conversation_id == conv, ChatMessage.role == "assistant")
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert assistant_rows == []
 
 
@@ -1959,7 +2033,13 @@ async def test_resume_turn_suspends_processing_anchor_with_pending_confirmation(
     assert result is False
     async with async_session() as db:
         pending_rows = (
-            await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call"))
-        ).scalars().all()
+            (
+                await db.execute(
+                    select(ChatMessage).where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert len(pending_rows) == 1
     assert json.loads(pending_rows[0].content)["status"] == "pending"

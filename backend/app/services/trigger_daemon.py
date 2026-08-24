@@ -9,45 +9,63 @@ import asyncio
 import ipaddress
 import json as _json
 import uuid
-from datetime import datetime, timezone, timedelta
+from contextlib import AsyncExitStack
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.core.logging_config import new_trace_id
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.project import Project
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
-from app.services.trigger_runtime.evaluator import (
-    handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
-    handle_okr_report_trigger as handle_okr_report_trigger_runtime,
-    mark_trigger_fired as mark_trigger_fired_runtime,
-    mark_trigger_skipped as mark_trigger_skipped_runtime,
-    recover_exact_on_message_events,
-    recover_legacy_on_message_events,
-    should_skip_non_workday as should_skip_non_workday_runtime,
-)
+from app.services.redis_lease_lock import RedisLeaseError
 from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
     enqueue_due_trigger,
     mark_trigger_executions_completed,
 )
-from app.services.trigger_runtime.executions import renew_trigger_execution_leases
 from app.services.trigger_runtime.cron_schedule import (
     CronOccurrence,
     compute_next_trigger_cron_occurrence,
     format_cron_timing_context,
 )
+from app.services.trigger_runtime.evaluator import (
+    handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
+)
+from app.services.trigger_runtime.evaluator import (
+    handle_okr_report_trigger as handle_okr_report_trigger_runtime,
+)
+from app.services.trigger_runtime.evaluator import (
+    mark_trigger_fired as mark_trigger_fired_runtime,
+)
+from app.services.trigger_runtime.evaluator import (
+    mark_trigger_skipped as mark_trigger_skipped_runtime,
+)
+from app.services.trigger_runtime.evaluator import (
+    recover_exact_on_message_events,
+    recover_legacy_on_message_events,
+)
+from app.services.trigger_runtime.evaluator import (
+    should_skip_non_workday as should_skip_non_workday_runtime,
+)
+from app.services.trigger_runtime.executions import renew_trigger_execution_leases
+from app.services.workload_capacity import (
+    WorkloadKind,
+    WorkloadOverloadedError,
+    get_workload_capacity,
+)
 
 TICK_INTERVAL = 15  # seconds
-DEDUP_WINDOW = 30   # seconds — same agent won't be invoked twice within this window
+DEDUP_WINDOW = 30  # seconds — same agent won't be invoked twice within this window
 MIN_POLL_INTERVAL_MINUTES = 5  # minimum poll interval to prevent abuse
 
 # Safety: per-agent on_message fire rate limiter
 _ON_MSG_RATE_WINDOW = 3600  # 1 hour window
-_ON_MSG_RATE_LIMIT = 30     # max on_message fires per agent per hour
+_ON_MSG_RATE_LIMIT = 30  # max on_message fires per agent per hour
 _on_msg_fire_log: dict[uuid.UUID, list[datetime]] = {}  # agent_id -> list of fire timestamps
 
 _last_invoke: dict[object, datetime] = {}
@@ -118,6 +136,7 @@ def _is_private_url(url: str) -> bool:
 
         # Try to resolve hostname and check IP
         import socket
+
         try:
             infos = socket.getaddrinfo(hostname, None)
             for info in infos:
@@ -161,8 +180,7 @@ async def _evaluate_trigger(
                 ):
                     await _mark_trigger_skipped(trigger.id, now)
                     logger.info(
-                        f"[Trigger] Skipped {trigger.name} on non-workday "
-                        f"{occurrence.local_scheduled_for.date()}"
+                        f"[Trigger] Skipped {trigger.name} on non-workday {occurrence.local_scheduled_for.date()}"
                     )
                     return False
                 return True
@@ -209,10 +227,10 @@ async def _evaluate_trigger(
                 try:
                     since_dt = datetime.fromisoformat(since)
                     if (now - since_dt) > timedelta(minutes=10):
-                        return True   # 锁超时, 强制重处理(死锁兜底)
+                        return True  # 锁超时, 强制重处理(死锁兜底)
                 except Exception:
                     pass
-            return False              # 串行: 有活动 session, 等
+            return False  # 串行: 有活动 session, 等
         return len(cfg.get("_webhook_queue") or []) > 0
 
     return False
@@ -229,11 +247,7 @@ def _is_trigger_eligible(trigger: AgentTrigger, now: datetime) -> bool:
         return False
 
     cfg = trigger.config or {}
-    webhook_mode = (
-        cfg.get("webhook_mode", "legacy")
-        if trigger.type == "webhook"
-        else None
-    )
+    webhook_mode = cfg.get("webhook_mode", "legacy") if trigger.type == "webhook" else None
 
     # Cooldown check — queue/merge webhook 绕过(串行锁保证不并发); 其余 type 行为不变
     if trigger.last_fired_at and webhook_mode not in ("queue", "merge"):
@@ -245,11 +259,12 @@ def _is_trigger_eligible(trigger: AgentTrigger, now: datetime) -> bool:
 
 async def _poll_check(trigger: AgentTrigger) -> bool:
     """HTTP poll: fetch URL, extract value via json_path, detect change.
-    
+
     Persists _last_value into the trigger's config JSONB so it survives
     across process restarts.
     """
     import httpx
+
     cfg = trigger.config or {}
     url = cfg.get("url")
     if not url:
@@ -287,12 +302,9 @@ async def _poll_check(trigger: AgentTrigger) -> bool:
         cfg["_last_value"] = current_str
         try:
             from sqlalchemy import update
+
             async with async_session() as db:
-                await db.execute(
-                    update(AgentTrigger)
-                    .where(AgentTrigger.id == trigger.id)
-                    .values(config=cfg)
-                )
+                await db.execute(update(AgentTrigger).where(AgentTrigger.id == trigger.id).values(config=cfg))
                 await db.commit()
         except Exception as e:
             logger.warning(f"Failed to persist poll _last_value for {trigger.name}: {e}")
@@ -334,11 +346,11 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
 
 async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
     """Check if there are new messages matching this trigger.
-    
+
     Supports two modes:
     - from_agent_name: check for agent-to-agent messages
     - from_user_name: check for human user messages (Feishu/Slack/Discord)
-    
+
     Stores the actual message content in trigger.config['_matched_message']
     so the invocation context can include it.
     """
@@ -368,12 +380,11 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
         async with async_session() as db:
             if from_agent_name:
                 # --- Agent-to-agent message check (existing logic) ---
-                from app.models.participant import Participant
                 from app.models.agent import Agent as AgentModel
+                from app.models.participant import Participant
+
                 safe_agent_name = from_agent_name.replace("%", "").replace("_", r"\_")
-                agent_r = await db.execute(
-                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_agent_name}%"))
-                )
+                agent_r = await db.execute(select(AgentModel).where(AgentModel.name.ilike(f"%{safe_agent_name}%")))
                 source_agent = agent_r.scalars().first()
                 if not source_agent:
                     return False
@@ -388,15 +399,19 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 if not from_participant:
                     return False
 
-                from sqlalchemy import cast as sa_cast, String as SaString
+                from sqlalchemy import String as SaString
+                from sqlalchemy import cast as sa_cast
+
                 result = await db.execute(
-                    select(ChatMessage).join(
-                        ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                    ).where(
+                    select(ChatMessage)
+                    .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
+                    .where(
                         ChatMessage.participant_id == from_participant,
                         ChatMessage.created_at > since,
                         ChatMessage.role == "assistant",
-                    ).order_by(ChatMessage.created_at.desc()).limit(1)
+                    )
+                    .order_by(ChatMessage.created_at.desc())
+                    .limit(1)
                 )
                 msg = result.scalar_one_or_none()
                 if not msg:
@@ -408,7 +423,9 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
             elif from_user_name:
                 # --- Human user message check (Feishu/Slack/Discord) ---
                 # Find sessions for this agent from external channels
-                from sqlalchemy import cast as sa_cast, String as SaString
+                from sqlalchemy import String as SaString
+                from sqlalchemy import cast as sa_cast
+
                 from app.models.agent import Agent as AgentModel
 
                 # 0. Get agent for tenant scoping
@@ -417,7 +434,9 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
 
                 # Look up user by display name or username within tenant
                 from sqlalchemy import or_
-                from app.models.user import User, Identity
+
+                from app.models.user import Identity, User
+
                 safe_user_name = from_user_name.replace("%", "").replace("_", r"\_")
                 query = (
                     select(User)
@@ -431,29 +450,31 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 )
                 if agent and agent.tenant_id:
                     query = query.where(User.tenant_id == agent.tenant_id)
-                
+
                 user_r = await db.execute(query)
                 target_user = user_r.scalars().first()
 
                 if target_user:
                     # Find channel sessions for this user with this agent
                     result = await db.execute(
-                        select(ChatMessage).join(
-                            ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                        ).where(
+                        select(ChatMessage)
+                        .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
+                        .where(
                             ChatSession.agent_id == trigger.agent_id,
                             ChatSession.user_id == target_user.id,
                             ChatSession.source_channel.in_(["feishu", "slack", "discord", "web"]),
                             ChatMessage.role == "user",
                             ChatMessage.created_at > since,
-                        ).order_by(ChatMessage.created_at.desc()).limit(1)
+                        )
+                        .order_by(ChatMessage.created_at.desc())
+                        .limit(1)
                     )
                 else:
                     # Fallback: search by session title or message content containing the target name
                     result = await db.execute(
-                        select(ChatMessage).join(
-                            ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                        ).where(
+                        select(ChatMessage)
+                        .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
+                        .where(
                             ChatSession.agent_id == trigger.agent_id,
                             ChatSession.source_channel.in_(["feishu", "slack", "discord", "web"]),
                             ChatMessage.role == "user",
@@ -462,7 +483,9 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
                                 ChatSession.title.ilike(f"%{safe_user_name}%"),
                                 ChatMessage.content.ilike(f"%{safe_user_name}%"),
                             ),
-                        ).order_by(ChatMessage.created_at.desc()).limit(1)
+                        )
+                        .order_by(ChatMessage.created_at.desc())
+                        .limit(1)
                     )
 
                 msg = result.scalar_one_or_none()
@@ -478,6 +501,7 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
 
 
 # ── Agent Invocation ────────────────────────────────────────────────
+
 
 async def _resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTrigger]) -> dict | None:
     """Resolve where a trigger result should be delivered.
@@ -573,11 +597,14 @@ def _audit_webhook_failed(db, agent_id, name, detail):
     """
     try:
         from app.models.audit import AuditLog
-        db.add(AuditLog(
-            agent_id=agent_id,
-            action="webhook_session_failed",
-            details={"trigger_name": name, "payload": str(detail)[:2000]},
-        ))
+
+        db.add(
+            AuditLog(
+                agent_id=agent_id,
+                action="webhook_session_failed",
+                details={"trigger_name": name, "payload": str(detail)[:2000]},
+            )
+        )
     except Exception:
         pass
 
@@ -651,12 +678,10 @@ async def _finalize_invocation_executions(
                     execution_ids,
                 )
         executions = (
-            await db.execute(
-                select(TriggerExecution)
-                .where(TriggerExecution.id.in_(execution_ids))
-                .with_for_update()
-            )
-        ).scalars().all()
+            (await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)).with_for_update()))
+            .scalars()
+            .all()
+        )
         for execution in executions:
             if valid_conversation_id is not None:
                 execution.conversation_id = valid_conversation_id
@@ -679,11 +704,7 @@ async def _finalize_invocation_executions(
             if runtime_trigger.type != "webhook":
                 continue
             stored_trigger = (
-                await db.execute(
-                    select(AgentTrigger)
-                    .where(AgentTrigger.id == runtime_trigger.id)
-                    .with_for_update()
-                )
+                await db.execute(select(AgentTrigger).where(AgentTrigger.id == runtime_trigger.id).with_for_update())
             ).scalar_one_or_none()
             if stored_trigger is not None:
                 _advance_webhook_trigger(db, stored_trigger, reply)
@@ -705,10 +726,8 @@ async def _link_invocation_executions(
         if session is None:
             raise RuntimeError("Origin conversation no longer exists")
         executions = (
-            await db.execute(
-                select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-            )
-        ).scalars().all()
+            (await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))).scalars().all()
+        )
         for execution in executions:
             if session.agent_id != execution.agent_id and session.peer_agent_id != execution.agent_id:
                 raise RuntimeError("Origin conversation belongs to a different agent")
@@ -721,6 +740,15 @@ _ONMESSAGE_TURN_NAMESPACE = uuid.UUID("1cb1fc5c-c7c4-4f02-aa83-fab956557622")
 
 class RetryableOnMessageError(RuntimeError):
     """A durable on_message turn completed locally but delivery should retry."""
+
+
+def _is_retryable_invocation_error(error: Exception) -> bool:
+    """Return whether a durable trigger execution should return to pending."""
+
+    return isinstance(
+        error,
+        (RetryableOnMessageError, WorkloadOverloadedError, RedisLeaseError),
+    )
 
 
 async def _create_failed_trigger_conversation(
@@ -748,8 +776,7 @@ async def _create_failed_trigger_conversation(
             ).scalar_one_or_none()
             names = [trigger.name for trigger in triggers] or ["trigger"]
             source_lines = [
-                f"Trigger: {trigger.name} ({trigger.type})\nReason: {trigger.reason or '-'}"
-                for trigger in triggers
+                f"Trigger: {trigger.name} ({trigger.type})\nReason: {trigger.reason or '-'}" for trigger in triggers
             ]
             now = datetime.now(timezone.utc)
             session = ChatSession(
@@ -762,22 +789,24 @@ async def _create_failed_trigger_conversation(
             )
             db.add(session)
             await db.flush()
-            db.add_all([
-                ChatMessage(
-                    agent_id=agent_id,
-                    conversation_id=str(session.id),
-                    role="user",
-                    content="===== Wake Context =====\n" + "\n---\n".join(source_lines),
-                    participant_id=participant.id if participant else None,
-                ),
-                ChatMessage(
-                    agent_id=agent_id,
-                    conversation_id=str(session.id),
-                    role="assistant",
-                    content=f"Execution failed before completion.\n\n{error}",
-                    participant_id=participant.id if participant else None,
-                ),
-            ])
+            db.add_all(
+                [
+                    ChatMessage(
+                        agent_id=agent_id,
+                        conversation_id=str(session.id),
+                        role="user",
+                        content="===== Wake Context =====\n" + "\n---\n".join(source_lines),
+                        participant_id=participant.id if participant else None,
+                    ),
+                    ChatMessage(
+                        agent_id=agent_id,
+                        conversation_id=str(session.id),
+                        role="assistant",
+                        content=f"Execution failed before completion.\n\n{error}",
+                        participant_id=participant.id if participant else None,
+                    ),
+                ]
+            )
             await db.commit()
             return session.id
     except Exception as persist_error:
@@ -789,7 +818,12 @@ async def _create_failed_trigger_conversation(
         return None
 
 
-async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: AgentTrigger) -> None:
+async def _resume_origin_session_for_on_message(
+    agent_id: uuid.UUID,
+    trigger: AgentTrigger,
+    *,
+    tenant_id: uuid.UUID | str | None = None,
+) -> None:
     """Start one real event turn inside the exact originating ChatSession.
 
     An on_message trigger is a subscription.  The inbound row can therefore
@@ -825,22 +859,16 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
             if origin is None or matched is None:
                 raise RuntimeError("on_message origin or matched message no longer exists")
             owns_origin = origin.agent_id == agent_id or (
-                origin.source_channel == "agent"
-                and agent_id in {origin.agent_id, origin.peer_agent_id}
+                origin.source_channel == "agent" and agent_id in {origin.agent_id, origin.peer_agent_id}
             )
             if not owns_origin:
                 raise RuntimeError("on_message origin session belongs to another agent")
             expected_channel = str(cfg.get("_origin_source_channel") or "").strip()
             if expected_channel and origin.source_channel != expected_channel:
                 raise RuntimeError("on_message origin source channel changed")
-            if (
-                "_origin_external_conv_id" in cfg
-                and origin.external_conv_id != cfg.get("_origin_external_conv_id")
-            ):
+            if "_origin_external_conv_id" in cfg and origin.external_conv_id != cfg.get("_origin_external_conv_id"):
                 raise RuntimeError("on_message origin session generation changed")
-            expected_watch = str(
-                cfg.get("_watch_session_id") or cfg.get("_matched_session_id") or ""
-            )
+            expected_watch = str(cfg.get("_watch_session_id") or cfg.get("_matched_session_id") or "")
             if expected_watch and matched.conversation_id != expected_watch:
                 raise RuntimeError("on_message matched message belongs to another remote session")
 
@@ -856,26 +884,19 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
                 except (TypeError, ValueError) as exc:
                     raise RuntimeError("on_message origin turn anchor is invalid") from exc
                 origin_turn_anchor = await db.get(ChatMessage, origin_turn_anchor_id)
-                if (
-                    origin_turn_anchor is None
-                    or origin_turn_anchor.conversation_id != str(origin.id)
-                ):
+                if origin_turn_anchor is None or origin_turn_anchor.conversation_id != str(origin.id):
                     raise RuntimeError("on_message origin turn anchor changed")
                 completion_query = select(ChatMessage.id).where(
                     ChatMessage.conversation_id == str(origin.id),
                     ChatMessage.role == "assistant",
-                    ChatMessage.message_meta["turn_anchor_id"].as_string()
-                    == str(origin_turn_anchor_id),
-                    ChatMessage.message_meta["turn_status"].as_string()
-                    == "completed",
+                    ChatMessage.message_meta["turn_anchor_id"].as_string() == str(origin_turn_anchor_id),
+                    ChatMessage.message_meta["turn_status"].as_string() == "completed",
                 )
                 completion_id = (
                     await db.execute(completion_query.order_by(ChatMessage.created_at.asc()).limit(1))
                 ).scalar_one_or_none()
                 if completion_id is None:
-                    raise RetryableOnMessageError(
-                        "on_message origin turn has not completed yet"
-                    )
+                    raise RetryableOnMessageError("on_message origin turn has not completed yet")
 
             # Validate the immutable origin envelope before every retry.  A
             # persisted final from an older session generation must never be
@@ -898,15 +919,17 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
             from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
 
             history_agent_id = origin.agent_id if origin.source_channel == "agent" else agent_id
-            trigger_context = cfg.get("_trigger_context") or cfg.get("_set_trigger_context") or {
-                "name": trigger.name,
-                "type": trigger.type,
-                "reason": trigger.reason,
-                "focus_ref": trigger.focus_ref or "",
-                "config": {
-                    key: value for key, value in cfg.items() if not str(key).startswith("_")
-                },
-            }
+            trigger_context = (
+                cfg.get("_trigger_context")
+                or cfg.get("_set_trigger_context")
+                or {
+                    "name": trigger.name,
+                    "type": trigger.type,
+                    "reason": trigger.reason,
+                    "focus_ref": trigger.focus_ref or "",
+                    "config": {key: value for key, value in cfg.items() if not str(key).startswith("_")},
+                }
+            )
             wake_content = (
                 "<on-message-event>\n"
                 "This event wakes the exact session that created the subscription.\n"
@@ -928,9 +951,7 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
                     role="user",
                     content=wake_content,
                     conversation_id=str(origin.id),
-                    external_event_key=(
-                        f"onmessage-wake:{trigger.id}:{matched.id}"[:500]
-                    ),
+                    external_event_key=(f"onmessage-wake:{trigger.id}:{matched.id}"[:500]),
                     message_meta={
                         "kind": "on_message_event",
                         "trigger_id": str(trigger.id),
@@ -989,9 +1010,7 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
                             "direction": "inbound",
                             "source_channel": "agent",
                             "actor_ref": str(
-                                origin_agent_participant.id
-                                if origin_agent_participant is not None
-                                else agent_id
+                                origin_agent_participant.id if origin_agent_participant is not None else agent_id
                             ),
                         }
                     )
@@ -1030,9 +1049,7 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
         async with async_session() as db:
             final_row = await db.get(ChatMessage, final_id)
             final_meta = (
-                final_row.message_meta
-                if final_row is not None and isinstance(final_row.message_meta, dict)
-                else {}
+                final_row.message_meta if final_row is not None and isinstance(final_row.message_meta, dict) else {}
             )
             if final_meta.get("origin_delivery_status") == "delivered":
                 return reply
@@ -1079,6 +1096,8 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
         reactions=ChannelReactions(),
         work=_work_and_deliver,
         distributed=True,
+        workload_kind=WorkloadKind.SCHEDULED,
+        tenant_id=tenant_id or cfg.get("_execution_user_id") or agent_id,
     )
 
 
@@ -1087,14 +1106,13 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
     Creates a Reflection Session and calls the LLM.
     """
-    from app.services.llm import call_llm
-    from app.models.llm import LLMModel
+    from app.core.okr_feature import partition_retired_okr_triggers
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
+    from app.models.llm import LLMModel
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
-
-    from app.core.okr_feature import partition_retired_okr_triggers
+    from app.services.llm import call_llm
 
     retired_triggers, active_triggers = partition_retired_okr_triggers(triggers)
     if retired_triggers:
@@ -1136,8 +1154,10 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     reply: str | None = None
     conversation_id: uuid.UUID | None = None
     lease_heartbeat_task: asyncio.Task | None = None
+    capacity_stack = AsyncExitStack()
 
     if execution_ids:
+
         async def _lease_heartbeat() -> None:
             while True:
                 await asyncio.sleep(60)
@@ -1149,9 +1169,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         lease_heartbeat_task = asyncio.create_task(_lease_heartbeat())
 
     try:
-        configured_execution_users = {
-            trigger.execution_user_id for trigger in triggers if trigger.execution_user_id
-        }
+        configured_execution_users = {trigger.execution_user_id for trigger in triggers if trigger.execution_user_id}
         if len(configured_execution_users) > 1:
             raise RuntimeError("A trigger invocation cannot mix execution users")
         configured_execution_user_id = next(iter(configured_execution_users), None)
@@ -1159,6 +1177,12 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             identity_agent = await identity_db.get(Agent, agent_id)
             if identity_agent is None:
                 raise RuntimeError("Agent is unavailable")
+            from app.services.project_service import project_runtime_allows_agent
+
+            if not await project_runtime_allows_agent(identity_db, identity_agent):
+                invocation_error = "Project runtime is paused"
+                invocation_retryable = True
+                return
             from app.services.execution_identity import resolve_execution_user_id
 
             execution_user_id = await resolve_execution_user_id(
@@ -1166,6 +1190,12 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 identity_agent,
                 configured_execution_user_id,
                 legacy_user_id=identity_agent.creator_id,
+            )
+            tenant_key = (
+                getattr(identity_agent, "company_id", None)
+                or getattr(identity_agent, "tenant_id", None)
+                or execution_user_id
+                or agent_id
             )
 
         if (
@@ -1181,8 +1211,16 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             trigger_config = dict(triggers[0].config or {})
             trigger_config["_execution_user_id"] = str(execution_user_id)
             triggers[0].config = trigger_config
-            await _resume_origin_session_for_on_message(agent_id, triggers[0])
+            await _resume_origin_session_for_on_message(
+                agent_id,
+                triggers[0],
+                tenant_id=tenant_key,
+            )
             return
+
+        # Admission is deliberately outside the identity transaction. A busy
+        # scheduled lane can queue without consuming a database connection.
+        await capacity_stack.enter_async_context(get_workload_capacity().slot(WorkloadKind.SCHEDULED, tenant_key))
 
         async with async_session() as db:
             # Load agent
@@ -1190,6 +1228,10 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             agent = result.scalar_one_or_none()
             if not agent or agent.is_expired:
                 raise RuntimeError("Agent is unavailable or expired")
+            if not await project_runtime_allows_agent(db, agent):
+                invocation_error = "Project runtime is paused"
+                invocation_retryable = True
+                return
             from app.core.okr_feature import is_retired_okr_agent
 
             if await is_retired_okr_agent(db, agent):
@@ -1235,7 +1277,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                     part += (
                         "\nExecution requirements: First call get_okr_settings to confirm whether OKR is enabled. "
                         "If enabled, call generate_monthly_okr_report to generate the OKR monthly report for the month that just ended, "
-                        "then send it to admins or publish it to Plaza. If disabled, state that no action is needed and stop."
+                        "then send it to admins. If disabled, state that no action is needed and stop."
                     )
                 if t.focus_ref:
                     part += f"\nRelated Focus: {t.focus_ref}"
@@ -1244,14 +1286,16 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 if t.type == "cron":
                     part += format_cron_timing_context(cfg, context_executed_at)
                 if t.type == "on_message" and cfg.get("_matched_message"):
-                    part += f"\nMatched message from {cfg.get('_matched_from', '?')}:\n\"{cfg['_matched_message'][:500]}\""
+                    part += (
+                        f'\nMatched message from {cfg.get("_matched_from", "?")}:\n"{cfg["_matched_message"][:500]}"'
+                    )
                 if t.type == "on_message" and cfg.get("okr_member_id") and cfg.get("okr_report_date"):
                     part += (
                         "\nExecution requirements: This is a daily-report reply ingestion event."
                         f"\n1. Organize the other party's reply into a final daily report no longer than 2000 characters."
-                        f"\n2. Immediately call upsert_member_daily_report(report_date=\"{cfg['okr_report_date']}\", "
-                        f"member_type=\"{cfg.get('okr_member_type', 'user')}\", "
-                        f"member_id=\"{cfg['okr_member_id']}\", content=\"<organized daily report>\")."
+                        f'\n2. Immediately call upsert_member_daily_report(report_date="{cfg["okr_report_date"]}", '
+                        f'member_type="{cfg.get("okr_member_type", "user")}", '
+                        f'member_id="{cfg["okr_member_id"]}", content="<organized daily report>").'
                         "\n3. After the tool call succeeds, send a brief confirmation that you received and recorded it."
                         "\n4. Do not only confirm without calling the tool, and do not store the raw long conversation verbatim as the daily report."
                     )
@@ -1279,9 +1323,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                         # rendered set == the deleted set (late arrivals only append
                         # to the tail → never silently dropped).
                         async with async_session() as _wdb:
-                            _wres = await _wdb.execute(
-                                select(AgentTrigger).where(AgentTrigger.id == t.id)
-                            )
+                            _wres = await _wdb.execute(select(AgentTrigger).where(AgentTrigger.id == t.id))
                             _wtrig = _wres.scalar_one_or_none()
                         _fresh_cfg = (_wtrig.config if _wtrig else cfg) or {}
                         _q = _fresh_cfg.get("_webhook_queue") or []
@@ -1338,10 +1380,10 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             db.add(turn_anchor)
             if execution_ids:
                 execution_rows = (
-                    await db.execute(
-                        select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-                    )
-                ).scalars().all()
+                    (await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))))
+                    .scalars()
+                    .all()
+                )
                 for execution in execution_rows:
                     execution.conversation_id = session_id
             await db.commit()
@@ -1380,26 +1422,34 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                         # Store args RAW — this row is replayed into the LLM context;
                         # masking here poisons the model (it copies "******" back into
                         # tool calls). Secrets are masked at output boundaries only.
-                        _tc_db.add(ChatMessage(
-                            agent_id=agent_id,
-                            conversation_id=str(session_id),
-                            role="tool_call",
-                            content=_json.dumps({"name": data["name"], "args": data.get("args")}, ensure_ascii=False, default=str),
-                            user_id=agent.creator_id,
-                            participant_id=agent_participant_id,
-                        ))
+                        _tc_db.add(
+                            ChatMessage(
+                                agent_id=agent_id,
+                                conversation_id=str(session_id),
+                                role="tool_call",
+                                content=_json.dumps(
+                                    {"name": data["name"], "args": data.get("args")}, ensure_ascii=False, default=str
+                                ),
+                                user_id=agent.creator_id,
+                                participant_id=agent_participant_id,
+                            )
+                        )
                     elif data["status"] == "done":
                         # data["result"] is already the bounded llm_view
                         # from tool_output_store.finalize_tool_output.
                         result_str = str(data.get("result", ""))
-                        _tc_db.add(ChatMessage(
-                            agent_id=agent_id,
-                            conversation_id=str(session_id),
-                            role="tool_call",
-                            content=_json.dumps({"name": data["name"], "result": result_str}, ensure_ascii=False, default=str),
-                            user_id=agent.creator_id,
-                            participant_id=agent_participant_id,
-                        ))
+                        _tc_db.add(
+                            ChatMessage(
+                                agent_id=agent_id,
+                                conversation_id=str(session_id),
+                                role="tool_call",
+                                content=_json.dumps(
+                                    {"name": data["name"], "result": result_str}, ensure_ascii=False, default=str
+                                ),
+                                user_id=agent.creator_id,
+                                participant_id=agent_participant_id,
+                            )
+                        )
                     await _tc_db.commit()
             except Exception as e:
                 logger.warning(f"Failed to persist tool call for trigger session: {e}")
@@ -1426,6 +1476,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             cap_thinking,
             lock_turn_anchor_for_finalization,
         )
+
         _capped_thinking = cap_thinking("".join(collected_thinking))
 
         # Compute final reply text once
@@ -1444,19 +1495,21 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 conversation_id=str(session_id),
                 turn_anchor_id=turn_anchor.id,
             )
-            db.add(ChatMessage(
-                agent_id=agent_id,
-                conversation_id=str(session_id),
-                role="assistant",
-                content=final_reply,
-                user_id=agent.creator_id,
-                participant_id=agent_participant.id if agent_participant else None,
-                thinking=_capped_thinking,
-                message_meta={
-                    "turn_anchor_id": str(turn_anchor.id),
-                    "turn_status": "completed",
-                },
-            ))
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    conversation_id=str(session_id),
+                    role="assistant",
+                    content=final_reply,
+                    user_id=agent.creator_id,
+                    participant_id=agent_participant.id if agent_participant else None,
+                    thinking=_capped_thinking,
+                    message_meta={
+                        "turn_anchor_id": str(turn_anchor.id),
+                        "turn_status": "completed",
+                    },
+                )
+            )
 
             # NOTE: trigger state (last_fired_at, fire_count, auto-disable)
             # is already updated in _tick() BEFORE this task was launched,
@@ -1472,9 +1525,11 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 try:
                     async with async_session() as db:
                         from app.models.participant import Participant as _P
+
                         _p_r = await db.execute(select(_P).where(_P.type == "agent", _P.ref_id == agent_id))
                         _p = _p_r.scalar_one_or_none()
                         from app.models.chat_session import ChatSession as _CS
+
                         _cs_r = await db.execute(select(_CS).where(_CS.id == uuid.UUID(a2a_sid)))
                         _cs = _cs_r.scalar_one_or_none()
                         _source_execution_id = str((t.config or {}).get("_execution_id") or "").strip()
@@ -1503,9 +1558,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                             participant_id=_p.id if _p else None,
                             thinking=_capped_thinking,
                             external_event_key=(
-                                f"a2a-inbound:{_source_execution_id}"[:500]
-                                if _source_execution_id
-                                else None
+                                f"a2a-inbound:{_source_execution_id}"[:500] if _source_execution_id else None
                             ),
                             message_meta={
                                 "direction": "inbound",
@@ -1537,6 +1590,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         if final_reply and delivery_target and not delivered_platform_message_via_tool:
             try:
                 from app.api.websocket import manager as ws_manager
+
                 agent_id_str = str(agent_id)
 
                 # Build notification message with trigger badge
@@ -1556,26 +1610,27 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 _is_a2a_wait = any(t.name.startswith("a2a_wait_") for t in triggers)
                 if _is_a2a_wait:
                     import re as _re
+
                     cleaned = final_reply
                     _internal_patterns = [
-                        r'\b(a2a_wait_\w+|a2a_wake)\b',
-                        r'\bwait_?\w+_?(task|reply|followup|meeting|sync|api_key)\w*\b',
-                        r'\bresolve_\w+\b',
-                        r'\bfocus[_ ]?item\b',
-                        r'\btask_delegate\b',
-                        r'\bfocus_ref\b',
-                        r'✅\s*(a2a\w+|wait\w+|触发器\w*|focus\w*).*(?:已取消|已为|保持|活跃|完成状态)[^\n]*',
-                        r'[\-•]\s*(?:触发器|trigger|focus|wait_\w+|a2a\w+).*[^\n]*',
-                        r'(?:触发器|trigger)\s+\S+\s*(?:已取消|保持活跃|已为完成状态|fired)',
-                        r'已静默清理触发器',
-                        r'已静默处理完毕',
-                        r'继续待命[。，]?\s*',
-                        r'，?\s*(?:继续)?待命。',
+                        r"\b(a2a_wait_\w+|a2a_wake)\b",
+                        r"\bwait_?\w+_?(task|reply|followup|meeting|sync|api_key)\w*\b",
+                        r"\bresolve_\w+\b",
+                        r"\bfocus[_ ]?item\b",
+                        r"\btask_delegate\b",
+                        r"\bfocus_ref\b",
+                        r"✅\s*(a2a\w+|wait\w+|触发器\w*|focus\w*).*(?:已取消|已为|保持|活跃|完成状态)[^\n]*",
+                        r"[\-•]\s*(?:触发器|trigger|focus|wait_\w+|a2a\w+).*[^\n]*",
+                        r"(?:触发器|trigger)\s+\S+\s*(?:已取消|保持活跃|已为完成状态|fired)",
+                        r"已静默清理触发器",
+                        r"已静默处理完毕",
+                        r"继续待命[。，]?\s*",
+                        r"，?\s*(?:继续)?待命。",
                     ]
                     for _pat in _internal_patterns:
-                        cleaned = _re.sub(_pat, '', cleaned, flags=_re.IGNORECASE)
-                    cleaned = _re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-                    cleaned = _re.sub(r'[。，]\s*$', '', cleaned).strip()
+                        cleaned = _re.sub(_pat, "", cleaned, flags=_re.IGNORECASE)
+                    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+                    cleaned = _re.sub(r"[。，]\s*$", "", cleaned).strip()
                     if not cleaned:
                         cleaned = final_reply
                 else:
@@ -1588,17 +1643,19 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
                 # Save to the resolved destination session for persistence.
                 async with async_session() as db:
-                    from app.models.chat_session import ChatSession
                     from app.api.websocket import maybe_mark_session_read_for_active_viewer
+                    from app.models.chat_session import ChatSession
 
-                    db.add(ChatMessage(
-                        agent_id=agent_id,
-                        conversation_id=target_session_id,
-                        role="assistant",
-                        content=notification,
-                        user_id=agent.creator_id,
-                        thinking=_capped_thinking,
-                    ))
+                    db.add(
+                        ChatMessage(
+                            agent_id=agent_id,
+                            conversation_id=target_session_id,
+                            role="assistant",
+                            content=notification,
+                            user_id=agent.creator_id,
+                            thinking=_capped_thinking,
+                        )
+                    )
                     session_row = await db.get(ChatSession, uuid.UUID(target_session_id))
                     if session_row:
                         session_row.last_message_at = datetime.now(timezone.utc)
@@ -1626,13 +1683,18 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             except Exception as e:
                 logger.error(f"Failed to push trigger result to WebSocket: {e}")
                 import traceback
+
                 traceback.print_exc()
 
         # Audit log
-        await write_audit_log("trigger_fired", {
-            "agent_name": agent.name,
-            "triggers": [{"name": t.name, "type": t.type} for t in triggers],
-        }, agent_id=agent_id)
+        await write_audit_log(
+            "trigger_fired",
+            {
+                "agent_name": agent.name,
+                "triggers": [{"name": t.name, "type": t.type} for t in triggers],
+            },
+            agent_id=agent_id,
+        )
 
         logger.info(f"⚡ Triggers fired for {agent.name}: {[t.name for t in triggers]}")
 
@@ -1642,7 +1704,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         raise
     except Exception as e:
         invocation_error = str(e)
-        invocation_retryable = isinstance(e, RetryableOnMessageError)
+        invocation_retryable = _is_retryable_invocation_error(e)
         if conversation_id is None and execution_ids and not invocation_retryable:
             conversation_id = await _create_failed_trigger_conversation(
                 agent_id,
@@ -1651,6 +1713,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             )
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
         import traceback
+
         traceback.print_exc()
     finally:
         if lease_heartbeat_task is not None:
@@ -1675,9 +1738,11 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 logger.warning(
                     f"Failed to finalize trigger executions {execution_ids} for agent {agent_id}: {_mark_err}"
                 )
+        await capacity_stack.aclose()
 
 
 # ── Main Tick Loop ──────────────────────────────────────────────────
+
 
 async def _tick():
     """One daemon tick: evaluate all triggers, group by agent, invoke."""
@@ -1686,7 +1751,13 @@ async def _tick():
 
     async with async_session() as db:
         result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.is_enabled.is_(True))
+            select(AgentTrigger)
+            .join(Agent, Agent.id == AgentTrigger.agent_id)
+            .outerjoin(Project, Project.id == Agent.project_id)
+            .where(
+                AgentTrigger.is_enabled.is_(True),
+                or_(Agent.scope != "project", Project.status == "running"),
+            )
         )
         all_triggers = result.scalars().all()
         # Expunge each object before session.close() is called.
@@ -1698,7 +1769,6 @@ async def _tick():
 
     if not all_triggers:
         return
-
 
     # Evaluate and enqueue due triggers. Agent invocation happens only after
     # executions are claimed through the distributed execution queue.
@@ -1727,16 +1797,8 @@ async def _tick():
                 handled = await _handle_okr_report_trigger(
                     trigger,
                     now,
-                    scheduled_for=(
-                        cron_occurrence.scheduled_for
-                        if cron_occurrence is not None
-                        else None
-                    ),
-                    local_scheduled_for=(
-                        cron_occurrence.local_scheduled_for
-                        if cron_occurrence is not None
-                        else None
-                    ),
+                    scheduled_for=(cron_occurrence.scheduled_for if cron_occurrence is not None else None),
+                    local_scheduled_for=(cron_occurrence.local_scheduled_for if cron_occurrence is not None else None),
                 )
                 if not handled:
                     handled = await _handle_okr_collection_trigger(trigger, now)
@@ -1753,9 +1815,7 @@ async def _tick():
                                 f"Auto-disabling trigger '{trigger.name}'."
                             )
                             async with async_session() as db:
-                                result = await db.execute(
-                                    select(AgentTrigger).where(AgentTrigger.id == trigger.id)
-                                )
+                                result = await db.execute(select(AgentTrigger).where(AgentTrigger.id == trigger.id))
                                 t_obj = result.scalar_one_or_none()
                                 if t_obj:
                                     t_obj.is_enabled = False
@@ -1766,16 +1826,8 @@ async def _tick():
                     await enqueue_due_trigger(
                         trigger,
                         now,
-                        scheduled_for=(
-                            cron_occurrence.scheduled_for
-                            if cron_occurrence is not None
-                            else None
-                        ),
-                        scheduled_timezone=(
-                            cron_occurrence.timezone_name
-                            if cron_occurrence is not None
-                            else None
-                        ),
+                        scheduled_for=(cron_occurrence.scheduled_for if cron_occurrence is not None else None),
+                        scheduled_timezone=(cron_occurrence.timezone_name if cron_occurrence is not None else None),
                     )
         except Exception as e:
             logger.warning(f"Error evaluating trigger {trigger.name}: {e}")
@@ -1810,7 +1862,14 @@ async def _tick():
         asyncio.create_task(_invoke_agent_for_triggers(agent_id, agent_triggers))
 
 
-async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False, a2a_session_id: str | None = None) -> None:
+async def wake_agent_with_context(
+    agent_id: uuid.UUID,
+    message_context: str,
+    *,
+    from_agent_id: uuid.UUID | None = None,
+    skip_dedup: bool = False,
+    a2a_session_id: str | None = None,
+) -> None:
     """Public API: wake an agent asynchronously with a message context.
 
     Creates a synthetic trigger invocation so the agent processes the
@@ -1833,8 +1892,7 @@ async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, 
         current_depth = _A2A_WAKE_CHAIN.get(chain_key, 0)
         if current_depth >= _A2A_MAX_WAKE_DEPTH:
             logger.warning(
-                f"[A2A] Wake chain depth {current_depth} reached for {chain_key}, "
-                f"stopping to prevent wake storm"
+                f"[A2A] Wake chain depth {current_depth} reached for {chain_key}, stopping to prevent wake storm"
             )
             return
 
@@ -1842,14 +1900,14 @@ async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, 
 
         def _decay_chain():
             _A2A_WAKE_CHAIN.pop(chain_key, None)
+
         asyncio.get_running_loop().call_later(_A2A_WAKE_CHAIN_TTL, _decay_chain)
 
     if not skip_dedup and agent_id in _last_invoke:
         elapsed = (now - _last_invoke[agent_id]).total_seconds()
         if elapsed < DEDUP_WINDOW:
             logger.info(
-                f"[A2A] Skipping wake for agent {agent_id} — "
-                f"invoked {elapsed:.0f}s ago (dedup window {DEDUP_WINDOW}s)"
+                f"[A2A] Skipping wake for agent {agent_id} — invoked {elapsed:.0f}s ago (dedup window {DEDUP_WINDOW}s)"
             )
             return
 
@@ -1860,6 +1918,7 @@ async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, 
         try:
             async with async_session() as db:
                 from app.models.agent import Agent as AgentModel
+
                 r = await db.execute(select(AgentModel.name).where(AgentModel.id == from_agent_id))
                 from_agent_name = r.scalar() or ""
         except Exception as e:
@@ -1870,7 +1929,12 @@ async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, 
         agent_id=agent_id,
         name="a2a_wake",
         type="on_message",
-        config={"from_agent_name": from_agent_name, "_matched_message": message_context[:2000], "_matched_from": "agent", "_a2a_session_id": a2a_session_id},
+        config={
+            "from_agent_name": from_agent_name,
+            "_matched_message": message_context[:2000],
+            "_matched_from": "agent",
+            "_a2a_session_id": a2a_session_id,
+        },
         reason=(
             "You received a notification from another agent. "
             "Read the message content above, update your focus and memory if needed, "
@@ -1895,6 +1959,7 @@ async def start_trigger_daemon():
         except Exception as e:
             logger.error(f"Trigger Daemon error: {e}")
             import traceback
+
             traceback.print_exc()
 
         # Run heartbeat check every 4th tick (~60 seconds)
@@ -1904,6 +1969,7 @@ async def start_trigger_daemon():
             _cleanup_stale_invoke_cache()
             try:
                 from app.services.heartbeat import _heartbeat_tick
+
                 await _heartbeat_tick()
             except Exception as e:
                 logger.error(f"Heartbeat tick error: {e}")

@@ -39,14 +39,15 @@ const getCategoryLabels = (t: any): Record<string, string> => ({
     general: t('agent.toolCategories.general'),
     media: t('agent.toolCategories.media', 'Image Generation'),
     pages: t('agent.toolCategories.pages', 'Page Publishing'),
+    project_management: t('agent.toolCategories.projectManagement', 'Project Management'),
     search: t('agent.toolCategories.search'),
     social: t('agent.toolCategories.social', 'Social'),
-    subagent: t('agent.toolCategories.subagent', 'Subagent'),
+    subagent: t('agent.subagentRun.taskFallback', 'Delegated task'),
     task: t('agent.toolCategories.task'),
     custom: t('agent.toolCategories.custom'),
 });
 
-export default function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { agentId: string; agentName?: string; canManage?: boolean }) {
+export default function ToolsManager({ agentId, canManage = false }: { agentId: string; agentName?: string; canManage?: boolean }) {
     const { t } = useTranslation();
     const dialog = useDialog();
     const toast = useToast();
@@ -68,6 +69,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     const [toolSearch, setToolSearch] = useState('');
     const [toolStatusFilter, setToolStatusFilter] = useState<'all' | 'enabled' | 'disabled' | 'configured'>('all');
     const [mcpEditor, setMcpEditor] = useState<{ serverId: string; toolDisplayName: string } | null>(null);
+    const [updatingCategories, setUpdatingCategories] = useState<Set<string>>(() => new Set());
     // Global (company-level) config for the currently open modal — used to show
     // lock hints and prevent agent from overriding company-set fields.
     const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
@@ -110,9 +112,10 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     const toggleTool = async (toolId: string, enabled: boolean) => {
         const previous = tools;
         const selected = tools.find(tool => tool.id === toolId);
+        if (selected?.category === 'project_management') return;
         const affectedToolIds = new Set(
             selected?.category === 'subagent'
-                ? tools.filter(tool => tool.category === 'subagent').map(tool => tool.id)
+                ? tools.filter(tool => tool.category === selected.category).map(tool => tool.id)
                 : [toolId],
         );
         setTools(prev => prev.map(tool => (
@@ -341,9 +344,10 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         general: 'General-purpose platform operations',
         media: 'Image generation through configured model providers',
         pages: 'Publish and manage workspace pages and their access',
+        project_management: 'Review progress and maintain project work, runs, milestones, and workspace assets',
         search: 'Web and knowledge search tools',
         social: 'Social publishing and community workflows',
-        subagent: 'Delegation and multi-round parent-child collaboration',
+        subagent: '',
         custom: 'Company-added or MCP tools',
         task: 'Task planning and management tools',
     };
@@ -353,6 +357,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
             t(`agent.toolCategoryDescriptions.${category}`, defaultValue),
         ]),
     );
+    categoryDescriptions.subagent = t('projectTerminology.meshDescription');
     const renderCategoryIcon = (category: string, size = 15) => {
         const style = { color: 'var(--text-tertiary)' };
         switch (category) {
@@ -383,31 +388,60 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         });
     };
 
-    const bulkToggleCategory = async (catTools: any[], enabled: boolean) => {
+    const bulkToggleCategory = async (category: string, catTools: any[], enabled: boolean) => {
+        if (updatingCategories.has(category)) return;
         const catToolIds = new Set(catTools.filter(t => t.can_disable !== false).map(t => t.id));
         if (catToolIds.size === 0) return;
+        const previousEnabledById = new Map(
+            tools
+                .filter(tool => catToolIds.has(tool.id))
+                .map(tool => [tool.id, !!tool.enabled]),
+        );
+        setUpdatingCategories(prev => new Set(prev).add(category));
         setTools(prev => prev.map(t => catToolIds.has(t.id) ? { ...t, enabled } : t));
         try {
             const token = localStorage.getItem('token');
             const payload = Array.from(catToolIds).map(id => ({ tool_id: id, enabled }));
-            await fetch(`/api/tools/agents/${agentId}`, {
+            const response = await fetch(`/api/tools/agents/${agentId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                 body: JSON.stringify(payload),
             });
+            if (!response.ok) {
+                const body = await response.json().catch(() => null);
+                const detail = typeof body?.detail === 'string'
+                    ? body.detail
+                    : typeof body?.detail?.message === 'string'
+                        ? body.detail.message
+                        : `HTTP ${response.status}`;
+                throw new Error(detail);
+            }
+            await Promise.all([
+                tmQueryClient.invalidateQueries({ queryKey: ['agent', agentId] }),
+                tmQueryClient.invalidateQueries({ queryKey: ['agent-tools', agentId] }),
+            ]);
+            await loadTools();
         } catch (err: any) {
-            console.error('Bulk update failed', err);
-            loadTools();
+            setTools(prev => prev.map(tool => (
+                previousEnabledById.has(tool.id)
+                    ? { ...tool, enabled: previousEnabledById.get(tool.id) }
+                    : tool
+            )));
+            toast.error(t('common.error.batchUpdateFailed', 'Batch update failed'), {
+                details: String(err?.message || err),
+            });
+        } finally {
+            setUpdatingCategories(prev => {
+                const next = new Set(prev);
+                next.delete(category);
+                return next;
+            });
         }
     };
 
     const uninstallMcpGroup = async (serverId: string, label: string, toolCount: number) => {
         const ok = await dialog.confirm(
-            t('agent.tools.confirmRemoveMcpGroup', {
-                name: label,
-                count: toolCount,
-                defaultValue: `Remove all ${toolCount} tools from MCP server "${label}"?`,
-            }),
+            `${t('common.confirmActions.deleteLabel', 'Delete')} “${label}” (${toolCount})?`,
             {
                 title: t('agent.tools.deleteMcpGroupTitle', 'Delete MCP tool group'),
                 danger: true,
@@ -438,11 +472,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
 
     const deleteCompanyMcpGroup = async (serverId: string, label: string, toolCount: number) => {
         const ok = await dialog.confirm(
-            t('agent.tools.confirmDeleteCompanyMcpGroup', {
-                name: label,
-                count: toolCount,
-                defaultValue: `Delete all ${toolCount} company tools from MCP server "${label}"? This affects every agent using this group and cannot be undone.`,
-            }),
+            `${t('common.confirmActions.deleteLabel', 'Delete')} “${label}” · ${t('agent.tools.companyTools', 'Company Tools')} (${toolCount})?`,
             {
                 title: t('agent.tools.deleteCompanyMcpGroupTitle', 'Delete company MCP tool group'),
                 danger: true,
@@ -477,6 +507,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         const isGlobalCategoryConfig = category === 'agentbay' && tool.name === 'agentbay_browser_navigate';
         const toolDisplayName = localizedToolName(tool);
         const toolDescription = localizedToolDescription(tool);
+        const categoryOnlyToggle = category === 'project_management';
         return (
             <div key={tool.id} style={{
                 display: 'grid',
@@ -506,14 +537,14 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                     </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                    {tool.name === 'publish_page' && (
+                    {!categoryOnlyToggle && tool.name === 'publish_page' && (
                         <a
                             href={`/published-pages?agent_id=${encodeURIComponent(agentId)}`}
                             onClick={event => event.stopPropagation()}
                             style={{ border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
                         ><IconFileText size={12} stroke={1.8} /> 管理已发布内容</a>
                     )}
-                    {canManage && tool.type === 'mcp' && tool.mcp_server_id && (
+                    {!categoryOnlyToggle && canManage && tool.type === 'mcp' && tool.mcp_server_id && (
                         <button
                             onClick={(e) => {
                                 e.stopPropagation();
@@ -527,21 +558,18 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                         ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                     )}
                     {/* Non-MCP tools that have a config_schema still use the legacy openConfig path */}
-                    {canManage && hasConfig && !isGlobalCategoryConfig && !(tool.type === 'mcp' && tool.mcp_server_id) && (
+                    {!categoryOnlyToggle && canManage && hasConfig && !isGlobalCategoryConfig && !(tool.type === 'mcp' && tool.mcp_server_id) && (
                         <button
                             onClick={() => openConfig(tool)}
                             style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                            title={t('agent.tools.configurePerAgent', 'Configure per-agent settings')}
+                            title={t('agent.tools.config', 'Config')}
                         ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                     )}
-                    {canManage && tool.source === 'agent' && tool.agent_tool_id && (
+                    {!categoryOnlyToggle && canManage && tool.source === 'agent' && tool.agent_tool_id && (
                         <button
                             onClick={async () => {
                                 const ok = await dialog.confirm(
-                                    t('agent.tools.confirmDelete', {
-                                        name: tool.display_name || tool.name,
-                                        defaultValue: 'Remove "{{name}}" from this agent?',
-                                    }),
+                                    `${t('common.confirmActions.removeLabel', 'Remove')} “${toolDisplayName}”?`,
                                     { danger: true, confirmLabel: t('common.confirmActions.removeLabel') },
                                 );
                                 if (!ok) return;
@@ -559,10 +587,14 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                             }}
                             disabled={deletingToolId === tool.id}
                             style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-tertiary)', opacity: deletingToolId === tool.id ? 0.5 : 1 }}
-                            title={t('agent.tools.removeTool', 'Remove from agent')}
+                            title={t('common.confirmActions.removeLabel', 'Remove')}
                         >{deletingToolId === tool.id ? '...' : '✕'}</button>
                     )}
-                    {tool.can_disable === false ? (
+                    {categoryOnlyToggle ? (
+                        <span style={{ fontSize: '11px', color: tool.enabled ? 'var(--accent-primary)' : 'var(--text-tertiary)', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                            {tool.enabled ? t('common.enabled', 'On') : t('common.disabled', 'Off')}
+                        </span>
+                    ) : tool.can_disable === false ? (
                         <span style={{ fontSize: '11px', color: 'var(--accent-primary)', fontWeight: 600, whiteSpace: 'nowrap' }}>
                             {t('agent.tools.alwaysAvailable', 'Always available')}
                         </span>
@@ -591,6 +623,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
             })
             .map(([category, catTools]) => {
                 const allCatTools = allGroupedTools[category] || catTools;
+                const isProjectManagementGroup = category === 'project_management';
                 const meta = getToolGroupMeta(category, allCatTools);
                 const label = meta.label;
                 const enabledCount = allCatTools.filter((tool: any) => tool.enabled).length;
@@ -599,8 +632,17 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                 const configuredCount = allCatTools.filter((tool: any) => tool.agent_config && Object.keys(tool.agent_config).length > 0).length;
                 const allEnabled = controllableTools.length > 0 && controllableEnabledCount === controllableTools.length;
                 const mixed = controllableEnabledCount > 0 && controllableEnabledCount < controllableTools.length;
+                const updating = updatingCategories.has(category);
                 const expanded = expandedCategories.has(category) || !!toolSearch.trim();
                 const visibleCount = (catTools as any[]).length;
+                const groupContract = allCatTools.find((tool: any) => tool.capability_group)?.capability_group;
+                const groupState = ['disabled', 'partial', 'enabled'].includes(groupContract?.state)
+                    ? String(groupContract.state)
+                    : mixed
+                        ? 'partial'
+                        : allEnabled
+                            ? 'enabled'
+                            : 'disabled';
                 const mcpServerId = allCatTools[0]?.mcp_server_id as string | undefined;
                 const removableMcpGroup = (
                     toolTab === 'installed'
@@ -677,19 +719,25 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                         <span style={{ fontSize: '13px', fontWeight: 650, color: 'var(--text-primary)' }}>{label}</span>
                                         <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                            {t('agent.tools.groupSummary', {
-                                                total: allCatTools.length,
-                                                enabled: enabledCount,
-                                                defaultValue: '{{total}} tools · {{enabled}} enabled',
-                                            })}
-                                            {visibleCount !== allCatTools.length
-                                                ? ` · ${t('agent.tools.groupShown', {
-                                                    count: visibleCount,
-                                                    defaultValue: '{{count}} shown',
-                                                })}`
-                                                : ''}
+                                            {isProjectManagementGroup
+                                                ? String(t(`agent.tools.capabilityGroupStates.${groupState}`, groupState))
+                                                : (
+                                                    <>
+                                                        {t('agent.tools.groupSummary', {
+                                                            total: allCatTools.length,
+                                                            enabled: enabledCount,
+                                                            defaultValue: '{{total}} tools · {{enabled}} enabled',
+                                                        })}
+                                                        {visibleCount !== allCatTools.length
+                                                            ? ` · ${t('agent.tools.groupShown', {
+                                                                count: visibleCount,
+                                                                defaultValue: '{{count}} shown',
+                                                            })}`
+                                                            : ''}
+                                                    </>
+                                                )}
                                         </span>
-                                        {configuredCount > 0 && (
+                                        {!isProjectManagementGroup && configuredCount > 0 && (
                                             <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>
                                                 {t('agent.tools.groupConfigured', {
                                                     count: configuredCount,
@@ -732,7 +780,8 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                     <ToggleSwitch
                                         checked={allEnabled}
                                         mixed={mixed}
-                                        onChange={(checked) => void bulkToggleCategory(allCatTools, checked)}
+                                        disabled={updating}
+                                        onChange={(checked) => void bulkToggleCategory(category, allCatTools, checked)}
                                         ariaLabel={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}
                                         title={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}
                                     />
@@ -741,7 +790,23 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                         </div>
                         {expanded && (
                             <div>
-                                {(catTools as any[]).map((tool: any) => renderToolRow(tool, category))}
+                                {isProjectManagementGroup ? (
+                                    <div style={{
+                                        borderTop: '1px solid var(--border-subtle)',
+                                        padding: '12px 16px 13px 56px',
+                                        color: 'var(--text-secondary)',
+                                        fontSize: '12px',
+                                        lineHeight: 1.6,
+                                        background: 'var(--bg-primary)',
+                                    }}>
+                                        {t(
+                                            'agent.tools.projectManagementScope',
+                                            'Browse projects, follow progress, and coordinate project work.',
+                                        )}
+                                    </div>
+                                ) : (
+                                    (catTools as any[]).map((tool: any) => renderToolRow(tool, category))
+                                )}
                             </div>
                         )}
                     </div>
@@ -795,7 +860,11 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                         className={toolTab === 'installed' ? 'active' : ''}
                         onClick={() => setToolTab('installed')}
                     >
-                        <span>{t('agent.tools.agentInstalled', 'Agent Self-Installed Tools')}</span>
+                        <span>
+                            {t('agent.sessionViewer.digitalEmployee', 'Digital Employee')}
+                            {' · '}
+                            {t('agent.tools.installed', 'Installed')}
+                        </span>
                         <span className="tool-source-tab-count">{agentInstalledTools.length}</span>
                     </button>
                 </div>
@@ -897,7 +966,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                                 <div>
                                     <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}><IconSettings size={20} stroke={1.8} /> {title}</h3>
-                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{isCat ? t('agent.tools.sharedCategoryConfig') : t('agent.tools.perAgentConfig')}</div>
+                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{isCat ? t('agent.tools.sharedCategoryConfig') : t('agent.sessionViewer.digitalEmployee', 'Digital Employee')}</div>
                                 </div>
                                 <button onClick={() => { setConfigTool(null); setConfigCategory(null); }} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)' }}>✕</button>
                             </div>
@@ -1163,7 +1232,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                 </div>
                             ) : (
                                 <div>
-                                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>Config JSON (Agent Override)</label>
+                                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{t('agent.tools.config', 'Config')} JSON</label>
                                     <textarea
                                         className="form-input"
                                         value={configJson}

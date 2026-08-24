@@ -28,11 +28,13 @@ from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import async_session
-from app.models.project import Project, ProjectRepositoryOperation
+from app.models.agent import Agent
+from app.models.project import Project, ProjectMemberSnapshot, ProjectRepositoryOperation
 from app.services.chat_attachments import sniff_image_mime_bytes, sniff_media_mime_bytes
 
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
@@ -44,6 +46,9 @@ _SCP_REMOTE_RE = re.compile(
 )
 _REPO_LOCKS: dict[Path, threading.RLock] = {}
 _REPO_LOCKS_GUARD = threading.Lock()
+_DEFAULT_PROJECT_AUTHOR_NAME = "项目负责人"
+_DEFAULT_PROJECT_AUTHOR_EMAIL = "project@project.local"
+_LEGACY_PROJECT_AUTHOR_NAMES = frozenset({"clawith", "clawith project"})
 PROJECT_FILE_EDIT_LIMIT_BYTES = 1024 * 1024
 PROJECT_FILE_CONTENT_MAX_CHARS = 1024 * 1024
 PROJECT_GIT_DIFF_PATCH_MAX_BYTES = 256 * 1024
@@ -51,6 +56,10 @@ PROJECT_GIT_DIFF_PATCH_HARD_LIMIT_BYTES = 1024 * 1024
 PROJECT_GIT_DIFF_CONTENT_MAX_BYTES = 512 * 1024
 PROJECT_GIT_DIFF_FILE_LIST_MAX_BYTES = 1024 * 1024
 PROJECT_GIT_DIFF_MAX_FILES = 500
+PROJECT_DIRECTORY_ARCHIVE_MAX_FILES = 5000
+PROJECT_DIRECTORY_ARCHIVE_MAX_BYTES = 100 * 1024 * 1024
+PROJECT_FILE_LIST_PREVIEW_BLOB_MAX_BYTES = 64 * 1024
+PROJECT_FILE_LIST_PREVIEW_TOTAL_BYTES = 2 * 1024 * 1024
 _TEXT_MIME_BY_SUFFIX = {
     ".c": "text/x-c",
     ".cc": "text/x-c++src",
@@ -120,6 +129,16 @@ def project_repo_path(tenant_id: uuid.UUID, project_id: uuid.UUID) -> Path:
     return repo
 
 
+async def remove_project_repository(project: Project) -> None:
+    """Remove only this project's managed storage after a failed create flow."""
+
+    project_root = project_repo_path(project.tenant_id, project.id).parent
+    managed_root = _managed_root()
+    if project_root.name != str(project.id) or managed_root not in project_root.parents:
+        raise RuntimeError("Resolved project storage escaped the managed root")
+    await asyncio.to_thread(shutil.rmtree, project_root, True)
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
@@ -138,6 +157,48 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     if check and result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "git command failed").strip())
     return result
+
+
+def project_agent_git_email(agent_id: uuid.UUID) -> str:
+    """Return a stable, repository-local address for one project Agent."""
+
+    return f"agent-{agent_id}@project.local"
+
+
+def project_user_git_email(user_id: uuid.UUID) -> str:
+    """Return a stable, repository-local address for one project user."""
+
+    return f"user-{user_id}@project.local"
+
+
+def _commit_with_author(
+    repo: Path,
+    *args: str,
+    author_name: str | None,
+    author_email: str | None,
+) -> subprocess.CompletedProcess[str]:
+    """Create a commit with an explicit per-operation identity.
+
+    Repository config remains a neutral safety net. Supplying the identity on
+    each commit prevents one actor's configuration from leaking into another
+    Agent's later work.
+    """
+
+    name = " ".join((author_name or _DEFAULT_PROJECT_AUTHOR_NAME).split())
+    email = (author_email or _DEFAULT_PROJECT_AUTHOR_EMAIL).strip()
+    if not name:
+        name = _DEFAULT_PROJECT_AUTHOR_NAME
+    if not email or any(char.isspace() for char in email):
+        email = _DEFAULT_PROJECT_AUTHOR_EMAIL
+    return _git(
+        repo,
+        "-c",
+        f"user.name={name}",
+        "-c",
+        f"user.email={email}",
+        "commit",
+        *args,
+    )
 
 
 def _git_stdout_prefix(repo: Path, *args: str, limit: int) -> tuple[bytes, bool]:
@@ -354,11 +415,7 @@ def _safe_relative_path(repo: Path, raw_path: str) -> tuple[str, Path]:
         raise HTTPException(status_code=422, detail="Invalid project file path")
     pure = PurePosixPath(raw_path)
     normalized = pure.as_posix()
-    if (
-        pure.is_absolute()
-        or normalized != raw_path
-        or any(part in {"", ".", ".."} for part in pure.parts)
-    ):
+    if pure.is_absolute() or normalized != raw_path or any(part in {"", ".", ".."} for part in pure.parts):
         raise HTTPException(status_code=422, detail="Project file path must be a normalized relative path")
     if any(part.lower() == ".git" for part in pure.parts):
         raise HTTPException(status_code=422, detail="The Git metadata directory cannot be modified")
@@ -368,14 +425,18 @@ def _safe_relative_path(repo: Path, raw_path: str) -> tuple[str, Path]:
     return normalized, target
 
 
-def _initialize(project: Project) -> dict:
+def _initialize(
+    project: Project,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict:
     repo = project_repo_path(project.tenant_id, project.id)
     with _repo_lock(repo):
         repo.mkdir(parents=True, exist_ok=True)
         if not (repo / ".git").exists():
             _git(repo, "init")
-            _git(repo, "config", "user.name", "Clawith Project")
-            _git(repo, "config", "user.email", "projects@clawith.local")
+            _git(repo, "config", "user.name", _DEFAULT_PROJECT_AUTHOR_NAME)
+            _git(repo, "config", "user.email", _DEFAULT_PROJECT_AUTHOR_EMAIL)
             (repo / "README.md").write_text(
                 f"# {project.name}\n\n{project.description}\n\n## Goal\n\n{project.goal}\n",
                 encoding="utf-8",
@@ -395,7 +456,13 @@ def _initialize(project: Project) -> dict:
                 encoding="utf-8",
             )
             _git(repo, "add", "--", "README.md", "PROJECT.json")
-            _git(repo, "commit", "-m", "Initialize AI-native project")
+            _commit_with_author(
+                repo,
+                "-m",
+                "Initialize AI-native project",
+                author_name=author_name,
+                author_email=author_email,
+            )
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         return {
             "mode": "managed",
@@ -404,8 +471,13 @@ def _initialize(project: Project) -> dict:
         }
 
 
-async def initialize_project_repo(project: Project) -> dict:
-    return await asyncio.to_thread(_initialize, project)
+async def initialize_project_repo(
+    project: Project,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict:
+    return await asyncio.to_thread(_initialize, project, author_name, author_email)
 
 
 def _repo_for(project: Project) -> Path:
@@ -419,7 +491,13 @@ def _repo_for(project: Project) -> Path:
     return repo
 
 
-def _restore(project: Project, commit: str, message: str | None) -> dict:
+def _restore(
+    project: Project,
+    commit: str,
+    message: str | None,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict:
     if not _COMMIT_RE.fullmatch(commit):
         raise HTTPException(status_code=422, detail="Invalid commit identifier")
     repo = _repo_for(project)
@@ -428,13 +506,34 @@ def _restore(project: Project, commit: str, message: str | None) -> dict:
             raise HTTPException(status_code=422, detail="Commit does not exist in this project repository")
         _git(repo, "restore", "--source", commit, "--", ".")
         _git(repo, "add", "-A")
-        _git(repo, "commit", "--allow-empty", "-m", message or f"Restore project tree from {commit[:12]}")
+        _commit_with_author(
+            repo,
+            "--allow-empty",
+            "-m",
+            message or f"Restore project tree from {commit[:12]}",
+            author_name=author_name,
+            author_email=author_email,
+        )
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         return {"status": "completed", "operation": "restore_commit", "source_commit": commit, "commit": head}
 
 
-async def restore_as_new_commit(project: Project, commit: str, message: str | None = None) -> dict:
-    return await asyncio.to_thread(_restore, project, commit, message)
+async def restore_as_new_commit(
+    project: Project,
+    commit: str,
+    message: str | None = None,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict:
+    return await asyncio.to_thread(
+        _restore,
+        project,
+        commit,
+        message,
+        author_name,
+        author_email,
+    )
 
 
 def _create_branch(project: Project, name: str, from_commit: str | None) -> dict:
@@ -485,12 +584,16 @@ def _put_remote(project: Project, name: str, safe_url: str) -> dict[str, str | b
     safe_name = _safe_remote_name(name)
     with _repo_lock(repo):
         exists = _git(repo, "remote", "get-url", "--", safe_name, check=False).returncode == 0
-        command = ("remote", "set-url", "--", safe_name, safe_url) if exists else (
-            "remote",
-            "add",
-            "--",
-            safe_name,
-            safe_url,
+        command = (
+            ("remote", "set-url", "--", safe_name, safe_url)
+            if exists
+            else (
+                "remote",
+                "add",
+                "--",
+                safe_name,
+                safe_url,
+            )
         )
         _git(repo, *command)
         return {"name": safe_name, "url": safe_url, "created": not exists}
@@ -520,11 +623,7 @@ def _assert_replaceable_baseline(repo: Path) -> None:
     if _git(repo, "status", "--porcelain").stdout.strip():
         raise HTTPException(status_code=409, detail="Project repository has uncommitted changes")
     count = _git(repo, "rev-list", "--count", "HEAD").stdout.strip()
-    files = {
-        line
-        for line in _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines()
-        if line
-    }
+    files = {line for line in _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines() if line}
     subject = _git(repo, "log", "-1", "--format=%s").stdout.strip()
     if count != "1" or files != {"PROJECT.json", "README.md"} or subject != "Initialize AI-native project":
         raise HTTPException(
@@ -614,8 +713,8 @@ def _stage_clone_repository(
             raise HTTPException(status_code=422, detail="Cloned Git repository has no valid HEAD")
         head = verified_head.stdout.strip()
         default_branch = _git(candidate, "branch", "--show-current").stdout.strip()
-        _git(candidate, "config", "user.name", "Clawith Project")
-        _git(candidate, "config", "user.email", "projects@clawith.local")
+        _git(candidate, "config", "user.name", _DEFAULT_PROJECT_AUTHOR_NAME)
+        _git(candidate, "config", "user.email", _DEFAULT_PROJECT_AUTHOR_EMAIL)
         remotes = [
             {
                 "name": name,
@@ -778,8 +877,6 @@ async def _reconcile_project_repository_operations(
 ) -> int:
     """Repair abandoned clone journals before the next repository access."""
 
-    from sqlalchemy import select
-
     statement = select(ProjectRepositoryOperation).order_by(ProjectRepositoryOperation.created_at)
     if project_id is not None:
         statement = statement.where(ProjectRepositoryOperation.project_id == project_id)
@@ -793,8 +890,126 @@ async def _reconcile_project_repository_operations(
             continue
         await db.delete(row)
         reconciled += 1
+    if project_id is not None:
+        await _ensure_project_member_directories(db, project_id)
     await db.flush()
     return reconciled
+
+
+def _missing_project_member_identity_paths(repo: Path, agent_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
+    missing: dict[uuid.UUID, list[str]] = {}
+    with _repo_lock(repo):
+        tracked_paths = set(_git(repo, "ls-tree", "-r", "--name-only", "HEAD", "--", ".agents").stdout.splitlines())
+        for agent_id in agent_ids:
+            agent_dir = f".agents/{agent_id}"
+            paths = [f"{agent_dir}/soul.md", f"{agent_dir}/memory.md"]
+            absent = [path for path in paths if path not in tracked_paths]
+            if absent:
+                missing[agent_id] = absent
+    return missing
+
+
+def _commit_project_member_workspace_paths(project: Project, paths: list[str]) -> None:
+    """Commit only files copied into member snapshots, never unrelated changes."""
+
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized_paths = [_safe_relative_path(repo, path)[0] for path in paths]
+        _git(repo, "add", "--", *normalized_paths)
+        diff_args = ["diff", "--cached", "--quiet", "--", *normalized_paths]
+        if _git(repo, *diff_args, check=False).returncode == 0:
+            return
+        _commit_with_author(
+            repo,
+            "--only",
+            "-m",
+            "Ensure project member directories",
+            "--",
+            *normalized_paths,
+            author_name=None,
+            author_email=None,
+        )
+
+
+async def _ensure_project_member_directories(db: AsyncSession, project_id: uuid.UUID) -> None:
+    """Keep every member snapshot visible through the canonical project Git HEAD."""
+
+    project = await db.get(Project, project_id)
+    if project is None:
+        return
+    repo = project_repo_path(project.tenant_id, project.id)
+    if not (repo / ".git").is_dir():
+        return
+    members = (
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot)
+                .where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                )
+                .order_by(ProjectMemberSnapshot.created_at, ProjectMemberSnapshot.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    missing = await asyncio.to_thread(
+        _missing_project_member_identity_paths,
+        repo,
+        [member.agent_id for member in members],
+    )
+    if not missing:
+        return
+
+    agents = (
+        (
+            await db.execute(
+                select(Agent).where(
+                    Agent.tenant_id == project.tenant_id,
+                    Agent.id.in_(missing),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    agent_by_id = {agent.id: agent for agent in agents}
+
+    from app.services.project_agent_workspace import (
+        build_project_agent_identity_defaults,
+        create_project_agent_workspace,
+    )
+
+    changed_paths: set[str] = set()
+    for member in members:
+        if member.agent_id not in missing:
+            continue
+        agent = agent_by_id.get(member.agent_id)
+        source_agent_id = None
+        if agent is not None:
+            source_agent_id = agent.source_agent_id if agent.scope == "project" else agent.id
+        default_soul, default_memory = build_project_agent_identity_defaults(
+            project_name=project.name,
+            project_goal=project.goal or "",
+            success_criteria=project.success_criteria or [],
+            agent_name=member.name_snapshot,
+            role_description=member.role_snapshot,
+        )
+        copy_result = await create_project_agent_workspace(
+            repo,
+            member.agent_id,
+            source_agent_id=source_agent_id,
+            default_soul=default_soul,
+            default_memory=default_memory,
+        )
+        changed_paths.update(missing[member.agent_id])
+        changed_paths.update(f".agents/{member.agent_id}/{path}" for path in copy_result.copied)
+    await asyncio.to_thread(
+        _commit_project_member_workspace_paths,
+        project,
+        sorted(changed_paths),
+    )
 
 
 async def reconcile_project_repository_operations(
@@ -813,7 +1028,7 @@ async def reconcile_project_repository_operations(
 def _blob_prefix(repo: Path, object_id: str, limit: int) -> bytes:
     """Read only a bounded prefix from an immutable Git object."""
 
-    process = subprocess.Popen(  # noqa: S603 - fixed argv, validated object id
+    process = subprocess.Popen(
         ["git", "-C", str(repo), "cat-file", "blob", object_id],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -906,13 +1121,16 @@ def _tree_entry(repo: Path, path: str) -> tuple[str, int]:
     return entry
 
 
-def _file_record(repo: Path, path: str, *, preview_limit: int = 4000) -> dict:
-    object_id, size = _tree_entry(repo, path)
+def _file_record_at(repo: Path, revision: str, path: str, *, preview_limit: int = 4000) -> dict:
+    entry = _tree_entry_at(repo, revision, path)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Project file is not committed at this revision")
+    object_id, size = entry
     sample = _blob_prefix(repo, object_id, max(preview_limit + 1, 8192))
     mime_type, kind, is_text = _mime_and_kind(path, sample)
     preview = sample[:preview_limit].decode("utf-8", errors="replace") if is_text else ""
-    commit = _git(repo, "log", "-1", "--format=%H", "--", path).stdout.strip()
-    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    commit = _git(repo, "log", "-1", "--format=%H", revision, "--", path).stdout.strip()
+    head = _git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").stdout.strip()
     return {
         "id": path,
         "path": path,
@@ -931,11 +1149,166 @@ def _file_record(repo: Path, path: str, *, preview_limit: int = 4000) -> dict:
     }
 
 
+def _file_record(repo: Path, path: str, *, preview_limit: int = 4000) -> dict:
+    return _file_record_at(repo, "HEAD", path, preview_limit=preview_limit)
+
+
+def _batch_blob_prefixes(
+    repo: Path,
+    entries: list[tuple[str, int]],
+    *,
+    prefix_limit: int,
+) -> dict[str, bytes]:
+    """Read bounded previews for many Git blobs through one Git process.
+
+    The file-list endpoint only needs a small preview for editor routing and
+    empty-state hints.  Large blobs are deliberately excluded, and the total
+    batch size is capped so a repository containing generated assets cannot
+    turn a metadata request into an unbounded content download.
+    """
+
+    selected: dict[str, int] = {}
+    total_size = 0
+    for object_id, size in entries:
+        if object_id in selected or size > PROJECT_FILE_LIST_PREVIEW_BLOB_MAX_BYTES:
+            continue
+        if total_size + size > PROJECT_FILE_LIST_PREVIEW_TOTAL_BYTES:
+            continue
+        selected[object_id] = size
+        total_size += size
+    if not selected:
+        return {}
+
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes",
+    }
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={repo}",
+            "-C",
+            str(repo),
+            "cat-file",
+            "--batch",
+        ],
+        input="".join(f"{object_id}\n" for object_id in selected).encode(),
+        capture_output=True,
+        timeout=30,
+        check=False,
+        env=env,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or "git cat-file batch failed")
+
+    payload = result.stdout
+    position = 0
+    previews: dict[str, bytes] = {}
+    for expected_object_id, expected_size in selected.items():
+        header_end = payload.find(b"\n", position)
+        if header_end < 0:
+            raise RuntimeError("Git returned a truncated batch header")
+        header = payload[position:header_end].decode("ascii", errors="strict")
+        parts = header.split()
+        if len(parts) != 3 or parts[1] != "blob":
+            raise RuntimeError("Git returned an invalid batch object")
+        object_id, _kind, raw_size = parts
+        try:
+            size = int(raw_size)
+        except ValueError as exc:
+            raise RuntimeError("Git returned an invalid batch object size") from exc
+        if object_id != expected_object_id or size != expected_size:
+            raise RuntimeError("Git batch output did not match the requested object")
+        content_start = header_end + 1
+        content_end = content_start + size
+        if content_end >= len(payload) or payload[content_end : content_end + 1] != b"\n":
+            raise RuntimeError("Git returned a truncated batch object")
+        previews[object_id] = payload[content_start:content_end][:prefix_limit]
+        position = content_end + 1
+    return previews
+
+
+def _last_commit_by_path(repo: Path, paths: set[str]) -> dict[str, str]:
+    """Resolve last-changing commits for all visible paths in one traversal."""
+
+    if not paths:
+        return {}
+    history = _git(
+        repo,
+        "log",
+        "--pretty=format:%x1e%H%x1f",
+        "--name-only",
+        "-z",
+        "HEAD",
+    ).stdout
+    commits: dict[str, str] = {}
+    for record in history.split("\x1e")[1:]:
+        commit, separator, names = record.partition("\x1f")
+        if not separator:
+            continue
+        for path in names.strip("\x00\n").split("\x00"):
+            normalized = path.strip("\n")
+            if normalized in paths and normalized not in commits:
+                commits[normalized] = commit
+        if len(commits) == len(paths):
+            break
+    return commits
+
+
 def _list_files(project: Project) -> list[dict]:
     repo = _repo_for(project)
     with _repo_lock(repo):
-        paths = [line for line in _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines() if line]
-        return [_file_record(repo, path) for path in paths]
+        tree = _git(repo, "ls-tree", "-r", "-l", "-z", "HEAD").stdout
+        entries: list[tuple[str, str, int]] = []
+        for record in tree.split("\x00"):
+            if not record:
+                continue
+            metadata, separator, path = record.partition("\t")
+            parts = metadata.split()
+            if not separator or len(parts) != 4 or parts[1] != "blob":
+                continue
+            try:
+                size = int(parts[3])
+            except ValueError as exc:
+                raise RuntimeError("Git returned an invalid project blob size") from exc
+            entries.append((path, parts[2], size))
+
+        head = _git(repo, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+        commits = _last_commit_by_path(repo, {path for path, _object_id, _size in entries})
+        samples = _batch_blob_prefixes(
+            repo,
+            [(object_id, size) for _path, object_id, size in entries],
+            prefix_limit=8192,
+        )
+        files: list[dict] = []
+        for path, object_id, size in entries:
+            sample = samples.get(object_id, b"")
+            mime_type, kind, is_text = _mime_and_kind(path, sample)
+            preview = sample[:4000].decode("utf-8", errors="replace") if is_text else ""
+            commit = commits.get(path, head)
+            files.append(
+                {
+                    "id": path,
+                    "path": path,
+                    "name": PurePosixPath(path).name,
+                    "size": size,
+                    "commit": commit,
+                    "commit_hash": commit,
+                    "head": head,
+                    "object_id": object_id,
+                    "mime_type": mime_type,
+                    "kind": kind,
+                    "is_text": is_text,
+                    "is_editable": is_text and size <= PROJECT_FILE_EDIT_LIMIT_BYTES,
+                    "preview": preview,
+                    "content_preview": preview,
+                }
+            )
+        return files
 
 
 async def list_project_files(project: Project) -> list[dict]:
@@ -951,6 +1324,18 @@ def _inspect_file(project: Project, path: str) -> dict:
 
 async def inspect_project_file(project: Project, path: str) -> dict:
     return await asyncio.to_thread(_inspect_file, project, path)
+
+
+def _inspect_file_at(project: Project, path: str, revision: str) -> dict:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, _target = _safe_relative_path(repo, path)
+        commit = _resolve_reachable_commit(repo, revision)
+        return _file_record_at(repo, commit, normalized, preview_limit=0)
+
+
+async def inspect_project_file_at(project: Project, path: str, revision: str) -> dict:
+    return await asyncio.to_thread(_inspect_file_at, project, path, revision)
 
 
 def _read_file_content(project: Project, path: str, max_chars: int) -> dict:
@@ -996,7 +1381,7 @@ def iter_project_file_blob(
 
     repo = _repo_for(project)
     remaining = max(0, end - start + 1)
-    process = subprocess.Popen(  # noqa: S603 - fixed argv, object id came from ls-tree
+    process = subprocess.Popen(
         ["git", "-C", str(repo), "cat-file", "blob", object_id],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -1027,6 +1412,101 @@ def iter_project_file_blob(
             process.wait(timeout=5)
 
 
+def _directory_snapshot(project: Project, path: str, revision: str = "HEAD") -> dict[str, Any]:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        commit = (
+            _git(repo, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+            if revision == "HEAD"
+            else _resolve_reachable_commit(repo, revision)
+        )
+        normalized = ""
+        if path:
+            normalized, _target = _safe_relative_path(repo, path)
+            directory = _git(repo, "ls-tree", "-d", "-z", commit, "--", normalized, check=False)
+            if directory.returncode != 0 or not directory.stdout:
+                raise HTTPException(status_code=404, detail="Project directory is not committed at this revision")
+
+        listing = _git(repo, "ls-tree", "-r", "-l", "-z", commit, "--", *([normalized] if normalized else []))
+        file_count = 0
+        total_size = 0
+        for raw_record in listing.stdout.split("\x00"):
+            if not raw_record:
+                continue
+            metadata, separator, recorded_path = raw_record.partition("\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 4 or fields[1] != "blob":
+                raise HTTPException(status_code=422, detail="Directory contains an unsupported Git entry")
+            # Symlinks can become traversal primitives after ZIP extraction.
+            if fields[0] not in {"100644", "100755"}:
+                raise HTTPException(status_code=422, detail="Directory archives cannot contain symbolic links")
+            safe_path, _target = _safe_relative_path(repo, recorded_path)
+            if normalized and not safe_path.startswith(f"{normalized}/"):
+                raise HTTPException(status_code=422, detail="Directory archive path escaped its prefix")
+            try:
+                size = int(fields[3])
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="Directory contains an unsupported Git entry") from exc
+            file_count += 1
+            total_size += size
+            if file_count > PROJECT_DIRECTORY_ARCHIVE_MAX_FILES:
+                raise HTTPException(status_code=413, detail="Directory contains too many files to download")
+            if total_size > PROJECT_DIRECTORY_ARCHIVE_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="Directory is too large to download")
+        if file_count == 0:
+            raise HTTPException(status_code=404, detail="Project directory has no committed files")
+        archive_stem = PurePosixPath(normalized).name if normalized else f"project-{str(project.id)[:8]}"
+        return {
+            "path": normalized,
+            "head": commit,
+            "name": f"{archive_stem}.zip",
+            "file_count": file_count,
+            "total_size": total_size,
+        }
+
+
+async def inspect_project_directory(
+    project: Project,
+    path: str = "",
+    revision: str = "HEAD",
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_directory_snapshot, project, path, revision)
+
+
+def iter_project_directory_archive(
+    project: Project,
+    revision: str,
+    path: str = "",
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> Iterator[bytes]:
+    """Stream a validated immutable Git tree as ZIP without staging files."""
+
+    repo = _repo_for(project)
+    # Store mode keeps CPU and output expansion predictable after the
+    # preflight uncompressed-size limit.
+    args = ["git", "-c", f"safe.directory={repo}", "-C", str(repo), "archive", "--format=zip", "-0", revision]
+    if path:
+        args.extend(["--", path])
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        assert process.stdout is not None
+        while chunk := process.stdout.read(chunk_size):
+            yield chunk
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            return_code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait(timeout=5)
+        if return_code != 0:
+            raise RuntimeError("Git directory archive failed")
+
+
 def _read_file(project: Project, path: str, max_chars: int) -> dict:
     result = _read_file_content(project, path, max_chars)
     if not result["is_text"]:
@@ -1044,7 +1524,13 @@ async def read_project_file(project: Project, path: str, max_chars: int = 20_000
     return await asyncio.to_thread(_read_file, project, path, bounded)
 
 
-def _write_file(project: Project, path: str, content: str) -> dict:
+def _write_file(
+    project: Project,
+    path: str,
+    content: str,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict:
     repo = _repo_for(project)
     with _repo_lock(repo):
         normalized, target = _safe_relative_path(repo, path)
@@ -1062,7 +1548,15 @@ def _write_file(project: Project, path: str, content: str) -> dict:
         _git(repo, "add", "--", normalized)
         if _git(repo, "diff", "--cached", "--quiet", "--", normalized, check=False).returncode == 0:
             raise HTTPException(status_code=409, detail="File content is unchanged; no commit was created")
-        _git(repo, "commit", "-m", f"Update project file: {normalized}", "--", normalized)
+        _commit_with_author(
+            repo,
+            "-m",
+            f"Update project file: {normalized}",
+            "--",
+            normalized,
+            author_name=author_name,
+            author_email=author_email,
+        )
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         return {
             "status": "completed",
@@ -1073,26 +1567,44 @@ def _write_file(project: Project, path: str, content: str) -> dict:
         }
 
 
-async def write_project_file(project: Project, path: str, content: str) -> dict:
-    return await asyncio.to_thread(_write_file, project, path, content)
+async def write_project_file(
+    project: Project,
+    path: str,
+    content: str,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict:
+    return await asyncio.to_thread(
+        _write_file,
+        project,
+        path,
+        content,
+        author_name,
+        author_email,
+    )
 
 
-_MILESTONE_OPERATION_TRAILER = "Clawith-Milestone-Operation"
+_MILESTONE_OPERATION_TRAILER = "Project-Milestone-Operation"
+_LEGACY_MILESTONE_OPERATION_TRAILER = "Clawith-Milestone-Operation"
 
 
 def _existing_milestone_operation_commit(repo: Path, operation_key: str) -> str | None:
-    trailer = f"{_MILESTONE_OPERATION_TRAILER}: {operation_key}"
-    result = _git(
-        repo,
-        "log",
-        "--all",
-        "-1",
-        "--format=%H",
-        "--fixed-strings",
-        f"--grep={trailer}",
-        check=False,
-    )
-    return result.stdout.strip() or None
+    for trailer_name in (_MILESTONE_OPERATION_TRAILER, _LEGACY_MILESTONE_OPERATION_TRAILER):
+        trailer = f"{trailer_name}: {operation_key}"
+        result = _git(
+            repo,
+            "log",
+            "--all",
+            "-1",
+            "--format=%H",
+            "--fixed-strings",
+            f"--grep={trailer}",
+            check=False,
+        )
+        if result.stdout.strip():
+            return result.stdout.strip()
+    return None
 
 
 def _milestone_commit_result(
@@ -1127,6 +1639,8 @@ def _commit(
     *,
     milestone: bool,
     operation_key: str | None = None,
+    author_name: str | None,
+    author_email: str | None,
 ) -> dict:
     repo = _repo_for(project)
     with _repo_lock(repo):
@@ -1151,7 +1665,7 @@ def _commit(
         changed = _git(repo, *diff_args, check=False).returncode != 0
         if not changed and not milestone:
             raise HTTPException(status_code=409, detail="There are no selected project changes to commit")
-        commit_args = ["commit"]
+        commit_args: list[str] = []
         if not changed:
             commit_args.append("--allow-empty")
         if normalized_paths:
@@ -1161,7 +1675,12 @@ def _commit(
             commit_args.extend(["-m", f"{_MILESTONE_OPERATION_TRAILER}: {operation_key}"])
         if normalized_paths:
             commit_args.extend(["--", *normalized_paths])
-        _git(repo, *commit_args)
+        _commit_with_author(
+            repo,
+            *commit_args,
+            author_name=author_name,
+            author_email=author_email,
+        )
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         if milestone:
             return _milestone_commit_result(
@@ -1189,6 +1708,8 @@ async def commit_project_changes(
     *,
     milestone: bool = False,
     operation_key: str | None = None,
+    author_name: str | None = None,
+    author_email: str | None = None,
 ) -> dict:
     return await asyncio.to_thread(
         _commit,
@@ -1197,6 +1718,8 @@ async def commit_project_changes(
         paths,
         milestone=milestone,
         operation_key=operation_key,
+        author_name=author_name,
+        author_email=author_email,
     )
 
 
@@ -1422,6 +1945,8 @@ def _repository_state(project: Project, limit: int) -> dict:
         commits = []
         for line in log.splitlines():
             full, short, author, created_at, subject = line.split("\x1f", 4)
+            if author.strip().casefold() in _LEGACY_PROJECT_AUTHOR_NAMES:
+                author = "项目成员"
             commits.append(
                 {
                     "commit": full,
@@ -1433,9 +1958,7 @@ def _repository_state(project: Project, limit: int) -> dict:
             )
         files = [line for line in _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines() if line]
         branches = [
-            line.lstrip("* ")
-            for line in _git(repo, "branch", "--format=%(refname:short)").stdout.splitlines()
-            if line
+            line.lstrip("* ") for line in _git(repo, "branch", "--format=%(refname:short)").stdout.splitlines() if line
         ]
         return {
             "mode": "managed",

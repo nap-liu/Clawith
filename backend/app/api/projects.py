@@ -1,8 +1,10 @@
 """REST API for closed-loop AI-native project management."""
 
 import hashlib
+import posixpath
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
@@ -14,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.permissions import build_visible_agents_query
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
@@ -47,6 +50,12 @@ from app.schemas.project import (
     LeaderUpdate,
     ProjectAccessGrantCreate,
     ProjectAccessGrantOut,
+    ProjectAgentCreate,
+    ProjectAgentLifecycleRequest,
+    ProjectAgentOut,
+    ProjectAgentPromoteRequest,
+    ProjectAgentPromotionOut,
+    ProjectAgentUpdate,
     ProjectCapabilityCreate,
     ProjectCreate,
     ProjectEventCreate,
@@ -66,12 +75,38 @@ from app.schemas.project import (
     ProjectRunUpdate,
     ProjectSettingsUpdate,
     ProjectTemplateCreate,
+    ProjectTemplateFromProjectCreate,
     ProjectUpdate,
     WorkItemCreate,
     WorkItemDetailOut,
     WorkItemOut,
     WorkItemUpdate,
 )
+from app.services.project_agent_service import (
+    create_project_agent,
+    deactivate_project_agent,
+    promote_project_agent,
+    restore_project_agent,
+    serialize_project_agent,
+    update_project_agent,
+)
+from app.services.project_agent_service import (
+    get_project_agent as get_project_agent_record,
+)
+from app.services.project_agent_service import (
+    list_project_agents as list_project_agent_records,
+)
+from app.services.project_agent_template_assets import (
+    ProjectAgentTemplateAssetError,
+    sanitize_project_agent_template_assets,
+)
+from app.services.project_agent_template_service import (
+    export_project_agents_for_template,
+    export_project_capabilities_for_template,
+    instantiate_project_agents_from_template,
+    instantiate_project_capabilities_from_template,
+)
+from app.services.project_collaboration_prompt import build_project_kickoff_task
 from app.services.project_git_service import (
     apply_project_repository_clone,
     begin_project_repository_clone,
@@ -79,14 +114,19 @@ from app.services.project_git_service import (
     create_branch,
     delete_git_remote,
     finalize_project_repository_clone,
+    inspect_project_directory,
     inspect_project_file,
+    inspect_project_file_at,
+    iter_project_directory_archive,
     iter_project_file_blob,
     list_git_remotes,
     list_project_files,
     project_commit_diff,
+    project_user_git_email,
     put_git_remote,
     read_project_file_content,
     reconcile_project_repository_operations,
+    remove_project_repository,
     release_project_repository_clone_lock,
     repository_state,
     restore_as_new_commit,
@@ -108,6 +148,7 @@ from app.services.project_service import (
     deliver_project_a2a,
     ensure_project_group_session,
     ensure_project_leader_session,
+    ensure_project_running,
     freeze_run_members,
     project_summary,
     reconcile_project_runs,
@@ -117,14 +158,61 @@ from app.services.project_service import (
     restore_project_member,
     serialize_project_runs,
 )
+from app.services.project_template_snapshot import (
+    ProjectHeadSnapshot,
+    ProjectTemplateSnapshotError,
+    capture_project_head_snapshot,
+    materialize_snapshot_agent_files,
+    public_template_definition,
+    restore_project_template_files,
+    sanitize_template_settings,
+)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 _PROJECT_FILE_TICKET_TTL_SECONDS = 15 * 60
+_PROJECT_AGENT_IDENTITY_PATH = re.compile(r"^\.agents/[^/]+/(?:soul|memory)\.md$")
+_PROJECT_PLANNING_RUN_TRIGGERS = {
+    "group_leader_message",
+    "group_mention",
+    "leader_reply_batch",
+}
+
+
+def _is_project_agent_identity_path(path: str) -> bool:
+    """Recognize owner-managed Agent identity files after POSIX normalization."""
+
+    normalized = posixpath.normpath(path.replace("\\", "/")).lstrip("/")
+    return bool(_PROJECT_AGENT_IDENTITY_PATH.fullmatch(normalized))
+
+
+async def _guard_project_agent_identity_paths(
+    db: AsyncSession,
+    user: User,
+    project: Project,
+    *paths: str,
+) -> None:
+    """Require the project owner before a generic file API changes Agent identity."""
+
+    if any(_is_project_agent_identity_path(path) for path in paths):
+        await require_owner(db, user, project.id)
+
+
+async def _guard_project_agent_member_mutation(
+    db: AsyncSession,
+    user: User,
+    project: Project,
+    member: ProjectMemberSnapshot,
+) -> None:
+    """Prevent edit-role users from changing project-owned Agent membership."""
+
+    agent = await db.get(Agent, member.agent_id)
+    if agent is not None and agent.scope == "project" and agent.project_id == project.id:
+        await require_owner(db, user, project.id)
 
 
 def _create_project_file_ticket(user: User, project: Project, metadata: dict) -> str:
     settings = get_settings()
-    expires_at = int(datetime.now(timezone.utc).timestamp()) + _PROJECT_FILE_TICKET_TTL_SECONDS
+    expires_at = int(datetime.now(UTC).timestamp()) + _PROJECT_FILE_TICKET_TTL_SECONDS
     return jwt.encode(
         {
             "sub": str(user.id),
@@ -138,6 +226,59 @@ def _create_project_file_ticket(user: User, project: Project, metadata: dict) ->
         settings.JWT_SECRET_KEY,
         algorithm=settings.JWT_ALGORITHM,
     )
+
+
+def _create_project_snapshot_ticket(
+    user: User,
+    project: Project,
+    *,
+    purpose: str,
+    path: str,
+    head: str,
+) -> str:
+    settings = get_settings()
+    expires_at = int(datetime.now(UTC).timestamp()) + _PROJECT_FILE_TICKET_TTL_SECONDS
+    return jwt.encode(
+        {
+            "sub": str(user.id),
+            "tenant_id": str(project.tenant_id),
+            "project_id": str(project.id),
+            "path": path,
+            "head": head,
+            "purpose": purpose,
+            "exp": expires_at,
+        },
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+async def _authorize_project_snapshot_ticket(
+    db: AsyncSession,
+    project_id: uuid.UUID,
+    ticket: str,
+    *,
+    purpose: str,
+) -> tuple[User, Project, dict]:
+    settings = get_settings()
+    try:
+        payload = jwt.decode(ticket, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        user_id = uuid.UUID(str(payload.get("sub")))
+    except (JWTError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired project snapshot ticket") from exc
+    if (
+        payload.get("purpose") != purpose
+        or payload.get("project_id") != str(project_id)
+        or not isinstance(payload.get("head"), str)
+        or not isinstance(payload.get("path"), str)
+    ):
+        raise HTTPException(status_code=401, detail="Project snapshot ticket does not match this resource")
+    user = (await db.execute(select(User).where(User.id == user_id, User.is_active.is_(True)))).scalar_one_or_none()
+    if user is None or payload.get("tenant_id") != str(user.tenant_id):
+        raise HTTPException(status_code=401, detail="Project snapshot ticket user is unavailable")
+    project = await require_project(db, user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    return user, project, payload
 
 
 async def _authorize_project_file_ticket(
@@ -267,6 +408,7 @@ def _git_remote_audit_metadata(remote: dict, *, history_changed: bool) -> dict:
 
 async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict:
     definition = template.definition or {}
+    public_definition = public_template_definition(definition) if "project_snapshot" in definition else definition
     usage_count = (
         await db.execute(select(func.count(Project.id)).where(Project.template_id == template.id))
     ).scalar_one()
@@ -284,18 +426,45 @@ async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict
         "category": template.category,
         "version": template.version,
         "is_published": template.is_published,
-        "definition": definition,
-        "author_name": author_name or "Clawith",
+        "definition": public_definition,
+        "author_name": author_name or "平台模板",
         "usage_count": usage_count,
-        "featured": bool(definition.get("featured", False)),
-        "objective_hint": definition.get("goal") or definition.get("objective", ""),
-        "success_criteria": definition.get("success_criteria", []),
-        "roles": definition.get("roles", definition.get("members", [])),
-        "skills": definition.get("skills", []),
-        "mcp_servers": definition.get("mcp_servers", []),
+        "featured": bool(public_definition.get("featured", False)),
+        "objective_hint": public_definition.get("goal") or public_definition.get("objective", ""),
+        "success_criteria": public_definition.get("success_criteria", []),
+        "roles": public_definition.get("roles", []),
+        "skills": public_definition.get("skills", []),
+        "mcp_servers": public_definition.get("mcp_servers", []),
         "created_at": template.created_at.isoformat() if template.created_at else None,
         "updated_at": template.updated_at.isoformat() if template.updated_at else None,
     }
+
+
+async def _build_project_template_definition(
+    db: AsyncSession,
+    project: Project,
+) -> tuple[dict, ProjectHeadSnapshot]:
+    """Build one sanitized definition from an immutable project HEAD."""
+
+    snapshot = await capture_project_head_snapshot(project)
+    with materialize_snapshot_agent_files(snapshot) as snapshot_root:
+        template_agents = await export_project_agents_for_template(
+            db,
+            project,
+            project_root=snapshot_root,
+        )
+    return (
+        {
+            "schema_version": 1,
+            "goal": project.goal,
+            "success_criteria": list(project.success_criteria or []),
+            "settings": sanitize_template_settings(project.settings or {}),
+            "agents": template_agents,
+            "capabilities": await export_project_capabilities_for_template(db, project),
+            "project_snapshot": snapshot.project_files,
+        },
+        snapshot,
+    )
 
 
 async def _ensure_builtin_templates(db: AsyncSession) -> None:
@@ -308,12 +477,12 @@ async def _ensure_builtin_templates(db: AsyncSession) -> None:
         {
             "name": "产品研发冲刺",
             "category": "研发",
-            "description": "由项目 Leader 驱动需求、研发、测试与交付闭环。",
+            "description": "由负责人驱动需求、研发、测试与交付闭环。",
             "definition": {
                 "featured": True,
                 "goal": "按验收标准交付一个可发布的产品增量",
                 "success_criteria": ["关键路径通过", "评审与测试留痕", "产出进入 Git 历史"],
-                "roles": ["项目 Leader", "产品设计", "前端开发", "后端开发", "质量工程"],
+                "roles": ["负责人", "产品设计", "前端开发", "后端开发", "质量工程"],
                 "skills": ["需求拆解", "代码评审"],
                 "mcp_servers": ["GitHub"],
                 "settings": {"runtime": {"max_parallel_runs": 4}},
@@ -326,7 +495,7 @@ async def _ensure_builtin_templates(db: AsyncSession) -> None:
             "definition": {
                 "goal": "输出可追溯的市场研究报告",
                 "success_criteria": ["来源可回溯", "结论经交叉评审"],
-                "roles": ["研究 Leader", "情报分析", "事实核查", "报告编辑"],
+                "roles": ["研究负责人", "情报分析", "事实核查", "报告编辑"],
                 "skills": ["深度研究", "事实核查"],
                 "mcp_servers": ["Web Search"],
             },
@@ -338,7 +507,7 @@ async def _ensure_builtin_templates(db: AsyncSession) -> None:
             "definition": {
                 "goal": "稳定产出符合品牌规范的内容",
                 "success_criteria": ["审校通过", "发布物与素材均进入项目 Git"],
-                "roles": ["内容 Leader", "作者", "审校", "发布运营"],
+                "roles": ["内容负责人", "作者", "审校", "发布运营"],
                 "skills": ["内容创作", "品牌审校"],
                 "mcp_servers": [],
             },
@@ -390,10 +559,24 @@ async def create_project_template(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    definition = dict(data.definition)
+    if "project_snapshot" in definition:
+        raise HTTPException(
+            status_code=422,
+            detail="Final project assets can only be published from an owned project",
+        )
+    template_agents = definition.get("agents", [])
+    try:
+        sanitized_agents = sanitize_project_agent_template_assets(template_agents)
+        if "agents" in definition:
+            definition["agents"] = sanitized_agents
+    except ProjectAgentTemplateAssetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     template = ProjectTemplate(
         tenant_id=_tenant_id(current_user),
         created_by_user_id=current_user.id,
-        **data.model_dump(),
+        **data.model_dump(exclude={"definition"}),
+        definition=definition,
     )
     db.add(template)
     await db.flush()
@@ -428,17 +611,7 @@ async def get_project_bootstrap_options(
 ):
     tenant_id = _tenant_id(current_user)
     agents = (
-        (
-            await db.execute(
-                select(Agent)
-                .where(
-                    Agent.tenant_id == tenant_id,
-                    Agent.is_deleted.is_(False),
-                    or_(Agent.creator_id == current_user.id, Agent.access_mode == "company"),
-                )
-                .order_by(Agent.name)
-            )
-        )
+        (await db.execute(build_visible_agents_query(current_user, tenant_id=tenant_id).order_by(Agent.name)))
         .scalars()
         .all()
     )
@@ -582,7 +755,27 @@ async def create_project_from_template(
     ).scalar_one_or_none()
     if template is None:
         raise HTTPException(status_code=404, detail="Project template not found")
-    definition = {**(template.definition or {}), **data.overrides}
+    allowed_override_keys = {"members", "capabilities", "shared_with_user_ids"}
+    unknown_override_keys = set(data.overrides) - allowed_override_keys
+    if unknown_override_keys:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported project template overrides: {', '.join(sorted(unknown_override_keys))}",
+        )
+    stored_definition = dict(template.definition or {})
+    definition = {**stored_definition, **data.overrides}
+    packaged_snapshot = stored_definition.get("project_snapshot")
+    packaged_capabilities = stored_definition.get("capabilities", []) if packaged_snapshot is not None else []
+    capabilities_overridden = "capabilities" in data.overrides
+    template_capabilities_to_restore = (
+        [
+            item
+            for item in packaged_capabilities
+            if not capabilities_overridden or (isinstance(item, dict) and item.get("source") == "inherited")
+        ]
+        if packaged_snapshot is not None
+        else list(definition.get("capabilities", []))
+    )
     payload = ProjectCreate(
         name=data.name or template.name,
         description=data.description if data.description is not None else template.description,
@@ -592,11 +785,122 @@ async def create_project_from_template(
         template_id=template.id,
         settings=definition.get("settings", {}),
         members=definition.get("members", []),
-        capabilities=definition.get("capabilities", []),
+        capabilities=definition.get("capabilities", []) if capabilities_overridden or packaged_snapshot is None else [],
         shared_with_user_ids=definition.get("shared_with_user_ids", []),
     )
     project = await create_project(db, current_user, payload)
-    return await project_summary(db, project)
+    try:
+        await restore_project_template_files(
+            project,
+            packaged_snapshot,
+            author_name=current_user.display_name,
+            author_email=project_user_git_email(current_user.id),
+        )
+        created_agents = await instantiate_project_agents_from_template(
+            db,
+            project,
+            current_user,
+            definition.get("agents", []),
+        )
+        if packaged_snapshot is not None:
+            await instantiate_project_capabilities_from_template(
+                db,
+                project,
+                current_user,
+                template_capabilities_to_restore,
+                created_agents,
+            )
+    except Exception as exc:
+        try:
+            await remove_project_repository(project)
+        except Exception:
+            logger.exception("Failed to compensate project template storage for project {}", project.id)
+        if isinstance(exc, (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError)):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise
+    try:
+        if definition.get("agents"):
+            await ensure_project_group_session(db, project)
+            await ensure_project_leader_session(db, project)
+        explicit_leader_id = next(
+            (member.agent_id for member in payload.members if member.is_leader),
+            None,
+        )
+        if explicit_leader_id is not None:
+            await db.execute(
+                ProjectMemberSnapshot.__table__.update()
+                .where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                )
+                .values(is_leader=False)
+            )
+            await db.execute(
+                ProjectMemberSnapshot.__table__.update()
+                .where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.agent_id == explicit_leader_id,
+                )
+                .values(is_leader=True)
+            )
+            add_event(
+                db,
+                project,
+                "leader.changed",
+                "Applied the responsible person selected during template creation",
+                actor_user_id=current_user.id,
+                actor_agent_id=explicit_leader_id,
+                metadata={"source": "template_override"},
+            )
+            await db.flush()
+        git_state = await repository_state(project, limit=1)
+        project.settings = {
+            **dict(project.settings or {}),
+            "git": {
+                **dict(dict(project.settings or {}).get("git") or {}),
+                "head": git_state.get("head"),
+            },
+        }
+        if packaged_snapshot is not None:
+            add_event(
+                db,
+                project,
+                "project.template.restored",
+                "Restored final project assets and digital employee configuration from a template",
+                actor_user_id=current_user.id,
+                metadata={
+                    "template_id": str(template.id),
+                    "file_count": len(packaged_snapshot.get("files", []))
+                    if isinstance(packaged_snapshot, dict) and isinstance(packaged_snapshot.get("files"), list)
+                    else 0,
+                    "digital_employee_count": len(created_agents),
+                },
+            )
+        await db.flush()
+        summary = await project_summary(db, project)
+        restored_files = (
+            packaged_snapshot.get("files", [])
+            if isinstance(packaged_snapshot, dict) and isinstance(packaged_snapshot.get("files"), list)
+            else []
+        )
+        portable_capabilities = [item for item in template_capabilities_to_restore if isinstance(item, dict)]
+        summary["template_setup_summary"] = {
+            "restored_file_count": len(restored_files),
+            "restored_digital_employee_count": len(created_agents),
+            "restored_skill_count": sum(item.get("capability_type") == "skill" for item in portable_capabilities),
+            "restored_connection_count": sum(
+                item.get("capability_type") == "mcp" for item in portable_capabilities
+            ),
+            "restored_tool_count": sum(item.get("capability_type") == "tool" for item in portable_capabilities),
+        }
+        return summary
+    except Exception:
+        try:
+            await remove_project_repository(project)
+        except Exception:
+            logger.exception("Failed to compensate project template storage for project {}", project.id)
+        raise
 
 
 @router.get("")
@@ -634,6 +938,113 @@ async def post_project(
 ):
     project = await create_project(db, current_user, data)
     return await project_summary(db, project)
+
+
+@router.post("/{project_id}/templates", status_code=status.HTTP_201_CREATED)
+async def create_template_from_project(
+    project_id: uuid.UUID,
+    data: ProjectTemplateFromProjectCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Publish a sanitized project template, including project-owned Agents."""
+
+    project = await require_owner(db, current_user, project_id)
+    # Serialize publication for one source project. The immutable package and
+    # its definition live in the same database row, so request rollback keeps
+    # both invisible and a retry can safely return the completed publication.
+    await db.refresh(project, with_for_update=True)
+    try:
+        definition, snapshot = await _build_project_template_definition(db, project)
+    except (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    template_agents = definition["agents"]
+    publication_key = hashlib.sha256(
+        "\x1f".join(
+            (
+                str(project.tenant_id),
+                str(project.id),
+                snapshot.head,
+                str(data.name or project.name),
+                str(data.description if data.description is not None else project.description or ""),
+                data.category,
+                data.version,
+                "published" if data.is_published else "draft",
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    existing_templates = (
+        (
+            await db.execute(
+                select(ProjectTemplate).where(
+                    ProjectTemplate.tenant_id == project.tenant_id,
+                    ProjectTemplate.created_by_user_id == current_user.id,
+                    ProjectTemplate.name == (data.name or project.name),
+                    ProjectTemplate.category == data.category,
+                    ProjectTemplate.version == data.version,
+                    ProjectTemplate.is_published == data.is_published,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing = next(
+        (
+            item
+            for item in existing_templates
+            if isinstance(item.definition, dict)
+            and item.definition.get("_publication_key") == publication_key
+        ),
+        None,
+    )
+    if existing is not None:
+        return await _template_payload(db, existing)
+    definition["_publication_key"] = publication_key
+    template = ProjectTemplate(
+        tenant_id=project.tenant_id,
+        created_by_user_id=current_user.id,
+        name=data.name or project.name,
+        description=data.description if data.description is not None else project.description,
+        category=data.category,
+        version=data.version,
+        is_published=data.is_published,
+        definition=definition,
+    )
+    db.add(template)
+    await db.flush()
+    add_event(
+        db,
+        project,
+        "project.template.published",
+        "Published final project assets and digital employee configuration as a template",
+        actor_user_id=current_user.id,
+        metadata={
+            "template_id": str(template.id),
+            "source_head": snapshot.head,
+            "file_count": len(snapshot.project_files["files"]),
+            "digital_employee_count": len(template_agents),
+            "excluded_file_count": snapshot.project_files["excluded_file_count"],
+        },
+    )
+    await db.flush()
+    return await _template_payload(db, template)
+
+
+@router.get("/{project_id}/template-manifest")
+async def get_project_template_manifest(
+    project_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview the exact safe assets that project-template publication will include."""
+
+    project = await require_owner(db, current_user, project_id)
+    try:
+        definition, _snapshot = await _build_project_template_definition(db, project)
+    except (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return public_template_definition(definition)
 
 
 @router.get("/{project_id}")
@@ -758,13 +1169,23 @@ async def patch_project(
 ):
     updates = data.model_dump(exclude_unset=True)
     acl_change = bool({"visibility", "shared_with_user_ids"} & data.model_fields_set)
+    runtime_change = "status" in data.model_fields_set
     project = (
         await require_owner(db, current_user, project_id)
-        if acl_change
+        if acl_change or runtime_change
         else await require_project(db, current_user, project_id, edit=True)
     )
-    if project.status == "planning" and updates.get("status") == "running":
-        raise HTTPException(status_code=409, detail="Confirm the Leader kickoff before starting a planning project")
+    runtime_event_type = None
+    target_status = updates.get("status")
+    if runtime_change:
+        await db.refresh(project, with_for_update=True)
+        if project.status not in {"running", "paused"} or target_status not in {"running", "paused"}:
+            raise HTTPException(
+                status_code=409,
+                detail="The project runtime switch only supports running and paused projects",
+            )
+        if target_status != project.status:
+            runtime_event_type = "project.paused" if target_status == "paused" else "project.resumed"
     shared_ids = updates.pop("shared_with_user_ids", None)
     requested_visibility = updates.pop("visibility", None)
     if requested_visibility == "shared" and shared_ids is not None and not shared_ids:
@@ -779,7 +1200,17 @@ async def patch_project(
         await replace_access_grants(db, project, [], actor_user_id=current_user.id)
     elif requested_visibility == "shared" and project.visibility != "shared":
         raise HTTPException(status_code=422, detail="Set shared_with_user_ids when sharing a project")
-    add_event(db, project, "project.updated", "Project settings updated", actor_user_id=current_user.id)
+    if runtime_event_type is not None:
+        add_event(
+            db,
+            project,
+            runtime_event_type,
+            "Paused all new project work" if target_status == "paused" else "Resumed project work",
+            actor_user_id=current_user.id,
+            metadata={"previous_status": "running" if target_status == "paused" else "paused"},
+        )
+    if set(updates) - {"status"} or acl_change:
+        add_event(db, project, "project.updated", "Project settings updated", actor_user_id=current_user.id)
     await db.flush()
     await db.refresh(project)
     return await project_summary(db, project)
@@ -944,6 +1375,144 @@ async def list_project_members(
     )
 
 
+@router.get("/{project_id}/agents", response_model=list[ProjectAgentOut])
+async def list_project_agents(
+    project_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List the project-owned Agents visible to every project participant."""
+
+    project = await require_project(db, current_user, project_id)
+    records = await list_project_agent_records(db, project)
+    return [await serialize_project_agent(project, agent, member) for agent, member in records]
+
+
+@router.post("/{project_id}/agents", response_model=ProjectAgentOut, status_code=201)
+async def create_project_owned_agent(
+    project_id: uuid.UUID,
+    data: ProjectAgentCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create or copy an Agent as a project-owned asset."""
+
+    project = await require_owner(db, current_user, project_id)
+    agent, member = await create_project_agent(db, project, current_user, data)
+    await db.commit()
+    await db.refresh(agent)
+    await db.refresh(member)
+    return await serialize_project_agent(project, agent, member)
+
+
+@router.get("/{project_id}/agents/{agent_id}", response_model=ProjectAgentOut)
+async def get_project_owned_agent(
+    project_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id)
+    agent, member = await get_project_agent_record(db, project, agent_id)
+    return await serialize_project_agent(project, agent, member)
+
+
+@router.patch("/{project_id}/agents/{agent_id}", response_model=ProjectAgentOut)
+async def patch_project_owned_agent(
+    project_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    data: ProjectAgentUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    agent, member = await get_project_agent_record(db, project, agent_id)
+    await update_project_agent(db, project, current_user, agent, member, data)
+    await db.commit()
+    await db.refresh(agent)
+    await db.refresh(member)
+    return await serialize_project_agent(project, agent, member)
+
+
+@router.post("/{project_id}/agents/{agent_id}/deactivate", response_model=ProjectAgentOut)
+async def deactivate_project_owned_agent(
+    project_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    data: ProjectAgentLifecycleRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.subagent_runtime import cancel_local_subagent_tasks
+
+    project = await require_owner(db, current_user, project_id)
+    agent, member = await get_project_agent_record(db, project, agent_id)
+    child_ids = await deactivate_project_agent(
+        db,
+        project,
+        current_user,
+        agent,
+        member,
+        reason=data.reason if data else None,
+    )
+    await db.commit()
+    await cancel_local_subagent_tasks(child_ids)
+    await db.refresh(agent)
+    await db.refresh(member)
+    return await serialize_project_agent(project, agent, member)
+
+
+@router.post("/{project_id}/agents/{agent_id}/restore", response_model=ProjectAgentOut)
+async def restore_project_owned_agent(
+    project_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    data: ProjectAgentLifecycleRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    agent, member = await get_project_agent_record(db, project, agent_id)
+    await restore_project_agent(
+        db,
+        project,
+        current_user,
+        agent,
+        member,
+        reason=data.reason if data else None,
+    )
+    await db.commit()
+    await db.refresh(agent)
+    await db.refresh(member)
+    return await serialize_project_agent(project, agent, member)
+
+
+@router.post("/{project_id}/agents/{agent_id}/promote", response_model=ProjectAgentPromotionOut, status_code=201)
+async def promote_project_owned_agent(
+    project_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    data: ProjectAgentPromoteRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    agent, _member = await get_project_agent_record(db, project, agent_id)
+    promoted = await promote_project_agent(
+        db,
+        project,
+        current_user,
+        agent,
+        name=data.name if data else None,
+    )
+    await db.commit()
+    await db.refresh(promoted)
+    return {
+        "id": promoted.id,
+        "name": promoted.name,
+        "role_description": promoted.role_description or "",
+        "source_project_id": project.id,
+        "source_project_agent_id": agent.id,
+    }
+
+
 @router.post("/{project_id}/members", response_model=ProjectMemberOut, status_code=201)
 async def create_project_member(
     project_id: uuid.UUID,
@@ -952,7 +1521,9 @@ async def create_project_member(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id, edit=True)
-    return await add_member(db, project, data, actor_user_id=current_user.id)
+    member = await add_member(db, project, data, actor_user_id=current_user.id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    return member
 
 
 async def _load_project_member(
@@ -988,6 +1559,7 @@ async def remove_project_member(
 
     project = await require_project(db, current_user, project_id, edit=True)
     member = await _load_project_member(db, project, member_id)
+    await _guard_project_agent_member_mutation(db, current_user, project, member)
     child_ids = await deactivate_project_member(
         db,
         project,
@@ -1013,6 +1585,7 @@ async def restore_removed_project_member(
 
     project = await require_project(db, current_user, project_id, edit=True)
     member = await _load_project_member(db, project, member_id)
+    await _guard_project_agent_member_mutation(db, current_user, project, member)
     await restore_project_member(
         db,
         project,
@@ -1035,11 +1608,12 @@ async def patch_project_member(
 ):
     project = await require_project(db, current_user, project_id, edit=True)
     member = await _load_project_member(db, project, member_id)
+    await _guard_project_agent_member_mutation(db, current_user, project, member)
     updates = data.model_dump(exclude_unset=True)
     requested_enabled = updates.pop("is_enabled", None)
     requested_leader = updates.pop("is_leader", None)
     if requested_enabled is False and requested_leader is True:
-        raise HTTPException(status_code=422, detail="A departed member cannot become project Leader")
+        raise HTTPException(status_code=422, detail="A departed member cannot become project owner")
     if "config_snapshot" in updates:
         member.config_snapshot = updates.pop("config_snapshot")
     if requested_enabled is False:
@@ -1063,10 +1637,13 @@ async def patch_project_member(
             reason="member_patch_restore",
         )
     if requested_leader is False and member.is_leader:
-        raise HTTPException(status_code=422, detail="Assign another enabled Leader instead of clearing leadership")
+        raise HTTPException(
+            status_code=422,
+            detail="Assign another enabled project owner instead of clearing responsibility",
+        )
     if requested_leader is True:
         if not member.is_enabled:
-            raise HTTPException(status_code=422, detail="Leader must be an active project member")
+            raise HTTPException(status_code=422, detail="Project owner must be an active project member")
         await db.execute(
             ProjectMemberSnapshot.__table__.update()
             .where(ProjectMemberSnapshot.project_id == project.id)
@@ -1105,7 +1682,8 @@ async def put_project_leader(
         )
     ).scalar_one_or_none()
     if member is None:
-        raise HTTPException(status_code=422, detail="Leader must be an enabled project member")
+        raise HTTPException(status_code=422, detail="Project owner must be an enabled project member")
+    await _guard_project_agent_member_mutation(db, current_user, project, member)
     await db.execute(
         ProjectMemberSnapshot.__table__.update()
         .where(ProjectMemberSnapshot.project_id == project.id)
@@ -1206,7 +1784,10 @@ async def _require_member_agent(db: AsyncSession, project: Project, agent_id: uu
         )
     ).scalar_one_or_none()
     if found is None:
-        raise HTTPException(status_code=422, detail="Agent must be an enabled project member")
+        raise HTTPException(
+            status_code=422,
+            detail="数字员工必须是已启用的项目成员",
+        )
 
 
 async def _validate_work_item_links(
@@ -1336,21 +1917,56 @@ async def get_work_item_detail(
         if event.work_item_id == item.id or bool(run_ids & event_run_ids):
             events.append(event)
     run_by_id = {str(run["id"]): run for run in run_payloads}
-    sessions = [
-        {
-            "run_id": str(run["id"]),
-            "work_item_id": str(item.id),
-            "agent_id": str(run["agent_id"]) if run.get("agent_id") else None,
-            "agent_name": run.get("agent_name"),
-            "status": run["status"],
-            "source_channel": "agent" if run["trigger_type"] == "a2a" else "subagent",
-            "session_intent": "a2a" if run["trigger_type"] == "a2a" else "execution",
-            "session_id": str(run["session_id"]) if run.get("session_id") else None,
-            "subagent_session_id": (str(run["subagent_session_id"]) if run.get("subagent_session_id") else None),
-        }
+    trace_session_ids = {
+        str(run.get("subagent_session_id") or run.get("session_id"))
         for run in run_payloads
-        if run.get("session_id") or run.get("subagent_session_id")
-    ]
+        if run.get("subagent_session_id") or run.get("session_id")
+    }
+    trace_run_ids = {str(run["id"]) for run in run_payloads}
+    trace_anchor_rows = (
+        (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id.in_(trace_session_ids),
+                    ChatMessage.role == "user",
+                    ChatMessage.message_meta["project_run_id"].as_string().in_(trace_run_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if trace_session_ids and trace_run_ids
+        else []
+    )
+    trace_anchor_by_run_id = {
+        str(dict(row.message_meta or {}).get("project_run_id")): str(row.id)
+        for row in trace_anchor_rows
+        if dict(row.message_meta or {}).get("project_run_id")
+    }
+    sessions = []
+    for run in run_payloads:
+        if not (run.get("session_id") or run.get("subagent_session_id")):
+            continue
+        run_input = dict(run.get("input") or {})
+        run_dispatch = dict(run_input.get("dispatch") or {})
+        anchor_message_id = trace_anchor_by_run_id.get(str(run["id"])) or (
+            str(run_dispatch.get("turn_anchor_id") or run_input.get("turn_anchor_id") or "").strip() or None
+        )
+        sessions.append(
+            {
+                "run_id": str(run["id"]),
+                "project_run_id": str(run["id"]),
+                "work_item_id": str(item.id),
+                "agent_id": str(run["agent_id"]) if run.get("agent_id") else None,
+                "agent_name": run.get("agent_name"),
+                "status": run["status"],
+                "source_channel": "agent" if run["trigger_type"] == "a2a" else "subagent",
+                "session_intent": "a2a" if run["trigger_type"] == "a2a" else "execution",
+                "session_id": str(run["session_id"]) if run.get("session_id") else None,
+                "subagent_session_id": (str(run["subagent_session_id"]) if run.get("subagent_session_id") else None),
+                "anchor_message_id": anchor_message_id,
+            }
+        )
     known_session_ids = {row["session_id"] for row in sessions if row.get("session_id")}
     session_actor_ids = {event.actor_agent_id for event in item_events if event.actor_agent_id is not None}
     session_members = (
@@ -1377,6 +1993,7 @@ async def get_work_item_detail(
         sessions.append(
             {
                 "run_id": str(event.run_id) if event.run_id else metadata.get("project_run_id"),
+                "project_run_id": str(event.run_id) if event.run_id else metadata.get("project_run_id"),
                 "work_item_id": str(item.id),
                 "agent_id": str(event.actor_agent_id) if event.actor_agent_id else None,
                 "agent_name": session_member_names.get(str(event.actor_agent_id)),
@@ -1385,6 +2002,9 @@ async def get_work_item_detail(
                 "session_intent": "evidence",
                 "session_id": event_session_id,
                 "subagent_session_id": metadata.get("subagent_session_id") or event_session_id,
+                "anchor_message_id": metadata.get("anchor_message_id")
+                or metadata.get("turn_anchor_id")
+                or metadata.get("subagent_turn_anchor_id"),
             }
         )
         known_session_ids.add(event_session_id)
@@ -1405,7 +2025,7 @@ async def get_work_item_detail(
                 str(linked_run["subagent_session_id"]) if linked_run and linked_run.get("subagent_session_id") else None
             ),
         }
-        commit = str(metadata.get("commit") or "").strip()
+        commit = str(metadata.get("commit") or metadata.get("commit_hash") or "").strip()
         if commit:
             commits_by_hash.setdefault(
                 commit,
@@ -1416,24 +2036,13 @@ async def get_work_item_detail(
                     "message": metadata.get("message") or event.summary,
                     "event_type": event.event_type,
                     "created_at": event.created_at,
-                    "paths": list(metadata.get("paths") or []),
+                    # Populated from Git below. Event metadata describes the
+                    # requested operation and is not authoritative evidence of
+                    # what the commit actually changed (an empty milestone can
+                    # legitimately carry a non-empty requested path list).
+                    "paths": [],
                 },
             )
-        raw_paths: list[str] = []
-        if metadata.get("path"):
-            raw_paths.append(str(metadata["path"]))
-        raw_paths.extend(str(path) for path in (metadata.get("paths") or []) if path)
-        file_meta = metadata.get("file")
-        if isinstance(file_meta, dict) and file_meta.get("path"):
-            raw_paths.append(str(file_meta["path"]))
-        for path in raw_paths:
-            files_by_path[path] = {
-                **trace,
-                "path": path,
-                "commit": commit or None,
-                "event_type": event.event_type,
-                "created_at": event.created_at,
-            }
         for value in metadata.get("evidence") or []:
             evidence.append({**trace, "kind": "evidence", "value": str(value), "created_at": event.created_at})
         if metadata.get("progress_note"):
@@ -1444,6 +2053,51 @@ async def get_work_item_detail(
                     "value": str(metadata["progress_note"]),
                     "created_at": event.created_at,
                 }
+            )
+    # Only commits reached through the explicit work-item/run relation above
+    # are inspected. The file list is derived from the repository diff, never
+    # from event ``path(s)`` hints, so unrelated repository files and requested
+    # paths on an empty milestone cannot leak into this detail contract.
+    for commit_hash, commit_record in commits_by_hash.items():
+        try:
+            diff = await project_commit_diff(project, commit_hash, max_patch_bytes=1)
+        except (HTTPException, RuntimeError) as exc:
+            logger.warning(
+                "Unable to resolve work-item Git diff project={} work_item={} commit={}: {}",
+                project.id,
+                item.id,
+                commit_hash,
+                exc,
+            )
+            commit_record["diff_available"] = False
+            continue
+        changed_files = list(diff.get("files") or [])
+        commit_record["paths"] = [str(file["path"]) for file in changed_files if file.get("path")]
+        commit_record["diff_available"] = True
+        commit_record["files_truncated"] = bool(diff.get("files_truncated"))
+        for changed_file in changed_files:
+            path = str(changed_file.get("path") or "").strip()
+            if not path:
+                continue
+            # Events and commits are newest-first. Keep the newest explicit
+            # commit for a path while the separate commit list preserves the
+            # full history for the work item.
+            files_by_path.setdefault(
+                path,
+                {
+                    "event_id": commit_record.get("event_id"),
+                    "run_id": commit_record.get("run_id"),
+                    "work_item_id": commit_record.get("work_item_id"),
+                    "session_id": commit_record.get("session_id"),
+                    "subagent_session_id": commit_record.get("subagent_session_id"),
+                    "path": path,
+                    "commit": commit_hash,
+                    "status": changed_file.get("status"),
+                    "additions": changed_file.get("additions"),
+                    "deletions": changed_file.get("deletions"),
+                    "binary": bool(changed_file.get("binary")),
+                    "created_at": commit_record.get("created_at"),
+                },
             )
     for run in run_payloads:
         output = dict(run.get("output") or {})
@@ -1605,13 +2259,12 @@ async def create_project_run(
     from app.services.subagent_runtime import dispatch_project_run
 
     project = await require_project(db, current_user, project_id, edit=True)
-    if project.status != "running":
-        raise HTTPException(
-            status_code=409,
-            detail="Confirm project kickoff before creating execution runs",
-        )
+    ensure_project_running(project)
     if data.trigger_type == "a2a":
-        raise HTTPException(status_code=422, detail="Use the project A2A endpoint for Agent-to-Agent delivery")
+        raise HTTPException(
+            status_code=422,
+            detail="数字员工之间发送消息请使用项目 A2A 接口",
+        )
     work_item = None
     if data.work_item_id:
         work_item = (
@@ -1646,8 +2299,11 @@ async def create_project_run(
     ).scalar_one_or_none()
     if member is None:
         if requested_agent_id is not None:
-            raise HTTPException(status_code=422, detail="Agent must be an enabled project member")
-        raise HTTPException(status_code=422, detail="Project needs an enabled Leader for a default run")
+            raise HTTPException(
+                status_code=422,
+                detail="数字员工必须是已启用的项目成员",
+            )
+        raise HTTPException(status_code=422, detail="Project needs an enabled project owner for a default run")
 
     supplied_input = dict(data.input or {})
     task = str(
@@ -1662,7 +2318,16 @@ async def create_project_run(
         )
         task = f"{work_context}\n\nAdditional instruction:\n{task}" if task else work_context
     if not task:
-        task = "Review the current project state, execute the next safe action, and report traceable progress."
+        raise HTTPException(
+            status_code=422,
+            detail="work_item_id or an explicit task/objective/message is required",
+        )
+    run_title = str(supplied_input.get("title") or supplied_input.get("objective") or "").strip()
+    if work_item is not None:
+        run_title = work_item.title
+    if not run_title:
+        run_title = task.splitlines()[0].strip()
+    run_title = run_title[:120]
 
     group_session = await ensure_project_group_session(db, project)
     anchor = ChatMessage(
@@ -1695,6 +2360,7 @@ async def create_project_run(
         trigger_type=data.trigger_type,
         input={
             **supplied_input,
+            "title": run_title,
             "group_session_id": str(group_session.id),
             "dispatch": {
                 "group_session_id": str(group_session.id),
@@ -1846,9 +2512,9 @@ def _group_session_payload(session: ChatSession, project: Project) -> dict:
     policies = dict((project.settings or {}).get("policies") or {})
     mention_limit = min(8, max(1, int(policies.get("max_group_mentions_per_message", 4))))
     configured_wake_budget = max(0, int(policies.get("max_a2a_wakes", mention_limit)))
-    # A Human message always gets one Leader turn, even when an old project
+    # A Human message always gets one project-owner turn, even when an old project
     # policy configured a zero A2A wake budget. The remainder is available to
-    # explicit, non-Leader mentions.
+    # explicit mentions of other members.
     max_mentions = min(mention_limit, max(0, max(1, configured_wake_budget) - 1))
     return {
         "id": str(session.id),
@@ -1868,6 +2534,7 @@ def _group_message_payload(message: ChatMessage) -> dict:
 
 
 def _leader_session_payload(session: ChatSession, discussion_count: int) -> dict:
+    config = dict(session.im_config or {})
     return {
         "id": str(session.id),
         "project_id": str(session.project_id) if session.project_id else None,
@@ -1876,10 +2543,61 @@ def _leader_session_payload(session: ChatSession, discussion_count: int) -> dict
         "title": session.title,
         "source_channel": session.source_channel,
         "is_group": False,
+        "read_only": bool(config.get("read_only")),
+        "planning_transport": config.get("planning_transport", "leader_session"),
         "discussion_count": discussion_count,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "last_message_at": session.last_message_at.isoformat() if session.last_message_at else None,
     }
+
+
+def _uses_project_group_planning(project: Project) -> bool:
+    planning = dict((project.settings or {}).get("planning") or {})
+    return planning.get("conversation_mode") == "project_group"
+
+
+def _has_unfinished_direct_planning_turn(messages: list[ChatMessage]) -> bool:
+    """Detect the latest Human anchor without its terminal owner reply.
+
+    Modern Web replies identify their exact Human anchor. Older planning rows did
+    not, so one later plain assistant row remains the compatibility completion
+    signal. Tool-call rows never satisfy the barrier.
+    """
+
+    latest_human_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].role == "user" and messages[index].sender_user_id is not None
+        ),
+        None,
+    )
+    if latest_human_index is None:
+        return False
+    human = messages[latest_human_index]
+    for message in messages[latest_human_index + 1 :]:
+        if message.role != "assistant":
+            continue
+        anchor_id = dict(message.message_meta or {}).get("turn_anchor_id")
+        if anchor_id is None or str(anchor_id) == str(human.id):
+            return False
+    return True
+
+
+async def _has_active_project_planning_run(db: AsyncSession, project: Project) -> bool:
+    active_id = (
+        await db.execute(
+            select(ProjectRun.id)
+            .where(
+                ProjectRun.project_id == project.id,
+                ProjectRun.tenant_id == project.tenant_id,
+                ProjectRun.trigger_type.in_(_PROJECT_PLANNING_RUN_TRIGGERS),
+                ProjectRun.status.in_(["queued", "running"]),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return active_id is not None
 
 
 def _kickoff_transcript(
@@ -1898,7 +2616,7 @@ def _kickoff_transcript(
         "## Planning discussion",
         "",
     ]
-    role_labels = {"user": "User", "assistant": "Leader", "system": "System", "tool_call": "Tool"}
+    role_labels = {"user": "用户", "assistant": "负责人", "system": "系统", "tool_call": "工具"}
     for message in messages:
         actor = role_labels.get(message.role, message.role.title())
         timestamp = message.created_at.isoformat() if message.created_at else "unknown time"
@@ -1935,10 +2653,10 @@ async def confirm_project_kickoff(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Freeze Leader planning evidence and start one durable Leader child.
+    """Freeze project-owner planning evidence and start one durable child.
 
     Confirmation is the only implicit wake in this flow and targets only the
-    enabled Leader. Group messages remain append-only and structured mentions
+    enabled project owner. Group messages remain append-only and structured mentions
     keep their zero-broadcast default.
     """
     from app.services.subagent_runtime import dispatch_project_run
@@ -2012,27 +2730,16 @@ async def confirm_project_kickoff(
         )
     ).scalar_one_or_none()
     if leader is None:
-        raise HTTPException(status_code=422, detail="Project needs an enabled Leader before kickoff")
+        raise HTTPException(status_code=422, detail="Project needs an enabled project owner before kickoff")
     leader_session = await ensure_project_leader_session(db, project)
-    discussion = (
-        (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == str(leader_session.id))
-                .order_by(ChatMessage.created_at, ChatMessage.id)
+    group_session = await ensure_project_group_session(db, project)
+    group_planning = _uses_project_group_planning(project)
+    if group_planning:
+        if await _has_active_project_planning_run(db, project):
+            raise HTTPException(
+                status_code=409,
+                detail="Project planning is still being processed; confirm kickoff after the current turn completes",
             )
-        )
-        .scalars()
-        .all()
-    )
-    roles = {message.role for message in discussion}
-    if "user" not in roles or "assistant" not in roles:
-        # New projects discuss the plan in the canonical project group. Keep
-        # the older dedicated Leader planning session as a compatible source,
-        # then fall back to the auditable Human <-> current Leader subset of
-        # the group timeline. Other Agents' replies are deliberately excluded
-        # from the frozen agreement.
-        group_session = await ensure_project_group_session(db, project)
         discussion = (
             (
                 await db.execute(
@@ -2057,22 +2764,80 @@ async def confirm_project_kickoff(
         discussion_source = "project_group"
         discussion_session_id = group_session.id
     else:
-        group_session = await ensure_project_group_session(db, project)
-        discussion_source = "leader_session"
-        discussion_session_id = leader_session.id
+        discussion = (
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.conversation_id == str(leader_session.id))
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if _has_unfinished_direct_planning_turn(discussion):
+            raise HTTPException(
+                status_code=409,
+                detail="Project planning is still being processed; confirm kickoff after the current turn completes",
+            )
+        roles = {message.role for message in discussion}
+        if "user" not in roles or "assistant" not in roles:
+            # Older projects may have moved planning into the canonical group
+            # before the transport marker existed. Keep that migration path.
+            discussion = (
+                (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.conversation_id == str(group_session.id),
+                            or_(
+                                and_(ChatMessage.role == "user", ChatMessage.sender_user_id.is_not(None)),
+                                and_(
+                                    ChatMessage.role == "assistant",
+                                    ChatMessage.sender_agent_id == leader.agent_id,
+                                ),
+                            ),
+                        )
+                        .order_by(ChatMessage.created_at, ChatMessage.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            roles = {message.role for message in discussion}
+            discussion_source = "project_group"
+            discussion_session_id = group_session.id
+        else:
+            discussion_source = "leader_session"
+            discussion_session_id = leader_session.id
+    if _has_unfinished_direct_planning_turn(discussion):
+        raise HTTPException(
+            status_code=409,
+            detail="Project planning has an unanswered Human message; wait for the project owner response",
+        )
     if "user" not in roles or "assistant" not in roles:
         raise HTTPException(
             status_code=422,
-            detail="Kickoff requires at least one Human message and one Leader response in planning or project chat",
+            detail=(
+                "Kickoff requires at least one Human message and one project owner response in planning or project chat"
+            ),
         )
 
-    confirmation = (data.confirmation or "I confirm this plan and authorize the Leader to begin execution.").strip()
-    confirmed_at = datetime.now(timezone.utc)
+    confirmation = (
+        data.confirmation or "I confirm this plan and authorize the project owner to begin execution."
+    ).strip()
+    confirmed_at = datetime.now(UTC)
     transcript = _kickoff_transcript(project, discussion, confirmation, confirmed_at)
     transcript_sha256 = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
     await reconcile_project_repository_operations(project.id, db=db)
     git_start = await repository_state(project, limit=1)
-    transcript_commit = await write_project_file(project, "docs/kickoff-transcript.md", transcript)
+    transcript_commit = await write_project_file(
+        project,
+        "docs/kickoff-transcript.md",
+        transcript,
+        author_name=current_user.display_name,
+        author_email=project_user_git_email(current_user.id),
+    )
     now = confirmed_at
     kickoff_message = ChatMessage(
         id=uuid.uuid4(),
@@ -2081,7 +2846,7 @@ async def confirm_project_kickoff(
         sender_user_id=current_user.id,
         role="user",
         content=(
-            f"Kickoff confirmed. Leader @{leader.name_snapshot} may begin driving the project. "
+            f"Kickoff confirmed. Project owner @{leader.name_snapshot} may begin driving the project. "
             "The frozen planning record is in docs/kickoff-transcript.md."
         ),
         conversation_id=str(group_session.id),
@@ -2100,11 +2865,7 @@ async def confirm_project_kickoff(
         },
         created_at=now,
     )
-    task = (
-        "The User confirmed project kickoff. Act as Project Leader: drive the agreed goal autonomously, "
-        "coordinate only explicit recipients, preserve all output in project Git, and report progress to the group.\n\n"
-        + transcript
-    )
+    task = build_project_kickoff_task(transcript)
     kickoff_snapshot = {
         "confirmed_at": confirmed_at.isoformat(),
         "confirmed_by_user_id": str(current_user.id),
@@ -2126,6 +2887,7 @@ async def confirm_project_kickoff(
         status="queued",
         trigger_type="leader_kickoff",
         input={
+            "title": f"启动项目：{project.name}"[:120],
             "leader_session_id": str(leader_session.id),
             "group_session_id": str(group_session.id),
             "leader_agent_id": str(leader.agent_id),
@@ -2229,6 +2991,10 @@ async def list_project_group_messages(
     project_id: uuid.UUID,
     session_id: uuid.UUID,
     limit: int = Query(500, ge=1, le=500),
+    before: str | None = Query(
+        None,
+        description="Cursor: ISO timestamp, optionally followed by |message UUID",
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2245,24 +3011,47 @@ async def list_project_group_messages(
     ).scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Project group session not found")
-    messages = (
-        (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == str(session.id))
-                .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-                .limit(limit)
-            )
-        )
-        .scalars()
-        .all()
+    messages_query = (
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == str(session.id))
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
     )
+    if before:
+        try:
+            before_timestamp, separator, before_message_id = before.partition("|")
+            before_dt = datetime.fromisoformat(before_timestamp.replace("Z", "+00:00"))
+            if separator:
+                cursor_id = uuid.UUID(before_message_id)
+                messages_query = messages_query.where(
+                    or_(
+                        ChatMessage.created_at < before_dt,
+                        and_(
+                            ChatMessage.created_at == before_dt,
+                            ChatMessage.id < cursor_id,
+                        ),
+                    )
+                )
+            else:
+                messages_query = messages_query.where(ChatMessage.created_at < before_dt)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=("Invalid `before` cursor. Use ISO 8601 or <ISO 8601>|<message UUID>."),
+            )
+    newest_first = (await db.execute(messages_query.limit(limit + 1))).scalars().all()
+    has_more = len(newest_first) > limit
+    messages = list(reversed(newest_first[:limit]))
+    oldest_message = messages[0] if messages else None
     return {
         "session": _group_session_payload(session, project),
         "items": await build_project_group_timeline(
             db,
             project_id=project.id,
-            group_messages=list(reversed(messages)),
+            group_messages=messages,
+        ),
+        "has_more": has_more,
+        "next_cursor": (
+            f"{oldest_message.created_at.isoformat()}|{oldest_message.id}" if oldest_message is not None else None
         ),
     }
 
@@ -2275,14 +3064,15 @@ async def create_project_group_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Append a group message, route Human input to Leader, and wake mentions."""
+    """Append a group message, route Human input to the project owner, and wake mentions."""
     from app.services.subagent_runtime import dispatch_project_run
 
     project = await require_project(db, current_user, project_id, edit=True)
+    ensure_project_running(project)
     if data.sender_agent_id is not None:
         raise HTTPException(
             status_code=422,
-            detail="Human project REST callers cannot impersonate an Agent sender",
+            detail="项目 REST 请求不能冒用数字员工身份发送消息",
         )
     session = (
         await db.execute(
@@ -2309,7 +3099,10 @@ async def create_project_group_message(
         )
     ).scalar_one_or_none()
     if leader is None:
-        raise HTTPException(status_code=422, detail="Project needs an enabled Leader for Human group messages")
+        raise HTTPException(
+            status_code=422,
+            detail="Project needs an enabled project owner for Human group messages",
+        )
     default_leader_agent_id = leader.agent_id
     policies = dict((project.settings or {}).get("policies") or {})
     mention_limit = min(8, max(1, int(policies.get("max_group_mentions_per_message", 4))))
@@ -2324,7 +3117,7 @@ async def create_project_group_message(
     if len(wake_agent_ids) > wake_budget:
         raise HTTPException(
             status_code=422,
-            detail=f"Leader and mentions exceed this project's per-message wake budget ({wake_budget})",
+            detail=f"Project owner and mentions exceed this project's per-message wake budget ({wake_budget})",
         )
     required_agent_ids = set(wake_agent_ids)
     members = (
@@ -2354,6 +3147,9 @@ async def create_project_group_message(
             await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == event_key))
         ).scalar_one_or_none()
     if existing is not None:
+        existing_work_item_id = dict(existing.message_meta or {}).get("work_item_id")
+        if str(existing_work_item_id or "") != str(data.work_item_id or ""):
+            raise HTTPException(status_code=409, detail="client_message_id already refers to another work item")
         pending_runs = (
             (
                 await db.execute(
@@ -2397,6 +3193,7 @@ async def create_project_group_message(
             "mentions": [str(agent_id) for agent_id in mention_ids],
             "default_leader_agent_id": str(default_leader_agent_id),
             "attachments": data.attachments,
+            "work_item_id": str(data.work_item_id) if data.work_item_id else None,
             "awakened_agent_ids": [],
             "subagent_runs": [],
             "wake_policy": "default_leader_plus_structured_mentions",
@@ -2409,27 +3206,40 @@ async def create_project_group_message(
     execution_content = (data.llm_content or data.content).strip()
     if not execution_content:
         execution_content = "处理项目群聊中附带的文件，并把结论回复到项目群。附件：" + str(data.attachments)
+    from app.services.project_collaboration_prompt import build_project_group_task
+
+    message_title = execution_content.splitlines()[0].strip()[:96] or "处理项目群聊消息"
     project_runs: list[ProjectRun] = []
     for agent_id in wake_agent_ids:
         member = member_by_agent[agent_id]
         project_run = ProjectRun(
             tenant_id=project.tenant_id,
             project_id=project.id,
+            work_item_id=data.work_item_id,
             agent_id=agent_id,
             initiated_by_user_id=current_user.id,
             status="queued",
             trigger_type="group_leader_message" if agent_id == default_leader_agent_id else "group_mention",
             input={
+                "title": (
+                    f"处理群聊：{message_title}"
+                    if agent_id == default_leader_agent_id
+                    else f"响应提及：{message_title}"
+                )[:120],
                 "group_session_id": str(session.id),
                 "group_message_id": str(message.id),
                 "mentioned_agent_id": str(agent_id),
                 "wake_reason": "default_leader" if agent_id == default_leader_agent_id else "structured_mention",
                 "initiator_user_id": str(current_user.id),
+                "work_item_id": str(data.work_item_id) if data.work_item_id else None,
                 "dispatch": {
                     "group_session_id": str(session.id),
                     "project_member_id": str(member.id),
                     "turn_anchor_id": str(message.id),
-                    "task": execution_content,
+                    "task": build_project_group_task(
+                        execution_content,
+                        is_owner=agent_id == default_leader_agent_id,
+                    ),
                 },
             },
             output={"group_session_id": str(session.id)},
@@ -2477,6 +3287,10 @@ async def create_project_group_message(
     message = await db.get(ChatMessage, message.id, with_for_update=True)
     if message is None:
         raise HTTPException(status_code=500, detail="Group message disappeared during wake dispatch")
+    # Dispatch executes in its own transaction and may defer the owner when
+    # the Human addressed specialists explicitly. Refresh the cached row so
+    # the API response exposes that durable routing decision immediately.
+    await db.refresh(message)
     recovered_meta = dict(message.message_meta or {})
     awakened = list(dict.fromkeys([*recovered_meta.get("awakened_agent_ids", []), *awakened]))
     recovered_rows = list(recovered_meta.get("subagent_runs", []))
@@ -2499,6 +3313,7 @@ async def create_project_group_message(
     event_metadata = {
         "group_session_id": str(session.id),
         "group_message_id": str(message.id),
+        "work_item_id": str(data.work_item_id) if data.work_item_id else None,
         "initiator_user_id": str(current_user.id),
         "visible_to_group": True,
         "mentioned_agent_ids": [str(agent_id) for agent_id in mention_ids],
@@ -2512,9 +3327,10 @@ async def create_project_group_message(
             db,
             project,
             "group.message.created",
-            "Appended project group message and dispatched Leader plus structured mentions",
+            "Appended project group message and dispatched its selected project members",
             actor_user_id=current_user.id,
             actor_agent_id=None,
+            work_item_id=data.work_item_id,
             metadata=event_metadata,
         )
     else:
@@ -2540,10 +3356,54 @@ async def wake_project_agent(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id, edit=True)
+    ensure_project_running(project)
     if data.from_agent_id == data.to_agent_id:
         raise HTTPException(status_code=422, detail="from_agent_id and to_agent_id must differ")
     await _require_member_agent(db, project, data.from_agent_id)
     await _require_member_agent(db, project, data.to_agent_id)
+    work_item = (
+        await db.execute(
+            select(ProjectWorkItem).where(
+                ProjectWorkItem.id == data.work_item_id,
+                ProjectWorkItem.project_id == project.id,
+                ProjectWorkItem.tenant_id == project.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if work_item is None:
+        raise HTTPException(status_code=422, detail="Work item is not in this project")
+    dependency_ids = {uuid.UUID(str(value)) for value in (work_item.dependency_ids or [])}
+    if dependency_ids:
+        dependency_rows = (
+            (
+                await db.execute(
+                    select(ProjectWorkItem).where(
+                        ProjectWorkItem.project_id == project.id,
+                        ProjectWorkItem.tenant_id == project.tenant_id,
+                        ProjectWorkItem.id.in_(dependency_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        unfinished = [item.title for item in dependency_rows if item.status != "done"]
+        missing = len(dependency_rows) != len(dependency_ids)
+        if unfinished or missing:
+            labels = ", ".join(unfinished) or "missing dependency records"
+            raise HTTPException(
+                status_code=409,
+                detail=f"Project A2A cannot wake this work item before its dependencies are done: {labels}",
+            )
+    run_title = data.title.strip()[:120]
+    expected_output = data.expected_output.strip()
+    message = data.message.strip()
+    if not run_title or not message or not expected_output:
+        raise HTTPException(
+            status_code=422,
+            detail="title, message and expected_output must contain non-whitespace text",
+        )
+    actionable_message = f"{message}\n\nExpected output: {expected_output}"
     group_session = await ensure_project_group_session(db, project)
     run = ProjectRun(
         tenant_id=project.tenant_id,
@@ -2554,10 +3414,12 @@ async def wake_project_agent(
         status="queued",
         trigger_type="a2a",
         input={
+            "title": run_title,
             "from_agent_id": str(data.from_agent_id),
             "to_agent_id": str(data.to_agent_id),
-            "message": data.message,
+            "message": actionable_message,
             "mode": data.mode,
+            "expected_output": expected_output,
             "new_conversation": data.new_conversation,
             "connector": "agent_tools.send_message_to_agent",
             "group_session_id": str(group_session.id),
@@ -2570,7 +3432,7 @@ async def wake_project_agent(
         db,
         project,
         "a2a.queued",
-        f"Queued direct {data.mode} wake between project agents",
+        f"Queued project collaboration action: {run_title}",
         actor_user_id=current_user.id,
         actor_agent_id=data.from_agent_id,
         from_agent_id=data.from_agent_id,
@@ -2579,7 +3441,9 @@ async def wake_project_agent(
         run_id=run.id,
         metadata={
             "mode": data.mode,
-            "message": data.message,
+            "title": run_title,
+            "message": message,
+            "expected_output": expected_output,
             "delivery": "queued",
             "connector": "agent_tools.send_message_to_agent",
             "group_session_id": str(group_session.id),
@@ -2778,9 +3642,17 @@ async def create_git_restore(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_project(db, current_user, project_id, edit=True)
+    # Restoring an arbitrary tree may replace project-owned Agent identity
+    # files, so this repository-wide mutation is owner-only.
+    project = await require_owner(db, current_user, project_id)
     await reconcile_project_repository_operations(project.id, db=db)
-    result = await restore_as_new_commit(project, data.commit, data.message)
+    result = await restore_as_new_commit(
+        project,
+        data.commit,
+        data.message,
+        author_name=current_user.display_name,
+        author_email=project_user_git_email(current_user.id),
+    )
     _record_git_head(project, result["commit"])
     event = add_event(
         db,
@@ -2822,10 +3694,24 @@ async def get_project_file_content(
     encoded_path = quote(result["path"], safe="")
     encoded_ticket = quote(ticket, safe="")
     raw_url = f"/api/projects/{project.id}/files/raw?path={encoded_path}&ticket={encoded_ticket}"
+    html_preview_url = None
+    if result["is_text"] and result["mime_type"] == "text/html":
+        preview_ticket = _create_project_snapshot_ticket(
+            current_user,
+            project,
+            purpose="project_html_preview",
+            path=result["path"],
+            head=result["head"],
+        )
+        html_preview_url = (
+            f"/api/projects/{project.id}/files/preview/"
+            f"{quote(preview_ticket, safe='')}/{quote(result['path'], safe='/')}"
+        )
     return {
         **result,
         "raw_url": raw_url,
         "download_url": f"{raw_url}&download=true",
+        "html_preview_url": html_preview_url,
         "ticket_expires_in": _PROJECT_FILE_TICKET_TTL_SECONDS,
     }
 
@@ -2890,6 +3776,120 @@ async def get_project_file_raw(
     )
 
 
+@router.get("/{project_id}/files/archive")
+async def get_project_directory_archive_ticket(
+    project_id: uuid.UUID,
+    path: str = Query(default="", max_length=1024),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a short-lived download URL for one immutable HEAD directory."""
+
+    project = await require_project(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    snapshot = await inspect_project_directory(project, path)
+    ticket = _create_project_snapshot_ticket(
+        current_user,
+        project,
+        purpose="project_directory_archive",
+        path=snapshot["path"],
+        head=snapshot["head"],
+    )
+    return {
+        **snapshot,
+        "download_url": (
+            f"/api/projects/{project.id}/files/archive/raw?"
+            f"ticket={quote(ticket, safe='')}&path={quote(snapshot['path'], safe='')}"
+        ),
+        "ticket_expires_in": _PROJECT_FILE_TICKET_TTL_SECONDS,
+    }
+
+
+@router.api_route("/{project_id}/files/archive/raw", methods=["GET", "HEAD"])
+async def get_project_directory_archive(
+    project_id: uuid.UUID,
+    request: Request,
+    ticket: str = Query(min_length=1),
+    path: str = Query(default="", max_length=1024),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a prevalidated ZIP from the exact HEAD captured by its ticket."""
+
+    _user, project, payload = await _authorize_project_snapshot_ticket(
+        db,
+        project_id,
+        ticket,
+        purpose="project_directory_archive",
+    )
+    if payload["path"] != path:
+        raise HTTPException(status_code=401, detail="Project archive ticket does not match this directory")
+    snapshot = await inspect_project_directory(project, path, revision=payload["head"])
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(snapshot['name'], safe='')}",
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        "Cross-Origin-Resource-Policy": "same-origin",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Project-Git-Head": snapshot["head"],
+    }
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="application/zip", headers=headers)
+    return StreamingResponse(
+        iter_project_directory_archive(project, snapshot["head"], snapshot["path"]),
+        media_type="application/zip",
+        headers=headers,
+    )
+
+
+@router.api_route("/{project_id}/files/preview/{ticket}/{path:path}", methods=["GET", "HEAD"])
+async def get_project_html_preview_resource(
+    project_id: uuid.UUID,
+    ticket: str,
+    path: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve one sandbox-preview asset from a ticket's immutable Git HEAD."""
+
+    _user, project, payload = await _authorize_project_snapshot_ticket(
+        db,
+        project_id,
+        ticket,
+        purpose="project_html_preview",
+    )
+    metadata = await inspect_project_file_at(project, path, payload["head"])
+    preview_prefix = f"{str(request.base_url).rstrip('/')}/api/projects/{project.id}/files/preview/"
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(metadata['name'], safe='')}",
+        "Content-Length": str(metadata["size"]),
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Project-Git-Head": metadata["head"],
+    }
+    if metadata["mime_type"] == "text/html":
+        headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts; default-src 'none'; "
+            f"script-src 'unsafe-inline' {preview_prefix}; "
+            f"style-src 'unsafe-inline' {preview_prefix}; "
+            f"img-src data: blob: {preview_prefix}; "
+            f"media-src data: blob: {preview_prefix}; "
+            f"font-src data: {preview_prefix}; "
+            "connect-src 'none'; frame-src 'none'; object-src 'none'; "
+            "worker-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'"
+        )
+    if request.method == "HEAD" or metadata["size"] == 0:
+        return Response(status_code=200, media_type=metadata["mime_type"], headers=headers)
+    return StreamingResponse(
+        iter_project_file_blob(project, metadata["object_id"], start=0, end=metadata["size"] - 1),
+        media_type=metadata["mime_type"],
+        headers=headers,
+    )
+
+
 @router.put("/{project_id}/files")
 async def put_project_file(
     project_id: uuid.UUID,
@@ -2900,8 +3900,15 @@ async def put_project_file(
     """Atomically write one project file and immediately create its Git commit."""
 
     project = await require_project(db, current_user, project_id, edit=True)
+    await _guard_project_agent_identity_paths(db, current_user, project, data.path)
     await reconcile_project_repository_operations(project.id, db=db)
-    result = await write_project_file(project, data.path, data.content)
+    result = await write_project_file(
+        project,
+        data.path,
+        data.content,
+        author_name=current_user.display_name,
+        author_email=project_user_git_email(current_user.id),
+    )
     _record_git_head(project, result["commit"])
     event = add_event(
         db,
@@ -2933,6 +3940,8 @@ async def create_git_commit(
         data.message,
         data.paths,
         milestone=data.milestone,
+        author_name=current_user.display_name,
+        author_email=project_user_git_email(current_user.id),
     )
     _record_git_head(project, result["commit"])
     commit_event = add_event(
@@ -3097,7 +4106,92 @@ async def get_git_state(
 ):
     project = await require_project(db, current_user, project_id)
     await reconcile_project_repository_operations(project.id, db=db)
-    return await repository_state(project, limit)
+    state = await repository_state(project, limit)
+    commits = list(state.get("commits") or [])
+    commit_hashes = [str(commit.get("commit") or "") for commit in commits if commit.get("commit")]
+    if not commit_hashes:
+        return state
+
+    events = (
+        (
+            await db.execute(
+                select(ProjectEvent)
+                .where(
+                    ProjectEvent.project_id == project.id,
+                    ProjectEvent.tenant_id == project.tenant_id,
+                    ProjectEvent.event_metadata["commit"].as_string().in_(commit_hashes),
+                )
+                .order_by(ProjectEvent.created_at.desc(), ProjectEvent.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    run_ids = {event.run_id for event in events if event.run_id is not None}
+    work_item_ids = {event.work_item_id for event in events if event.work_item_id is not None}
+    runs = (
+        (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.tenant_id == project.tenant_id,
+                    ProjectRun.id.in_(run_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if run_ids
+        else []
+    )
+    work_items = (
+        (
+            await db.execute(
+                select(ProjectWorkItem).where(
+                    ProjectWorkItem.project_id == project.id,
+                    ProjectWorkItem.tenant_id == project.tenant_id,
+                    ProjectWorkItem.id.in_(work_item_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if work_item_ids
+        else []
+    )
+    run_agents = {run.id: run.agent_id for run in runs if run.agent_id is not None}
+    work_item_agents = {item.id: item.assignee_agent_id for item in work_items if item.assignee_agent_id is not None}
+    event_agent_by_commit: dict[str, uuid.UUID] = {}
+    for event in events:
+        commit_hash = str((event.event_metadata or {}).get("commit") or "")
+        if not commit_hash or commit_hash in event_agent_by_commit:
+            continue
+        agent_id = run_agents.get(event.run_id) or work_item_agents.get(event.work_item_id) or event.actor_agent_id
+        if agent_id is not None:
+            event_agent_by_commit[commit_hash] = agent_id
+    agent_ids = set(event_agent_by_commit.values())
+    members = (
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.agent_id.in_(agent_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if agent_ids
+        else []
+    )
+    member_names = {member.agent_id: member.name_snapshot for member in members}
+    for commit in commits:
+        agent_id = event_agent_by_commit.get(str(commit.get("commit") or ""))
+        if agent_id is not None and member_names.get(agent_id):
+            commit["author"] = member_names[agent_id]
+            commit["author_agent_id"] = str(agent_id)
+    return {**state, "commits": commits}
 
 
 @router.get("/{project_id}/git/diff")

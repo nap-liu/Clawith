@@ -14,6 +14,8 @@ compatibility, but new code should import from this module.
 """
 
 import uuid
+from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from sqlalchemy import select
@@ -21,6 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import is_agent_expired
 from app.database import async_session
+
+if TYPE_CHECKING:
+    from app.models.chat_session import ChatSession
+    from app.services.agent_runtime_workspace import AgentRuntimeWorkspace
 
 # LLM-layer error sentinels surfaced verbatim to the IM user, followed by a
 # recovery hint that guides them to reset the session with /new.
@@ -127,6 +133,9 @@ async def _call_agent_llm(
     broadcast_web: bool = True,
     include_soul: bool = True,
     include_memory: bool = True,
+    release_db_before_dispatch: bool = False,
+    runtime_session: "ChatSession | None" = None,
+    runtime_workspace: "AgentRuntimeWorkspace | None" = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -186,7 +195,13 @@ async def _call_agent_llm(
         return "⚠️ 数字员工未找到"
 
     if is_agent_expired(agent):
-        return "This Agent has expired and is off duty. Please contact your admin to extend its service."
+        return "数字员工已过期并停止服务，请联系管理员延长有效期。"
+
+    if str(getattr(agent, "scope", "") or "").strip().lower() == "project":
+        if runtime_workspace is None:
+            raise RuntimeError("Project Agent runtime workspace was not bound before dispatch")
+        if runtime_workspace.agent_id != agent.id or runtime_workspace.project_id != agent.project_id:
+            raise RuntimeError("Project Agent runtime workspace does not match execution identity")
 
     if model_name:
         from app.services.chat_model_selection import (
@@ -225,10 +240,11 @@ async def _call_agent_llm(
             from app.models.project import Project
             from app.services.chat_model_selection import resolve_project_runtime_models
 
-            try:
-                runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
-            except (TypeError, ValueError):
-                runtime_session = None
+            if runtime_session is None:
+                try:
+                    runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
+                except (TypeError, ValueError):
+                    runtime_session = None
             if (
                 runtime_session is not None
                 and runtime_session.source_channel == "subagent"
@@ -242,14 +258,8 @@ async def _call_agent_llm(
                 )
             else:
                 resolved_models = await resolve_runtime_models(db, agent=agent)
-        if (
-            turn_model_id
-            and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}
-        ):
-            return (
-                "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，"
-                "或 /model default 恢复默认模型。"
-            )
+        if turn_model_id and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}:
+            return "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，或 /model default 恢复默认模型。"
         model = resolved_models.primary_model
         fallback_model = resolved_models.fallback_model
 
@@ -281,11 +291,7 @@ async def _call_agent_llm(
             )
 
             anchor = await get_row(ChatMessage, turn_anchor_id)
-            if (
-                anchor is not None
-                and anchor.agent_id == history_agent_id
-                and anchor.conversation_id == str(session_id)
-            ):
+            if anchor is not None and anchor.agent_id == history_agent_id and anchor.conversation_id == str(session_id):
                 meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
                 if "attachments" in meta:
                     # Keep sender attribution and extracted document text from
@@ -328,8 +334,7 @@ async def _call_agent_llm(
             )
             if not compacted.triggered:
                 logger.warning(
-                    "[Channel] context recovery could not compact session="
-                    f"{session_id}: {compacted.skipped_reason}"
+                    f"[Channel] context recovery could not compact session={session_id}: {compacted.skipped_reason}"
                 )
                 return None
             async with async_session() as recovery_db:
@@ -342,9 +347,7 @@ async def _call_agent_llm(
                     is_group=is_group,
                 )
             if prefix is None:
-                logger.warning(
-                    f"[Channel] context recovery lost latest-anchor race session={session_id}"
-                )
+                logger.warning(f"[Channel] context recovery lost latest-anchor race session={session_id}")
                 return None
             return _normalize_history_messages(prefix) + frozen_current_suffix
 
@@ -400,9 +403,7 @@ async def _call_agent_llm(
         from app.utils.sanitize import sanitize_tool_args
 
         _evt = (
-            {**public_evt, "args": sanitize_tool_args(public_evt.get("args"))}
-            if "args" in public_evt
-            else public_evt
+            {**public_evt, "args": sanitize_tool_args(public_evt.get("args"))} if "args" in public_evt else public_evt
         )
         await _web_broadcast({"type": "tool_call", **_evt})
         if on_tool_call is not None:
@@ -425,32 +426,47 @@ async def _call_agent_llm(
     async def _collect_usage(usage: TokenUsage) -> None:
         turn_usage.add(usage)
 
+    if release_db_before_dispatch:
+        # All runtime configuration has been materialized above. Recovery and
+        # other detached workers may now return the connection to the pool
+        # before the potentially long model/tool loop. Persistence callbacks
+        # already use their own short-lived sessions.
+        await db.close()
+
     try:
-        reply = await call_llm_with_failover(
-            primary_model=model,
-            fallback_model=fallback_model,
-            messages=messages,
-            agent_name=agent.name,
-            role_description=agent.role_description or "",
-            agent_id=agent_id,
-            user_id=effective_user_id,
-            session_id=session_id,
-            on_chunk=_on_chunk_bridged,
-            on_thinking=_on_thinking_bridged,
-            on_usage=_collect_usage,
-            on_tool_call=_on_tool_call_persisted,
-            is_group=is_group,
-            channel_context=scene_channel_context,
-            turn_anchor_id=turn_anchor_id,
-            turn_anchor_agent_id=history_agent_id,
-            turn_type=turn_type,
-            context_recovery=context_recovery,
-            prepared_tools=prepared_tools,
-            before_round=before_round,
-            before_tool_execution=before_tool_execution,
-            include_soul=include_soul,
-            include_memory=include_memory,
-        )
+        runtime_binding = nullcontext()
+        if runtime_workspace is not None:
+            from app.services.agent_runtime_workspace import (
+                bind_agent_runtime_workspace,
+            )
+
+            runtime_binding = bind_agent_runtime_workspace(runtime_workspace)
+        with runtime_binding:
+            reply = await call_llm_with_failover(
+                primary_model=model,
+                fallback_model=fallback_model,
+                messages=messages,
+                agent_name=agent.name,
+                role_description=agent.role_description or "",
+                agent_id=agent_id,
+                user_id=effective_user_id,
+                session_id=session_id,
+                on_chunk=_on_chunk_bridged,
+                on_thinking=_on_thinking_bridged,
+                on_usage=_collect_usage,
+                on_tool_call=_on_tool_call_persisted,
+                is_group=is_group,
+                channel_context=scene_channel_context,
+                turn_anchor_id=turn_anchor_id,
+                turn_anchor_agent_id=history_agent_id,
+                turn_type=turn_type,
+                context_recovery=context_recovery,
+                prepared_tools=prepared_tools,
+                before_round=before_round,
+                before_tool_execution=before_tool_execution,
+                include_soul=include_soul,
+                include_memory=include_memory,
+            )
     finally:
         try:
             await persist_turn_token_usage(

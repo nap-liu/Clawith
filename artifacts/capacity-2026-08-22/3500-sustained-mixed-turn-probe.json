@@ -1,0 +1,37 @@
+{
+  "passed": true,
+  "health_before": {
+    "status_code": 200,
+    "latency_ms": 382.58
+  },
+  "health_after": {
+    "status_code": 200,
+    "latency_ms": 9.6
+  },
+  "waves": 5,
+  "turns_per_wave": 700,
+  "completed_turns": 3500,
+  "interactive_sessions": 300,
+  "same_session_max_active": 1,
+  "overflow_attempts": 125,
+  "overflow_rejected": 125,
+  "error_count": 0,
+  "errors": [],
+  "latency_ms": {
+    "p50": 517.78,
+    "p95": 718.98,
+    "p99": 819.27,
+    "max": 862.31
+  },
+  "wave_duration_ms": {
+    "median": 755.58,
+    "max": 900.61
+  },
+  "queue_depth_high_watermark": 25,
+  "capacity_high_watermark": 700,
+  "database_pool_checked_out_high_watermark": 30,
+  "database_pool_configured_max": 30,
+  "recovery_ms": 0.03,
+  "final_active": 0,
+  "final_waiting": 0
+}

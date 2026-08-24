@@ -15,18 +15,19 @@
 """
 
 import asyncio
-import hashlib
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from loguru import logger
-from sqlalchemy import text
 
-from app.database import async_session
 from app.services.active_turns import active_turn_boundary
+from app.services.redis_lease_lock import redis_lease_lock
+from app.services.workload_capacity import (
+    WorkloadKind,
+    get_workload_capacity,
+)
 
 if TYPE_CHECKING:
     from app.models.chat_session import ChatSession
@@ -157,30 +158,7 @@ async def cancel_running_turn(lock_key: str) -> bool:
 async def has_running_turn(lock_key: str) -> bool:
     """Return whether this IM session currently has a running or queued turn."""
     async with _running_turns_guard:
-        return any(
-            not task.done()
-            for task in _running_turns.get(lock_key, set())
-        )
-
-
-@asynccontextmanager
-async def _distributed_session_lock(lock_key: str):
-    """Cross-replica PostgreSQL advisory lock for durable trigger turns."""
-    lock_id = int.from_bytes(
-        hashlib.blake2b(lock_key.encode("utf-8"), digest_size=8).digest(),
-        byteorder="big",
-        signed=True,
-    )
-    async with async_session() as db:
-        bind = db.get_bind()
-        if bind.dialect.name != "postgresql":
-            yield
-            return
-        await db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
-        try:
-            yield
-        finally:
-            await db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+        return any(not task.done() for task in _running_turns.get(lock_key, set()))
 
 
 async def run_channel_message(
@@ -190,6 +168,8 @@ async def run_channel_message(
     reactions: ChannelReactions,
     work: Callable[[], Awaitable[str]],
     distributed: bool = False,
+    workload_kind: WorkloadKind | str = WorkloadKind.INTERACTIVE,
+    tenant_id: UUID | str | None = None,
 ) -> str:
     """Unified entry every IM channel calls to process one inbound message turn.
 
@@ -202,6 +182,14 @@ async def run_channel_message(
     ``work`` must encompass the channel's full turn (user-row write through reply
     persistence). Loop-internal reactions (on_tool_call/on_thinking/on_chunk) are
     threaded by the channel into ``_call_agent_llm`` inside ``work``.
+
+    ``tenant_id`` should be the durable tenant UUID at every tenant-aware entry.
+    The lock key fallback preserves existing adapters and isolates their local
+    traffic, but it is not a substitute for a real tenant quota identity.
+
+    ``distributed=True`` adds a renewable Redis lease across replicas. Redis
+    acquisition is bounded and a Redis outage raises a retryable lease error;
+    the turn never waits or executes while holding a database connection.
     """
     if is_command:
         return await work()
@@ -210,9 +198,17 @@ async def run_channel_message(
     if current_task is not None:
         await _register_running_turn(lock_key, current_task)
     try:
-        async with active_turn_boundary():
+        capacity = get_workload_capacity()
+        async with (
+            capacity.slot(
+                workload_kind,
+                tenant_id or "unscoped",
+            ),
+            active_turn_boundary(),
+        ):
             lock = await _get_session_lock(lock_key)
             async with lock:
+
                 async def _run_locked() -> str:
                     await _safe(reactions.on_consume)
                     try:
@@ -224,7 +220,10 @@ async def run_channel_message(
                     return reply
 
                 if distributed:
-                    async with _distributed_session_lock(lock_key):
+                    async with redis_lease_lock(
+                        lock_key,
+                        namespace="channel-session-turn",
+                    ):
                         return await _run_locked()
                 return await _run_locked()
     finally:

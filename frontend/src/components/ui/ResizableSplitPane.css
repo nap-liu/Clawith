@@ -1,0 +1,84 @@
+.resizable-split-pane {
+  display: grid;
+  grid-template-columns:
+    minmax(0, var(--split-pane-first-size)) 7px
+    minmax(0, 1fr);
+}
+
+.resizable-split-pane__separator {
+  position: relative;
+  z-index: 2;
+  width: 7px;
+  min-width: 7px;
+  align-self: stretch;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.resizable-split-pane__separator::before {
+  position: absolute;
+  inset: 0 3px;
+  background: var(--border-subtle);
+  content: "";
+  transition:
+    inset var(--transition-fast),
+    background var(--transition-fast);
+}
+
+.resizable-split-pane__separator > span {
+  position: relative;
+  width: 3px;
+  height: 32px;
+  border-radius: var(--radius-full);
+  background: var(--text-tertiary);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.resizable-split-pane__separator:hover::before,
+.resizable-split-pane__separator:focus-visible::before {
+  inset-inline: 2px;
+  background: var(--info);
+}
+
+.resizable-split-pane__separator:hover > span,
+.resizable-split-pane__separator:focus-visible > span {
+  opacity: 0.72;
+}
+
+body.is-resizing-split-pane {
+  cursor: col-resize;
+  user-select: none;
+}
+
+body.is-resizing-split-pane .resizable-split-pane__separator::before {
+  inset-inline: 2px;
+  background: var(--info);
+  transition: none;
+}
+
+body.is-resizing-split-pane .resizable-split-pane__separator > span {
+  opacity: 0.72;
+  transition: none;
+}
+
+@media (max-width: 760px) {
+  .resizable-split-pane {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .resizable-split-pane__separator {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .resizable-split-pane__separator::before,
+  .resizable-split-pane__separator > span {
+    transition: none;
+  }
+}

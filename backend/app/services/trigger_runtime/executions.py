@@ -11,6 +11,7 @@ from sqlalchemy import and_, or_, select, update
 from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.project import Project
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import User
@@ -22,9 +23,7 @@ async def mark_trigger_executions_completed(execution_ids: list[uuid.UUID]) -> N
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-        )
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
         for execution in result.scalars().all():
             execution.status = "completed"
             execution.finished_at = datetime.now(timezone.utc)
@@ -38,9 +37,7 @@ async def mark_trigger_executions_failed(execution_ids: list[uuid.UUID], error_t
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-        )
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
         for execution in result.scalars().all():
             execution.status = "failed"
             execution.finished_at = datetime.now(timezone.utc)
@@ -60,9 +57,7 @@ async def requeue_trigger_executions(execution_ids: list[uuid.UUID], error_text:
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-        )
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
         for execution in result.scalars().all():
             execution.status = "pending"
             execution.finished_at = None
@@ -88,8 +83,10 @@ async def claim_pending_trigger_executions(
             select(TriggerExecution, AgentTrigger, Agent)
             .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
             .join(Agent, Agent.id == TriggerExecution.agent_id)
+            .outerjoin(Project, Project.id == Agent.project_id)
             .where(
                 TriggerExecution.source.in_(sources),
+                or_(Agent.scope != "project", Project.status == "running"),
                 or_(
                     and_(
                         TriggerExecution.status == "pending",
@@ -134,9 +131,7 @@ async def claim_pending_trigger_executions(
                     pass
         origin_users = {}
         if origin_ids:
-            users = (
-                await db.execute(select(User).where(User.id.in_(origin_ids)))
-            ).scalars().all()
+            users = (await db.execute(select(User).where(User.id.in_(origin_ids)))).scalars().all()
             origin_users = {user.id: user for user in users}
 
         for execution, trigger, agent in rows:
@@ -151,9 +146,7 @@ async def claim_pending_trigger_executions(
                     origin = origin_users.get(candidate)
                     if origin and origin.tenant_id == agent.tenant_id:
                         origin_id = origin.id
-                execution.execution_user_id = (
-                    origin_id or trigger.execution_user_id or agent.creator_id
-                )
+                execution.execution_user_id = origin_id or trigger.execution_user_id or agent.creator_id
             # Transient marker consumed by dispatch before the objects are
             # detached.  Retries must not increment fire_count a second time.
             execution._is_first_claim = execution.started_at is None
@@ -275,9 +268,7 @@ async def mark_base_triggers_fired(trigger_ids: list[uuid.UUID], now: datetime) 
         return
     trigger_counts = Counter(trigger_ids)
     async with async_session() as db:
-        result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.id.in_(trigger_counts))
-        )
+        result = await db.execute(select(AgentTrigger).where(AgentTrigger.id.in_(trigger_counts)))
         for trigger in result.scalars().all():
             apply_base_trigger_fired_state(
                 trigger,

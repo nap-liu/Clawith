@@ -15,13 +15,13 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction  # noqa: F401 - register ChatMessage FK target
 from app.models.chat_session import ChatSession
-from app.models.participant import Participant  # noqa: F401 - register FK table metadata
 from app.models.org import AgentRelationship
+from app.models.participant import Participant  # noqa: F401 - register FK table metadata
+from app.models.project import Project  # noqa: F401 - register ChatSession FK target
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import Identity, User
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -479,17 +479,13 @@ async def test_openclaw_report_is_one_agent_channel_event_across_retries():
         inbound_rows = list(
             (
                 await db.execute(
-                    select(ChatMessage).where(
-                        ChatMessage.external_event_key == f"gateway-report:{message_id}"
-                    )
+                    select(ChatMessage).where(ChatMessage.external_event_key == f"gateway-report:{message_id}")
                 )
             ).scalars()
         )
         execution_count = (
             await db.execute(
-                select(func.count())
-                .select_from(TriggerExecution)
-                .where(TriggerExecution.trigger_id == trigger_id)
+                select(func.count()).select_from(TriggerExecution).where(TriggerExecution.trigger_id == trigger_id)
             )
         ).scalar_one()
         reply_count = (
@@ -574,9 +570,9 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
                     message_meta={
                         "direction": "outbound",
                         "source_channel": "slack",
-                            "actor_ref": "remote-actor",
-                            "target_user_id": str(user.id),
-                            "target_name": "Remote User",
+                        "actor_ref": "remote-actor",
+                        "target_user_id": str(user.id),
+                        "target_name": "Remote User",
                         "origin_session_id": str(origin.id),
                         "origin_turn_anchor_id": str(old_turn.id),
                     },
@@ -591,9 +587,9 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
                     message_meta={
                         "direction": "outbound",
                         "source_channel": "dingtalk",
-                            "actor_ref": "remote-actor",
-                            "target_user_id": str(user.id),
-                            "target_name": "Remote User",
+                        "actor_ref": "remote-actor",
+                        "target_user_id": str(user.id),
+                        "target_name": "Remote User",
                         "origin_session_id": str(origin.id),
                         "origin_turn_anchor_id": str(current_turn.id),
                         "external_message_id": "provider-outbound-7",
@@ -701,18 +697,10 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
     assert "re-enabled" in reenabled
     async with async_session() as db:
         recovered = list(
-            (
-                await db.execute(
-                    select(TriggerExecution).where(
-                        TriggerExecution.trigger_id == stored.id
-                    )
-                )
-            ).scalars()
+            (await db.execute(select(TriggerExecution).where(TriggerExecution.trigger_id == stored.id))).scalars()
         )
     assert len(recovered) == 2
-    assert {row.payload["_matched_session_id"] for row in recovered} == {
-        str(current_remote.id)
-    }
+    assert {row.payload["_matched_session_id"] for row in recovered} == {str(current_remote.id)}
     assert {row.payload["_matched_message"] for row in recovered} == {
         "reply while trigger was disabled",
         "second reply before re-arm",
@@ -781,11 +769,7 @@ async def test_legacy_recovery_keeps_stable_event_cursor_after_processing_time()
     async with async_session() as db:
         payloads = list(
             (
-                await db.execute(
-                    select(TriggerExecution.payload).where(
-                        TriggerExecution.trigger_id == trigger.id
-                    )
-                )
+                await db.execute(select(TriggerExecution.payload).where(TriggerExecution.trigger_id == trigger.id))
             ).scalars()
         )
     assert {payload["_matched_message"] for payload in payloads} == {
@@ -852,16 +836,10 @@ async def test_legacy_upgrade_floor_skips_pre_cutover_history():
     async with async_session() as db:
         payloads = list(
             (
-                await db.execute(
-                    select(TriggerExecution.payload).where(
-                        TriggerExecution.trigger_id == trigger.id
-                    )
-                )
+                await db.execute(select(TriggerExecution.payload).where(TriggerExecution.trigger_id == trigger.id))
             ).scalars()
         )
-    assert [payload["_matched_message"] for payload in payloads] == [
-        "at-cutover legacy event"
-    ]
+    assert [payload["_matched_message"] for payload in payloads] == ["at-cutover legacy event"]
 
 
 async def test_legacy_recovery_ignores_exact_watch_session_trigger():
@@ -913,11 +891,7 @@ async def test_legacy_recovery_ignores_exact_watch_session_trigger():
     assert await recover_legacy_on_message_events(trigger) == 0
     async with async_session() as db:
         execution_count = (
-            await db.execute(
-                select(func.count(TriggerExecution.id)).where(
-                    TriggerExecution.trigger_id == trigger.id
-                )
-            )
+            await db.execute(select(func.count(TriggerExecution.id)).where(TriggerExecution.trigger_id == trigger.id))
         ).scalar_one()
     assert execution_count == 0
 
@@ -974,9 +948,7 @@ async def test_legacy_recovery_serializes_max_fire_capacity():
     async with async_session() as db:
         execution_count = (
             await db.execute(
-                select(func.count())
-                .select_from(TriggerExecution)
-                .where(TriggerExecution.trigger_id == trigger.id)
+                select(func.count()).select_from(TriggerExecution).where(TriggerExecution.trigger_id == trigger.id)
             )
         ).scalar_one()
     assert execution_count == 1
@@ -1198,9 +1170,7 @@ async def test_openclaw_recorded_replay_queues_gateway_once(monkeypatch):
     assert arm_callback.await_count == 1
     async with async_session() as db:
         stored_receipt = (
-            await db.execute(
-                select(ChatMessage).where(ChatMessage.external_event_key == operation_key)
-            )
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == operation_key))
         ).scalar_one()
         gateway_count = (
             await db.execute(

@@ -46,7 +46,7 @@ async def _managed_agent(
 ):
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent manage access required")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "需要数字员工管理权限")
     return agent
 
 

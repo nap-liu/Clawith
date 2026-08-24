@@ -25,9 +25,11 @@ def sanitize_filename(filename: str, fallback: str = "file.bin") -> str:
 
 
 def agent_storage_key(agent_id: uuid.UUID | str, rel_path: str = "") -> str:
-    prefix = str(agent_id)
-    rel = normalize_storage_key(rel_path)
-    return f"{prefix}/{rel}" if rel else prefix
+    # Import lazily: runtime workspace resolution itself depends on the storage
+    # facade and must remain safe during storage package initialization.
+    from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+
+    return current_agent_runtime_workspace(agent_id).storage_key(rel_path)
 
 
 def agent_workspace_key(agent_id: uuid.UUID | str, rel_path: str = "") -> str:

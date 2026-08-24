@@ -381,7 +381,7 @@ async def refresh_mcp_server_tools(
             await db.execute(select(Agent).where(Agent.id == agent_id))
         ).scalar_one_or_none()
         if agent is None:
-            raise LookupError("Agent not found")
+            raise LookupError("未找到数字员工")
         if (
             server.tenant_id is not None
             and agent.tenant_id != server.tenant_id

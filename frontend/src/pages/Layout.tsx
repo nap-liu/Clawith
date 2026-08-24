@@ -2394,7 +2394,7 @@ export default function Layout() {
             navigate(
               tourAssistantId
                 ? `/agents/${tourAssistantId}/chat?onboarding=1`
-                : "/plaza",
+                : "/explore",
               { replace: true },
             );
           }}

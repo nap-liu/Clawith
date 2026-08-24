@@ -7,20 +7,53 @@ and executes them by calling the LLM with the schedule's instruction.
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from croniter import croniter
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
+
+from app.services.workload_capacity import (
+    WorkloadKind,
+    WorkloadOverloadedError,
+    get_workload_capacity,
+)
+
+
+class ScheduleExecutionOutcome(StrEnum):
+    """Result of one schedule attempt, including admission deferral."""
+
+    SUCCEEDED = "succeeded"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    RETRYABLE = "retryable"
+
+
+@dataclass(frozen=True, slots=True)
+class _DueSchedule:
+    """Immutable dispatch data returned after the claim transaction closes."""
+
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    name: str
+    instruction: str
+    execution_user_id: uuid.UUID | None
+    occurrence_at: datetime
+    claimed_at: datetime
+    previous_last_run_at: datetime | None
+    previous_run_count: int
+    next_run_at: datetime | None
 
 
 def compute_next_run(cron_expr: str, after: datetime | None = None) -> datetime | None:
     """Compute the next run time from a cron expression."""
     try:
-        base = after or datetime.now(timezone.utc)
+        base = after or datetime.now(UTC)
         cron = croniter(cron_expr, base)
-        return cron.get_next(datetime).replace(tzinfo=timezone.utc)
-    except Exception as e:
+        return cron.get_next(datetime).replace(tzinfo=UTC)
+    except Exception as e:  # noqa: BLE001 - invalid cron input is non-fatal
         logger.error(f"Invalid cron expression '{cron_expr}': {e}")
         return None
 
@@ -30,110 +63,220 @@ async def _execute_schedule(
     agent_id: uuid.UUID,
     instruction: str,
     execution_user_id: uuid.UUID | None = None,
-):
+) -> ScheduleExecutionOutcome:
     """Execute a single schedule by calling the LLM with the instruction."""
     try:
         from app.database import async_session
         from app.models.agent import Agent
 
+        # Load only the immutable prompt inputs in a short read session.  The
+        # storage/context builder and provider call may take minutes and must
+        # never inherit this transaction or its checked-out connection.
         async with async_session() as db:
-            # Load agent
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
             if not agent:
                 logger.warning(f"Schedule {schedule_id}: agent {agent_id} not found")
-                return
+                return ScheduleExecutionOutcome.SKIPPED
 
             if agent.status != "running":
                 logger.info(f"Schedule {schedule_id}: agent {agent.name} not running, skipping")
-                return
+                return ScheduleExecutionOutcome.SKIPPED
 
             from app.core.permissions import is_agent_expired
+
             if is_agent_expired(agent):
                 logger.info(f"Schedule {schedule_id}: agent {agent.name} has expired, skipping")
-                return
+                return ScheduleExecutionOutcome.SKIPPED
 
-            # Build context and call LLM with failover support
-            from app.services.agent_context import build_agent_context
-            from app.services.llm import call_agent_llm_with_tools
+            from app.services.project_service import project_runtime_allows_agent
 
-            static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent.name, agent.role_description or "")
+            if not await project_runtime_allows_agent(db, agent):
+                logger.info(f"Schedule {schedule_id}: project runtime is paused, deferring")
+                return ScheduleExecutionOutcome.RETRYABLE
+
+            agent_name = agent.name
+            role_description = agent.role_description or ""
+            tenant_key = (
+                getattr(agent, "company_id", None) or getattr(agent, "tenant_id", None) or execution_user_id or agent_id
+            )
+
+        from app.services.agent_context import build_agent_context
+        from app.services.llm import call_agent_llm_with_tools
+
+        # Admission can queue for a bounded period, so it must happen only
+        # after the agent read session has returned its connection.
+        async with get_workload_capacity().slot(WorkloadKind.SCHEDULED, tenant_key):
+            async with async_session() as db:
+                current_agent = await db.get(Agent, agent_id)
+                if current_agent is None or not await project_runtime_allows_agent(db, current_agent):
+                    logger.info(f"Schedule {schedule_id}: project paused while waiting for capacity, deferring")
+                    return ScheduleExecutionOutcome.RETRYABLE
+            static_prompt, dynamic_prompt = await build_agent_context(
+                agent_id,
+                agent_name,
+                role_description,
+            )
             system_prompt = f"{static_prompt}\n\n{dynamic_prompt}"
 
             user_prompt = f"[自动调度任务] {instruction}"
 
-            reply = await call_agent_llm_with_tools(
-                db=db,
-                agent_id=agent_id,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_rounds=50,
-                session_id=str(schedule_id),
-                execution_user_id=execution_user_id,
-                turn_type="schedule",
-            )
+            # A newly-created AsyncSession has no checked-out connection.  The
+            # caller snapshots model configuration and commits its read phase
+            # before provider I/O; tool implementations use short sessions.
+            async with async_session() as db:
+                reply = await call_agent_llm_with_tools(
+                    db=db,
+                    agent_id=agent_id,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_rounds=50,
+                    session_id=str(schedule_id),
+                    execution_user_id=execution_user_id,
+                    turn_type="schedule",
+                )
 
-            # Log activity
             from app.services.activity_logger import log_activity
+
             await log_activity(
-                agent_id, "schedule_run",
+                agent_id,
+                "schedule_run",
                 f"定时任务执行: {instruction[:60]}",
-                detail={"schedule_id": str(schedule_id), "instruction": instruction, "reply": reply[:500]},
+                detail={
+                    "schedule_id": str(schedule_id),
+                    "instruction": instruction,
+                    "reply": reply[:500],
+                },
             )
 
-            logger.info(f"Schedule {schedule_id} executed for agent {agent.name}: {reply[:80]}")
+            logger.info(f"Schedule {schedule_id} executed for agent {agent_name}: {reply[:80]}")
+            return ScheduleExecutionOutcome.SUCCEEDED
 
-    except Exception as e:
+    except WorkloadOverloadedError as e:
+        logger.warning(f"Schedule {schedule_id} deferred by workload capacity: {e}")
+        return ScheduleExecutionOutcome.RETRYABLE
+    except Exception as e:  # noqa: BLE001 - one schedule must not stop the daemon
         logger.exception(f"Schedule {schedule_id} execution error: {e}")
+        return ScheduleExecutionOutcome.FAILED
+
+
+async def _claim_due_schedules(now: datetime) -> tuple[_DueSchedule, ...]:
+    """Atomically claim due schedules and release the connection immediately."""
+
+    from app.database import async_session
+    from app.models.agent import Agent
+    from app.models.project import Project
+    from app.models.schedule import AgentSchedule
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentSchedule)
+            .join(Agent, Agent.id == AgentSchedule.agent_id)
+            .outerjoin(Project, Project.id == Agent.project_id)
+            .where(
+                AgentSchedule.is_enabled.is_(True),
+                AgentSchedule.next_run_at <= now,
+                or_(Agent.scope != "project", Project.status == "running"),
+            )
+            .order_by(AgentSchedule.next_run_at, AgentSchedule.id)
+            .with_for_update(skip_locked=True)
+        )
+        due_schedules = result.scalars().all()
+        claimed: list[_DueSchedule] = []
+        for schedule in due_schedules:
+            occurrence_at = schedule.next_run_at
+            previous_last_run_at = schedule.last_run_at
+            previous_run_count = schedule.run_count or 0
+            next_run = compute_next_run(schedule.cron_expr, now)
+            schedule.last_run_at = now
+            schedule.next_run_at = next_run
+            schedule.run_count = (schedule.run_count or 0) + 1
+            claimed.append(
+                _DueSchedule(
+                    id=schedule.id,
+                    agent_id=schedule.agent_id,
+                    name=schedule.name,
+                    instruction=schedule.instruction,
+                    execution_user_id=schedule.execution_user_id,
+                    occurrence_at=occurrence_at,
+                    claimed_at=now,
+                    previous_last_run_at=previous_last_run_at,
+                    previous_run_count=previous_run_count,
+                    next_run_at=next_run,
+                )
+            )
+        await db.commit()
+
+    return tuple(claimed)
+
+
+async def _release_schedule_occurrence(schedule: _DueSchedule) -> bool:
+    """Return an admission-deferred occurrence to the durable due queue."""
+
+    from app.database import async_session
+    from app.models.schedule import AgentSchedule
+
+    async with async_session() as db:
+        stored = await db.scalar(select(AgentSchedule).where(AgentSchedule.id == schedule.id).with_for_update())
+        if stored is None:
+            return False
+        if stored.last_run_at != schedule.claimed_at or stored.next_run_at != schedule.next_run_at:
+            return False
+        stored.last_run_at = schedule.previous_last_run_at
+        stored.next_run_at = schedule.occurrence_at
+        stored.run_count = schedule.previous_run_count
+        await db.commit()
+        return True
+
+
+async def _execute_claimed_schedule(schedule: _DueSchedule) -> None:
+    """Execute a claimed occurrence and requeue it after admission timeout."""
+
+    outcome = await _execute_schedule(
+        schedule.id,
+        schedule.agent_id,
+        schedule.instruction,
+        schedule.execution_user_id,
+    )
+    if outcome is ScheduleExecutionOutcome.RETRYABLE:
+        released = await _release_schedule_occurrence(schedule)
+        if released:
+            logger.info(f"Schedule '{schedule.name}' occurrence returned to the due queue")
+        else:
+            logger.warning(f"Schedule '{schedule.name}' changed after claim; deferred occurrence was not restored")
 
 
 async def _tick():
-    """One scheduler tick: find and execute due schedules."""
-    from app.database import async_session
-    from app.models.schedule import AgentSchedule
+    """One scheduler tick: claim due schedules, then dispatch without a DB lease."""
     from app.services.audit_logger import write_audit_log
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     try:
-        async with async_session() as db:
-            result = await db.execute(
-                select(AgentSchedule).where(
-                    AgentSchedule.is_enabled.is_(True),
-                    AgentSchedule.next_run_at <= now,
-                )
+        due_schedules = await _claim_due_schedules(now)
+
+        if due_schedules:
+            await write_audit_log(
+                "schedule_tick",
+                {"due_count": len(due_schedules)},
             )
-            due_schedules = result.scalars().all()
 
-            if due_schedules:
-                await write_audit_log("schedule_tick", {"due_count": len(due_schedules)})
+        for schedule in due_schedules:
+            await write_audit_log(
+                "schedule_fire",
+                {
+                    "schedule_id": str(schedule.id),
+                    "name": schedule.name,
+                    "instruction": schedule.instruction[:100],
+                    "next_run": str(schedule.next_run_at),
+                },
+                agent_id=schedule.agent_id,
+            )
 
-            for sched in due_schedules:
-                # Update run tracking immediately
-                next_run = compute_next_run(sched.cron_expr, now)
-                sched.last_run_at = now
-                sched.next_run_at = next_run
-                sched.run_count = (sched.run_count or 0) + 1
-                await db.commit()
+            asyncio.create_task(_execute_claimed_schedule(schedule))
+            logger.info(f"Triggered schedule '{schedule.name}' (next: {schedule.next_run_at})")
 
-                await write_audit_log(
-                    "schedule_fire",
-                    {"schedule_id": str(sched.id), "name": sched.name, "instruction": sched.instruction[:100], "next_run": str(next_run)},
-                    agent_id=sched.agent_id,
-                )
-
-                # Fire execution in background (don't block ticker)
-                asyncio.create_task(
-                    _execute_schedule(
-                        sched.id,
-                        sched.agent_id,
-                        sched.instruction,
-                        sched.execution_user_id,
-                    )
-                )
-                logger.info(f"Triggered schedule '{sched.name}' (next: {next_run})")
-
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - the scheduler loop must remain alive
         logger.exception(f"Scheduler tick error: {e}")
         await write_audit_log("schedule_error", {"error": str(e)[:300]})
 

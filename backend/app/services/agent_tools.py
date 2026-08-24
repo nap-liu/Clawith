@@ -34,6 +34,7 @@ import re
 from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import func, select, or_
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from app.database import async_session, engine
@@ -49,6 +50,11 @@ from app.models.participant import Participant  # noqa: F401 - register chat FK 
 from app.models.user import User as UserModel
 from app.services.auth_registry import auth_provider_registry
 from app.services.agent_memory import CORE_MEMORY_TEMPLATE
+from app.services.agent_runtime_workspace import (
+    current_agent_runtime_workspace,
+    project_agent_runtime_workspace,
+    standard_agent_runtime_workspace,
+)
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import get_platform_user_by_org_member
 from app.services.chat_attachments import (
@@ -105,6 +111,13 @@ from app.services.recipient_resolver import (
     resolve_platform_user_recipient,
 )
 from app.services.turn_runtime import TurnRuntime, deliver_message_to_runtime
+from app.services.user_project_tools import (
+    USER_PROJECT_TOOL_NAMES,
+    USER_PROJECT_TOOL_SCHEMAS,
+    execute_user_project_tool,
+    record_user_project_tool_activity,
+    user_project_tool_error,
+)
 
 
 _settings = get_settings()
@@ -142,7 +155,7 @@ _STDOUT_RPA_LIMIT = 20000
 A2A_DELIVERY_GUIDANCE = (
     "你正在回复另一位数字员工同事,请简洁、切题地作答。\n"
     "如果你写了任何文件(报告/文档/分析)需要交付给对方,必须调用 "
-    "send_file_to_agent(agent_id=\"<Relationships 中对方的 agent_id>\", file_path=\"<路径>\") 投递 —— "
+    'send_file_to_agent(agent_id="<Relationships 中对方的 agent_id>", file_path="<路径>") 投递 —— '
     "对方无法访问你的工作区,绝不能只告诉路径。"
 )
 
@@ -154,6 +167,7 @@ _TOOL_CONFIG_CACHE_TTL_SECONDS = 60
 
 # Sensitive field keys that should be encrypted/decrypted
 SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret", "atlassian_api_key"}
+
 
 def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
     """Decrypt sensitive fields in config dict.
@@ -211,9 +225,7 @@ def _set_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str, confi
     _tool_config_cache[cache_key] = (config, expiry)
 
 
-def invalidate_tool_config_cache(
-    agent_id: Optional[uuid.UUID], tool_name: str | None = None
-) -> None:
+def invalidate_tool_config_cache(agent_id: Optional[uuid.UUID], tool_name: str | None = None) -> None:
     """Invalidate cached config after an Agent or company-level update.
 
     ``agent_id=None`` clears matching entries for every Agent because a company
@@ -311,16 +323,17 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     logger.error(f"[ToolConfig] No DB config found for {tool_name}, agent_id={agent_id}")
     return None
 
+
 # ContextVar set by each channel handler so send_channel_file knows where to send
 # Value: async callable(file_path: Path) -> None  |  None for web chat (returns URL)
-channel_file_sender: ContextVar = ContextVar('channel_file_sender', default=None)
-channel_audio_sender: ContextVar = ContextVar('channel_audio_sender', default=None)
-channel_video_sender: ContextVar = ContextVar('channel_video_sender', default=None)
+channel_file_sender: ContextVar = ContextVar("channel_file_sender", default=None)
+channel_audio_sender: ContextVar = ContextVar("channel_audio_sender", default=None)
+channel_video_sender: ContextVar = ContextVar("channel_video_sender", default=None)
 # For web chat: agent_id needed to build download URL
-channel_web_agent_id: ContextVar = ContextVar('channel_web_agent_id', default=None)
+channel_web_agent_id: ContextVar = ContextVar("channel_web_agent_id", default=None)
 # Set by Feishu channel handler — open_id of the message sender so calendar tool
 # can auto-invite them as attendee when no explicit attendee list is given
-channel_feishu_sender_open_id: ContextVar = ContextVar('channel_feishu_sender_open_id', default=None)
+channel_feishu_sender_open_id: ContextVar = ContextVar("channel_feishu_sender_open_id", default=None)
 _outbound_media_connection: ContextVar = ContextVar(
     "outbound_media_connection",
     default=None,
@@ -382,9 +395,7 @@ AGENT_TOOLS = [
                     },
                     "expected_execution_user_id": {
                         "type": ["string", "null"],
-                        "description": (
-                            "Execution user ID read before this change; pass null when it is unset."
-                        ),
+                        "description": ("Execution user ID read before this change; pass null when it is unset."),
                     },
                     "reason": {
                         "type": "string",
@@ -675,7 +686,7 @@ AGENT_TOOLS = [
                     },
                     "config": {
                         "type": "object",
-                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message must contain exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}. webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)",
+                        "description": 'Type-specific config. cron: {"expr": "0 9 * * *"}. once: {"at": "2026-03-10T09:00:00+08:00"}. interval: {"minutes": 30}. poll: {"url": "...", "json_path": "$.status", "fire_on": "change", "interval_min": 5}. on_message must contain exactly one canonical actor: {"from_agent_id": "<agent_id>"} or {"from_user_id": "<user_id>"}. webhook: {"secret": "optional_hmac_secret"} (system auto-generates the URL)',
                     },
                     "reason": {
                         "type": "string",
@@ -915,7 +926,7 @@ AGENT_TOOLS = [
                     "channel": {
                         "type": "string",
                         "description": "External route chosen by the Agent when multiple valid routes exist.",
-                        "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "wechat"]
+                        "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "wechat"],
                     },
                 },
                 "required": ["user_id", "message"],
@@ -1044,8 +1055,7 @@ AGENT_TOOLS = [
                     "force_reconfigure": {
                         "type": "boolean",
                         "description": (
-                            "默认 false。仅当用户明确要求强制覆盖当前钉钉通道时设为 true；"
-                            "普通配置请求保持 false。"
+                            "默认 false。仅当用户明确要求强制覆盖当前钉钉通道时设为 true；普通配置请求保持 false。"
                         ),
                         "default": False,
                     },
@@ -1492,7 +1502,10 @@ AGENT_TOOLS = [
                 "properties": {
                     "url": {"type": "string", "description": "多维表格的 URL 链接。"},
                     "table_id": {"type": "string", "description": "具体的数据表 ID，如果 url 中包含 tbl 则可以不填。"},
-                    "filter_info": {"type": "string", "description": "可选，FQL 语法的过滤条件，例如 'CurrentValue.[Status]=\"Done\"'。如不确定过滤语法，可以不填，由你臺己在本地过滤返回的所有数据。"},
+                    "filter_info": {
+                        "type": "string",
+                        "description": "可选，FQL 语法的过滤条件，例如 'CurrentValue.[Status]=\"Done\"'。如不确定过滤语法，可以不填，由你臺己在本地过滤返回的所有数据。",
+                    },
                     "max_results": {"type": "integer", "description": "最大返回条数 (默认 100)"},
                 },
                 "required": ["url"],
@@ -1509,7 +1522,10 @@ AGENT_TOOLS = [
                 "properties": {
                     "url": {"type": "string", "description": "多维表格的 URL 链接。"},
                     "table_id": {"type": "string", "description": "具体的数据表 ID，如果 url 中包含 tbl 则可以不填。"},
-                    "fields": {"type": "string", "description": "一个 JSON 字符串，代表要插入的 fields。例如：'{\"Name\": \"张三\", \"Age\": 30}'"},
+                    "fields": {
+                        "type": "string",
+                        "description": '一个 JSON 字符串，代表要插入的 fields。例如：\'{"Name": "张三", "Age": 30}\'',
+                    },
                 },
                 "required": ["url", "fields"],
             },
@@ -1525,8 +1541,14 @@ AGENT_TOOLS = [
                 "properties": {
                     "url": {"type": "string", "description": "多维表格的 URL 链接。"},
                     "table_id": {"type": "string", "description": "具体的数据表 ID，如果 url 中包含 tbl 则可以不填。"},
-                    "record_id": {"type": "string", "description": "要更新的 record_id，通过 bitable_query_records 获取。"},
-                    "fields": {"type": "string", "description": "一个 JSON 字符串，代表要更新的 fields。例如：'{\"Status\": \"Done\"}'"},
+                    "record_id": {
+                        "type": "string",
+                        "description": "要更新的 record_id，通过 bitable_query_records 获取。",
+                    },
+                    "fields": {
+                        "type": "string",
+                        "description": '一个 JSON 字符串，代表要更新的 fields。例如：\'{"Status": "Done"}\'',
+                    },
                 },
                 "required": ["url", "record_id", "fields"],
             },
@@ -1542,7 +1564,10 @@ AGENT_TOOLS = [
                 "properties": {
                     "url": {"type": "string", "description": "多维表格的 URL 链接。"},
                     "table_id": {"type": "string", "description": "具体的数据表 ID，如果 url 中包含 tbl 则可以不填。"},
-                    "record_id": {"type": "string", "description": "要删除的 record_id，通过 bitable_query_records 获取。"},
+                    "record_id": {
+                        "type": "string",
+                        "description": "要删除的 record_id，通过 bitable_query_records 获取。",
+                    },
                 },
                 "required": ["url", "record_id"],
             },
@@ -1908,7 +1933,7 @@ AGENT_TOOLS = [
                     },
                     "form_data": {
                         "type": "string",
-                        "description": "表单内容的 JSON 字符串，例如 '[{\"id\":\"widget1\",\"type\":\"input\",\"value\":\"这是内容\"}]'",
+                        "description": '表单内容的 JSON 字符串，例如 \'[{"id":"widget1","type":"input","value":"这是内容"}]\'',
                     },
                 },
                 "required": ["approval_code", "user_id", "form_data"],
@@ -1963,7 +1988,7 @@ AGENT_TOOLS = [
                 "properties": {
                     "mcp_config": {
                         "type": "object",
-                        "description": "Standard MCP config (object or JSON string). HTTP form: {\"mcpServers\":{\"<name>\":{\"url\":\"https://...\",\"headers\":{...}}}}. stdio/npx form: {\"mcpServers\":{\"<name>\":{\"command\":\"npx\",\"args\":[\"-y\",\"<package>\"],\"env\":{\"<KEY>\":\"<value>\"}}}}.",
+                        "description": 'Standard MCP config (object or JSON string). HTTP form: {"mcpServers":{"<name>":{"url":"https://...","headers":{...}}}}. stdio/npx form: {"mcpServers":{"<name>":{"command":"npx","args":["-y","<package>"],"env":{"<KEY>":"<value>"}}}}.',
                     },
                     "mcp_url": {
                         "type": "string",
@@ -2133,7 +2158,9 @@ AGENT_TOOLS = [
                         "description": "File path in workspace, e.g. 'workspace/output.html'",
                     },
                     "access_mode": {
-                        "type": "string", "enum": ["public", "authenticated", "restricted"], "default": "authenticated",
+                        "type": "string",
+                        "enum": ["public", "authenticated", "restricted"],
+                        "default": "authenticated",
                         "description": (
                             "Optional. Defaults to authenticated for a new page. public = anyone with the link, "
                             "authenticated = any logged-in user in the page's company, restricted = only the publisher, "
@@ -2141,7 +2168,8 @@ AGENT_TOOLS = [
                         ),
                     },
                     "allowed_user_ids": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array",
+                        "items": {"type": "string"},
                         "description": "Required only for restricted access. Get IDs with search_page_viewers; use [] when nobody else should be allowed.",
                     },
                 },
@@ -2199,11 +2227,19 @@ AGENT_TOOLS = [
                 "properties": {
                     "short_id": {"type": "string", "description": "Published page short ID, without the /p/ prefix."},
                     "status": {
-                        "type": "string", "enum": ["all", "pending", "approved", "rejected"], "default": "all",
+                        "type": "string",
+                        "enum": ["all", "pending", "approved", "rejected"],
+                        "default": "all",
                         "description": "Optional status filter. Defaults to all request statuses.",
                     },
                     "page": {"type": "integer", "minimum": 1, "default": 1, "description": "Result page number."},
-                    "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Requests per page."},
+                    "page_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 20,
+                        "description": "Requests per page.",
+                    },
                 },
                 "required": ["short_id"],
             },
@@ -2241,8 +2277,8 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["source"],
-            }
-        }
+            },
+        },
     },
     # ── AgentBay Tools ────────────────────────────────────────────
     # First-party Skill Market tools
@@ -2341,8 +2377,8 @@ AGENT_TOOLS = [
                     "wait_for": {"type": "string", "description": "等待特定元素出现的选择器（可选）"},
                 },
                 "required": ["url"],
-            }
-        }
+            },
+        },
     },
     {
         "type": "function",
@@ -2352,8 +2388,8 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {},
-            }
-        }
+            },
+        },
     },
     {
         "type": "function",
@@ -2363,7 +2399,10 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string", "description": "CSS selector (e.g. #button) or natural language description of the element (e.g. 'the blue Submit button')"},
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector (e.g. #button) or natural language description of the element (e.g. 'the blue Submit button')",
+                    },
                 },
                 "required": ["selector"],
             },
@@ -2377,7 +2416,10 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string", "description": "CSS selector or natural language description of the input field (e.g. 'the phone number input' or 'input[type=tel]')"},
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector or natural language description of the input field (e.g. 'the phone number input' or 'input[type=tel]')",
+                    },
                     "text": {"type": "string", "description": "要输入的文本"},
                 },
                 "required": ["selector", "text"],
@@ -2393,7 +2435,10 @@ AGENT_TOOLS = [
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "The login page URL to navigate to"},
-                    "login_config": {"type": "string", "description": "JSON string with login config, e.g. '{\"api_key\": \"xxx\", \"skill_id\": \"yyy\"}'"},
+                    "login_config": {
+                        "type": "string",
+                        "description": 'JSON string with login config, e.g. \'{"api_key": "xxx", "skill_id": "yyy"}\'',
+                    },
                 },
                 "required": ["url", "login_config"],
             },
@@ -2543,6 +2588,10 @@ AGENT_TOOLS = [
     },
 ]
 
+# Database rows are the runtime source of truth. Keep the static schema registry
+# aligned for code paths that build named subsets from it.
+AGENT_TOOLS.extend(USER_PROJECT_TOOL_SCHEMAS)
+
 
 # Core tools that should always be available to agents regardless of
 # DB configuration.
@@ -2604,14 +2653,12 @@ _LEGACY_MEDIA_TOOL_NAMES = frozenset({"send_audio", "send_video"})
 def _stabilize_media_tool_definitions(tools: list[dict]) -> list[dict]:
     """Keep media tool schemas and relative order independent of channel state."""
     canonical = {
-        item["function"]["name"]: item
-        for item in AGENT_TOOLS
-        if item["function"]["name"] in _FIXED_MEDIA_TOOL_NAMES
+        item["function"]["name"]: item for item in AGENT_TOOLS if item["function"]["name"] in _FIXED_MEDIA_TOOL_NAMES
     }
     stable = [
-        item for item in tools
-        if item.get("function", {}).get("name")
-        not in {*_FIXED_MEDIA_TOOL_NAMES, *_LEGACY_MEDIA_TOOL_NAMES}
+        item
+        for item in tools
+        if item.get("function", {}).get("name") not in {*_FIXED_MEDIA_TOOL_NAMES, *_LEGACY_MEDIA_TOOL_NAMES}
     ]
     stable.extend(canonical[name] for name in _FIXED_MEDIA_TOOL_NAMES)
     return stable
@@ -2641,45 +2688,49 @@ def _patch_computer_tool_descriptions(tools: list[dict], os_type: str) -> list[d
     if os_type == "windows":
         # Windows paths used by AgentBay's windows_latest image
         desktop_path = r"C:\Users\Administrator\Desktop"
-        home_path    = r"C:\Users\Administrator"
+        home_path = r"C:\Users\Administrator"
         computer_os_label = "Windows"
     else:
         # Linux paths used by AgentBay's linux_latest image
         desktop_path = "/home/wuying/Desktop"
-        home_path    = "/home/wuying"
+        home_path = "/home/wuying"
         computer_os_label = "Linux"
 
     # Build the OS-aware description for agentbay_file_transfer
     new_file_transfer_desc = (
-        "Transfer a file between any two endpoints: the agent workspace, "
-        "the AgentBay browser environment, the cloud desktop (computer), or the code sandbox.\n\n"
-        f"COMPUTER ENVIRONMENT OS: {computer_os_label}\n"
-        f"VERIFIED PATH CONVENTIONS for the computer environment ({computer_os_label}):\n"
-        f"- computer desktop: {desktop_path}\\<filename>  (e.g. {desktop_path}\\report.xlsx)\n"
-        f"- computer home:    {home_path}\\<filename>\n\n"
-        "Other environments (Linux-based, user 'wuying', HOME=/home/wuying/):\n"
-        "- code env:     /home/wuying/<filename>  (e.g. /home/wuying/data.csv)\n"
-        "- browser env:  /home/wuying/下载/<filename>  (download folder)\n"
-        "- workspace:    relative path, e.g. 'workspace/data.csv'\n\n"
-        "Transfer directions:\n"
-        "- workspace -> env: upload a workspace file into a cloud environment\n"
-        "- env -> workspace: download a file from a cloud environment into the workspace\n"
-        "- env A -> env B:   transfer between environments (transparent backend temp)"
-    ) if os_type == "windows" else (
-        "Transfer a file between any two endpoints: the agent workspace, "
-        "the AgentBay browser environment, the cloud desktop (computer), or the code sandbox.\n\n"
-        f"COMPUTER ENVIRONMENT OS: {computer_os_label}\n"
-        f"VERIFIED PATH CONVENTIONS for the computer environment ({computer_os_label}):\n"
-        f"- computer desktop: {desktop_path}/<filename>  (e.g. {desktop_path}/report.xlsx)\n"
-        f"- computer home:    {home_path}/<filename>\n\n"
-        "Other environments (also Linux, user 'wuying'):\n"
-        "- code env:     /home/wuying/<filename>  (e.g. /home/wuying/data.csv)\n"
-        "- browser env:  /home/wuying/下载/<filename>  (download folder)\n"
-        "- workspace:    relative path, e.g. 'workspace/data.csv'\n\n"
-        "Transfer directions:\n"
-        "- workspace -> env: upload a workspace file into a cloud environment\n"
-        "- env -> workspace: download a file from a cloud environment into the workspace\n"
-        "- env A -> env B:   transfer between environments (transparent backend temp)"
+        (
+            "Transfer a file between any two endpoints: the agent workspace, "
+            "the AgentBay browser environment, the cloud desktop (computer), or the code sandbox.\n\n"
+            f"COMPUTER ENVIRONMENT OS: {computer_os_label}\n"
+            f"VERIFIED PATH CONVENTIONS for the computer environment ({computer_os_label}):\n"
+            f"- computer desktop: {desktop_path}\\<filename>  (e.g. {desktop_path}\\report.xlsx)\n"
+            f"- computer home:    {home_path}\\<filename>\n\n"
+            "Other environments (Linux-based, user 'wuying', HOME=/home/wuying/):\n"
+            "- code env:     /home/wuying/<filename>  (e.g. /home/wuying/data.csv)\n"
+            "- browser env:  /home/wuying/下载/<filename>  (download folder)\n"
+            "- workspace:    relative path, e.g. 'workspace/data.csv'\n\n"
+            "Transfer directions:\n"
+            "- workspace -> env: upload a workspace file into a cloud environment\n"
+            "- env -> workspace: download a file from a cloud environment into the workspace\n"
+            "- env A -> env B:   transfer between environments (transparent backend temp)"
+        )
+        if os_type == "windows"
+        else (
+            "Transfer a file between any two endpoints: the agent workspace, "
+            "the AgentBay browser environment, the cloud desktop (computer), or the code sandbox.\n\n"
+            f"COMPUTER ENVIRONMENT OS: {computer_os_label}\n"
+            f"VERIFIED PATH CONVENTIONS for the computer environment ({computer_os_label}):\n"
+            f"- computer desktop: {desktop_path}/<filename>  (e.g. {desktop_path}/report.xlsx)\n"
+            f"- computer home:    {home_path}/<filename>\n\n"
+            "Other environments (also Linux, user 'wuying'):\n"
+            "- code env:     /home/wuying/<filename>  (e.g. /home/wuying/data.csv)\n"
+            "- browser env:  /home/wuying/下载/<filename>  (download folder)\n"
+            "- workspace:    relative path, e.g. 'workspace/data.csv'\n\n"
+            "Transfer directions:\n"
+            "- workspace -> env: upload a workspace file into a cloud environment\n"
+            "- env -> workspace: download a file from a cloud environment into the workspace\n"
+            "- env A -> env B:   transfer between environments (transparent backend temp)"
+        )
     )
 
     patched = []
@@ -2726,6 +2777,7 @@ async def _agent_has_feishu(agent_id: uuid.UUID) -> bool:
     """Check if agent has a configured Feishu channel."""
     try:
         from app.models.channel_config import ChannelConfig
+
         async with async_session() as db:
             r = await db.execute(
                 select(ChannelConfig).where(
@@ -2743,6 +2795,7 @@ async def _agent_has_any_channel(agent_id: uuid.UUID) -> bool:
     """Check if agent has any configured channel (Feishu/DingTalk/WeCom)."""
     try:
         from app.models.channel_config import ChannelConfig
+
         async with async_session() as db:
             r = await db.execute(
                 select(ChannelConfig).where(
@@ -2766,6 +2819,7 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
     who see the tool call arguments in the chat UI.
     """
     import copy
+
     result = []
     for t in tools:
         fn = t.get("function", {})
@@ -2811,7 +2865,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """
     has_feishu = await _agent_has_feishu(agent_id)
     has_any_channel = await _agent_has_any_channel(agent_id)
-    _always_tools = _always_core_tools + (_feishu_tools if has_feishu else []) + (_channel_tools if has_any_channel else [])
+    _always_tools = (
+        _always_core_tools + (_feishu_tools if has_feishu else []) + (_channel_tools if has_any_channel else [])
+    )
 
     # Check tenant-level a2a_async_enabled flag
     _a2a_async = False
@@ -2820,6 +2876,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     try:
         from app.models.tenant import Tenant
         from app.models.agent import Agent as AgentModel
+
         async with async_session() as _flag_db:
             _ag_r = await _flag_db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             _agent = _ag_r.scalar_one_or_none()
@@ -2840,7 +2897,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     computer_os_type = "windows"
 
     try:
-        from app.models.tool import Tool, AgentTool
+        from app.core.plaza_feature import PLAZA_TOOL_NAMES
+        from app.models.tool import AgentTool, Tool
         from app.services.tool_enablement import (
             REQUIRED_AGENT_TOOL_NAMES,
             resolved_agent_tool_enabled,
@@ -2857,9 +2915,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             # Platform-level admin tools (tenant_id IS NULL) are visible to all tenants;
             # tenant-scoped admin tools only to their own tenant.
             if agent_tenant_id:
-                visible_clauses.append((Tool.source == "admin") & (
-                    (Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))
-                ))
+                visible_clauses.append(
+                    (Tool.source == "admin") & ((Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None)))
+                )
             else:
                 visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
             if assigned_tool_ids:
@@ -2872,10 +2930,12 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             ]
             if not okr_feature_enabled():
                 tool_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
+            tool_clauses.append(Tool.name.not_in(PLAZA_TOOL_NAMES))
             all_tools_r = await db.execute(select(Tool).where(*tool_clauses))
             all_tools = all_tools_r.scalars().all()
 
             from app.services.cli_tools.sandbox_inject import _TOOL_NAME_RE
+
             result = []
             db_tool_names = set()
             # Track tool names that were explicitly disabled by the user
@@ -2918,29 +2978,31 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                             "(unsafe name, or collides with a builtin/duplicate function)"
                         )
                         continue
-                    result.append({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "command": {
-                                        "type": "string",
-                                        "description": (
-                                            f"完整的 bash 命令行,**必须以程序名 `{t.name}` 开头**"
-                                            f"(它是沙箱里一个已注入身份认证的真实命令;具体子命令/"
-                                            f"参数见本工具说明)。例如 `{t.name} <参数...>`——不要省略"
-                                            f"程序名只写参数。支持管道/重定向等任意 bash 组合,"
-                                            f"如 `{t.name} <参数...> | jq '.'`。"
-                                        ),
-                                    }
+                    result.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {
+                                            "type": "string",
+                                            "description": (
+                                                f"完整的 bash 命令行,**必须以程序名 `{t.name}` 开头**"
+                                                f"(它是沙箱里一个已注入身份认证的真实命令;具体子命令/"
+                                                f"参数见本工具说明)。例如 `{t.name} <参数...>`——不要省略"
+                                                f"程序名只写参数。支持管道/重定向等任意 bash 组合,"
+                                                f"如 `{t.name} <参数...> | jq '.'`。"
+                                            ),
+                                        }
+                                    },
+                                    "required": ["command"],
                                 },
-                                "required": ["command"],
                             },
-                        },
-                    })
+                        }
+                    )
                     db_tool_names.add(t.name)
                     continue
 
@@ -2961,14 +3023,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     # This is an Agent-level switch. Missing configuration uses
                     # the platform's enabled-by-default policy, while an
                     # explicit false remains a per-Agent opt-out.
-                    toolscall_enabled = toolscall_enabled_for_agent(
-                        at.config if at else None
-                    )
+                    toolscall_enabled = toolscall_enabled_for_agent(at.config if at else None)
                     if toolscall_enabled:
-                        description = (
-                            str(description or "").rstrip()
-                            + TOOLSCALL_USAGE_DESCRIPTION
-                        )
+                        description = str(description or "").rstrip() + TOOLSCALL_USAGE_DESCRIPTION
 
                 # Build OpenAI function-calling format
                 tool_def = {
@@ -3012,9 +3069,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                         result.append(t)
                         always_added.append(fn_name)
                 if always_added:
-                    logger.debug(
-                        f"[Tools] agent={agent_id} added from _always_tools: {always_added}"
-                    )
+                    logger.debug(f"[Tools] agent={agent_id} added from _always_tools: {always_added}")
                 if "agentbay_file_transfer" in db_tool_names:
                     computer_os_type = await _get_computer_os_type(agent_id)
                 # Inject OS-aware paths into computer-related tool descriptions
@@ -3133,7 +3188,11 @@ async def _prepare_temp_workspace(
 
     storage = get_storage_backend()
     budget = {"total": 0}
-    selected = TEMP_WORKSPACE_DEFAULT_PATHS if paths is None else [path for path in paths if path]
+    runtime_workspace = current_agent_runtime_workspace(agent_id)
+    if paths is None and runtime_workspace.is_project:
+        selected = ["workspace", "memory/memory.md", "soul.md"]
+    else:
+        selected = TEMP_WORKSPACE_DEFAULT_PATHS if paths is None else [path for path in paths if path]
     manifest: dict[str, TempWorkspaceManifestEntry] = {}
     for rel_path in selected:
         storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
@@ -3213,21 +3272,21 @@ async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
 
     try:
         async with async_session() as db:
-            result = await db.execute(
-                select(Task).where(Task.agent_id == agent_id).order_by(Task.created_at.desc())
-            )
+            result = await db.execute(select(Task).where(Task.agent_id == agent_id).order_by(Task.created_at.desc()))
             tasks = result.scalars().all()
 
         task_list = []
         for t in tasks:
-            task_list.append({
-                "title": t.title,
-                "status": t.status,
-                "priority": t.priority,
-                "description": t.description or "",
-                "created_at": t.created_at.isoformat() if t.created_at else "",
-                "completed_at": t.completed_at.isoformat() if t.completed_at else "",
-            })
+            task_list.append(
+                {
+                    "title": t.title,
+                    "status": t.status,
+                    "priority": t.priority,
+                    "description": t.description or "",
+                    "created_at": t.created_at.isoformat() if t.created_at else "",
+                    "completed_at": t.completed_at.isoformat() if t.completed_at else "",
+                }
+            )
 
         tasks_path.write_text(
             json.dumps(task_list, ensure_ascii=False, indent=2),
@@ -3248,10 +3307,14 @@ async def flush_temp_workspace(temp_workspace: TempWorkspace, conflict_mode: str
     conflicted: list[str] = []
     deleted: list[str] = []
     skipped: list[str] = []
+    runtime_workspace = current_agent_runtime_workspace(temp_workspace.agent_id)
 
     async with workspace_locks(temp_workspace.agent_id, selected_paths):
         for rel_path, local_path in local_files.items():
             if local_path.name.startswith("_exec_tmp") or "__pycache__" in local_path.parts:
+                continue
+            if runtime_workspace.is_agent_write_protected(rel_path):
+                skipped.append(rel_path)
                 continue
             data = local_path.read_bytes()
             current_hash = content_hash_bytes(data)
@@ -3260,11 +3323,9 @@ async def flush_temp_workspace(temp_workspace: TempWorkspace, conflict_mode: str
                 skipped.append(rel_path)
                 continue
             condition = (
-                WriteCondition(version_token=entry.base_version_token)
-                if entry
-                else WriteCondition(require_absent=True)
+                WriteCondition(version_token=entry.base_version_token) if entry else WriteCondition(require_absent=True)
             )
-            storage_key = entry.storage_key if entry else normalize_storage_key(f"{temp_workspace.agent_id}/{rel_path}")
+            storage_key = entry.storage_key if entry else runtime_workspace.storage_key(rel_path)
             result = await storage.write_bytes_if_match(
                 storage_key,
                 data,
@@ -3279,6 +3340,9 @@ async def flush_temp_workspace(temp_workspace: TempWorkspace, conflict_mode: str
 
         for rel_path, entry in manifest.items():
             if rel_path in local_files:
+                continue
+            if runtime_workspace.is_agent_write_protected(rel_path):
+                skipped.append(rel_path)
                 continue
             result = await storage.delete_if_match(
                 entry.storage_key,
@@ -3337,7 +3401,7 @@ _TOOL_AUTONOMY_MAP = {
     "remove_contact": "manage_relationships",
     "send_feishu_message": "send_feishu_message",
     "send_message_to_agent": "send_message_to_agent",  # A2A messaging — distinct from feishu
-    "send_file_to_agent": "send_file_to_agent",          # A2A file transfer
+    "send_file_to_agent": "send_file_to_agent",  # A2A file transfer
     "web_search": "web_search",
     "execute_code": "execute_code",
     "sql_execute": "sql_execute",
@@ -3364,7 +3428,6 @@ async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
     """Get the agent tenant ID for tenant-scoped shared paths."""
     try:
         async with async_session() as db:
-
             r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
 
             tenant_id = r.scalar_one_or_none()
@@ -3377,7 +3440,7 @@ async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
 
 def _agent_workspace_root(agent_id: uuid.UUID) -> Path:
     """Return the per-agent local path without creating or hydrating it."""
-    return WORKSPACE_ROOT / str(agent_id)
+    return current_agent_runtime_workspace(agent_id).local_root
 
 
 def _non_empty_paths(*paths: str | None) -> list[str] | None:
@@ -3437,6 +3500,7 @@ async def _execute_workspace_mutation(
     session_id: str | None,
 ) -> str:
     """Handle shared workspace mutations for both direct and normal tool execution."""
+    runtime_workspace = current_agent_runtime_workspace(agent_id)
     if tool_name == "write_file":
         path = arguments.get("path")
         content = arguments.get("content")
@@ -3447,7 +3511,11 @@ async def _execute_workspace_mutation(
         if is_focus_file_path(path):
             return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
         if _is_enterprise_info_path(path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return (
+                "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            )
+        if runtime_workspace.is_agent_write_protected(path):
+            return f"❌ {path} is managed by the project owner and is read-only for Agents."
         async with async_session() as _wdb:
             write_result = await write_workspace_file(
                 _wdb,
@@ -3480,7 +3548,13 @@ async def _execute_workspace_mutation(
         if str(source_path).strip("/") in {"tasks.json", "soul.md"}:
             return f"❌ {source_path} cannot be moved (protected)"
         if _is_enterprise_info_path(source_path) or _is_enterprise_info_path(destination_path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return (
+                "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            )
+        if runtime_workspace.is_agent_write_protected(source_path) or runtime_workspace.is_agent_write_protected(
+            destination_path
+        ):
+            return "❌ Project-owned Agent identity files cannot be moved."
         async with async_session() as _wdb:
             move_result = await move_workspace_path(
                 _wdb,
@@ -3502,7 +3576,11 @@ async def _execute_workspace_mutation(
         if is_focus_file_path(path):
             return "❌ Focus is no longer stored in focus.md. Use Focus tools instead."
         if _is_enterprise_info_path(path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return (
+                "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            )
+        if runtime_workspace.is_agent_write_protected(path):
+            return f"❌ {path} is managed by the project owner and is read-only for Agents."
         async with async_session() as _wdb:
             delete_result = await delete_workspace_file(
                 _wdb,
@@ -3530,7 +3608,11 @@ async def _execute_workspace_mutation(
         if is_focus_file_path(path):
             return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
         if _is_enterprise_info_path(path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return (
+                "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            )
+        if runtime_workspace.is_agent_write_protected(path):
+            return f"❌ {path} is managed by the project owner and is read-only for Agents."
 
         replace_all = arguments.get("replace_all", False)
         storage = get_storage_backend()
@@ -3540,12 +3622,16 @@ async def _execute_workspace_mutation(
 
         content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
         if old_string not in content:
-            return f"❌ 'old_string' not found in {path}. Please check the exact text including whitespace and newlines."
+            return (
+                f"❌ 'old_string' not found in {path}. Please check the exact text including whitespace and newlines."
+            )
         count = content.count(old_string)
         if count > 1 and not replace_all:
             return f"❌ 'old_string' appears {count} times in {path}. Use replace_all=true or provide more context to make the match unique."
 
-        new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+        new_content = (
+            content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+        )
         async with async_session() as _wdb:
             write_result = await write_workspace_file(
                 _wdb,
@@ -3707,8 +3793,7 @@ async def execute_tool(
     if not isinstance(tool_name, str):
         tool_name = str(tool_name or "")
     tool_name = (
-        tool_name
-        .replace("`", "")
+        tool_name.replace("`", "")
         .replace("\u200b", "")
         .replace("\u200c", "")
         .replace("\u200d", "")
@@ -3733,6 +3818,16 @@ async def execute_tool(
             )
         if creator_id is not None:
             user_id = creator_id
+
+    from app.core.plaza_feature import PLAZA_TOOL_NAMES
+
+    if tool_name in PLAZA_TOOL_NAMES:
+        logger.warning(
+            "[Tools] Blocked globally disabled Plaza tool {} for agent {}",
+            tool_name,
+            agent_id,
+        )
+        return "This capability is unavailable."
 
     if is_retired_okr_tool(tool_name):
         return "This tool is unavailable."
@@ -3832,6 +3927,43 @@ async def execute_tool(
         except SubagentError as exc:
             return f"❌ {exc}"
 
+    if tool_name in USER_PROJECT_TOOL_NAMES:
+        try:
+            return await execute_user_project_tool(
+                tool_name,
+                arguments,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+        except (ValueError, HTTPException) as exc:
+            await record_user_project_tool_activity(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                outcome="rejected",
+                user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+                tool_call_id=tool_call_id,
+                project_id=arguments.get("project_id"),
+            )
+            return f"❌ {user_project_tool_error(exc)}"
+        except (OSError, RuntimeError, SQLAlchemyError, TypeError):
+            logger.exception("[UserProjectTool] {} failed", tool_name)
+            await record_user_project_tool_activity(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                outcome="failed",
+                user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+                tool_call_id=tool_call_id,
+                project_id=arguments.get("project_id"),
+            )
+            return "❌ Project query failed."
+
     from app.services.project_runtime_tools import (
         PROJECT_RUNTIME_TOOL_NAMES,
         execute_project_runtime_tool,
@@ -3866,11 +3998,13 @@ async def execute_tool(
         try:
             from app.services.autonomy_service import autonomy_service
             from app.models.agent import Agent as AgentModel
+
             async with async_session() as _adb:
                 _ar = await _adb.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 _agent = _ar.scalar_one_or_none()
                 if _agent:
                     from app.utils.sanitize import sanitize_tool_args as _sanitize_tool_args
+
                     _sanitized_args = _sanitize_tool_args(arguments) or {}
                     approval_key = None
                     if tool_name in _FORCED_L3_TOOLS and tool_call_id:
@@ -3934,19 +4068,12 @@ async def execute_tool(
             origin_turn_anchor_id=turn_anchor_id,
         )
         if cached_outbound is not None:
-            cached_meta = (
-                cached_outbound.message_meta
-                if isinstance(cached_outbound.message_meta, dict)
-                else {}
-            )
+            cached_meta = cached_outbound.message_meta if isinstance(cached_outbound.message_meta, dict) else {}
             # OpenClaw task delivery has two durable phases: the outbound row is
             # first recorded and its exact callback is armed, then the gateway
             # row and `queued` status commit together. A crash between those
             # phases must resume instead of pretending the target saw it.
-            if not (
-                tool_name == "send_message_to_agent"
-                and cached_meta.get("delivery_status") == "recorded"
-            ):
+            if not (tool_name == "send_message_to_agent" and cached_meta.get("delivery_status") == "recorded"):
                 target = str(cached_meta.get("target_name") or "the recipient")
                 channel = str(cached_meta.get("source_channel") or "the selected channel")
                 return f"✅ Message already sent to {target} via {channel} (idempotent replay)."
@@ -3961,6 +4088,7 @@ async def execute_tool(
         # is manually controlling the browser/desktop session. This prevents
         # input collisions between human clicks and agent-initiated actions.
         from app.api.agentbay_control import is_session_locked
+
         if is_session_locked(str(agent_id), session_id):
             return (
                 "⏸️ A human operator is currently controlling this browser session "
@@ -3999,7 +4127,11 @@ async def execute_tool(
                 source=arguments.get("source") or "user",
                 metadata={"tool": "upsert_focus_item"},
             )
-            result = f"✅ Focus item saved: {item['key']} (title: {item['title']}) — {item['description']}" if item.get("title") else f"✅ Focus item saved: {item['key']} — {item['description']}"
+            result = (
+                f"✅ Focus item saved: {item['key']} (title: {item['title']}) — {item['description']}"
+                if item.get("title")
+                else f"✅ Focus item saved: {item['key']} — {item['description']}"
+            )
         elif tool_name == "complete_focus_item":
             key = (arguments.get("key") or "").strip()
             if not key:
@@ -4031,14 +4163,17 @@ async def execute_tool(
             )
         elif tool_name == "read_image":
             from app.services.tools.read_image import handle_read_image
+
             return await handle_read_image(agent_id, arguments)
         elif tool_name == "list_sessions":
             from app.services.tools.session_introspection import handle_list_sessions
+
             return await handle_list_sessions(agent_id, user_id, session_id, arguments)
         elif tool_name == "set_execution_user":
             from app.services.execution_identity import (
                 handle_reassign_background_execution_user,
             )
+
             return await handle_reassign_background_execution_user(
                 agent_id,
                 user_id,
@@ -4048,6 +4183,7 @@ async def execute_tool(
             )
         elif tool_name == "run_background_resource":
             from app.services.background_manual_run import handle_run_background_resource
+
             return await handle_run_background_resource(
                 agent_id,
                 user_id,
@@ -4057,9 +4193,11 @@ async def execute_tool(
             )
         elif tool_name == "read_session_messages":
             from app.services.tools.session_introspection import handle_read_session_messages
+
             return await handle_read_session_messages(agent_id, user_id, session_id, arguments)
         elif tool_name == "search_sessions":
             from app.services.tools.session_introspection import handle_search_sessions
+
             return await handle_search_sessions(agent_id, user_id, session_id, arguments)
         # --- Enhanced file management tools ---
         elif tool_name == "convert_csv_to_xlsx":
@@ -4117,17 +4255,14 @@ async def execute_tool(
                 path=arguments.get("path", "."),
                 file_pattern=arguments.get("file_pattern", "*"),
                 ignore_case=arguments.get("ignore_case", False),
-                tenant_id=_agent_tenant_id
+                tenant_id=_agent_tenant_id,
             )
         elif tool_name == "find_files":
             pattern = arguments.get("pattern")
             if not pattern:
                 return "❌ Missing required argument 'pattern' for find_files"
             result = await _storage_find_files(
-                agent_id,
-                pattern,
-                path=arguments.get("path", "."),
-                tenant_id=_agent_tenant_id
+                agent_id, pattern, path=arguments.get("path", "."), tenant_id=_agent_tenant_id
             )
         elif tool_name == "manage_tasks":
             result = await _manage_tasks(agent_id, user_id, ws, arguments)
@@ -4216,7 +4351,13 @@ async def execute_tool(
                 origin_turn_anchor_id=turn_anchor_id,
             )
         elif tool_name == "send_file_to_agent":
-            result = await _send_file_to_agent(agent_id, arguments)
+            result = await _send_file_to_agent(
+                agent_id,
+                arguments,
+                origin_session_id=session_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=turn_anchor_id,
+            )
         elif tool_name == "send_channel_file":
             file_path = (arguments.get("file_path") or "").strip()
             if not file_path:
@@ -4237,15 +4378,25 @@ async def execute_tool(
             )
             file_path = (arguments.get("file_path") or "").strip()
             if media_kind not in {"audio", "video"}:
-                result = json.dumps({
-                    "type": "media_delivery_result", "version": 1, "status": "failed",
-                    "code": "INVALID_MEDIA_TYPE", "media_kind": media_kind or None,
-                })
+                result = json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": "INVALID_MEDIA_TYPE",
+                        "media_kind": media_kind or None,
+                    }
+                )
             elif media_kind == "audio" and arguments.get("cover_image_path"):
-                result = json.dumps({
-                    "type": "media_delivery_result", "version": 1, "status": "failed",
-                    "code": "COVER_NOT_ALLOWED_FOR_AUDIO", "media_kind": media_kind,
-                })
+                result = json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": "COVER_NOT_ALLOWED_FOR_AUDIO",
+                        "media_kind": media_kind,
+                    }
+                )
             elif (
                 not file_path
                 and str(arguments.get("url_mode") or "").strip().lower() == "managed"
@@ -4256,23 +4407,18 @@ async def execute_tool(
                         intent_id=str(tool_call_id or ""),
                         origin_turn_anchor_id=turn_anchor_id,
                     )
-                ) is not None
+                )
+                is not None
             ):
                 result = json.dumps(replay_result, ensure_ascii=False)
             else:
-                cover_path = (
-                    str(arguments.get("cover_image_path") or "").strip()
-                    if media_kind == "video"
-                    else ""
-                )
+                cover_path = str(arguments.get("cover_image_path") or "").strip() if media_kind == "video" else ""
                 selected_paths = ([file_path] if file_path else []) + ([cover_path] if cover_path else [])
                 oversized_code = None
                 selected_sizes: list[int | None] = []
                 storage = get_storage_backend()
                 for selected_path in selected_paths:
-                    resolved = await _resolve_storage_source_path(
-                        agent_id, selected_path, _agent_tenant_id
-                    )
+                    resolved = await _resolve_storage_source_path(agent_id, selected_path, _agent_tenant_id)
                     if resolved.exists:
                         entry = await storage.stat(resolved.storage_key)
                         selected_sizes.append(entry.size)
@@ -4285,11 +4431,16 @@ async def execute_tool(
                         selected_sizes[1] if len(selected_sizes) > 1 else None,
                     )
                 if oversized_code:
-                    result = json.dumps({
-                        "type": "media_delivery_result", "version": 1,
-                        "status": "failed", "code": oversized_code,
-                        "media_kind": media_kind,
-                    }, ensure_ascii=False)
+                    result = json.dumps(
+                        {
+                            "type": "media_delivery_result",
+                            "version": 1,
+                            "status": "failed",
+                            "code": oversized_code,
+                            "media_kind": media_kind,
+                        },
+                        ensure_ascii=False,
+                    )
                 elif selected_paths:
                     result = await _run_with_temp_workspace(
                         agent_id,
@@ -4413,9 +4564,11 @@ async def execute_tool(
             result = await _import_mcp_server(agent_id, arguments)
         elif tool_name == "list_installed_mcp_servers":
             from app.services.agent_mcp_lifecycle import list_installed_mcp_servers
+
             result = await list_installed_mcp_servers(agent_id)
         elif tool_name == "refresh_mcp_server":
             from app.services.agent_mcp_lifecycle import refresh_mcp_server
+
             try:
                 _server_id = uuid.UUID(str(arguments.get("mcp_server_id") or ""))
             except (ValueError, TypeError):
@@ -4424,6 +4577,7 @@ async def execute_tool(
                 result = await refresh_mcp_server(agent_id, _server_id)
         elif tool_name == "uninstall_mcp_server":
             from app.services.agent_mcp_lifecycle import uninstall_mcp_server
+
             try:
                 _server_id = uuid.UUID(str(arguments.get("mcp_server_id") or ""))
             except (ValueError, TypeError):
@@ -4686,6 +4840,7 @@ async def execute_tool(
         if tool_name not in ("list_files", "read_file", "read_document"):
             from app.services.activity_logger import log_activity
             from app.utils.sanitize import sanitize_sensitive_values, sanitize_tool_args
+
             _log_args = sanitize_tool_args(arguments) or {}
             _log_result = result
             if tool_name == "list_installed_mcp_servers":
@@ -4704,29 +4859,39 @@ async def execute_tool(
                 "result": _log_result[:300],
             }
             await log_activity(
-                agent_id, "tool_call",
+                agent_id,
+                "tool_call",
                 _summary,
                 detail=_detail,
             )
         # Save error message to current session if a messaging tool fails, so the user is notified
-        if session_id and tool_name in (
-            "send_channel_message",
-            "send_group_session_message",
-            "send_session_message",
-            "send_feishu_message",
-            "send_platform_message",
-            "send_message_to_agent",
-        ) and isinstance(result, str) and result.startswith("❌"):
+        if (
+            session_id
+            and tool_name
+            in (
+                "send_channel_message",
+                "send_group_session_message",
+                "send_session_message",
+                "send_feishu_message",
+                "send_platform_message",
+                "send_message_to_agent",
+            )
+            and isinstance(result, str)
+            and result.startswith("❌")
+        ):
             try:
                 async with async_session() as _err_db:
                     from app.models.audit import ChatMessage as _CM
-                    _err_db.add(_CM(
-                        agent_id=agent_id,
-                        user_id=user_id,
-                        role="assistant",
-                        content=f"⚠️ [系统提示] 数字员工工具调用失败！\n工具名: `{tool_name}`\n参数: `{json.dumps(arguments, ensure_ascii=False)}`\n错误信息: {result}",
-                        conversation_id=session_id,
-                    ))
+
+                    _err_db.add(
+                        _CM(
+                            agent_id=agent_id,
+                            user_id=user_id,
+                            role="assistant",
+                            content=f"⚠️ [系统提示] 数字员工工具调用失败！\n工具名: `{tool_name}`\n参数: `{json.dumps(arguments, ensure_ascii=False)}`\n错误信息: {result}",
+                            conversation_id=session_id,
+                        )
+                    )
                     await _err_db.commit()
             except Exception as _e:
                 logger.warning(f"Failed to save tool error message to session: {_e}")
@@ -4788,13 +4953,15 @@ async def _search_duckduckgo(query: str, max_results: int) -> str:
     blocks = re.findall(
         r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?'
         r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
-        resp.text, re.DOTALL,
+        resp.text,
+        re.DOTALL,
     )
     for url, title, snippet in blocks[:max_results]:
-        title = re.sub(r'<[^>]+>', '', title).strip()
-        snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+        title = re.sub(r"<[^>]+>", "", title).strip()
+        snippet = re.sub(r"<[^>]+>", "", snippet).strip()
         if "uddg=" in url:
             from urllib.parse import unquote, parse_qs, urlparse
+
             parsed = parse_qs(urlparse(url).query)
             url = unquote(parsed.get("uddg", [url])[0])
         results.append(f"**{title}**\n{url}\n{snippet}")
@@ -4803,12 +4970,14 @@ async def _search_duckduckgo(query: str, max_results: int) -> str:
         return f'🔍 No results found for "{query}"'
     return f'🔍 DuckDuckGo results for "{query}" ({len(results)} items):\n\n' + "\n\n---\n\n".join(results)
 
+
 async def _get_jina_api_key() -> str:
     """Read Jina API key from DB system_settings first, then fall back to env."""
     try:
         from app.database import async_session
         from app.models.system_settings import SystemSetting
         from sqlalchemy import select
+
         async with async_session() as db:
             result = await db.execute(select(SystemSetting).where(SystemSetting.key == "jina_api_key"))
             setting = result.scalar_one_or_none()
@@ -4817,6 +4986,7 @@ async def _get_jina_api_key() -> str:
     except Exception:
         pass
     from app.config import get_settings
+
     return get_settings().JINA_API_KEY
 
 
@@ -4948,7 +5118,9 @@ async def _validate_public_http_url(url: str) -> tuple[str | None, str | None]:
             loop = asyncio.get_running_loop()
             infos = await loop.run_in_executor(
                 None,
-                lambda: socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM),
+                lambda: socket.getaddrinfo(
+                    hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM
+                ),
             )
             addresses = [info[4][0] for info in infos]
     except Exception as exc:
@@ -5112,7 +5284,6 @@ async def _read_webpage(arguments: dict) -> str:
         return f"❌ Webpage fetch timed out: {url}"
     except Exception as e:
         return f"❌ Webpage read error: {str(e)[:300]}"
-
 
 
 async def _search_tavily(query: str, api_key: str, max_results: int) -> str:
@@ -5307,7 +5478,6 @@ async def _exa_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str
         return f"❌ Exa search error: {str(e)[:300]}"
 
 
-
 # ── Standalone search engine tool wrappers ───────────────────────────────────
 # Each function reads its own tool config (agent > company > defaults) and
 # delegates to the existing private search implementations above.
@@ -5375,7 +5545,7 @@ async def _bing_search_tool(arguments: dict, agent_id: uuid.UUID | None = None) 
 
 async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     """Send a file to a person or back to the current channel.
-    
+
     Priority:
     1. If canonical user_id is provided, resolve one exact internal route.
     2. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
@@ -5398,7 +5568,7 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     try:
         file_path.relative_to(ws_resolved)
     except ValueError:
-        file_path = (WORKSPACE_ROOT / str(agent_id) / rel_path).resolve()
+        file_path = (_agent_workspace_root(agent_id) / rel_path).resolve()
         if not file_path.exists():
             return f"Error: File not found: {rel_path}"
     if not file_path.exists():
@@ -5408,14 +5578,17 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
         file_path.name, mimetypes.guess_type(file_path.name)[0]
     )
     if detected_kind in {"audio", "video"}:
-        return json.dumps({
-            "type": "media_delivery_result",
-            "version": 1,
-            "status": "failed",
-            "code": "WRONG_MEDIA_TOOL",
-            "media_kind": detected_kind,
-            "message": f"Use send_media with media_type='{detected_kind}'.",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "WRONG_MEDIA_TOOL",
+                "media_kind": detected_kind,
+                "message": f"Use send_media with media_type='{detected_kind}'.",
+            },
+            ensure_ascii=False,
+        )
 
     # Priority 1: explicit canonical recipient.
     if canonical_user_id:
@@ -5438,7 +5611,7 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
 
     # Priority 3: Web/H5 chat fallback — return a structured platform file
     # delivery payload. The frontend builds the authenticated download URL.
-    base_abs = (WORKSPACE_ROOT / str(agent_id)).resolve()
+    base_abs = _agent_workspace_root(agent_id).resolve()
     try:
         file_rel = file_path.resolve().relative_to(base_abs).as_posix()
     except ValueError:
@@ -5458,10 +5631,16 @@ async def _send_channel_media(
 ) -> str:
     """Create one audio/video delivery without leaking renderer/IM details."""
     if not str(tool_call_id or "").strip():
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "MISSING_DELIVERY_INTENT_ID", "media_kind": media_kind,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "MISSING_DELIVERY_INTENT_ID",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
     raw_rel_path = arguments.get("file_path", "")
     raw_url = arguments.get("url", "")
     rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
@@ -5472,59 +5651,102 @@ async def _send_channel_media(
     has_file = bool(rel_path)
     has_url = bool(media_url)
     if has_file == has_url:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "INVALID_MEDIA_SOURCE", "media_kind": media_kind,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "INVALID_MEDIA_SOURCE",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
     if has_file and url_mode:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "INVALID_MEDIA_SOURCE", "media_kind": media_kind,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "INVALID_MEDIA_SOURCE",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
     if has_url and url_mode not in {"external", "managed"}:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "INVALID_URL_MODE", "media_kind": media_kind,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "INVALID_URL_MODE",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
     if has_headers and not (has_url and url_mode == "managed"):
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "INVALID_MEDIA_HEADERS", "media_kind": media_kind,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "INVALID_MEDIA_HEADERS",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
     if has_headers:
         try:
-            managed_headers = normalize_managed_media_headers(
-                arguments.get("headers")
-            )
+            managed_headers = normalize_managed_media_headers(arguments.get("headers"))
         except MediaUrlError as exc:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1,
-                "status": "failed", "code": exc.code,
-                "media_kind": media_kind,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": exc.code,
+                    "media_kind": media_kind,
+                },
+                ensure_ascii=False,
+            )
 
     canonical_user_id = str(arguments.get("user_id") or "").strip()
     requested_session_id = str(arguments.get("session_id") or "").strip()
     requested_channel = str(arguments.get("channel") or "").strip().lower() or None
     if canonical_user_id and requested_session_id:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "AMBIGUOUS_MEDIA_TARGET", "media_kind": media_kind,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "AMBIGUOUS_MEDIA_TARGET",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
     if requested_channel and not canonical_user_id:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "CHANNEL_REQUIRES_USER_TARGET", "media_kind": media_kind,
-        }, ensure_ascii=False)
-    target_session_id = requested_session_id or (
-        str(origin_session_id or "").strip() if not canonical_user_id else ""
-    )
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "CHANNEL_REQUIRES_USER_TARGET",
+                "media_kind": media_kind,
+            },
+            ensure_ascii=False,
+        )
+    target_session_id = requested_session_id or (str(origin_session_id or "").strip() if not canonical_user_id else "")
     if not target_session_id and not canonical_user_id:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "SESSION_REQUIRED", "media_kind": media_kind,
-            "intent_id": tool_call_id or "",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "SESSION_REQUIRED",
+                "media_kind": media_kind,
+                "intent_id": tool_call_id or "",
+            },
+            ensure_ascii=False,
+        )
 
     file_path: Path | None = None
     managed_import = None
@@ -5532,69 +5754,109 @@ async def _send_channel_media(
     if has_file:
         rel_path = _normalize_tool_workspace_rel_path(rel_path)
         if not rel_path:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "INVALID_FILE_PATH", "media_kind": media_kind,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "INVALID_FILE_PATH",
+                    "media_kind": media_kind,
+                },
+                ensure_ascii=False,
+            )
         agent_root = ws.resolve()
         file_path = (agent_root / rel_path).resolve()
         try:
             file_path.relative_to(agent_root)
         except ValueError:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1,
-                "status": "failed", "code": "INVALID_FILE_PATH",
-                "media_kind": media_kind,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "INVALID_FILE_PATH",
+                    "media_kind": media_kind,
+                },
+                ensure_ascii=False,
+            )
         if not file_path.exists() or not file_path.is_file():
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "MEDIA_NOT_FOUND", "media_kind": media_kind,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "MEDIA_NOT_FOUND",
+                    "media_kind": media_kind,
+                },
+                ensure_ascii=False,
+            )
         actual_mime = _sniff_media_file_mime(file_path)
         actual_kind = actual_mime.split("/", 1)[0] if actual_mime else None
         if actual_kind != media_kind:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "MEDIA_KIND_MISMATCH", "media_kind": media_kind,
-                "actual_kind": actual_kind,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "MEDIA_KIND_MISMATCH",
+                    "media_kind": media_kind,
+                    "actual_kind": actual_kind,
+                },
+                ensure_ascii=False,
+            )
     else:
         if url_mode == "external":
             try:
                 media_url = await validate_media_url(media_url, external=True)
             except MediaUrlError as exc:
-                return json.dumps({
-                    "type": "media_delivery_result", "version": 1, "status": "failed",
-                    "code": exc.code, "media_kind": media_kind,
-                }, ensure_ascii=False)
+                return json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": exc.code,
+                        "media_kind": media_kind,
+                    },
+                    ensure_ascii=False,
+                )
 
     cover_path: Path | None = None
     if media_kind == "video" and arguments.get("cover_image_path"):
         raw_cover_path = str(arguments.get("cover_image_path") or "").strip()
         cover_rel_path = _normalize_tool_workspace_rel_path(raw_cover_path)
         if not cover_rel_path:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "INVALID_COVER_PATH", "media_kind": media_kind,
-            })
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "INVALID_COVER_PATH",
+                    "media_kind": media_kind,
+                }
+            )
         cover_path = (ws / cover_rel_path).resolve()
         try:
             cover_path.relative_to(ws.resolve())
         except ValueError:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "INVALID_COVER_PATH", "media_kind": media_kind,
-            })
-        if (
-            not cover_path.exists()
-            or not cover_path.is_file()
-            or _sniff_image_file(cover_path) is None
-        ):
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "INVALID_VIDEO_COVER", "media_kind": media_kind,
-            })
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "INVALID_COVER_PATH",
+                    "media_kind": media_kind,
+                }
+            )
+        if not cover_path.exists() or not cover_path.is_file() or _sniff_image_file(cover_path) is None:
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "INVALID_VIDEO_COVER",
+                    "media_kind": media_kind,
+                }
+            )
 
     if has_url and url_mode == "managed":
         replay = await _replay_terminal_media_delivery(
@@ -5623,11 +5885,19 @@ async def _send_channel_media(
     allow_download = tool_config.get("allow_download") is True
     if has_url and url_mode == "external":
         if canonical_user_id:
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1,
-                "status": "unsupported", "code": "EXTERNAL_URL_NOT_SUPPORTED_BY_CHANNEL",
-                "media_kind": media_kind, "intent_id": tool_call_id or "",
-            }), ensure_ascii=False)
+            return json.dumps(
+                _describe_media_delivery_result(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "unsupported",
+                        "code": "EXTERNAL_URL_NOT_SUPPORTED_BY_CHANNEL",
+                        "media_kind": media_kind,
+                        "intent_id": tool_call_id or "",
+                    }
+                ),
+                ensure_ascii=False,
+            )
         return await _publish_external_media_to_session(
             agent_id=agent_id,
             session_id=target_session_id,
@@ -5653,9 +5923,7 @@ async def _send_channel_media(
                 operation_scope=(
                     _build_outbound_operation_key(
                         agent_id=agent_id,
-                        origin_session_id=(
-                            origin_session_id or target_session_id or None
-                        ),
+                        origin_session_id=(origin_session_id or target_session_id or None),
                         tool_call_id=tool_call_id,
                         origin_turn_anchor_id=origin_turn_anchor_id,
                     )
@@ -5665,8 +5933,11 @@ async def _send_channel_media(
             )
         except MediaUrlError as exc:
             payload = {
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": exc.code, "media_kind": media_kind,
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": exc.code,
+                "media_kind": media_kind,
                 "intent_id": tool_call_id or "",
             }
             if exc.http_status is not None:
@@ -5683,20 +5954,26 @@ async def _send_channel_media(
         if managed_import is not None:
             try:
                 await get_storage_backend().write_local_file(
-                    normalize_storage_key(f"{agent_id}/{rel_path}"),
+                    current_agent_runtime_workspace(agent_id).storage_key(rel_path),
                     file_path,
                     content_type=managed_import.mime_type,
                 )
             except Exception:
-                logger.opt(exception=True).error(
-                    "[SessionMedia] Managed import persistence failed"
+                logger.opt(exception=True).error("[SessionMedia] Managed import persistence failed")
+                return json.dumps(
+                    _describe_media_delivery_result(
+                        {
+                            "type": "media_delivery_result",
+                            "version": 1,
+                            "status": "failed",
+                            "code": "MEDIA_STORAGE_FAILED",
+                            "media_kind": media_kind,
+                            "intent_id": tool_call_id or "",
+                            "managed_path": rel_path,
+                        }
+                    ),
+                    ensure_ascii=False,
                 )
-                return json.dumps(_describe_media_delivery_result({
-                    "type": "media_delivery_result", "version": 1,
-                    "status": "failed", "code": "MEDIA_STORAGE_FAILED",
-                    "media_kind": media_kind, "intent_id": tool_call_id or "",
-                    "managed_path": rel_path,
-                }), ensure_ascii=False)
 
         assert file_path is not None and rel_path is not None
         if target_session_id:
@@ -5781,10 +6058,12 @@ async def _replay_terminal_media_delivery_under_slot(
         await _lock_outbound_operation(db, operation_key)
         existing = (
             await db.execute(
-                select(ChatMessage).where(
+                select(ChatMessage)
+                .where(
                     ChatMessage.agent_id == agent_id,
                     ChatMessage.external_event_key == operation_key,
-                ).with_for_update()
+                )
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if existing is None or existing.role != "tool_call":
@@ -5804,32 +6083,33 @@ async def _replay_terminal_media_delivery_under_slot(
             stored_args = stored_call.get("args")
             if not isinstance(stored_args, dict):
                 stored_args = {}
-            media_kind = str(
-                next_meta.get("media_kind")
-                or stored_args.get("media_type")
-                or ""
+            media_kind = str(next_meta.get("media_kind") or stored_args.get("media_type") or "")
+            result_payload = _describe_media_delivery_result(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "unknown",
+                    "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                    "media_kind": media_kind or None,
+                    "intent_id": intent_id,
+                    "session_id": str(existing.conversation_id),
+                    "channel": str(next_meta.get("source_channel") or ""),
+                    "message_id": str(existing.id),
+                }
             )
-            result_payload = _describe_media_delivery_result({
-                "type": "media_delivery_result",
-                "version": 1,
-                "status": "unknown",
-                "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
-                "media_kind": media_kind or None,
-                "intent_id": intent_id,
-                "session_id": str(existing.conversation_id),
-                "channel": str(next_meta.get("source_channel") or ""),
-                "message_id": str(existing.id),
-            })
             if not stored_args and media_kind:
                 stored_args = {"media_type": media_kind}
-            existing.content = json.dumps({
-                "name": str(stored_call.get("name") or "send_media"),
-                "call_id": str(stored_call.get("call_id") or intent_id),
-                "args": stored_args,
-                "status": "done",
-                "result": json.dumps(result_payload, ensure_ascii=False),
-                "reasoning_content": stored_call.get("reasoning_content"),
-            }, ensure_ascii=False)
+            existing.content = json.dumps(
+                {
+                    "name": str(stored_call.get("name") or "send_media"),
+                    "call_id": str(stored_call.get("call_id") or intent_id),
+                    "args": stored_args,
+                    "status": "done",
+                    "result": json.dumps(result_payload, ensure_ascii=False),
+                    "reasoning_content": stored_call.get("reasoning_content"),
+                },
+                ensure_ascii=False,
+            )
             recovered_session_id = str(existing.conversation_id)
             recovered_event = {
                 "type": "tool_call",
@@ -5855,15 +6135,15 @@ async def _replay_terminal_media_delivery_under_slot(
             status = str(stored_result.get("status") or "")
             if status == "sent":
                 code = str(stored_result.get("code") or "")
-                result_payload = _describe_media_delivery_result({
-                    **stored_result,
-                    "status": "already_sent",
-                    "code": (
-                        "MEDIA_SENT_CAPTION_FAILED"
-                        if code == "MEDIA_SENT_CAPTION_FAILED"
-                        else "MEDIA_ALREADY_SENT"
-                    ),
-                })
+                result_payload = _describe_media_delivery_result(
+                    {
+                        **stored_result,
+                        "status": "already_sent",
+                        "code": (
+                            "MEDIA_SENT_CAPTION_FAILED" if code == "MEDIA_SENT_CAPTION_FAILED" else "MEDIA_ALREADY_SENT"
+                        ),
+                    }
+                )
             elif status in {"already_sent", "failed", "unsupported", "unknown"}:
                 result_payload = _describe_media_delivery_result(stored_result)
             else:
@@ -5872,6 +6152,7 @@ async def _replay_terminal_media_delivery_under_slot(
     if recovered_event is not None and recovered_session_id:
         try:
             from app.api.websocket import manager as ws_manager
+
             recovered_event["session_id"] = recovered_session_id
             await ws_manager.send_to_session(
                 str(agent_id),
@@ -5879,9 +6160,7 @@ async def _replay_terminal_media_delivery_under_slot(
                 recovered_event,
             )
         except Exception:
-            logger.opt(exception=True).warning(
-                "[SessionMedia] Unknown-state recovery live mirror failed"
-            )
+            logger.opt(exception=True).warning("[SessionMedia] Unknown-state recovery live mirror failed")
     return result_payload
 
 
@@ -6019,9 +6298,7 @@ _MEDIA_DELIVERY_MESSAGES = {
     "COVER_NOT_ALLOWED_FOR_AUDIO": "音频不支持封面参数。",
     "INVALID_MEDIA_SOURCE": "必须且只能提供一个媒体来源：file_path，或 url 与 url_mode。",
     "INVALID_URL_MODE": "使用 url 时，url_mode 必须是 external 或 managed。",
-    "INVALID_MEDIA_HEADERS": (
-        "headers 只支持 managed URL，且请求头名称和值必须是合法的 HTTP 字符串。"
-    ),
+    "INVALID_MEDIA_HEADERS": ("headers 只支持 managed URL，且请求头名称和值必须是合法的 HTTP 字符串。"),
     "INVALID_MEDIA_URL": "媒体 URL 无效；external 仅支持 HTTPS，managed 支持 HTTP(S)。",
     "MEDIA_URL_FORBIDDEN_TARGET": "媒体 URL 指向内网、本机或其他受保护地址，平台拒绝访问。",
     "MEDIA_URL_DNS_FAILED": "媒体 URL 的域名无法解析。",
@@ -6070,10 +6347,7 @@ def _describe_media_delivery_result(payload: dict) -> dict:
         "媒体发送未完成，请根据 status 和 code 向用户说明结果。",
     )
     if code == "MEDIA_SENT_CAPTION_FAILED":
-        agent_action = (
-            "Tell the user the media was sent but its caption failed; "
-            "do not resend the media."
-        )
+        agent_action = "Tell the user the media was sent but its caption failed; do not resend the media."
     elif status == "unknown":
         agent_action = "Report the uncertain result and do not retry this call automatically."
     else:
@@ -6141,11 +6415,19 @@ async def _publish_external_media_to_session(
     try:
         target_session_id = uuid.UUID(str(session_id))
     except (TypeError, ValueError):
-        return json.dumps(_describe_media_delivery_result({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "SESSION_NOT_FOUND_OR_FORBIDDEN", "media_kind": media_kind,
-            "intent_id": intent_id,
-        }), ensure_ascii=False)
+        return json.dumps(
+            _describe_media_delivery_result(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "SESSION_NOT_FOUND_OR_FORBIDDEN",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                }
+            ),
+            ensure_ascii=False,
+        )
     operation_key = _build_outbound_operation_key(
         agent_id=agent_id,
         origin_session_id=origin_session_id,
@@ -6153,11 +6435,19 @@ async def _publish_external_media_to_session(
         origin_turn_anchor_id=origin_turn_anchor_id,
     )
     if not operation_key:
-        return json.dumps(_describe_media_delivery_result({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "MISSING_DELIVERY_INTENT_ID", "media_kind": media_kind,
-            "intent_id": intent_id,
-        }), ensure_ascii=False)
+        return json.dumps(
+            _describe_media_delivery_result(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "MISSING_DELIVERY_INTENT_ID",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                }
+            ),
+            ensure_ascii=False,
+        )
 
     filename = _external_media_filename(media_url, media_kind)
     display_title = normalize_media_display_title(tool_args.get("title"))
@@ -6182,11 +6472,20 @@ async def _publish_external_media_to_session(
                 if existing_result.get("status") == "sent":
                     existing_result = {**existing_result, "status": "already_sent", "code": "MEDIA_ALREADY_SENT"}
                 return json.dumps(existing_result, ensure_ascii=False)
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1, "status": "unknown",
-                "code": "MEDIA_DELIVERY_STATE_UNKNOWN", "media_kind": media_kind,
-                "intent_id": intent_id, "message_id": str(existing.id),
-            }), ensure_ascii=False)
+            return json.dumps(
+                _describe_media_delivery_result(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "unknown",
+                        "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "message_id": str(existing.id),
+                    }
+                ),
+                ensure_ascii=False,
+            )
 
         session = (
             await db.execute(
@@ -6197,33 +6496,57 @@ async def _publish_external_media_to_session(
             )
         ).scalar_one_or_none()
         if session is None:
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "SESSION_NOT_FOUND_OR_FORBIDDEN", "media_kind": media_kind,
-                "intent_id": intent_id,
-            }), ensure_ascii=False)
+            return json.dumps(
+                _describe_media_delivery_result(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": "SESSION_NOT_FOUND_OR_FORBIDDEN",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                    }
+                ),
+                ensure_ascii=False,
+            )
         channel = str(session.source_channel or "").strip()
         if channel not in _PLATFORM_SESSION_CHANNELS:
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1, "status": "unsupported",
-                "code": "EXTERNAL_URL_NOT_SUPPORTED_BY_CHANNEL", "media_kind": media_kind,
-                "intent_id": intent_id, "session_id": str(session.id), "channel": channel,
-            }), ensure_ascii=False)
+            return json.dumps(
+                _describe_media_delivery_result(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "unsupported",
+                        "code": "EXTERNAL_URL_NOT_SUPPORTED_BY_CHANNEL",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(session.id),
+                        "channel": channel,
+                    }
+                ),
+                ensure_ascii=False,
+            )
 
         receipt: ChatMessage | None = None
         if str(origin_session_id or "") == str(session.id) and origin_turn_anchor_id:
             running_rows = (
-                await db.execute(
-                    select(ChatMessage).where(
-                        ChatMessage.agent_id == agent_id,
-                        ChatMessage.conversation_id == str(session.id),
-                        ChatMessage.role == "tool_call",
-                        ChatMessage.external_event_key.is_(None),
-                        ChatMessage.message_meta["turn_anchor_id"].as_string()
-                        == str(origin_turn_anchor_id),
-                    ).order_by(ChatMessage.created_at.desc()).limit(20)
+                (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.agent_id == agent_id,
+                            ChatMessage.conversation_id == str(session.id),
+                            ChatMessage.role == "tool_call",
+                            ChatMessage.external_event_key.is_(None),
+                            ChatMessage.message_meta["turn_anchor_id"].as_string() == str(origin_turn_anchor_id),
+                        )
+                        .order_by(ChatMessage.created_at.desc())
+                        .limit(20)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for candidate in running_rows:
                 try:
                     candidate_payload = json.loads(candidate.content or "")
@@ -6290,14 +6613,17 @@ async def _publish_external_media_to_session(
             "conversation_type": "group" if session.is_group else "person",
             "delivery_mode": "external_url",
         }
-        receipt.content = json.dumps({
-            "name": "send_media",
-            "call_id": intent_id,
-            "args": dict(tool_args),
-            "status": "done",
-            "result": json.dumps(result_payload, ensure_ascii=False),
-            "reasoning_content": None,
-        }, ensure_ascii=False)
+        receipt.content = json.dumps(
+            {
+                "name": "send_media",
+                "call_id": intent_id,
+                "args": dict(tool_args),
+                "status": "done",
+                "result": json.dumps(result_payload, ensure_ascii=False),
+                "reasoning_content": None,
+            },
+            ensure_ascii=False,
+        )
         caption_row: ChatMessage | None = None
         if caption.strip():
             caption_row = ChatMessage(
@@ -6321,14 +6647,22 @@ async def _publish_external_media_to_session(
             db.add(caption_row)
         await db.commit()
         await db.refresh(receipt)
-        events.append({
-            "type": "tool_call", "id": str(receipt.id), "message_id": str(receipt.id),
-            "name": "send_media", "call_id": intent_id, "args": dict(tool_args),
-            "status": "done", "result": json.dumps(result_payload, ensure_ascii=False),
-            "created_at": receipt.created_at.isoformat() if receipt.created_at else None,
-        })
+        events.append(
+            {
+                "type": "tool_call",
+                "id": str(receipt.id),
+                "message_id": str(receipt.id),
+                "name": "send_media",
+                "call_id": intent_id,
+                "args": dict(tool_args),
+                "status": "done",
+                "result": json.dumps(result_payload, ensure_ascii=False),
+                "created_at": receipt.created_at.isoformat() if receipt.created_at else None,
+            }
+        )
         if caption_row is not None:
             from app.services.chat_message_serializer import serialize_chat_message_for_client
+
             await db.refresh(caption_row)
             caption_event = serialize_chat_message_for_client(caption_row, source_channel=channel)
             caption_event["type"] = "assistant_message_committed"
@@ -6336,6 +6670,7 @@ async def _publish_external_media_to_session(
 
     try:
         from app.api.websocket import manager as ws_manager
+
         for event in events:
             event["session_id"] = str(target_session_id)
             await ws_manager.send_to_session(str(agent_id), str(target_session_id), event)
@@ -6405,11 +6740,17 @@ async def _send_media_to_session_under_lifecycle_lock(
     try:
         target_session_id = uuid.UUID(str(session_id))
     except (TypeError, ValueError):
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "SESSION_NOT_FOUND_OR_FORBIDDEN", "media_kind": media_kind,
-            "intent_id": intent_id,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "SESSION_NOT_FOUND_OR_FORBIDDEN",
+                "media_kind": media_kind,
+                "intent_id": intent_id,
+            },
+            ensure_ascii=False,
+        )
 
     operation_key = _build_outbound_operation_key(
         agent_id=agent_id,
@@ -6428,11 +6769,17 @@ async def _send_media_to_session_under_lifecycle_lock(
     persisted_args = dict(tool_args or {"media_type": media_kind, "file_path": workspace_path})
     display_title = normalize_media_display_title(persisted_args.get("title"))
     if not operation_key:
-        return json.dumps({
-            "type": "media_delivery_result", "version": 1, "status": "failed",
-            "code": "MISSING_DELIVERY_INTENT_ID", "media_kind": media_kind,
-            "intent_id": intent_id,
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": "failed",
+                "code": "MISSING_DELIVERY_INTENT_ID",
+                "media_kind": media_kind,
+                "intent_id": intent_id,
+            },
+            ensure_ascii=False,
+        )
 
     receipt_id: uuid.UUID
     channel = ""
@@ -6446,9 +6793,7 @@ async def _send_media_to_session_under_lifecycle_lock(
     async with _outbound_media_db_session() as db:
         existing = (
             await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.external_event_key == operation_key
-                ).with_for_update()
+                select(ChatMessage).where(ChatMessage.external_event_key == operation_key).with_for_update()
             )
         ).scalar_one_or_none()
         if existing is not None:
@@ -6456,30 +6801,28 @@ async def _send_media_to_session_under_lifecycle_lock(
             state = str(meta.get("delivery_status") or "unknown")
             if state == "sent":
                 caption_status = str(meta.get("caption_status") or "not_requested")
-                existing_display_title = normalize_media_display_title(
-                    meta.get("display_title")
+                existing_display_title = normalize_media_display_title(meta.get("display_title"))
+                existing_result = _describe_media_delivery_result(
+                    {
+                        "type": "platform_media_delivery",
+                        "version": 1,
+                        "status": "already_sent",
+                        "code": ("MEDIA_SENT_CAPTION_FAILED" if caption_status == "failed" else "MEDIA_ALREADY_SENT"),
+                        "caption_status": caption_status,
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(existing.conversation_id),
+                        "channel": str(meta.get("source_channel") or ""),
+                        "path": workspace_path,
+                        "filename": file_path.name,
+                        **({"title": existing_display_title} if existing_display_title else {}),
+                        "mime_type": mime_type,
+                        "size": file_path.stat().st_size,
+                        "message_id": str(existing.id),
+                        "allow_download": meta.get("allow_download") is True,
+                        "source_mode": str(meta.get("source_mode") or source_mode),
+                    }
                 )
-                existing_result = _describe_media_delivery_result({
-                    "type": "platform_media_delivery", "version": 1,
-                    "status": "already_sent",
-                    "code": (
-                        "MEDIA_SENT_CAPTION_FAILED"
-                        if caption_status == "failed"
-                        else "MEDIA_ALREADY_SENT"
-                    ),
-                    "caption_status": caption_status,
-                    "media_kind": media_kind, "intent_id": intent_id,
-                    "session_id": str(existing.conversation_id),
-                    "channel": str(meta.get("source_channel") or ""),
-                    "path": workspace_path,
-                    "filename": file_path.name,
-                    **({"title": existing_display_title} if existing_display_title else {}),
-                    "mime_type": mime_type,
-                    "size": file_path.stat().st_size,
-                    "message_id": str(existing.id),
-                    "allow_download": meta.get("allow_download") is True,
-                    "source_mode": str(meta.get("source_mode") or source_mode),
-                })
                 return json.dumps(existing_result, ensure_ascii=False)
             if state == "pending":
                 next_meta = {
@@ -6488,45 +6831,58 @@ async def _send_media_to_session_under_lifecycle_lock(
                     "delivery_code": "MEDIA_DELIVERY_STATE_UNKNOWN",
                 }
                 existing.message_meta = next_meta
-                unknown_result = _describe_media_delivery_result({
-                    "type": "media_delivery_result", "version": 1,
-                    "status": "unknown",
-                    "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
-                    "media_kind": media_kind, "intent_id": intent_id,
-                    "session_id": str(existing.conversation_id),
-                    "channel": str(next_meta.get("source_channel") or ""),
-                    "message_id": str(existing.id),
-                })
+                unknown_result = _describe_media_delivery_result(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "unknown",
+                        "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(existing.conversation_id),
+                        "channel": str(next_meta.get("source_channel") or ""),
+                        "message_id": str(existing.id),
+                    }
+                )
                 if existing.role == "tool_call":
                     try:
                         existing_call = json.loads(existing.content or "")
                     except (TypeError, ValueError, json.JSONDecodeError):
                         existing_call = {}
-                    existing.content = json.dumps({
-                        "name": str(existing_call.get("name") or "send_media"),
-                        "call_id": str(existing_call.get("call_id") or intent_id),
-                        "args": existing_call.get("args") or {
-                            "media_type": media_kind,
-                            "file_path": workspace_path,
+                    existing.content = json.dumps(
+                        {
+                            "name": str(existing_call.get("name") or "send_media"),
+                            "call_id": str(existing_call.get("call_id") or intent_id),
+                            "args": existing_call.get("args")
+                            or {
+                                "media_type": media_kind,
+                                "file_path": workspace_path,
+                            },
+                            "status": "done",
+                            "result": json.dumps(unknown_result, ensure_ascii=False),
+                            "reasoning_content": existing_call.get("reasoning_content"),
                         },
-                        "status": "done",
-                        "result": json.dumps(unknown_result, ensure_ascii=False),
-                        "reasoning_content": existing_call.get("reasoning_content"),
-                    }, ensure_ascii=False)
+                        ensure_ascii=False,
+                    )
                 await db.commit()
                 return json.dumps(unknown_result, ensure_ascii=False)
-            existing_result = _describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1,
-                "status": state if state in {"failed", "unknown", "unsupported"} else "unknown",
-                "code": (
-                    "MEDIA_DELIVERY_STATE_UNKNOWN" if state == "unknown"
-                    else str(meta.get("delivery_code") or "MEDIA_DELIVERY_FAILED")
-                ),
-                "media_kind": media_kind, "intent_id": intent_id,
-                "session_id": str(existing.conversation_id),
-                "channel": str(meta.get("source_channel") or ""),
-                "message_id": str(existing.id),
-            })
+            existing_result = _describe_media_delivery_result(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": state if state in {"failed", "unknown", "unsupported"} else "unknown",
+                    "code": (
+                        "MEDIA_DELIVERY_STATE_UNKNOWN"
+                        if state == "unknown"
+                        else str(meta.get("delivery_code") or "MEDIA_DELIVERY_FAILED")
+                    ),
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "session_id": str(existing.conversation_id),
+                    "channel": str(meta.get("source_channel") or ""),
+                    "message_id": str(existing.id),
+                }
+            )
             return json.dumps(existing_result, ensure_ascii=False)
 
         session = (
@@ -6538,11 +6894,17 @@ async def _send_media_to_session_under_lifecycle_lock(
             )
         ).scalar_one_or_none()
         if session is None:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "SESSION_NOT_FOUND_OR_FORBIDDEN", "media_kind": media_kind,
-                "intent_id": intent_id,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "failed",
+                    "code": "SESSION_NOT_FOUND_OR_FORBIDDEN",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                },
+                ensure_ascii=False,
+            )
 
         channel = str(session.source_channel or "").strip()
         external_conv_id = str(session.external_conv_id or "").strip()
@@ -6552,12 +6914,19 @@ async def _send_media_to_session_under_lifecycle_lock(
             delivery_mode = "platform"
         elif channel == "dingtalk":
             if not external_conv_id or "__archived_" in external_conv_id:
-                return json.dumps({
-                    "type": "media_delivery_result", "version": 1,
-                    "status": "failed", "code": "SESSION_ROUTE_UNAVAILABLE",
-                    "media_kind": media_kind, "intent_id": intent_id,
-                    "session_id": str(session.id), "channel": channel,
-                }, ensure_ascii=False)
+                return json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": "SESSION_ROUTE_UNAVAILABLE",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(session.id),
+                        "channel": channel,
+                    },
+                    ensure_ascii=False,
+                )
             config = (
                 await db.execute(
                     select(ChannelConfig).where(
@@ -6568,55 +6937,89 @@ async def _send_media_to_session_under_lifecycle_lock(
                 )
             ).scalar_one_or_none()
             if not config or not config.app_id or not config.app_secret:
-                return json.dumps({
-                    "type": "media_delivery_result", "version": 1,
-                    "status": "unsupported", "code": "CHANNEL_MEDIA_UNSUPPORTED",
-                    "media_kind": media_kind, "intent_id": intent_id,
-                    "session_id": str(session.id), "channel": channel,
-                }, ensure_ascii=False)
+                return json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "unsupported",
+                        "code": "CHANNEL_MEDIA_UNSUPPORTED",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(session.id),
+                        "channel": channel,
+                    },
+                    ensure_ascii=False,
+                )
             expected_prefix = "dingtalk_group_" if target_is_group else "dingtalk_p2p_"
             wrong_prefix = "dingtalk_p2p_" if target_is_group else "dingtalk_group_"
             if not external_conv_id.startswith(expected_prefix) or external_conv_id.startswith(wrong_prefix):
-                return json.dumps({
-                    "type": "media_delivery_result", "version": 1,
-                    "status": "failed", "code": "SESSION_ROUTE_MISMATCH",
-                    "media_kind": media_kind, "intent_id": intent_id,
-                    "session_id": str(session.id), "channel": channel,
-                }, ensure_ascii=False)
-            target_id = external_conv_id[len(expected_prefix):].strip()
+                return json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": "SESSION_ROUTE_MISMATCH",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(session.id),
+                        "channel": channel,
+                    },
+                    ensure_ascii=False,
+                )
+            target_id = external_conv_id[len(expected_prefix) :].strip()
             if not target_id:
-                return json.dumps({
-                    "type": "media_delivery_result", "version": 1,
-                    "status": "failed", "code": "SESSION_ROUTE_UNAVAILABLE",
-                    "media_kind": media_kind, "intent_id": intent_id,
-                    "session_id": str(session.id), "channel": channel,
-                }, ensure_ascii=False)
+                return json.dumps(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "failed",
+                        "code": "SESSION_ROUTE_UNAVAILABLE",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(session.id),
+                        "channel": channel,
+                    },
+                    ensure_ascii=False,
+                )
             conversation_type = "2" if target_is_group else "1"
             dingtalk_app_id = str(config.app_id)
             dingtalk_app_secret = str(config.app_secret)
             delivery_mode = "native"
         else:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1,
-                "status": "unsupported", "code": "CHANNEL_MEDIA_UNSUPPORTED",
-                "media_kind": media_kind, "intent_id": intent_id,
-                "session_id": str(session.id), "channel": channel,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "unsupported",
+                    "code": "CHANNEL_MEDIA_UNSUPPORTED",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "session_id": str(session.id),
+                    "channel": channel,
+                },
+                ensure_ascii=False,
+            )
 
         receipt: ChatMessage | None = None
         if str(origin_session_id or "") == str(session.id) and origin_turn_anchor_id:
             running_rows = (
-                await db.execute(
-                    select(ChatMessage).where(
-                        ChatMessage.agent_id == agent_id,
-                        ChatMessage.conversation_id == str(session.id),
-                        ChatMessage.role == "tool_call",
-                        ChatMessage.external_event_key.is_(None),
-                        ChatMessage.message_meta["turn_anchor_id"].as_string()
-                        == str(origin_turn_anchor_id),
-                    ).order_by(ChatMessage.created_at.desc()).limit(20)
+                (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.agent_id == agent_id,
+                            ChatMessage.conversation_id == str(session.id),
+                            ChatMessage.role == "tool_call",
+                            ChatMessage.external_event_key.is_(None),
+                            ChatMessage.message_meta["turn_anchor_id"].as_string() == str(origin_turn_anchor_id),
+                        )
+                        .order_by(ChatMessage.created_at.desc())
+                        .limit(20)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for candidate in running_rows:
                 try:
                     candidate_payload = json.loads(candidate.content or "")
@@ -6649,14 +7052,17 @@ async def _send_media_to_session_under_lifecycle_lock(
                 agent_id=agent_id,
                 user_id=session.user_id,
                 role="tool_call",
-                content=json.dumps({
-                    "name": "send_media",
-                    "call_id": intent_id,
-                    "args": persisted_args,
-                    "status": "running",
-                    "result": "",
-                    "reasoning_content": None,
-                }, ensure_ascii=False),
+                content=json.dumps(
+                    {
+                        "name": "send_media",
+                        "call_id": intent_id,
+                        "args": persisted_args,
+                        "status": "running",
+                        "result": "",
+                        "reasoning_content": None,
+                    },
+                    ensure_ascii=False,
+                ),
                 conversation_id=str(session.id),
                 external_event_key=operation_key,
                 message_meta=claim_meta,
@@ -6725,9 +7131,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                     filename=file_path.name,
                     raise_on_transport_error=True,
                 )
-                code = "MEDIA_SENT" if sent else (
-                    "MEDIA_SEND_FAILED" if media_id else "MEDIA_UPLOAD_FAILED"
-                )
+                code = "MEDIA_SENT" if sent else ("MEDIA_SEND_FAILED" if media_id else "MEDIA_UPLOAD_FAILED")
         except Exception:
             logger.opt(exception=True).error("[SessionMedia] Provider result is unknown")
             sent, uncertain, code = False, True, "MEDIA_DELIVERY_STATE_UNKNOWN"
@@ -6752,19 +7156,24 @@ async def _send_media_to_session_under_lifecycle_lock(
                 caption_sent = False
 
     final_status = "sent" if sent else ("unknown" if uncertain else "failed")
-    final_code = (
-        "MEDIA_SENT_CAPTION_FAILED" if sent and not caption_sent else code
-    )
+    final_code = "MEDIA_SENT_CAPTION_FAILED" if sent and not caption_sent else code
     events: list[dict] = []
     async with _outbound_media_db_session() as db:
         final_receipt = await db.get(ChatMessage, receipt_id, with_for_update=True)
         if final_receipt is None:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1, "status": "unknown",
-                "code": "MEDIA_DELIVERY_STATE_UNKNOWN", "media_kind": media_kind,
-                "intent_id": intent_id, "session_id": str(target_session_id),
-                "channel": channel,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "unknown",
+                    "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "session_id": str(target_session_id),
+                    "channel": channel,
+                },
+                ensure_ascii=False,
+            )
         final_meta = dict(final_receipt.message_meta or {})
         if str(final_meta.get("delivery_status") or "") != "pending":
             try:
@@ -6777,13 +7186,22 @@ async def _send_media_to_session_under_lifecycle_lock(
                     _describe_media_delivery_result(terminal_result),
                     ensure_ascii=False,
                 )
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1,
-                "status": "unknown", "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
-                "media_kind": media_kind, "intent_id": intent_id,
-                "session_id": str(target_session_id), "channel": channel,
-                "message_id": str(final_receipt.id),
-            }), ensure_ascii=False)
+            return json.dumps(
+                _describe_media_delivery_result(
+                    {
+                        "type": "media_delivery_result",
+                        "version": 1,
+                        "status": "unknown",
+                        "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                        "media_kind": media_kind,
+                        "intent_id": intent_id,
+                        "session_id": str(target_session_id),
+                        "channel": channel,
+                        "message_id": str(final_receipt.id),
+                    }
+                ),
+                ensure_ascii=False,
+            )
         final_meta["delivery_status"] = final_status
         final_meta["delivery_code"] = final_code
         final_meta["caption_status"] = (
@@ -6814,40 +7232,42 @@ async def _send_media_to_session_under_lifecycle_lock(
             }
             result_payload = _describe_media_delivery_result(result_payload)
         else:
-            result_payload = _describe_media_delivery_result({
-                "type": "media_delivery_result",
-                "version": 1,
-                "status": final_status,
-                "code": final_code,
-                "media_kind": media_kind,
-                "intent_id": intent_id,
-                "session_id": str(target_session_id),
-                "channel": channel,
-                "message_id": str(final_receipt.id),
-            })
-        final_receipt.content = json.dumps({
-            "name": "send_media",
-            "call_id": intent_id,
-            "args": persisted_args,
-            "status": "done",
-            "result": json.dumps(result_payload, ensure_ascii=False),
-            "reasoning_content": None,
-        }, ensure_ascii=False)
+            result_payload = _describe_media_delivery_result(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": final_status,
+                    "code": final_code,
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "session_id": str(target_session_id),
+                    "channel": channel,
+                    "message_id": str(final_receipt.id),
+                }
+            )
+        final_receipt.content = json.dumps(
+            {
+                "name": "send_media",
+                "call_id": intent_id,
+                "args": persisted_args,
+                "status": "done",
+                "result": json.dumps(result_payload, ensure_ascii=False),
+                "reasoning_content": None,
+            },
+            ensure_ascii=False,
+        )
         caption_row: ChatMessage | None = None
         if sent and caption_sent and caption.strip():
             caption_operation_key = f"{operation_key}:caption"
             caption_row = (
-                await db.execute(
-                    select(ChatMessage).where(
-                        ChatMessage.external_event_key == caption_operation_key
-                    )
-                )
+                await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == caption_operation_key))
             ).scalar_one_or_none()
             if caption_row is None:
                 caption_meta = {
                     key: value
                     for key, value in final_meta.items()
-                    if key not in {
+                    if key
+                    not in {
                         "attachments",
                         "media_kind",
                         "delivery_mode",
@@ -6860,11 +7280,13 @@ async def _send_media_to_session_under_lifecycle_lock(
                 # A caption is a normal assistant message. It must not inherit
                 # the media claim's LLM-history suppression marker.
                 caption_meta.pop("delivery_claim", None)
-                caption_meta.update({
-                    "attachments": [],
-                    "delivery_status": "sent",
-                    "media_caption_for": str(final_receipt.id),
-                })
+                caption_meta.update(
+                    {
+                        "attachments": [],
+                        "delivery_status": "sent",
+                        "media_caption_for": str(final_receipt.id),
+                    }
+                )
                 caption_row = ChatMessage(
                     agent_id=agent_id,
                     user_id=final_receipt.user_id,
@@ -6878,19 +7300,22 @@ async def _send_media_to_session_under_lifecycle_lock(
                 await db.flush()
         await db.commit()
         await db.refresh(final_receipt)
-        events.append({
-            "type": "tool_call",
-            "id": str(final_receipt.id),
-            "message_id": str(final_receipt.id),
-            "name": "send_media",
-            "call_id": intent_id,
-            "args": persisted_args,
-            "status": "done",
-            "result": json.dumps(result_payload, ensure_ascii=False),
-            "created_at": final_receipt.created_at.isoformat() if final_receipt.created_at else None,
-        })
+        events.append(
+            {
+                "type": "tool_call",
+                "id": str(final_receipt.id),
+                "message_id": str(final_receipt.id),
+                "name": "send_media",
+                "call_id": intent_id,
+                "args": persisted_args,
+                "status": "done",
+                "result": json.dumps(result_payload, ensure_ascii=False),
+                "created_at": final_receipt.created_at.isoformat() if final_receipt.created_at else None,
+            }
+        )
         if sent:
             from app.services.chat_message_serializer import serialize_chat_message_for_client
+
             if caption_row is not None:
                 await db.refresh(caption_row)
                 caption_event = serialize_chat_message_for_client(caption_row, source_channel=channel)
@@ -6934,32 +7359,48 @@ async def _send_media_to_recipient(
 
     async with async_session() as db:
         try:
-            route = await resolve_human_channel_recipient(
-                db, agent_id, user_id, channel=channel
-            )
+            route = await resolve_human_channel_recipient(db, agent_id, user_id, channel=channel)
         except RecipientResolutionError as exc:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1,
-                "status": "unsupported", "code": exc.code,
-                "message": exc.message,
-                "media_kind": media_kind, "intent_id": intent_id,
-                "available_channels": exc.available_channels,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "unsupported",
+                    "code": exc.code,
+                    "message": exc.message,
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "available_channels": exc.available_channels,
+                },
+                ensure_ascii=False,
+            )
         if route.channel != "dingtalk":
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1,
-                "status": "unsupported", "code": "CHANNEL_MEDIA_UNSUPPORTED",
-                "media_kind": media_kind, "intent_id": intent_id,
-                "channel": route.channel,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "unsupported",
+                    "code": "CHANNEL_MEDIA_UNSUPPORTED",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "channel": route.channel,
+                },
+                ensure_ascii=False,
+            )
         target_staff_id = str(route.member.external_id or "").strip()
         if not target_staff_id:
-            return json.dumps({
-                "type": "media_delivery_result", "version": 1,
-                "status": "unsupported", "code": "RECIPIENT_MEDIA_ROUTE_UNAVAILABLE",
-                "media_kind": media_kind, "intent_id": intent_id,
-                "channel": route.channel,
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "type": "media_delivery_result",
+                    "version": 1,
+                    "status": "unsupported",
+                    "code": "RECIPIENT_MEDIA_ROUTE_UNAVAILABLE",
+                    "media_kind": media_kind,
+                    "intent_id": intent_id,
+                    "channel": route.channel,
+                },
+                ensure_ascii=False,
+            )
         session = await find_or_create_channel_session(
             db=db,
             agent_id=agent_id,
@@ -7023,16 +7464,13 @@ async def _send_file_to_recipient(
     """Resolve one canonical recipient route and send without name lookup."""
     async with async_session() as db:
         try:
-            route = await resolve_human_channel_recipient(
-                db, agent_id, user_id, channel=channel
-            )
+            route = await resolve_human_channel_recipient(db, agent_id, user_id, channel=channel)
         except RecipientResolutionError as exc:
             return exc.as_json()
         config_result = await db.execute(
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
-                ChannelConfig.channel_type
-                == ("microsoft_teams" if route.channel == "teams" else route.channel),
+                ChannelConfig.channel_type == ("microsoft_teams" if route.channel == "teams" else route.channel),
                 ChannelConfig.is_configured.is_(True),
             )
         )
@@ -7043,13 +7481,9 @@ async def _send_file_to_recipient(
             f"Source agent has no configured {route.channel} channel",
         ).as_json()
     if route.channel == "feishu":
-        return await _send_file_via_feishu(
-            agent_id, config, file_path, route.member, route.user.display_name, message
-        )
+        return await _send_file_via_feishu(agent_id, config, file_path, route.member, route.user.display_name, message)
     if route.channel == "slack":
-        return await _send_file_via_slack(
-            config, file_path, route.member, route.user.display_name, message
-        )
+        return await _send_file_via_slack(config, file_path, route.member, route.user.display_name, message)
     return RecipientResolutionError(
         "file_route_unsupported",
         f"File delivery is not implemented for {route.channel}",
@@ -7068,10 +7502,13 @@ async def _send_file_via_feishu(
             "recipient_unreachable", "Canonical user has no usable Feishu endpoint"
         ).as_json()
     from app.services.feishu_service import feishu_service
+
     try:
         await feishu_service.upload_and_send_file(
-            config.app_id, config.app_secret,
-            receive_id, file_path,
+            config.app_id,
+            config.app_secret,
+            receive_id,
+            file_path,
             receive_id_type=id_type,
             accompany_msg=message,
         )
@@ -7080,9 +7517,10 @@ async def _send_file_via_feishu(
         # If upload fails, try sending a download link as fallback
         import json as _j
         from app.config import get_settings as _gs
+
         _s = _gs()
-        base_url = getattr(_s, 'BASE_URL', '').rstrip('/') or ''
-        base_abs = (WORKSPACE_ROOT / str(agent_id)).resolve()
+        base_url = getattr(_s, "BASE_URL", "").rstrip("/") or ""
+        base_abs = _agent_workspace_root(agent_id).resolve()
         try:
             _rel = str(file_path.resolve().relative_to(base_abs))
         except ValueError:
@@ -7093,11 +7531,15 @@ async def _send_file_via_feishu(
         if base_url:
             dl_url = f"{base_url}/api/agents/{agent_id}/files/download?path={_rel}"
             parts.append(f"{file_path.name}\n{dl_url}")
-        parts.append(f"File upload failed ({e}). If you need direct file sending, enable im:resource permission in Feishu.")
+        parts.append(
+            f"File upload failed ({e}). If you need direct file sending, enable im:resource permission in Feishu."
+        )
         try:
             await feishu_service.send_message(
-                config.app_id, config.app_secret,
-                receive_id, "text",
+                config.app_id,
+                config.app_secret,
+                receive_id,
+                "text",
                 _j.dumps({"text": "\n\n".join(parts)}, ensure_ascii=False),
                 receive_id_type=id_type,
             )
@@ -7106,16 +7548,13 @@ async def _send_file_via_feishu(
             return f"Failed to send file to {display_name} via Feishu: {e}"
 
 
-async def _send_file_via_slack(
-    config, file_path: Path, member: OrgMember, display_name: str, message: str
-) -> str:
+async def _send_file_via_slack(config, file_path: Path, member: OrgMember, display_name: str, message: str) -> str:
     """Send file to an already-authorized internal Slack endpoint."""
     import httpx
+
     bot_token = config.app_secret or ""
     if not bot_token:
-        return RecipientResolutionError(
-            "channel_unconfigured", "Slack bot token is missing"
-        ).as_json()
+        return RecipientResolutionError("channel_unconfigured", "Slack bot token is missing").as_json()
     slack_user_id = (member.external_id or "").strip()
     if not slack_user_id:
         return RecipientResolutionError(
@@ -7133,7 +7572,7 @@ async def _send_file_via_slack(
             if not dm_data.get("ok"):
                 return f"Slack conversations.open failed: {dm_data.get('error')}"
             channel_id = dm_data["channel"]["id"]
-            
+
             # Upload file
             upload_url_resp = await client.post(
                 "https://slack.com/api/files.getUploadURLExternal",
@@ -7143,13 +7582,13 @@ async def _send_file_via_slack(
             ud = upload_url_resp.json()
             if not ud.get("ok"):
                 return f"Slack file upload failed: {ud.get('error')}"
-            await client.post(ud["upload_url"], content=file_path.read_bytes(),
-                            headers={"Content-Type": "application/octet-stream"})
+            await client.post(
+                ud["upload_url"], content=file_path.read_bytes(), headers={"Content-Type": "application/octet-stream"}
+            )
             complete = await client.post(
                 "https://slack.com/api/files.completeUploadExternal",
                 headers={"Authorization": f"Bearer {bot_token}"},
-                json={"files": [{"id": ud["file_id"]}], "channel_id": channel_id,
-                      "initial_comment": message or ""},
+                json={"files": [{"id": ud["file_id"]}], "channel_id": channel_id, "initial_comment": message or ""},
             )
             if not complete.json().get("ok"):
                 return f"Slack file upload complete failed: {complete.json().get('error')}"
@@ -7172,11 +7611,16 @@ async def _execute_mcp_tool(
         from app.models.mcp_server import MCPServer
         from app.services.mcp_client import MCPClient
         from app.services.placeholder_engine import (
-            render, render_dict, ALL_ROOTS,
-            DisallowedPlaceholderError, UnknownPlaceholderError,
+            render,
+            render_dict,
+            ALL_ROOTS,
+            DisallowedPlaceholderError,
+            UnknownPlaceholderError,
         )
         from app.services.mcp_server_service import (
-            compose_runtime_config, lookup_overrides, build_placeholder_context_for_call,
+            compose_runtime_config,
+            lookup_overrides,
+            build_placeholder_context_for_call,
         )
 
         async with async_session() as db:
@@ -7194,22 +7638,25 @@ async def _execute_mcp_tool(
                 if not agent_id:
                     return f"❌ MCP tool {tool_name}: current agent identity is required"
                 candidates = (
-                    await db.execute(
-                        select(Tool)
-                        .join(AgentTool, AgentTool.tool_id == Tool.id)
-                        .where(
-                            Tool.mcp_tool_name == tool_name,
-                            Tool.type == "mcp",
-                            Tool.enabled == True,
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.enabled == True,
+                    (
+                        await db.execute(
+                            select(Tool)
+                            .join(AgentTool, AgentTool.tool_id == Tool.id)
+                            .where(
+                                Tool.mcp_tool_name == tool_name,
+                                Tool.type == "mcp",
+                                Tool.enabled == True,
+                                AgentTool.agent_id == agent_id,
+                                AgentTool.enabled == True,
+                            )
                         )
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 if len(candidates) > 1:
                     return (
-                        f"❌ MCP tool name '{tool_name}' is ambiguous for this agent; "
-                        "use the exact platform tool name."
+                        f"❌ MCP tool name '{tool_name}' is ambiguous for this agent; use the exact platform tool name."
                     )
                 tool = candidates[0] if candidates else None
 
@@ -7239,25 +7686,26 @@ async def _execute_mcp_tool(
             if tool.mcp_server_id:
                 from app.models.agent import Agent
 
-                srv = (await db.execute(
-                    select(MCPServer).where(MCPServer.id == tool.mcp_server_id)
-                )).scalar_one_or_none()
+                srv = (
+                    await db.execute(select(MCPServer).where(MCPServer.id == tool.mcp_server_id))
+                ).scalar_one_or_none()
                 if srv is None:
                     return f"❌ MCP tool {tool_name}: server row {tool.mcp_server_id} not found"
 
                 # Load agent → derive tenant_id for tenant override lookup
                 agent_row = None
                 if agent_id:
-                    agent_row = (await db.execute(
-                        select(Agent).where(Agent.id == agent_id)
-                    )).scalar_one_or_none()
+                    agent_row = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
                 tenant_id = agent_row.tenant_id if agent_row else None
 
                 t_ovr, a_ovr = await lookup_overrides(db, srv.id, tenant_id, agent_id)
                 cfg = compose_runtime_config(srv, t_ovr, a_ovr)
 
                 ctx = await build_placeholder_context_for_call(
-                    db, agent_id, user_id, session_id=session_id,
+                    db,
+                    agent_id,
+                    user_id,
+                    session_id=session_id,
                 )
 
                 # stdio branch: route through aio-sandbox hub instead of HTTP.
@@ -7298,19 +7746,16 @@ async def _execute_mcp_tool(
                     # across sessions or requests.  Include correlation data
                     # for diagnostics, but always add a backend nonce so two
                     # real executions can never share/deregister one entry.
-                    invocation_id = (
-                        f"{session_id or 'no-session'}:"
-                        f"{tool_call_id or 'no-tool-call'}:"
-                        f"{uuid.uuid4().hex}"
-                    )
+                    invocation_id = f"{session_id or 'no-session'}:{tool_call_id or 'no-tool-call'}:{uuid.uuid4().hex}"
                     entry = await host.ensure_registered(
-                        srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env},
+                        srv.name,
+                        str(agent_id),
+                        {"command": r_cmd, "args": r_args, "env": r_env},
                         cwd=work_dir,
                         invocation_id=invocation_id,
                     )
                     logger.info(
-                        "[MCP] stdio call start agent={} session={} tool_call={} "
-                        "server_id={} entry={} workspace={}",
+                        "[MCP] stdio call start agent={} session={} tool_call={} server_id={} entry={} workspace={}",
                         agent_id,
                         session_id or "no-session",
                         tool_call_id or "no-tool-call",
@@ -7363,6 +7808,7 @@ async def _execute_mcp_tool(
                 # via standard urllib.parse.unquote. Pure-ASCII values pass through
                 # unchanged.
                 from urllib.parse import quote as _url_quote
+
                 def _ascii_safe_header(v):
                     s = str(v)
                     try:
@@ -7370,6 +7816,7 @@ async def _execute_mcp_tool(
                         return s
                     except UnicodeEncodeError:
                         return _url_quote(s, safe="")
+
                 resolved_headers = {k: _ascii_safe_header(v) for k, v in resolved_headers.items()}
 
                 resolved_credential = None
@@ -7392,7 +7839,11 @@ async def _execute_mcp_tool(
                     }
                     smithery_cfg = {k: v for k, v in smithery_cfg.items() if v}
                     return await _execute_via_smithery_connect(
-                        resolved_url, mcp_name, arguments, smithery_cfg, agent_id=agent_id,
+                        resolved_url,
+                        mcp_name,
+                        arguments,
+                        smithery_cfg,
+                        agent_id=agent_id,
                     )
 
                 client = MCPClient(
@@ -7439,6 +7890,7 @@ async def _execute_mcp_tool(
         if not direct_api_key and tool.mcp_server_name == "Atlassian Rovo":
             try:
                 from app.api.atlassian import get_atlassian_api_key_for_agent
+
                 direct_api_key = await get_atlassian_api_key_for_agent(agent_id)
             except Exception:
                 pass
@@ -7451,7 +7903,9 @@ async def _execute_mcp_tool(
         return f"❌ MCP tool execution error: {str(e)[:200]}"
 
 
-async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments: dict, config: dict, agent_id=None) -> str:
+async def _execute_via_smithery_connect(
+    mcp_url: str, tool_name: str, arguments: dict, config: dict, agent_id=None
+) -> str:
     """Execute an MCP tool via Smithery Connect API.
 
     Uses stored namespace/connection or falls back to creating one.
@@ -7462,6 +7916,7 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
 
     # Get Smithery API key centrally (from discover_resources/import_mcp_server AgentTool config)
     from app.services.resource_discovery import _get_smithery_api_key
+
     api_key = await _get_smithery_api_key(agent_id)
     if not api_key:
         return (
@@ -7480,6 +7935,7 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
         # Fallback: try to get from Smithery settings
         try:
             from app.models.tool import Tool
+
             async with async_session() as db:
                 r = await db.execute(select(Tool).where(Tool.name == "discover_resources"))
                 disc_tool = r.scalar_one_or_none()
@@ -7524,9 +7980,7 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
 
             # Detect auth/connection failures and attempt auto-recovery
             if tool_resp.status_code in (401, 403, 404):
-                recovery_result = await _smithery_auto_recover(
-                    api_key, mcp_url, namespace, connection_id, agent_id
-                )
+                recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id)
                 if recovery_result:
                     return recovery_result
                 # If recovery returned None, fall through to normal parsing
@@ -7558,9 +8012,7 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
                 # Check if error indicates auth/connection issue
                 auth_keywords = ["auth", "unauthorized", "forbidden", "expired", "not found", "connection"]
                 if any(kw in msg.lower() for kw in auth_keywords):
-                    recovery_result = await _smithery_auto_recover(
-                        api_key, mcp_url, namespace, connection_id, agent_id
-                    )
+                    recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id)
                     if recovery_result:
                         return recovery_result
                 return f"❌ MCP tool error: {msg[:300]}"
@@ -7590,7 +8042,9 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
         return f"❌ Smithery Connect error: {str(e)[:200]}"
 
 
-async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, connection_id: str, agent_id=None) -> str | None:
+async def _smithery_auto_recover(
+    api_key: str, mcp_url: str, namespace: str, connection_id: str, agent_id=None
+) -> str | None:
     """Attempt to auto-recover a failed Smithery connection.
 
     Re-creates the Smithery Connect connection. If OAuth is needed,
@@ -7598,13 +8052,14 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
     """
     try:
         from app.services.resource_discovery import _ensure_smithery_connection
+
         display_name = connection_id.replace("-", " ").title() if connection_id else "MCP Server"
 
         conn_result = await _ensure_smithery_connection(api_key, mcp_url, display_name)
         if "error" in conn_result:
             return (
                 f"❌ MCP tool connection expired and auto-recovery failed: {conn_result['error']}\n\n"
-                f"💡 Please re-authorize by telling me: `import_mcp_server(server_id=\"...\", reauthorize=true)`"
+                f'💡 Please re-authorize by telling me: `import_mcp_server(server_id="...", reauthorize=true)`'
             )
 
         if conn_result.get("auth_url"):
@@ -7627,11 +8082,10 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
         if agent_id:
             try:
                 from app.models.tool import Tool, AgentTool
+
                 async with async_session() as db:
                     # Update all MCP tools for this server URL
-                    r = await db.execute(
-                        select(Tool).where(Tool.mcp_server_url == mcp_url, Tool.type == "mcp")
-                    )
+                    r = await db.execute(select(Tool).where(Tool.mcp_server_url == mcp_url, Tool.type == "mcp"))
                     for tool in r.scalars().all():
                         at_r = await db.execute(
                             select(AgentTool).where(
@@ -7691,7 +8145,7 @@ def _allowed_root_for_tool_path(ws: Path, rel_path: str, tenant_id: str | None =
             if tenant_id
             else (WORKSPACE_ROOT / "enterprise_info").resolve()
         )
-        sub = normalized[len("enterprise_info"):].lstrip("/")
+        sub = normalized[len("enterprise_info") :].lstrip("/")
         return enterprise_root, sub
     return ws.resolve(), normalized
 
@@ -7734,6 +8188,7 @@ def _canonicalize_execute_code_upload_paths(ws: Path, code: str) -> tuple[str, l
     root = ws.resolve()
 
     for pattern in _QUOTED_UPLOAD_PATH_PATTERNS:
+
         def _replace(match: re.Match[str]) -> str:
             raw_path = match.group("path")
             marker_index = raw_path.find("workspace/uploads/")
@@ -7772,12 +8227,16 @@ def _tool_storage_key(agent_id: uuid.UUID, rel_path: str, tenant_id: str | None 
     normalized = normalize_workspace_path(_normalize_tool_rel_path(rel_path))
     if _is_enterprise_info_path(normalized):
         if not tenant_id:
-            return normalize_storage_key("enterprise_info/" + normalized.removeprefix("enterprise_info").lstrip("/")), normalized, True
-        sub = normalized[len("enterprise_info"):].lstrip("/")
+            return (
+                normalize_storage_key("enterprise_info/" + normalized.removeprefix("enterprise_info").lstrip("/")),
+                normalized,
+                True,
+            )
+        sub = normalized[len("enterprise_info") :].lstrip("/")
         key = f"enterprise_info_{tenant_id}/{sub}" if sub else f"enterprise_info_{tenant_id}"
         return normalize_storage_key(key), normalized, True
-    key = f"{agent_id}/{normalized}" if normalized else str(agent_id)
-    return normalize_storage_key(key), normalized, False
+    key = current_agent_runtime_workspace(agent_id).storage_key(normalized)
+    return key, normalized, False
 
 
 @dataclass(frozen=True)
@@ -7844,10 +8303,7 @@ async def _resolve_storage_source_path(
         for entry in await storage.list_dir(parent_key)
         if not entry.is_dir and _collapse_filename_for_match(entry.name) == wanted
     ]
-    candidate_paths = tuple(
-        f"{parent_virtual}/{entry.name}" if parent_virtual else entry.name
-        for entry in matches
-    )
+    candidate_paths = tuple(f"{parent_virtual}/{entry.name}" if parent_virtual else entry.name for entry in matches)
     if len(matches) == 1:
         return _ResolvedStorageSource(
             matches[0].key,
@@ -7982,10 +8438,7 @@ async def _storage_read_file(
         output = "\n".join(f"{i + 1:6}\t{line}" for i, line in enumerate(line_range.lines, start=start))
         if total_lines > end:
             output += f"\n\n... [{total_lines - end} more lines not shown, lines {end + 1}-{total_lines}]"
-        header = (
-            f"📄 {resolved.virtual_path} "
-            f"(lines {start + 1 if total_lines else 0}-{end} of {total_lines})\n"
-        )
+        header = f"📄 {resolved.virtual_path} (lines {start + 1 if total_lines else 0}-{end} of {total_lines})\n"
         return header + output
     except Exception as exc:
         return (
@@ -8041,7 +8494,21 @@ async def _storage_search_files(
         rel_display = _relative_storage_display(entry.key, base_key, normalized)
         if not fnmatch.fnmatch(Path(rel_display).name, file_pattern) and not fnmatch.fnmatch(rel_display, file_pattern):
             continue
-        if Path(rel_display).suffix.lower() in {".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".tar", ".gz"}:
+        if Path(rel_display).suffix.lower() in {
+            ".pyc",
+            ".pyo",
+            ".so",
+            ".dll",
+            ".exe",
+            ".bin",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".zip",
+            ".tar",
+            ".gz",
+        }:
             continue
         files_searched += 1
         try:
@@ -8059,8 +8526,13 @@ async def _storage_search_files(
     if not results:
         return f"No matches found for pattern '{pattern}' in {files_searched} file(s)"
     truncated = total_matches > len(results)
-    truncation_note = f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)" if truncated else ""
-    return f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) for pattern '{pattern}'{truncation_note}:\n" + "\n".join(results)
+    truncation_note = (
+        f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)" if truncated else ""
+    )
+    return (
+        f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) for pattern '{pattern}'{truncation_note}:\n"
+        + "\n".join(results)
+    )
 
 
 async def _storage_find_files(
@@ -8092,7 +8564,10 @@ async def _storage_find_files(
         else:
             file_count += 1
             results.append(f"📄 {rel_display} ({_display_size(entry.size)})")
-    return f"📂 Found {len(matches)} item(s) ({dir_count} dirs, {file_count} files) matching '{pattern}':\n" + "\n".join(results)
+    return (
+        f"📂 Found {len(matches)} item(s) ({dir_count} dirs, {file_count} files) matching '{pattern}':\n"
+        + "\n".join(results)
+    )
 
 
 def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
@@ -8103,7 +8578,7 @@ def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
         # Remap: enterprise_info/... → enterprise_info_{tenant_id}/...
-        sub = rel_path[len("enterprise_info"):].lstrip("/")
+        sub = rel_path[len("enterprise_info") :].lstrip("/")
         target = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(target).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -8141,7 +8616,7 @@ def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
             if size_bytes < 1024:
                 size_str = f"{size_bytes}B"
             else:
-                size_str = f"{size_bytes/1024:.1f}KB"
+                size_str = f"{size_bytes / 1024:.1f}KB"
             items.append(f"  📄 {p.name} ({size_str})")
 
     if not items:
@@ -8189,16 +8664,16 @@ def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: in
         # Format with line numbers (like cat -n)
         result = []
         for i, line in enumerate(selected_lines, start=start):
-            result.append(f"{i+1:6}\t{line}")
+            result.append(f"{i + 1:6}\t{line}")
 
         output = "\n".join(result)
 
         # Add pagination info if file is larger than what we show
         if total_lines > end:
-            output += f"\n\n... [{total_lines - end} more lines not shown, lines {end+1}-{total_lines}]"
+            output += f"\n\n... [{total_lines - end} more lines not shown, lines {end + 1}-{total_lines}]"
 
         # Add header with file info
-        header = f"📄 {rel_path} (lines {start+1}-{end} of {total_lines})\n"
+        header = f"📄 {rel_path} (lines {start + 1}-{end} of {total_lines})\n"
         return header + output
 
     except Exception as e:
@@ -8288,13 +8763,14 @@ def _read_document_sync(
     try:
         if ext == ".pdf":
             import pdfplumber
+
             text_parts = []
             with pdfplumber.open(str(file_path)) as pdf:
                 total_pages = len(pdf.pages)
                 for i, page in enumerate(pdf.pages[:_READ_DOCUMENT_MAX_PAGES]):
                     page_text = page.extract_text() or ""
                     if page_text:
-                        text_parts.append(f"--- Page {i+1} ---\n{page_text}")
+                        text_parts.append(f"--- Page {i + 1} ---\n{page_text}")
                     if sum(len(part) for part in text_parts) >= max_chars:
                         break
                 if total_pages > _READ_DOCUMENT_MAX_PAGES:
@@ -8306,6 +8782,7 @@ def _read_document_sync(
         elif ext == ".docx":
             from docx import Document
             from docx.oxml.ns import qn
+
             doc = Document(str(file_path))
             lines: list[str] = []
 
@@ -8316,7 +8793,9 @@ def _read_document_sync(
                 """Flatten a table into readable text."""
                 rows = []
                 for row in table.rows:
-                    cells = [_safe_document_cell_text(cell.text).strip() for cell in row.cells[:_READ_DOCUMENT_MAX_COLUMNS]]
+                    cells = [
+                        _safe_document_cell_text(cell.text).strip() for cell in row.cells[:_READ_DOCUMENT_MAX_COLUMNS]
+                    ]
                     if not cells:
                         continue
                     # Remove duplicate adjacent cells (merged cells repeat)
@@ -8357,6 +8836,7 @@ def _read_document_sync(
 
         elif ext == ".xlsx":
             from openpyxl import load_workbook
+
             wb = load_workbook(str(file_path), read_only=True, data_only=True)
             sheets = []
             total_chars = 0  # bounds peak memory; the cross-sheet content budget
@@ -8402,6 +8882,7 @@ def _read_document_sync(
 
         elif ext == ".pptx":
             from pptx import Presentation
+
             prs = Presentation(str(file_path))
             slides = []
             all_slides = list(prs.slides)
@@ -8411,7 +8892,7 @@ def _read_document_sync(
                     if hasattr(shape, "text") and shape.text.strip():
                         texts.append(shape.text)
                 if texts:
-                    slides.append(f"--- Slide {i+1} ---\n" + "\n".join(texts))
+                    slides.append(f"--- Slide {i + 1} ---\n" + "\n".join(texts))
             if len(all_slides) > _READ_DOCUMENT_MAX_SLIDES:
                 slides.append(
                     f"[presentation has {len(all_slides)} slides; only the first {_READ_DOCUMENT_MAX_SLIDES} are shown]"
@@ -8468,7 +8949,7 @@ def _read_pdf_fast_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_i
             for i, page in enumerate(doc[:50]):
                 page_text = page.get_text("text") or ""
                 if page_text:
-                    text_parts.append(f"--- Page {i+1} ---\n{page_text}")
+                    text_parts.append(f"--- Page {i + 1} ---\n{page_text}")
                 if sum(len(part) for part in text_parts) >= max_chars:
                     break
         content = "\n\n".join(text_parts) if text_parts else "(PDF is empty or text extraction failed)"
@@ -8647,6 +9128,7 @@ async def _read_document_from_storage(
 
 # ─── Format Conversion Tools ────────────────────────────────────
 
+
 async def _convert_csv_to_xlsx(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     source_path = arguments.get("source_path")
     target_path = arguments.get("target_path")
@@ -8657,8 +9139,9 @@ async def _convert_csv_to_xlsx(agent_id: uuid.UUID, ws: Path, arguments: dict) -
         tgt_file = _resolve_tool_target_path(ws, target_path)
     except ValueError as exc:
         return str(exc)
-    if not src_file.exists(): return f"❌ Source file not found: {source_path}"
-    
+    if not src_file.exists():
+        return f"❌ Source file not found: {source_path}"
+
     try:
         import csv
         from openpyxl import Workbook
@@ -8671,7 +9154,7 @@ async def _convert_csv_to_xlsx(agent_id: uuid.UUID, ws: Path, arguments: dict) -
             scores = {candidate: sum(line.count(candidate) for line in lines) for candidate in candidates}
             if any(scores.values()):
                 delimiter = max(scores, key=scores.get)
-        
+
         wb = Workbook()
         ws_sheet = wb.active
         with src_file.open("r", encoding="utf-8-sig", newline="") as f:
@@ -8682,13 +9165,14 @@ async def _convert_csv_to_xlsx(agent_id: uuid.UUID, ws: Path, arguments: dict) -
                     values.pop()
                 if values:
                     ws_sheet.append(values)
-        
+
         tgt_file.parent.mkdir(parents=True, exist_ok=True)
         wb.save(str(tgt_file))
         return f"✅ Successfully converted CSV to Excel: {target_path}"
     except Exception as e:
         logger.exception(f"Convert CSV to XLSX failed: {e}")
         return f"❌ Conversion failed: {e}"
+
 
 async def _convert_html_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     source_path = arguments.get("source_path")
@@ -8721,19 +9205,23 @@ async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) 
 
     return await convert_html_file_to_pptx(src_file, tgt_file, str(target_path), ws, arguments)
 
+
 async def _convert_markdown_to_docx(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     source_path = arguments.get("source_path")
     target_path = arguments.get("target_path")
-    if not source_path or not target_path: return "❌ Missing paths."
+    if not source_path or not target_path:
+        return "❌ Missing paths."
     try:
         src_file = _resolve_tool_source_path(ws, source_path)
         tgt_file = _resolve_tool_target_path(ws, target_path)
     except ValueError as exc:
         return str(exc)
-    if not src_file.exists(): return "❌ Source file not found."
+    if not src_file.exists():
+        return "❌ Source file not found."
 
     try:
         from docx import Document
+
         md_text = src_file.read_text(encoding="utf-8")
         doc = Document()
 
@@ -8811,16 +9299,19 @@ async def _convert_markdown_to_docx(agent_id: uuid.UUID, ws: Path, arguments: di
         logger.exception(f"Convert MD to Docx failed: {e}")
         return f"❌ Conversion failed: {e}"
 
+
 async def _convert_markdown_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     source_path = arguments.get("source_path")
     target_path = arguments.get("target_path")
-    if not source_path or not target_path: return "❌ Missing paths."
+    if not source_path or not target_path:
+        return "❌ Missing paths."
     try:
         src_file = _resolve_tool_source_path(ws, source_path)
         tgt_file = _resolve_tool_target_path(ws, target_path)
     except ValueError as exc:
         return str(exc)
-    if not src_file.exists(): return "❌ Source file not found."
+    if not src_file.exists():
+        return "❌ Source file not found."
 
     try:
         from weasyprint import HTML
@@ -8828,12 +9319,7 @@ async def _convert_markdown_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dic
         md_text = src_file.read_text(encoding="utf-8")
 
         def escape_html(text: str) -> str:
-            return (
-                text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace('"', "&quot;")
-            )
+            return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
         def render_inline(text: str) -> str:
             text = escape_html(text)
@@ -8895,11 +9381,10 @@ async def _convert_markdown_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dic
                     row = [render_inline(cell.strip()) for cell in lines[i].strip().strip("|").split("|")]
                     table_rows.append(row)
                     i += 1
-                html_parts.append("<table><thead><tr>" + "".join(f"<th>{cell}</th>" for cell in header_cells) + "</tr></thead><tbody>")
-                html_parts.extend(
-                    "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
-                    for row in table_rows
+                html_parts.append(
+                    "<table><thead><tr>" + "".join(f"<th>{cell}</th>" for cell in header_cells) + "</tr></thead><tbody>"
                 )
+                html_parts.extend("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in table_rows)
                 html_parts.append("</tbody></table>")
                 continue
 
@@ -8951,7 +9436,7 @@ def _write_file(ws: Path, rel_path: str, content: str, tenant_id: str | None = N
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = rel_path[len("enterprise_info"):].lstrip("/")
+        sub = rel_path[len("enterprise_info") :].lstrip("/")
         if not sub:
             return "Write failed: please provide a file path under enterprise_info/, e.g. enterprise_info/knowledge_base/report.md"
         file_path = (enterprise_root / sub).resolve()
@@ -8986,6 +9471,7 @@ def _delete_file(ws: Path, rel_path: str) -> str:
     try:
         if file_path.is_dir():
             import shutil
+
             shutil.rmtree(file_path)
             return f"✅ Deleted directory {rel_path}"
         else:
@@ -8995,7 +9481,9 @@ def _delete_file(ws: Path, rel_path: str) -> str:
         return f"Delete failed: {e}"
 
 
-def _edit_file(ws: Path, rel_path: str, old_string: str, new_string: str, replace_all: bool = False, tenant_id: str | None = None) -> str:
+def _edit_file(
+    ws: Path, rel_path: str, old_string: str, new_string: str, replace_all: bool = False, tenant_id: str | None = None
+) -> str:
     """Perform surgical string replacement in a file.
 
     Args:
@@ -9018,7 +9506,7 @@ def _edit_file(ws: Path, rel_path: str, old_string: str, new_string: str, replac
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = rel_path[len("enterprise_info"):].lstrip("/")
+        sub = rel_path[len("enterprise_info") :].lstrip("/")
         file_path = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(file_path).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -9057,7 +9545,14 @@ def _edit_file(ws: Path, rel_path: str, old_string: str, new_string: str, replac
         return f"Edit failed: {e}"
 
 
-def _search_files(ws: Path, pattern: str, path: str = ".", file_pattern: str = "*", ignore_case: bool = False, tenant_id: str | None = None) -> str:
+def _search_files(
+    ws: Path,
+    pattern: str,
+    path: str = ".",
+    file_pattern: str = "*",
+    ignore_case: bool = False,
+    tenant_id: str | None = None,
+) -> str:
     """Search for content patterns across files using regex.
 
     Args:
@@ -9077,7 +9572,7 @@ def _search_files(ws: Path, pattern: str, path: str = ".", file_pattern: str = "
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = path[len("enterprise_info"):].lstrip("/")
+        sub = path[len("enterprise_info") :].lstrip("/")
         search_path = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(search_path).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -9110,7 +9605,21 @@ def _search_files(ws: Path, pattern: str, path: str = ".", file_pattern: str = "
         if file_path.name.startswith("."):
             continue
         suffix = file_path.suffix.lower()
-        if suffix in {".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".tar", ".gz"}:
+        if suffix in {
+            ".pyc",
+            ".pyo",
+            ".so",
+            ".dll",
+            ".exe",
+            ".bin",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".zip",
+            ".tar",
+            ".gz",
+        }:
             continue
 
         files_searched += 1
@@ -9136,8 +9645,12 @@ def _search_files(ws: Path, pattern: str, path: str = ".", file_pattern: str = "
 
     # Warn the LLM if results were capped so it knows to refine the search.
     truncated = total_matches > len(results)
-    truncation_note = f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)" if truncated else ""
-    header = f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) for pattern '{pattern}'{truncation_note}:\n"
+    truncation_note = (
+        f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)" if truncated else ""
+    )
+    header = (
+        f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) for pattern '{pattern}'{truncation_note}:\n"
+    )
     return header + "\n".join(results)
 
 
@@ -9159,7 +9672,7 @@ def _find_files(ws: Path, pattern: str, path: str = ".", tenant_id: str | None =
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = path[len("enterprise_info"):].lstrip("/")
+        sub = path[len("enterprise_info") :].lstrip("/")
         search_path = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(search_path).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -9197,7 +9710,7 @@ def _find_files(ws: Path, pattern: str, path: str = ".", tenant_id: str | None =
             file_count += 1
             try:
                 size = m.stat().st_size
-                size_str = f"{size//1024}KB" if size > 1024 else f"{size}B"
+                size_str = f"{size // 1024}KB" if size > 1024 else f"{size}B"
                 results.append(f"📄 {rel_path} ({size_str})")
             except Exception:
                 results.append(f"📄 {rel_path}")
@@ -9246,6 +9759,7 @@ async def _manage_tasks(
                 except (TypeError, ValueError):
                     return "❌ supervision target IDs must be complete platform UUIDs"
                 from app.services.supervision_targets import resolve_supervision_target
+
                 try:
                     resolved_target = await resolve_supervision_target(
                         db,
@@ -9255,11 +9769,7 @@ async def _manage_tasks(
                         channel=args.get("supervision_channel"),
                     )
                 except (RecipientResolutionError, ValueError) as exc:
-                    return (
-                        exc.as_json()
-                        if isinstance(exc, RecipientResolutionError)
-                        else f"❌ {exc}"
-                    )
+                    return exc.as_json() if isinstance(exc, RecipientResolutionError) else f"❌ {exc}"
             task = Task(
                 agent_id=agent_id,
                 title=title,
@@ -9271,9 +9781,7 @@ async def _manage_tasks(
                 status="pending",
                 supervision_target_user_id=target_user_id,
                 supervision_target_agent_id=target_agent_id,
-                supervision_target_name=(
-                    resolved_target.display_name if resolved_target else None
-                ),
+                supervision_target_name=(resolved_target.display_name if resolved_target else None),
                 supervision_channel=(resolved_target.channel if resolved_target else None),
                 remind_schedule=args.get("remind_schedule"),
             )
@@ -9285,20 +9793,19 @@ async def _manage_tasks(
                 # Trigger auto-execution for todo tasks
                 import asyncio
                 from app.services.task_executor import execute_task
+
                 asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
                 await _sync_tasks_to_file(agent_id, ws)
                 return f"✅ Task created: {title} — auto-execution started"
             else:
                 # Supervision task — reminder engine will pick it up
                 target = resolved_target.display_name if resolved_target else "unknown"
-                schedule = args.get('remind_schedule', 'not set')
+                schedule = args.get("remind_schedule", "not set")
                 await _sync_tasks_to_file(agent_id, ws)
                 return f"✅ Supervision task created: '{title}' — will remind {target} on schedule ({schedule})"
 
         elif action == "update_status":
-            result = await db.execute(
-                select(Task).where(Task.agent_id == agent_id, Task.title.ilike(f"%{title}%"))
-            )
+            result = await db.execute(select(Task).where(Task.agent_id == agent_id, Task.title.ilike(f"%{title}%")))
             task = result.scalars().first()
             if not task:
                 return f"No task found matching '{title}'"
@@ -9323,9 +9830,8 @@ async def _manage_tasks(
 
         elif action == "delete":
             from sqlalchemy import delete as sa_delete
-            result = await db.execute(
-                select(Task).where(Task.agent_id == agent_id, Task.title.ilike(f"%{title}%"))
-            )
+
+            result = await db.execute(select(Task).where(Task.agent_id == agent_id, Task.title.ilike(f"%{title}%")))
             task = result.scalars().first()
             if not task:
                 return f"No task found matching '{title}'"
@@ -9427,13 +9933,9 @@ async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID 
             "current_user_id": user_id,
         }
         if digital_id:
-            result = await add_agent_contact_for_agent(
-                db, agent_id, target_agent_id=target_uuid, **common
-            )
+            result = await add_agent_contact_for_agent(db, agent_id, target_agent_id=target_uuid, **common)
         else:
-            result = await add_user_contact_for_agent(
-                db, agent_id, user_id=target_uuid, **common
-            )
+            result = await add_user_contact_for_agent(db, agent_id, user_id=target_uuid, **common)
         if result.get("status") in {"added", "already_added"}:
             await db.commit()
         else:
@@ -9442,9 +9944,7 @@ async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID 
     if result.get("status") == "added":
         public_id = digital_id if digital_id else human_id
         public_field = "agent_id" if digital_id else "user_id"
-        return (
-            f"✅ Added {result.get('name')} ({public_field}={public_id}) as a contact."
-        )
+        return f"✅ Added {result.get('name')} ({public_field}={public_id}) as a contact."
     if result.get("status") == "already_added":
         public_id = digital_id if digital_id else human_id
         public_field = "agent_id" if digital_id else "user_id"
@@ -9493,17 +9993,11 @@ async def _remove_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UU
     if result.get("status") == "removed":
         public_id = digital_id if digital_id else human_id
         public_field = "agent_id" if digital_id else "user_id"
-        return (
-            f"✅ Removed {result.get('name')} ({public_field}={public_id}) "
-            "from your relationship network."
-        )
+        return f"✅ Removed {result.get('name')} ({public_field}={public_id}) from your relationship network."
     if result.get("status") == "not_found":
         public_id = digital_id if digital_id else human_id
         public_field = "agent_id" if digital_id else "user_id"
-        return (
-            f"ℹ️ {result.get('name')} ({public_field}={public_id}) "
-            "is not in your relationship network."
-        )
+        return f"ℹ️ {result.get('name')} ({public_field}={public_id}) is not in your relationship network."
     return f"❌ Unable to remove contact: {result.get('reason', 'unknown_error')}"
 
 
@@ -9523,11 +10017,10 @@ async def _send_feishu_message(
         return "❌ Please provide canonical user_id and message content"
     try:
         from app.services.feishu_service import FeishuAPIError, feishu_service
+
         async with async_session() as db:
             try:
-                route = await resolve_human_channel_recipient(
-                    db, agent_id, canonical_user_id, channel="feishu"
-                )
+                route = await resolve_human_channel_recipient(db, agent_id, canonical_user_id, channel="feishu")
             except RecipientResolutionError as exc:
                 return exc.as_json()
             config_result = await db.execute(
@@ -9568,11 +10061,9 @@ async def _send_feishu_message(
                 source_channel="feishu",
                 first_message_title=f"[Agent → {route.user.display_name}]",
             )
-            external_message_id = str(
-                ((resp.get("data") or {}).get("message_id"))
-                or resp.get("message_id")
-                or ""
-            ) or None
+            external_message_id = (
+                str(((resp.get("data") or {}).get("message_id")) or resp.get("message_id") or "") or None
+            )
             await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
@@ -9645,19 +10136,14 @@ async def _start_dingtalk_channel_provisioning_tool(
             "原应用需要用户在钉钉后台自行清理。"
         )
     if flow_action == "configured_existing":
-        return (
-            "原钉钉授权已经成功，数字员工通道配置已完成。\n"
-            f"配置编号: {response['provisioning_id']}"
-        )
+        return f"原钉钉授权已经成功，数字员工通道配置已完成。\n配置编号: {response['provisioning_id']}"
     action_message = {
         "reused": "当前授权流程仍有效，已复用原钉钉授权链接。",
         "replaced": "已同步并替换原授权流程，请只使用下面的新链接。",
         "created": "已创建钉钉数字员工机器人授权流程。",
     }.get(flow_action, "钉钉数字员工机器人授权流程已就绪。")
     force_warning = (
-        "\n这是强制重配流程，会创建新的钉钉机器人应用；切换完成后请在钉钉后台清理原应用。"
-        if force_reconfigure
-        else ""
+        "\n这是强制重配流程，会创建新的钉钉机器人应用；切换完成后请在钉钉后台清理原应用。" if force_reconfigure else ""
     )
     return (
         f"{action_message}\n"
@@ -9846,9 +10332,7 @@ async def _find_outbound_tool_receipt(
         return None
     async with async_session() as db:
         return (
-            await db.execute(
-                select(ChatMessage).where(ChatMessage.external_event_key == operation_key)
-            )
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == operation_key))
         ).scalar_one_or_none()
 
 
@@ -9933,9 +10417,7 @@ _SESSION_MESSAGE_CAPABILITIES = {
     "whatsapp": frozenset({"person"}),
     "wechat": frozenset({"person"}),
 }
-_LEGACY_GROUP_SESSION_CHANNELS = frozenset(
-    {"dingtalk", "feishu", "wecom", "slack", "teams", "microsoft_teams"}
-)
+_LEGACY_GROUP_SESSION_CHANNELS = frozenset({"dingtalk", "feishu", "wecom", "slack", "teams", "microsoft_teams"})
 _PLATFORM_SESSION_CHANNELS = frozenset({"web", "miniprogram", "wechat_miniprogram"})
 _SESSION_MESSAGE_DENIAL = "❌ 无法投递：该会话不存在，或不属于当前数字员工。"
 _GROUP_SESSION_DENIAL = "❌ 无法投递：该群会话不存在，或不属于当前数字员工。"
@@ -9995,9 +10477,7 @@ async def _send_exact_session_message(
     elif not isinstance(raw_mention_user_ids, list):
         return "❌ mention_user_ids must be an array of canonical platform user_ids"
     else:
-        mention_user_ids = list(
-            dict.fromkeys(str(value or "").strip() for value in raw_mention_user_ids)
-        )
+        mention_user_ids = list(dict.fromkeys(str(value or "").strip() for value in raw_mention_user_ids))
         if not all(mention_user_ids):
             return "❌ mention_user_ids cannot contain empty values"
         if len(mention_user_ids) > 20:
@@ -10025,9 +10505,7 @@ async def _send_exact_session_message(
             await _lock_outbound_operation(db, operation_key)
             if operation_key:
                 existing = (
-                    await db.execute(
-                        select(ChatMessage).where(ChatMessage.external_event_key == operation_key)
-                    )
+                    await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == operation_key))
                 ).scalar_one_or_none()
                 if existing is not None:
                     meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
@@ -10047,13 +10525,7 @@ async def _send_exact_session_message(
             ]
             if require_group:
                 conditions.append(ChatSession.is_group.is_(True))
-            session = (
-                await db.execute(
-                    select(ChatSession)
-                    .where(*conditions)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            session = (await db.execute(select(ChatSession).where(*conditions).with_for_update())).scalar_one_or_none()
             if session is None:
                 return _GROUP_SESSION_DENIAL if require_group else _SESSION_MESSAGE_DENIAL
 
@@ -10083,8 +10555,7 @@ async def _send_exact_session_message(
                 dingtalk_session_webhook = load_group_session_webhook(session)
                 if not dingtalk_session_webhook:
                     return (
-                        "❌ 当前钉钉群 Session 没有可用的临时回复凭证；"
-                        "请让群成员先在群内 @数字员工发送一条消息后重试。"
+                        "❌ 当前钉钉群 Session 没有可用的临时回复凭证；请让群成员先在群内 @数字员工发送一条消息后重试。"
                     )
                 for mention_user_id in mention_user_ids:
                     try:
@@ -10101,9 +10572,7 @@ async def _send_exact_session_message(
                         return "❌ 指定用户缺少可用的钉钉 userId，无法 @。"
                     if staff_id not in dingtalk_at_user_ids:
                         dingtalk_at_user_ids.append(staff_id)
-                        mentioned_names.append(
-                            str(route.user.display_name or route.member.name or "用户")
-                        )
+                        mentioned_names.append(str(route.user.display_name or route.member.name or "用户"))
 
             if target_is_group:
                 target_name = str(session.group_name or session.title or "group")
@@ -10189,9 +10658,7 @@ async def _send_exact_session_message(
                     },
                 )
             except Exception:
-                logger.opt(exception=True).warning(
-                    "[SessionMessage] Web live mirror failed after external delivery"
-                )
+                logger.opt(exception=True).warning("[SessionMessage] Web live mirror failed after external delivery")
 
         return _session_message_result(
             status="sent",
@@ -10304,36 +10771,56 @@ async def _send_channel_message(
                 )
             elif provider_type == "dingtalk":
                 return await _send_dingtalk_message(
-                    agent_id, member_name, message_text, target_member,
-                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    agent_id,
+                    member_name,
+                    message_text,
+                    target_member,
+                    origin_session_id=origin_session_id,
+                    origin_user_id=origin_user_id,
                     tool_call_id=tool_call_id,
                     origin_turn_anchor_id=origin_turn_anchor_id,
                 )
             elif provider_type == "wecom":
                 return await _send_wecom_message(
-                    agent_id, member_name, message_text, target_member,
-                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    agent_id,
+                    member_name,
+                    message_text,
+                    target_member,
+                    origin_session_id=origin_session_id,
+                    origin_user_id=origin_user_id,
                     tool_call_id=tool_call_id,
                     origin_turn_anchor_id=origin_turn_anchor_id,
                 )
             elif provider_type == "slack":
                 return await _send_slack_message(
-                    agent_id, member_name, message_text, target_member,
-                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    agent_id,
+                    member_name,
+                    message_text,
+                    target_member,
+                    origin_session_id=origin_session_id,
+                    origin_user_id=origin_user_id,
                     tool_call_id=tool_call_id,
                     origin_turn_anchor_id=origin_turn_anchor_id,
                 )
             elif provider_type == "teams":
                 return await _send_teams_channel_message(
-                    agent_id, member_name, message_text, target_member,
-                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    agent_id,
+                    member_name,
+                    message_text,
+                    target_member,
+                    origin_session_id=origin_session_id,
+                    origin_user_id=origin_user_id,
                     tool_call_id=tool_call_id,
                     origin_turn_anchor_id=origin_turn_anchor_id,
                 )
             elif provider_type == "wechat":
                 return await _send_wechat_channel_message(
-                    agent_id, member_name, message_text, target_member,
-                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    agent_id,
+                    member_name,
+                    message_text,
+                    target_member,
+                    origin_session_id=origin_session_id,
+                    origin_user_id=origin_user_id,
                     tool_call_id=tool_call_id,
                     origin_turn_anchor_id=origin_turn_anchor_id,
                 )
@@ -10358,7 +10845,6 @@ async def _send_dingtalk_message(
 ) -> str:
     """Send message via DingTalk channel using Open API."""
     from app.services.dingtalk_service import send_dingtalk_message
-
 
     try:
         async with async_session() as db:
@@ -10402,14 +10888,12 @@ async def _send_dingtalk_message(
                     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                     agent_obj = agent_r.scalar_one_or_none()
 
-
                     # Get or create platform user from OrgMember (unified logic)
                     platform_user = await get_platform_user_by_org_member(
                         db=db,
                         org_member=target_member,
                         agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
                     )
-
 
                     conv_id = f"dingtalk_p2p_{user_id}"
                     # 2. Get/Create session
@@ -10434,9 +10918,7 @@ async def _send_dingtalk_message(
                         origin_source_channel=None,
                         tool_call_id=tool_call_id,
                         origin_turn_anchor_id=origin_turn_anchor_id,
-                        external_message_id=str(
-                            result.get("task_id") or result.get("processQueryKey") or ""
-                        ) or None,
+                        external_message_id=str(result.get("task_id") or result.get("processQueryKey") or "") or None,
                     )
                     await db.commit()
                     logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
@@ -10471,7 +10953,6 @@ async def _send_wecom_message(
 ) -> str:
     """Send message via WeCom channel using Open API."""
     from app.services.wecom_service import send_wecom_message
-
 
     try:
         async with async_session() as db:
@@ -10508,11 +10989,9 @@ async def _send_wecom_message(
             if result.get("errcode") == 0:
                 # Save proactive message to session so it appears in UI
                 try:
-
                     # Get agent tenant context
                     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                     agent = agent_r.scalar_one_or_none()
-
 
                     # Get or create platform user from OrgMember (unified logic)
                     platform_user = await get_platform_user_by_org_member(
@@ -10564,6 +11043,7 @@ async def _send_wecom_message(
         logger.exception("[WeCom] Error")
         return f"❌ WeCom message error: {str(e)[:200]}"
 
+
 async def _send_slack_message(
     agent_id: uuid.UUID,
     member_name: str,
@@ -10611,7 +11091,7 @@ async def _send_slack_message(
                 if open_resp.status_code >= 400 or not data.get("ok"):
                     err = data.get("error") or open_resp.text[:200]
                     return f"❌ Slack conversations.open failed: {err}"
-                channel_id = (((data.get("channel") or {})).get("id") or "").strip()
+                channel_id = ((data.get("channel") or {}).get("id") or "").strip()
 
             if not channel_id:
                 return f"❌ Slack DM channel unavailable for {member_name}"
@@ -10843,6 +11323,8 @@ async def _send_wechat_channel_message(
     except Exception as e:
         logger.exception("[WeChat] Error")
         return f"❌ WeChat message error: {str(e)[:200]}"
+
+
 async def _send_platform_message(
     agent_id: uuid.UUID,
     args: dict,
@@ -10862,9 +11344,7 @@ async def _send_platform_message(
     try:
         async with async_session() as db:
             try:
-                recipient = await resolve_platform_user_recipient(
-                    db, agent_id, canonical_user_id
-                )
+                recipient = await resolve_platform_user_recipient(db, agent_id, canonical_user_id)
             except RecipientResolutionError as exc:
                 return exc.as_json()
             target_user = recipient.user
@@ -10906,6 +11386,7 @@ async def _send_platform_message(
             # Push via WebSocket if user has an active connection
             try:
                 from app.api.websocket import manager as ws_manager
+
                 await ws_manager.send_to_user(
                     str(agent_id),
                     str(target_user.id),
@@ -10927,7 +11408,14 @@ async def _send_platform_message(
         return f"❌ Web message send error: {str(e)[:200]}"
 
 
-async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
+async def _send_file_to_agent(
+    from_agent_id: uuid.UUID,
+    args: dict,
+    *,
+    origin_session_id: str | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
     """Send a workspace file to another digital employee (agent)."""
     canonical_agent_id = str(args.get("agent_id") or "").strip()
     rel_path = (args.get("file_path") or "").strip()
@@ -10937,7 +11425,7 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         return "❌ Please provide both canonical agent_id and file_path"
 
     storage = get_storage_backend()
-    source_key = normalize_storage_key(f"{from_agent_id}/{rel_path}")
+    source_key = current_agent_runtime_workspace(from_agent_id).storage_key(rel_path)
     if not await storage.is_file(source_key):
         return f"❌ Source file not found: {rel_path}"
     source_entry = await storage.stat(source_key)
@@ -10953,18 +11441,29 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
     try:
         from app.services.activity_logger import log_activity
+        from app.services.a2a_file_delivery import resolve_a2a_file_origin_scope
 
         async with async_session() as db:
             try:
-                project_id = None
+                origin_scope = await resolve_a2a_file_origin_scope(
+                    db,
+                    origin_session_id=origin_session_id,
+                    sender_agent_id=from_agent_id,
+                )
+                explicit_project_id = None
                 if args.get("_project_id"):
                     try:
-                        project_id = uuid.UUID(str(args["_project_id"]))
+                        explicit_project_id = uuid.UUID(str(args["_project_id"]))
                     except (TypeError, ValueError):
                         return "❌ _project_id must be a complete platform UUID"
-                recipient = await resolve_agent_recipient(
-                    db, from_agent_id, canonical_agent_id, project_id=project_id
-                )
+                if (
+                    origin_scope.project_id is not None
+                    and explicit_project_id is not None
+                    and origin_scope.project_id != explicit_project_id
+                ):
+                    return "❌ The file delivery project does not match the originating conversation"
+                project_id = origin_scope.project_id or explicit_project_id
+                recipient = await resolve_agent_recipient(db, from_agent_id, canonical_agent_id, project_id=project_id)
             except RecipientResolutionError as exc:
                 return exc.as_json()
             source_agent = recipient.source_agent
@@ -10974,21 +11473,32 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             target_name = target_agent.name
             target_id = target_agent.id
 
+            if str(getattr(target_agent, "scope", "") or "").strip().lower() == "project":
+                if project_id is None or getattr(target_agent, "project_id", None) != project_id:
+                    return "❌ Project Agent file delivery must remain inside its owning project"
+                target_workspace = project_agent_runtime_workspace(
+                    agent_id=target_id,
+                    tenant_id=target_agent.tenant_id,
+                    project_id=project_id,
+                )
+            else:
+                target_workspace = standard_agent_runtime_workspace(target_id)
+
         ts = datetime.now(timezone.utc)
         stamp = ts.strftime("%Y%m%d_%H%M%S_%f")
         delivered_name = source_name
         target_rel_path = f"workspace/inbox/files/{delivered_name}"
-        target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
+        target_key = target_workspace.storage_key(target_rel_path)
         while await storage.exists(target_key):
             delivered_name = f"{stamp}_{source_name}"
             target_rel_path = f"workspace/inbox/files/{delivered_name}"
-            target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
+            target_key = target_workspace.storage_key(target_rel_path)
 
         await storage.write_bytes(target_key, source_bytes)
 
         sender_short = str(from_agent_id)[:8]
         note_rel_path = f"workspace/inbox/{stamp}_{sender_short}_file_delivery.md"
-        note_key = normalize_storage_key(f"{target_id}/{note_rel_path}")
+        note_key = target_workspace.storage_key(note_rel_path)
         note_lines = [
             f"# File delivery from {source_agent_name}",
             "",
@@ -11003,31 +11513,36 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             note_lines.append(delivery_note)
             note_lines.append("")
         note_lines.append("## Action")
-        note_lines.append(f"- Read the file via `read_file(path=\"{target_rel_path}\")`")
+        note_lines.append(f'- Read the file via `read_file(path="{target_rel_path}")`')
         await storage.write_text(note_key, "\n".join(note_lines), encoding="utf-8")
 
         from app.models.audit import AuditLog
+
         async with async_session() as db:
-            db.add(AuditLog(
-                agent_id=from_agent_id,
-                action="collaboration:file_send",
-                details={
-                    "to_agent": str(target_id),
-                    "to_agent_name": target_name,
-                    "source_file": rel_path,
-                    "delivered_file": target_rel_path,
-                },
-            ))
-            db.add(AuditLog(
-                agent_id=target_id,
-                action="collaboration:file_receive",
-                details={
-                    "from_agent": str(from_agent_id),
-                    "from_agent_name": source_agent_name,
-                    "source_file": rel_path,
-                    "delivered_file": target_rel_path,
-                },
-            ))
+            db.add(
+                AuditLog(
+                    agent_id=from_agent_id,
+                    action="collaboration:file_send",
+                    details={
+                        "to_agent": str(target_id),
+                        "to_agent_name": target_name,
+                        "source_file": rel_path,
+                        "delivered_file": target_rel_path,
+                    },
+                )
+            )
+            db.add(
+                AuditLog(
+                    agent_id=target_id,
+                    action="collaboration:file_receive",
+                    details={
+                        "from_agent": str(from_agent_id),
+                        "from_agent_name": source_agent_name,
+                        "source_file": rel_path,
+                        "delivered_file": target_rel_path,
+                    },
+                )
+            )
             await db.commit()
 
         await log_activity(
@@ -11043,93 +11558,59 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             detail={"source_agent": source_agent_name, "source_file": rel_path, "delivered_file": target_rel_path},
         )
 
-        # ── Inject file-delivery message into A2A chat session ──
-        # This ensures the target agent sees the file delivery in its
-        # conversation context when send_message_to_agent is called next.
+        # Inject the file into the exact standard A2A conversation. Project
+        # child executions resolve through their durable SubagentRun parent;
+        # multiple legitimate threads for the same Agent pair remain distinct.
         logger.info(
             "[A2A-File] Injecting file delivery message: from=%s to=%s file=%s",
             source_name,
             target_name,
             delivered_name,
         )
-        try:
-            from app.models.audit import ChatMessage
-            from app.models.chat_session import ChatSession
-            from app.models.participant import Participant
-            async with async_session() as db2:
-                # Find or create A2A session (same ordering as send_message_to_agent)
-                session_agent_id = min(from_agent_id, target_id, key=str)
-                session_peer_id = max(from_agent_id, target_id, key=str)
-                sess_r = await db2.execute(
-                    select(ChatSession).where(
-                        ChatSession.agent_id == session_agent_id,
-                        ChatSession.peer_agent_id == session_peer_id,
-                        ChatSession.source_channel == "agent",
-                    )
-                )
-                chat_session = sess_r.scalar_one_or_none()
-                if not chat_session:
-                    src_part_r = await db2.execute(
-                        select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id)
-                    )
-                    src_participant = src_part_r.scalar_one_or_none()
-                    chat_session = ChatSession(
-                        agent_id=session_agent_id,
-                        user_id=source_creator_id,
-                        title=f"{source_name} ↔ {target_name}",
-                        source_channel="agent",
-                        participant_id=src_participant.id if src_participant else None,
-                        peer_agent_id=session_peer_id,
-                    )
-                    db2.add(chat_session)
-                    await db2.flush()
+        from app.services.a2a_file_delivery import append_a2a_file_delivery_message
 
-                file_msg_content = (
-                    f"[File delivery from {source_name}]\n"
-                    f"{source_name} sent you a file: {delivered_name}\n"
-                    f"File path: {target_rel_path}\n"
-                    f"Use read_file(path=\"{target_rel_path}\") to inspect it."
-                )
-                if delivery_note:
-                    file_msg_content += f"\nNote: {delivery_note}"
-
-                # Resolve sender participant for proper attribution
-                src_part_r2 = await db2.execute(
-                    select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id)
-                )
-                src_part2 = src_part_r2.scalar_one_or_none()
-
-                db2.add(ChatMessage(
-                    agent_id=session_agent_id,
-                    user_id=source_creator_id,
-                    sender_agent_id=from_agent_id,
-                    role="user",
-                    content=file_msg_content,
-                    conversation_id=str(chat_session.id),
-                    participant_id=src_part2.id if src_part2 else None,
-                ))
-                chat_session.last_message_at = ts
-                await db2.commit()
-                logger.info(
-                    "[A2A-File] Injected file delivery message into session %s for %s",
-                    chat_session.id,
-                    target_name,
-                )
-        except Exception as e:
-            logger.error(f"[A2A-File] FAILED to inject file delivery message: {e}")
-
-        return (
-            f"✅ File sent to {target_name}.\n"
-            f"- Delivered to: {target_rel_path}\n"
-            f"- Inbox note: {note_rel_path}"
+        operation_key = _build_outbound_operation_key(
+            agent_id=from_agent_id,
+            origin_session_id=origin_session_id,
+            tool_call_id=tool_call_id,
+            origin_turn_anchor_id=origin_turn_anchor_id,
         )
+        file_event_key = f"{operation_key}:file"[:500] if operation_key else None
+        async with async_session() as db2:
+            chat_session_id = await append_a2a_file_delivery_message(
+                db2,
+                sender_agent_id=from_agent_id,
+                target_agent_id=target_id,
+                sender_creator_id=source_creator_id,
+                sender_name=source_agent_name,
+                target_name=target_name,
+                project_id=project_id,
+                preferred_session_id=origin_scope.preferred_session_id,
+                source_path=rel_path,
+                delivered_path=target_rel_path,
+                delivered_name=delivered_name,
+                delivery_note=delivery_note,
+                file_size=file_size,
+                created_at=ts,
+                external_event_key=file_event_key,
+                origin_session_id=origin_session_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+            )
+            await db2.commit()
+        logger.info(
+            "[A2A-File] Injected file delivery message into session %s for %s",
+            chat_session_id,
+            target_name,
+        )
+
+        return f"✅ File sent to {target_name}.\n- Delivered to: {target_rel_path}\n- Inbox note: {note_rel_path}"
     except Exception as e:
+        logger.exception("[A2A-File] File delivery failed")
         return f"❌ Agent file send error: {str(e)[:200]}"
 
 
-async def _resolve_a2a_target(
-    db, from_agent_id: uuid.UUID, agent_id: str
-) -> tuple[AgentModel | None, str | None]:
+async def _resolve_a2a_target(db, from_agent_id: uuid.UUID, agent_id: str) -> tuple[AgentModel | None, str | None]:
     """Compatibility helper backed by the canonical exact-ID resolver."""
     try:
         recipient = await resolve_agent_recipient(db, from_agent_id, agent_id)
@@ -11213,15 +11694,14 @@ async def _create_on_message_trigger(
         "type": "on_message",
         "reason": reason,
         "focus_ref": focus_ref or "",
-        "config": {
-            key: value for key, value in config.items() if not str(key).startswith("_")
-        },
+        "config": {key: value for key, value in config.items() if not str(key).startswith("_")},
     }
 
     try:
         from app.models.audit import ChatMessage as _CM
         from app.models.chat_session import ChatSession as _CS
         from sqlalchemy import cast as sa_cast, String as SaString
+
         async with async_session() as _snap_db:
             if origin_turn_anchor_id and origin_session_id:
                 try:
@@ -11231,21 +11711,12 @@ async def _create_on_message_trigger(
                     )
                 except (TypeError, ValueError):
                     _origin_anchor = None
-                if (
-                    _origin_anchor is not None
-                    and _origin_anchor.conversation_id == str(origin_session_id)
-                ):
-                    _origin_meta = (
-                        _origin_anchor.message_meta
-                        if isinstance(_origin_anchor.message_meta, dict)
-                        else {}
-                    )
+                if _origin_anchor is not None and _origin_anchor.conversation_id == str(origin_session_id):
+                    _origin_meta = _origin_anchor.message_meta if isinstance(_origin_anchor.message_meta, dict) else {}
                     if _origin_meta.get("actor_ref"):
                         config["_origin_actor_ref"] = str(_origin_meta["actor_ref"])
                     if _origin_meta.get("actor_ref_type"):
-                        config["_origin_actor_ref_type"] = str(
-                            _origin_meta["actor_ref_type"]
-                        )
+                        config["_origin_actor_ref_type"] = str(_origin_meta["actor_ref_type"])
             _outbound_anchor = None
             if outbound_message_id:
                 try:
@@ -11264,12 +11735,16 @@ async def _create_on_message_trigger(
                 # active session, is the event cursor for this subscription.
                 config["_since_ts"] = _outbound_anchor.created_at.isoformat()
             else:
-                _snap_q = select(_CM.created_at).join(
-                    _CS, _CM.conversation_id == sa_cast(_CS.id, SaString)
-                ).where(
-                    _CS.agent_id == agent_id,
-                    _CM.created_at.isnot(None),
-                ).order_by(_CM.created_at.desc()).limit(1)
+                _snap_q = (
+                    select(_CM.created_at)
+                    .join(_CS, _CM.conversation_id == sa_cast(_CS.id, SaString))
+                    .where(
+                        _CS.agent_id == agent_id,
+                        _CM.created_at.isnot(None),
+                    )
+                    .order_by(_CM.created_at.desc())
+                    .limit(1)
+                )
                 _snap_r = await _snap_db.execute(_snap_q)
                 _latest_ts = _snap_r.scalar_one_or_none()
                 if _latest_ts:
@@ -11288,10 +11763,9 @@ async def _create_on_message_trigger(
         if existing:
             if existing.is_enabled:
                 existing_cfg = existing.config or {}
-                if (
-                    existing_cfg.get("_origin_session_id") == config.get("_origin_session_id")
-                    and existing_cfg.get("_outbound_message_id") == config.get("_outbound_message_id")
-                ):
+                if existing_cfg.get("_origin_session_id") == config.get("_origin_session_id") and existing_cfg.get(
+                    "_outbound_message_id"
+                ) == config.get("_outbound_message_id"):
                     trigger = existing
                 else:
                     raise RuntimeError(
@@ -11387,15 +11861,14 @@ async def _arm_a2a_delegate_callback(
         f"marking items complete, trigger status, etc.). "
         f"Just summarize the task result in plain language."
     )
+
     def _same_callback(existing: AgentTrigger) -> bool:
         existing_cfg = existing.config if isinstance(existing.config, dict) else {}
         return (
             existing.is_enabled
             and str(existing_cfg.get("_watch_session_id") or "") == watch_session_id
-            and str(existing_cfg.get("_outbound_message_id") or "")
-            == str(outbound_message_id)
-            and str(existing_cfg.get("_origin_session_id") or "")
-            == str(origin_session_id or "")
+            and str(existing_cfg.get("_outbound_message_id") or "") == str(outbound_message_id)
+            and str(existing_cfg.get("_origin_session_id") or "") == str(origin_session_id or "")
         )
 
     async def _load_existing() -> AgentTrigger | None:
@@ -11452,12 +11925,20 @@ async def _append_focus_item(agent_id: uuid.UUID, identifier: str, description: 
         logger.warning(f"[A2A] Failed to update Focus for agent {agent_id}: {e}")
 
 
-async def _wake_agent_async(agent_id: uuid.UUID, reason_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False, a2a_session_id: str | None = None) -> None:
+async def _wake_agent_async(
+    agent_id: uuid.UUID,
+    reason_context: str,
+    *,
+    from_agent_id: uuid.UUID | None = None,
+    skip_dedup: bool = False,
+    a2a_session_id: str | None = None,
+) -> None:
     """Wake an agent asynchronously via the trigger invocation path.
 
     Delegates to the public wake_agent_with_context API in trigger_daemon.
     """
     from app.services.trigger_daemon import wake_agent_with_context
+
     kwargs = {"from_agent_id": from_agent_id, "skip_dedup": skip_dedup}
     if a2a_session_id is not None:
         kwargs["a2a_session_id"] = a2a_session_id
@@ -11498,6 +11979,14 @@ async def _send_message_to_agent(
             project_id = uuid.UUID(str(args["_project_id"]))
         except (TypeError, ValueError):
             return "❌ _project_id must be a complete platform UUID"
+    work_item_id = None
+    if args.get("_work_item_id"):
+        try:
+            work_item_id = uuid.UUID(str(args["_work_item_id"]))
+        except (TypeError, ValueError):
+            return "❌ _work_item_id must be a complete platform UUID"
+        if project_id is None:
+            return "❌ _work_item_id requires a project-scoped message"
 
     if not canonical_agent_id or not message_text:
         return "❌ Please provide canonical agent_id and message content"
@@ -11514,9 +12003,7 @@ async def _send_message_to_agent(
         async with async_session() as db:
             if origin_session_id:
                 try:
-                    _osr = await db.execute(
-                        select(ChatSession).where(ChatSession.id == uuid.UUID(origin_session_id))
-                    )
+                    _osr = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(origin_session_id)))
                     _osess = _osr.scalar_one_or_none()
                     if _osess:
                         origin_source_channel = _osess.source_channel
@@ -11525,18 +12012,20 @@ async def _send_message_to_agent(
                     pass
 
             try:
-                recipient = await resolve_agent_recipient(
-                    db, from_agent_id, canonical_agent_id, project_id=project_id
-                )
+                recipient = await resolve_agent_recipient(db, from_agent_id, canonical_agent_id, project_id=project_id)
             except RecipientResolutionError as exc:
                 return exc.as_json()
             source_agent = recipient.source_agent
             target = recipient.target_agent
             source_name = source_agent.name
 
-            src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id))
+            src_part_r = await db.execute(
+                select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id)
+            )
             src_participant = src_part_r.scalar_one_or_none()
-            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
+            tgt_part_r = await db.execute(
+                select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id)
+            )
             tgt_participant = tgt_part_r.scalar_one_or_none()
 
             outbound_operation_key = _build_outbound_operation_key(
@@ -11554,24 +12043,17 @@ async def _send_message_to_agent(
                 await _lock_outbound_operation(db, outbound_operation_key)
                 candidate = (
                     await db.execute(
-                        select(ChatMessage).where(
-                            ChatMessage.external_event_key == outbound_operation_key
-                        ).with_for_update()
+                        select(ChatMessage)
+                        .where(ChatMessage.external_event_key == outbound_operation_key)
+                        .with_for_update()
                     )
                 ).scalar_one_or_none()
                 if candidate is not None:
-                    candidate_meta = (
-                        candidate.message_meta
-                        if isinstance(candidate.message_meta, dict)
-                        else {}
-                    )
+                    candidate_meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
                     if str(candidate_meta.get("target_agent_id") or "") != str(target.id):
                         return "❌ The replayed message receipt does not match the requested target"
                     if candidate_meta.get("delivery_status") == "queued":
-                        return (
-                            f"✅ Message already sent to {target.name} via agent "
-                            "(idempotent replay)."
-                        )
+                        return f"✅ Message already sent to {target.name} via agent (idempotent replay)."
                     if candidate_meta.get("delivery_status") != "recorded":
                         return "❌ The replayed message receipt has an invalid delivery state"
                     try:
@@ -11584,29 +12066,32 @@ async def _send_message_to_agent(
                     if replay_session is None:
                         return "❌ The recorded message's conversation no longer exists"
                     expected_pair = {from_agent_id, target.id}
-                    if {
-                        replay_session.agent_id,
-                        replay_session.peer_agent_id,
-                    } != expected_pair or replay_session.source_channel != "agent" or replay_session.project_id != project_id:
+                    if (
+                        {
+                            replay_session.agent_id,
+                            replay_session.peer_agent_id,
+                        }
+                        != expected_pair
+                        or replay_session.source_channel != "agent"
+                        or replay_session.project_id != project_id
+                    ):
                         return "❌ The recorded message's conversation route changed"
                     recorded_openclaw_outbound = candidate
             elif project_id is not None and outbound_operation_key:
                 await _lock_outbound_operation(db, outbound_operation_key)
                 candidate = (
                     await db.execute(
-                        select(ChatMessage).where(
-                            ChatMessage.external_event_key == outbound_operation_key
-                        ).with_for_update()
+                        select(ChatMessage)
+                        .where(ChatMessage.external_event_key == outbound_operation_key)
+                        .with_for_update()
                     )
                 ).scalar_one_or_none()
                 if candidate is not None:
-                    candidate_meta = (
-                        candidate.message_meta
-                        if isinstance(candidate.message_meta, dict)
-                        else {}
-                    )
+                    candidate_meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
                     if str(candidate_meta.get("target_agent_id") or "") != str(target.id):
                         return "❌ The replayed project message does not match the requested target"
+                    if str(candidate_meta.get("work_item_id") or "") != str(work_item_id or ""):
+                        return "❌ The replayed project message does not match the requested work item"
                     try:
                         replay_session = await db.get(
                             ChatSession,
@@ -11619,8 +12104,7 @@ async def _send_message_to_agent(
                         replay_session is None
                         or replay_session.source_channel != "agent"
                         or replay_session.project_id != project_id
-                        or {replay_session.agent_id, replay_session.peer_agent_id}
-                        != expected_pair
+                        or {replay_session.agent_id, replay_session.peer_agent_id} != expected_pair
                     ):
                         return "❌ The replayed project message's conversation route changed"
                     recorded_project_outbound = candidate
@@ -11635,21 +12119,23 @@ async def _send_message_to_agent(
             # Only reuse an existing thread when not explicitly starting a fresh one
             chat_session = (
                 replay_session
-                if recorded_openclaw_outbound is not None
-                or recorded_project_outbound is not None
+                if recorded_openclaw_outbound is not None or recorded_project_outbound is not None
                 else None
             )
             if chat_session is None and not new_conversation:
                 sess_r = await db.execute(
-                    select(ChatSession).where(
+                    select(ChatSession)
+                    .where(
                         ChatSession.agent_id == session_agent_id,
                         ChatSession.peer_agent_id == session_peer_id,
                         ChatSession.source_channel == "agent",
                         ChatSession.project_id == project_id if project_id else ChatSession.project_id.is_(None),
-                    ).order_by(
+                    )
+                    .order_by(
                         ChatSession.last_message_at.desc().nulls_last(),
                         ChatSession.created_at.desc(),
-                    ).limit(1)
+                    )
+                    .limit(1)
                 )
                 chat_session = sess_r.scalars().first()
 
@@ -11658,9 +12144,12 @@ async def _send_message_to_agent(
                 _suffix = ""
                 if new_conversation:
                     from sqlalchemy import func as _sa_func
+
                     _ext = f"a2a-{uuid.uuid4().hex[:8]}"
                     _cnt_r = await db.execute(
-                        select(_sa_func.count()).select_from(ChatSession).where(
+                        select(_sa_func.count())
+                        .select_from(ChatSession)
+                        .where(
                             ChatSession.agent_id == session_agent_id,
                             ChatSession.peer_agent_id == session_peer_id,
                             ChatSession.source_channel == "agent",
@@ -11730,9 +12219,7 @@ async def _send_message_to_agent(
                             origin_external_conv_id=origin_external_conv_id,
                             origin_turn_anchor_id=origin_turn_anchor_id,
                             watch_session_id=session_id,
-                            watch_actor_ref=str(
-                                tgt_participant.id if tgt_participant else target.id
-                            ),
+                            watch_actor_ref=str(tgt_participant.id if tgt_participant else target.id),
                             outbound_message_id=outbound_a2a_message.id,
                         )
                     except Exception as e:
@@ -11754,19 +12241,15 @@ async def _send_message_to_agent(
                 await _lock_outbound_operation(db, outbound_operation_key)
                 await db.refresh(outbound_a2a_message)
                 refreshed_meta = (
-                    outbound_a2a_message.message_meta
-                    if isinstance(outbound_a2a_message.message_meta, dict)
-                    else {}
+                    outbound_a2a_message.message_meta if isinstance(outbound_a2a_message.message_meta, dict) else {}
                 )
                 if refreshed_meta.get("delivery_status") == "queued":
-                    return (
-                        f"✅ Message already sent to {target.name} via agent "
-                        "(idempotent replay)."
-                    )
+                    return f"✅ Message already sent to {target.name} via agent (idempotent replay)."
                 if refreshed_meta.get("delivery_status") != "recorded":
                     return "❌ The replayed message receipt has an invalid delivery state"
 
                 from app.models.gateway_message import GatewayMessage as GMsg
+
                 gw_msg = GMsg(
                     agent_id=target.id,
                     sender_agent_id=from_agent_id,
@@ -11780,16 +12263,21 @@ async def _send_message_to_agent(
                     "delivery_status": "queued",
                 }
                 await db.commit()
-                
+
                 # 3. Log activity
                 from app.services.activity_logger import log_activity
+
                 await log_activity(
-                    from_agent_id, "agent_msg_sent",
+                    from_agent_id,
+                    "agent_msg_sent",
                     f"Sent message to {target.name} (queued)",
                     detail={"partner": target.name, "message": message_text[:200]},
                 )
 
-                online = target.openclaw_last_seen and (datetime.now(timezone.utc) - target.openclaw_last_seen).total_seconds() < 300
+                online = (
+                    target.openclaw_last_seen
+                    and (datetime.now(timezone.utc) - target.openclaw_last_seen).total_seconds() < 300
+                )
                 status_hint = "online" if online else "offline (message will be delivered on next heartbeat)"
                 if msg_type == "task_delegate":
                     return (
@@ -11807,6 +12295,7 @@ async def _send_message_to_agent(
             if source_agent.tenant_id:
                 try:
                     from app.models.tenant import Tenant
+
                     _t_r = await db.execute(select(Tenant).where(Tenant.id == source_agent.tenant_id))
                     _tenant = _t_r.scalar_one_or_none()
                     if _tenant:
@@ -11851,6 +12340,7 @@ async def _send_message_to_agent(
                         "actor_ref": str(tgt_participant.id if tgt_participant else target.id),
                         "target_agent_id": str(target.id),
                         "target_name": target.name,
+                        "work_item_id": str(work_item_id) if work_item_id else None,
                     },
                 )
                 db.add(outbound_a2a_message)
@@ -11875,15 +12365,20 @@ async def _send_message_to_agent(
             if project_id is not None:
                 from app.services.subagent_runtime import enqueue_project_a2a_run
 
-                raw_project_run_id = args.get("_project_run_id") or dict(
-                    outbound_a2a_message.message_meta or {}
-                ).get("project_run_id")
+                raw_project_run_id = args.get("_project_run_id") or dict(outbound_a2a_message.message_meta or {}).get(
+                    "project_run_id"
+                )
                 try:
-                    scoped_project_run_id = (
-                        uuid.UUID(str(raw_project_run_id)) if raw_project_run_id else None
-                    )
+                    scoped_project_run_id = uuid.UUID(str(raw_project_run_id)) if raw_project_run_id else None
                 except (TypeError, ValueError):
                     return "❌ _project_run_id must be a complete platform UUID"
+                raw_parent_project_run_id = args.get("_parent_project_run_id")
+                try:
+                    parent_project_run_id = (
+                        uuid.UUID(str(raw_parent_project_run_id)) if raw_parent_project_run_id else None
+                    )
+                except (TypeError, ValueError):
+                    return "❌ _parent_project_run_id must be a complete platform UUID"
                 try:
                     dispatch_result = await enqueue_project_a2a_run(
                         project_id=project_id,
@@ -11895,6 +12390,9 @@ async def _send_message_to_agent(
                         message=message_text,
                         mode=msg_type,
                         project_run_id=scoped_project_run_id,
+                        parent_project_run_id=parent_project_run_id,
+                        work_item_id=work_item_id,
+                        run_title=str(args.get("_run_title") or "").strip() or None,
                     )
                 except Exception as exc:
                     logger.exception("[project-a2a] durable target dispatch failed: {}", exc)
@@ -11905,11 +12403,7 @@ async def _send_message_to_agent(
                         "message": f"Message queued for {target.name}",
                         "session_id": session_id,
                         "a2a_session_id": session_id,
-                        "project_run_id": str(
-                            scoped_project_run_id
-                            or dispatch_result.get("project_run_id")
-                            or ""
-                        ),
+                        "project_run_id": str(scoped_project_run_id or dispatch_result.get("project_run_id") or ""),
                         "subagent_run_id": dispatch_result.get("subagent_run_id"),
                         "subagent_session_id": dispatch_result.get("subagent_session_id"),
                         "awakened_agent_ids": [str(target.id)],
@@ -11921,8 +12415,10 @@ async def _send_message_to_agent(
             if msg_type == "notify":
                 try:
                     from app.services.activity_logger import log_activity
+
                     await log_activity(
-                        from_agent_id, "agent_msg_sent",
+                        from_agent_id,
+                        "agent_msg_sent",
                         f"Sent notification to {target.name}",
                         detail={"partner": target.name, "message": message_text[:200], "msg_type": "notify"},
                     )
@@ -11969,8 +12465,10 @@ async def _send_message_to_agent(
 
                 try:
                     from app.services.activity_logger import log_activity
+
                     await log_activity(
-                        from_agent_id, "agent_msg_sent",
+                        from_agent_id,
+                        "agent_msg_sent",
                         f"Delegated task to {target.name}",
                         detail={"partner": target.name, "message": message_text[:200], "msg_type": "task_delegate"},
                     )
@@ -12029,7 +12527,10 @@ async def _send_message_to_agent(
             # 2) Structured history (tool_call rows auto-expand; NO sanitize poisoning)
             ctx_size = target.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
             history = await load_history_for_llm(
-                db, agent_id=session_agent_id, conversation_id=session_id, ctx_size=ctx_size,
+                db,
+                agent_id=session_agent_id,
+                conversation_id=session_id,
+                ctx_size=ctx_size,
             )
             # The shared loader protects complete recent turns. Never re-slice
             # its expanded assistant/tool pairs by message count.
@@ -12063,8 +12564,7 @@ async def _send_message_to_agent(
                 )
                 if not compacted.triggered:
                     logger.warning(
-                        "[A2A] context recovery could not compact session="
-                        f"{session_id}: {compacted.skipped_reason}"
+                        f"[A2A] context recovery could not compact session={session_id}: {compacted.skipped_reason}"
                     )
                     return None
                 async with async_session() as recovery_db:
@@ -12076,17 +12576,18 @@ async def _send_message_to_agent(
                         ctx_size=ctx_size,
                     )
                 if prefix is None:
-                    logger.warning(
-                        f"[A2A] context recovery lost latest-anchor race session={session_id}"
-                    )
+                    logger.warning(f"[A2A] context recovery lost latest-anchor race session={session_id}")
                     return None
                 return prefix + frozen_current_suffix
 
             # 3) persist callback stores tool calls under session_agent_id, RAW
             async def _a2a_persist(evt: dict):
                 await persist_tool_call(
-                    async_session, agent_id=session_agent_id, user_id=owner_id,
-                    conversation_id=session_id, evt=evt,
+                    async_session,
+                    agent_id=session_agent_id,
+                    user_id=owner_id,
+                    conversation_id=session_id,
+                    evt=evt,
                     turn_anchor_id=outbound_a2a_message.id,
                 )
 
@@ -12102,10 +12603,14 @@ async def _send_message_to_agent(
             #    agent_id=target.id so build_agent_context loads the right soul/system
             #    prompt; tool calls are stored under session_agent_id via _a2a_persist.
             target_reply = await call_llm_with_failover(
-                primary_model=target_model, fallback_model=target_fallback,
-                messages=messages, agent_name=target.name,
+                primary_model=target_model,
+                fallback_model=target_fallback,
+                messages=messages,
+                agent_name=target.name,
                 role_description=target.role_description or "",
-                agent_id=target.id, user_id=owner_id, session_id=session_id,
+                agent_id=target.id,
+                user_id=owner_id,
+                session_id=session_id,
                 on_tool_call=_a2a_persist,
                 on_thinking=_a2a_on_thinking,
                 turn_anchor_id=outbound_a2a_message.id,
@@ -12118,7 +12623,9 @@ async def _send_message_to_agent(
 
             # Save target reply
             async with async_session() as db2:
-                part_r = await db2.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
+                part_r = await db2.execute(
+                    select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id)
+                )
                 tgt_part = part_r.scalar_one_or_none()
                 from app.services.chat_history import (
                     cap_thinking,
@@ -12131,31 +12638,36 @@ async def _send_message_to_agent(
                     conversation_id=session_id,
                     turn_anchor_id=outbound_a2a_message.id,
                 )
-                db2.add(ChatMessage(
-                    agent_id=session_agent_id,
-                    user_id=owner_id,
-                    sender_agent_id=target.id,
-                    role="assistant",
-                    content=target_reply,
-                    conversation_id=session_id,
-                    participant_id=tgt_part.id if tgt_part else None,
-                    thinking=cap_thinking("".join(_a2a_thinking)),
-                    message_meta={
-                        "turn_anchor_id": str(outbound_a2a_message.id),
-                        "turn_status": "completed",
-                    },
-                ))
+                db2.add(
+                    ChatMessage(
+                        agent_id=session_agent_id,
+                        user_id=owner_id,
+                        sender_agent_id=target.id,
+                        role="assistant",
+                        content=target_reply,
+                        conversation_id=session_id,
+                        participant_id=tgt_part.id if tgt_part else None,
+                        thinking=cap_thinking("".join(_a2a_thinking)),
+                        message_meta={
+                            "turn_anchor_id": str(outbound_a2a_message.id),
+                            "turn_status": "completed",
+                        },
+                    )
+                )
                 await db2.commit()
 
             # Log activity
             from app.services.activity_logger import log_activity
+
             await log_activity(
-                target.id, "agent_msg_sent",
+                target.id,
+                "agent_msg_sent",
                 f"Replied to message from {source_name}",
                 detail={"partner": source_name, "message": message_text[:200], "reply": target_reply[:200]},
             )
             await log_activity(
-                from_agent_id, "agent_msg_sent",
+                from_agent_id,
+                "agent_msg_sent",
                 f"Sent message to {target.name} and received reply",
                 detail={"partner": target.name, "message": message_text[:200], "reply": target_reply[:200]},
             )
@@ -12163,9 +12675,7 @@ async def _send_message_to_agent(
             return f"💬 {target.name} replied:\n{target_reply}"
 
     except Exception as e:
-        logger.exception(
-            f"[A2A] send_message_to_agent failed: from={from_agent_id}, to={args.get('agent_id', '')}"
-        )
+        logger.exception(f"[A2A] send_message_to_agent failed: from={from_agent_id}, to={args.get('agent_id', '')}")
         error_type = type(e).__name__
         error_detail = (str(e) or "").strip()
         if not error_detail:
@@ -12177,12 +12687,12 @@ async def _send_message_to_agent(
         return f"❌ Message send error ({error_type}): {error_detail[:200]}"
 
 
-
 # Plaza Tools — Agent Square social feed
 # ═══════════════════════════════════════════════════════
 
 # Plaza Tools — Agent Square social feed
 # ═══════════════════════════════════════════════════════
+
 
 async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
     """Get recent posts from the Agent Plaza, scoped to agent's tenant."""
@@ -12284,9 +12794,11 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
             # Extract @mentions
             try:
                 import re
-                mentions = re.findall(r'@(\S+)', content)
+
+                mentions = re.findall(r"@(\S+)", content)
                 if mentions:
                     from app.services.notification_service import send_notification
+
                     a_q = select(AgentModel).where(AgentModel.id != agent_id)
                     if agent.tenant_id:
                         a_q = a_q.where(AgentModel.tenant_id == agent.tenant_id)
@@ -12297,7 +12809,8 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
                         if ma and ma.id not in notified:
                             notified.add(ma.id)
                             await send_notification(
-                                db, agent_id=ma.id,
+                                db,
+                                agent_id=ma.id,
                                 type="mention",
                                 title=f"{agent.name} mentioned you in a plaza post",
                                 body=content[:150],
@@ -12366,9 +12879,11 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             if post.author_id != agent_id:
                 try:
                     from app.services.notification_service import send_notification
+
                     if post.author_type == "agent":
                         await send_notification(
-                            db, agent_id=post.author_id,
+                            db,
+                            agent_id=post.author_id,
                             type="plaza_reply",
                             title=f"{agent.name} commented on your post",
                             body=content[:150],
@@ -12377,10 +12892,13 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
                             sender_name=agent.name,
                         )
                         # Also notify human creator
-                        pa = (await db.execute(select(AgentModel).where(AgentModel.id == post.author_id))).scalar_one_or_none()
+                        pa = (
+                            await db.execute(select(AgentModel).where(AgentModel.id == post.author_id))
+                        ).scalar_one_or_none()
                         if pa and pa.creator_id:
                             await send_notification(
-                                db, user_id=pa.creator_id,
+                                db,
+                                user_id=pa.creator_id,
                                 type="plaza_comment",
                                 title=f"{agent.name} commented on {pa.name}'s post",
                                 body=content[:100],
@@ -12390,7 +12908,8 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
                             )
                     elif post.author_type == "human":
                         await send_notification(
-                            db, user_id=post.author_id,
+                            db,
+                            user_id=post.author_id,
                             type="plaza_reply",
                             title=f"{agent.name} commented on your post",
                             body=content[:150],
@@ -12404,6 +12923,7 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             # Notify other agents who commented on this post
             try:
                 from app.services.notification_service import send_notification
+
                 other_crs = await db.execute(
                     select(PlazaComment.author_id, PlazaComment.author_type)
                     .where(PlazaComment.post_id == pid)
@@ -12417,7 +12937,8 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
                     notified.add(cid)
                     if ctype == "agent":
                         await send_notification(
-                            db, agent_id=cid,
+                            db,
+                            agent_id=cid,
                             type="plaza_reply",
                             title=f"{agent.name} also commented on a post you commented on",
                             body=content[:150],
@@ -12431,10 +12952,12 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             # Extract @mentions
             try:
                 import re
-                mentions = re.findall(r'@(\S+)', content)
+
+                mentions = re.findall(r"@(\S+)", content)
                 if mentions:
                     from app.services.notification_service import send_notification
                     from app.models.user import User
+
                     # Load agents in tenant
                     a_q = select(AgentModel).where(AgentModel.id != agent_id)
                     if agent.tenant_id:
@@ -12446,7 +12969,8 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
                         if ma and ma.id not in notified_m:
                             notified_m.add(ma.id)
                             await send_notification(
-                                db, agent_id=ma.id,
+                                db,
+                                agent_id=ma.id,
                                 type="mention",
                                 title=f"{agent.name} mentioned you in a comment",
                                 body=content[:150],
@@ -12468,30 +12992,56 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
 
 # Dangerous patterns to block (for legacy fallback)
 _DANGEROUS_BASH_ALWAYS = [
-    "rm -rf /", "rm -rf ~", "sudo ", "mkfs", "dd if=",
-    ":(){ :", "chmod 777 /", "chown ", "shutdown", "reboot",
+    "rm -rf /",
+    "rm -rf ~",
+    "sudo ",
+    "mkfs",
+    "dd if=",
+    ":(){ :",
+    "chmod 777 /",
+    "chown ",
+    "shutdown",
+    "reboot",
 ]
 
 _DANGEROUS_BASH_NETWORK = [
-    "curl ", "wget ", "nc ", "ncat ", "ssh ", "scp ",
+    "curl ",
+    "wget ",
+    "nc ",
+    "ncat ",
+    "ssh ",
+    "scp ",
 ]
 
 _DANGEROUS_PYTHON_IMPORTS_ALWAYS = [
-    "shutil.rmtree", "os.system", "os.popen",
-    "os.exec", "os.spawn",
+    "shutil.rmtree",
+    "os.system",
+    "os.popen",
+    "os.exec",
+    "os.spawn",
 ]
 
 _DANGEROUS_PYTHON_IMPORTS_NETWORK = [
-    "socket", "http.client", "urllib.request", "requests",
-    "ftplib", "smtplib", "telnetlib", "ctypes",
+    "socket",
+    "http.client",
+    "urllib.request",
+    "requests",
+    "ftplib",
+    "smtplib",
+    "telnetlib",
+    "ctypes",
 ]
 
 _DANGEROUS_NODE_ALWAYS = [
-    "fs.rmSync", "fs.rmdirSync", "process.exit",
+    "fs.rmSync",
+    "fs.rmdirSync",
+    "process.exit",
 ]
 
 _DANGEROUS_NODE_NETWORK = [
-    "require('http')", "require('https')", "require('net')",
+    "require('http')",
+    "require('https')",
+    "require('net')",
 ]
 
 
@@ -12576,26 +13126,22 @@ async def build_cli_injection(
             assignments = {}
             assigned_tool_ids: list[uuid.UUID] = []
             if agent_id:
-                tid_r = await db.execute(
-                    select(AgentModel.tenant_id).where(AgentModel.id == agent_id)
-                )
+                tid_r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
                 _raw_tid = tid_r.scalar_one_or_none()
                 # Coerce to UUID object: production (Postgres) returns UUID,
                 # test stubs (SQLite TEXT column) return a plain string.
                 if isinstance(_raw_tid, str):
                     _raw_tid = uuid.UUID(_raw_tid)
                 agent_tenant_id = _raw_tid
-                at_r = await db.execute(
-                    select(AgentTool).where(AgentTool.agent_id == agent_id)
-                )
+                at_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
                 assignments = {str(at.tool_id): at for at in at_r.scalars().all()}
                 assigned_tool_ids = [uuid.UUID(tid) for tid in assignments]
 
             visible_clauses = [Tool.source == "builtin"]
             if agent_tenant_id:
-                visible_clauses.append((Tool.source == "admin") & (
-                    (Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))
-                ))
+                visible_clauses.append(
+                    (Tool.source == "admin") & ((Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None)))
+                )
             else:
                 visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
             if assigned_tool_ids:
@@ -12620,6 +13166,7 @@ async def build_cli_injection(
                     }
 
         from app.services.cli_tools.storage import BINARY_ROOT, BinaryStorage
+
         binary_storage = BinaryStorage(root=BINARY_ROOT)
         state_storage = StateStorage()
         wrappers: list[dict] = []
@@ -12647,9 +13194,7 @@ async def build_cli_injection(
             state_ctx: dict[str, str] = {}
             needs_state = any(v == "$state.dir" for v in cfg.env.values())
             if needs_state and user_id:
-                leaf = state_storage.ensure_home(
-                    tenant_id=tool.tenant_id, tool_id=tool.id, user_id=user_id
-                )
+                leaf = state_storage.ensure_home(tenant_id=tool.tenant_id, tool_id=tool.id, user_id=user_id)
                 state_ctx = {"dir": str(leaf)}
 
             ctx = PlaceholderContext(
@@ -12661,11 +13206,13 @@ async def build_cli_injection(
             # Keep each tool's resolved env separate. The AIO backend signs it
             # into that tool's process-local context; it is never merged into a
             # persistent shell/Jupyter environment.
-            wrappers.append({
-                "name": tool.name,
-                "binary_path": str(binary_path),
-                "env": render_env(cfg.env, ctx),
-            })
+            wrappers.append(
+                {
+                    "name": tool.name,
+                    "binary_path": str(binary_path),
+                    "env": render_env(cfg.env, ctx),
+                }
+            )
         if not wrappers:
             return None
         return {"wrappers": wrappers}
@@ -12686,9 +13233,7 @@ async def _resolve_sandbox_backend(agent_id: Optional[uuid.UUID], tool_name: str
 
     fallback_config = get_sandbox_config()
     tool_config = await _get_tool_config(agent_id, tool_name)
-    sandbox_config = (
-        SandboxConfig.from_dict(tool_config, fallback_config) if tool_config else fallback_config
-    )
+    sandbox_config = SandboxConfig.from_dict(tool_config, fallback_config) if tool_config else fallback_config
     return get_sandbox_backend(sandbox_config), sandbox_config
 
 
@@ -12902,9 +13447,7 @@ async def _execute_code(
                     are isolated per conversation, not per agent.
     """
     action = str(arguments.get("action") or "execute").strip().lower()
-    execution_mode = str(
-        arguments.get("execution_mode") or "foreground"
-    ).strip().lower()
+    execution_mode = str(arguments.get("execution_mode") or "foreground").strip().lower()
     language = arguments.get("language")
     code = arguments.get("code", "")
     if action == "execute" and code:
@@ -12985,29 +13528,22 @@ async def _execute_code(
                 work_dir=str(work_dir),
             )
             icon = "✅" if payload.get("success") else "❌"
-            return (
-                f"{icon} AIO background jobs:\n"
-                + json.dumps(payload, ensure_ascii=False, indent=2)
-            )
+            return f"{icon} AIO background jobs:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
         if execution_mode == "background":
             if not agent_id or not session_id:
                 return "❌ Background execution requires an active chat session"
-            background_default = int(
-                (tool_config or {}).get("background_default_timeout", 900)
-            )
-            background_cap = int(
-                (tool_config or {}).get("background_max_timeout", 3600)
-            )
-            requested_timeout = int(
-                arguments.get("timeout") or background_default
-            )
+            background_default = int((tool_config or {}).get("background_default_timeout", 900))
+            background_cap = int((tool_config or {}).get("background_max_timeout", 3600))
+            requested_timeout = int(arguments.get("timeout") or background_default)
             timeout = max(1, min(requested_timeout, background_cap))
         else:
             requested_timeout = int(arguments.get("timeout") or 30)
             timeout = max(1, min(requested_timeout, sandbox_config.max_timeout))
 
-        logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name}, timeout={timeout}s)")
+        logger.info(
+            f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name}, timeout={timeout}s)"
+        )
         injection = None
         if cli_injection is not None:
             # Caller already built it (e.g. _execute_cli_tool, scoped to its own
@@ -13022,12 +13558,7 @@ async def _execute_code(
             )
 
             toolscall_enabled = toolscall_enabled_for_agent(tool_config)
-            if (
-                toolscall_enabled
-                and agent_id
-                and user_id
-                and tools_for_llm is not None
-            ):
+            if toolscall_enabled and agent_id and user_id and tools_for_llm is not None:
                 from app.services.toolscall.capability import build_toolscall_wrapper
 
                 try:
@@ -13050,15 +13581,11 @@ async def _execute_code(
                     # lookup failure must not turn unrelated sandbox code into
                     # a failed ToolCall; the missing command remains explicit
                     # if the submitted code actually tries to invoke it.
-                    logger.exception(
-                        "[Toolscall] launcher setup failed; continuing without it"
-                    )
+                    logger.exception("[Toolscall] launcher setup failed; continuing without it")
                     toolscall_wrapper = None
                 if toolscall_wrapper:
                     injection = injection or {}
-                    injection.setdefault("platform_wrappers", []).append(
-                        toolscall_wrapper
-                    )
+                    injection.setdefault("platform_wrappers", []).append(toolscall_wrapper)
 
         if execution_mode == "background":
             payload = await backend.start_background_job(
@@ -13071,10 +13598,7 @@ async def _execute_code(
                 inject=injection,
             )
             icon = "✅" if payload.get("success") else "❌"
-            return (
-                f"{icon} AIO background job:\n"
-                + json.dumps(payload, ensure_ascii=False, indent=2)
-            )
+            return f"{icon} AIO background job:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
         result = await backend.execute(
             code=code,
@@ -13096,7 +13620,13 @@ async def _execute_code(
             # Do not silently fall back — surface the config error to the user
             return f"❌ Sandbox configuration error: {str(e)[:300]}\nPlease check the tool settings."
         logger.warning(f"[Sandbox] Config issue, falling back to legacy subprocess: {e}")
-        return await _execute_code_legacy(ws, arguments, allow_network=fallback_config.allow_network, max_timeout=fallback_config.max_timeout, on_output=on_output)
+        return await _execute_code_legacy(
+            ws,
+            arguments,
+            allow_network=fallback_config.allow_network,
+            max_timeout=fallback_config.max_timeout,
+            on_output=on_output,
+        )
 
     except Exception as e:
         logger.exception(f"[Sandbox] Execution failed for agent {agent_id} (tool={tool_name})")
@@ -13105,7 +13635,13 @@ async def _execute_code(
             return f"❌ Sandbox execution error: {str(e)[:200]}"
         # For local tool: try legacy subprocess as last resort
         try:
-            return await _execute_code_legacy(ws, arguments, allow_network=sandbox_config.allow_network, max_timeout=sandbox_config.max_timeout, on_output=on_output)
+            return await _execute_code_legacy(
+                ws,
+                arguments,
+                allow_network=sandbox_config.allow_network,
+                max_timeout=sandbox_config.max_timeout,
+                on_output=on_output,
+            )
         except Exception:
             logger.exception(f"[Sandbox] Fallback also failed for agent {agent_id}")
             return f"❌ Execution error: {str(e)[:200]}"
@@ -13177,13 +13713,19 @@ async def _execute_cli_tool(
     if not command:
         return f"❌ Missing required parameter 'command' for CLI tool '{tool_name}'."
     return await _execute_code(
-        agent_id, ws, {"language": "bash", "code": command},
-        tool_name="execute_code_aio", user_id=user_id,
-        cli_injection=injection, session_id=session_id,
+        agent_id,
+        ws,
+        {"language": "bash", "code": command},
+        tool_name="execute_code_aio",
+        user_id=user_id,
+        cli_injection=injection,
+        session_id=session_id,
     )
 
 
-async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = False, max_timeout: int = 60, on_output=None) -> str:
+async def _execute_code_legacy(
+    ws: Path, arguments: dict, allow_network: bool = False, max_timeout: int = 60, on_output=None
+) -> str:
     """Legacy subprocess-based code execution (fallback)."""
     import asyncio
 
@@ -13231,7 +13773,8 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
         safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd_prefix, str(script_path),
+            *cmd_prefix,
+            str(script_path),
             cwd=str(work_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -13282,7 +13825,9 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
             result_parts.append(f"⚠️ Stderr:\n{stderr_str}")
 
         if is_timeout:
-            result_parts.append(f"❌ Code execution timed out after {timeout}s. If you expect this code to take longer, try calling the tool again with a higher 'timeout' parameter (up to 3600s).")
+            result_parts.append(
+                f"❌ Code execution timed out after {timeout}s. If you expect this code to take longer, try calling the tool again with a higher 'timeout' parameter (up to 3600s)."
+            )
             return "\n\n".join(result_parts)
 
         if proc.returncode != 0:
@@ -13305,6 +13850,7 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
 
 # ─── Resource Discovery Executors ───────────────────────────────
 
+
 async def _discover_resources(agent_id: uuid.UUID, arguments: dict) -> str:
     """Search Smithery registry for MCP servers."""
     query = arguments.get("query", "")
@@ -13313,6 +13859,7 @@ async def _discover_resources(agent_id: uuid.UUID, arguments: dict) -> str:
     max_results = min(arguments.get("max_results", 5), 10)
 
     from app.services.resource_discovery import search_smithery
+
     return await search_smithery(query, max_results, agent_id=agent_id)
 
 
@@ -13347,16 +13894,14 @@ async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
     if parsed:
         if parsed.get("error") and not parsed.get("url"):
             return f"❌ {parsed['error']}"
-        if parsed.get("transport") == "stdio":          # stdio self-install via aio-sandbox hub
+        if parsed.get("transport") == "stdio":  # stdio self-install via aio-sandbox hub
             from app.services.resource_discovery import import_mcp_stdio_direct
+
             return await import_mcp_stdio_direct(agent_id, parsed)
         if parsed.get("url"):
             from app.services.resource_discovery import import_mcp_direct
-            server_name = (
-                arguments.get("server_name")
-                or parsed.get("name")
-                or arguments.get("server_id")
-            )
+
+            server_name = arguments.get("server_name") or parsed.get("name") or arguments.get("server_id")
             api_key = arguments.get("api_key") or parsed.get("api_key")
             headers = parsed.get("headers")
             warning = parsed.get("_warning")
@@ -13384,6 +13929,7 @@ async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
         if smithery_config is not None and not isinstance(smithery_config, dict):
             smithery_config = None
         from app.services.resource_discovery import import_mcp_from_smithery
+
         return await import_mcp_from_smithery(server_id, agent_id, smithery_config, reauthorize=reauthorize)
 
     return (
@@ -13419,9 +13965,7 @@ async def _handle_set_trigger(
     # contract unchanged and never let a model/client forge hidden routing
     # state through the free-form config object.
     config = {
-        key: value
-        for key, value in dict(arguments.get("config", {}) or {}).items()
-        if not str(key).startswith("_")
+        key: value for key, value in dict(arguments.get("config", {}) or {}).items() if not str(key).startswith("_")
     }
     reason = arguments.get("reason", "").strip()
     focus_ref = arguments.get("focus_ref", "") or arguments.get("agenda_ref", "")  # backward compat
@@ -13448,18 +13992,19 @@ async def _handle_set_trigger(
     if ttype == "cron":
         expr = config.get("expr", "")
         if not expr:
-            return "❌ cron trigger requires config.expr, e.g. {\"expr\": \"0 9 * * *\"}"
+            return '❌ cron trigger requires config.expr, e.g. {"expr": "0 9 * * *"}'
         try:
             from croniter import croniter
+
             croniter(expr)
         except Exception:
             return f"❌ Invalid cron expression: '{expr}'"
     elif ttype == "once":
         if not config.get("at"):
-            return "❌ once trigger requires config.at, e.g. {\"at\": \"2026-03-10T09:00:00+08:00\"}"
+            return '❌ once trigger requires config.at, e.g. {"at": "2026-03-10T09:00:00+08:00"}'
     elif ttype == "interval":
         if not config.get("minutes"):
-            return "❌ interval trigger requires config.minutes, e.g. {\"minutes\": 30}"
+            return '❌ interval trigger requires config.minutes, e.g. {"minutes": 30}'
     elif ttype == "poll":
         if not config.get("url"):
             return "❌ poll trigger requires config.url"
@@ -13471,14 +14016,10 @@ async def _handle_set_trigger(
         try:
             async with async_session() as _identity_db:
                 if raw_agent_id:
-                    resolved = await resolve_agent_recipient(
-                        _identity_db, agent_id, raw_agent_id
-                    )
+                    resolved = await resolve_agent_recipient(_identity_db, agent_id, raw_agent_id)
                     config["from_agent_id"] = str(resolved.target_agent.id)
                 else:
-                    resolved = await resolve_platform_user_recipient(
-                        _identity_db, agent_id, raw_user_id
-                    )
+                    resolved = await resolve_platform_user_recipient(_identity_db, agent_id, raw_user_id)
                     config["from_user_id"] = str(resolved.user.id)
         except RecipientResolutionError as exc:
             return exc.as_json()
@@ -13488,13 +14029,18 @@ async def _handle_set_trigger(
             from app.models.audit import ChatMessage
             from app.models.chat_session import ChatSession
             from sqlalchemy import cast as sa_cast, String as SaString
+
             async with async_session() as _snap_db:
-                _snap_q = select(ChatMessage.created_at).join(
-                    ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                ).where(
-                    ChatSession.agent_id == agent_id,
-                    ChatMessage.created_at.isnot(None),
-                ).order_by(ChatMessage.created_at.desc()).limit(1)
+                _snap_q = (
+                    select(ChatMessage.created_at)
+                    .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
+                    .where(
+                        ChatSession.agent_id == agent_id,
+                        ChatMessage.created_at.isnot(None),
+                    )
+                    .order_by(ChatMessage.created_at.desc())
+                    .limit(1)
+                )
                 _snap_r = await _snap_db.execute(_snap_q)
                 _latest_ts = _snap_r.scalar_one_or_none()
                 if _latest_ts:
@@ -13504,6 +14050,7 @@ async def _handle_set_trigger(
     elif ttype == "webhook":
         # Auto-generate a unique token for the webhook URL
         import secrets
+
         token = secrets.token_urlsafe(8)  # ~11 chars, URL-safe
         config["token"] = token
         wmode = arguments.get("webhook_mode", "legacy")
@@ -13511,9 +14058,7 @@ async def _handle_set_trigger(
             config["webhook_mode"] = wmode
             config["_webhook_queue"] = []
 
-    public_config = {
-        key: value for key, value in config.items() if not str(key).startswith("_")
-    }
+    public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
 
     # Record the session that created this trigger so trigger results can later be routed to
     # the correct destination instead of being broadcast to every live web session.
@@ -13532,21 +14077,14 @@ async def _handle_set_trigger(
                         config["_origin_turn_anchor_id"] = str(turn_anchor_id)
                         config["_origin_completion_barrier"] = True
                         origin_anchor = await _ctx_db.get(ChatMessage, turn_anchor_id)
-                        if (
-                            origin_anchor is not None
-                            and origin_anchor.conversation_id == str(origin_session.id)
-                        ):
+                        if origin_anchor is not None and origin_anchor.conversation_id == str(origin_session.id):
                             origin_meta = (
-                                origin_anchor.message_meta
-                                if isinstance(origin_anchor.message_meta, dict)
-                                else {}
+                                origin_anchor.message_meta if isinstance(origin_anchor.message_meta, dict) else {}
                             )
                             if origin_meta.get("actor_ref"):
                                 config["_origin_actor_ref"] = str(origin_meta["actor_ref"])
                             if origin_meta.get("actor_ref_type"):
-                                config["_origin_actor_ref_type"] = str(
-                                    origin_meta["actor_ref_type"]
-                                )
+                                config["_origin_actor_ref_type"] = str(origin_meta["actor_ref_type"])
                     # The active tool caller is authoritative.  Group IM
                     # sessions keep a creator placeholder in ChatSession.user_id.
                     if user_id:
@@ -13578,8 +14116,7 @@ async def _handle_set_trigger(
                             ChatMessage.role.in_(["assistant", "user"]),
                             ChatMessage.message_meta["direction"].as_string() == "outbound",
                             ChatMessage.message_meta["origin_session_id"].as_string() == str(session_id),
-                            ChatMessage.message_meta["origin_turn_anchor_id"].as_string()
-                            == str(turn_anchor_id),
+                            ChatMessage.message_meta["origin_turn_anchor_id"].as_string() == str(turn_anchor_id),
                         )
                         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
                     )
@@ -13610,9 +14147,7 @@ async def _handle_set_trigger(
                         config["_outbound_external_message_id"] = str(meta["external_message_id"])
                     if meta.get("actor_ref"):
                         config["_watch_actor_ref"] = str(meta["actor_ref"])
-                    watch_session = await _bind_db.get(
-                        ChatSession, uuid.UUID(str(outbound.conversation_id))
-                    )
+                    watch_session = await _bind_db.get(ChatSession, uuid.UUID(str(outbound.conversation_id)))
                     if watch_session is None:
                         return "❌ The sent message's conversation no longer exists"
                     owns_session = watch_session.agent_id == agent_id or (
@@ -13643,14 +14178,18 @@ async def _handle_set_trigger(
         async with async_session() as db:
             # Load agent to get per-agent trigger limit
             from app.models.agent import Agent as _AgentModel
+
             _a_result = await db.execute(select(_AgentModel).where(_AgentModel.id == agent_id))
             _agent_obj = _a_result.scalar_one_or_none()
             agent_max_triggers = (_agent_obj.max_triggers if _agent_obj else None) or MAX_TRIGGERS_PER_AGENT
 
             # Check max triggers
             from sqlalchemy import func as sa_func
+
             result = await db.execute(
-                select(sa_func.count()).select_from(AgentTrigger).where(
+                select(sa_func.count())
+                .select_from(AgentTrigger)
+                .where(
                     AgentTrigger.agent_id == agent_id,
                     AgentTrigger.is_enabled == True,
                 )
@@ -13739,9 +14278,16 @@ async def _handle_set_trigger(
         # Activity log
         try:
             from app.services.audit_logger import write_audit_log
-            await write_audit_log("trigger_created", {
-                "name": name, "type": ttype, "reason": reason[:100],
-            }, agent_id=agent_id)
+
+            await write_audit_log(
+                "trigger_created",
+                {
+                    "name": name,
+                    "type": ttype,
+                    "reason": reason[:100],
+                },
+                agent_id=agent_id,
+            )
         except Exception:
             pass
 
@@ -13753,6 +14299,7 @@ async def _handle_set_trigger(
         if ttype == "webhook":
             from app.core.domain import resolve_base_url
             from app.models.agent import Agent as _AgentModel
+
             async with async_session() as _url_db:
                 _a_r = await _url_db.execute(select(_AgentModel).where(_AgentModel.id == agent_id))
                 _agent = _a_r.scalar_one_or_none()
@@ -13816,10 +14363,12 @@ async def _handle_update_trigger(
     try:
         async with async_session() as db:
             result = await db.execute(
-                select(AgentTrigger).where(
+                select(AgentTrigger)
+                .where(
                     AgentTrigger.agent_id == agent_id,
                     AgentTrigger.name == name,
-                ).with_for_update()
+                )
+                .with_for_update()
             )
             trigger = result.scalar_one_or_none()
             if not trigger:
@@ -13843,9 +14392,7 @@ async def _handle_update_trigger(
                 if not isinstance(new_config, dict):
                     return "❌ Trigger config must be an object"
                 old_config = dict(trigger.config or {})
-                public_new = {
-                    key: value for key, value in new_config.items() if not str(key).startswith("_")
-                }
+                public_new = {key: value for key, value in new_config.items() if not str(key).startswith("_")}
                 if trigger.type == "on_message":
                     raw_agent_id = str(public_new.get("from_agent_id") or "").strip()
                     raw_user_id = str(public_new.get("from_user_id") or "").strip()
@@ -13853,22 +14400,16 @@ async def _handle_update_trigger(
                         return "❌ on_message config requires exactly one of from_agent_id or from_user_id"
                     try:
                         if raw_agent_id:
-                            recipient = await resolve_agent_recipient(
-                                db, agent_id, raw_agent_id
-                            )
+                            recipient = await resolve_agent_recipient(db, agent_id, raw_agent_id)
                             public_new["from_agent_id"] = str(recipient.target_agent.id)
                         else:
-                            recipient = await resolve_platform_user_recipient(
-                                db, agent_id, raw_user_id
-                            )
+                            recipient = await resolve_platform_user_recipient(db, agent_id, raw_user_id)
                             public_new["from_user_id"] = str(recipient.user.id)
                     except RecipientResolutionError as exc:
                         return exc.as_json()
                     public_new.pop("from_agent_name", None)
                     public_new.pop("from_user_name", None)
-                private_old = {
-                    key: value for key, value in old_config.items() if str(key).startswith("_")
-                }
+                private_old = {key: value for key, value in old_config.items() if str(key).startswith("_")}
                 old_target = (
                     old_config.get("from_agent_id"),
                     old_config.get("from_user_id"),
@@ -13913,9 +14454,7 @@ async def _handle_update_trigger(
                     "type": "on_message",
                     "reason": trigger.reason,
                     "focus_ref": trigger.focus_ref or "",
-                    "config": {
-                        key: value for key, value in cfg.items() if not str(key).startswith("_")
-                    },
+                    "config": {key: value for key, value in cfg.items() if not str(key).startswith("_")},
                 }
                 trigger.config = cfg
 
@@ -13923,9 +14462,15 @@ async def _handle_update_trigger(
 
         try:
             from app.services.audit_logger import write_audit_log
-            await write_audit_log("trigger_updated", {
-                "name": name, "changes": "; ".join(changes),
-            }, agent_id=agent_id)
+
+            await write_audit_log(
+                "trigger_updated",
+                {
+                    "name": name,
+                    "changes": "; ".join(changes),
+                },
+                agent_id=agent_id,
+            )
         except Exception:
             pass
 
@@ -13977,6 +14522,7 @@ async def _handle_cancel_trigger(
 
         try:
             from app.services.audit_logger import write_audit_log
+
             await write_audit_log("trigger_cancelled", {"name": name}, agent_id=agent_id)
         except Exception:
             pass
@@ -13996,9 +14542,11 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
     try:
         async with async_session() as db:
             result = await db.execute(
-                select(AgentTrigger).where(
+                select(AgentTrigger)
+                .where(
                     AgentTrigger.agent_id == agent_id,
-                ).order_by(AgentTrigger.created_at.desc())
+                )
+                .order_by(AgentTrigger.created_at.desc())
             )
             triggers = result.scalars().all()
 
@@ -14011,9 +14559,7 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         if not triggers:
             return "No triggers found. Use set_trigger to create one."
 
-        active_onmessage = sum(
-            1 for trigger in triggers if trigger.type == "on_message" and trigger.is_enabled
-        )
+        active_onmessage = sum(1 for trigger in triggers if trigger.type == "on_message" and trigger.is_enabled)
         total_onmessage = sum(1 for trigger in triggers if trigger.type == "on_message")
         lines = [
             f"on_message: {active_onmessage} active / {total_onmessage} total",
@@ -14028,9 +14574,7 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
                 config_str = f"token: {config['token']}"
                 webhook_url = f"{_base_url}/api/webhooks/t/{config['token']}"
             else:
-                public_config = {
-                    key: value for key, value in config.items() if not str(key).startswith("_")
-                }
+                public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
                 config_str = str(public_config)[:50]
                 webhook_url = "-"
             reason_str = t.reason[:40] if t.reason else ""
@@ -14042,12 +14586,8 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
 
         return "\n".join(lines)
 
-
-
-
     except Exception as e:
         return f"❌ Failed to list triggers: {e}"
-
 
 
 async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
@@ -14109,6 +14649,7 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
         form_data["file"] = url
         if not file_name:
             from urllib.parse import urlparse
+
             file_name = urlparse(url).path.split("/")[-1] or "image.jpg"
 
     if not file_name:
@@ -14163,8 +14704,8 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
         return f"❌ Upload error: {type(e).__name__}: {str(e)[:300]}"
 
 
-
 # ─── Image Generation (Multi-Provider) ────────────────────────────────────────
+
 
 async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provider: str) -> str:
     """Generate an image using the configured provider and save to workspace.
@@ -14221,21 +14762,24 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
                 api_key,
                 model or "black-forest-labs/FLUX.1-schnell",
                 base_url or "https://api.siliconflow.cn/v1",
-                prompt, size,
+                prompt,
+                size,
             )
         elif provider == "openai":
             image_bytes = await _generate_image_openai(
                 api_key,
                 model or "gpt-image-1",
                 base_url or "https://api.openai.com/v1",
-                prompt, size,
+                prompt,
+                size,
             )
         elif provider == "google":
             image_bytes = await _generate_image_google(
                 api_key,
                 model or "gemini-2.5-flash-image",
                 base_url or "https://generativelanguage.googleapis.com/v1beta",
-                prompt, size,
+                prompt,
+                size,
             )
         elif provider == "custom":
             image_bytes = await _generate_image_custom_api(
@@ -14282,9 +14826,7 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
         return f"❌ Image generation failed ({provider}): {err_msg[:400]}"
 
 
-async def _generate_image_siliconflow(
-    api_key: str, model: str, base_url: str, prompt: str, size: str
-) -> bytes:
+async def _generate_image_siliconflow(api_key: str, model: str, base_url: str, prompt: str, size: str) -> bytes:
     """Generate image via SiliconFlow (OpenAI-compatible images.generate API).
 
     SiliconFlow returns a temporary URL (expires in ~1 hour), so we download
@@ -14330,9 +14872,7 @@ async def _generate_image_siliconflow(
         raise ValueError(f"No image URL or b64_json in SiliconFlow response: {data}")
 
 
-async def _generate_image_openai(
-    api_key: str, model: str, base_url: str, prompt: str, size: str
-) -> bytes:
+async def _generate_image_openai(api_key: str, model: str, base_url: str, prompt: str, size: str) -> bytes:
     """Generate image via OpenAI GPT Image API.
 
     Requests b64_json format to avoid dealing with URL expiry.
@@ -14413,11 +14953,7 @@ def _render_json_template(template_json: str, variables: dict[str, str]) -> dict
 
     candidates = [template_text]
     normalized_quotes = (
-        template_text
-        .replace("\u201c", '"')
-        .replace("\u201d", '"')
-        .replace("\u2018", "'")
-        .replace("\u2019", "'")
+        template_text.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
     )
     if normalized_quotes != template_text:
         candidates.append(normalized_quotes)
@@ -14513,9 +15049,7 @@ def _find_first_image_reference(data: Any) -> Any:
                 if found:
                     return found
         elif isinstance(value, str) and (
-            value.startswith("data:image")
-            or value.startswith("http://")
-            or value.startswith("https://")
+            value.startswith("data:image") or value.startswith("http://") or value.startswith("https://")
         ):
             return value
         return None
@@ -14637,9 +15171,7 @@ async def _generate_image_custom_api(
         return await _custom_image_reference_to_bytes(image_ref, client)
 
 
-async def _generate_image_google(
-    api_key: str, model: str, base_url: str, prompt: str, size: str
-) -> bytes:
+async def _generate_image_google(api_key: str, model: str, base_url: str, prompt: str, size: str) -> bytes:
     """Generate image via Google Gemini Native Image API (Nano Banana) or Vertex AI.
 
     Uses the Gemini generateContent endpoint with responseModalities=["IMAGE"].
@@ -14711,6 +15243,7 @@ async def _generate_image_google(
 
 # ─── Feishu Helper ────────────────────────────────────────────────────────────
 
+
 async def _get_feishu_token(agent_id: uuid.UUID) -> tuple[str, str] | None:
     """Get (app_id, app_access_token) for the agent's configured Feishu channel."""
     import httpx
@@ -14745,6 +15278,7 @@ async def _get_agent_calendar_id(token: str) -> tuple[str | None, str | None]:
     Returns (calendar_id, None) on success, or (None, human_readable_error) on failure.
     """
     import httpx
+
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary",
@@ -14775,6 +15309,7 @@ async def _get_agent_calendar_id(token: str) -> tuple[str | None, str | None]:
 async def _feishu_resolve_open_id(token: str, email: str) -> str | None:
     """Resolve a user's open_id from their email."""
     import httpx
+
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             "https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id",
@@ -14795,6 +15330,7 @@ async def _feishu_resolve_open_id(token: str, email: str) -> str | None:
 def _iso_to_ts(iso_str: str) -> float:
     """Convert ISO 8601 string to Unix timestamp."""
     from datetime import datetime as _dt
+
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
         try:
             if iso_str.endswith("Z"):
@@ -14814,11 +15350,11 @@ async def _get_feishu_credentials(agent_id: uuid.UUID) -> tuple[str, str]:
     """
     from app.models.channel_config import ChannelConfig
     from app.config import get_settings
-    
+
     settings = get_settings()
     app_id = settings.FEISHU_APP_ID
     app_secret = settings.FEISHU_APP_SECRET
-    
+
     try:
         async with async_session() as db:
             result = await db.execute(
@@ -14830,7 +15366,7 @@ async def _get_feishu_credentials(agent_id: uuid.UUID) -> tuple[str, str]:
                 app_secret = config.app_secret
     except Exception:
         pass
-        
+
     return app_id, app_secret
 
 
@@ -14849,6 +15385,7 @@ async def _get_feishu_tenant_doc_url(tenant_token: str, doc_token: str, doc_type
         A fully-formed URL string.
     """
     import httpx
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -14866,8 +15403,6 @@ async def _get_feishu_tenant_doc_url(tenant_token: str, doc_token: str, doc_type
     return f"https://feishu.cn/{doc_type}/{doc_token}"
 
 
-
-
 async def _get_feishu_bitable_url(tenant_token: str, app_token: str, table_id: str = "") -> str:
     """Build a user-accessible Bitable URL using the tenant's actual domain.
 
@@ -14882,6 +15417,7 @@ async def _get_feishu_bitable_url(tenant_token: str, app_token: str, table_id: s
         A fully-formed URL string.
     """
     import httpx
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -14910,41 +15446,43 @@ def _parse_feishu_url(url: str) -> dict:
     Supports Bitable (table, view) and Docx.
     """
     import re
+
     result = {}
-    
+
     # Bitable URL regex: e.g., https://example.feishu.cn/base/{app_token}?table={table_id}&view={view_id}
-    base_match = re.search(r'/base/([a-zA-Z0-9_]+)', url)
+    base_match = re.search(r"/base/([a-zA-Z0-9_]+)", url)
     if base_match:
-        result['app_token'] = base_match.group(1)
-        
-    table_match = re.search(r'table=([a-zA-Z0-9_]+)', url)
+        result["app_token"] = base_match.group(1)
+
+    table_match = re.search(r"table=([a-zA-Z0-9_]+)", url)
     if table_match:
-        result['table_id'] = table_match.group(1)
-    
+        result["table_id"] = table_match.group(1)
+
     # support URL with /tblxxxxxx
-    if not 'table_id' in result:
-        tbl_match = re.search(r'/(tbl[a-zA-Z0-9_]+)', url)
+    if not "table_id" in result:
+        tbl_match = re.search(r"/(tbl[a-zA-Z0-9_]+)", url)
         if tbl_match:
-            result['table_id'] = tbl_match.group(1)
-            
-    view_match = re.search(r'view=([a-zA-Z0-9_]+)', url)
+            result["table_id"] = tbl_match.group(1)
+
+    view_match = re.search(r"view=([a-zA-Z0-9_]+)", url)
     if view_match:
-        result['view_id'] = view_match.group(1)
-        
+        result["view_id"] = view_match.group(1)
+
     # Docx URL regex
-    docx_match = re.search(r'/docx/([a-zA-Z0-9_]+)', url)
+    docx_match = re.search(r"/docx/([a-zA-Z0-9_]+)", url)
     if docx_match:
-        result['document_token'] = docx_match.group(1)
-        
+        result["document_token"] = docx_match.group(1)
+
     # Wiki URL regex
-    wiki_match = re.search(r'/wiki/([a-zA-Z0-9_]+)', url)
+    wiki_match = re.search(r"/wiki/([a-zA-Z0-9_]+)", url)
     if wiki_match:
-        result['wiki_token'] = wiki_match.group(1)
-        
+        result["wiki_token"] = wiki_match.group(1)
+
     return result
 
 
 # ─── Feishu Bitable Tools ──────────────────────────────────────────
+
 
 async def _resolve_bitable_app_token(agent_id: uuid.UUID, parsed_url: dict) -> str | None:
     app_token = parsed_url.get("app_token")
@@ -14955,11 +15493,13 @@ async def _resolve_bitable_app_token(agent_id: uuid.UUID, parsed_url: dict) -> s
         app_id, app_secret = await _get_feishu_credentials(agent_id)
         if app_id and app_secret:
             from app.services.feishu_service import feishu_service
+
             token = await feishu_service.get_tenant_access_token(app_id, app_secret)
             node_info = await _feishu_wiki_get_node(wiki_token, token)
             if node_info and node_info.get("obj_token"):
                 return node_info["obj_token"]
     return None
+
 
 def _check_feishu_err(resp: dict) -> str | None:
     """Check Feishu API response for errors and return a user-friendly message.
@@ -15006,6 +15546,7 @@ def _check_feishu_err(resp: dict) -> str | None:
         return f"Failed: API Error {code} - {msg}"
     return None
 
+
 async def _bitable_list_tables(agent_id: uuid.UUID, arguments: dict) -> str:
     """List all tables in a Feishu Bitable app."""
     url = arguments.get("url", "")
@@ -15013,17 +15554,19 @@ async def _bitable_list_tables(agent_id: uuid.UUID, arguments: dict) -> str:
     app_token = await _resolve_bitable_app_token(agent_id, parsed)
     if not app_token:
         return "Failed: Could not extract Bitable app_token from the URL (also could not resolve wiki_token)."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "Failed: Feishu app credentials not configured for this agent."
-        
+
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.bitable_list_tables(app_id, app_secret, app_token)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         tables = resp.get("data", {}).get("items", [])
         if not tables:
             return "OK: No tables found in this Bitable."
@@ -15053,6 +15596,7 @@ async def _bitable_create_app(agent_id: uuid.UUID, arguments: dict) -> str:
         return "Failed: Feishu app credentials not configured for this agent."
 
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.bitable_create_app(app_id, app_secret, name, folder_token)
         err = _check_feishu_err(resp)
@@ -15072,12 +15616,7 @@ async def _bitable_create_app(agent_id: uuid.UUID, arguments: dict) -> str:
             tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
             bitable_url = await _get_feishu_bitable_url(tenant_token, app_token)
 
-        result = (
-            f"OK: Bitable created successfully!\n"
-            f"Name: {name}\n"
-            f"App Token: {app_token}\n"
-            f"URL: {bitable_url}"
-        )
+        result = f"OK: Bitable created successfully!\nName: {name}\nApp Token: {app_token}\nURL: {bitable_url}"
         if default_table_id:
             result += f"\nDefault Table ID: {default_table_id}"
         return result
@@ -15089,23 +15628,25 @@ async def _bitable_list_fields(agent_id: uuid.UUID, arguments: dict) -> str:
     """List all fields (columns) in a specific Bitable table."""
     url = arguments.get("url", "")
     table_id = arguments.get("table_id", "")
-    
+
     parsed = _parse_feishu_url(url)
     app_token = await _resolve_bitable_app_token(agent_id, parsed)
     table_id = table_id or parsed.get("table_id")
-    
+
     if not app_token:
         return "Failed: Could not extract Bitable app_token from the URL."
     if not table_id:
         return "Failed: table_id is required. Provide it as a parameter or include it in the URL."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.bitable_list_fields(app_id, app_secret, app_token, table_id)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         fields = resp.get("data", {}).get("items", [])
         if not fields:
             return "OK: No fields found in this table."
@@ -15114,24 +15655,27 @@ async def _bitable_list_fields(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 async def _bitable_query_records(agent_id: uuid.UUID, arguments: dict) -> str:
     """Query records (rows) from a Bitable table, with optional FQL filter."""
     url = arguments.get("url", "")
     table_id = arguments.get("table_id", "")
     filter_info = arguments.get("filter_info", "")
     max_results = arguments.get("max_results", 100)
-    
+
     parsed = _parse_feishu_url(url)
     app_token = await _resolve_bitable_app_token(agent_id, parsed)
     table_id = table_id or parsed.get("table_id")
-    
+
     if not app_token or not table_id:
         return "Failed: Could not resolve app_token or table_id from the provided parameters/URL."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     from app.services.feishu_service import feishu_service
+
     try:
         import json
+
         filters_dict = {}
         if isinstance(filter_info, dict):
             filters_dict = filter_info
@@ -15139,16 +15683,17 @@ async def _bitable_query_records(agent_id: uuid.UUID, arguments: dict) -> str:
             try:
                 filters_dict = json.loads(filter_info)
             except:
-                pass 
-                
+                pass
+
         resp = await feishu_service.bitable_query_records(app_id, app_secret, app_token, table_id, filters_dict)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         records = resp.get("data", {}).get("items", [])
         if not records:
             return "OK: No matching records found."
-        
+
         lines = []
         for r in records[:max_results]:
             lines.append(f"Record {r.get('record_id')}: {json.dumps(r.get('fields', {}), ensure_ascii=False)}")
@@ -15156,32 +15701,36 @@ async def _bitable_query_records(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 async def _bitable_create_record(agent_id: uuid.UUID, arguments: dict) -> str:
     """Create a new record (row) in a Bitable table."""
     url = arguments.get("url", "")
     table_id = arguments.get("table_id", "")
     fields_str = arguments.get("fields", "{}")
-    
+
     parsed = _parse_feishu_url(url)
     app_token = await _resolve_bitable_app_token(agent_id, parsed)
     table_id = table_id or parsed.get("table_id")
-    
+
     if not app_token or not table_id:
         return "Failed: Could not resolve app_token or table_id from the provided parameters/URL."
-        
+
     import json
+
     try:
         fields = json.loads(fields_str)
     except json.JSONDecodeError:
         return "Failed: The 'fields' parameter is not valid JSON."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.bitable_create_record(app_id, app_secret, app_token, table_id, fields)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         record = resp.get("data", {}).get("record", {})
         # Provide a user-accessible link so they can verify the new row in the table
         tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
@@ -15194,33 +15743,37 @@ async def _bitable_create_record(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 async def _bitable_update_record(agent_id: uuid.UUID, arguments: dict) -> str:
     """Update an existing record in a Bitable table by record_id."""
     url = arguments.get("url", "")
     table_id = arguments.get("table_id", "")
     record_id = arguments.get("record_id", "")
     fields_str = arguments.get("fields", "{}")
-    
+
     parsed = _parse_feishu_url(url)
     app_token = await _resolve_bitable_app_token(agent_id, parsed)
     table_id = table_id or parsed.get("table_id")
-    
+
     if not app_token or not table_id or not record_id:
         return "Failed: Missing required parameters. Need app_token (from URL), table_id, and record_id."
-        
+
     import json
+
     try:
         fields = json.loads(fields_str)
     except json.JSONDecodeError:
         return "Failed: The 'fields' parameter is not valid JSON."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.bitable_update_record(app_id, app_secret, app_token, table_id, record_id, fields)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         record = resp.get("data", {}).get("record", {})
         # Provide a user-accessible link so they can verify the updated row
         tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
@@ -15233,26 +15786,29 @@ async def _bitable_update_record(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 async def _bitable_delete_record(agent_id: uuid.UUID, arguments: dict) -> str:
     """Delete a record from a Bitable table by record_id."""
     url = arguments.get("url", "")
     table_id = arguments.get("table_id", "")
     record_id = arguments.get("record_id", "")
-    
+
     parsed = _parse_feishu_url(url)
     app_token = await _resolve_bitable_app_token(agent_id, parsed)
     table_id = table_id or parsed.get("table_id")
-    
+
     if not app_token or not table_id or not record_id:
         return "Failed: Missing required parameters. Need app_token (from URL), table_id, and record_id."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.bitable_delete_record(app_id, app_secret, app_token, table_id, record_id)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         # Provide a user-accessible link so they can verify the deletion
         tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
         bitable_url = await _get_feishu_bitable_url(tenant_token, app_token, table_id)
@@ -15263,6 +15819,7 @@ async def _bitable_delete_record(agent_id: uuid.UUID, arguments: dict) -> str:
 
 # ─── Feishu Document Tools ──────────────────────────────────────────
 
+
 async def _resolve_docx_document_token(agent_id: uuid.UUID, parsed_url: dict) -> str | None:
     doc_token = parsed_url.get("document_token")
     if doc_token:
@@ -15272,11 +15829,13 @@ async def _resolve_docx_document_token(agent_id: uuid.UUID, parsed_url: dict) ->
         app_id, app_secret = await _get_feishu_credentials(agent_id)
         if app_id and app_secret:
             from app.services.feishu_service import feishu_service
+
             token = await feishu_service.get_tenant_access_token(app_id, app_secret)
             node_info = await _feishu_wiki_get_node(wiki_token, token)
             if node_info and node_info.get("obj_token"):
                 return node_info["obj_token"]
     return None
+
 
 async def _feishu_read_doc(agent_id: uuid.UUID, arguments: dict) -> str:
     """Read full text content of a Feishu Docx."""
@@ -15285,17 +15844,19 @@ async def _feishu_read_doc(agent_id: uuid.UUID, arguments: dict) -> str:
     doc_token = await _resolve_docx_document_token(agent_id, parsed)
     if not doc_token:
         return "Failed: Could not extract Document token from the URL."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "Failed: Feishu app credentials not configured for this agent."
-        
+
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.read_feishu_doc(app_id, app_secret, doc_token)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         content = resp.get("data", {}).get("content", "")
         if not content:
             return "OK: Document is empty or content is unavailable."
@@ -15303,21 +15864,24 @@ async def _feishu_read_doc(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 async def _feishu_create_doc(agent_id: uuid.UUID, arguments: dict) -> str:
     """Create a new blank Feishu Docx."""
     title = arguments.get("title", "Untitled Document")
     folder_token = arguments.get("folder_token", "")
-    
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "Failed: Feishu app credentials not configured for this agent."
-        
+
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.create_feishu_doc(app_id, app_secret, folder_token or None, title)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         doc = resp.get("data", {}).get("document", {})
         doc_id = doc.get("document_id")
         # Get the tenant's actual domain (open.feishu.cn is the API gateway, not for users)
@@ -15327,39 +15891,45 @@ async def _feishu_create_doc(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 async def _feishu_append_doc(agent_id: uuid.UUID, arguments: dict) -> str:
     """Append text to the bottom of a Feishu Docx."""
     url = arguments.get("url", "")
     content = arguments.get("content", "")
     if not content:
         return "Failed: Content to append cannot be empty."
-        
+
     parsed = _parse_feishu_url(url)
     doc_token = await _resolve_docx_document_token(agent_id, parsed)
     if not doc_token:
         return "Failed: Could not extract Document token from the URL."
-        
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "Failed: Feishu app credentials not configured for this agent."
-        
+
     from app.services.feishu_service import feishu_service
+
     try:
         # Feishu uses the document_id as the root block_id to append entirely to the document
         resp = await feishu_service.append_feishu_doc(app_id, app_secret, doc_token, content)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         return "OK: Content appended successfully to the end of the document."
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
+
 # ─── Feishu Wiki Tools ───────────────────────────────────────────────────────
+
 
 async def _feishu_wiki_get_node(token_str: str, auth_token: str) -> dict | None:
     """Call wiki get_node API to resolve a wiki node token → {obj_token, space_id, has_child, title}.
     Returns None if the token is not a wiki node."""
     import httpx
+
     async with httpx.AsyncClient(timeout=5) as client:
         r = await client.get(
             "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node",
@@ -15455,11 +16025,11 @@ async def _feishu_doc_search(agent_id: uuid.UUID, arguments: dict) -> str:
 
     lines.append("")
     lines.append("💡 后续操作建议：")
-    lines.append("- 读取普通文档/知识库页：`feishu_doc_read(document_token=\"...\")`")
-    lines.append("- 管理权限：`feishu_drive_share(document_token=\"...\", doc_type=\"...\", action=\"list|add|remove\")`")
-    lines.append("- 删除文件：`feishu_drive_delete(file_token=\"...\", file_type=\"...\")`")
+    lines.append('- 读取普通文档/知识库页：`feishu_doc_read(document_token="...")`')
+    lines.append('- 管理权限：`feishu_drive_share(document_token="...", doc_type="...", action="list|add|remove")`')
+    lines.append('- 删除文件：`feishu_drive_delete(file_token="...", file_type="...")`')
     if has_more:
-        lines.append(f"- 下一页：`feishu_doc_search(query=\"{query}\", offset={offset + len(entities)}, count={count})`")
+        lines.append(f'- 下一页：`feishu_doc_search(query="{query}", offset={offset + len(entities)}, count={count})`')
 
     return "\n".join(lines)
 
@@ -15478,6 +16048,7 @@ async def _feishu_wiki_list(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -15535,8 +16106,8 @@ async def _feishu_wiki_list(agent_id: uuid.UUID, arguments: dict) -> str:
             f"{indent}  obj_token: `{p['obj_token']}`"
         )
     lines.append(
-        "\n💡 用 `feishu_doc_read(document_token=\"<node_token>\")` 读取每个子页面的内容。"
-        "\n   对有子页面的条目，再次调用 `feishu_wiki_list(node_token=\"...\")` 继续展开。"
+        '\n💡 用 `feishu_doc_read(document_token="<node_token>")` 读取每个子页面的内容。'
+        '\n   对有子页面的条目，再次调用 `feishu_wiki_list(node_token="...")` 继续展开。'
     )
     return "\n".join(lines)
 
@@ -15547,7 +16118,7 @@ async def _feishu_doc_read(agent_id: uuid.UUID, arguments: dict) -> str:
         url = arguments.get("url", "")
         parsed = _parse_feishu_url(url)
         document_token = parsed.get("document_token", parsed.get("wiki_token", ""))
-        
+
     if not document_token:
         return "Failed: Missing required argument 'document_token'"
     max_chars = min(int(arguments.get("max_chars", 6000)), 20000)
@@ -15557,8 +16128,9 @@ async def _feishu_doc_read(agent_id: uuid.UUID, arguments: dict) -> str:
         return "Failed: Feishu app credentials not configured for this agent."
 
     from app.services.feishu_service import feishu_service
+
     tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
-    
+
     read_token = document_token
     wiki_hint = ""
     node_info = await _feishu_wiki_get_node(document_token, tenant_token)
@@ -15573,8 +16145,9 @@ async def _feishu_doc_read(agent_id: uuid.UUID, arguments: dict) -> str:
     try:
         resp = await feishu_service.read_feishu_doc(app_id, app_secret, read_token)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         content = resp.get("data", {}).get("content", "")
         if not content:
             return f"📄 Document '{document_token}' is empty.{wiki_hint}"
@@ -15603,6 +16176,7 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
     parent_node_token = (arguments.get("parent_node_token") or "").strip()
 
     from app.services.feishu_service import feishu_service
+
     tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     try:
@@ -15636,6 +16210,7 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
                 body["parent_node_token"] = parent_node_token
 
             import logging
+
             _wiki_log = logging.getLogger("feishu_wiki_create")
             _wiki_log.info(f"Creating wiki node in space={wiki_space_id}, body={body}")
 
@@ -15664,18 +16239,19 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
                 f"文档 Token（用于 feishu_doc_append）：{doc_token}\n"
                 f"Wiki Node Token：{node_token}\n"
                 f"🔗 访问链接：{doc_url}\n"
-                f"下一步：调用 feishu_doc_append(document_token=\"{doc_token}\", content=\"...\") 写入正文内容。"
+                f'下一步：调用 feishu_doc_append(document_token="{doc_token}", content="...") 写入正文内容。'
             )
 
         # ── Regular Drive branch (original behavior) ─────────────────────
         resp = await feishu_service.create_feishu_doc(app_id, app_secret, folder_token, title)
         err = _check_feishu_err(resp)
-        if err: return err
-        
+        if err:
+            return err
+
         doc = resp.get("data", {}).get("document", {})
         doc_token = doc.get("document_id", "")
         doc_url = await _get_feishu_tenant_doc_url(tenant_token, doc_token)
-        
+
         # Auto-share with the Feishu sender so they can access the document.
         # channel_feishu_sender_open_id is a module-level ContextVar defined in this file;
         # no import needed — it is already in scope.
@@ -15707,7 +16283,7 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
             f"标题：{title}\n"
             f"Token：{doc_token}\n"
             f"🔗 访问链接：{doc_url}\n"
-            f"下一步：调用 feishu_doc_append(document_token=\"{doc_token}\", content=\"...\") 写入正文内容。"
+            f'下一步：调用 feishu_doc_append(document_token="{doc_token}", content="...") 写入正文内容。'
         )
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
@@ -15730,11 +16306,11 @@ def _parse_inline_markdown(text: str) -> list[dict]:
 
     elements = []
     # Only handle **bold**, *italic*, ~~strikethrough~~; backticks become plain text
-    pattern = r'(\*\*(.+?)\*\*|\*(.+?)\*|~~(.+?)~~|`(.+?)`)'
+    pattern = r"(\*\*(.+?)\*\*|\*(.+?)\*|~~(.+?)~~|`(.+?)`)"
     pos = 0
     for m in _re.finditer(pattern, text):
         if m.start() > pos:
-            elements.append(_make_run(text[pos:m.start()]))
+            elements.append(_make_run(text[pos : m.start()]))
         raw = m.group(0)
         if raw.startswith("**"):
             elements.append(_make_run(m.group(2), {"bold": True}))
@@ -15768,8 +16344,7 @@ def _markdown_to_feishu_blocks(markdown: str) -> list[dict]:
     """
     import re as _re
 
-    _HEADING_BLOCK = {1: (3, "heading1"), 2: (4, "heading2"),
-                      3: (5, "heading3"), 4: (6, "heading4")}
+    _HEADING_BLOCK = {1: (3, "heading1"), 2: (4, "heading2"), 3: (5, "heading3"), 4: (6, "heading4")}
 
     def _text_block(bt: int, key: str, line: str) -> dict:
         # Omit "style" entirely to avoid Feishu field validation errors on empty style dicts
@@ -15792,35 +16367,54 @@ def _markdown_to_feishu_blocks(markdown: str) -> list[dict]:
             while i < len(lines) and not lines[i].strip().startswith("```"):
                 code_lines.append(lines[i])
                 i += 1
-            blocks.append({
-                "block_type": 14,
-                "code": {
-                    "elements": [{"text_run": {"content": "\n".join(code_lines)}}],
-                    "style": {"language": 1 if not lang else
-                              {"python": 49, "javascript": 22, "js": 22,
-                               "typescript": 56, "ts": 56, "bash": 4, "sh": 4,
-                               "sql": 53, "java": 21, "go": 17, "rust": 51,
-                               "json": 25, "yaml": 60, "html": 19, "css": 10,
-                               }.get(lang.lower(), 1)},
-                },
-            })
+            blocks.append(
+                {
+                    "block_type": 14,
+                    "code": {
+                        "elements": [{"text_run": {"content": "\n".join(code_lines)}}],
+                        "style": {
+                            "language": 1
+                            if not lang
+                            else {
+                                "python": 49,
+                                "javascript": 22,
+                                "js": 22,
+                                "typescript": 56,
+                                "ts": 56,
+                                "bash": 4,
+                                "sh": 4,
+                                "sql": 53,
+                                "java": 21,
+                                "go": 17,
+                                "rust": 51,
+                                "json": 25,
+                                "yaml": 60,
+                                "html": 19,
+                                "css": 10,
+                            }.get(lang.lower(), 1)
+                        },
+                    },
+                }
+            )
             i += 1
             continue
 
         # ── Divider ──────────────────────────────────────────────────────────
-        if _re.fullmatch(r'[-*_]{3,}', line.strip()):
+        if _re.fullmatch(r"[-*_]{3,}", line.strip()):
             # NOTE: block_type 22 (Feishu native divider) is rejected by the batch children
             # creation API with error 99992402 (field validation failed).  Render as a plain
             # text block containing a visual em-dash separator instead — always accepted.
-            blocks.append({
-                "block_type": 2,
-                "text": {"elements": [{"text_run": {"content": "\u2500" * 24}}]},
-            })
+            blocks.append(
+                {
+                    "block_type": 2,
+                    "text": {"elements": [{"text_run": {"content": "\u2500" * 24}}]},
+                }
+            )
             i += 1
             continue
 
         # ── Headings ─────────────────────────────────────────────────────────
-        hm = _re.match(r'^(#{1,4})\s+(.*)', line)
+        hm = _re.match(r"^(#{1,4})\s+(.*)", line)
         if hm:
             level = min(len(hm.group(1)), 4)
             bt, key = _HEADING_BLOCK[level]
@@ -15829,15 +16423,15 @@ def _markdown_to_feishu_blocks(markdown: str) -> list[dict]:
             continue
 
         # ── Bullet list ──────────────────────────────────────────────────────
-        if _re.match(r'^[\-\*\+]\s+', line):
-            text = _re.sub(r'^[\-\*\+]\s+', '', line)
+        if _re.match(r"^[\-\*\+]\s+", line):
+            text = _re.sub(r"^[\-\*\+]\s+", "", line)
             blocks.append(_text_block(12, "bullet", text))
             i += 1
             continue
 
         # ── Ordered list ─────────────────────────────────────────────────────
-        if _re.match(r'^\d+\.\s+', line):
-            text = _re.sub(r'^\d+\.\s+', '', line)
+        if _re.match(r"^\d+\.\s+", line):
+            text = _re.sub(r"^\d+\.\s+", "", line)
             blocks.append(_text_block(13, "ordered", text))
             i += 1
             continue
@@ -15850,15 +16444,17 @@ def _markdown_to_feishu_blocks(markdown: str) -> list[dict]:
 
         # ── Empty line → empty text block ────────────────────────────────────
         if line.strip() == "":
-            blocks.append({
-                "block_type": 2,
-                "text": {"elements": [{"text_run": {"content": " "}}]},
-            })
+            blocks.append(
+                {
+                    "block_type": 2,
+                    "text": {"elements": [{"text_run": {"content": " "}}]},
+                }
+            )
             i += 1
             continue
 
         # ── Markdown table separator line (|---|---| ) → skip ───────────────
-        if _re.match(r'^\|[\s\-:]+(\|[\s\-:]+)*\|?\s*$', line.strip()):
+        if _re.match(r"^\|[\s\-:]+(\|[\s\-:]+)*\|?\s*$", line.strip()):
             i += 1
             continue
 
@@ -15884,7 +16480,7 @@ async def _feishu_doc_append(agent_id: uuid.UUID, arguments: dict) -> str:
         url = arguments.get("url", "")
         parsed = _parse_feishu_url(url)
         document_token = parsed.get("document_token", parsed.get("wiki_token", ""))
-        
+
     content = arguments.get("content", "").strip()
     if not document_token:
         return "Failed: Missing required argument 'document_token'"
@@ -15896,6 +16492,7 @@ async def _feishu_doc_append(agent_id: uuid.UUID, arguments: dict) -> str:
         return "Failed: Feishu app credentials not configured for this agent."
 
     from app.services.feishu_service import feishu_service
+
     tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     # For wiki node tokens, use the obj_token for the docx API
@@ -15904,43 +16501,45 @@ async def _feishu_doc_append(agent_id: uuid.UUID, arguments: dict) -> str:
 
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=20) as client:
-            meta_resp = (await client.get(
-                f"https://open.feishu.cn/open-apis/docx/v1/documents/{docx_token}",
-                headers={"Authorization": f"Bearer {tenant_token}"},
-            )).json()
-            err = _check_feishu_err(meta_resp)
-            if err: return err
 
-            body_block_id = (
-                meta_resp.get("data", {}).get("document", {}).get("body", {}).get("block_id")
-                or docx_token
-            )
+        async with httpx.AsyncClient(timeout=20) as client:
+            meta_resp = (
+                await client.get(
+                    f"https://open.feishu.cn/open-apis/docx/v1/documents/{docx_token}",
+                    headers={"Authorization": f"Bearer {tenant_token}"},
+                )
+            ).json()
+            err = _check_feishu_err(meta_resp)
+            if err:
+                return err
+
+            body_block_id = meta_resp.get("data", {}).get("document", {}).get("body", {}).get("block_id") or docx_token
 
             children = _markdown_to_feishu_blocks(content)
 
-            result = (await client.post(
-                f"https://open.feishu.cn/open-apis/docx/v1/documents/{docx_token}/blocks/{body_block_id}/children",
-                # Do NOT pass index: -1.  Omitting the field lets Feishu default to
-                # append-at-end, which is always valid.  Passing -1 explicitly can
-                # trigger error 1770001 (invalid param) with certain block type mixes.
-                json={"children": children},
-                headers={"Authorization": f"Bearer {tenant_token}"},
-            )).json()
+            result = (
+                await client.post(
+                    f"https://open.feishu.cn/open-apis/docx/v1/documents/{docx_token}/blocks/{body_block_id}/children",
+                    # Do NOT pass index: -1.  Omitting the field lets Feishu default to
+                    # append-at-end, which is always valid.  Passing -1 explicitly can
+                    # trigger error 1770001 (invalid param) with certain block type mixes.
+                    json={"children": children},
+                    headers={"Authorization": f"Bearer {tenant_token}"},
+                )
+            ).json()
 
             err = _check_feishu_err(result)
-            if err: return err
+            if err:
+                return err
 
         doc_url = await _get_feishu_tenant_doc_url(tenant_token, docx_token)
-        return (
-            f"✅ 已写入 {len(children)} 个段落到文档。\n"
-            f"🔗 文档直链（原文发给用户，勿修改）：{doc_url}"
-        )
+        return f"✅ 已写入 {len(children)} 个段落到文档。\n🔗 文档直链（原文发给用户，勿修改）：{doc_url}"
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
 
 # ─── Feishu Drive Share (All File Types) ────────────────────────────────────────
+
 
 async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
     """Manage Feishu drive file collaborators.
@@ -15962,6 +16561,7 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -15995,11 +16595,7 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
                     "请直接在飞书知识库中管理成员权限。"
                 )
             if _c in (99991672, 99991668):
-                return (
-                    f"❌ 权限不足（code {_c}）\n"
-                    "需要在飞书开放平台开通：\n"
-                    "• drive:drive（云文档权限管理）"
-                )
+                return f"❌ 权限不足（code {_c}）\n需要在飞书开放平台开通：\n• drive:drive（云文档权限管理）"
             return f"❌ 获取协作者列表失败：{data.get('msg')} (code {_c})"
 
         members = data.get("data", {}).get("items", [])
@@ -16007,30 +16603,24 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
             return f"📄 文档 `{document_token}` 当前没有其他协作者。"
 
         provider_ids = [
-            str(m.get("member_id") or "")
-            for m in members
-            if m.get("member_type") == "openid" and m.get("member_id")
+            str(m.get("member_id") or "") for m in members if m.get("member_type") == "openid" and m.get("member_id")
         ]
         identity_map: dict[str, tuple[str, str]] = {}
         if provider_ids:
             async with async_session() as identity_db:
-                agent_result = await identity_db.execute(
-                    select(AgentModel).where(AgentModel.id == agent_id)
-                )
+                agent_result = await identity_db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 source_agent = agent_result.scalar_one_or_none()
                 if source_agent:
                     rows = await identity_db.execute(
-                        select(OrgMember, UserModel).join(
-                            UserModel, OrgMember.user_id == UserModel.id
-                        ).where(
+                        select(OrgMember, UserModel)
+                        .join(UserModel, OrgMember.user_id == UserModel.id)
+                        .where(
                             OrgMember.tenant_id == source_agent.tenant_id,
                             OrgMember.open_id.in_(provider_ids),
                         )
                     )
                     for member, user in rows.all():
-                        identity_map[str(member.open_id)] = (
-                            str(user.id), user.display_name
-                        )
+                        identity_map[str(member.open_id)] = (str(user.id), user.display_name)
         lines = [f"📄 文档 `{document_token}` 的协作者列表（共 {len(members)} 人）：\n"]
         for m in members:
             perm = m.get("perm", "")
@@ -16039,9 +16629,7 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
             canonical = identity_map.get(str(member_id))
             if member_type == "openid" and canonical:
                 user_id, display_name = canonical
-                lines.append(
-                    f"• {display_name} | user_id: `{user_id}` | 权限: **{perm}**"
-                )
+                lines.append(f"• {display_name} | user_id: `{user_id}` | 权限: **{perm}**")
             else:
                 lines.append(f"• 非用户协作者或未映射用户 | 权限: **{perm}**")
         return "\n".join(lines)
@@ -16087,10 +16675,7 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
                         results.append(f"ℹ️ 「{display}」已经是知识库成员，无需重复添加")
                     elif _c == 131101:
                         # Public wiki space — everyone already has access
-                        results.append(
-                            f"ℹ️ 这是一个**公开知识库**，所有人已可访问。\n"
-                            f"「{display}」无需单独添加权限。"
-                        )
+                        results.append(f"ℹ️ 这是一个**公开知识库**，所有人已可访问。\n「{display}」无需单独添加权限。")
                     else:
                         results.append(f"❌ 添加「{display}」到知识库失败：{d.get('msg')} (code {_c})")
                     continue
@@ -16120,11 +16705,7 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
                             f"请手动操作：打开文档 → 右上角「分享」→ 添加自己并设置权限。"
                         )
                     elif _c in (99991672, 99991668):
-                        return (
-                            f"❌ 权限不足（code {_c}）\n"
-                            "需要在飞书开放平台开通：\n"
-                            "• drive:drive（云文档权限管理）"
-                        )
+                        return f"❌ 权限不足（code {_c}）\n需要在飞书开放平台开通：\n• drive:drive（云文档权限管理）"
                     else:
                         results.append(f"❌ 添加「{display}」失败：{d.get('msg')} (code {_c})")
 
@@ -16158,6 +16739,7 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
 
 # ─── Feishu Drive Delete ──────────────────────────────────────────────────────
 
+
 async def _feishu_drive_delete(agent_id: uuid.UUID, arguments: dict) -> str:
     """Delete a file or folder from Feishu Drive (cloud space).
     The file is moved to the recycle bin, not permanently deleted.
@@ -16181,13 +16763,20 @@ async def _feishu_drive_delete(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     # Type label mapping for user-friendly output
     type_labels = {
-        "file": "文件", "docx": "文档", "bitable": "多维表格",
-        "folder": "文件夹", "doc": "旧版文档", "sheet": "电子表格",
-        "mindnote": "思维笔记", "shortcut": "快捷方式", "slides": "幻灯片",
+        "file": "文件",
+        "docx": "文档",
+        "bitable": "多维表格",
+        "folder": "文件夹",
+        "doc": "旧版文档",
+        "sheet": "电子表格",
+        "mindnote": "思维笔记",
+        "shortcut": "快捷方式",
+        "slides": "幻灯片",
     }
     type_label = type_labels.get(file_type, file_type)
 
@@ -16237,15 +16826,14 @@ async def _feishu_drive_delete(agent_id: uuid.UUID, arguments: dict) -> str:
 
 # ─── Feishu Calendar Tools ────────────────────────────────────────────────────
 
+
 async def _resolve_feishu_open_id(
     agent_id: uuid.UUID,
     canonical_user_id: object,
 ) -> tuple[str, str]:
     """Resolve a public canonical user_id to one internal Feishu open_id."""
     async with async_session() as db:
-        route = await resolve_human_channel_recipient(
-            db, agent_id, canonical_user_id, channel="feishu"
-        )
+        route = await resolve_human_channel_recipient(db, agent_id, canonical_user_id, channel="feishu")
         open_id = str(route.member.open_id or "").strip()
         if not open_id:
             raise RecipientResolutionError(
@@ -16264,6 +16852,7 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     now = datetime.now(timezone.utc)
@@ -16272,8 +16861,9 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
         """Return an ISO-8601 string with timezone for freebusy API."""
         if not t:
             return default.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        if _re.fullmatch(r'\d+', t.strip()):
+        if _re.fullmatch(r"\d+", t.strip()):
             from datetime import datetime as _dt2
+
             return _dt2.fromtimestamp(int(t.strip()), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
         return t.strip()
 
@@ -16281,10 +16871,11 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
         """Convert ISO-8601 / Unix string / None to Unix timestamp string."""
         if not t:
             return str(int(default.timestamp()))
-        if _re.fullmatch(r'\d+', t.strip()):
+        if _re.fullmatch(r"\d+", t.strip()):
             return t.strip()
         try:
             from datetime import datetime as _dt2
+
             for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
                 try:
                     dt = _dt2.strptime(t.strip(), fmt)
@@ -16294,6 +16885,7 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
                 except ValueError:
                     continue
             from dateutil import parser as _dp
+
             return str(int(_dp.parse(t).timestamp()))
         except Exception:
             return str(int(default.timestamp()))
@@ -16310,9 +16902,7 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
     canonical_user_id = str(arguments.get("user_id") or "").strip()
     if canonical_user_id:
         try:
-            _, sender_open_id = await _resolve_feishu_open_id(
-                agent_id, canonical_user_id
-            )
+            _, sender_open_id = await _resolve_feishu_open_id(agent_id, canonical_user_id)
         except RecipientResolutionError as exc:
             return exc.as_json()
 
@@ -16336,6 +16926,7 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
                 if busy_slots:
                     from datetime import datetime as _dt2
                     from zoneinfo import ZoneInfo
+
                     tz_cn = ZoneInfo("Asia/Shanghai")
                     busy_lines = []
                     for slot in sorted(busy_slots, key=lambda x: x.get("start_time", "")):
@@ -16394,6 +16985,7 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
         event_id = ev.get("event_id", "")
         try:
             from datetime import datetime as _dt
+
             s = _dt.fromtimestamp(int(start), tz=timezone.utc).strftime("%m-%d %H:%M") if start else "?"
             e = _dt.fromtimestamp(int(end_t), tz=timezone.utc).strftime("%H:%M") if end_t else "?"
         except Exception:
@@ -16422,6 +17014,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     # Resolve every explicit attendee before creating the event, so invalid or
@@ -16430,9 +17023,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     attendee_display: list[str] = []
     for canonical_user_id in list(arguments.get("attendee_user_ids") or [])[:20]:
         try:
-            display_name, open_id = await _resolve_feishu_open_id(
-                agent_id, canonical_user_id
-            )
+            display_name, open_id = await _resolve_feishu_open_id(agent_id, canonical_user_id)
         except RecipientResolutionError as exc:
             return exc.as_json()
         if open_id not in attendee_open_ids:
@@ -16503,6 +17094,7 @@ async def _feishu_calendar_update(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     agent_cal_id, cal_err = await _get_agent_calendar_id(token)
@@ -16550,6 +17142,7 @@ async def _feishu_calendar_delete(agent_id: uuid.UUID, arguments: dict) -> str:
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
+
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
     agent_cal_id, cal_err = await _get_agent_calendar_id(token)
@@ -16568,7 +17161,9 @@ async def _feishu_calendar_delete(agent_id: uuid.UUID, arguments: dict) -> str:
 
     return f"✅ Event `{event_id}` deleted successfully."
 
+
 # ─── Feishu Approval Tools ───────────────────────────────────────────────────
+
 
 async def _feishu_approval_create(agent_id: uuid.UUID, arguments: dict) -> str:
     app_id, app_secret = await _get_feishu_credentials(agent_id)
@@ -16588,10 +17183,12 @@ async def _feishu_approval_create(agent_id: uuid.UUID, arguments: dict) -> str:
         return exc.as_json()
 
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.create_approval_instance(app_id, app_secret, approval_code, open_id, form_data)
         err = _check_feishu_err(resp)
-        if err: return err
+        if err:
+            return err
 
         instance_code = resp.get("data", {}).get("instance_code", "")
         return f"✅ 审批发起成功！\n审批实例 ID: `{instance_code}`"
@@ -16611,14 +17208,16 @@ async def _feishu_approval_query(agent_id: uuid.UUID, arguments: dict) -> str:
         return "❌ approval_code is required."
 
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.query_approval_instances(app_id, app_secret, approval_code, status)
         err = _check_feishu_err(resp)
-        if err: return err
+        if err:
+            return err
 
         data = resp.get("data", {})
         instance_codes = data.get("instance_code_list", [])
-        
+
         return f"✅ 查询完成。共发现 {len(instance_codes)} 个符合条件的审批实例。\n实例列表: {instance_codes}"
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
@@ -16634,19 +17233,23 @@ async def _feishu_approval_get(agent_id: uuid.UUID, arguments: dict) -> str:
         return "❌ instance_id is required."
 
     from app.services.feishu_service import feishu_service
+
     try:
         resp = await feishu_service.get_approval_instance(app_id, app_secret, instance_id)
         err = _check_feishu_err(resp)
-        if err: return err
+        if err:
+            return err
 
         data = resp.get("data", {})
         import json
+
         return f"✅ 审批实例查询结果:\n```json\n{json.dumps(data, ensure_ascii=False, indent=2)}\n```"
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
 
 # ─── Feishu User Search ───────────────────────────────────────────────────────
+
 
 async def _feishu_user_search(agent_id: uuid.UUID, arguments: dict) -> str:
     """Search related people by display name and return canonical IDs only."""
@@ -16704,6 +17307,7 @@ async def _feishu_user_search(agent_id: uuid.UUID, arguments: dict) -> str:
 
 # ─── Email Tool Helpers ─────────────────────────────────────
 
+
 async def _get_email_config(agent_id: uuid.UUID) -> dict:
     """Retrieve per-agent email config from the send_email tool's AgentTool config."""
     from app.models.tool import Tool, AgentTool
@@ -16730,6 +17334,7 @@ async def _get_email_config(agent_id: uuid.UUID) -> dict:
 
 # ── Pages: public HTML hosting ──────────────────────────
 
+
 async def _resolve_public_base_url() -> str:
     """Resolve the platform's public base URL for building shareable links.
 
@@ -16740,6 +17345,7 @@ async def _resolve_public_base_url() -> str:
     """
     try:
         from app.services.platform_service import platform_service
+
         async with async_session() as db:
             base = (await platform_service.get_public_base_url(db=db) or "").rstrip("/")
         # get_public_base_url returns http://localhost:8000 as its last-resort
@@ -16772,7 +17378,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 
     # Resolve via storage backend (supports local FS and S3)
     storage = get_storage_backend()
-    storage_key = normalize_storage_key(f"{agent_id}/{path}")
+    storage_key = current_agent_runtime_workspace(agent_id).storage_key(path)
     if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         return f"File not found: {path}"
 
@@ -16793,6 +17399,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     # only mint a new id when the file was never published before.
     from app.models.published_page import PublishedPage
     from app.models.user import User
+
     reused = False
     page_id: uuid.UUID | None = None
     publication_actor_label = f"unknown user (user_id: {user_id})"
@@ -16838,10 +17445,12 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
                 tenant_id = None
                 try:
                     from app.models.agent import Agent as _AgModel
+
                     _r = await db.execute(select(_AgModel.tenant_id).where(_AgModel.id == agent_id))
                     tenant_id = _r.scalar_one_or_none()
                     if tenant_id is None:
                         from app.models.user import User as _UserModel
+
                         tenant_id = await db.scalar(select(_UserModel.tenant_id).where(_UserModel.id == user_id))
                 except Exception:
                     tenant_id = None
@@ -16909,11 +17518,11 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     )
 
 
-
 async def _list_published_pages(agent_id: uuid.UUID) -> str:
     """List all published pages for this agent."""
     from app.models.published_page import PublishedPage, PublishedPageAccess
     from app.models.user import User
+
     public_base = await _resolve_public_base_url()
 
     try:
@@ -16950,10 +17559,7 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
             actor_rows = []
             if actor_ids:
                 actor_rows = (await db.scalars(select(User).where(User.id.in_(actor_ids)))).all()
-            actors = {
-                user.id: f"{user.display_name} (user_id: {user.id})"
-                for user in actor_rows
-            }
+            actors = {user.id: f"{user.display_name} (user_id: {user.id})" for user in actor_rows}
 
         if not pages:
             return "No published pages yet."
@@ -16972,8 +17578,7 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
             lines.append(f"  Created by: {actors.get(p.user_id, 'unknown user')}")
             lines.append(f"  Created at: {p.created_at.isoformat() if p.created_at else 'not recorded'}")
             lines.append(
-                "  Last published by: "
-                f"{actors.get(p.last_published_by_user_id, 'historical data not recorded')}"
+                f"  Last published by: {actors.get(p.last_published_by_user_id, 'historical data not recorded')}"
             )
             lines.append(
                 "  Last published at: "
@@ -17008,10 +17613,12 @@ async def _list_page_access_requests(agent_id: uuid.UUID, user_id: uuid.UUID, ar
 
     try:
         async with async_session() as db:
-            published_page = await db.scalar(select(PublishedPage).where(
-                PublishedPage.agent_id == agent_id,
-                PublishedPage.short_id == short_id,
-            ))
+            published_page = await db.scalar(
+                select(PublishedPage).where(
+                    PublishedPage.agent_id == agent_id,
+                    PublishedPage.short_id == short_id,
+                )
+            )
             if not published_page:
                 return "Published page not found for this Agent"
             actor = await db.get(User, user_id)
@@ -17024,25 +17631,30 @@ async def _list_page_access_requests(agent_id: uuid.UUID, user_id: uuid.UUID, ar
             ]
             if status != "all":
                 conditions.append(PublishedPageAccess.status == status)
-            total = int(await db.scalar(
-                select(func.count()).select_from(PublishedPageAccess).where(*conditions)
-            ) or 0)
-            pending_count = int(await db.scalar(
-                select(func.count()).select_from(PublishedPageAccess).where(
-                    PublishedPageAccess.page_id == published_page.id,
-                    PublishedPageAccess.requested_at.is_not(None),
-                    PublishedPageAccess.status == "pending",
+            total = int(await db.scalar(select(func.count()).select_from(PublishedPageAccess).where(*conditions)) or 0)
+            pending_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(PublishedPageAccess)
+                    .where(
+                        PublishedPageAccess.page_id == published_page.id,
+                        PublishedPageAccess.requested_at.is_not(None),
+                        PublishedPageAccess.status == "pending",
+                    )
                 )
-            ) or 0)
-            rows = (await db.execute(
-                select(User, Identity, PublishedPageAccess)
-                .join(PublishedPageAccess, PublishedPageAccess.user_id == User.id)
-                .outerjoin(Identity, Identity.id == User.identity_id)
-                .where(*conditions)
-                .order_by(PublishedPageAccess.requested_at.desc(), PublishedPageAccess.id.desc())
-                .offset((page_number - 1) * page_size)
-                .limit(page_size)
-            )).all()
+                or 0
+            )
+            rows = (
+                await db.execute(
+                    select(User, Identity, PublishedPageAccess)
+                    .join(PublishedPageAccess, PublishedPageAccess.user_id == User.id)
+                    .outerjoin(Identity, Identity.id == User.identity_id)
+                    .where(*conditions)
+                    .order_by(PublishedPageAccess.requested_at.desc(), PublishedPageAccess.id.desc())
+                    .offset((page_number - 1) * page_size)
+                    .limit(page_size)
+                )
+            ).all()
 
         public_base = await _resolve_public_base_url()
         management_path = f"/published-pages?page={published_page.id}"
@@ -17058,14 +17670,16 @@ async def _list_page_access_requests(agent_id: uuid.UUID, user_id: uuid.UUID, ar
             return "\n".join(lines)
         for requester, identity, access_request in rows:
             requester_email = identity.email if identity and identity.email else "no email"
-            lines.extend([
-                "",
-                f"- {requester.display_name} ({requester_email})",
-                f"  User ID: {requester.id}",
-                f"  Status: {access_request.status}",
-                f"  Requested at: {access_request.requested_at.isoformat()}",
-                f"  Resolved at: {access_request.resolved_at.isoformat() if access_request.resolved_at else 'not resolved'}",
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"- {requester.display_name} ({requester_email})",
+                    f"  User ID: {requester.id}",
+                    f"  Status: {access_request.status}",
+                    f"  Requested at: {access_request.requested_at.isoformat()}",
+                    f"  Resolved at: {access_request.resolved_at.isoformat() if access_request.resolved_at else 'not resolved'}",
+                ]
+            )
         return "\n".join(lines)
     except Exception as exc:
         return f"Failed to list page access requests: {exc}"
@@ -17081,9 +17695,15 @@ async def _replace_page_allowed_users(db, page, raw_user_ids, resolved_by: uuid.
     except ValueError as exc:
         raise ValueError("allowed_user_ids contains an invalid user ID") from exc
     if user_ids:
-        valid_ids = set((await db.scalars(select(User.id).where(
-            User.id.in_(user_ids), User.tenant_id == page.tenant_id, User.is_active.is_(True)
-        ))).all())
+        valid_ids = set(
+            (
+                await db.scalars(
+                    select(User.id).where(
+                        User.id.in_(user_ids), User.tenant_id == page.tenant_id, User.is_active.is_(True)
+                    )
+                )
+            ).all()
+        )
         if valid_ids != user_ids:
             raise ValueError("All allowed users must be active members of the page's company")
     rows = (await db.scalars(select(PublishedPageAccess).where(PublishedPageAccess.page_id == page.id))).all()
@@ -17097,20 +17717,24 @@ async def _replace_page_allowed_users(db, page, raw_user_ids, resolved_by: uuid.
         if row:
             row.status, row.resolved_at, row.resolved_by = "approved", now, resolved_by
         else:
-            db.add(PublishedPageAccess(
-                page_id=page.id, user_id=viewer_id, status="approved", resolved_at=now, resolved_by=resolved_by
-            ))
+            db.add(
+                PublishedPageAccess(
+                    page_id=page.id, user_id=viewer_id, status="approved", resolved_at=now, resolved_by=resolved_by
+                )
+            )
 
 
 async def _search_page_viewers(agent_id: uuid.UUID, user_id: uuid.UUID, arguments: dict) -> str:
     from sqlalchemy import or_
     from app.models.agent import Agent
     from app.models.user import Identity, User
+
     query = str(arguments.get("query") or "").strip()
     if not query:
         return "Missing required argument 'query'"
     async with async_session() as db:
         from app.core.permissions import check_agent_access
+
         actor = await db.get(User, user_id)
         if actor is None:
             return "Permission denied: user not found"
@@ -17121,15 +17745,24 @@ async def _search_page_viewers(agent_id: uuid.UUID, user_id: uuid.UUID, argument
         if access != "manage":
             return "Permission denied: Agent manage access required"
         tenant_id = await db.scalar(select(Agent.tenant_id).where(Agent.id == agent_id))
-        rows = (await db.execute(
-            select(User, Identity).outerjoin(Identity, Identity.id == User.identity_id).where(
-                User.tenant_id == tenant_id, User.is_active.is_(True),
-                or_(User.display_name.ilike(f"%{query}%"), Identity.email.ilike(f"%{query}%")),
-            ).order_by(User.display_name).limit(20)
-        )).all()
+        rows = (
+            await db.execute(
+                select(User, Identity)
+                .outerjoin(Identity, Identity.id == User.identity_id)
+                .where(
+                    User.tenant_id == tenant_id,
+                    User.is_active.is_(True),
+                    or_(User.display_name.ilike(f"%{query}%"), Identity.email.ilike(f"%{query}%")),
+                )
+                .order_by(User.display_name)
+                .limit(20)
+            )
+        ).all()
     if not rows:
         return "No matching users."
-    return "\n".join(f"- {user.display_name} ({identity.email if identity else 'no email'}): {user.id}" for user, identity in rows)
+    return "\n".join(
+        f"- {user.display_name} ({identity.email if identity else 'no email'}): {user.id}" for user, identity in rows
+    )
 
 
 async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID, arguments: dict) -> str:
@@ -17137,6 +17770,7 @@ async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID,
     from app.models.published_page import PublishedPage
     from app.models.user import User
     from app.services.published_page_access import can_manage_page
+
     short_id = str(arguments.get("short_id") or "")
     access_mode = arguments.get("access_mode")
     if access_mode not in {"public", "authenticated", "restricted"}:
@@ -17159,17 +17793,19 @@ async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID,
             page.access_mode = access_mode
             allowed_user_ids = arguments.get("allowed_user_ids", []) if access_mode == "restricted" else []
             await _replace_page_allowed_users(db, page, allowed_user_ids, user_id)
-            db.add(AuditLog(
-                user_id=user_id,
-                agent_id=page.agent_id,
-                action="published_page_access_updated",
-                details={
-                    "page_id": str(page.id),
-                    "access_mode": access_mode,
-                    "allowed_user_ids": [str(value) for value in allowed_user_ids],
-                    "source": "agent_tool",
-                },
-            ))
+            db.add(
+                AuditLog(
+                    user_id=user_id,
+                    agent_id=page.agent_id,
+                    action="published_page_access_updated",
+                    details={
+                        "page_id": str(page.id),
+                        "access_mode": access_mode,
+                        "allowed_user_ids": [str(value) for value in allowed_user_ids],
+                        "source": "agent_tool",
+                    },
+                )
+            )
             await db.commit()
         return f"Updated /p/{short_id} access to {access_mode}."
     except Exception as exc:
@@ -17177,6 +17813,7 @@ async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID,
 
 
 # ─── AgentBay Tool Handlers ─────────────────────────────────────
+
 
 def _agentbay_normalize_image_bytes(data) -> bytes | None:
     """Normalize AgentBay image payloads to raw bytes."""
@@ -17207,10 +17844,8 @@ def _agentbay_save_image_to_workspace(
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     screenshot_path.write_bytes(raw_bytes)
     logger.info(f"[AgentBay] Explicit screenshot saved to workspace: {rel_path}")
-    return (
-        f"Screenshot saved to `{rel_path}`.\n"
-        f"![{label}](/api/agents/{agent_id}/files/download?path={rel_path})"
-    )
+    return f"Screenshot saved to `{rel_path}`.\n![{label}](/api/agents/{agent_id}/files/download?path={rel_path})"
+
 
 async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
     """AgentBay browser navigation.
@@ -17249,6 +17884,7 @@ async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, ar
             if raw_bytes:
                 # Store in memory only — vision_inject.py will consume it.
                 from app.services.vision_inject import store_temp_screenshot
+
                 img_id = store_temp_screenshot(raw_bytes)
                 parts.append(
                     f"Internal screenshot captured for analysis. [ImageID: {img_id}]\n"
@@ -17295,6 +17931,7 @@ async def _agentbay_browser_screenshot(agent_id: Optional[uuid.UUID], ws: Path, 
 
         # Store in memory only — vision_inject.py will consume it for LLM vision
         from app.services.vision_inject import store_temp_screenshot
+
         img_id = store_temp_screenshot(raw_bytes)
         logger.info(f"[AgentBay] Browser screenshot stored in memory (id={img_id})")
         return (
@@ -17585,6 +18222,7 @@ async def _search_clawhub(agent_id: uuid.UUID, arguments: dict) -> str:
 
     # Resolve tenant ClawHub API key
     from app.api.skills import _clawhub_search_endpoint, _fetch_clawhub_json, _get_clawhub_key
+
     tenant_id = await _get_agent_tenant_id(agent_id)
     api_key = await _get_clawhub_key(tenant_id)
 
@@ -17609,6 +18247,7 @@ async def _search_clawhub(agent_id: uuid.UUID, arguments: dict) -> str:
         updated = ""
         if r.get("updatedAt"):
             from datetime import datetime
+
             try:
                 dt = datetime.fromtimestamp(r["updatedAt"] / 1000)
                 updated = f" | Updated: {dt.strftime('%Y-%m-%d')}"
@@ -17617,7 +18256,7 @@ async def _search_clawhub(agent_id: uuid.UUID, arguments: dict) -> str:
         lines.append(f"• **{name}** (`{slug}`){updated}")
         if summary:
             lines.append(f"  {summary}")
-    lines.append("\nTo install a skill, use: install_skill(source=\"<slug>\")")
+    lines.append('\nTo install a skill, use: install_skill(source="<slug>")')
     return "\n".join(lines)
 
 
@@ -17686,7 +18325,6 @@ async def _install_skill(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
         return f"❌ Install failed: {str(e)[:300]}"
 
 
-
 async def _search_skill_market(agent_id: uuid.UUID, arguments: dict) -> str:
     """Search the first-party Skill market within the Agent's tenant scope."""
     query = str(arguments.get("query") or "").strip()
@@ -17716,10 +18354,7 @@ async def _search_skill_market(agent_id: uuid.UUID, arguments: dict) -> str:
         )
         if item.get("description"):
             lines.append(f"  {item['description'][:180]}")
-    lines.append(
-        "\nTo install one, obtain user confirmation and call "
-        'install_skill_from_market(skill_id="<id>").'
-    )
+    lines.append('\nTo install one, obtain user confirmation and call install_skill_from_market(skill_id="<id>").')
     return "\n".join(lines)
 
 
@@ -17864,6 +18499,7 @@ def _clamp_sql_max_rows(raw) -> int:
 def _resolve_sql_max_bytes() -> int:
     """Per-fetch byte budget, env-overridable, clamped to the hard ceiling."""
     import os
+
     override = os.environ.get("CLAWITH_SQL_MAX_BYTES")
     if override:
         try:
@@ -17890,7 +18526,9 @@ async def _bounded_collect(row_source, max_rows: int, max_bytes: int):
         if len(rows) >= max_rows:
             truncated = True  # N+1: one more row exists beyond the cap
             break
-        row_bytes = sum(len(str(v)) for v in row)  # char-count approximation; CJK uses more real bytes — max_rows + host swap are the primary guards
+        row_bytes = sum(
+            len(str(v)) for v in row
+        )  # char-count approximation; CJK uses more real bytes — max_rows + host swap are the primary guards
         if rows and total_bytes + row_bytes > max_bytes:
             truncated = True
             break
@@ -18023,7 +18661,7 @@ async def _sql_execute_postgres(connection_string: str, sql: str, max_rows: int,
 
     dsn = connection_string
     if dsn.startswith("postgresql://"):
-        dsn = "postgres://" + dsn[len("postgresql://"):]
+        dsn = "postgres://" + dsn[len("postgresql://") :]
 
     conn = await asyncpg.connect(dsn)
     try:
@@ -18068,10 +18706,7 @@ def _format_sql_result(columns: list, rows: list, truncated: bool, max_rows: int
         return f"Query returned 0 rows.\nColumns: {', '.join(columns)}"
 
     str_rows = [[str(v) if v is not None else "NULL" for v in row] for row in rows]
-    widths = [
-        min(max(len(c), max((len(r[i]) for r in str_rows), default=0)), 50)
-        for i, c in enumerate(columns)
-    ]
+    widths = [min(max(len(c), max((len(r[i]) for r in str_rows), default=0)), 50) for i, c in enumerate(columns)]
     header = " | ".join(c.ljust(w) for c, w in zip(columns, widths))
     separator = "-+-".join("-" * w for w in widths)
     lines = [header, separator]
@@ -18101,7 +18736,9 @@ def _format_sql_result(columns: list, rows: list, truncated: bool, max_rows: int
         )
     return result
 
+
 # ─── AgentBay: Browser Extract & Observe ────────────────────────────────
+
 
 async def _agentbay_browser_extract(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
     """Extract structured data from current browser page."""
@@ -18123,6 +18760,7 @@ async def _agentbay_browser_extract(agent_id: Optional[uuid.UUID], ws: Path, arg
 
         if result.get("success"):
             import json
+
             data = result.get("data", {})
             data_str = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list)) else str(data)
             return f"Extraction successful:\n\n{data_str[:5000]}"
@@ -18156,6 +18794,7 @@ async def _agentbay_browser_observe(agent_id: Optional[uuid.UUID], ws: Path, arg
 
         if result.get("success"):
             import json
+
             elements = result.get("elements", [])
             if not elements:
                 return "No interactive elements found matching your instruction."
@@ -18172,6 +18811,7 @@ async def _agentbay_browser_observe(agent_id: Optional[uuid.UUID], ws: Path, arg
 
 
 # ─── AgentBay: Command (Shell) ──────────────────────────────────────────
+
 
 async def _agentbay_browser_login(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
     """Perform an automated login using AgentBay's built-in login skill.
@@ -18251,6 +18891,7 @@ async def _agentbay_command_exec(agent_id: Optional[uuid.UUID], ws: Path, argume
 
 
 # ─── AgentBay: Computer Use Handlers ────────────────────────────────────
+
 
 def _agentbay_extract_screen_dimensions(screen_data) -> tuple[int | None, int | None, str]:
     """Return width/height/dpi text from AgentBay get_screen_size payload."""
@@ -18406,7 +19047,15 @@ def _agentbay_format_apps(apps: list, limit: int = 40) -> str:
             compact_apps.append(
                 {
                     key: app.get(key)
-                    for key in ("name", "start_cmd", "startCmd", "work_directory", "workDirectory", "stop_cmd", "stopCmd")
+                    for key in (
+                        "name",
+                        "start_cmd",
+                        "startCmd",
+                        "work_directory",
+                        "workDirectory",
+                        "stop_cmd",
+                        "stopCmd",
+                    )
                     if app.get(key)
                 }
             )
@@ -18461,7 +19110,9 @@ async def _agentbay_visible_apps_note(client) -> str:
         visible = await client.computer_list_visible_apps()
         if visible.get("success"):
             apps = visible.get("apps", [])
-            return f"Visible applications after the launch attempt ({len(apps)}):\n{_agentbay_format_apps(apps, limit=20)}"
+            return (
+                f"Visible applications after the launch attempt ({len(apps)}):\n{_agentbay_format_apps(apps, limit=20)}"
+            )
         return f"Could not verify visible applications: {visible.get('error_message', 'Unknown error')}"
     except Exception as e:
         logger.debug(f"[AgentBay] Could not list visible apps after start_app: {e}")
@@ -18502,12 +19153,7 @@ async def _agentbay_computer_screenshot(agent_id: Optional[uuid.UUID], ws: Path,
         crop_bounds: tuple[int, int, int, int] | None = None
         crop_scale = 1
         analysis_bytes = raw_bytes
-        if (
-            focus_x is not None
-            and focus_y is not None
-            and focus_width is not None
-            and focus_height is not None
-        ):
+        if focus_x is not None and focus_y is not None and focus_width is not None and focus_height is not None:
             try:
                 crop_result = _agentbay_crop_image_bytes(
                     raw_bytes,
@@ -18523,6 +19169,7 @@ async def _agentbay_computer_screenshot(agent_id: Optional[uuid.UUID], ws: Path,
 
         # Store in memory only — vision_inject.py will consume it for LLM vision
         from app.services.vision_inject import store_temp_screenshot
+
         grid_options = {}
         if crop_bounds:
             crop_x, crop_y, crop_width, crop_height = crop_bounds
@@ -18847,6 +19494,7 @@ async def _agentbay_computer_get_screen_size(agent_id: Optional[uuid.UUID], ws: 
         result = await client.computer_get_screen_size()
         if result.get("success"):
             import json
+
             data = result.get("data")
             data_str = json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data)
             return f"Screen size: {data_str}"
@@ -18882,7 +19530,12 @@ async def _agentbay_computer_start_app(agent_id: Optional[uuid.UUID], ws: Path, 
             if data is not None:
                 try:
                     import json
-                    data_str = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list, str, int, float, bool)) else str(data)
+
+                    data_str = (
+                        json.dumps(data, ensure_ascii=False, indent=2)
+                        if isinstance(data, (dict, list, str, int, float, bool))
+                        else str(data)
+                    )
                 except (TypeError, ValueError):
                     data_str = str(data)
             else:
@@ -18934,7 +19587,9 @@ async def _agentbay_computer_start_app(agent_id: Optional[uuid.UUID], ws: Path, 
                     f"Use agentbay_computer_get_installed_apps and then pass the returned start_cmd to this tool."
                 )
             else:
-                installed_note = f"\n\nCould not check installed apps: {installed_result.get('error_message', 'Unknown error')}"
+                installed_note = (
+                    f"\n\nCould not check installed apps: {installed_result.get('error_message', 'Unknown error')}"
+                )
         except Exception as e:
             logger.debug(f"[AgentBay] Installed app fallback failed: {e}")
             installed_note = f"\n\nCould not check installed apps: {str(e)[:200]}"
@@ -18942,9 +19597,7 @@ async def _agentbay_computer_start_app(agent_id: Optional[uuid.UUID], ws: Path, 
         if _agentbay_uncertain_start_error(direct_error):
             visible_note = await _agentbay_visible_apps_note(client)
             return (
-                f"Start command reported an uncertain launch result: {direct_error}\n\n"
-                f"{visible_note}"
-                f"{installed_note}"
+                f"Start command reported an uncertain launch result: {direct_error}\n\n{visible_note}{installed_note}"
             )
 
         return f"Failed to start application: {direct_error}{installed_note}"
@@ -19004,6 +19657,7 @@ async def _agentbay_computer_get_cursor_position(agent_id: Optional[uuid.UUID], 
         result = await client.computer_get_cursor_position()
         if result.get("success"):
             import json
+
             data = result.get("data")
             data_str = json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data)
             return f"Cursor position: {data_str}"
@@ -19028,6 +19682,7 @@ async def _agentbay_computer_get_active_window(agent_id: Optional[uuid.UUID], ws
         result = await client.computer_get_active_window()
         if result.get("success"):
             import json
+
             window = result.get("window")
             window_str = json.dumps(window, ensure_ascii=False, indent=2) if isinstance(window, dict) else str(window)
             return f"Active window:\n\n{window_str}"
@@ -19079,6 +19734,7 @@ async def _agentbay_computer_list_windows(agent_id: Optional[uuid.UUID], ws: Pat
         result = await client.computer_list_windows(timeout_ms=int(timeout_ms))
         if result.get("success"):
             import json
+
             windows = result.get("windows", [])
             if not windows:
                 return "No root windows found."
@@ -19238,6 +19894,7 @@ async def _agentbay_computer_list_visible_apps(agent_id: Optional[uuid.UUID], ws
         result = await client.computer_list_visible_apps()
         if result.get("success"):
             import json
+
             apps = result.get("apps", [])
             if not apps:
                 return "No visible applications running."
@@ -19269,8 +19926,8 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
 
     from_type = arguments.get("from_type", "")
     from_path = arguments.get("from_path", "")
-    to_type   = arguments.get("to_type", "")
-    to_path   = arguments.get("to_path", "")
+    to_type = arguments.get("to_type", "")
+    to_path = arguments.get("to_path", "")
     session_id = arguments.pop("_session_id", "")
 
     if not all([from_type, from_path, to_type, to_path]):
@@ -19299,26 +19956,20 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
             if err:
                 return err
             import os
+
             if not os.path.exists(local_path):
                 return f"File not found in workspace: {from_path}"
             client = await get_agentbay_client_for_agent(agent_id, to_type, session_id=session_id)
-            result = await asyncio.to_thread(
-                client._session.file_system.upload_file,
-                local_path, to_path
-            )
+            result = await asyncio.to_thread(client._session.file_system.upload_file, local_path, to_path)
             if result.success:
-                msg = (
-                    f"Transferred workspace/{from_path} → [{to_type}]{to_path} "
-                    f"({result.bytes_sent} bytes)"
-                )
+                msg = f"Transferred workspace/{from_path} → [{to_type}]{to_path} ({result.bytes_sent} bytes)"
                 # After uploading to the computer desktop directory, notify the GNOME
                 # file manager so the file icon appears immediately without manual refresh.
                 desktop_dir = "/home/wuying/桌面"
                 if to_type == "computer" and to_path.startswith(desktop_dir):
                     try:
                         await asyncio.to_thread(
-                            client._session.command.exec,
-                            f"DISPLAY=:0 gio info '{to_path}' 2>/dev/null || true"
+                            client._session.command.exec, f"DISPLAY=:0 gio info '{to_path}' 2>/dev/null || true"
                         )
                     except Exception:
                         pass  # Non-critical: desktop refresh failure doesn't affect transfer result
@@ -19331,12 +19982,10 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
             if err:
                 return err
             import os
+
             os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
             client = await get_agentbay_client_for_agent(agent_id, from_type, session_id=session_id)
-            result = await asyncio.to_thread(
-                client._session.file_system.download_file,
-                from_path, local_path
-            )
+            result = await asyncio.to_thread(client._session.file_system.download_file, from_path, local_path)
             if result.success:
                 return (
                     f"Transferred [{from_type}]{from_path} → workspace/{to_path} "
@@ -19349,30 +19998,22 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
         elif from_type in env_types and to_type in env_types:
             import uuid as _uuid
             import os
+
             tmp_path = f"/tmp/agentbay_transfer_{_uuid.uuid4().hex}"
             try:
                 # Step 1: download from source env to backend /tmp/
                 src_client = await get_agentbay_client_for_agent(agent_id, from_type, session_id=session_id)
-                dl_result = await asyncio.to_thread(
-                    src_client._session.file_system.download_file,
-                    from_path, tmp_path
-                )
+                dl_result = await asyncio.to_thread(src_client._session.file_system.download_file, from_path, tmp_path)
                 if not dl_result.success:
                     return f"Transfer failed (download from {from_type}): {dl_result.error_message}"
 
                 # Step 2: upload from backend /tmp/ to destination env
                 dst_client = await get_agentbay_client_for_agent(agent_id, to_type, session_id=session_id)
-                ul_result = await asyncio.to_thread(
-                    dst_client._session.file_system.upload_file,
-                    tmp_path, to_path
-                )
+                ul_result = await asyncio.to_thread(dst_client._session.file_system.upload_file, tmp_path, to_path)
                 if not ul_result.success:
                     return f"Transfer failed (upload to {to_type}): {ul_result.error_message}"
 
-                return (
-                    f"Transferred [{from_type}]{from_path} → [{to_type}]{to_path} "
-                    f"({dl_result.bytes_received} bytes)"
-                )
+                return f"Transferred [{from_type}]{from_path} → [{to_type}]{to_path} ({dl_result.bytes_received} bytes)"
             finally:
                 # Always clean up the temporary file regardless of success or failure
                 try:
@@ -19452,9 +20093,7 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
             tenant_id = agent.tenant_id
 
             # Get OKR settings to determine period
-            settings_result = await db.execute(
-                _select(OKRSettings).where(OKRSettings.tenant_id == tenant_id)
-            )
+            settings_result = await db.execute(_select(OKRSettings).where(OKRSettings.tenant_id == tenant_id))
             settings = settings_result.scalar_one_or_none()
 
             if not settings or not settings.enabled:
@@ -19474,12 +20113,14 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
 
             # Fetch all active objectives
             obj_result = await db.execute(
-                _select(OKRObjective).where(
+                _select(OKRObjective)
+                .where(
                     OKRObjective.tenant_id == tenant_id,
                     OKRObjective.period_start >= ps,
                     OKRObjective.period_end <= pe,
                     OKRObjective.status != "archived",
-                ).order_by(OKRObjective.created_at)
+                )
+                .order_by(OKRObjective.created_at)
             )
             objectives = obj_result.scalars().all()
 
@@ -19489,9 +20130,7 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
             # Fetch all KRs
             obj_ids = [o.id for o in objectives]
             kr_result = await db.execute(
-                _select(OKRKeyResult)
-                .where(OKRKeyResult.objective_id.in_(obj_ids))
-                .order_by(OKRKeyResult.created_at)
+                _select(OKRKeyResult).where(OKRKeyResult.objective_id.in_(obj_ids)).order_by(OKRKeyResult.created_at)
             )
             all_krs = kr_result.scalars().all()
 
@@ -19501,32 +20140,18 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
 
             # Resolve readable owner names so the OKR Agent can reason about
             # members by display name instead of raw UUIDs.
-            user_owner_ids = [
-                o.owner_user_id for o in objectives if o.owner_user_id
-            ]
-            agent_owner_ids = [
-                o.owner_agent_id for o in objectives if o.owner_agent_id
-            ]
+            user_owner_ids = [o.owner_user_id for o in objectives if o.owner_user_id]
+            agent_owner_ids = [o.owner_agent_id for o in objectives if o.owner_agent_id]
 
             user_names: dict[uuid.UUID, str] = {}
             if user_owner_ids:
-                u_result = await db.execute(
-                    _select(User.id, User.display_name).where(User.id.in_(user_owner_ids))
-                )
-                user_names = {
-                    row.id: (row.display_name or "")
-                    for row in u_result.fetchall()
-                }
+                u_result = await db.execute(_select(User.id, User.display_name).where(User.id.in_(user_owner_ids)))
+                user_names = {row.id: (row.display_name or "") for row in u_result.fetchall()}
 
             agent_names: dict[uuid.UUID, str] = {}
             if agent_owner_ids:
-                a_result = await db.execute(
-                    _select(Agent.id, Agent.name).where(Agent.id.in_(agent_owner_ids))
-                )
-                agent_names = {
-                    row.id: (row.name or "")
-                    for row in a_result.fetchall()
-                }
+                a_result = await db.execute(_select(Agent.id, Agent.name).where(Agent.id.in_(agent_owner_ids)))
+                agent_names = {row.id: (row.name or "") for row in a_result.fetchall()}
 
             def _resolve_owner_label(obj: OKRObjective) -> str:
                 if not obj.owner_user_id and not obj.owner_agent_id:
@@ -19600,9 +20225,7 @@ async def _get_my_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
             if not agent:
                 return "Agent not found."
 
-            settings_result = await db.execute(
-                _select(OKRSettings).where(OKRSettings.tenant_id == agent.tenant_id)
-            )
+            settings_result = await db.execute(_select(OKRSettings).where(OKRSettings.tenant_id == agent.tenant_id))
             settings = settings_result.scalar_one_or_none()
             if not settings or not settings.enabled:
                 return "OKR is not enabled for your organization."
@@ -19631,9 +20254,7 @@ async def _get_my_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
 
             obj_ids = [o.id for o in objectives]
             kr_result = await db.execute(
-                _select(OKRKeyResult)
-                .where(OKRKeyResult.objective_id.in_(obj_ids))
-                .order_by(OKRKeyResult.created_at)
+                _select(OKRKeyResult).where(OKRKeyResult.objective_id.in_(obj_ids)).order_by(OKRKeyResult.created_at)
             )
             all_krs = kr_result.scalars().all()
 
@@ -19712,9 +20333,7 @@ def _can_access_existing_okr_target(
         return None
 
     if owner_agent_id != ctx["agent"].id or owner_user_id is not None:
-        return _okr_permission_denied(
-            "you can only create or modify your own agent OKRs."
-        )
+        return _okr_permission_denied("you can only create or modify your own agent OKRs.")
     return None
 
 
@@ -19734,9 +20353,7 @@ def _can_create_okr_target(
         return None
 
     if owner_agent_id != ctx["agent"].id or owner_user_id is not None:
-        return _okr_permission_denied(
-            "you can only create OKRs for yourself."
-        )
+        return _okr_permission_denied("you can only create OKRs for yourself.")
     return None
 
 
@@ -19785,9 +20402,7 @@ async def _update_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID | N
                 return f"Key Result {kr_id_str} not found in your organization."
 
             kr, obj = row
-            permission_error = _can_access_existing_okr_target(
-                ctx, obj.owner_user_id, obj.owner_agent_id
-            )
+            permission_error = _can_access_existing_okr_target(ctx, obj.owner_user_id, obj.owner_agent_id)
             if permission_error:
                 return permission_error
 
@@ -19816,10 +20431,7 @@ async def _update_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID | N
             db.add(log)
             await db.commit()
 
-        return (
-            f"KR updated: {kr.title}\n"
-            f"  {prev_value} → {value} {kr.unit or ''} (status: {kr.status})"
-        )
+        return f"KR updated: {kr.title}\n  {prev_value} → {value} {kr.unit or ''} (status: {kr.status})"
 
     except Exception as e:
         logger.exception(f"[OKR] update_kr_progress failed for agent {agent_id}")
@@ -19873,9 +20485,7 @@ async def _update_kr_content(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
                 return f"Key Result {kr_id_str} not found in your organization."
 
             kr, obj = row
-            permission_error = _can_access_existing_okr_target(
-                ctx, obj.owner_user_id, obj.owner_agent_id
-            )
+            permission_error = _can_access_existing_okr_target(ctx, obj.owner_user_id, obj.owner_agent_id)
             if permission_error:
                 return permission_error
 
@@ -19898,10 +20508,7 @@ async def _update_kr_content(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
 
             await db.commit()
 
-        return (
-            f"KR content updated: {kr.title}\n"
-            f"Changed fields: {', '.join(changed_fields)}"
-        )
+        return f"KR content updated: {kr.title}\nChanged fields: {', '.join(changed_fields)}"
 
     except Exception as e:
         logger.exception(f"[OKR] update_kr_content failed for agent {agent_id}")
@@ -19922,9 +20529,7 @@ async def _collect_okr_progress(agent_id: uuid.UUID | None) -> str:
         from app.services.okr_scheduler import collect_all_focus_updates
 
         async with async_session() as db:
-            agent_result = await db.execute(
-                select(AgentModel).where(AgentModel.id == agent_id)
-            )
+            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 return "Agent not found."
@@ -19956,9 +20561,7 @@ async def _generate_okr_report(agent_id: uuid.UUID | None, arguments: dict) -> s
         from app.services.okr_scheduler import generate_daily_report, generate_weekly_report
 
         async with async_session() as db:
-            agent_result = await db.execute(
-                select(AgentModel).where(AgentModel.id == agent_id)
-            )
+            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 return "Agent not found."
@@ -19994,9 +20597,7 @@ async def _generate_monthly_okr_report(agent_id: uuid.UUID | None) -> str:
         from app.services.okr_scheduler import generate_monthly_report
 
         async with async_session() as db:
-            agent_result = await db.execute(
-                select(AgentModel).where(AgentModel.id == agent_id)
-            )
+            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 return "Agent not found."
@@ -20026,9 +20627,7 @@ async def _get_okr_settings_tool(agent_id: uuid.UUID | None) -> str:
         import json as _json
 
         async with async_session() as db:
-            agent_result = await db.execute(
-                select(AgentModel).where(AgentModel.id == agent_id)
-            )
+            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 return "Agent not found."
@@ -20048,6 +20647,7 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
         from app.models.agent import Agent as AgentModel
         from app.models.okr import OKRObjective
         from app.models.user import User as UserModel
+
         async with async_session() as db:
             ctx = await _load_okr_request_context(db, agent_id, user_id)
             ag = ctx["agent"]
@@ -20061,6 +20661,7 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 return "Missing required fields: title, period_start, period_end"
 
             from datetime import date
+
             p_start = date.fromisoformat(period_start)
             p_end = date.fromisoformat(period_end)
 
@@ -20115,7 +20716,7 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 owner_agent_id=owner_agent_id,
                 period_start=p_start,
                 period_end=p_end,
-                status="active"
+                status="active",
             )
             db.add(obj)
             await db.commit()
@@ -20131,6 +20732,7 @@ async def _create_key_result(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
         return "OKR tools require agent context."
     try:
         from app.models.okr import OKRObjective, OKRKeyResult
+
         async with async_session() as db:
             ctx = await _load_okr_request_context(db, agent_id, user_id)
             if not ctx["agent"]:
@@ -20155,9 +20757,7 @@ async def _create_key_result(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
             if not obj:
                 return f"Objective {obj_id} not found."
 
-            permission_error = _can_access_existing_okr_target(
-                ctx, obj.owner_user_id, obj.owner_agent_id
-            )
+            permission_error = _can_access_existing_okr_target(ctx, obj.owner_user_id, obj.owner_agent_id)
             if permission_error:
                 return permission_error
 
@@ -20167,7 +20767,7 @@ async def _create_key_result(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
                 target_value=float(arguments.get("target_value", 100)),
                 current_value=0.0,
                 unit=arguments.get("unit"),
-                focus_ref=arguments.get("focus_ref")
+                focus_ref=arguments.get("focus_ref"),
             )
             db.add(kr)
             await db.commit()
@@ -20189,6 +20789,7 @@ async def _update_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
         return "OKR tools require agent context."
     try:
         from app.models.okr import OKRObjective
+
         async with async_session() as db:
             ctx = await _load_okr_request_context(db, agent_id, user_id)
             if not ctx["agent"]:
@@ -20212,9 +20813,7 @@ async def _update_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
             if not obj:
                 return f"Objective {obj_id} not found."
 
-            permission_error = _can_access_existing_okr_target(
-                ctx, obj.owner_user_id, obj.owner_agent_id
-            )
+            permission_error = _can_access_existing_okr_target(ctx, obj.owner_user_id, obj.owner_agent_id)
             if permission_error:
                 return permission_error
 
@@ -20230,10 +20829,12 @@ async def _update_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 updates.append("status")
             if "period_start" in arguments:
                 from datetime import date
+
                 obj.period_start = date.fromisoformat(arguments["period_start"])
                 updates.append("period_start")
             if "period_end" in arguments:
                 from datetime import date
+
                 obj.period_end = date.fromisoformat(arguments["period_end"])
                 updates.append("period_end")
 
@@ -20253,6 +20854,7 @@ async def _update_any_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID
         return "OKR tools require agent context."
     try:
         from app.models.okr import OKRKeyResult, OKRObjective, OKRProgressLog
+
         async with async_session() as db:
             ctx = await _load_okr_request_context(db, agent_id, user_id)
             if not ctx["agent"]:
@@ -20280,9 +20882,7 @@ async def _update_any_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID
                 return f"Key Result {kr_id} not found in your organization."
 
             kr, obj = row
-            permission_error = _can_access_existing_okr_target(
-                ctx, obj.owner_user_id, obj.owner_agent_id
-            )
+            permission_error = _can_access_existing_okr_target(ctx, obj.owner_user_id, obj.owner_agent_id)
             if permission_error:
                 return permission_error
 
@@ -20305,6 +20905,7 @@ async def _update_any_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID
                     kr.status = "behind"
 
             from datetime import datetime
+
             kr.last_updated_at = datetime.utcnow()
 
             note = arguments.get("note", "Updated by OKR Agent after check-in")
@@ -20313,7 +20914,7 @@ async def _update_any_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID
                 previous_value=old_val,
                 new_value=kr.current_value,
                 source="okr_agent" if ctx["agent_is_system"] else "agent",
-                note=note
+                note=note,
             )
             db.add(log_entry)
             await db.commit()
@@ -20431,6 +21032,7 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
 
 # ── Vercel & Neon Deploy Helper Functions ──
 
+
 async def _get_vercel_token(agent_id: uuid.UUID, tool_name: str) -> str | None:
     config = await _get_tool_config(agent_id, tool_name)
     token = (config or {}).get("vercel_token")
@@ -20442,6 +21044,7 @@ async def _get_vercel_token(agent_id: uuid.UUID, tool_name: str) -> str | None:
 
 async def _get_vercel_quota_summary(vercel_token: str) -> str:
     import httpx
+
     headers = {"Authorization": f"Bearer {vercel_token}"}
     async with httpx.AsyncClient() as client:
         try:
@@ -20456,21 +21059,21 @@ async def _get_vercel_quota_summary(vercel_token: str) -> str:
                     user_data = user_res.json().get("user", {})
                     username = user_data.get("username", username)
                     plan = user_data.get("billing", {}).get("plan", plan)
-                
-                quota_str = f"📊 **Vercel Account status ({username} - {plan} Plan)**:\n- Active Projects: {project_count}"
+
+                quota_str = (
+                    f"📊 **Vercel Account status ({username} - {plan} Plan)**:\n- Active Projects: {project_count}"
+                )
                 return quota_str
         except Exception as e:
             logger.warning(f"Error fetching Vercel quota info: {e}")
-            
+
     return "📊 **Vercel Account status**: Active (Quota details unavailable)"
 
 
 async def _check_neon_quota_limit(api_key: str) -> tuple[bool, str]:
     import httpx
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json"
-    }
+
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
             res = await client.get("https://console.neon.tech/api/v2/projects", headers=headers)
@@ -20478,7 +21081,10 @@ async def _check_neon_quota_limit(api_key: str) -> tuple[bool, str]:
                 projects = res.json().get("projects", [])
                 project_count = len(projects)
                 if project_count >= 1:
-                    return True, f"⚠️ **Neon 免费额度已达上限** (当前项目数: {project_count}/1)。请升级您的 Neon 账户，或者删除已有的旧项目。"
+                    return (
+                        True,
+                        f"⚠️ **Neon 免费额度已达上限** (当前项目数: {project_count}/1)。请升级您的 Neon 账户，或者删除已有的旧项目。",
+                    )
                 return False, f"📊 **Neon 账户额度**: {project_count}/1 个项目已使用。"
         except Exception as e:
             logger.warning(f"Error checking Neon quota: {e}")
@@ -20489,30 +21095,30 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     import httpx
     import hashlib
     import os
-    
+
     project_name = arguments.get("project_name")
     source_dir_arg = arguments.get("source_dir") or "."
     deploy_method = arguments.get("deploy_method", "upload")
     github_repo = arguments.get("github_repo")
     framework = arguments.get("framework")
     production = bool(arguments.get("production", False))
-    
+
     if not project_name:
         return "❌ Missing required argument 'project_name'."
-        
+
     token = await _get_vercel_token(agent_id, "vercel_deploy")
     if not token:
         return "❌ Vercel Access Token is not configured. Please paste your token in the tool settings."
-        
+
     headers = {"Authorization": f"Bearer {token}"}
-    
+
     # Resolve the absolute path of the source directory in the workspace
     source_dir_path = ws / source_dir_arg.lstrip("/")
     if not source_dir_path.exists() or not source_dir_path.is_dir():
-        source_dir_path = WORKSPACE_ROOT / str(agent_id) / source_dir_arg.lstrip("/")
+        source_dir_path = _agent_workspace_root(agent_id) / source_dir_arg.lstrip("/")
         if not source_dir_path.exists() or not source_dir_path.is_dir():
             return f"❌ Source directory '{source_dir_arg}' does not exist in workspace."
-            
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             # 1. Ensure project exists
@@ -20526,89 +21132,83 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                 create_res = await client.post("https://api.vercel.com/v9/projects", headers=headers, json=payload)
                 if create_res.status_code not in (200, 201):
                     return f"❌ Failed to create Vercel project '{project_name}': {create_res.text}"
-                    
+
             # 1.5 Disable Deployment Protection automatically to allow automated crawler debugging
-            patch_payload = {
-                "ssoProtection": None,
-                "passwordProtection": None
-            }
-            patch_res = await client.patch(f"https://api.vercel.com/v9/projects/{project_name}", headers=headers, json=patch_payload)
+            patch_payload = {"ssoProtection": None, "passwordProtection": None}
+            patch_res = await client.patch(
+                f"https://api.vercel.com/v9/projects/{project_name}", headers=headers, json=patch_payload
+            )
             if patch_res.status_code == 200:
                 logger.info(f"Successfully disabled deployment protection for project '{project_name}'")
             else:
                 logger.warning(f"Failed to disable deployment protection: {patch_res.text}")
-                
+
             dep_id = None
             dep_url = None
-            
+
             if deploy_method == "github":
                 if not github_repo:
                     return "❌ Argument 'github_repo' (format 'owner/repo') is required when deploy_method='github'."
-                
+
                 # Link repository
-                link_payload = {
-                    "type": "github",
-                    "repo": github_repo
-                }
-                link_res = await client.post(f"https://api.vercel.com/v9/projects/{project_name}/link", headers=headers, json=link_payload)
+                link_payload = {"type": "github", "repo": github_repo}
+                link_res = await client.post(
+                    f"https://api.vercel.com/v9/projects/{project_name}/link", headers=headers, json=link_payload
+                )
                 if link_res.status_code not in (200, 201, 409):
                     logger.warning(f"Repo linking returned status {link_res.status_code}: {link_res.text}")
-                
+
                 # Trigger a git deployment
                 deploy_payload = {
                     "name": project_name,
-                    "gitSource": {
-                        "type": "github",
-                        "repo": github_repo,
-                        "ref": "main"
-                    }
+                    "gitSource": {"type": "github", "repo": github_repo, "ref": "main"},
                 }
                 if production:
                     deploy_payload["target"] = "production"
-                    
-                dep_res = await client.post("https://api.vercel.com/v13/deployments", headers=headers, json=deploy_payload)
+
+                dep_res = await client.post(
+                    "https://api.vercel.com/v13/deployments", headers=headers, json=deploy_payload
+                )
                 if dep_res.status_code not in (200, 201):
                     return f"❌ Failed to trigger GitHub deployment: {dep_res.text}"
-                
+
                 dep_data = dep_res.json()
                 dep_id = dep_data.get("id")
                 dep_url = dep_data.get("url")
-                
-            else: # upload mode
+
+            else:  # upload mode
                 files_payload = []
                 ignored_dirs = {".git", "node_modules", ".next", "dist", ".vercel", "out", "build"}
-                
+
                 for root, dirs, files in os.walk(source_dir_path):
                     dirs[:] = [d for d in dirs if d not in ignored_dirs]
                     for file in files:
                         file_path = Path(root) / file
                         rel_path = file_path.relative_to(source_dir_path)
-                        
+
                         try:
                             file_bytes = file_path.read_bytes()
                         except Exception as e:
                             logger.warning(f"Could not read file {file_path}: {e}")
                             continue
-                            
+
                         sha1 = hashlib.sha1(file_bytes).hexdigest()
                         file_size = len(file_bytes)
-                        
+
                         file_headers = {
                             **headers,
                             "Content-Type": "application/octet-stream",
                             "x-vercel-digest": sha1,
-                            "x-vercel-size": str(file_size)
+                            "x-vercel-size": str(file_size),
                         }
-                        upload_res = await client.post("https://api.vercel.com/v2/files", headers=file_headers, content=file_bytes)
+                        upload_res = await client.post(
+                            "https://api.vercel.com/v2/files", headers=file_headers, content=file_bytes
+                        )
                         if upload_res.status_code not in (200, 201):
                             logger.error(f"Failed to upload file {rel_path}: {upload_res.text}")
-                            
-                        files_payload.append({
-                            "file": str(rel_path),
-                            "sha": sha1,
-                            "size": file_size
-                        })
-                
+
+                        files_payload.append({"file": str(rel_path), "sha": sha1, "size": file_size})
+
                 deploy_payload = {
                     "name": project_name,
                     "files": files_payload,
@@ -20617,15 +21217,17 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                     deploy_payload["projectSettings"] = {"framework": framework}
                 if production:
                     deploy_payload["target"] = "production"
-                    
-                dep_res = await client.post("https://api.vercel.com/v13/deployments", headers=headers, json=deploy_payload)
+
+                dep_res = await client.post(
+                    "https://api.vercel.com/v13/deployments", headers=headers, json=deploy_payload
+                )
                 if dep_res.status_code not in (200, 201):
                     return f"❌ Failed to trigger upload deployment: {dep_res.text}"
-                    
+
                 dep_data = dep_res.json()
                 dep_id = dep_data.get("id")
                 dep_url = dep_data.get("url")
-            
+
             # Poll status
             status = "QUEUED"
             max_polls = 60
@@ -20638,9 +21240,9 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                     if status in ("READY", "ERROR", "CANCELED"):
                         break
                 await asyncio.sleep(2.0)
-                
+
             quota_summary = await _get_vercel_quota_summary(token)
-            
+
             if status == "READY":
                 return (
                     f"✅ **Deployment triggered successfully!**\n\n"
@@ -20659,7 +21261,7 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                     f"- **Note**: Check build logs using `vercel_get_deploy_logs` to diagnose errors.\n\n"
                     f"{quota_summary}"
                 )
-                
+
         except Exception as e:
             logger.exception("Vercel deployment failed")
             return f"❌ Failed to deploy to Vercel: {str(e)}"
@@ -20667,14 +21269,15 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
 
 async def _vercel_list_deployments(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
+
     project_name = arguments.get("project_name")
     if not project_name:
         return "❌ Missing required argument: 'project_name'."
-        
+
     token = await _get_vercel_token(agent_id, "vercel_list_deployments")
     if not token:
         return "❌ Vercel Access Token is not configured."
-        
+
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient() as client:
         try:
@@ -20683,7 +21286,7 @@ async def _vercel_list_deployments(agent_id: uuid.UUID, arguments: dict) -> str:
                 deployments = res.json().get("deployments", [])
                 if not deployments:
                     return f"No deployments found for project '{project_name}'."
-                
+
                 lines = [f"📋 **Deployments for {project_name}**:"]
                 for dep in deployments[:10]:
                     created_at = dep.get("created")
@@ -20707,17 +21310,18 @@ async def _vercel_list_deployments(agent_id: uuid.UUID, arguments: dict) -> str:
 
 async def _vercel_get_deploy_logs(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
+
     deployment_id = arguments.get("deployment_id")
     if not deployment_id:
         return "❌ Missing required argument: 'deployment_id'."
-        
+
     if "https://" in deployment_id:
         deployment_id = deployment_id.replace("https://", "").split("/")[0]
-        
+
     token = await _get_vercel_token(agent_id, "vercel_get_deploy_logs")
     if not token:
         return "❌ Vercel Access Token is not configured."
-        
+
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -20728,14 +21332,14 @@ async def _vercel_get_deploy_logs(agent_id: uuid.UUID, arguments: dict) -> str:
                     events = events.get("events", []) if isinstance(events, dict) else []
                 if not events:
                     return f"No logs found for deployment '{deployment_id}'."
-                
+
                 log_lines = []
                 for event in events:
                     payload = event.get("payload", {})
                     text = payload.get("text", "") or event.get("text", "")
                     if text:
                         log_lines.append(text.strip())
-                
+
                 content = "\n".join(log_lines[-100:])
                 return f"📜 **Logs for deployment {deployment_id} (last 100 lines)**:\n```\n{content}\n```"
             else:
@@ -20746,35 +21350,30 @@ async def _vercel_get_deploy_logs(agent_id: uuid.UUID, arguments: dict) -> str:
 
 async def _vercel_set_env(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
+
     project_name = arguments.get("project_name")
     key = arguments.get("key")
     value = arguments.get("value")
     target = arguments.get("target") or ["production", "preview", "development"]
-    
+
     if not project_name or not key or not value:
         return "❌ Missing required arguments: 'project_name', 'key', and 'value' are required."
-        
+
     token = await _get_vercel_token(agent_id, "vercel_set_env")
     if not token:
         return "❌ Vercel Access Token is not configured."
-        
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "key": key,
-        "value": value,
-        "type": "encrypted" if key == "DATABASE_URL" else "plain",
-        "target": target
-    }
-    
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"key": key, "value": value, "type": "encrypted" if key == "DATABASE_URL" else "plain", "target": target}
+
     async with httpx.AsyncClient() as client:
         try:
-            res = await client.post(f"https://api.vercel.com/v9/projects/{project_name}/env", headers=headers, json=payload)
+            res = await client.post(
+                f"https://api.vercel.com/v9/projects/{project_name}/env", headers=headers, json=payload
+            )
             if res.status_code in (200, 201):
                 return f"✅ Environment variable '{key}' set successfully for project '{project_name}'."
-                
+
             res_text_lower = res.text.lower()
             if (
                 "already exists" in res_text_lower
@@ -20789,16 +21388,13 @@ async def _vercel_set_env(agent_id: uuid.UUID, arguments: dict) -> str:
                         if env.get("key") == key:
                             env_id = env.get("id")
                             break
-                            
+
                     if env_id:
-                        patch_payload = {
-                            "value": value,
-                            "target": target
-                        }
+                        patch_payload = {"value": value, "target": target}
                         patch_res = await client.patch(
                             f"https://api.vercel.com/v9/projects/{project_name}/env/{env_id}",
                             headers=headers,
-                            json=patch_payload
+                            json=patch_payload,
                         )
                         if patch_res.status_code in (200, 201):
                             return f"✅ Environment variable '{key}' updated successfully for project '{project_name}'."
@@ -20816,49 +21412,52 @@ async def _vercel_set_env(agent_id: uuid.UUID, arguments: dict) -> str:
 
 async def _vercel_manage_domain(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
+
     action = arguments.get("action")
     domain = arguments.get("domain")
     project_name = arguments.get("project_name")
-    
+
     if not action or not domain:
         return "❌ Missing required arguments: 'action' and 'domain' are required."
-        
+
     token = await _get_vercel_token(agent_id, "vercel_manage_domain")
     if not token:
         return "❌ Vercel Access Token is not configured."
-        
+
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient() as client:
         try:
             if action == "check":
                 # Check domain availability
-                avail_res = await client.get(f"https://api.vercel.com/v1/registrar/domains/{domain}/availability", headers=headers)
+                avail_res = await client.get(
+                    f"https://api.vercel.com/v1/registrar/domains/{domain}/availability", headers=headers
+                )
                 available = False
                 if avail_res.status_code == 200:
                     available = avail_res.json().get("available", False)
                 else:
                     logger.warning(f"Failed to check domain availability: {avail_res.text}")
-                    
+
                 # Check pricing
                 price = 0
-                price_res = await client.get(f"https://api.vercel.com/v1/registrar/domains/{domain}/price", headers=headers)
+                price_res = await client.get(
+                    f"https://api.vercel.com/v1/registrar/domains/{domain}/price", headers=headers
+                )
                 if price_res.status_code == 200:
                     price = price_res.json().get("price", 0)
                 else:
                     logger.warning(f"Failed to check domain price: {price_res.text}")
-                    
+
                 avail_str = "Yes" if available else "No"
-                return (
-                    f"🌐 **Domain Check: {domain}**\n"
-                    f"- Available for purchase: {avail_str}\n"
-                    f"- Price: ${price}"
-                )
-                    
+                return f"🌐 **Domain Check: {domain}**\n- Available for purchase: {avail_str}\n- Price: ${price}"
+
             elif action == "bind":
                 if not project_name:
                     return "❌ Argument 'project_name' is required for action 'bind'."
                 payload = {"name": domain}
-                res = await client.post(f"https://api.vercel.com/v9/projects/{project_name}/domains", headers=headers, json=payload)
+                res = await client.post(
+                    f"https://api.vercel.com/v9/projects/{project_name}/domains", headers=headers, json=payload
+                )
                 if res.status_code in (200, 201):
                     return f"✅ Domain '{domain}' bound successfully to project '{project_name}'."
                 else:
@@ -20871,29 +21470,26 @@ async def _vercel_manage_domain(agent_id: uuid.UUID, arguments: dict) -> str:
 
 async def _neon_create_database(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
+
     project_name = arguments.get("project_name")
     database_name = arguments.get("database_name", "neondb")
     region = arguments.get("region", "aws-us-east-1")
     org_id = arguments.get("org_id")
-    
+
     if not project_name:
         return "❌ Missing required argument: 'project_name'."
-        
+
     config = await _get_tool_config(agent_id, "neon_create_database")
     api_key = (config or {}).get("neon_api_key")
     if not api_key:
         return "❌ Neon API Key is not configured. Please paste your key in the tool settings."
-        
+
     is_blocked, quota_msg = await _check_neon_quota_limit(api_key)
     if is_blocked:
         return quota_msg
-        
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"}
+
     async with httpx.AsyncClient(timeout=45.0) as client:
         if not org_id:
             try:
@@ -20912,32 +21508,28 @@ async def _neon_create_database(agent_id: uuid.UUID, arguments: dict) -> str:
                         )
             except Exception as e:
                 logger.warning(f"Failed to auto-resolve Neon org_id: {e}")
-                
-        project_payload = {
-            "project": {
-                "name": project_name,
-                "region_id": region,
-                "pg_version": 15
-            }
-        }
+
+        project_payload = {"project": {"name": project_name, "region_id": region, "pg_version": 15}}
         if org_id:
             project_payload["project"]["org_id"] = org_id
-            
+
         res = await client.post("https://console.neon.tech/api/v2/projects", headers=headers, json=project_payload)
         if res.status_code in (200, 201):
             data = res.json()
             project = data.get("project", {})
             proj_id = project.get("id")
             connection_uri = data.get("connection_uri")
-            
+
             if not connection_uri:
-                conn_res = await client.get(f"https://console.neon.tech/api/v2/projects/{proj_id}/connection_string", headers=headers)
+                conn_res = await client.get(
+                    f"https://console.neon.tech/api/v2/projects/{proj_id}/connection_string", headers=headers
+                )
                 if conn_res.status_code == 200:
                     connection_uri = conn_res.json().get("connection_uri")
-                    
+
             if not connection_uri:
                 connection_uri = f"postgresql://alex:password@ep-cool-breeze-12345.us-east-1.neon.tech/{database_name}?sslmode=require"
-                
+
             return (
                 f"✅ **Neon database created successfully!**\n\n"
                 f"- **Project ID**: {proj_id}\n"

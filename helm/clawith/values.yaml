@@ -6,7 +6,7 @@ global:
   # Namespace to deploy to
   namespace: clawith
   # Image registry
-  imageRegistry: your docker image registry, e.g. docker.io/yourusername
+  imageRegistry: registry.cn-hangzhou.aliyuncs.com/your-namespace
 
 # Backend configuration
 backend:
@@ -112,7 +112,7 @@ postgresql:
 
   image:
     repository: bitnami/postgresql
-    registry: your docker image registry, e.g. docker.io/yourusername
+    registry: docker.m.daocloud.io
     tag: 15.3.0-debian-11-r7
     pullPolicy: IfNotPresent
 
@@ -162,7 +162,7 @@ redis:
 
   image:
     repository: redis
-    registry: your docker image registry, e.g. docker.io/yourusername
+    registry: docker.m.daocloud.io
     tag: 7-alpine
     pullPolicy: IfNotPresent
 

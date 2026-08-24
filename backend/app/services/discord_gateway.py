@@ -213,7 +213,7 @@ class DiscordGatewayManager:
                 )
                 agent_obj = agent_r.scalar_one_or_none()
                 if not agent_obj:
-                    return "Agent not found."
+                    return "未找到数字员工。"
                 creator_id = agent_obj.creator_id
                 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
                 ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE

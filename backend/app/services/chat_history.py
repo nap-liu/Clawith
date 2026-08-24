@@ -1571,10 +1571,14 @@ async def load_history_prefix_before_anchor(
 ) -> list[dict[str, Any]] | None:
     """Reload the compacted persisted prefix for one fresh user turn.
 
-    Recovery is fail-safe: the anchor must still be the newest persisted row.
-    Only rows before it are returned, so the caller can append its frozen
-    current-turn message and ephemeral overlays without losing their exact
-    in-memory shape.
+    Recovery is fail-safe: the exact anchor must still be present in active
+    history. Only rows before it are returned, so later durable inputs queued
+    on the same session cannot leak into this turn's frozen history. Those
+    inputs remain available to the caller's standard round-boundary inbox.
+
+    A compaction summary may precede the anchor and is retained. If compaction
+    consumed the anchor itself, its exact boundary can no longer be recovered
+    from the summary, so this function returns ``None``.
     """
     rows = await load_messages_for_session(
         db,
@@ -1582,15 +1586,19 @@ async def load_history_prefix_before_anchor(
         conversation_id=conversation_id,
         ctx_size=ctx_size,
     )
-    real_rows = [row for row in rows if not isinstance(row, _SyntheticSummaryMessage)]
-    if not real_rows or str(real_rows[-1].id) != str(turn_anchor_id):
+    anchor_idx = next(
+        (
+            idx
+            for idx, row in enumerate(rows)
+            if not isinstance(row, _SyntheticSummaryMessage)
+            and str(row.id) == str(turn_anchor_id)
+        ),
+        None,
+    )
+    if anchor_idx is None:
         return None
 
-    prefix_rows = [
-        row
-        for row in rows
-        if isinstance(row, _SyntheticSummaryMessage) or str(row.id) != str(turn_anchor_id)
-    ]
+    prefix_rows = rows[:anchor_idx]
     wrap_users = False
     name_map: dict[uuid.UUID, str] = {}
     if is_group:

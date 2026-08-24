@@ -8,8 +8,13 @@ import uuid
 from pathlib import Path
 
 from app.config import get_settings
-from app.services.agent_memory import MEMORY_SYSTEM_PROMPT, load_agent_memory_snapshot
-from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.agent_memory import (
+    MEMORY_SYSTEM_PROMPT,
+    PROJECT_MEMORY_SYSTEM_PROMPT,
+    load_agent_memory_snapshot,
+)
+from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+from app.services.storage import get_storage_backend
 
 settings = get_settings()
 
@@ -42,16 +47,10 @@ def _render_scene_quick_actions(actions: list[dict]) -> str:
     header = "| Title | Type | Content | AI Context |\n|---|---|---|---|"
     rows: list[str] = []
     used_chars = len(header)
-    content_budget = (
-        SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS
-        - len(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE)
-        - 2
-    )
+    content_budget = SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS - len(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE) - 2
     omitted = False
     for action in actions:
-        if not isinstance(action, dict) or not action.get(
-            "ai_visible", action.get("enabled", True)
-        ):
+        if not isinstance(action, dict) or not action.get("ai_visible", action.get("enabled", True)):
             continue
         action_type = str(action.get("type") or "").strip()
         if action_type not in {"send_message", "open_uri"}:
@@ -166,7 +165,7 @@ async def _load_skills_index(
     """
     skills: list[tuple[str, str, str]] = []  # (name, description, path_relative_to_skills)
     storage = get_storage_backend()
-    skills_prefix = normalize_storage_key(f"{agent_id}/skills")
+    skills_prefix = current_agent_runtime_workspace(agent_id).storage_key("skills")
     if await storage.exists(skills_prefix) and await storage.is_dir(skills_prefix):
         for entry in await storage.list_dir(skills_prefix):
             if entry.name.startswith("."):
@@ -380,14 +379,18 @@ async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
         if not server_ids:
             return []
 
-        servers = (await db.execute(
-            select(MCPServer).where(MCPServer.id.in_(server_ids)).order_by(MCPServer.name)
-        )).scalars().all()
+        servers = (
+            (await db.execute(select(MCPServer).where(MCPServer.id.in_(server_ids)).order_by(MCPServer.name)))
+            .scalars()
+            .all()
+        )
 
         # Bulk-load overrides for these servers
-        ovr_rows = (await db.execute(
-            select(MCPServerOverride).where(MCPServerOverride.mcp_server_id.in_(server_ids))
-        )).scalars().all()
+        ovr_rows = (
+            (await db.execute(select(MCPServerOverride).where(MCPServerOverride.mcp_server_id.in_(server_ids))))
+            .scalars()
+            .all()
+        )
         ovr_index: dict[tuple[uuid.UUID, str, uuid.UUID], MCPServerOverride] = {
             (o.mcp_server_id, o.scope_type, o.scope_id): o for o in ovr_rows
         }
@@ -456,15 +459,9 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
 
     # Load human relationships
     source_agent = await db.get(Agent, agent_id)
-    h_result = await db.execute(
-        select(AgentRelationship).where(AgentRelationship.agent_id == agent_id)
-    )
+    h_result = await db.execute(select(AgentRelationship).where(AgentRelationship.agent_id == agent_id))
     human_relationships = list(h_result.scalars().all())
-    profiles = (
-        await load_human_recipient_profiles(db, source_agent, human_relationships)
-        if source_agent
-        else {}
-    )
+    profiles = await load_human_recipient_profiles(db, source_agent, human_relationships) if source_agent else {}
     human_rows = []
     for rel in human_relationships:
         profile = profiles.get(rel.user_id)
@@ -551,11 +548,8 @@ async def build_agent_context(
     # generous cap. Memory is injected in full (no truncation): truncating it
     # silently dropped curated notes past the cap. Memory growth is managed by
     # the agent curating memory.md, not by a hard context cap here.
-    soul = (
-        await _read_file_safe(normalize_storage_key(f"{agent_id}/soul.md"), 30000)
-        if include_soul
-        else ""
-    )
+    runtime_workspace = current_agent_runtime_workspace(agent_id)
+    soul = await _read_file_safe(runtime_workspace.storage_key("soul.md"), 30000) if include_soul else ""
     # Strip markdown heading if present
     if soul.startswith("# "):
         soul = "\n".join(soul.split("\n")[1:]).strip()
@@ -593,10 +587,12 @@ async def build_agent_context(
     relationships = ""
     try:
         from app.database import async_session
+
         async with async_session() as _rel_db:
             relationships = await _load_relationships_from_db(_rel_db, agent_id)
     except Exception as _rel_err:
         from loguru import logger as _ctx_logger
+
         _ctx_logger.warning(f"[agent_context] failed to load relationships for agent {agent_id}: {_rel_err}")
 
     # --- Compose static and dynamic system prompt blocks ---
@@ -657,7 +653,12 @@ When installing or importing an MCP server via `discover_resources` / `import_mc
 - Do **NOT** ask the user for tool-specific tokens (GitHub PAT, Notion integration secret, etc.) when the Smithery flow supports OAuth.
 - Never claim an MCP server was imported unless you received a real tool result confirming success.
 """)
-    if include_memory:
+    if runtime_workspace.is_project:
+        # Project identity ownership is an authorization boundary, not a
+        # memory feature. Keep the owner-only rule even when a Run excludes
+        # Core Memory content.
+        static_parts.append(PROJECT_MEMORY_SYSTEM_PROMPT)
+    elif include_memory:
         static_parts.append(MEMORY_SYSTEM_PROMPT)
 
     dynamic_parts = []
@@ -935,6 +936,8 @@ Strict rules:
         static_parts.append(f"\n## Skills\n{skills_text}")
 
     if project_runtime is not None:
+        from app.services.project_collaboration_prompt import build_project_runtime_context
+
         dynamic_parts.append(
             "\n## Project Runtime Boundary\n"
             f"project_id: {project_runtime.get('project_id')}\n"
@@ -942,6 +945,7 @@ Strict rules:
             "Only the immutable project capability snapshot applies. Skills and MCPs absent "
             "from that snapshot are unavailable even if the source Agent later enables them."
         )
+        dynamic_parts.append("\n" + build_project_runtime_context(project_runtime))
 
     if relationships and "暂无" not in relationships and "None yet" not in relationships:
         static_parts.append(f"\n## Relationships\n{relationships}")
@@ -973,9 +977,7 @@ Strict rules:
                 continue
             name = str(block.get("name") or block.get("id") or "Scene prompt").strip()
             enabled_prompt_lines.append(f"### {name}\n{content}")
-        quick_actions_context = _render_scene_quick_actions(
-            channel_context.get("scene_quick_actions") or []
-        )
+        quick_actions_context = _render_scene_quick_actions(channel_context.get("scene_quick_actions") or [])
         if enabled_prompt_lines or quick_actions_context:
             scene_parts = [
                 "\n## Scene Instructions",
@@ -987,13 +989,8 @@ Strict rules:
             if enabled_prompt_lines:
                 scene_parts.append("\n\n".join(enabled_prompt_lines))
             if quick_actions_context:
-                scene_parts.append(
-                    "### Available Quick Actions\n"
-                    + quick_actions_context
-                )
-            dynamic_parts.append(
-                "\n\n".join(scene_parts)
-            )
+                scene_parts.append("### Available Quick Actions\n" + quick_actions_context)
+            dynamic_parts.append("\n\n".join(scene_parts))
 
     # --- Focus (working memory) --- DISABLED: injecting completed focus items
     # into the system prompt was reinforcing stale workflow patterns over updated

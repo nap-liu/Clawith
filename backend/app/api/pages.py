@@ -632,6 +632,7 @@ async def list_page_agent_options(
     if is_platform_admin_user(current_user) or current_user.role == "org_admin":
         query = select(Agent).where(
             Agent.tenant_id == current_user.tenant_id,
+            Agent.scope == "standard",
             Agent.is_deleted.is_(False),
         )
     else:

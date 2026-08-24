@@ -45,7 +45,7 @@ vi helm/clawith/values.yaml
 ```yaml
 # 1. Configure Image Registry
 global:
-  imageRegistry: docker.io/yourusername  # Change to your image registry
+  imageRegistry: registry.cn-hangzhou.aliyuncs.com/your-namespace  # Use a domestic image registry
 
 # 2. Configure Image Tags
 backend:
@@ -65,7 +65,7 @@ backend:
 
 postgresql:
   image:
-    registry: docker.io/bitnami  # Change to your image registry
+    registry: docker.m.daocloud.io  # Domestic image mirror
   auth:
     password: "clawith123456"  # Strongly recommended to change to a strong password!
   primary:
@@ -76,7 +76,7 @@ postgresql:
 
 redis:
   image:
-    registry: docker.io  # Change to your image registry
+    registry: docker.m.daocloud.io  # Domestic image mirror
   persistence:
     existingClaim: ""  # If using existing PVC, enter PVC name
     storageClass: ""  # If creating new, change to your StorageClass name

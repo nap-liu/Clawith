@@ -24,6 +24,7 @@ from app.models.subagent_run import SubagentRun
 from app.services.project_git_service import (
     commit_project_changes,
     list_project_files,
+    project_agent_git_email,
     read_project_file,
     repository_state,
     restore_as_new_commit,
@@ -61,6 +62,24 @@ PROJECT_RUNTIME_TOOL_NAMES = PARTICIPANT_PROJECT_TOOLS | LEADER_ONLY_PROJECT_TOO
 
 WORK_ITEM_STATUSES = {"backlog", "todo", "in_progress", "review", "blocked", "done"}
 WORK_ITEM_PRIORITIES = {"low", "medium", "high", "urgent"}
+
+# Project context is injected into an LLM tool result, so every newly exposed
+# human-authored field must have a deterministic upper bound.  These limits are
+# intentionally smaller than storage limits: the complete records remain
+# available through the project detail APIs and event timeline.
+PROJECT_MEMBER_NAME_MAX_CHARS = 100
+PROJECT_MEMBER_ROLE_MAX_CHARS = 500
+WORK_ITEM_PROGRESS_MAX_CHARS = 600
+WORK_ITEM_EVIDENCE_MAX_ITEMS = 6
+WORK_ITEM_EVIDENCE_MAX_CHARS = 300
+WORK_ITEM_EVENT_SCAN_MAX = 600
+
+
+def _bounded_context_text(value: Any, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1].rstrip()}…"
 
 
 def _milestone_operation_key(
@@ -139,12 +158,13 @@ def _schema(name: str, description: str, properties: dict, required: list[str] |
 PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "project_get_context": _schema(
         "project_get_context",
-        "Read only the current project's goal, plan signals, status and Git head.",
+        "Read the current project's goal, plan signals, status, Git head, and each member's project and professional roles.",
         {},
     ),
     "project_list_work_items": _schema(
         "project_list_work_items",
-        "List project work items. Optionally return only work assigned to this Agent.",
+        "List project work items with assignee role, latest progress, and bounded evidence. "
+        "Optionally return only work assigned to this Agent.",
         {"mine_only": {"type": "boolean", "default": False}},
     ),
     "project_list_files": _schema(
@@ -200,14 +220,45 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     ),
     "project_message_agent": _schema(
         "project_message_agent",
-        "Send one project-scoped message to exactly one enabled Agent; never broadcasts.",
+        "Request one professional judgment or delegate one concrete project task to exactly one enabled Agent; "
+        "never broadcasts. Project A2A is not a status-notification channel: do not use it for FYI, progress "
+        "announcements, acknowledgements, or asking a downstream role to wait. Record passive progress on the "
+        "work item or project timeline instead. Every request must identify the evidence/context, the decision or "
+        "work required from the recipient's role, and the expected output. Provide work_item_id whenever the "
+        "message advances a concrete work item.",
         {
             "agent_id": {"type": "string"},
-            "message": {"type": "string"},
-            "mode": {"type": "string", "enum": ["notify", "task_delegate", "consult"]},
+            "work_item_id": {
+                "type": "string",
+                "description": (
+                    "Exact related project work item UUID. Required for task delegation unless "
+                    "the current Run is already linked to that work item."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "maxLength": 120,
+                "description": "Concise, durable name for this professional question or delegated action.",
+            },
+            "message": {
+                "type": "string",
+                "description": (
+                    "Actionable handoff containing evidence/context, the professional question or decision need, "
+                    "and the expected result. Status-only or FYI messages are not allowed."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["task_delegate", "consult"],
+                "description": "Use task_delegate for asynchronous work with a result; use consult for a focused decision now.",
+            },
+            "expected_output": {
+                "type": "string",
+                "description": "The concrete decision, review, analysis or artifact the recipient must return.",
+            },
             "new_conversation": {"type": "boolean"},
         },
-        ["agent_id", "message"],
+        ["agent_id", "title", "message", "mode", "expected_output"],
     ),
     "project_update_plan": _schema(
         "project_update_plan",
@@ -221,7 +272,7 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     ),
     "project_set_member_enabled": _schema(
         "project_set_member_enabled",
-        "Enable or disable one non-Leader project member.",
+        "Enable or disable one project member who is not the project owner.",
         {"agent_id": {"type": "string"}, "is_enabled": {"type": "boolean"}},
         ["agent_id", "is_enabled"],
     ),
@@ -461,8 +512,12 @@ async def _project_context(project: Project) -> str:
             {
                 "member_id": str(member.id),
                 "agent_id": str(member.agent_id),
-                "name": member.name_snapshot,
-                "role": "leader" if member.is_leader else "participant",
+                "name": _bounded_context_text(member.name_snapshot, PROJECT_MEMBER_NAME_MAX_CHARS),
+                "project_role": "owner" if member.is_leader else "participant",
+                "professional_role": _bounded_context_text(
+                    member.role_snapshot,
+                    PROJECT_MEMBER_ROLE_MAX_CHARS,
+                ),
                 "enabled": member.is_enabled,
             }
             for member in members
@@ -477,6 +532,64 @@ async def _list_work_items(project: Project, agent_id: uuid.UUID, mine_only: boo
         if mine_only:
             statement = statement.where(ProjectWorkItem.assignee_agent_id == agent_id)
         items = (await db.execute(statement.order_by(ProjectWorkItem.created_at))).scalars().all()
+
+        assignee_ids = {item.assignee_agent_id for item in items if item.assignee_agent_id is not None}
+        members = (
+            (
+                await db.execute(
+                    select(ProjectMemberSnapshot).where(
+                        ProjectMemberSnapshot.project_id == project.id,
+                        ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                        ProjectMemberSnapshot.agent_id.in_(assignee_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if assignee_ids
+            else []
+        )
+        member_by_agent_id = {member.agent_id: member for member in members}
+
+        item_ids = [item.id for item in items]
+        events = (
+            (
+                await db.execute(
+                    select(ProjectEvent)
+                    .where(
+                        ProjectEvent.project_id == project.id,
+                        ProjectEvent.tenant_id == project.tenant_id,
+                        ProjectEvent.work_item_id.in_(item_ids),
+                        ProjectEvent.event_type == "work_item.updated",
+                    )
+                    .order_by(ProjectEvent.created_at.desc())
+                    .limit(WORK_ITEM_EVENT_SCAN_MAX)
+                )
+            )
+            .scalars()
+            .all()
+            if item_ids
+            else []
+        )
+        progress_by_item_id: dict[uuid.UUID, str] = {}
+        evidence_by_item_id: dict[uuid.UUID, list[str]] = {}
+        for event in events:
+            if event.work_item_id is None:
+                continue
+            metadata = dict(event.event_metadata or {})
+            progress = _bounded_context_text(metadata.get("progress_note"), WORK_ITEM_PROGRESS_MAX_CHARS)
+            if progress and event.work_item_id not in progress_by_item_id:
+                progress_by_item_id[event.work_item_id] = progress
+
+            evidence = evidence_by_item_id.setdefault(event.work_item_id, [])
+            raw_evidence = metadata.get("evidence") or []
+            if not isinstance(raw_evidence, list):
+                raw_evidence = [raw_evidence]
+            for raw_value in raw_evidence:
+                value = _bounded_context_text(raw_value, WORK_ITEM_EVIDENCE_MAX_CHARS)
+                if value and value not in evidence and len(evidence) < WORK_ITEM_EVIDENCE_MAX_ITEMS:
+                    evidence.append(value)
+
         payload = [
             {
                 "id": str(item.id),
@@ -485,8 +598,26 @@ async def _list_work_items(project: Project, agent_id: uuid.UUID, mine_only: boo
                 "status": item.status,
                 "priority": item.priority,
                 "assignee_agent_id": str(item.assignee_agent_id) if item.assignee_agent_id else None,
+                "assignee_name": (
+                    _bounded_context_text(
+                        member_by_agent_id[item.assignee_agent_id].name_snapshot,
+                        PROJECT_MEMBER_NAME_MAX_CHARS,
+                    )
+                    if item.assignee_agent_id in member_by_agent_id
+                    else None
+                ),
+                "professional_role": (
+                    _bounded_context_text(
+                        member_by_agent_id[item.assignee_agent_id].role_snapshot,
+                        PROJECT_MEMBER_ROLE_MAX_CHARS,
+                    )
+                    if item.assignee_agent_id in member_by_agent_id
+                    else None
+                ),
                 "dependency_ids": list(item.dependency_ids or []),
                 "acceptance_criteria": list(item.acceptance_criteria or []),
+                "progress": progress_by_item_id.get(item.id),
+                "evidence": evidence_by_item_id.get(item.id, []),
             }
             for item in items
         ]
@@ -541,22 +672,74 @@ async def execute_project_runtime_tool(
     if tool_name == "project_message_agent":
         target_id = _uuid(arguments.get("agent_id"), "agent_id")
         message = str(arguments.get("message") or "").strip()
+        mode = str(arguments.get("mode") or "task_delegate")
+        title = str(arguments.get("title") or "").strip()
+        expected_output = str(arguments.get("expected_output") or "").strip()
         if not message:
             raise ValueError("message is required")
+        if mode not in {"task_delegate", "consult"}:
+            raise ValueError(
+                "Project A2A only accepts actionable task_delegate or consult requests; "
+                "record passive status on the work item or project timeline"
+            )
+        if not title:
+            raise ValueError("title is required for project A2A collaboration")
+        if not expected_output:
+            raise ValueError("expected_output is required for project A2A collaboration")
+        from app.services.project_reply_quality import project_handoff_rejection_reasons
+
+        handoff_reasons = project_handoff_rejection_reasons(message)
+        if handoff_reasons:
+            raise ValueError(
+                "Project A2A requires an actionable professional handoff, not an acknowledgement, "
+                "status update, activity log, or internal narration"
+            )
         if target_id == agent_id:
             raise ValueError("A project Agent cannot delegate a task to itself")
+        explicit_work_item_id = _uuid(arguments.get("work_item_id"), "work_item_id", optional=True)
+        related_work_item_id = explicit_work_item_id or (project_run.work_item_id if project_run else None)
         async with async_session() as db:
             await _enabled_member(db, project, target_id)
+            if related_work_item_id is not None:
+                related_work_item = await db.get(ProjectWorkItem, related_work_item_id)
+                if related_work_item is None or related_work_item.project_id != project.id:
+                    raise ValueError("work_item_id must identify a work item in the current project")
+                dependency_ids = list(related_work_item.dependency_ids or [])
+                if dependency_ids:
+                    dependency_rows = (
+                        (
+                            await db.execute(
+                                select(ProjectWorkItem).where(
+                                    ProjectWorkItem.project_id == project.id,
+                                    ProjectWorkItem.id.in_(dependency_ids),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    unfinished = [row.title for row in dependency_rows if row.status != "done"]
+                    missing = len(dependency_rows) != len(set(dependency_ids))
+                    if unfinished or missing:
+                        labels = ", ".join(unfinished) or "missing dependency records"
+                        raise ValueError(
+                            "Project A2A cannot wake this work item before its dependencies are done: " + labels
+                        )
+        if mode == "task_delegate" and related_work_item_id is None:
+            raise ValueError("work_item_id is required when delegating work from an unlinked project Run")
         from app.services.agent_tools import _send_message_to_agent
 
         result = await _send_message_to_agent(
             agent_id,
             {
                 "agent_id": str(target_id),
-                "message": message,
-                "msg_type": str(arguments.get("mode") or "task_delegate"),
+                "message": f"{message}\n\nExpected output / 预期产出：{expected_output}",
+                "msg_type": mode,
                 "new_conversation": bool(arguments.get("new_conversation", False)),
                 "_project_id": str(project.id),
+                "_parent_project_run_id": str(project_run.id) if project_run else None,
+                "_work_item_id": str(related_work_item_id) if related_work_item_id else None,
+                "_run_title": title or None,
             },
             user_id=execution_user_id,
             origin_session_id=session_id,
@@ -578,8 +761,11 @@ async def execute_project_runtime_tool(
                 actor_agent_id=agent_id,
                 from_agent_id=agent_id,
                 to_agent_id=target_id,
+                work_item_id=related_work_item_id,
                 metadata={
-                    "mode": str(arguments.get("mode") or "task_delegate"),
+                    "mode": mode,
+                    "title": title,
+                    "expected_output": expected_output,
                     "new_conversation": bool(arguments.get("new_conversation", False)),
                     "session_id": delivered_session_id,
                     "a2a_session_id": delivered_session_id,
@@ -636,7 +822,13 @@ async def execute_project_runtime_tool(
         commit = str(arguments.get("commit") or "").strip()
         if not commit:
             raise ValueError("commit is required")
-        result = await restore_as_new_commit(project, commit, str(arguments.get("message") or "").strip() or None)
+        result = await restore_as_new_commit(
+            project,
+            commit,
+            str(arguments.get("message") or "").strip() or None,
+            author_name=member.name_snapshot,
+            author_email=project_agent_git_email(agent_id),
+        )
         async with async_session() as db:
             attached = await db.get(Project, project.id)
             settings = dict(attached.settings or {})
@@ -658,7 +850,13 @@ async def execute_project_runtime_tool(
         content = arguments.get("content")
         if not path or not isinstance(content, str):
             raise ValueError("path and string content are required")
-        result = await write_project_file(project, path, content)
+        result = await write_project_file(
+            project,
+            path,
+            content,
+            author_name=member.name_snapshot,
+            author_email=project_agent_git_email(agent_id),
+        )
         async with async_session() as db:
             attached = await db.get(Project, project.id)
             settings = dict(attached.settings or {})
@@ -754,6 +952,8 @@ async def execute_project_runtime_tool(
             paths,
             milestone=True,
             operation_key=operation_key,
+            author_name=member.name_snapshot,
+            author_email=project_agent_git_email(agent_id),
         )
         async with async_session() as db:
             attached = await db.get(Project, project.id)
@@ -766,9 +966,7 @@ async def execute_project_runtime_tool(
             settings["git"] = {**dict(settings.get("git") or {}), "head": result["commit"]}
             attached.settings = settings
             operation_event.event_type = "git.milestone.created"
-            operation_event.summary = (
-                f"{member.name_snapshot} created project Git milestone {result['commit'][:12]}"
-            )
+            operation_event.summary = f"{member.name_snapshot} created project Git milestone {result['commit'][:12]}"
             operation_event.event_metadata = {
                 **dict(operation_event.event_metadata or {}),
                 **result,
@@ -826,7 +1024,7 @@ async def execute_project_runtime_tool(
             if target is None:
                 raise ValueError("member was not found in the current project")
             if target.is_leader:
-                raise ValueError("Leader enablement and transfer are Human-only operations")
+                raise ValueError("Project-owner enablement and transfer require a Human operator")
             enabled = bool(arguments.get("is_enabled"))
             cancelled_child_ids: list[uuid.UUID] = []
             if enabled:

@@ -127,6 +127,64 @@ class ProjectMemberOut(BaseModel):
     updated_at: datetime
 
 
+class ProjectAgentCreate(BaseModel):
+    """Create a project-owned Agent, optionally from a visible standard Agent."""
+
+    source_agent_id: uuid.UUID | None = None
+    name: str | None = Field(default=None, min_length=2, max_length=100)
+    role_description: str | None = Field(default=None, max_length=500)
+    soul: str | None = Field(default=None, max_length=200_000)
+    core_memory: str | None = Field(default=None, max_length=200_000)
+    is_leader: bool = False
+
+    @model_validator(mode="after")
+    def require_name_for_blank_agent(self):
+        if self.source_agent_id is None and not (self.name or "").strip():
+            raise ValueError("name is required when source_agent_id is not provided")
+        return self
+
+
+class ProjectAgentUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=100)
+    role_description: str | None = Field(default=None, max_length=500)
+    soul: str | None = Field(default=None, max_length=200_000)
+    core_memory: str | None = Field(default=None, max_length=200_000)
+
+
+class ProjectAgentLifecycleRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ProjectAgentPromoteRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=100)
+
+
+class ProjectAgentOut(BaseModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    member_id: uuid.UUID
+    source_agent_id: uuid.UUID | None = None
+    name: str
+    role_description: str
+    avatar_url: str | None = None
+    status: str
+    agent_dir: str
+    soul: str
+    core_memory: str
+    is_leader: bool
+    is_enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectAgentPromotionOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    role_description: str
+    source_project_id: uuid.UUID
+    source_project_agent_id: uuid.UUID
+
+
 class ProjectAccessGrantCreate(BaseModel):
     user_id: uuid.UUID
     role: Literal["view", "edit"] = "view"
@@ -177,6 +235,14 @@ class ProjectTemplateCreate(BaseModel):
     version: str = "1.0.0"
     is_published: bool = False
     definition: dict = Field(default_factory=dict)
+
+
+class ProjectTemplateFromProjectCreate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    category: str = "general"
+    version: str = "1.0.0"
+    is_published: bool = False
 
 
 class ProjectTemplateOut(BaseModel):
@@ -252,6 +318,17 @@ class ProjectRunCreate(BaseModel):
     trigger_type: Literal["manual", "leader", "a2a", "schedule", "retry"] = "manual"
     input: dict = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def require_actionable_execution(self):
+        """Reject unscoped Runs that can only produce generic progress prose."""
+
+        if self.work_item_id is not None:
+            return self
+        actionable = any(str(self.input.get(field) or "").strip() for field in ("task", "objective", "message"))
+        if not actionable:
+            raise ValueError("work_item_id or an explicit task/objective/message is required")
+        return self
+
 
 class ProjectRunUpdate(BaseModel):
     status: Literal["queued", "running", "waiting", "succeeded", "failed", "cancelled"] | None = None
@@ -269,6 +346,7 @@ class ProjectRunOut(BaseModel):
     initiated_by_user_id: uuid.UUID | None
     status: str
     trigger_type: str
+    title: str | None = None
     input: dict
     output: dict
     error: str | None
@@ -362,9 +440,11 @@ class WorkItemDetailOut(BaseModel):
 class A2AWakeRequest(BaseModel):
     from_agent_id: uuid.UUID
     to_agent_id: uuid.UUID
+    title: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1)
-    mode: Literal["notify", "consult", "delegate", "review"] = "notify"
-    work_item_id: uuid.UUID | None = None
+    mode: Literal["consult", "delegate", "review"]
+    expected_output: str = Field(min_length=1, max_length=10_000)
+    work_item_id: uuid.UUID
     new_conversation: bool = False
 
 
@@ -376,6 +456,7 @@ class ProjectGroupMessageCreate(BaseModel):
     llm_content: str | None = Field(default=None, max_length=250_000)
     mentions: list[uuid.UUID] = Field(default_factory=list)
     attachments: list[dict] = Field(default_factory=list, max_length=10)
+    work_item_id: uuid.UUID | None = None
     sender_agent_id: uuid.UUID | None = None
     client_message_id: str | None = Field(default=None, min_length=1, max_length=200)
 

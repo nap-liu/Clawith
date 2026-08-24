@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "sessions": 300,
+  "interactive_turns": 500,
+  "reserved_turns": 200,
+  "total_turns": 700,
+  "same_session_max_active": 1,
+  "capacity_high_watermark": 700,
+  "interactive_high_watermark": 500,
+  "project_high_watermark": 100,
+  "scheduled_high_watermark": 50,
+  "background_high_watermark": 50,
+  "rejected_overflow_turns": 1,
+  "database_pool_configured_max": 30,
+  "database_pool_checked_out_high_watermark": 30,
+  "provider_parallelism": 32,
+  "elapsed_seconds": 0.951
+}

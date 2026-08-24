@@ -31,7 +31,7 @@ export default function Messages() {
                 <div>
                     <h1 style={{ fontSize: '20px', fontWeight: 600, margin: 0 }}>{t('messages.title')}</h1>
                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '3px' }}>
-                        {i18n.language?.startsWith('zh') ? '选择记录后使用标准 Web 对话视图查看完整上下文' : 'Open a record to view its full context in the standard Web conversation view'}
+                        {i18n.language?.startsWith('zh') ? '选择记录查看完整上下文' : 'Open a record to view its full context'}
                     </div>
                 </div>
             </div>

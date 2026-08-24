@@ -1,6 +1,7 @@
 # ─── Backend Dockerfile (Optimized) ─────────────────────
 # Multi-stage: deps → production
-FROM python:3.12-slim AS deps
+ARG CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io
+FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim AS deps
 
 WORKDIR /app
 # APT mirror is a build arg — the default (aliyun) occasionally stalls on
@@ -27,7 +28,7 @@ RUN if [ -n "$CLAWITH_PIP_INDEX_URL" ] && [ -n "$CLAWITH_PIP_TRUSTED_HOST" ]; th
     fi
 
 # ─── Production ─────────────────────────────────────────
-FROM python:3.12-slim AS production
+FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim AS production
 
 WORKDIR /app
 ARG CLAWITH_APT_MIRROR=mirrors.aliyun.com

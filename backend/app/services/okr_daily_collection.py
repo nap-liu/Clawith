@@ -73,12 +73,12 @@ async def trigger_daily_collection_for_tenant(tenant_id: uuid.UUID) -> dict:
         if not settings.daily_report_enabled:
             raise ValueError("Daily report collection is not enabled for this tenant")
         if not settings.okr_agent_id:
-            raise ValueError("OKR Agent not found for this tenant")
+            raise ValueError("当前租户未找到 OKR 数字员工")
 
         okr_agent_result = await db.execute(select(Agent).where(Agent.id == settings.okr_agent_id))
         okr_agent = okr_agent_result.scalar_one_or_none()
         if not okr_agent:
-            raise ValueError("OKR Agent not found for this tenant")
+            raise ValueError("当前租户未找到 OKR 数字员工")
 
         await db.commit()
 

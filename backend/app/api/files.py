@@ -1258,7 +1258,7 @@ async def import_skill_to_agent(
     """
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
-        raise HTTPException(status_code=403, detail="Agent manage access required")
+        raise HTTPException(status_code=403, detail="需要数字员工管理权限")
 
     from sqlalchemy import or_
     from sqlalchemy.orm import selectinload

@@ -49,7 +49,7 @@ export default function MentionSuggestions({
             ref={menuRef}
             id={id}
             role="listbox"
-            aria-label="选择要提及的项目 Agent"
+            aria-label="选择要提及的项目数字员工"
             className="ui-mention-suggestions"
             data-placement={floatingPosition.placement}
             style={floatingPosition.style}

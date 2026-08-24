@@ -245,7 +245,7 @@ export default function OkrTab({ tenantId, t }: { tenantId: string; t: any }) {
                                     </a>
                                 ) : (
                                     <span style={{ fontSize: '12px', color: 'var(--text-tertiary)', flexShrink: 0 }}>
-                                        {zh ? 'OKR Agent 未找到' : 'OKR Agent not found'}
+                                        {zh ? '未找到 OKR 数字员工' : 'OKR Digital Employee not found'}
                                     </span>
                                 )}
                             </div>

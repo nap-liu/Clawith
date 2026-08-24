@@ -3,7 +3,20 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,6 +36,14 @@ class Agent(Base):
     """
 
     __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint("scope IN ('standard', 'project')", name="ck_agents_scope"),
+        CheckConstraint(
+            "(scope = 'standard' AND project_id IS NULL) OR "
+            "(scope = 'project' AND project_id IS NOT NULL AND agent_dir IS NOT NULL)",
+            name="ck_agents_project_scope",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -34,6 +55,18 @@ class Agent(Base):
     # Ownership
     creator_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"))
+
+    # Project-native agents are standard Agent runtimes whose mutable assets
+    # belong to one project. They may be created from scratch or copied from a
+    # source Agent; the source row always remains unchanged.
+    scope: Mapped[str] = mapped_column(String(20), nullable=False, default="standard", server_default="standard")
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    source_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    agent_dir: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # Agent type: 'native' (platform-hosted LLM) or 'openclaw' (remote OpenClaw bot)
     agent_type: Mapped[str] = mapped_column(String(20), default="native", nullable=False)
@@ -136,7 +169,9 @@ class Agent(Base):
     timezone: Mapped[str | None] = mapped_column(String(50), default=None, nullable=True)
 
     # External IM channels can optionally show model thinking progress.
-    im_thinking_output_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    im_thinking_output_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -146,11 +181,19 @@ class Agent(Base):
 
     # Relationships
     creator: Mapped["User"] = relationship("User", back_populates="created_agents", foreign_keys=[creator_id])
+    project: Mapped["Project | None"] = relationship("Project", foreign_keys=[project_id])
+    source_agent: Mapped["Agent | None"] = relationship("Agent", remote_side=[id], foreign_keys=[source_agent_id])
+
+    @staticmethod
+    def project_agent_dir(agent_id: uuid.UUID) -> str:
+        """Return the repository-relative directory for a project Agent."""
+        return f".agents/{agent_id}"
 
     @property
     def has_api_key(self) -> bool:
         """Whether this agent has an API key configured."""
         return bool(self.api_key_hash)
+
     permissions: Mapped[list["AgentPermission"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     tasks: Mapped[list["Task"]] = relationship(
         back_populates="agent",
@@ -242,21 +285,30 @@ class AgentUserOnboarding(Base):
     __tablename__ = "agent_user_onboardings"
 
     agent_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True,
+        UUID(as_uuid=True),
+        ForeignKey("agents.id", ondelete="CASCADE"),
+        primary_key=True,
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True,
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
     )
     onboarded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False,
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
     )
     phase: Mapped[str] = mapped_column(
-        String(32), default="completed", server_default="completed", nullable=False,
+        String(32),
+        default="completed",
+        server_default="completed",
+        nullable=False,
     )
 
 
-# Import for relationship resolution
-from app.models.task import Task  # noqa: E402, F401
 from app.models.channel_config import ChannelConfig  # noqa: E402, F401
-from app.models.user import User  # noqa: E402, F401
 from app.models.llm import LLMModel  # noqa: E402, F401
+from app.models.project import Project  # noqa: E402, F401
+from app.models.task import Task  # noqa: E402, F401
+from app.models.user import User  # noqa: E402, F401

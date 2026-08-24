@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.llm.caller import _stream_with_throttle_retry, call_llm
+from app.services.llm.caller import (
+    _complete_with_throttle_retry,
+    _provider_slot,
+    _stream_with_throttle_retry,
+    call_llm,
+)
 from app.services.llm.client import LLMError, LLMResponse
 
 
@@ -77,14 +82,11 @@ def _patch_call_llm_collaborators(monkeypatch, client):
 async def test_provider_throttle_is_retried_before_returning_success(monkeypatch):
     client = _ThrottleScriptClient(
         [
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
             LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
-            LLMError(
-                "HTTP 500: {\"error\":{\"message\":\"<503> Too many requests. "
-                "Your requests are being throttled due to system capacity limits\","
-                "\"code\":\"ServiceUnavailable\"}}"
+                'HTTP 500: {"error":{"message":"<503> Too many requests. '
+                'Your requests are being throttled due to system capacity limits",'
+                '"code":"ServiceUnavailable"}}'
             ),
             _stop_response("重试后成功"),
         ]
@@ -233,21 +235,70 @@ async def test_provider_slot_bounds_parallel_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_background_complete_shares_provider_capacity(monkeypatch):
+    active = 0
+    maximum = 0
+
+    class _ParallelCompleteClient:
+        async def complete(self, **_kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return _stop_response("done")
+
+    monkeypatch.setenv("CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT", "2")
+    model = _FakeModel(request_timeout=1)
+    await asyncio.gather(
+        *(
+            _complete_with_throttle_retry(
+                _ParallelCompleteClient(),
+                model=model,
+                round_i=1,
+                messages=[],
+            )
+            for _ in range(4)
+        )
+    )
+
+    assert maximum == 2
+
+
+@pytest.mark.asyncio
+async def test_background_complete_queue_wait_is_outside_request_timeout(monkeypatch):
+    class _ImmediateCompleteClient:
+        async def complete(self, **_kwargs):
+            return _stop_response("done")
+
+    monkeypatch.setenv("CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT", "1")
+    model = _FakeModel(request_timeout=0.01)
+    provider_slot = _provider_slot(model)
+    await provider_slot.acquire()
+    queued = asyncio.create_task(
+        _complete_with_throttle_retry(
+            _ImmediateCompleteClient(),
+            model=model,
+            round_i=1,
+            messages=[],
+        )
+    )
+
+    await asyncio.sleep(0.02)
+    assert not queued.done()
+    provider_slot.release()
+
+    response = await queued
+    assert response.content == "done"
+
+
+@pytest.mark.asyncio
 async def test_provider_throttle_exhaustion_returns_later_user_message(monkeypatch):
     client = _ThrottleScriptClient(
         [
-            LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
-            LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
-            LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
         ]
     )
     _patch_call_llm_collaborators(monkeypatch, client)

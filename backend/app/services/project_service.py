@@ -1,6 +1,7 @@
 """Tenant-safe orchestration services for AI-native projects."""
 
 import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +31,34 @@ from app.models.user import User
 from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
 
 PROJECT_EVENT_SUMMARY_MAX_LENGTH = 500
+PROJECT_RUNTIME_STATUS_RUNNING = "running"
+PROJECT_RUNTIME_STATUS_PAUSED = "paused"
+
+
+def ensure_project_running(project: Project) -> None:
+    """Reject a new project wake unless the authoritative project is running."""
+
+    if project.status != PROJECT_RUNTIME_STATUS_RUNNING:
+        raise HTTPException(
+            status_code=409,
+            detail="Project runtime is paused or unavailable; resume the project before starting new work",
+        )
+
+
+async def project_runtime_allows_agent(db: AsyncSession, agent: Agent) -> bool:
+    """Return whether an Agent may accept a new turn under its project switch.
+
+    Standard Agents are not governed by a project. Project Agents always defer
+    to their owning Project status, which keeps schedules and triggers aligned
+    with the same switch used by Project Runs and collaboration.
+    """
+
+    if agent.scope != "project":
+        return True
+    if agent.project_id is None:
+        return False
+    status_value = await db.scalar(select(Project.status).where(Project.id == agent.project_id))
+    return status_value == PROJECT_RUNTIME_STATUS_RUNNING
 
 
 def bounded_project_event_summary(event_type: str, summary: str) -> tuple[str, dict[str, Any]]:
@@ -73,26 +102,55 @@ def accessible_projects_clause(user: User, *, edit: bool = False):
     return and_(Project.tenant_id == tenant_id, or_(Project.owner_user_id == user.id, grant))
 
 
-async def require_project(db: AsyncSession, user: User, project_id: uuid.UUID, *, edit: bool = False) -> Project:
-    project = (
-        await db.execute(select(Project).where(Project.id == project_id, accessible_projects_clause(user, edit=edit)))
-    ).scalar_one_or_none()
+async def require_project(
+    db: AsyncSession,
+    user: User,
+    project_id: uuid.UUID,
+    *,
+    edit: bool = False,
+    lock: bool = False,
+) -> Project:
+    statement = select(Project).where(
+        Project.id == project_id,
+        accessible_projects_clause(user, edit=edit),
+    )
+    if lock:
+        statement = statement.with_for_update()
+    project = (await db.execute(statement)).scalar_one_or_none()
     if project is None:
         # Deliberately hide existence across tenants and unauthorized users.
         raise HTTPException(status_code=404, detail="Project not found")
+    if lock and project.owner_user_id != user.id:
+        grant_role = await db.scalar(
+            select(ProjectAccessGrant.role)
+            .where(
+                ProjectAccessGrant.project_id == project.id,
+                ProjectAccessGrant.tenant_id == project.tenant_id,
+                ProjectAccessGrant.user_id == user.id,
+                *([ProjectAccessGrant.role == "edit"] if edit else []),
+            )
+            .with_for_update()
+        )
+        if grant_role is None:
+            raise HTTPException(status_code=404, detail="Project not found")
     return project
 
 
-async def require_owner(db: AsyncSession, user: User, project_id: uuid.UUID) -> Project:
-    project = (
-        await db.execute(
-            select(Project).where(
-                Project.id == project_id,
-                Project.tenant_id == _tenant_id(user),
-                Project.owner_user_id == user.id,
-            )
-        )
-    ).scalar_one_or_none()
+async def require_owner(
+    db: AsyncSession,
+    user: User,
+    project_id: uuid.UUID,
+    *,
+    lock: bool = False,
+) -> Project:
+    statement = select(Project).where(
+        Project.id == project_id,
+        Project.tenant_id == _tenant_id(user),
+        Project.owner_user_id == user.id,
+    )
+    if lock:
+        statement = statement.with_for_update()
+    project = (await db.execute(statement)).scalar_one_or_none()
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
@@ -101,7 +159,7 @@ async def require_owner(db: AsyncSession, user: User, project_id: uuid.UUID) -> 
 async def ensure_project_group_session(db: AsyncSession, project: Project) -> ChatSession:
     """Return the project's single durable group root.
 
-    The access Agent is fixed at first creation instead of following Leader
+    The access Agent is fixed at first creation instead of following project-owner
     changes. Project REST endpoints enforce ACL; this session is only the
     append-only conversation/root for durable child runs.
     """
@@ -133,7 +191,7 @@ async def ensure_project_group_session(db: AsyncSession, project: Project) -> Ch
         )
     ).scalar_one_or_none()
     if anchor is None:
-        raise HTTPException(status_code=422, detail="Project needs an enabled Agent before group chat can start")
+        raise HTTPException(status_code=422, detail="项目需要至少一名已启用的数字员工才能开始群聊")
     session = ChatSession(
         project_id=project.id,
         agent_id=anchor.agent_id,
@@ -156,13 +214,15 @@ async def ensure_project_group_session(db: AsyncSession, project: Project) -> Ch
 
 
 async def ensure_project_leader_session(db: AsyncSession, project: Project) -> ChatSession:
-    """Return the durable project-scoped planning conversation with its Leader.
+    """Return the legacy project-owner Web session for history compatibility.
 
-    This is deliberately a normal, non-primary Web session so the existing Web
-    Chat transport/history can be reused. The project owner is the canonical
-    human participant; project REST remains the discovery and ACL boundary.
+    New projects plan in the canonical project group. Their matching Web session
+    remains readable so historical links continue to resolve, but it is marked
+    read-only and is never selected as the kickoff discussion source.
     """
     external_conv_id = f"project-leader:{project.id}"
+    planning_mode = str(dict((project.settings or {}).get("planning") or {}).get("conversation_mode") or "")
+    planning_transport = "project_group" if planning_mode == "project_group" else "leader_session"
     session = (
         await db.execute(
             select(ChatSession)
@@ -189,23 +249,28 @@ async def ensure_project_leader_session(db: AsyncSession, project: Project) -> C
         )
     ).scalar_one_or_none()
     if leader is None:
-        raise HTTPException(status_code=422, detail="Project needs an enabled Leader before planning can start")
+        raise HTTPException(
+            status_code=422,
+            detail="Project needs an enabled project owner before planning can start",
+        )
     if session is not None:
-        # Leader replacement before confirmation should continue the same
-        # auditable project discussion rather than orphaning a second thread.
+        # Keep historical links attached to the current project owner without
+        # creating a second compatibility thread.
         if session.agent_id != leader.agent_id:
             session.agent_id = leader.agent_id
-            session.title = f"{project.name} · Leader Planning"
-            session.im_config = {
-                **dict(session.im_config or {}),
-                "leader_agent_id": str(leader.agent_id),
-            }
+            session.title = f"{project.name} · 项目规划"
+        session.im_config = {
+            **dict(session.im_config or {}),
+            "leader_agent_id": str(leader.agent_id),
+            "planning_transport": planning_transport,
+            "read_only": True,
+        }
         return session
     session = ChatSession(
         project_id=project.id,
         agent_id=leader.agent_id,
         user_id=project.owner_user_id,
-        title=f"{project.name} · Leader Planning",
+        title=f"{project.name} · 项目规划",
         source_channel="web",
         external_conv_id=external_conv_id,
         is_group=False,
@@ -215,6 +280,8 @@ async def ensure_project_leader_session(db: AsyncSession, project: Project) -> C
             "project_member_id": str(leader.id),
             "leader_agent_id": str(leader.agent_id),
             "purpose": "project_kickoff_planning",
+            "planning_transport": planning_transport,
+            "read_only": True,
         },
     )
     db.add(session)
@@ -254,18 +321,20 @@ def add_event(
     return event
 
 
-async def _get_project_agent(db: AsyncSession, tenant_id: uuid.UUID, agent_id: uuid.UUID) -> Agent:
+async def _get_project_agent(db: AsyncSession, project: Project, agent_id: uuid.UUID) -> Agent:
     agent = (
         await db.execute(
             select(Agent).where(
                 Agent.id == agent_id,
-                Agent.tenant_id == tenant_id,
+                Agent.tenant_id == project.tenant_id,
                 Agent.is_deleted.is_(False),
             )
         )
     ).scalar_one_or_none()
     if agent is None:
-        raise HTTPException(status_code=422, detail=f"Agent {agent_id} is unavailable in this tenant")
+        raise HTTPException(status_code=422, detail=f"数字员工 {agent_id} 在当前租户不可用")
+    if agent.scope == "project" and agent.project_id != project.id:
+        raise HTTPException(status_code=422, detail="项目专用数字员工不能加入其他项目")
     return agent
 
 
@@ -276,7 +345,7 @@ async def add_member(
     *,
     actor_user_id: uuid.UUID,
 ) -> ProjectMemberSnapshot:
-    agent = await _get_project_agent(db, project.tenant_id, data.agent_id)
+    agent = await _get_project_agent(db, project, data.agent_id)
     existing = (
         await db.execute(
             select(ProjectMemberSnapshot).where(
@@ -404,7 +473,10 @@ async def deactivate_project_member(
     if member.project_id != project.id or member.tenant_id != project.tenant_id:
         raise HTTPException(status_code=404, detail="Project member not found")
     if member.is_leader:
-        raise HTTPException(status_code=422, detail="Transfer project leadership before removing the Leader")
+        raise HTTPException(
+            status_code=422,
+            detail="Transfer project responsibility before removing the project owner",
+        )
     if not member.is_enabled:
         return []
 
@@ -528,7 +600,7 @@ async def restore_project_member(
         raise HTTPException(status_code=404, detail="Project member not found")
     if member.is_enabled:
         return []
-    await _get_project_agent(db, project.tenant_id, member.agent_id)
+    await _get_project_agent(db, project, member.agent_id)
 
     member.is_enabled = True
     member.config_snapshot = _membership_config(
@@ -732,6 +804,11 @@ async def replace_access_grants(
 
 async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> Project:
     tenant_id = _tenant_id(user)
+    settings = dict(data.settings or {})
+    settings["planning"] = {
+        **dict(settings.get("planning") or {}),
+        "conversation_mode": "project_group",
+    }
     project = Project(
         tenant_id=tenant_id,
         owner_user_id=user.id,
@@ -742,7 +819,7 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
         success_criteria=data.success_criteria,
         visibility="private",
         status=data.status,
-        settings=data.settings,
+        settings=settings,
     )
     db.add(project)
     await db.flush()
@@ -803,17 +880,26 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     if members:
         await ensure_project_group_session(db, project)
         await ensure_project_leader_session(db, project)
-    from app.services.project_git_service import initialize_project_repo
+    from app.services.project_git_service import (
+        initialize_project_repo,
+        project_user_git_email,
+        reconcile_project_repository_operations,
+    )
 
     git_config = dict((project.settings or {}).get("git") or {})
     git_mode = git_config.get("mode") or git_config.get("repository_mode", "managed")
     if git_mode != "managed":
         raise HTTPException(status_code=501, detail="External Git repositories require a connector")
-    git_state = await initialize_project_repo(project)
+    git_state = await initialize_project_repo(
+        project,
+        author_name=user.display_name,
+        author_email=project_user_git_email(user.id),
+    )
     project.settings = {
         **(project.settings or {}),
         "git": {**git_config, "mode": git_mode, **git_state},
     }
+    await reconcile_project_repository_operations(project.id, db=db)
     add_event(db, project, "project.created", f"Created project {project.name}", actor_user_id=user.id)
     if project.status == "initializing":
         project.status = "planning"
@@ -822,7 +908,7 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
             db,
             project,
             "project.initialized",
-            "Project snapshots and capability bindings are ready for Leader planning",
+            "Project snapshots and capability bindings are ready for project-owner planning",
             actor_user_id=user.id,
         )
     await db.flush()
@@ -900,6 +986,148 @@ def _trace_uuid(*values: Any) -> uuid.UUID | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _project_a2a_receipt(result: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse the structured receipt emitted by the native project transport.
+
+    Legacy transports return a human-readable confirmation and are resolved by
+    the scoped pair lookup. A value that claims to be JSON must be valid: a
+    malformed native receipt must never silently attach the run to whichever
+    same-pair conversation happened to be updated most recently.
+    """
+
+    stripped = str(result or "").strip()
+    if not stripped.startswith("{"):
+        return None, None
+    try:
+        receipt = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None, "Project A2A transport returned a malformed JSON receipt"
+    if not isinstance(receipt, dict):
+        return None, "Project A2A transport receipt must be a JSON object"
+    return receipt, None
+
+
+async def _resolve_project_a2a_session_info(
+    db: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    project_run_id: uuid.UUID,
+    source_agent_id: uuid.UUID,
+    target_agent_id: uuid.UUID,
+    result: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Resolve and validate the exact native A2A/session receipt.
+
+    Native delivery returns all durable identities. They are treated as one
+    integrity boundary: any mismatch fails delivery instead of falling back to
+    a latest-session guess. Only legacy plain-text transports use the scoped
+    pair lookup retained at the end of this function.
+    """
+
+    receipt, receipt_error = _project_a2a_receipt(result)
+    if receipt_error:
+        return {}, receipt_error
+
+    if receipt is not None:
+        raw_session_id = receipt.get("a2a_session_id") or receipt.get("session_id")
+        raw_run_id = receipt.get("project_run_id")
+        raw_subagent_run_id = receipt.get("subagent_run_id")
+        raw_subagent_session_id = receipt.get("subagent_session_id")
+        if not all(
+            (
+                raw_session_id,
+                raw_run_id,
+                raw_subagent_run_id,
+                raw_subagent_session_id,
+            )
+        ):
+            return {}, "Project A2A transport receipt is missing durable identity fields"
+
+        session_id = _trace_uuid(raw_session_id)
+        receipt_run_id = _trace_uuid(raw_run_id)
+        subagent_run_id = _trace_uuid(raw_subagent_run_id)
+        subagent_session_id = _trace_uuid(raw_subagent_session_id)
+        if None in {
+            session_id,
+            receipt_run_id,
+            subagent_run_id,
+            subagent_session_id,
+        }:
+            return {}, "Project A2A transport receipt contains an invalid UUID"
+        if receipt_run_id != project_run_id:
+            return {}, "Project A2A transport receipt references another project run"
+        if subagent_run_id != subagent_session_id:
+            return {}, "Project A2A child run and child session identities do not match"
+
+        session = await db.get(ChatSession, session_id)
+        expected_pair = {source_agent_id, target_agent_id}
+        if (
+            session is None
+            or session.project_id != project_id
+            or session.source_channel != "agent"
+            or {session.agent_id, session.peer_agent_id} != expected_pair
+        ):
+            return {}, "Project A2A transport receipt references an invalid collaboration session"
+
+        child_run = await db.get(SubagentRun, subagent_run_id)
+        child_session = await db.get(ChatSession, subagent_session_id)
+        if (
+            child_run is None
+            or child_session is None
+            or child_run.project_id != project_id
+            or child_run.parent_session_id != session.id
+            or child_session.project_id != project_id
+            or child_session.source_channel != "subagent"
+            or child_session.agent_id != target_agent_id
+        ):
+            return {}, "Project A2A transport receipt references an invalid execution session"
+
+        return (
+            {
+                "session_id": str(session.id),
+                "a2a_session_id": str(session.id),
+                "session_agent_id": str(session.agent_id),
+                "session_access_agent_id": str(session.agent_id),
+                "session_title": session.title,
+                "project_run_id": str(project_run_id),
+                "subagent_run_id": str(child_run.id),
+                "subagent_session_id": str(child_session.id),
+            },
+            None,
+        )
+
+    session_agent_id = min(source_agent_id, target_agent_id, key=str)
+    session_peer_id = max(source_agent_id, target_agent_id, key=str)
+    session = (
+        await db.execute(
+            select(ChatSession)
+            .where(
+                ChatSession.project_id == project_id,
+                ChatSession.source_channel == "agent",
+                ChatSession.agent_id == session_agent_id,
+                ChatSession.peer_agent_id == session_peer_id,
+            )
+            .order_by(
+                ChatSession.last_message_at.desc().nulls_last(),
+                ChatSession.created_at.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        return {}, None
+    return (
+        {
+            "session_id": str(session.id),
+            "a2a_session_id": str(session.id),
+            "session_agent_id": str(session.agent_id),
+            "session_access_agent_id": str(session.agent_id),
+            "session_title": session.title,
+        },
+        None,
+    )
 
 
 async def serialize_project_runs(
@@ -996,6 +1224,7 @@ async def serialize_project_runs(
                 "initiated_by_user_id": run.initiated_by_user_id,
                 "status": run.status,
                 "trigger_type": run.trigger_type,
+                "title": str(input_data.get("title") or "").strip() or None,
                 "input": input_data,
                 "output": output,
                 "error": run.error,
@@ -1170,6 +1399,22 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         project = await db.get(Project, run.project_id)
         if project is None:
             return
+        if project.status != PROJECT_RUNTIME_STATUS_RUNNING:
+            apply_run_status(run, "cancelled")
+            run.error = "Project runtime paused before A2A delivery"
+            add_event(
+                db,
+                project,
+                "a2a.cancelled",
+                "Cancelled project A2A because the project runtime was paused",
+                actor_user_id=run.initiated_by_user_id,
+                from_agent_id=uuid.UUID(str((run.input or {})["from_agent_id"])),
+                to_agent_id=uuid.UUID(str((run.input or {})["to_agent_id"])),
+                run_id=run.id,
+                metadata={"reason": "project_paused"},
+            )
+            await db.commit()
+            return
         payload = dict(run.input or {})
         project_id = run.project_id
         initiated_by_user_id = run.initiated_by_user_id
@@ -1224,38 +1469,23 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         )
     except Exception as exc:  # delivery failures must become durable run state
         result = f"❌ Project A2A delivery raised {type(exc).__name__}: {exc!s}"
-    failed = result.startswith("❌") or '"status": "error"' in result
-    session_info: dict = {}
+    receipt, _ = _project_a2a_receipt(result)
+    failed = result.startswith("❌") or bool(receipt and receipt.get("status") == "error")
+    session_info: dict[str, Any] = {}
     async with async_session() as session_db:
-        from app.models.chat_session import ChatSession
-
         source_id = uuid.UUID(payload["from_agent_id"])
         target_id = uuid.UUID(payload["to_agent_id"])
-        session_agent_id = min(source_id, target_id, key=str)
-        session_peer_id = max(source_id, target_id, key=str)
-        session = (
-            await session_db.execute(
-                select(ChatSession)
-                .where(
-                    ChatSession.project_id == project_id,
-                    ChatSession.source_channel == "agent",
-                    ChatSession.agent_id == session_agent_id,
-                    ChatSession.peer_agent_id == session_peer_id,
-                )
-                .order_by(
-                    ChatSession.last_message_at.desc().nulls_last(),
-                    ChatSession.created_at.desc(),
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if session is not None:
-            session_info = {
-                "session_id": str(session.id),
-                "session_agent_id": str(session.agent_id),
-                "session_access_agent_id": str(session.agent_id),
-                "session_title": session.title,
-            }
+        session_info, identity_error = await _resolve_project_a2a_session_info(
+            session_db,
+            project_id=project_id,
+            project_run_id=run_id,
+            source_agent_id=source_id,
+            target_agent_id=target_id,
+            result=result,
+        )
+        if identity_error:
+            failed = True
+            result = f"❌ Project A2A delivery receipt rejected: {identity_error}"
     async with async_session() as db:
         run = await db.get(ProjectRun, run_id)
         project = await db.get(Project, run.project_id) if run else None

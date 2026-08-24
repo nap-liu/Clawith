@@ -401,7 +401,7 @@ async def _process_wecom_stream_message(
         agent_obj = agent_r.scalar_one_or_none()
         if not agent_obj:
             logger.warning(f"[WeCom Stream] Agent {agent_id} not found")
-            return "Agent not found"
+            return "未找到数字员工"
         from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
         ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
 

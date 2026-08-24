@@ -336,7 +336,7 @@ async def trigger_task(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     if is_agent_expired(agent):
-        raise HTTPException(status_code=403, detail="Agent has expired")
+        raise HTTPException(status_code=403, detail="数字员工已过期")
 
     result = await db.execute(select(Task).where(Task.id == task_id, Task.agent_id == agent_id))
     task = result.scalar_one_or_none()

@@ -210,7 +210,7 @@ export default function AgentCreate() {
         const errors: Record<string, string> = {};
         const name = form.name.trim();
         if (!name) {
-            errors.name = t('wizard.errors.nameRequired', '智能体名称不能为空');
+            errors.name = t('wizard.errors.nameRequired', '数字员工名称不能为空');
         } else if (name.length < 2) {
             errors.name = t('wizard.errors.nameTooShort', '名称至少需要 2 个字符');
         } else if (name.length > 100) {

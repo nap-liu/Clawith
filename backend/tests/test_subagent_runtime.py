@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer  # noqa: F401 - register Tool FK target
 from app.models.participant import Participant  # noqa: F401
-from app.models.project import Project, ProjectMemberSnapshot  # noqa: F401 - project FK targets
+from app.models.project import Project, ProjectMemberSnapshot
 from app.models.subagent_run import SubagentRun
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
@@ -30,6 +31,7 @@ from app.models.user import Identity, User
 from app.services import subagent_runtime as runtime
 from app.services.tool_enablement import SUBAGENT_TOOL_NAMES
 from app.services.tool_seeder import seed_builtin_tools
+from app.services.workload_capacity import WorkloadCapacity, WorkloadKind
 
 pytestmark = pytest.mark.asyncio
 
@@ -40,7 +42,7 @@ async def _dispose_engine_between_tests():
     await engine.dispose()
 
 
-async def _make_context(*, parent_channel: str = "web"):
+async def _make_context(*, parent_channel: str = "web", project: bool = False):
     suffix = uuid.uuid4().hex[:10]
     async with async_session() as db:
         tenant = Tenant(name=f"subagent-{suffix}", slug=f"subagent-{suffix}")
@@ -83,8 +85,32 @@ async def _make_context(*, parent_channel: str = "web"):
         )
         db.add(agent)
         await db.flush()
+        project_row = None
+        if project:
+            project_row = Project(
+                tenant_id=tenant.id,
+                owner_user_id=user.id,
+                name="Professional collaboration quality",
+                goal="Produce an evidence-backed release decision",
+                success_criteria=["role-specific conclusion", "verifiable evidence"],
+                status="running",
+            )
+            db.add(project_row)
+            await db.flush()
+            db.add(
+                ProjectMemberSnapshot(
+                    tenant_id=tenant.id,
+                    project_id=project_row.id,
+                    agent_id=agent.id,
+                    name_snapshot="Release reviewer",
+                    role_snapshot="Assess release evidence and operational risk",
+                    is_leader=False,
+                    is_enabled=True,
+                )
+            )
         parent = ChatSession(
             agent_id=agent.id,
+            project_id=project_row.id if project_row is not None else None,
             user_id=user.id if parent_channel == "web" else None,
             title="Parent",
             source_channel=parent_channel,
@@ -131,6 +157,78 @@ async def _make_context(*, parent_channel: str = "web"):
         db.add(anchor)
         await db.commit()
         return agent.id, user.id, parent.id, anchor.id
+
+
+@pytest.mark.parametrize(
+    ("corrected_reply", "still_low_value"),
+    (
+        (
+            "结论：暂缓发布。依据 run a1b2c3d4 的错误率为 8%，超过 2% 阈值；建议运维负责人先回滚。",
+            False,
+        ),
+        ("已同步，继续推进。", True),
+    ),
+)
+async def test_project_reply_quality_guard_rewrites_once_without_tools_or_broadcast(
+    monkeypatch,
+    corrected_reply: str,
+    still_low_value: bool,
+):
+    agent_id, user_id, parent_id, anchor_id = await _make_context(
+        parent_channel="project",
+        project=True,
+    )
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-project-quality-guard",
+        task="Decide whether the release evidence supports production rollout",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    invocations: list[dict] = []
+
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del _agent_id, _session_id, execution_user_id
+        return [{"type": "function", "function": {"name": "read_evidence", "parameters": {}}}]
+
+    async def fake_llm(_db, _agent_id, user_text, **kwargs):
+        invocations.append({"user_text": user_text, **kwargs})
+        if len(invocations) == 1:
+            return "收到，我会继续推进。"
+        assert kwargs["prepared_tools"] == []
+        assert kwargs["broadcast_web"] is False
+        assert kwargs.get("before_round") is None
+        assert "single bounded self-correction" in user_text
+        assert "Your immutable project role is: Assess release evidence and operational risk" in user_text
+        assert "risk-based verification" in user_text
+        assert kwargs["history"][-1] == {"role": "assistant", "content": "收到，我会继续推进。"}
+        return corrected_reply
+
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
+
+    await runtime.execute_claimed_subagent(run.id)
+
+    assert len(invocations) == 2
+    async with async_session() as db:
+        final = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(run.id),
+                    ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_COMPLETION,
+                )
+            )
+        ).scalar_one()
+    assert final.content == corrected_reply
+    assert final.message_meta["reply_quality"] == {
+        "correction_attempted": True,
+        "correction_applied": True,
+        "initial_reasons": ["acknowledgement_only", "no_professional_substance"],
+        "final_needs_correction": still_low_value,
+    }
 
 
 async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(monkeypatch):
@@ -377,6 +475,7 @@ async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
     )
 
     await reset_active_turns_for_testing()
+
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
         agent_id=agent_id,
@@ -426,6 +525,240 @@ async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
     assert fresh.status == runtime.RUN_CANCELLED
     assert all(row.message_meta["subagent_input_state"] == runtime.INPUT_CANCELLED for row in input_rows)
     await reset_active_turns_for_testing()
+
+
+async def test_fresh_turn_uses_exact_prefix_when_later_input_is_already_queued(
+    monkeypatch,
+):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-concurrent-prefix",
+        task="first queued project input",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    await runtime.append_subagent_message(
+        agent_id=agent_id,
+        parent_session_id=str(parent_id),
+        subagent_id=str(run.id),
+        message="later queued project input",
+        execution_user_id=user_id,
+        origin_tool_call_id="append-concurrent-prefix",
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+
+    captured: dict = {}
+
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del _agent_id, _session_id, execution_user_id
+        return []
+
+    async def fake_llm(_db, _agent_id, user_text, **kwargs):
+        captured["user_text"] = user_text
+        captured["history"] = list(kwargs["history"])
+        captured["inbox"] = await kwargs["before_round"](0)
+        return "handled queued project inputs"
+
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
+
+    await runtime.execute_claimed_subagent(run.id)
+
+    assert captured["user_text"] == "first queued project input"
+    assert all(row.get("content") != "later queued project input" for row in captured["history"])
+    assert captured["inbox"] == [{"role": "user", "content": "later queued project input"}]
+    async with async_session() as db:
+        fresh = await db.get(SubagentRun, run.id)
+        inputs = (
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.conversation_id == str(run.id),
+                        ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_INPUT,
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert fresh.status == runtime.RUN_COMPLETED
+    assert [row.message_meta["subagent_input_state"] for row in inputs] == [
+        runtime.INPUT_DONE,
+        runtime.INPUT_DONE,
+    ]
+
+
+async def test_provider_round_releases_preflight_database_transaction(
+    monkeypatch,
+):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-release-provider-connection",
+        task="perform one long provider request",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    transaction_state: list[bool] = []
+
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del _agent_id, _session_id, execution_user_id
+        return []
+
+    async def fake_llm(db, _agent_id, _user_text, **kwargs):
+        # Mirror the unified channel preflight, which resolves Agent/model/scene
+        # records before the first provider round.
+        await db.execute(select(ChatSession.id).where(ChatSession.id == run.id))
+        transaction_state.append(bool(db.in_transaction()))
+        await kwargs["before_round"](0)
+        transaction_state.append(bool(db.in_transaction()))
+        return "provider request completed"
+
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
+
+    await runtime.execute_claimed_subagent(run.id)
+
+    assert transaction_state == [True, False]
+    async with async_session() as db:
+        fresh = await db.get(SubagentRun, run.id)
+    assert fresh.status == runtime.RUN_COMPLETED
+
+
+async def test_project_capacity_wait_does_not_retain_database_session(
+    monkeypatch,
+):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-project-capacity",
+        task="wait for project capacity",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    async with async_session() as db:
+        tenant_id = (await db.get(Agent, agent_id)).tenant_id
+
+    capacity = WorkloadCapacity(
+        global_limit=1,
+        tenant_limit=1,
+        category_limits={kind: 1 for kind in WorkloadKind},
+        default_timeout_seconds=5,
+        instance_id="subagent-capacity-test",
+    )
+    blocker = await capacity.acquire(WorkloadKind.PROJECT, tenant_id)
+    monkeypatch.setattr(runtime, "get_workload_capacity", lambda: capacity)
+
+    real_async_session = runtime.async_session
+    open_sessions: set[int] = set()
+
+    @asynccontextmanager
+    async def tracking_session():
+        async with real_async_session() as db:
+            marker = id(db)
+            open_sessions.add(marker)
+            try:
+                yield db
+            finally:
+                open_sessions.discard(marker)
+
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del _agent_id, _session_id, execution_user_id
+        return []
+
+    async def fake_llm(_db, _agent_id, _user_text, **kwargs):
+        snapshot = await capacity.snapshot()
+        assert snapshot.categories[WorkloadKind.PROJECT.value].active == 1
+        assert snapshot.tenants[str(tenant_id)].active == 1
+        await kwargs["before_round"](0)
+        return "project capacity admitted"
+
+    monkeypatch.setattr(runtime, "async_session", tracking_session)
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
+
+    worker = asyncio.create_task(runtime.execute_claimed_subagent(run.id))
+    try:
+        for _ in range(100):
+            snapshot = await capacity.snapshot()
+            if snapshot.categories[WorkloadKind.PROJECT.value].waiting == 1:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("subagent did not wait for project capacity")
+
+        assert not open_sessions
+        await blocker.release()
+        await worker
+    finally:
+        await blocker.release()
+        if not worker.done():
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    snapshot = await capacity.snapshot()
+    project_metrics = snapshot.categories[WorkloadKind.PROJECT.value]
+    tenant_metrics = snapshot.tenants[str(tenant_id)]
+    assert project_metrics.admitted_total == 2
+    assert project_metrics.completed_total == 2
+    assert tenant_metrics.admitted_total == 2
+    assert tenant_metrics.completed_total == 2
+
+
+async def test_project_capacity_timeout_requeues_claimed_turn(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-project-capacity-timeout",
+        task="retry after project admission timeout",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+    async with async_session() as db:
+        tenant_id = (await db.get(Agent, agent_id)).tenant_id
+
+    capacity = WorkloadCapacity(
+        global_limit=1,
+        tenant_limit=1,
+        category_limits={kind: 1 for kind in WorkloadKind},
+        default_timeout_seconds=0.01,
+        instance_id="subagent-capacity-timeout-test",
+    )
+    blocker = await capacity.acquire(WorkloadKind.PROJECT, tenant_id)
+    monkeypatch.setattr(runtime, "get_workload_capacity", lambda: capacity)
+    try:
+        await runtime.execute_claimed_subagent(run.id)
+    finally:
+        await blocker.release()
+
+    async with async_session() as db:
+        fresh = await db.get(SubagentRun, run.id)
+        input_row = await db.scalar(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(run.id),
+                ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_INPUT,
+            )
+        )
+    assert fresh.status == runtime.RUN_QUEUED
+    assert fresh.lease_owner is None
+    assert input_row.message_meta["subagent_input_state"] == runtime.INPUT_PENDING
+    snapshot = await capacity.snapshot()
+    assert snapshot.categories[WorkloadKind.PROJECT.value].rejected_total == 1
+    assert snapshot.tenants[str(tenant_id)].rejected_total == 1
 
 
 async def test_failed_turn_continues_when_parent_input_is_pending():
@@ -791,12 +1124,21 @@ async def test_async_parent_event_is_deduplicated_and_keeps_execution_agent(monk
         ).scalar_one()
 
     captured = []
+    dispatch_kwargs = []
 
     async def fake_resume(anchor):
         captured.append(anchor)
         return True
 
+    async def fake_run_channel_message(_lock_key, *, work, **kwargs):
+        dispatch_kwargs.append(kwargs)
+        return await work()
+
     monkeypatch.setattr("app.services.turn_recovery.resume_turn", fake_resume)
+    monkeypatch.setattr(
+        "app.services.channel_dispatch.run_channel_message",
+        fake_run_channel_message,
+    )
     assert await runtime._dispatch_parent_event(child_event.id)
     assert await runtime._dispatch_parent_event(child_event.id)
 
@@ -815,6 +1157,9 @@ async def test_async_parent_event_is_deduplicated_and_keeps_execution_agent(monk
     assert anchors[0].sender_agent_id == agent_id
     assert anchors[0].message_meta["execution_agent_id"] == str(agent_id)
     assert captured
+    assert dispatch_kwargs
+    assert all(kwargs["workload_kind"] is WorkloadKind.PROJECT for kwargs in dispatch_kwargs)
+    assert all(kwargs["tenant_id"] != f"web:{parent_id}" for kwargs in dispatch_kwargs)
 
 
 async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(monkeypatch):

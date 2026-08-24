@@ -18,6 +18,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
+from app.services.project_service import project_runtime_allows_agent
 from app.services.scheduler import compute_next_run
 
 router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
@@ -25,7 +26,7 @@ router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
 
 class ScheduleCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    instruction: str = Field(default='', max_length=5000)
+    instruction: str = Field(default="", max_length=5000)
     cron_expr: str = Field(min_length=1, max_length=100)
     is_enabled: bool = True
 
@@ -69,16 +70,11 @@ async def list_schedules(
     """List all schedules for an agent."""
     await check_agent_access(db, current_user, agent_id)
     result = await db.execute(
-        select(AgentSchedule)
-        .where(AgentSchedule.agent_id == agent_id)
-        .order_by(AgentSchedule.created_at.desc())
+        select(AgentSchedule).where(AgentSchedule.agent_id == agent_id).order_by(AgentSchedule.created_at.desc())
     )
     schedules = result.scalars().all()
     user_ids = {
-        user_id
-        for schedule in schedules
-        for user_id in (schedule.created_by, schedule.execution_user_id)
-        if user_id
+        user_id for schedule in schedules for user_id in (schedule.created_by, schedule.execution_user_id) if user_id
     }
     user_map = {}
     if user_ids:
@@ -155,12 +151,8 @@ async def update_schedule(
     }
     if non_identity_fields and not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can manage schedules")
-    identity_admin = access == "manage" and (
-        current_user.role == "org_admin" or is_platform_admin_user(current_user)
-    )
-    if updates and not non_identity_fields and not (
-        is_agent_creator(current_user, agent) or identity_admin
-    ):
+    identity_admin = access == "manage" and (current_user.role == "org_admin" or is_platform_admin_user(current_user))
+    if updates and not non_identity_fields and not (is_agent_creator(current_user, agent) or identity_admin):
         raise HTTPException(status_code=403, detail="Manage access is required")
     identity_reassigned = False
     if "execution_user_id" in updates:
@@ -254,7 +246,9 @@ async def trigger_schedule(
     """Manually trigger a schedule execution."""
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if is_agent_expired(agent):
-        raise HTTPException(status_code=403, detail="Agent has expired and cannot be triggered.")
+        raise HTTPException(status_code=403, detail="数字员工已过期，无法触发。")
+    if not await project_runtime_allows_agent(db, agent):
+        raise HTTPException(status_code=409, detail="项目已暂停；恢复项目后才能运行调度。")
 
     result = await db.execute(
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
@@ -286,6 +280,7 @@ async def get_schedule_history(
     """Get execution history for a schedule from activity logs."""
     await check_agent_access(db, current_user, agent_id)
     from app.models.activity_log import AgentActivityLog
+
     result = await db.execute(
         select(AgentActivityLog)
         .where(
@@ -300,13 +295,15 @@ async def get_schedule_history(
     for log in logs:
         detail = log.detail_json or {}
         if detail.get("schedule_id") == str(schedule_id):
-            history.append({
-                "id": str(log.id),
-                "created_at": log.created_at.isoformat() if log.created_at else None,
-                "summary": log.summary,
-                "instruction": detail.get("instruction", ""),
-                "reply": detail.get("reply", ""),
-            })
+            history.append(
+                {
+                    "id": str(log.id),
+                    "created_at": log.created_at.isoformat() if log.created_at else None,
+                    "summary": log.summary,
+                    "instruction": detail.get("instruction", ""),
+                    "reply": detail.get("reply", ""),
+                }
+            )
         if len(history) >= 20:
             break
     return history

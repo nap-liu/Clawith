@@ -337,7 +337,7 @@ async def list_sessions(
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = agent_result.scalar_one_or_none()
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise HTTPException(status_code=404, detail="未找到数字员工")
     await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     source_channel = (source_channel or "").strip() or None
@@ -1166,12 +1166,16 @@ async def get_session_messages(
     session_id: uuid.UUID,
     limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
     before: str = Query(None, description="Cursor: ISO timestamp, optionally followed by |message UUID"),
+    paginated: bool = Query(
+        False,
+        description="Return cursor metadata in the response body.",
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     response: Response = None,
 ):
     """Legacy row-count pagination. Kept unchanged for existing clients."""
-    return await _get_session_messages_page(
+    rows = await _get_session_messages_page(
         agent_id=agent_id,
         session_id=session_id,
         limit=limit,
@@ -1181,6 +1185,13 @@ async def get_session_messages(
         db=db,
         response=response,
     )
+    if not paginated:
+        return rows
+    return {
+        "items": rows,
+        "has_more": response.headers.get("X-Message-Has-More") == "true",
+        "next_cursor": response.headers.get("X-Message-Next-Cursor") or None,
+    }
 
 
 @router.get("/{agent_id}/sessions/{session_id}/message-turns")

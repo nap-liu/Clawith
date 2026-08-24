@@ -534,19 +534,19 @@ function AccessPermissionsPanel({
             value: 'company',
             icon: <IconBuilding size={14} stroke={1.8} />,
             label: t('agent.settings.perm.companyWide', 'Company-wide'),
-            desc: isChinese ? '所有平台用户和所有 Agent 都可以访问；可参与 Plaza。' : 'All platform users and all agents can access it; Plaza is enabled.',
+            desc: isChinese ? '所有平台用户和数字员工都可以访问。' : 'All platform users and digital employees can access it.',
         },
         {
             value: 'private',
             icon: <IconUser size={14} stroke={1.8} />,
             label: t('agent.settings.perm.onlyMe', 'Only Me'),
-            desc: isChinese ? '只有创建者可以使用和管理；不可参与 Plaza。' : 'Only the creator can use and manage it; Plaza is disabled.',
+            desc: isChinese ? '只有创建者可以使用和管理。' : 'Only the creator can use and manage it.',
         },
         {
             value: 'custom',
             icon: <IconLock size={14} stroke={1.8} />,
             label: isChinese ? '指定访问' : 'Custom',
-            desc: isChinese ? '指定可访问的部门或成员；不可参与 Plaza。Agent 关系请在“关系”里配置。' : 'Choose departments or members; Plaza is disabled. Agent relationships are configured in Relationships.',
+            desc: isChinese ? '指定可访问的部门或成员；数字员工关系请在“关系”里配置。' : 'Choose departments or members. Digital employee relationships are configured in Relationships.',
         },
     ] as const;
 
@@ -792,7 +792,7 @@ function AccessPermissionsPanel({
 
             {localScope !== 'company' && (
                 <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                    {isChinese ? '非全公司可见的 Agent 不会出现在 Plaza，也不能在 Plaza 发布或评论。' : 'Agents that are not company-wide cannot view, post, or comment in Plaza.'}
+                    {isChinese ? '访问范围仅影响谁可以查看和使用该数字员工。' : 'Access scope controls who can view and use this digital employee.'}
                 </div>
             )}
 
@@ -6951,7 +6951,7 @@ export default function AgentDetailPage() {
                     activeTab === 'activityLog' && (() => {
                         // Category definitions
                         const userActionTypes = ['chat_reply', 'tool_call', 'task_created', 'task_updated', 'file_written', 'error'];
-                        const heartbeatTypes = ['heartbeat', 'plaza_post'];
+                        const heartbeatTypes = ['heartbeat'];
                         const scheduleTypes = ['schedule_run'];
                         const messageTypes = ['feishu_msg_sent', 'agent_msg_sent', 'web_msg_sent'];
 
@@ -7027,7 +7027,6 @@ export default function AgentDetailPage() {
                                                 error: <IconAlertTriangle size={16} stroke={1.8} />,
                                                 schedule_run: <IconClock size={16} stroke={1.8} />,
                                                 heartbeat: <IconHeartbeat size={16} stroke={1.8} />,
-                                                plaza_post: <IconBuilding size={16} stroke={1.8} />,
                                             };
                                             const time = log.created_at ? new Date(log.created_at).toLocaleString('zh-CN', {
                                                 month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',

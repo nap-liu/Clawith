@@ -96,7 +96,7 @@ function createUnresolvedToken(raw: string) {
     token.contentEditable = 'false';
     token.dataset.richMentionUnresolved = 'true';
     token.setAttribute('aria-invalid', 'true');
-    token.title = '未匹配到唯一可用的项目 Agent';
+    token.title = '未匹配到唯一可用的项目数字员工';
     token.textContent = raw;
     return token;
 }

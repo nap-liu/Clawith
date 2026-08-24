@@ -77,9 +77,7 @@ async def test_command_bypasses_lock_and_reactions():
         return "已开启新对话"
 
     reactions = cd.ChannelReactions(on_consume=on_consume, on_complete=on_complete)
-    result = await cd.run_channel_message(
-        "k:cmd", is_command=True, reactions=reactions, work=work
-    )
+    result = await cd.run_channel_message("k:cmd", is_command=True, reactions=reactions, work=work)
     assert result == "已开启新对话"
     assert events == ["work"]
 
@@ -98,9 +96,7 @@ async def test_normal_message_fires_consume_then_work_then_complete():
         return "回复内容"
 
     reactions = cd.ChannelReactions(on_consume=on_consume, on_complete=on_complete)
-    result = await cd.run_channel_message(
-        "k:normal", is_command=False, reactions=reactions, work=work
-    )
+    result = await cd.run_channel_message("k:normal", is_command=False, reactions=reactions, work=work)
     assert result == "回复内容"
     assert events == ["consume", "work", "complete:回复内容"]
 
@@ -116,9 +112,7 @@ async def test_work_exception_fires_on_error_and_reraises():
 
     reactions = cd.ChannelReactions(on_error=on_error)
     with pytest.raises(ValueError):
-        await cd.run_channel_message(
-            "k:err", is_command=False, reactions=reactions, work=work
-        )
+        await cd.run_channel_message("k:err", is_command=False, reactions=reactions, work=work)
     assert events == ["error:ValueError"]
 
 
@@ -132,9 +126,7 @@ async def test_hook_exception_is_swallowed_and_does_not_break_turn():
         return "ok"
 
     reactions = cd.ChannelReactions(on_consume=on_consume)
-    result = await cd.run_channel_message(
-        "k:hookerr", is_command=False, reactions=reactions, work=work
-    )
+    result = await cd.run_channel_message("k:hookerr", is_command=False, reactions=reactions, work=work)
     assert result == "ok"
 
 
@@ -148,6 +140,7 @@ async def test_normal_message_holds_session_lock():
             await asyncio.sleep(0.02)
             order.append(f"{tag}-end")
             return tag
+
         return _w
 
     r = cd.ChannelReactions()
@@ -190,6 +183,7 @@ async def test_different_keys_run_concurrently():
             await asyncio.sleep(0.02)
             order.append(f"{tag}-end")
             return tag
+
         return _w
 
     await asyncio.gather(

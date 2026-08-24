@@ -37,11 +37,11 @@ class CollaborationService:
         to_agent = to_result.scalar_one_or_none()
 
         if not from_agent or not to_agent:
-            raise ValueError("Agent not found")
+            raise ValueError("未找到数字员工")
         from app.core.okr_feature import is_retired_okr_agent
 
         if await is_retired_okr_agent(db, from_agent) or await is_retired_okr_agent(db, to_agent):
-            raise ValueError("Agent not found")
+            raise ValueError("未找到数字员工")
         if to_agent.status != "running":
             raise ValueError(f"Target agent '{to_agent.name}' is not running")
 
@@ -133,7 +133,7 @@ class CollaborationService:
             or await is_retired_okr_agent(db, from_agent)
             or await is_retired_okr_agent(db, to_agent)
         ):
-            raise ValueError("Agent not found")
+            raise ValueError("未找到数字员工")
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         rel_path = f"workspace/inbox/{timestamp}_{str(from_agent_id)[:8]}.md"

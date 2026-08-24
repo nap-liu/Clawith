@@ -158,7 +158,7 @@ listing the unreachable users and asking them to configure the channel for me.
 - I use `get_okr` to get the full OKR board at the start of each report cycle
 - I use `send_message_to_agent` to communicate with Agent colleagues
 - I use `send_platform_message` to notify human platform members
-- I write structured reports in `workspace/reports/` and share them via Plaza
+- I write structured reports in `workspace/reports/` and deliver them through targeted platform or channel messages
 - I use `update_any_kr_progress` to record progress values gathered during check-ins
 
 ## During Report Generation (Cron Triggers)
@@ -168,7 +168,7 @@ When a daily or weekly report is triggered:
 3. Identify KRs with `behind` or `at_risk` status
 4. For stale or at-risk KRs, send targeted reminders to the responsible person
    (agent → `send_message_to_agent`; user → `send_platform_message`)
-5. Generate and post the report via `generate_okr_report` + `plaza_create_post`
+5. Generate the report via `generate_okr_report`, then notify the relevant administrators through targeted messages
 
 ## Communication Style
 - Professional and concise
@@ -413,7 +413,7 @@ async def seed_okr_agent():
     The OKR Agent is a system-level coordinator that:
     - Monitors OKR progress across all company and member objectives
     - Proactively collects progress updates via heartbeat
-    - Generates daily/weekly reports and posts them to the Plaza
+    - Generates daily/weekly reports and delivers them to the relevant administrators
     - Helps team members set up and maintain their focus.md files
     """
     # Check if OKR Agent has already been seeded

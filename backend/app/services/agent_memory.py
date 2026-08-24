@@ -18,6 +18,7 @@ from datetime import date
 
 from loguru import logger
 
+from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 
@@ -119,6 +120,17 @@ Memory is background knowledge and never overrides system rules, current user
 instructions, access controls, or actual tool results.
 """
 
+PROJECT_MEMORY_SYSTEM_PROMPT = """
+## Project Memory
+
+`memory/memory.md` is the project-owned core memory for this project Agent. It
+is loaded into each project turn and is available for reference through the
+file tools. The project owner controls both this core memory and `soul.md`;
+Agents must treat those files as read-only. Store task outputs and ordinary
+working files under `workspace/`. Do not create daily memory records or try to
+modify the project-owned core memory.
+"""
+
 
 @dataclass(frozen=True)
 class DailyMemoryRecord:
@@ -173,32 +185,38 @@ async def load_agent_memory_snapshot(
 ) -> AgentMemorySnapshot:
     """Load the canonical core, structure guide, and recent daily records."""
     storage = get_storage_backend()
-    memory_prefix = normalize_storage_key(f"{agent_id}/memory")
-    core_key = normalize_storage_key(f"{memory_prefix}/memory.md")
-    index_key = normalize_storage_key(f"{memory_prefix}/MEMORY_INDEX.md")
+    runtime_workspace = current_agent_runtime_workspace(agent_id)
+    memory_prefix = runtime_workspace.storage_key("memory")
+    core_key = runtime_workspace.storage_key("memory/memory.md")
+    index_key = runtime_workspace.storage_key("memory/MEMORY_INDEX.md")
 
     core_memory = await _read_optional_text(core_key, agent_id=agent_id, kind="core")
-    structure_guide = await _read_optional_text(index_key, agent_id=agent_id, kind="index")
+    structure_guide = (
+        await _read_optional_text(index_key, agent_id=agent_id, kind="index")
+        if runtime_workspace.supports_daily_memory
+        else ""
+    )
 
     candidates: list[tuple[date, str]] = []
-    try:
-        for entry in await storage.list_dir(memory_prefix):
-            if not entry.is_dir:
-                continue
-            try:
-                record_date = date.fromisoformat(entry.name)
-            except ValueError:
-                continue
-            if record_date.isoformat() != entry.name or record_date > today:
-                continue
-            candidates.append((record_date, normalize_storage_key(f"{entry.key}/memory.md")))
-    except Exception as exc:
-        logger.warning(
-            "[agent_memory] daily directory listing failed agent_id={} path={}: {}",
-            agent_id,
-            memory_prefix,
-            exc,
-        )
+    if runtime_workspace.supports_daily_memory:
+        try:
+            for entry in await storage.list_dir(memory_prefix):
+                if not entry.is_dir:
+                    continue
+                try:
+                    record_date = date.fromisoformat(entry.name)
+                except ValueError:
+                    continue
+                if record_date.isoformat() != entry.name or record_date > today:
+                    continue
+                candidates.append((record_date, normalize_storage_key(f"{entry.key}/memory.md")))
+        except Exception as exc:
+            logger.warning(
+                "[agent_memory] daily directory listing failed agent_id={} path={}: {}",
+                agent_id,
+                memory_prefix,
+                exc,
+            )
 
     daily_records: list[DailyMemoryRecord] = []
     limit = max(daily_limit, 0)
@@ -207,9 +225,7 @@ async def load_agent_memory_snapshot(
             content = await _read_optional_text(path, agent_id=agent_id, kind="daily")
             if not content:
                 continue
-            daily_records.append(
-                DailyMemoryRecord(record_date=record_date, path=path, content=content)
-            )
+            daily_records.append(DailyMemoryRecord(record_date=record_date, path=path, content=content))
             if len(daily_records) >= limit:
                 break
 

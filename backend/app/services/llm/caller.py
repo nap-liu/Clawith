@@ -17,7 +17,6 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -315,6 +314,67 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
                 f"(attempt {throttle_attempt_idx + 1}/"
                 f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
                 f"provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')}): {e}"
+            )
+            await _sleep_before_throttle_retry(delay)
+
+
+async def _complete_with_throttle_retry(client, *, model, round_i: int, **complete_kwargs):
+    """Run a non-streaming provider request through the shared capacity gate.
+
+    Background, scheduled, and project turns use ``complete`` while Web Chat
+    uses ``stream``. Both paths must share the same provider-account limit;
+    otherwise a project burst can bypass admission and starve interactive
+    conversations. Waiting for a provider slot is intentionally outside the
+    request timeout and does not hold a database transaction.
+    """
+
+    request_timeout = _get_model_timeout(model)
+    throttle_attempt_idx = 0
+    timeout_attempt_idx = 0
+    provider_slot = _provider_slot(model)
+
+    while True:
+        queued_at = perf_counter()
+        dispatch_started_at = queued_at
+        try:
+            async with provider_slot:
+                dispatch_started_at = perf_counter()
+                async with asyncio.timeout(request_timeout):
+                    response = await client.complete(**complete_kwargs)
+            elapsed = perf_counter() - dispatch_started_at
+            logger.info(
+                f"[LLM Timing] round={round_i} model={getattr(model, 'model', '?')} "
+                f"queue={dispatch_started_at - queued_at:.2f}s llm_call={elapsed:.2f}s (complete)"
+            )
+            return response
+        except TimeoutError as exc:
+            if timeout_attempt_idx < len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS):
+                delay = PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS[timeout_attempt_idx]
+                timeout_attempt_idx += 1
+                logger.warning(
+                    f"[LLM] Provider complete timeout; retrying after {delay:.1f}s "
+                    f"(attempt {timeout_attempt_idx + 1}/"
+                    f"{len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS) + 1}, "
+                    f"round {round_i}, provider={getattr(model, 'provider', '?')} "
+                    f"model={getattr(model, 'model', '?')})"
+                )
+                await _sleep_before_timeout_retry(delay)
+                continue
+            raise LLMError(f"Request timed out after {request_timeout:g}s") from exc
+        except LLMError as exc:
+            if not _is_provider_throttle_error(exc):
+                raise
+            if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
+                raise ProviderThrottleExhausted(str(exc)) from exc
+
+            delay = PROVIDER_THROTTLE_RETRY_DELAYS[throttle_attempt_idx]
+            throttle_attempt_idx += 1
+            logger.warning(
+                f"[LLM] Provider complete throttled; retrying after {delay:.1f}s "
+                f"(attempt {throttle_attempt_idx + 1}/"
+                f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
+                f"provider={getattr(model, 'provider', '?')} "
+                f"model={getattr(model, 'model', '?')}): {exc}"
             )
             await _sleep_before_throttle_retry(delay)
 
@@ -1205,8 +1265,9 @@ async def _process_tool_call(
         try:
             from app.services.vision_inject import try_inject_screenshot_vision
 
-            settings = get_settings()
-            ws_path = Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR) / str(agent_id)
+            from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+
+            ws_path = current_agent_runtime_workspace(agent_id).local_root
             vision_content = try_inject_screenshot_vision(tool_name, str(result), ws_path)
             if vision_content:
                 tool_content = vision_content
@@ -1297,9 +1358,7 @@ async def call_llm(
         from app.models.agent import Agent as AgentModel
 
         async with async_session() as identity_db:
-            creator_id = await identity_db.scalar(
-                select(AgentModel.creator_id).where(AgentModel.id == agent_uuid)
-            )
+            creator_id = await identity_db.scalar(select(AgentModel.creator_id).where(AgentModel.id == agent_uuid))
         if creator_id is not None:
             user_id = creator_id
 
@@ -2275,7 +2334,7 @@ async def call_agent_llm(
         return "⚠️ 数字员工未找到"
 
     if is_agent_expired(agent):
-        return "This Agent has expired and is off duty. Please contact your admin to extend its service."
+        return "数字员工已过期并停止服务，请联系管理员延长有效期。"
 
     # Load primary model
     primary_model: LLMModel | None = None
@@ -2344,11 +2403,11 @@ async def call_agent_llm_with_tools(
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
-        return "⚠️ Agent not found"
+        return "⚠️ 未找到数字员工"
     from app.core.okr_feature import is_retired_okr_agent
 
     if await is_retired_okr_agent(db, agent):
-        return "⚠️ Agent not found"
+        return "⚠️ 未找到数字员工"
 
     if execution_user_id is None:
         # Rolling-upgrade compatibility for legacy background call sites.
@@ -2402,6 +2461,12 @@ async def call_agent_llm_with_tools(
     tools_for_llm = await get_agent_tools_for_llm(agent_id)
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
+    # Everything needed by the provider/tool loop is now an immutable snapshot.
+    # End the read transaction before waiting for provider capacity or remote
+    # model I/O so hundreds of queued turns do not pin one database connection
+    # each. ``expire_on_commit=False`` keeps the loaded agent/model values usable.
+    await db.commit()
+
     async def _try_model(model: LLMModel) -> tuple[str, bool, bool]:
         """Try to complete with a model. Returns (response, success, tool_executed)."""
         _accumulated_usage = TokenUsage()
@@ -2452,16 +2517,14 @@ async def call_agent_llm_with_tools(
                     return context_stop, False, tool_executed
 
                 try:
-                    _round_t0 = perf_counter()
-                    response = await client.complete(
+                    response = await _complete_with_throttle_retry(
+                        client,
+                        model=model,
+                        round_i=round_i + 1,
                         messages=api_messages,
                         tools=tools_for_llm if tools_for_llm else None,
                         temperature=model.temperature,
                         max_tokens=max_tokens,
-                    )
-                    logger.info(
-                        f"[LLM Timing] round={round_i + 1} model={getattr(model, 'model', '?')} "
-                        f"llm_call={perf_counter() - _round_t0:.2f}s (complete) agent={agent_id}"
                     )
                 except Exception as e:
                     logger.error(f"[call_agent_llm_with_tools] Agent {agent_id}: LLM call error: {e}")
