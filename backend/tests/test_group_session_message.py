@@ -493,6 +493,60 @@ async def test_send_group_session_message_replay_is_idempotent(monkeypatch):
     assert len(receipts) == 1
 
 
+async def test_send_group_session_message_concurrent_replay_reports_pending(monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    call_count = 0
+
+    async def blocked_deliver(**_kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider_started.set()
+        await release_provider.wait()
+        return IMDeliveryResult.sent(
+            "dingtalk",
+            IMDeliveryPart(
+                transport="dingtalk_openapi_group",
+                provider_message_id="provider-concurrent-1",
+            ),
+        )
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", blocked_deliver)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+    kwargs = {
+        "origin_session_id": str(uuid.uuid4()),
+        "tool_call_id": "same-concurrent-tool-call",
+        "origin_turn_anchor_id": uuid.uuid4(),
+    }
+
+    first_task = asyncio.create_task(
+        agent_tools._send_group_session_message(
+            owner.id,
+            {"session_id": str(target.id), "message": "only once"},
+            **kwargs,
+        )
+    )
+    await asyncio.wait_for(provider_started.wait(), timeout=2)
+    replay = json.loads(
+        await agent_tools._send_group_session_message(
+            owner.id,
+            {"session_id": str(target.id), "message": "only once"},
+            **kwargs,
+        )
+    )
+    release_provider.set()
+    first = json.loads(await asyncio.wait_for(first_task, timeout=3))
+
+    assert replay["status"] == "pending"
+    assert first["status"] == "sent"
+    assert call_count == 1
+
+
 async def test_failed_transport_persists_failed_lifecycle_receipt(monkeypatch):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
@@ -1472,6 +1526,78 @@ async def test_send_media_pending_claim_replay_never_calls_provider(tmp_path, mo
             )
         ).scalar_one()
     assert receipt.message_meta["delivery_status"] == "unknown"
+
+
+async def test_send_channel_media_sanitizes_native_visible_fields(tmp_path, monkeypatch):
+    forbidden = "cla" + "with"
+    media = tmp_path / "demo.mp4"
+    media.write_bytes(b"video")
+    captured = {}
+
+    async def no_tool_config(*_args, **_kwargs):
+        return {}
+
+    async def capture_native(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", no_tool_config)
+    monkeypatch.setattr(agent_tools, "_sniff_media_file_mime", lambda _path: "video/mp4")
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", capture_native)
+
+    await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        tmp_path,
+        {
+            "media_type": "video",
+            "file_path": "demo.mp4",
+            "session_id": str(uuid.uuid4()),
+            "message": f"caption {forbidden.upper()}",
+            "title": f"title {forbidden}",
+        },
+        media_kind="video",
+        tool_call_id="sanitized-native-media",
+    )
+
+    assert forbidden not in captured["caption"].lower()
+    assert forbidden not in str(captured["tool_args"]).lower()
+
+
+async def test_send_channel_media_sanitizes_platform_visible_fields(monkeypatch):
+    forbidden = "cla" + "with"
+    captured = {}
+
+    async def allow_url(url, **_kwargs):
+        return url
+
+    async def no_tool_config(*_args, **_kwargs):
+        return {}
+
+    async def capture_platform(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "validate_media_url", allow_url)
+    monkeypatch.setattr(agent_tools, "_get_tool_config", no_tool_config)
+    monkeypatch.setattr(agent_tools, "_publish_external_media_to_session", capture_platform)
+
+    await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        ws=agent_tools.WORKSPACE_ROOT,
+        arguments={
+            "media_type": "video",
+            "url": "https://media.example/demo.mp4",
+            "url_mode": "external",
+            "session_id": str(uuid.uuid4()),
+            "message": f"caption {forbidden}",
+            "title": f"title {forbidden.upper()}",
+        },
+        media_kind="video",
+        tool_call_id="sanitized-platform-media",
+    )
+
+    assert forbidden not in captured["caption"].lower()
+    assert forbidden not in str(captured["tool_args"]).lower()
 
 
 async def test_send_channel_file_terminal_receipt_replay_never_calls_provider(

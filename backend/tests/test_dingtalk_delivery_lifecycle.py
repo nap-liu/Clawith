@@ -170,7 +170,7 @@ async def test_provider_success_receipt_failure_is_unknown_without_fallback_io(
         return receipt_id
 
     async def append(_message_id, _part):
-        return False
+        raise DeliveryReceiptPersistenceError("receipt unavailable")
 
     async def register(message_id, result):
         assert message_id == receipt_id

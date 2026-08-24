@@ -21,7 +21,7 @@ from app.models.participant import Participant  # noqa: F401 - register ChatMess
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
-from app.services import im_delivery
+from app.services import agent_tools, im_delivery
 from app.services.chat_history import build_llm_messages_from_rows, load_messages_for_session
 from app.services.chat_message_serializer import serialize_chat_message_for_client
 from app.services.channel_commands import prepare_channel_command_reply
@@ -150,6 +150,110 @@ async def test_command_reply_is_pending_before_provider_send_and_reuses_session(
     assert row.message_meta["artifact_role"] == "command_reply"
     assert row.message_meta["delivery"]["status"] == "pending"
     assert row.external_event_key.startswith(f"channel-command:slack:{agent.id}:")
+
+
+async def test_proactive_channel_claim_is_single_sender_and_sanitizes_every_boundary(
+    monkeypatch,
+):
+    from app.services import dingtalk_service
+
+    agent, user = await _seed_agent()
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=agent.id,
+                channel_type="dingtalk",
+                app_id=f"app-{uuid.uuid4().hex}",
+                app_secret="secret",
+                is_configured=True,
+                extra_config={"agent_id": "provider-agent"},
+            )
+        )
+        await db.commit()
+
+    async def resolve_platform_user(**_kwargs):
+        return user
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    provider_messages: list[str] = []
+
+    async def send_provider(**kwargs):
+        provider_messages.append(kwargs["message"])
+        entered.set()
+        await release.wait()
+        return {"errcode": 0, "processQueryKey": "provider-process-key"}
+
+    monkeypatch.setattr(
+        agent_tools,
+        "get_platform_user_by_org_member",
+        resolve_platform_user,
+    )
+    monkeypatch.setattr(dingtalk_service, "send_dingtalk_message", send_provider)
+
+    forbidden = "cLaW" + "iTh"
+    raw_message = f"before【{forbidden}】after"
+    member = SimpleNamespace(
+        external_id="staff-proactive",
+        unionid=None,
+        open_id=None,
+    )
+
+    async def resolve_route(*_args, **_kwargs):
+        return SimpleNamespace(member=member, user=user, channel="dingtalk")
+
+    monkeypatch.setattr(
+        agent_tools,
+        "resolve_human_channel_recipient",
+        resolve_route,
+    )
+    turn_anchor_id = uuid.uuid4()
+    kwargs = {
+        "origin_session_id": "origin-session",
+        "origin_user_id": user.id,
+        "tool_call_id": "same-proactive-call",
+        "origin_turn_anchor_id": turn_anchor_id,
+    }
+
+    arguments = {
+        "user_id": str(user.id),
+        "message": raw_message,
+        "channel": "dingtalk",
+    }
+    first = asyncio.create_task(
+        agent_tools._send_channel_message(agent.id, arguments, **kwargs)
+    )
+    await entered.wait()
+    second = await agent_tools._send_channel_message(agent.id, arguments, **kwargs)
+    release.set()
+    first_result = await first
+
+    assert "message_id" in first_result
+    assert "will not be sent twice" in second
+    assert len(provider_messages) == 1
+    assert forbidden.casefold() not in provider_messages[0].casefold()
+
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.agent_id == agent.id,
+                    ChatMessage.external_event_key.is_not(None),
+                )
+            )
+        ).scalars().all()
+        session = (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.agent_id == agent.id,
+                    ChatSession.external_conv_id == "dingtalk_p2p_staff-proactive",
+                )
+            )
+        ).scalar_one()
+
+    assert len(rows) == 1
+    assert forbidden.casefold() not in rows[0].content.casefold()
+    assert forbidden.casefold() not in session.title.casefold()
 
 
 async def test_reset_reply_anchors_to_archived_session_without_creating_active_ghost():
@@ -827,7 +931,77 @@ async def test_transport_timeout_maps_to_unknown_but_provider_rejection_maps_to_
     assert unknown.status == "unknown"
     assert unknown.to_meta()["status"] == "unknown"
     assert im_delivery.attach_delivery_to_meta({}, unknown)["delivery_status"] == "unknown"
+    receipt_failure = IMDeliveryResult.from_exception(
+        "slack",
+        im_delivery.DeliveryReceiptPersistenceError("receipt unavailable"),
+    )
+    assert receipt_failure.status == "unknown"
     assert IMDeliveryResult.from_exception("slack", RuntimeError("rejected")).status == "failed"
+
+
+async def test_append_missing_receipt_raises_unknown_delivery_error():
+    part = IMDeliveryPart(
+        transport="slack",
+        provider_message_id="provider-visible",
+        conversation_ref="channel-1",
+    )
+
+    with pytest.raises(im_delivery.DeliveryReceiptPersistenceError):
+        await im_delivery.append_delivery_part(uuid.uuid4(), part)
+
+
+async def test_stale_pending_with_known_part_can_still_recall_that_part(monkeypatch):
+    agent, user = await _seed_agent()
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=agent.id,
+                channel_type="slack",
+                app_id="app",
+                app_secret="token",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    row = await _seed_message(agent, user, IMDeliveryResult.pending("slack"))
+    await im_delivery.append_delivery_part(
+        row.id,
+        IMDeliveryPart(
+            transport="test_stale_known_part",
+            provider_message_id="known-provider-part",
+            conversation_ref="channel-1",
+        ),
+    )
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row.id)
+        delivery = dict(stored.message_meta["delivery"])
+        delivery["updated_at"] = (
+            datetime.now(UTC) - im_delivery.DELIVERY_LEASE - timedelta(seconds=1)
+        ).isoformat()
+        stored.message_meta = {**stored.message_meta, "delivery": delivery}
+        await db.commit()
+
+    recalled_parts = []
+
+    async def fake_recall(_config, parts):
+        recalled_parts.extend(parts)
+        return [
+            PartRecallResult(part_id=str(part["part_id"]), status="recalled")
+            for part in parts
+        ]
+
+    monkeypatch.setitem(
+        im_delivery.IM_RECALL_ADAPTERS,
+        "test_stale_known_part",
+        fake_recall,
+    )
+
+    result = await _recall(agent, user, row)
+
+    assert result["status"] == "partial"
+    assert [part["provider_message_id"] for part in recalled_parts] == [
+        "known-provider-part"
+    ]
 
 
 async def test_supported_recall_adapters_normalize_provider_success(monkeypatch):

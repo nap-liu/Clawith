@@ -5634,8 +5634,7 @@ async def _send_channel_file(
         if receipt_id is None:
             return "Failed to send file: durable delivery receipt unavailable"
         async def _record_part(part: IMDeliveryPart) -> None:
-            if not await append_delivery_part(receipt_id, part):
-                raise RuntimeError("delivery part persistence failed")
+            await append_delivery_part(receipt_id, part)
 
         recorder_token = channel_file_part_recorder.set(_record_part)
         try:
@@ -5671,8 +5670,7 @@ async def _send_channel_file(
         if receipt_id is None:
             return "Failed to send file: durable delivery receipt unavailable"
         async def _record_part(part: IMDeliveryPart) -> None:
-            if not await append_delivery_part(receipt_id, part):
-                raise RuntimeError("delivery part persistence failed")
+            await append_delivery_part(receipt_id, part)
 
         recorder_token = channel_file_part_recorder.set(_record_part)
         try:
@@ -5718,6 +5716,15 @@ async def _send_channel_media(
     origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Create one audio/video delivery without leaking renderer/IM details."""
+    arguments = dict(arguments)
+    if "message" in arguments:
+        arguments["message"] = sanitize_user_visible_text(
+            str(arguments.get("message") or "")
+        ).strip()
+    if "title" in arguments:
+        arguments["title"] = normalize_media_display_title(
+            sanitize_user_visible_text(str(arguments.get("title") or ""))
+        )
     if not str(tool_call_id or "").strip():
         return json.dumps({
             "type": "media_delivery_result", "version": 1, "status": "failed",
@@ -6989,7 +6996,9 @@ async def _send_media_to_session_under_lifecycle_lock(
                     with_for_update=True,
                 )
                 if part_receipt is None:
-                    raise RuntimeError("delivery_part_persistence_failed")
+                    raise DeliveryReceiptPersistenceError(
+                        "provider artifact receipt persistence failed"
+                    )
                 part_receipt.message_meta = _merge_delivery_into_meta(
                     part_receipt.message_meta,
                     IMDeliveryResult(
@@ -9952,7 +9961,9 @@ async def _send_feishu_message(
 ) -> str:
     """Send Feishu IM by canonical platform user_id."""
     canonical_user_id = (args.get("user_id") or "").strip()
-    message_text = (args.get("message") or "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
     if not canonical_user_id or not message_text:
         return "❌ Please provide canonical user_id and message content"
     try:
@@ -9988,7 +9999,7 @@ async def _send_feishu_message(
                 source_channel="feishu",
                 first_message_title=f"[Agent → {route.user.display_name}]",
             )
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=route.user.id,
@@ -10005,6 +10016,8 @@ async def _send_feishu_message(
             )
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
             try:
                 resp = await feishu_service.send_message(
                     config.app_id,
@@ -10327,8 +10340,11 @@ async def _persist_outbound_channel_message(
     external_message_id: str | None = None,
     delivery_status: str = "sent",
     delivery_result: IMDeliveryResult | None = None,
-) -> ChatMessage:
-    """Append/reuse the outbound receipt used by strict on_message binding."""
+) -> tuple[ChatMessage, bool]:
+    """Atomically claim one outbound operation and return its send ownership."""
+    content = sanitize_user_visible_text(content or "").strip()
+    if not content:
+        raise ValueError("user-visible message must be non-empty after sanitization")
     operation_key = _build_outbound_operation_key(
         agent_id=agent_id,
         origin_session_id=origin_session_id,
@@ -10336,11 +10352,12 @@ async def _persist_outbound_channel_message(
         origin_turn_anchor_id=origin_turn_anchor_id,
     )
     if operation_key:
+        await _lock_outbound_operation(db, operation_key)
         existing = (
             await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == operation_key))
         ).scalar_one_or_none()
         if existing is not None:
-            return existing
+            return existing, False
 
     if origin_session_id and not origin_source_channel:
         try:
@@ -10411,7 +10428,14 @@ async def _persist_outbound_channel_message(
     db.add(row)
     session.last_message_at = datetime.now(timezone.utc)
     await db.flush()
-    return row
+    return row, True
+
+
+def _duplicate_outbound_claim_result(receipt: ChatMessage) -> str:
+    return (
+        "⏳ This delivery is already claimed and will not be sent twice.\n"
+        f"message_id: {receipt.id}"
+    )
 
 
 _SESSION_MESSAGE_CAPABILITIES = {
@@ -10469,6 +10493,17 @@ def _session_message_result(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _session_receipt_replay_status(receipt: ChatMessage) -> str:
+    meta = receipt.message_meta if isinstance(receipt.message_meta, dict) else {}
+    delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+    status = str(delivery.get("status") or meta.get("delivery_status") or "unknown")
+    if status == "sent":
+        return "already_sent"
+    if status in {"pending", "failed", "unknown", "partial"}:
+        return status
+    return "unknown"
+
+
 async def _send_exact_session_message(
     agent_id: uuid.UUID,
     args: dict,
@@ -10481,7 +10516,9 @@ async def _send_exact_session_message(
 ) -> str:
     """Authorize and send text through one exact human ChatSession route."""
     raw_session_id = str(args.get("session_id") or "").strip()
-    message_text = str(args.get("message") or "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
     raw_mention_user_ids = args.get("mention_user_ids")
     if not raw_session_id:
         qualifier = "group " if require_group else ""
@@ -10530,7 +10567,7 @@ async def _send_exact_session_message(
                 if existing is not None:
                     meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
                     return _session_message_result(
-                        status="already_sent",
+                        status=_session_receipt_replay_status(existing),
                         session_id=str(existing.conversation_id),
                         channel=str(meta.get("source_channel") or ""),
                         target_name=str(meta.get("target_name") or target_name),
@@ -10643,7 +10680,7 @@ async def _send_exact_session_message(
                         "dingtalk_session_webhook": dingtalk_session_webhook,
                     }
                 )
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=target_user_id,
@@ -10658,23 +10695,41 @@ async def _send_exact_session_message(
                 origin_turn_anchor_id=origin_turn_anchor_id,
                 delivery_result=IMDeliveryResult.pending(target_channel),
             )
-            receipt_meta = dict(receipt.message_meta or {})
-            receipt_meta["target_is_group"] = target_is_group
-            if mentioned_names:
-                receipt_meta["mention_user_ids"] = mention_user_ids
-                receipt_meta["mentioned_users"] = mentioned_names
-            receipt.message_meta = receipt_meta
+            if should_deliver:
+                receipt_meta = dict(receipt.message_meta or {})
+                receipt_meta["target_is_group"] = target_is_group
+                if mentioned_names:
+                    receipt_meta["mention_user_ids"] = mention_user_ids
+                    receipt_meta["mentioned_users"] = mentioned_names
+                receipt.message_meta = receipt_meta
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _session_message_result(
+                    status=_session_receipt_replay_status(receipt),
+                    session_id=str(receipt.conversation_id),
+                    channel=target_channel,
+                    target_name=target_name,
+                    is_group=target_is_group,
+                    legacy_group_contract=legacy_group_contract,
+                    mentioned_users=mentioned_names,
+                    message_id=str(receipt.id),
+                )
 
         # The provider call runs outside the row/advisory lock. The pending
         # receipt above is the durable idempotency claim and crash marker.
         async def _record_part(part: IMDeliveryPart) -> None:
-            if not await append_delivery_part(receipt_id, part):
-                raise RuntimeError("delivery_part_persistence_failed")
+            await append_delivery_part(receipt_id, part)
 
         delivery_kwargs["on_part"] = _record_part
-        delivery_result = await deliver_message_with_receipt(**delivery_kwargs)
+        try:
+            delivery_result = await deliver_message_with_receipt(**delivery_kwargs)
+        except Exception as exc:
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.from_exception(target_channel, exc),
+            )
+            raise
         await register_delivery(receipt_id, delivery_result)
         if not delivery_result.ok:
             label = "Group message" if target_is_group else "Session message"
@@ -10768,7 +10823,9 @@ async def _send_channel_message(
 ) -> str:
     """Send an external-channel message by canonical platform user_id."""
     canonical_user_id = str(args.get("user_id") or "").strip()
-    message_text = (args.get("message") or "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
     raw_target_channel = (args.get("channel") or "").strip().lower()
     target_channel = "teams" if raw_target_channel == "microsoft_teams" else raw_target_channel
 
@@ -10910,7 +10967,7 @@ async def _send_dingtalk_message(
                 source_channel="dingtalk",
                 first_message_title=message_text[:30],
             )
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -10927,6 +10984,8 @@ async def _send_dingtalk_message(
             )
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
             # 3. Send message via DingTalk service
             result = await send_dingtalk_message(
@@ -11021,7 +11080,7 @@ async def _send_wecom_message(
                 source_channel="wecom",
                 first_message_title=message_text[:30],
             )
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -11038,6 +11097,8 @@ async def _send_wecom_message(
             )
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
             # 3. Send message via WeCom service
             result = await send_wecom_message(
@@ -11144,7 +11205,7 @@ async def _send_slack_message(
                 source_channel="slack",
                 first_message_title=message_text[:30],
             )
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -11161,6 +11222,8 @@ async def _send_slack_message(
             )
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
             async def _record_slack_part(response: dict) -> None:
                 part = IMDeliveryPart(
@@ -11170,8 +11233,7 @@ async def _send_slack_message(
                     artifact_role="chunk",
                     recallable=bool(response.get("ts")),
                 )
-                if not await append_delivery_part(receipt_id, part):
-                    raise RuntimeError("delivery_part_persistence_failed")
+                await append_delivery_part(receipt_id, part)
 
             try:
                 slack_responses = await _send_slack_messages(
@@ -11265,7 +11327,7 @@ async def _send_teams_channel_message(
                 return f"❌ Teams proactive send to {member_name} requires them to message the bot first"
 
             actor_ref = str(target_member.external_id or target_member.open_id or platform_user.id)
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -11282,6 +11344,8 @@ async def _send_teams_channel_message(
             )
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
             async def _record_teams_part(response: dict) -> None:
                 part = IMDeliveryPart(
@@ -11292,8 +11356,7 @@ async def _send_teams_channel_message(
                     recallable=bool(response.get("id")),
                     metadata={"service_url": service_url},
                 )
-                if not await append_delivery_part(receipt_id, part):
-                    raise RuntimeError("delivery_part_persistence_failed")
+                await append_delivery_part(receipt_id, part)
 
             try:
                 teams_responses = await _send_teams_message(
@@ -11398,7 +11461,7 @@ async def _send_wechat_channel_message(
                 source_channel="wechat",
                 first_message_title=message_text[:30],
             )
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -11415,6 +11478,8 @@ async def _send_wechat_channel_message(
             )
             receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
             async def _record_wechat_part(response: dict) -> None:
                 part = IMDeliveryPart(
@@ -11424,8 +11489,7 @@ async def _send_wechat_channel_message(
                     artifact_role="chunk",
                     recallable=False,
                 )
-                if not await append_delivery_part(receipt_id, part):
-                    raise RuntimeError("delivery_part_persistence_failed")
+                await append_delivery_part(receipt_id, part)
 
             try:
                 wechat_responses = await send_wechat_text_message(
@@ -11475,7 +11539,9 @@ async def _send_platform_message(
 ) -> str:
     """Send a proactive message to a first-party platform user."""
     canonical_user_id = str(args.get("user_id") or "").strip()
-    message_text = args.get("message", "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
 
     if not canonical_user_id or not message_text:
         return "❌ Please provide canonical user_id and message content"
@@ -11497,7 +11563,7 @@ async def _send_platform_message(
 
             session = await ensure_primary_platform_session(db, agent_id, target_user.id)
 
-            await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=target_user.id,
@@ -11511,21 +11577,24 @@ async def _send_platform_message(
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
             )
-            try:
-                from app.api.websocket import maybe_mark_session_read_for_active_viewer
+            if should_deliver:
+                try:
+                    from app.api.websocket import maybe_mark_session_read_for_active_viewer
 
-                await maybe_mark_session_read_for_active_viewer(
-                    db,
-                    agent_id=agent_id,
-                    session_id=str(session.id),
-                    user_id=target_user.id,
-                )
-            except Exception:
-                pass
+                    await maybe_mark_session_read_for_active_viewer(
+                        db,
+                        agent_id=agent_id,
+                        session_id=str(session.id),
+                        user_id=target_user.id,
+                    )
+                except Exception:
+                    pass
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
-            # Push via WebSocket if user has an active connection
             try:
+                # Push via WebSocket if user has an active connection
                 from app.api.websocket import manager as ws_manager
                 await ws_manager.send_to_user(
                     str(agent_id),

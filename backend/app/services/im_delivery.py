@@ -232,17 +232,24 @@ async def register_delivery(message_id: uuid.UUID | str, result: IMDeliveryResul
         local_id = uuid.UUID(str(message_id))
     except (TypeError, ValueError):
         return False
-    async with async_session() as db:
-        row = (
-            await db.execute(
-                select(ChatMessage).where(ChatMessage.id == local_id).with_for_update()
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            return False
-        row.message_meta = _merge_delivery_into_meta(row.message_meta, result)
-        await db.commit()
-        return True
+    try:
+        async with async_session() as db:
+            row = (
+                await db.execute(
+                    select(ChatMessage).where(ChatMessage.id == local_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            row.message_meta = _merge_delivery_into_meta(row.message_meta, result)
+            await db.commit()
+            return True
+    except DeliveryReceiptPersistenceError:
+        raise
+    except Exception as exc:
+        raise DeliveryReceiptPersistenceError(
+            "provider delivery receipt persistence failed"
+        ) from exc
 
 
 async def append_delivery_part(
@@ -250,10 +257,34 @@ async def append_delivery_part(
     part: IMDeliveryPart,
 ) -> bool:
     """Durably append one provider-visible part immediately after it is sent."""
-    return await register_delivery(
-        message_id,
-        IMDeliveryResult(ok=True, channel="", parts=(part,), status="pending"),
-    )
+    try:
+        persisted = await register_delivery(
+            message_id,
+            IMDeliveryResult(ok=True, channel="", parts=(part,), status="pending"),
+        )
+    except DeliveryReceiptPersistenceError:
+        # The provider ID is already known.  Make one bounded best-effort retry
+        # that preserves it as uncertain, then propagate so callers never send
+        # a fallback duplicate for a receipt failure.
+        try:
+            await register_delivery(
+                message_id,
+                IMDeliveryResult(
+                    ok=False,
+                    channel="",
+                    parts=(part,),
+                    status="unknown",
+                    error="delivery_part_persistence_failed",
+                ),
+            )
+        except DeliveryReceiptPersistenceError:
+            pass
+        raise
+    if not persisted:
+        raise DeliveryReceiptPersistenceError(
+            "provider artifact receipt persistence failed"
+        )
+    return True
 
 
 @dataclass(frozen=True)
@@ -264,12 +295,13 @@ class PersistedDeliveryRecorder:
     channel: str
 
     async def append(self, part: IMDeliveryPart) -> None:
-        if not await append_delivery_part(self.message_id, part):
-            raise RuntimeError("delivery_part_persistence_failed")
+        await append_delivery_part(self.message_id, part)
 
     async def finalize(self, result: IMDeliveryResult) -> IMDeliveryResult:
         if not await register_delivery(self.message_id, result):
-            raise RuntimeError("delivery_finalization_failed")
+            raise DeliveryReceiptPersistenceError(
+                "provider delivery finalization failed"
+            )
         return result
 
     async def sent(self) -> IMDeliveryResult:
@@ -360,8 +392,7 @@ async def deliver_persisted_message(
         await db.commit()
 
     async def _record_part(part: IMDeliveryPart) -> None:
-        if not await append_delivery_part(message_id, part):
-            raise RuntimeError("delivery_part_persistence_failed")
+        await append_delivery_part(message_id, part)
 
     try:
         result = await deliver_message_with_receipt(
@@ -386,7 +417,9 @@ async def deliver_persisted_message(
             exc,
         )
     if not await register_delivery(message_id, result):
-        raise RuntimeError("delivery_finalization_failed")
+        raise DeliveryReceiptPersistenceError(
+            "provider delivery finalization failed"
+        )
     return result
 
 
@@ -488,8 +521,7 @@ async def deliver_persisted_with_callback(
     """Run an exact transport adapter and durably merge every observed part."""
 
     async def _record_part(part: IMDeliveryPart) -> None:
-        if not await append_delivery_part(message_id, part):
-            raise RuntimeError("delivery_part_persistence_failed")
+        await append_delivery_part(message_id, part)
 
     try:
         result = await deliver(sanitize_user_visible_text(message or ""), _record_part)
@@ -502,7 +534,9 @@ async def deliver_persisted_with_callback(
     except Exception as exc:  # noqa: BLE001 - provider adapters vary
         result = IMDeliveryResult.from_exception(channel, exc)
     if not await register_delivery(message_id, result):
-        raise RuntimeError("delivery_finalization_failed")
+        raise DeliveryReceiptPersistenceError(
+            "provider delivery finalization failed"
+        )
     return result
 
 
@@ -1055,15 +1089,21 @@ async def recall_message(
         if delivery_status == "pending":
             updated_at = _parse_iso(delivery.get("updated_at"))
             if updated_at is not None and now - updated_at >= DELIVERY_LEASE:
-                delivery["status"] = "unknown"
+                delivery["status"] = "partial" if parts else "unknown"
+                delivery["uncertain"] = True
                 delivery["updated_at"] = now.isoformat()
                 meta["delivery"] = delivery
                 row.message_meta = meta
-                await db.commit()
-                return {"status": "unknown", "message_id": str(local_id)}
-            return {"status": "pending", "message_id": str(local_id)}
+                if not parts:
+                    await db.commit()
+                    return {"status": "unknown", "message_id": str(local_id)}
+                delivery_status = "partial"
+            else:
+                return {"status": "pending", "message_id": str(local_id)}
         if delivery_status == "unknown":
-            return {"status": "unknown", "message_id": str(local_id)}
+            if not parts:
+                return {"status": "unknown", "message_id": str(local_id)}
+            delivery["uncertain"] = True
         if delivery_status == "failed" and not parts:
             return {
                 "status": "failed",

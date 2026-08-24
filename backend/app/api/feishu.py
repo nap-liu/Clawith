@@ -659,6 +659,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 _cmd_reply_to = chat_id if chat_type == "group" and chat_id else sender_open_id
                 _cmd_rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
                 from app.services.im_delivery import (
+                    DeliveryReceiptPersistenceError,
                     IMDeliveryPart,
                     IMDeliveryResult,
                     register_delivery,
@@ -688,6 +689,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             ),
                         ),
                     )
+                except DeliveryReceiptPersistenceError:
+                    raise
                 except Exception as _cmd_e:
                     await register_delivery(
                         cmd_result["message_id"],
@@ -1129,6 +1132,12 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     streaming=True,
                     agent_name=_agent_name,
                 )
+                from app.services.im_delivery import (
+                    DeliveryReceiptPersistenceError,
+                    IMDeliveryPart,
+                    append_delivery_part,
+                )
+
                 try:
                     _init_resp = await feishu_service.send_message(
                         config.app_id,
@@ -1142,8 +1151,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     )
                     _patch_msg_id = _init_resp.get("data", {}).get("message_id")
                     if _patch_msg_id:
-                        from app.services.im_delivery import append_delivery_part, IMDeliveryPart
-
                         await append_delivery_part(
                             assistant_message_id,
                             IMDeliveryPart(
@@ -1153,6 +1160,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                 artifact_role="card",
                             ),
                         )
+                except DeliveryReceiptPersistenceError:
+                    raise
                 except Exception as e:
                     logger.error(f"[Feishu] Failed to send init streaming card: {e}")
 
@@ -1309,6 +1318,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 )
 
                 from app.services.im_delivery import (
+                    DeliveryReceiptPersistenceError,
                     IMDeliveryPart,
                     IMDeliveryResult,
                     append_delivery_part,
@@ -1371,6 +1381,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                 )
                                 delivery_parts.append(fallback_part)
                                 await append_delivery_part(assistant_message_id, fallback_part)
+                        except DeliveryReceiptPersistenceError:
+                            raise
                         except Exception as e2:
                             logger.error(f"[Feishu] Failed to send fallback text reply: {e2}")
                 else:
@@ -1396,6 +1408,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             )
                             delivery_parts.append(final_part)
                             await append_delivery_part(assistant_message_id, final_part)
+                    except DeliveryReceiptPersistenceError:
+                        raise
                     except Exception as e:
                         logger.error(f"[Feishu] Failed to send final interactive reply: {e}")
                         try:
@@ -1420,6 +1434,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                 )
                                 delivery_parts.append(fallback_part)
                                 await append_delivery_part(assistant_message_id, fallback_part)
+                        except DeliveryReceiptPersistenceError:
+                            raise
                         except Exception as e2:
                             logger.error(f"[Feishu] Failed to send fallback text reply: {e2}")
 
@@ -1725,6 +1741,12 @@ async def _handle_feishu_file(
                 artifact_role="streaming_card",
             )
             _patch_msg_id = None
+            from app.services.im_delivery import (
+                DeliveryReceiptPersistenceError,
+                IMDeliveryPart,
+                append_delivery_part,
+            )
+
             try:
                 _init_resp = await feishu_service.send_message(
                     config.app_id, config.app_secret, _reply_to, "interactive",
@@ -1734,8 +1756,6 @@ async def _handle_feishu_file(
                 )
                 _patch_msg_id = _init_resp.get("data", {}).get("message_id")
                 if _patch_msg_id:
-                    from app.services.im_delivery import append_delivery_part, IMDeliveryPart
-
                     await append_delivery_part(
                         assistant_message_id,
                         IMDeliveryPart(
@@ -1745,6 +1765,8 @@ async def _handle_feishu_file(
                             artifact_role="card",
                         ),
                     )
+            except DeliveryReceiptPersistenceError:
+                raise
             except Exception as _e_init:
                 logger.error(f"[Feishu] Failed to send init card for image: {_e_init}")
 
@@ -1847,6 +1869,7 @@ async def _handle_feishu_file(
             logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
 
             from app.services.im_delivery import (
+                DeliveryReceiptPersistenceError,
                 IMDeliveryPart,
                 IMDeliveryResult,
                 append_delivery_part,
@@ -1910,6 +1933,8 @@ async def _handle_feishu_file(
                             "feishu",
                             fallback_part,
                         )
+                except DeliveryReceiptPersistenceError:
+                    raise
                 except Exception as _e_fb:
                     logger.error(f"[Feishu] Failed to send image reply: {_e_fb}")
 
