@@ -5151,13 +5151,14 @@ async def seed_builtin_tools():
                 if updated_fields:
                     logger.info(f"[ToolSeeder] Updated {', '.join(updated_fields)}: {t['name']}")
 
-        # Auto-assign new default tools and self-heal required protocol tools
-        # for every existing Agent. Required bindings cannot remain missing or
-        # disabled after startup, even if legacy control-plane data says so.
+        # Auto-assign new default tools to standard Agents only. Project Agents
+        # have an explicit project-local allowlist and must not inherit future
+        # platform defaults during startup. Required protocol tools still
+        # self-heal for every Agent regardless of scope.
         assignment_tool_ids = set(new_tool_ids) | required_tool_ids
         if assignment_tool_ids:
-            agents_result = await db.execute(select(Agent.id))
-            agent_ids = [row[0] for row in agents_result.fetchall()]
+            agents_result = await db.execute(select(Agent.id, Agent.scope))
+            agent_rows = agents_result.fetchall()
             assignments_result = await db.execute(
                 select(AgentTool).where(AgentTool.tool_id.in_(assignment_tool_ids))
             )
@@ -5165,16 +5166,22 @@ async def seed_builtin_tools():
                 (assignment.agent_id, assignment.tool_id): assignment
                 for assignment in assignments_result.scalars().all()
             }
-            for agent_id in agent_ids:
-                for tool_id in assignment_tool_ids:
+            ensured_count = 0
+            for agent_id, agent_scope in agent_rows:
+                applicable_tool_ids = set(required_tool_ids)
+                if agent_scope == "standard":
+                    applicable_tool_ids.update(new_tool_ids)
+                for tool_id in applicable_tool_ids:
                     assignment = assignments_by_pair.get((agent_id, tool_id))
                     if assignment is None:
                         db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=True))
+                        ensured_count += 1
                     elif tool_id in required_tool_ids and not assignment.enabled:
                         assignment.enabled = True
+                        ensured_count += 1
             logger.info(
-                f"[ToolSeeder] Ensured {len(assignment_tool_ids)} new/required "
-                f"tools for {len(agent_ids)} agents"
+                f"[ToolSeeder] Ensured {ensured_count} new/required assignments "
+                f"across {len(agent_rows)} agents"
             )
 
         OBSOLETE_TOOLS = ["bing_search", "manage_tasks"]
