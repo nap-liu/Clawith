@@ -14,9 +14,11 @@ from app.main import app
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
 from app.models.tenant import Tenant
+from app.models.tool import AgentTool, Tool
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import User, Identity
+from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
 from app.services.trigger_daemon import (
     _finalize_invocation_executions,
     _link_invocation_executions,
@@ -27,6 +29,7 @@ from app.services.trigger_daemon import (
 from app.services.trigger_runtime.dispatch import enqueue_due_trigger
 from app.models.audit import AuditLog
 from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.tool_seeder import BUILTIN_TOOLS, seed_builtin_tools
 from app.services.webhook_inbox import format_webhook_inbox_context
 
 pytestmark = pytest.mark.asyncio
@@ -1040,12 +1043,10 @@ async def test_set_trigger_description_mentions_webhook_mode():
 
 async def test_webhook_mode_description_has_scenario_guidance():
     """B: webhook_mode description tells the agent WHEN to use each mode, not just what they do."""
-    from app.services.agent_tools import AGENT_TOOLS
-
     st = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
     desc = st["function"]["parameters"]["properties"]["webhook_mode"]["description"]
-    assert "FIFO" in desc and "individually" in desc  # queue scenario
-    assert "summarize" in desc or "together" in desc  # merge scenario
+    assert "FIFO" in desc and "once per event" in desc
+    assert "batch captured when execution starts" in desc
 
 
 # --- C: update_trigger can switch an existing hook's mode without clobbering token/queue ---
@@ -1065,12 +1066,65 @@ async def _make_webhook_agent(cfg):
 
 
 async def test_update_trigger_schema_contains_webhook_mode():
-    from app.services.agent_tools import AGENT_TOOLS
-
     ut = next(t for t in AGENT_TOOLS if t["function"]["name"] == "update_trigger")
     props = ut["function"]["parameters"]["properties"]
     assert "webhook_mode" in props
     assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
+
+
+async def test_webhook_guidance_reaches_seeded_llm_runtime():
+    aid = await _make_webhook_agent({"token": "runtime-guidance", "webhook_mode": "queue"})
+    await seed_builtin_tools()
+
+    expected_names = {"set_trigger", "update_trigger"}
+    async with async_session() as db:
+        tool_rows = (
+            await db.execute(select(Tool).where(Tool.name.in_(expected_names)))
+        ).scalars().all()
+        assert {tool.name for tool in tool_rows} == expected_names
+        assignments = {
+            assignment.tool_id: assignment
+            for assignment in (
+                await db.execute(select(AgentTool).where(AgentTool.agent_id == aid))
+            ).scalars().all()
+        }
+        for tool in tool_rows:
+            assignment = assignments.get(tool.id)
+            if assignment is None:
+                db.add(AgentTool(agent_id=aid, tool_id=tool.id, enabled=True))
+            else:
+                assignment.enabled = True
+        await db.commit()
+
+    runtime_by_name = {
+        tool["function"]["name"]: tool["function"]
+        for tool in await get_agent_tools_for_llm(aid)
+        if tool["function"]["name"] in expected_names
+    }
+    seeded_by_name = {
+        tool["name"]: tool for tool in BUILTIN_TOOLS if tool["name"] in expected_names
+    }
+    fallback_by_name = {
+        tool["function"]["name"]: tool["function"]
+        for tool in AGENT_TOOLS
+        if tool["function"]["name"] in expected_names
+    }
+
+    assert set(runtime_by_name) == expected_names
+    for name in expected_names:
+        assert runtime_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
+        assert fallback_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
+
+    set_mode_description = runtime_by_name["set_trigger"]["parameters"]["properties"][
+        "webhook_mode"
+    ]["description"]
+    update_properties = runtime_by_name["update_trigger"]["parameters"]["properties"]
+    assert "stored byte-for-byte" in set_mode_description
+    assert "read the referenced file" in set_mode_description
+    assert "does not convert or drain in-flight work" in update_properties["webhook_mode"][
+        "description"
+    ]
+    assert "partial patch" in update_properties["config"]["description"]
 
 
 async def test_update_trigger_switches_mode_preserving_token_and_queue():
