@@ -197,15 +197,30 @@ function normalizeRole(value: unknown, index: number): ProjectTemplateRole {
 
 function normalizeTemplateCapability(
   value: unknown,
+  fallbackType?: "tool" | "mcp" | "skill",
 ): ProjectTemplateCapability {
-  if (typeof value === "string") return { name: value };
+  if (typeof value === "string") return { name: value, type: fallbackType };
   const source = record(value);
+  const affectedMembers = array(source.affected_members).map((item) => {
+    const member = record(item);
+    return {
+      member_id: string(member.member_id) || null,
+      agent_id: string(member.agent_id || member.member_agent_id) || null,
+      name: string(member.name || member.member_name),
+      role: string(member.role || member.member_role) || null,
+      is_active: member.is_active !== false,
+    };
+  });
+  const rawSelected = source.selected;
   return {
     id: string(source.id) || undefined,
     binding_id:
       string(source.binding_id || source.project_capability_binding_id) ||
       undefined,
-    name: string(source.name || source.display_name, "未命名能力"),
+    type:
+      string(source.type || source.capability_type, fallbackType) || undefined,
+    key: string(source.key) || null,
+    name: string(source.name || source.display_name),
     version: string(source.version) || null,
     source: string(source.source) || null,
     owner_agent_id:
@@ -226,6 +241,17 @@ function normalizeTemplateCapability(
     files_available: boolean(
       source.files_available ?? source.has_files ?? source.file_count,
     ),
+    selected:
+      rawSelected === undefined || rawSelected === null
+        ? undefined
+        : boolean(rawSelected),
+    selection_state: string(source.selection_state) || undefined,
+    availability: string(source.availability) || null,
+    affected_members: affectedMembers,
+    affected_member_count: number(
+      source.affected_member_count,
+      affectedMembers.length,
+    ),
   };
 }
 
@@ -245,16 +271,32 @@ function normalizeTemplateAssetSummary(
     excluded_file_count: number(source.excluded_file_count),
     skill_count: number(source.skill_count),
     mcp_server_count: number(source.mcp_server_count),
+    capability_count: number(source.capability_count),
   };
 }
 
 function normalizeTemplateManifest(value: unknown): ProjectTemplateManifest {
   const source = record(value);
+  const skills = array(source.skills).map((item) =>
+    normalizeTemplateCapability(item, "skill"),
+  );
+  const mcpServers = array(source.mcp_servers).map((item) =>
+    normalizeTemplateCapability(item, "mcp"),
+  );
+  const platformCapabilities = array(source.capabilities).length
+    ? array(source.capabilities).map((item) => normalizeTemplateCapability(item))
+    : mcpServers;
+  const assetSummary = normalizeTemplateAssetSummary(source.asset_summary);
   return {
     roles: array(source.roles).map(normalizeRole),
-    skills: array(source.skills).map(normalizeTemplateCapability),
-    mcp_servers: array(source.mcp_servers).map(normalizeTemplateCapability),
-    asset_summary: normalizeTemplateAssetSummary(source.asset_summary),
+    skills,
+    mcp_servers: mcpServers,
+    capabilities: [...skills, ...platformCapabilities],
+    asset_summary: {
+      ...assetSummary,
+      capability_count:
+        assetSummary.capability_count || platformCapabilities.length,
+    },
   };
 }
 
@@ -292,8 +334,8 @@ function normalizeTemplate(value: unknown): ProjectTemplate {
           .map((item) => string(item))
           .filter(Boolean),
     roles: roles.map(normalizeRole),
-    skills: skills.map(normalizeTemplateCapability),
-    mcp_servers: mcps.map(normalizeTemplateCapability),
+    skills: skills.map((item) => normalizeTemplateCapability(item)),
+    mcp_servers: mcps.map((item) => normalizeTemplateCapability(item)),
     snapshot_backed:
       Boolean(rawAssetSummary) &&
       typeof rawAssetSummary === "object" &&

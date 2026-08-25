@@ -736,7 +736,7 @@ async def export_project_skills_for_template(
     missing = set(included_binding_ids) - set(by_id)
     if missing:
         raise ProjectTemplateSnapshotError("One or more selected project Skills are unavailable")
-    project_agent_ids = list(
+    template_agent_ids = list(
         (
             await db.execute(
                 select(Agent.id)
@@ -746,16 +746,19 @@ async def export_project_skills_for_template(
                     & (ProjectMemberSnapshot.agent_id == Agent.id),
                 )
                 .where(
-                    Agent.scope == "project",
-                    Agent.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
                     Agent.tenant_id == project.tenant_id,
                     Agent.is_deleted.is_(False),
                 )
-                .order_by(ProjectMemberSnapshot.is_leader.desc(), Agent.created_at)
+                .order_by(
+                    ProjectMemberSnapshot.is_leader.desc(),
+                    ProjectMemberSnapshot.created_at,
+                    ProjectMemberSnapshot.id,
+                )
             )
         ).scalars()
     )
-    agent_index = {agent_id: index for index, agent_id in enumerate(project_agent_ids)}
+    agent_index = {agent_id: index for index, agent_id in enumerate(template_agent_ids)}
     bindings_by_id = {binding.id: binding for binding in await _skill_bindings(db, project)}
     root = project_root or project_repo_path(project.tenant_id, project.id)
     packages: list[dict] = []

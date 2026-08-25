@@ -55,6 +55,8 @@ export interface ProjectListResponse {
 export interface ProjectTemplateCapability {
   id?: string;
   binding_id?: string;
+  type?: "tool" | "mcp" | "skill" | string;
+  key?: string | null;
   name: string;
   version?: string | null;
   source?: string | null;
@@ -69,6 +71,19 @@ export interface ProjectTemplateCapability {
   file_count?: number;
   size_bytes?: number;
   files_available?: boolean;
+  selected?: boolean;
+  selection_state?: "selected" | "unselected" | string;
+  availability?: "available" | "missing" | "restricted" | string | null;
+  affected_members?: ProjectTemplateAffectedMember[];
+  affected_member_count?: number;
+}
+
+export interface ProjectTemplateAffectedMember {
+  member_id?: string | null;
+  agent_id?: string | null;
+  name: string;
+  role?: string | null;
+  is_active?: boolean;
 }
 
 export interface ProjectTemplateRole {
@@ -87,12 +102,14 @@ export interface ProjectTemplateAssetSummary {
   excluded_file_count: number;
   skill_count: number;
   mcp_server_count: number;
+  capability_count: number;
 }
 
 export interface ProjectTemplateManifest {
   roles: ProjectTemplateRole[];
   skills: ProjectTemplateCapability[];
   mcp_servers: ProjectTemplateCapability[];
+  capabilities: ProjectTemplateCapability[];
   asset_summary: ProjectTemplateAssetSummary;
 }
 

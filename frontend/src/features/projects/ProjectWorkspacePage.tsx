@@ -4624,19 +4624,17 @@ function MembersPanel({
     () => events.filter(isProjectA2ARecord),
     [events],
   );
-  const departedMembers = members.filter((entry) => entry.is_enabled === false);
-  const member =
-    members.find((entry) =>
-      [
-        text(entry, "id"),
-        text(entry, "member_id"),
-        text(entry, "agent_id"),
-      ]
-        .filter(Boolean)
-        .includes(selectedId),
-    ) ||
-    activeMembers[0] ||
-    departedMembers[0];
+  const member = selectedId
+    ? members.find((entry) =>
+        [
+          text(entry, "id"),
+          text(entry, "member_id"),
+          text(entry, "agent_id"),
+        ]
+          .filter(Boolean)
+          .includes(selectedId),
+      )
+    : undefined;
   const [configDraft, setConfigDraft] = useState<RecordValue>({});
   const [memberModels, setMemberModels] = useState<
     Array<{
@@ -4656,7 +4654,9 @@ function MembersPanel({
   const [agentDrawerMode, setAgentDrawerMode] = useState<
     "create" | "edit" | null
   >(null);
-  const [settingsOpen, setSettingsOpen] = useState(Boolean(selectedId));
+  const [settingsOpen, setSettingsOpen] = useState(
+    Boolean(selectedId && member),
+  );
   const [capabilitySection, setCapabilitySection] = useState<
     "config" | "tools" | "mcp" | "skill"
   >("config");
@@ -4772,7 +4772,7 @@ function MembersPanel({
   }, [memberId]);
 
   useEffect(() => {
-    if (selectedId && memberId) setSettingsOpen(true);
+    setSettingsOpen(Boolean(selectedId && memberId));
   }, [memberId, selectedId]);
 
   useEffect(() => {
@@ -7039,7 +7039,9 @@ function ProjectVisibilitySettings({
             }
             onChange={setExecutionUserId}
             ariaLabel={t("projectWorkspacePage.visibility.executionUser")}
-            disabled={readOnly || visibility !== "shared"}
+            disabled={
+              readOnly || visibility !== "shared" || selectedUsers.length === 0
+            }
             placeholder={t(
               "projectWorkspacePage.visibility.selectExecutionUser",
             )}
@@ -7468,10 +7470,10 @@ function PoliciesPanel({
                   </span>
                   <span>
                     <strong>
-                      {templateManifest.asset_summary.mcp_server_count}
+                      {templateManifest.asset_summary.capability_count}
                     </strong>
                     <small>
-                      {t("projectTemplatePublish.manifest.sharedConnections")}
+                      {t("projectTemplatePublish.manifest.platformDependencies")}
                     </small>
                   </span>
                 </div>
@@ -7482,31 +7484,19 @@ function PoliciesPanel({
                       {templateManifest.roles.length
                         ? templateManifest.roles
                             .map((role) => role.name)
-                            .join("、")
-                        : t("projectTemplatePublish.manifest.none")}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{t("projectTemplatePublish.manifest.capabilities")}</dt>
-                    <dd>
-                      {[
-                        ...templateManifest.skills,
-                        ...templateManifest.mcp_servers,
-                      ].length
-                        ? [
-                            ...templateManifest.skills,
-                            ...templateManifest.mcp_servers,
-                          ]
-                            .map((capability) => capability.name)
-                            .join("、")
+                            .join(
+                              t(
+                                "projectTemplatePublish.manifest.memberSeparator",
+                              ),
+                            )
                         : t("projectTemplatePublish.manifest.none")}
                     </dd>
                   </div>
                 </dl>
-                <section className="project-workspace__template-skill-files">
+                <section className="project-workspace__template-capability-list">
                   <header>
                     <strong>
-                      {t("projectTemplatePublish.manifest.skillFilesTitle")}
+                      {t("projectTemplatePublish.manifest.capabilityListTitle")}
                     </strong>
                     <span>
                       {t("projectTemplatePublish.manifest.selectedCount", {
@@ -7515,71 +7505,158 @@ function PoliciesPanel({
                     </span>
                   </header>
                   <p>
-                    {t("projectTemplatePublish.manifest.skillFilesHint")}
+                    {t("projectTemplatePublish.manifest.capabilityListHint")}
                   </p>
-                  {templateManifest.skills.length ? (
+                  {templateManifest.capabilities.length ? (
                     <div>
-                      {templateManifest.skills.map((skill, index) => {
+                      {templateManifest.capabilities.map((capability, index) => {
+                        const capabilityType = capability.type || "tool";
+                        const isSkill = capabilityType === "skill";
                         const selectionId =
-                          skill.binding_id ||
-                          skill.id ||
-                          `${skill.name}-${index}`;
-                        const checked =
-                          includedTemplateSkillIds.includes(selectionId);
+                          capability.binding_id ||
+                          capability.id ||
+                          `${capabilityType}-${capability.key || capability.name}-${index}`;
+                        const checked = isSkill
+                          ? includedTemplateSkillIds.includes(selectionId)
+                          : capability.selected !== false;
+                        const affectedNames = [
+                          ...(capability.affected_members || []).map(
+                            (affectedMember) => affectedMember.name,
+                          ),
+                          capability.member_name || "",
+                        ].filter(
+                          (name, nameIndex, names) =>
+                            Boolean(name) && names.indexOf(name) === nameIndex,
+                        );
+                        const affectedCount = Math.max(
+                          capability.affected_member_count || 0,
+                          affectedNames.length,
+                        );
+                        const availability = [
+                          "available",
+                          "missing",
+                          "restricted",
+                        ].includes(capability.availability || "")
+                          ? capability.availability
+                          : "available";
                         return (
-                          <label
-                            className="project-workspace__template-skill-row"
+                          <div
+                            className="project-workspace__template-capability-row"
                             key={selectionId}
                           >
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              disabled={publishingTemplate}
-                              onChange={(event) =>
-                                setIncludedTemplateSkillIds((current) =>
-                                  event.target.checked
-                                    ? [...current, selectionId]
-                                    : current.filter(
-                                        (id) => id !== selectionId,
-                                      ),
-                                )
-                              }
-                            />
-                            <span>
-                              <strong>{skill.name}</strong>
-                              <small>
-                                {skill.member_name ||
-                                  skill.owner_agent_name ||
-                                  t(
-                                    "projectTemplatePublish.manifest.projectShared",
+                            <span className="project-workspace__template-capability-selector">
+                              {isSkill ? (
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  disabled={publishingTemplate}
+                                  aria-label={t(
+                                    "projectTemplatePublish.manifest.selectSkill",
+                                    {
+                                      name:
+                                        capability.name ||
+                                        t(
+                                          "projectTemplatePublish.manifest.unnamedCapability",
+                                        ),
+                                    },
                                   )}
-                              </small>
+                                  onChange={(event) =>
+                                    setIncludedTemplateSkillIds((current) =>
+                                      event.target.checked
+                                        ? [...current, selectionId]
+                                        : current.filter(
+                                            (id) => id !== selectionId,
+                                          ),
+                                    )
+                                  }
+                                />
+                              ) : capabilityType === "mcp" ? (
+                                <IconCodeDots size={17} />
+                              ) : (
+                                <IconTool size={17} />
+                              )}
                             </span>
                             <span>
                               <strong>
-                                {t(
-                                  "projectTemplatePublish.manifest.filesAndSize",
-                                  {
-                                    count: skill.file_count || 0,
-                                    size: fileSizeLabel(skill.size_bytes || 0),
-                                  },
-                                )}
+                                {capability.name ||
+                                  t(
+                                    "projectTemplatePublish.manifest.unnamedCapability",
+                                  )}
                               </strong>
                               <small>
                                 {t(
-                                  checked
-                                    ? "projectTemplatePublish.manifest.carriedImpact"
-                                    : "projectTemplatePublish.manifest.notCarriedImpact",
+                                  `projectTemplatePublish.manifest.types.${capabilityType}`,
+                                  {
+                                    defaultValue: capabilityType,
+                                  },
                                 )}
+                                {" · "}
+                                {isSkill
+                                  ? t(
+                                      "projectTemplatePublish.manifest.filesAndSize",
+                                      {
+                                        count: capability.file_count || 0,
+                                        size: fileSizeLabel(
+                                          capability.size_bytes || 0,
+                                        ),
+                                      },
+                                    )
+                                  : t(
+                                      "projectTemplatePublish.manifest.platformDependency",
+                                    )}
                               </small>
                             </span>
-                          </label>
+                            <span>
+                              <ProjectStatusBadge
+                                tone={
+                                  isSkill
+                                    ? checked
+                                      ? "info"
+                                      : "neutral"
+                                    : availability === "available"
+                                      ? "success"
+                                      : availability === "restricted"
+                                        ? "warning"
+                                        : "error"
+                                }
+                              >
+                                {t(
+                                  isSkill
+                                    ? checked
+                                      ? "projectTemplatePublish.manifest.included"
+                                      : "projectTemplatePublish.manifest.notIncluded"
+                                    : `projectTemplatePublish.manifest.availability.${availability}`,
+                                )}
+                              </ProjectStatusBadge>
+                              <small>
+                                {affectedCount
+                                  ? t(
+                                      "projectTemplatePublish.manifest.affectedMembers",
+                                      {
+                                        count: affectedCount,
+                                        names:
+                                          affectedNames.join(
+                                            t(
+                                              "projectTemplatePublish.manifest.memberSeparator",
+                                            ),
+                                          ) ||
+                                          t(
+                                            "projectTemplatePublish.manifest.memberDetailsUnavailable",
+                                          ),
+                                      },
+                                    )
+                                  : t(
+                                      "projectTemplatePublish.manifest.noAffectedMembers",
+                                    )}
+                              </small>
+                            </span>
+                          </div>
                         );
                       })}
                     </div>
                   ) : (
-                    <div className="project-workspace__template-skill-empty">
-                      {t("projectTemplatePublish.manifest.noSkillFiles")}
+                    <div className="project-workspace__template-capability-empty">
+                      {t("projectTemplatePublish.manifest.noCapabilities")}
                     </div>
                   )}
                 </section>

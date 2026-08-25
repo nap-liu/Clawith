@@ -84,6 +84,7 @@ class ProjectAgentTemplateSource:
     role_description: str = ""
     is_leader: bool = False
     is_enabled: bool = True
+    include_assets: bool = True
     runtime: dict | None = None
     member_config: dict | None = None
 
@@ -130,19 +131,24 @@ def export_project_agent_template_assets(
     total_bytes = 0
     exported: list[dict] = []
     for source in sources:
-        layout = project_agent_workspace(project_root, source.agent_id)
-        if not layout.root.is_dir():
-            raise ProjectAgentTemplateAssetError(f"Project Agent assets are missing: {source.name}")
-
         agent_redactions = (*common_redactions, str(source.agent_id))
-        soul = _read_sanitized_text(layout.soul, MAX_SOUL_BYTES, agent_redactions, required=True)
-        core_memory = _read_sanitized_text(
-            layout.memory,
-            MAX_CORE_MEMORY_BYTES,
-            agent_redactions,
-            required=True,
-        )
-        workspace_files, workspace_bytes = _export_workspace_files(layout.workspace, agent_redactions)
+        if source.include_assets:
+            layout = project_agent_workspace(project_root, source.agent_id)
+            if not layout.root.is_dir():
+                raise ProjectAgentTemplateAssetError(f"Project Agent assets are missing: {source.name}")
+            soul = _read_sanitized_text(layout.soul, MAX_SOUL_BYTES, agent_redactions, required=True)
+            core_memory = _read_sanitized_text(
+                layout.memory,
+                MAX_CORE_MEMORY_BYTES,
+                agent_redactions,
+                required=True,
+            )
+            workspace_files, workspace_bytes = _export_workspace_files(layout.workspace, agent_redactions)
+        else:
+            soul = ""
+            core_memory = ""
+            workspace_files = []
+            workspace_bytes = 0
         total_bytes += len(soul.encode("utf-8")) + len(core_memory.encode("utf-8")) + workspace_bytes
         _enforce_template_total(total_bytes)
         item = {

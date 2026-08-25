@@ -388,6 +388,16 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     assert saved.status_code == 200, saved.text
     assert saved.json()["policies"] == {"approval": "all_writes", "max_parallel_runs": 2}
     assert saved.json()["runtime"]["monthly_budget"] == 450
+    rejected_mixed_settings = await env.client.patch(
+        f"/api/projects/{project_id}/settings",
+        json={
+            "runtime": {"mode": "must-not-save", "monthly_budget": 999},
+            "git": {"repository_mode": "external"},
+        },
+    )
+    assert rejected_mixed_settings.status_code == 422
+    settings_after_rejection = (await env.client.get(f"/api/projects/{project_id}/settings")).json()
+    assert settings_after_rejection["runtime"] == saved.json()["runtime"]
 
     shared = await env.client.patch(
         f"/api/projects/{project_id}",
@@ -407,6 +417,12 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     visible = await env.client.get(f"/api/projects/{project_id}")
     assert visible.status_code == 200
     assert visible.json()["access_role"] == "view"
+    assert (await env.client.get(f"/api/projects/{project_id}/settings")).status_code == 200
+    viewer_settings_write = await env.client.patch(
+        f"/api/projects/{project_id}/settings",
+        json={"runtime": {"mode": "viewer-must-not-save"}},
+    )
+    assert viewer_settings_write.status_code == 404
     cannot_edit = await env.client.patch(f"/api/projects/{project_id}", json={"name": "Not allowed"})
     assert cannot_edit.status_code == 404
 
@@ -428,6 +444,11 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
         json={"description": "Editors may update ordinary project fields"},
     )
     assert normal_editor_update.status_code == 200
+    editor_settings_update = await env.client.patch(
+        f"/api/projects/{project_id}/settings",
+        json={"current_signal": "Editor-visible delivery signal"},
+    )
+    assert editor_settings_update.status_code == 200
     editor_cannot_unshare = await env.client.patch(
         f"/api/projects/{project_id}",
         json={"visibility": "private"},
@@ -472,6 +493,10 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
         .all()
     )
     assert remaining_grants == []
+    env.authenticate_as(env.viewer_id)
+    assert (await env.client.get(f"/api/projects/{project_id}")).status_code == 404
+    assert (await env.client.get(f"/api/projects/{project_id}/settings")).status_code == 404
+    env.authenticate_as(env.owner_id)
 
     events_response = await env.client.get(f"/api/projects/{project_id}/events")
     assert events_response.status_code == 200
@@ -5683,6 +5708,29 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         instructions="Internal protocol instructions must not be product copy.",
     )
     env.db.add(mcp_server)
+    await env.db.flush()
+    source_mcp_tool = Tool(
+        name=f"mcp_release_evidence_{uuid.uuid4().hex[:8]}",
+        display_name="Release evidence query",
+        description="Read release evidence from an approved connection.",
+        type="mcp",
+        category="engineering",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="admin",
+        tenant_id=env.tenant_id,
+        mcp_server_id=mcp_server.id,
+    )
+    env.db.add(source_mcp_tool)
+    await env.db.flush()
+    source_mcp_assignment = AgentTool(
+        agent_id=env.worker_id,
+        tool_id=source_mcp_tool.id,
+        enabled=True,
+        config={"token": "must-not-cross-project-boundary"},
+        source="user_installed",
+    )
+    env.db.add(source_mcp_assignment)
     await env.db.commit()
 
     bootstrap_response = await env.client.get("/api/projects/bootstrap-options")
@@ -5720,6 +5768,28 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     project_agent = created_response.json()
     project_agent_id = uuid.UUID(project_agent["id"])
 
+    explicit_tool_binding = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "tool",
+            "capability_id": str(source_tool_id),
+            "capability_name": source_tool.display_name,
+            "source": "inherited",
+            "inherited_from_agent_id": str(project_agent_id),
+        },
+    )
+    explicit_mcp_binding = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "mcp",
+            "capability_id": str(mcp_server.id),
+            "capability_name": mcp_server.display_name,
+            "source": "inherited",
+            "inherited_from_agent_id": str(project_agent_id),
+        },
+    )
+    assert explicit_tool_binding.status_code == explicit_mcp_binding.status_code == 201
+
     capabilities_response = await env.client.get(f"/api/projects/{source_project_id}/capabilities")
     assert capabilities_response.status_code == 200, capabilities_response.text
     skill_binding = next(
@@ -5731,6 +5801,11 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         item
         for item in capabilities_response.json()
         if item["capability_type"] == "tool" and item["inherited_from_agent_id"] == str(project_agent_id)
+    )
+    mcp_binding = next(
+        item
+        for item in capabilities_response.json()
+        if item["capability_type"] == "mcp" and item["inherited_from_agent_id"] == str(project_agent_id)
     )
     assert tool_binding["capability_id"] == str(source_tool_id)
     assert tool_binding["key"] == source_tool.name
@@ -5747,6 +5822,55 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     ).scalar_one()
     assert copied_assignment.enabled is True
     assert copied_assignment.config == {}
+    copied_mcp_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == project_agent_id,
+                AgentTool.tool_id == source_mcp_tool.id,
+            )
+        )
+    ).scalar_one()
+    assert copied_mcp_assignment.enabled is True
+    assert copied_mcp_assignment.config == {}
+    disabled_tool_binding = await env.client.patch(
+        f"/api/projects/{source_project_id}/capabilities/{tool_binding['id']}",
+        json={"is_enabled": False},
+    )
+    disabled_mcp_binding = await env.client.patch(
+        f"/api/projects/{source_project_id}/capabilities/{mcp_binding['id']}",
+        json={"is_enabled": False},
+    )
+    assert disabled_tool_binding.status_code == disabled_mcp_binding.status_code == 200
+    await env.db.refresh(copied_assignment)
+    await env.db.refresh(copied_mcp_assignment)
+    await env.db.refresh(source_mcp_assignment)
+    assert copied_assignment.enabled is False
+    assert copied_mcp_assignment.enabled is False
+    assert source_mcp_assignment.enabled is True
+    source_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == env.worker_id,
+                AgentTool.tool_id == source_tool_id,
+            )
+        )
+    ).scalar_one()
+    assert source_assignment.enabled is True
+    assert source_tool.enabled is True
+    assert source_mcp_tool.enabled is True
+    assert await env.db.get(MCPServer, mcp_server.id) is not None
+    assert (
+        await env.client.patch(
+            f"/api/projects/{source_project_id}/capabilities/{tool_binding['id']}",
+            json={"is_enabled": True},
+        )
+    ).status_code == 200
+    assert (
+        await env.client.patch(
+            f"/api/projects/{source_project_id}/capabilities/{mcp_binding['id']}",
+            json={"is_enabled": True},
+        )
+    ).status_code == 200
     source_tool_row = await env.db.get(Tool, source_tool_id)
     assert source_tool_row is not None
     source_tool_row.enabled = False
@@ -5904,7 +6028,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         if item["type"] == "tool" and item["key"] == source_tool.name
     )
     assert manifest_tool["selected"] is True
-    assert manifest_tool["affected_member_count"] == 1
+    assert manifest_tool["affected_member_count"] == 2
     assert {
         key: manifest_skill[key]
         for key in (
@@ -5997,7 +6121,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     assert selected_template is not None
     packaged_skill = selected_template.definition["skill_assets"][0]
     assert packaged_skill["sha256"] == metadata["sha256"]
-    assert packaged_skill["digital_employee_index"] == 0
+    assert packaged_skill["digital_employee_index"] == 3
     assert skill_binding["id"] not in str(packaged_skill)
     assert str(env.worker_id) not in str(packaged_skill)
     assert "capability_id" not in packaged_skill
@@ -6017,8 +6141,10 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     restored_project_id = uuid.UUID(restored["id"])
     assert restored["template_setup_summary"]["restored_skill_count"] == 1
     restored_agents = (await env.client.get(f"/api/projects/{restored_project_id}/agents")).json()
-    assert len(restored_agents) == 1
-    restored_agent_id = uuid.UUID(restored_agents[0]["id"])
+    assert len(restored_agents) == 4
+    restored_agent_id = uuid.UUID(
+        next(item for item in restored_agents if item["name"] == "Project release owner")["id"]
+    )
     assert restored_agent_id != project_agent_id
     restored_binding = (
         await env.db.execute(
@@ -6032,14 +6158,19 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     assert restored_binding.inherited_from_agent_id == restored_agent_id
     assert restored_binding.config["skill_asset"]["source"] == "template"
     assert restored_binding.config["skill_asset"]["source_agent_id"] is None
-    restored_tool_binding = (
-        await env.db.execute(
-            select(ProjectCapabilityBinding).where(
-                ProjectCapabilityBinding.project_id == restored_project_id,
-                ProjectCapabilityBinding.capability_type == "tool",
+    restored_tool_bindings = list(
+        (
+            await env.db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == restored_project_id,
+                    ProjectCapabilityBinding.capability_type == "tool",
+                )
             )
-        )
-    ).scalar_one()
+        ).scalars()
+    )
+    restored_tool_binding = next(
+        item for item in restored_tool_bindings if item.inherited_from_agent_id == restored_agent_id
+    )
     assert restored_tool_binding.inherited_from_agent_id == restored_agent_id
     restored_assignment = (
         await env.db.execute(
@@ -6127,6 +6258,16 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     assert disabled_response.json()["is_enabled"] is False
     assert disabled_response.json()["availability"] == "available"
     assert not second_library_root.exists()
+    source_library_after_disable = await env.db.get(Skill, library_skill_id)
+    assert source_library_after_disable is not None
+    assert source_library_after_disable.status == "published"
+    assert len(
+        list(
+            (
+                await env.db.execute(select(SkillFile).where(SkillFile.skill_id == library_skill_id))
+            ).scalars()
+        )
+    ) == 2
     enabled_response = await env.client.patch(
         f"/api/projects/{source_project_id}/capabilities/{second_library_binding['id']}",
         json={"is_enabled": True},
@@ -6302,20 +6443,18 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
     assert template_response.status_code == 201, template_response.text
     template = template_response.json()
     assert "agents" not in template["definition"]
-    assert template["definition"]["roles"] == [
-        {
-            "key": "digital-employee-1",
-            "name": "Project release specialist",
-            "description": "Own release readiness inside this project",
-        }
-    ]
-    assert template["definition"]["asset_summary"]["digital_employee_count"] == 1
+    assert len(template["definition"]["roles"]) == 4
+    release_role = next(
+        item for item in template["definition"]["roles"] if item["name"] == "Project release specialist"
+    )
+    assert release_role["description"] == "Own release readiness inside this project"
+    assert template["definition"]["asset_summary"]["digital_employee_count"] == 4
 
     stored_template = await env.db.get(ProjectTemplate, uuid.UUID(template["id"]))
     assert stored_template is not None
     exported_agents = stored_template.definition["agents"]
-    assert len(exported_agents) == 1
-    exported_agent = exported_agents[0]
+    assert len(exported_agents) == 4
+    exported_agent = next(item for item in exported_agents if item["name"] == "Project release specialist")
     assert {
         key: exported_agent[key]
         for key in (
@@ -6357,7 +6496,7 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
     assert target["success_criteria"] == source["success_criteria"]
     assert target["template_setup_summary"] == {
         "restored_file_count": len(stored_template.definition["project_snapshot"]["files"]),
-        "restored_digital_employee_count": 1,
+        "restored_digital_employee_count": 4,
         "restored_skill_count": 0,
         "restored_connection_count": 0,
         "restored_tool_count": 0,
@@ -6366,13 +6505,13 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
     target_agents_response = await env.client.get(f"/api/projects/{target_project_id}/agents")
     assert target_agents_response.status_code == 200, target_agents_response.text
     target_agents = target_agents_response.json()
-    assert len(target_agents) == 1
-    target_agent = target_agents[0]
+    assert len(target_agents) == 4
+    target_agent = next(item for item in target_agents if item["name"] == source_agent["name"])
     assert target_agent["id"] != source_agent["id"]
     assert target_agent["name"] == source_agent["name"]
     assert target_agent["soul"] == source_agent["soul"]
     assert target_agent["core_memory"] == source_agent["core_memory"]
-    assert target_agent["is_leader"] is True
+    assert target_agent["is_leader"] is False
 
     member = (
         await env.db.execute(
@@ -6383,7 +6522,7 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
         )
     ).scalar_one()
     assert member.is_enabled is True
-    assert member.is_leader is True
+    assert member.is_leader is False
 
     sessions = (
         (await env.db.execute(select(ChatSession).where(ChatSession.project_id == target_project_id))).scalars().all()
@@ -6392,7 +6531,178 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
         ("project", True),
         ("web", False),
     }
-    assert {session.agent_id for session in sessions} == {uuid.UUID(target_agent["id"])}
+    target_leader = next(item for item in target_agents if item["is_leader"])
+    assert {session.agent_id for session in sessions} == {uuid.UUID(target_leader["id"])}
+
+
+async def test_template_manifest_and_restore_include_legacy_members_effective_platform_dependencies(
+    project_api: ProjectApiEnv,
+):
+    from app.models.mcp_server import MCPServer
+    from app.models.project import ProjectCapabilityBinding, ProjectTemplate
+    from app.models.tool import AgentTool
+
+    env = project_api
+    for agent in (env.leader, env.worker, env.reviewer):
+        agent.autonomy_policy = {"write": "L2"}
+    common_tool = Tool(
+        name=f"template-common-{uuid.uuid4().hex[:8]}",
+        display_name="Shared delivery checklist",
+        description="Review the delivery checklist assigned to a project member.",
+        type="builtin",
+        category="project",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="builtin",
+    )
+    server = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"template-evidence-{uuid.uuid4().hex[:8]}",
+        display_name="Evidence catalog",
+        base_url_template="https://evidence.example.test/mcp",
+    )
+    env.db.add_all([common_tool, server])
+    await env.db.flush()
+    mcp_tool = Tool(
+        name=f"template-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Read evidence catalog",
+        description="Read evidence available to the organization.",
+        type="mcp",
+        category="project",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="admin",
+        tenant_id=env.tenant_id,
+        mcp_server_id=server.id,
+        mcp_server_name=server.display_name,
+    )
+    env.db.add(mcp_tool)
+    await env.db.flush()
+    env.db.add_all(
+        [
+            AgentTool(
+                agent_id=agent_id,
+                tool_id=common_tool.id,
+                enabled=True,
+                source="user_installed",
+                config={"access_token": "must-not-enter-template"},
+            )
+            for agent_id in (env.leader_id, env.worker_id, env.reviewer_id)
+        ]
+        + [
+            AgentTool(
+                agent_id=env.leader_id,
+                tool_id=mcp_tool.id,
+                enabled=True,
+                source="user_installed",
+                config={"credential": "must-not-enter-template"},
+            )
+        ]
+    )
+    await env.db.commit()
+
+    source_response = await env.client.post(
+        "/api/projects",
+        json={
+            "name": "Legacy member template source",
+            "goal": "Preserve the actual member setup",
+            "members": [
+                {"agent_id": str(env.leader_id), "is_leader": True},
+                {"agent_id": str(env.worker_id)},
+                {"agent_id": str(env.reviewer_id)},
+            ],
+            "capabilities": [],
+        },
+    )
+    assert source_response.status_code == 201, source_response.text
+    source_project_id = source_response.json()["id"]
+    members_response = await env.client.get(f"/api/projects/{source_project_id}/members")
+    assert members_response.status_code == 200, members_response.text
+    reviewer_member = next(
+        item for item in members_response.json() if item["agent_id"] == str(env.reviewer_id)
+    )
+    disable_response = await env.client.put(
+        f"/api/projects/{source_project_id}/members/{reviewer_member['id']}/tools",
+        json=[{"tool_id": str(common_tool.id), "enabled": False}],
+    )
+    assert disable_response.status_code == 200, disable_response.text
+    disabled_common = next(item for item in disable_response.json() if item["id"] == str(common_tool.id))
+    assert disabled_common["enabled"] is False
+
+    manifest_response = await env.client.get(f"/api/projects/{source_project_id}/template-manifest")
+    assert manifest_response.status_code == 200, manifest_response.text
+    manifest = manifest_response.json()
+    assert manifest["asset_summary"]["digital_employee_count"] == 3
+    assert len(manifest["roles"]) == 3
+    assert manifest["asset_summary"]["capability_count"] == 2
+    common_manifest = next(
+        item for item in manifest["capabilities"] if item["capability_id"] == str(common_tool.id)
+    )
+    assert common_manifest["key"] == common_tool.name
+    assert common_manifest["description"] == common_tool.description
+    assert common_manifest["availability"] == "available"
+    assert common_manifest["affected_member_count"] == 2
+    assert {item["agent_id"] for item in common_manifest["affected_members"]} == {
+        str(env.leader_id),
+        str(env.worker_id),
+    }
+    mcp_manifest = next(
+        item for item in manifest["capabilities"] if item["capability_id"] == str(server.id)
+    )
+    assert mcp_manifest["key"] == server.name
+    assert mcp_manifest["affected_member_count"] == 1
+    assert mcp_manifest["affected_members"][0]["agent_id"] == str(env.leader_id)
+    assert "must-not-enter-template" not in json.dumps(manifest)
+
+    template_response = await env.client.post(
+        f"/api/projects/{source_project_id}/templates",
+        json={"name": "Legacy member setup", "version": "1.0.0"},
+    )
+    assert template_response.status_code == 201, template_response.text
+    stored_template = await env.db.get(ProjectTemplate, uuid.UUID(template_response.json()["id"]))
+    assert stored_template is not None
+    assert len(stored_template.definition["agents"]) == 3
+    assert len(stored_template.definition["capabilities"]) == 3
+    assert "must-not-enter-template" not in json.dumps(stored_template.definition)
+
+    restored_response = await env.client.post(
+        "/api/projects/from-template",
+        json={
+            "template_id": str(stored_template.id),
+            "name": "Legacy member template target",
+            "visibility": "private",
+        },
+    )
+    assert restored_response.status_code == 201, restored_response.text
+    restored = restored_response.json()
+    assert restored["template_setup_summary"]["restored_digital_employee_count"] == 3
+    assert restored["template_setup_summary"]["restored_tool_count"] == 2
+    assert restored["template_setup_summary"]["restored_connection_count"] == 1
+    target_project_id = uuid.UUID(restored["id"])
+    target_agents = (await env.client.get(f"/api/projects/{target_project_id}/agents")).json()
+    assert len(target_agents) == 3
+    assert {item["name"] for item in target_agents} == {"Leader", "Worker", "Reviewer"}
+    target_agent_ids = {uuid.UUID(item["id"]) for item in target_agents}
+    restored_bindings = list(
+        (
+            await env.db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == target_project_id,
+                )
+            )
+        ).scalars()
+    )
+    assert len(restored_bindings) == 3
+    restored_assignments = list(
+        (
+            await env.db.execute(select(AgentTool).where(AgentTool.agent_id.in_(target_agent_ids)))
+        ).scalars()
+    )
+    restored_dependency_assignments = [
+        item for item in restored_assignments if item.tool_id in {common_tool.id, mcp_tool.id}
+    ]
+    assert len(restored_dependency_assignments) == 3
+    assert all(item.enabled and item.config in ({}, None) for item in restored_dependency_assignments)
 
 
 @pytest.mark.parametrize("invalid_agents", [None, {}, "not-a-list"])

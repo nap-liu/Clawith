@@ -683,6 +683,13 @@ async def test_standard_agent_project_tool_group_reports_disabled_partial_enable
             }
             assert {tool["name"] for tool in group} == set(USER_PROJECT_TOOL_NAMES)
             assert all(tool["capability_group"] == expected for tool in group)
+            llm_project_tools = {
+                item["function"]["name"]
+                for item in await get_agent_tools_for_llm(agent_id)
+                if item["function"]["name"] in USER_PROJECT_TOOL_NAMES
+            }
+            assert len(llm_project_tools) == enabled_count
+            assert llm_project_tools <= set(USER_PROJECT_TOOL_NAMES)
 
         await assert_group_contract("disabled", 0)
 
@@ -715,18 +722,6 @@ async def test_standard_agent_project_tool_group_reports_disabled_partial_enable
             )
         }
         assert persisted_descriptions == expected_descriptions
-        assert persisted_descriptions["user_project_run_start"] == (
-            "Start work in a running project using either a work item or a clear instruction. An active project "
-            "member must be assigned to perform the work."
-        )
-        assert persisted_descriptions["user_project_status_update"] == (
-            "Pause or resume project work. The project must already be running or paused. Requires project owner "
-            "permission."
-        )
-        assert persisted_descriptions["user_project_git_diff"] == (
-            "Read file change statistics for one saved version, or detailed text changes for one file. Requires "
-            "access to the project."
-        )
 
     llm_tools = await get_agent_tools_for_llm(agent_id)
     llm_descriptions = {

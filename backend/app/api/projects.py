@@ -1128,16 +1128,26 @@ async def get_project_template_manifest(
                 "affected_member_count": impact["affected_member_count"],
             }
         )
-    members = list(
+    member_rows = list(
         (
             await db.execute(
-                select(ProjectMemberSnapshot).where(
+                select(ProjectMemberSnapshot, Agent)
+                .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
+                .where(
                     ProjectMemberSnapshot.project_id == project.id,
                     ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    Agent.tenant_id == project.tenant_id,
+                    Agent.is_deleted.is_(False),
+                )
+                .order_by(
+                    ProjectMemberSnapshot.is_leader.desc(),
+                    ProjectMemberSnapshot.created_at,
+                    ProjectMemberSnapshot.id,
                 )
             )
-        ).scalars()
+        ).all()
     )
+    members = [member for member, _agent in member_rows]
     capability_bindings = list(
         (
             await db.execute(
@@ -1149,23 +1159,66 @@ async def get_project_template_manifest(
             )
         ).scalars()
     )
-    result["capabilities"] = []
+    binding_ids: dict[tuple[str, uuid.UUID], list[str]] = {}
     for binding in capability_bindings:
-        affected = [
-            member
-            for member in members
-            if binding.source == "shared" or member.agent_id == binding.inherited_from_agent_id
-        ]
-        observed = await serialize_project_capability(db, project, binding)
+        if binding.capability_id is not None:
+            binding_ids.setdefault((binding.capability_type, binding.capability_id), []).append(str(binding.id))
+
+    grouped_capabilities: dict[tuple[str, uuid.UUID], dict] = {}
+    for item in definition.get("capabilities", []):
+        if not isinstance(item, dict) or item.get("capability_type") not in {"tool", "mcp"}:
+            continue
+        try:
+            capability_id = uuid.UUID(str(item.get("capability_id")))
+        except ValueError:
+            continue
+        key = (str(item["capability_type"]), capability_id)
+        grouped = grouped_capabilities.setdefault(
+            key,
+            {
+                "name": str(item.get("capability_name") or ""),
+                "is_enabled": False,
+                "member_indexes": set(),
+            },
+        )
+        grouped["is_enabled"] = grouped["is_enabled"] or bool(item.get("is_enabled", True))
+        if item.get("source") == "shared":
+            grouped["member_indexes"].update(range(len(members)))
+        else:
+            index = item.get("digital_employee_index")
+            if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(members):
+                grouped["member_indexes"].add(index)
+
+    result["capabilities"] = []
+    for (capability_type, capability_id), grouped in sorted(
+        grouped_capabilities.items(), key=lambda item: (item[0][0], item[1]["name"], str(item[0][1]))
+    ):
+        synthetic = ProjectCapabilityBinding(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            capability_type=capability_type,
+            capability_id=capability_id,
+            capability_name=grouped["name"],
+            source="shared",
+            is_enabled=grouped["is_enabled"],
+            scope={},
+            config={},
+        )
+        observed = await serialize_project_capability(db, project, synthetic)
+        affected = [members[index] for index in sorted(grouped["member_indexes"])]
+        persisted_binding_ids = binding_ids.get((capability_type, capability_id), [])
         result["capabilities"].append(
             {
-                "binding_id": str(binding.id),
-                "type": binding.capability_type,
+                "binding_id": persisted_binding_ids[0] if persisted_binding_ids else None,
+                "binding_ids": persisted_binding_ids,
+                "capability_id": str(capability_id),
+                "type": capability_type,
                 "key": observed.get("key"),
-                "name": binding.capability_name,
+                "name": grouped["name"],
+                "description": observed["description"],
                 "selected": True,
                 "selection_state": "selected",
-                "is_enabled": binding.is_enabled,
+                "is_enabled": grouped["is_enabled"],
                 "availability": observed["availability"],
                 "affected_members": [
                     {

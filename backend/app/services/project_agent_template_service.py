@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from app.models.participant import Participant
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 from app.models.skill import Skill
 from app.models.tenant import Tenant
-from app.models.tool import Tool
+from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.project import ProjectCapabilityCreate, ProjectMemberCreate
 from app.services.project_agent_template_assets import (
@@ -33,10 +34,41 @@ from app.services.project_git_service import (
 )
 from app.services.project_service import add_capability, add_event, add_member
 from app.services.project_template_snapshot import ProjectTemplateSnapshotError, sanitize_template_scope
+from app.services.tool_enablement import resolved_agent_tool_enabled, tool_is_required
 
 
 def _project_root(project: Project) -> Path:
     return project_repo_path(project.tenant_id, project.id)
+
+
+async def _template_member_rows(
+    db: AsyncSession,
+    project: Project,
+) -> list[tuple[Agent, ProjectMemberSnapshot]]:
+    """Return every durable member in the ordering used by template indexes."""
+
+    return list(
+        (
+            await db.execute(
+                select(Agent, ProjectMemberSnapshot)
+                .join(
+                    ProjectMemberSnapshot,
+                    (ProjectMemberSnapshot.project_id == project.id)
+                    & (ProjectMemberSnapshot.agent_id == Agent.id),
+                )
+                .where(
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    Agent.tenant_id == project.tenant_id,
+                    Agent.is_deleted.is_(False),
+                )
+                .order_by(
+                    ProjectMemberSnapshot.is_leader.desc(),
+                    ProjectMemberSnapshot.created_at,
+                    ProjectMemberSnapshot.id,
+                )
+            )
+        ).all()
+    )
 
 
 async def export_project_agents_for_template(
@@ -47,41 +79,38 @@ async def export_project_agents_for_template(
 ) -> list[dict]:
     """Return sanitized project-owned Agent assets for ``definition.agents``."""
 
-    rows = (
-        await db.execute(
-            select(Agent, ProjectMemberSnapshot)
-            .join(
-                ProjectMemberSnapshot,
-                (ProjectMemberSnapshot.project_id == project.id) & (ProjectMemberSnapshot.agent_id == Agent.id),
-            )
-            .where(
-                Agent.scope == "project",
-                Agent.project_id == project.id,
-                Agent.tenant_id == project.tenant_id,
-                Agent.is_deleted.is_(False),
-            )
-            .order_by(ProjectMemberSnapshot.is_leader.desc(), Agent.created_at)
-        )
-    ).all()
+    rows = await _template_member_rows(db, project)
     sources = [
         ProjectAgentTemplateSource(
             agent_id=agent.id,
-            name=agent.name,
-            role_description=agent.role_description or "",
+            name=member.name_snapshot,
+            role_description=member.role_snapshot or "",
             is_leader=member.is_leader and member.is_enabled,
             is_enabled=member.is_enabled,
+            include_assets=agent.scope == "project" and agent.project_id == project.id,
             runtime={
                 "primary_model_id": str(agent.primary_model_id) if agent.primary_model_id else None,
                 "fallback_model_id": str(agent.fallback_model_id) if agent.fallback_model_id else None,
-                "autonomy_policy": dict(agent.autonomy_policy or {}),
+                "autonomy_policy": {
+                    key: level
+                    for key, level in dict(agent.autonomy_policy or {}).items()
+                    if isinstance(key, str)
+                    and re.fullmatch(r"[a-z][a-z0-9_-]{0,99}", key)
+                    and level in {"L1", "L2", "L3"}
+                },
                 "context_window_size": agent.context_window_size or 100,
                 "max_tool_rounds": agent.max_tool_rounds or 50,
                 "max_tokens_per_day": agent.max_tokens_per_day,
                 "max_tokens_per_month": agent.max_tokens_per_month,
             },
             member_config={
-                key: dict(member.config_snapshot or {}).get(key, [] if key.endswith("_tools") else "")
-                for key in ("project_instruction", "enabled_project_tools", "disabled_project_tools")
+                "project_instruction": str(dict(member.config_snapshot or {}).get("project_instruction") or ""),
+                "enabled_project_tools": list(
+                    dict(member.config_snapshot or {}).get("enabled_project_tools") or []
+                ),
+                "disabled_project_tools": list(
+                    dict(member.config_snapshot or {}).get("disabled_project_tools") or []
+                ),
             },
         )
         for agent, member in rows
@@ -203,24 +232,8 @@ async def instantiate_project_agents_from_template(
 async def export_project_capabilities_for_template(db: AsyncSession, project: Project) -> list[dict]:
     """Export neutral Tool/MCP dependencies; Skill files use their own package."""
 
-    agent_ids = list(
-        (
-            await db.execute(
-                select(Agent.id)
-                .join(
-                    ProjectMemberSnapshot,
-                    (ProjectMemberSnapshot.project_id == project.id) & (ProjectMemberSnapshot.agent_id == Agent.id),
-                )
-                .where(
-                    Agent.scope == "project",
-                    Agent.project_id == project.id,
-                    Agent.tenant_id == project.tenant_id,
-                    Agent.is_deleted.is_(False),
-                )
-                .order_by(ProjectMemberSnapshot.is_leader.desc(), Agent.created_at)
-            )
-        ).scalars()
-    )
+    member_rows = await _template_member_rows(db, project)
+    agent_ids = [agent.id for agent, _member in member_rows]
     agent_index = {agent_id: index for index, agent_id in enumerate(agent_ids)}
     bindings = list(
         (
@@ -240,7 +253,7 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
             continue
         if binding.capability_type == "mcp":
             server = await db.get(MCPServer, binding.capability_id)
-            if server is None or server.tenant_id is not None:
+            if server is None or server.tenant_id not in {None, project.tenant_id}:
                 continue
         elif binding.capability_type == "tool":
             tool = await db.get(Tool, binding.capability_id)
@@ -263,6 +276,105 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
                 "scope": sanitize_template_scope(binding.scope or {}),
             }
         )
+
+    # Legacy projects can reference standard Agents directly. Their effective
+    # Tool/MCP state lives on AgentTool plus the project member overrides, not
+    # on ProjectCapabilityBinding. Preserve those platform dependency IDs only;
+    # per-Agent configuration is intentionally never exported.
+    assignments = list(
+        (
+            await db.execute(
+                select(AgentTool, Tool)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id.in_(agent_ids),
+                    Tool.enabled.is_(True),
+                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                )
+            )
+        ).all()
+    ) if agent_ids else []
+    assignments_by_agent: dict[uuid.UUID, list[tuple[AgentTool, Tool]]] = {}
+    for assignment, tool in assignments:
+        assignments_by_agent.setdefault(assignment.agent_id, []).append((assignment, tool))
+
+    effective: dict[tuple[str, uuid.UUID, str], set[int]] = {}
+    for index, (agent, member) in enumerate(member_rows):
+        config = dict(member.config_snapshot or {})
+        enabled_overrides = {str(name) for name in config.get("enabled_platform_tools", [])}
+        disabled_overrides = {str(name) for name in config.get("disabled_platform_tools", [])}
+        is_project_agent = agent.scope == "project" and agent.project_id == project.id
+        for assignment, tool in assignments_by_agent.get(agent.id, []):
+            enabled = resolved_agent_tool_enabled(tool.name, assignment)
+            if not is_project_agent:
+                enabled = (
+                    tool_is_required(tool.name)
+                    or tool.name in enabled_overrides
+                    or (enabled and tool.name not in disabled_overrides)
+                )
+            if not enabled:
+                continue
+            if tool.type == "mcp":
+                if tool.mcp_server_id is None:
+                    continue
+                server = await db.get(MCPServer, tool.mcp_server_id)
+                if server is None or server.tenant_id not in {None, project.tenant_id}:
+                    continue
+                dependency = ("mcp", server.id, server.display_name or server.name)
+            else:
+                dependency = ("tool", tool.id, tool.display_name or tool.name)
+            effective.setdefault(dependency, set()).add(index)
+
+    explicit_shared = {
+        (item["capability_type"], uuid.UUID(item["capability_id"]))
+        for item in exported
+        if item["source"] == "shared"
+    }
+    explicit_inherited = {
+        (item["capability_type"], uuid.UUID(item["capability_id"]), item["digital_employee_index"])
+        for item in exported
+        if item["source"] == "inherited"
+    }
+    all_indexes = set(range(len(member_rows)))
+    for (capability_type, capability_id, capability_name), indexes in sorted(
+        effective.items(), key=lambda item: (item[0][0], item[0][2], str(item[0][1]))
+    ):
+        if (capability_type, capability_id) in explicit_shared:
+            continue
+        missing_indexes = {
+            index
+            for index in indexes
+            if (capability_type, capability_id, index) not in explicit_inherited
+        }
+        if not missing_indexes:
+            continue
+        if indexes == all_indexes and missing_indexes == all_indexes:
+            exported.append(
+                {
+                    "schema_version": 1,
+                    "capability_type": capability_type,
+                    "capability_id": str(capability_id),
+                    "capability_name": capability_name,
+                    "source": "shared",
+                    "digital_employee_index": None,
+                    "is_enabled": True,
+                    "scope": {},
+                }
+            )
+            continue
+        for index in sorted(missing_indexes):
+            exported.append(
+                {
+                    "schema_version": 1,
+                    "capability_type": capability_type,
+                    "capability_id": str(capability_id),
+                    "capability_name": capability_name,
+                    "source": "inherited",
+                    "digital_employee_index": index,
+                    "is_enabled": True,
+                    "scope": {},
+                }
+            )
     return exported
 
 
@@ -300,8 +412,8 @@ async def instantiate_project_capabilities_from_template(
             raise ProjectTemplateSnapshotError("Project template capability identifier is invalid") from exc
         if capability_type == "mcp":
             server = await db.get(MCPServer, capability_id)
-            if server is None or server.tenant_id is not None:
-                raise ProjectTemplateSnapshotError("Private MCP servers cannot be restored from a project template")
+            if server is None or server.tenant_id not in {None, project.tenant_id}:
+                raise ProjectTemplateSnapshotError("Project template MCP server is unavailable")
         elif capability_type == "skill":
             skill = await db.get(Skill, capability_id)
             if skill is None or skill.tenant_id not in {None, project.tenant_id}:
