@@ -1,4 +1,4 @@
-# Clawith Helm 部署快速开始指南
+# 数字员工平台 Helm 部署快速开始指南
 
 ## 📋 目录结构
 
@@ -28,7 +28,7 @@ helm/
 - ❌ **不支持 OpenClaw Agent 托管模式**
 - 如需使用 OpenClaw Agent 托管，请采用 Docker Compose 或其他部署方式
 
-Native Agent 是 Clawith 内置的代理模式，适用于 Kubernetes 环境。OpenClaw Agent 托管模式目前仅在 Docker Compose 环境中支持。
+Native Agent 是平台内置的代理模式，适用于 Kubernetes 环境。OpenClaw Agent 托管模式目前仅在 Docker Compose 环境中支持。
 
 ## 🚀 快速开始
 

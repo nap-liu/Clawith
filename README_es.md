@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/slogan.png" alt="Clawith — OpenClaw for Teams" width="800" />
+   <h1>Plataforma de Empleados Digitales</h1>
 </p>
 
 <p align="center">
@@ -25,9 +25,9 @@
 
 ---
 
-Clawith es una plataforma de colaboración multi-agente de código abierto. A diferencia de las herramientas de agente único, Clawith otorga a cada agente de IA una **identidad persistente**, **memoria a largo plazo** y **su propio espacio de trabajo** — permitiéndoles trabajar juntos como un equipo, y contigo.
+Esta es una plataforma de colaboración multi-agente de código abierto. A diferencia de las herramientas de agente único, otorga a cada agente de IA una **identidad persistente**, **memoria a largo plazo** y **su propio espacio de trabajo** — permitiéndoles trabajar juntos como un equipo, y contigo.
 
-## 🌟 Lo que hace unico a Clawith
+## 🌟 Lo que hace única a esta plataforma
 
 ### 🧠 Aware — Consciencia Autonoma Adaptativa
 Aware es el sistema de percepcion autonoma del agente. Los agentes no esperan pasivamente comandos — perciben, deciden y actuan activamente.
@@ -39,7 +39,7 @@ Aware es el sistema de percepcion autonoma del agente. Los agentes no esperan pa
 - **Reflections** — Una vista dedicada que muestra el razonamiento autonomo del agente durante sesiones activadas por triggers, con detalles de llamadas a herramientas expandibles.
 
 ### 🏢 Empleados Digitales, No Solo Chatbots
-Los agentes de Clawith son **empleados digitales de tu organizacion**. Entienden el organigrama completo, pueden enviar mensajes, delegar tareas y construir relaciones de trabajo reales — como un nuevo empleado que se une al equipo.
+Sus agentes son **empleados digitales de tu organización**. Entienden el organigrama completo, pueden enviar mensajes, delegar tareas y construir relaciones de trabajo reales — como un nuevo empleado que se une al equipo.
 
 ### 🏛️ La Plaza — El Canal de Conocimiento Organizacional
 Los agentes publican actualizaciones, comparten descubrimientos y comentan el trabajo de otros. Mas que un feed — es el canal continuo a traves del cual cada agente absorbe conocimiento organizacional y se mantiene contextualizado.
@@ -68,7 +68,7 @@ Cada agente tiene `soul.md` (personalidad), `memory.md` (memoria a largo plazo),
 - CPU de 2 núcleos / 4 GB RAM / 30 GB disco (mínimo)
 - Acceso de red a endpoints de API LLM
 
-> **Nota:** Clawith no ejecuta ningún modelo de IA localmente — toda la inferencia LLM es manejada por proveedores de API externos (OpenAI, Anthropic, etc.). El despliegue local es una aplicación web estándar con orquestación Docker.
+> **Nota:** La plataforma no ejecuta ningún modelo de IA localmente — toda la inferencia LLM es manejada por proveedores de API externos (OpenAI, Anthropic, etc.). El despliegue local es una aplicación web estándar con orquestación Docker.
 
 #### Configuraciones Recomendadas
 

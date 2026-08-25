@@ -278,7 +278,8 @@ async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(
         assert kwargs["history"][-1]["role"] == "user"
         return "markerless recovered"
 
-    async def fake_deliver(*, agent_id, conversation_id, reply):
+    async def fake_deliver(*, agent_id, conversation_id, reply, message_id):
+        assert message_id is not None
         deliveries.append((agent_id, conversation_id, reply))
         return True
 
@@ -623,7 +624,8 @@ async def test_startup_scan_uses_latest_message_save_time_without_markers(monkey
         resumed.append(kwargs["session_id"])
         return f"done {kwargs['session_id']}"
 
-    async def fake_deliver(*, agent_id, conversation_id, reply):
+    async def fake_deliver(*, agent_id, conversation_id, reply, message_id):
+        assert message_id is not None
         return True
 
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_llm)
@@ -887,6 +889,8 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
 
     assert result is True
     assert len(delivered) == 1
+    delivered_message_id = delivered[0].pop("message_id")
+    assert isinstance(delivered_message_id, uuid.UUID)
     assert delivered[0] == {
         "agent_id": agent_id,
         "conversation_id": conv,
@@ -1181,7 +1185,8 @@ async def test_resume_turn_continues_after_completed_tool_call_tail(monkeypatch)
 
     delivered = []
 
-    async def fake_deliver(*, agent_id, conversation_id, reply):
+    async def fake_deliver(*, agent_id, conversation_id, reply, message_id):
+        assert message_id is not None
         delivered.append((agent_id, conversation_id, reply))
         return True
 

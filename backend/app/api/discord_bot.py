@@ -197,27 +197,44 @@ def _verify_discord_signature(public_key: str, body: bytes, headers: dict) -> bo
         return False
 
 
-async def _send_discord_followup(application_id: str, bot_token: str, interaction_token: str, text: str) -> None:
+async def _send_discord_followup(
+    application_id: str,
+    bot_token: str,
+    interaction_token: str,
+    text: str,
+    *,
+    on_result=None,
+) -> list[dict]:
     """Send follow-up message(s) to Discord Interactions, chunked at 2000 chars."""
     import httpx
     chunks = [text[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(text), DISCORD_MSG_LIMIT)]
     proxy = os.environ.get("DISCORD_PROXY") or os.environ.get("HTTPS_PROXY") or None
+    results: list[dict] = []
     async with httpx.AsyncClient(timeout=10, proxy=proxy) as client:
         for i, chunk in enumerate(chunks):
             if i == 0:
                 # Edit the original deferred response
-                await client.patch(
+                response = await client.patch(
                     f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}/messages/@original",
                     headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
                     json={"content": chunk},
                 )
             else:
                 # Additional chunks as follow-up messages
-                await client.post(
+                response = await client.post(
                     f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}",
                     headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
                     json={"content": chunk},
                 )
+            response.raise_for_status()
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+            results.append(result)
+            if on_result is not None:
+                await on_result(result)
+    return results
 
 
 @router.post("/channel/discord/{agent_id}/webhook")
@@ -281,7 +298,6 @@ async def discord_interaction_webhook(
         # Defer response immediately (Discord requires response within 3 seconds)
         # We return type 5 (DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE) and reply later
         async def handle_in_background():
-            from app.models.audit import ChatMessage
             from app.models.agent import Agent as AgentModel
             from app.services.channel_llm import _call_agent_llm
             from app.services.channel_session import find_or_create_channel_session
@@ -289,7 +305,7 @@ async def discord_interaction_webhook(
                 ChannelReactions,
                 run_channel_message,
             )
-            from app.services.channel_commands import handle_channel_command
+            from app.services.channel_commands import prepare_channel_command_reply
             from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
             from app.database import async_session
             from datetime import datetime, timezone
@@ -298,13 +314,17 @@ async def discord_interaction_webhook(
             # archive the session and reply via follow-up — no LLM, no lock needed.
             if is_cmd:
                 async with async_session() as _cmd_db:
-                    cmd_result = await handle_channel_command(
+                    cmd_result = await prepare_channel_command_reply(
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id,
+                        external_user_id=sender_id,
                         source_channel="discord",
+                        provider_event_id=str(body.get("id") or ""),
                         is_group=_is_group_discord,
                     )
                     await _cmd_db.commit()
+                if not cmd_result["should_deliver"]:
+                    return
                 # Re-read config for bot credentials
                 async with async_session() as _cfg_db:
                     from sqlalchemy import select as _sel_cmd
@@ -316,10 +336,42 @@ async def discord_interaction_webhook(
                     _bot_token_cmd = _cfg.app_secret if _cfg else ""
                     _app_id_cmd = _cfg.app_id if _cfg else ""
                 if _bot_token_cmd and interaction_token and _app_id_cmd:
+                    from app.services.im_delivery import (
+                        IMDeliveryPart,
+                        PersistedDeliveryRecorder,
+                    )
+                    _cmd_recorder = PersistedDeliveryRecorder(
+                        cmd_result["message_id"],
+                        "discord",
+                    )
+
+                    async def _record_command_part(item: dict) -> None:
+                        await _cmd_recorder.append(IMDeliveryPart(
+                            transport="discord_interaction",
+                            provider_message_id=str(item.get("id") or "") or None,
+                            conversation_ref=channel_id,
+                            artifact_role="command_reply",
+                            recallable=False,
+                        ))
+
                     try:
-                        await _send_discord_followup(_app_id_cmd, _bot_token_cmd, interaction_token, cmd_result["message"])
+                        await _send_discord_followup(
+                            _app_id_cmd,
+                            _bot_token_cmd,
+                            interaction_token,
+                            cmd_result["message"],
+                            on_result=_record_command_part,
+                        )
+                        await _cmd_recorder.sent()
                     except Exception as _cmd_e:
+                        await _cmd_recorder.failed(_cmd_e)
                         logger.error(f"[Discord] Failed to send command reply: {_cmd_e}")
+                else:
+                    from app.services.im_delivery import IMDeliveryResult, register_delivery
+                    await register_delivery(
+                        cmd_result["message_id"],
+                        IMDeliveryResult.failed("discord", "command_route_unavailable"),
+                    )
                 return
 
             async with async_session() as bg_db:
@@ -419,13 +471,12 @@ async def discord_interaction_webhook(
                     bot_token_bg = cfg.app_secret if cfg else ""
                     app_id_bg = cfg.app_id if cfg else ""
 
-                    async def _send_thinking_text(text: str) -> None:
-                        if bot_token_bg and interaction_token and app_id_bg:
-                            await _send_discord_followup(app_id_bg, bot_token_bg, interaction_token, text)
-
-                    _thinking_sender = BufferedIMThinkingSender(
+                    _thinking_sender = BufferedIMThinkingSender.for_runtime(
                         enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                        send_text=_send_thinking_text,
+                        agent_id=agent_id,
+                        user_id=platform_user_id,
+                        conversation_id=session_conv_id,
+                        turn_anchor_id=ingested.message.id,
                     )
 
                     async def _collect_thinking(text: str):
@@ -449,21 +500,68 @@ async def discord_interaction_webhook(
                     # analysis card.
                     from app.services.chat_history import persist_assistant_reply
                     from app.database import async_session as _areply_session
-                    await persist_assistant_reply(
+                    from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+                    assistant_message_id = await persist_assistant_reply(
                         _areply_session, agent_id=agent_id, user_id=platform_user_id,
                         conversation_id=session_conv_id, content=reply_text,
                         thinking="".join(_thinking_chunks) or None,
+                        message_meta=attach_delivery_to_meta(
+                            {},
+                            IMDeliveryResult.pending("discord"),
+                        ),
                         turn_anchor_id=ingested.message.id,
+                        required=True,
                     )
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()
 
                     # Send chunked reply via Discord follow-up
+                    from app.services.im_delivery import (
+                        IMDeliveryPart,
+                        IMDeliveryResult,
+                        append_delivery_part,
+                        register_delivery,
+                    )
+
+                    delivery_result = IMDeliveryResult.failed("discord", "channel_config_unavailable")
                     if bot_token_bg and interaction_token and app_id_bg:
+                        async def _record_discord_part(response: dict) -> None:
+                            part = IMDeliveryPart(
+                                transport="discord_interaction",
+                                provider_message_id=str(response.get("id") or "") or None,
+                                conversation_ref=channel_id,
+                                artifact_role="chunk",
+                                recallable=False,
+                            )
+                            if not await append_delivery_part(assistant_message_id, part):
+                                raise RuntimeError("delivery_part_persistence_failed")
+
                         try:
-                            await _send_discord_followup(app_id_bg, bot_token_bg, interaction_token, reply_text)
+                            responses = await _send_discord_followup(
+                                app_id_bg,
+                                bot_token_bg,
+                                interaction_token,
+                                reply_text,
+                                on_result=_record_discord_part,
+                            )
+                            delivery_result = IMDeliveryResult.sent(
+                                "discord",
+                                *(
+                                    IMDeliveryPart(
+                                        transport="discord_interaction",
+                                        provider_message_id=str(response.get("id") or "") or None,
+                                        conversation_ref=channel_id,
+                                        artifact_role="chunk",
+                                        recallable=False,
+                                    )
+                                    for response in responses
+                                ),
+                            )
                         except Exception as e:
                             logger.error(f"[Discord] Failed to send follow-up: {e}")
+                            delivery_result = IMDeliveryResult.from_exception("discord", e)
+                    if assistant_message_id is not None:
+                        await register_delivery(assistant_message_id, delivery_result)
 
                     return reply_text or ""
 

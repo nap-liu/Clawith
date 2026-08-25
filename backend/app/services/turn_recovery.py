@@ -18,6 +18,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.services.channel_llm import _call_agent_llm
 from app.services.chat_history import (
+    is_incomplete_delivery_progress,
     load_recoverable_history_for_turn,
     load_recoverable_messages_for_turn,
     persist_assistant_reply_row,
@@ -26,7 +27,7 @@ from app.services.chat_history import (
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
 from app.services.redis_lease_lock import RedisLeaseBusyError, RedisLeaseLock
-from app.services.turn_runtime import deliver_recovered_reply_to_origin
+from app.services.turn_runtime import deliver_recovered_reply_to_origin, load_turn_runtime
 from app.services.workload_capacity import WorkloadKind, get_workload_capacity
 
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
@@ -338,6 +339,7 @@ async def _deliver_recovered_reply(
     expected_origin: _RecoveryOrigin,
     reply: str,
     execution_agent_id: uuid.UUID,
+    message_id: uuid.UUID | str | None = None,
 ) -> bool:
     """Validate the turn generation and deliver while its rows stay locked."""
     async with async_session() as db:
@@ -353,6 +355,7 @@ async def _deliver_recovered_reply(
             "agent_id": execution_agent_id,
             "conversation_id": anchor.conversation_id,
             "reply": reply,
+            "message_id": message_id,
         }
         if expected_origin.session_found:
             delivery_kwargs.update(
@@ -419,6 +422,8 @@ async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
         # LLM invocation for the same event.
         return False
     if row.role == "assistant":
+        if is_incomplete_delivery_progress(row):
+            return True
         # Persisted assistant output is the durable completion boundary. Without a
         # separate delivery receipt, startup cannot distinguish "persisted before
         # send" from "already sent"; retrying here duplicates every recent IM reply
@@ -591,13 +596,23 @@ async def resume_turn(anchor: ChatMessage) -> bool:
         if reply and reply.strip():
             if not await _recovery_origin_matches(anchor, expected_origin):
                 return False
+            from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+            runtime = await load_turn_runtime(
+                agent_id=anchor.agent_id,
+                conversation_id=anchor.conversation_id,
+            )
             async with async_session() as db:
-                await persist_assistant_reply_row(
+                assistant_message_id = await persist_assistant_reply_row(
                     db,
                     agent_id=anchor.agent_id,
                     user_id=anchor.user_id,
                     conversation_id=anchor.conversation_id,
                     content=reply,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending(runtime.source_channel),
+                    ),
                     turn_anchor_id=anchor.id,
                     sender_agent_id=execution_agent_id,
                 )
@@ -607,6 +622,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 expected_origin=expected_origin,
                 reply=reply,
                 execution_agent_id=execution_agent_id,
+                message_id=assistant_message_id,
             )
             if not delivered:
                 logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")

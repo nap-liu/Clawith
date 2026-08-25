@@ -32,6 +32,7 @@ from app.services.tool_enablement import (
     tool_is_required,
 )
 from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES
+from app.services.user_output import sanitize_user_visible_text
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
@@ -320,7 +321,8 @@ async def create_tool(
         select(Tool).where(Tool.name == data.name, Tool.tenant_id == target_tenant_id)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail=f"Tool '{data.name}' already exists")
+        safe_name = sanitize_user_visible_text(data.name)
+        raise HTTPException(status_code=400, detail=f"Tool '{safe_name}' already exists")
 
     tool = Tool(
         name=data.name,

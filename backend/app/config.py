@@ -83,8 +83,8 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # App
-    APP_NAME: str = "Clawith"
-    PLATFORM_NAME: str = "Clawith"
+    APP_NAME: str = "Digital Employee Platform"
+    PLATFORM_NAME: str = "Digital Employee Platform"
     APP_VERSION: str = _read_version()
     DEBUG: bool = False
     SECRET_KEY: str = "change-me-in-production"

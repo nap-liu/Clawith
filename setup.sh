@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ────────────────────────────────────────────────
-# Clawith — First-time Setup Script
+# Digital Employee Platform — First-time Setup Script
 # Sets up backend, frontend, database, and seed data.
 # ────────────────────────────────────────────────
 set -e
@@ -33,13 +33,13 @@ if command -v "$PYTHON_BIN" &>/dev/null; then
     PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
     PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
     if [ "$PY_MAJOR" -lt 3 ] || ([ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 12 ]); then
-        echo -e "${RED}Python $PY_VER detected, but Clawith requires Python >= 3.12.${NC}"
+        echo -e "${RED}Python $PY_VER detected, but the platform requires Python >= 3.12.${NC}"
         echo ""
         echo "  Please install Python 3.12+:"
         echo "    Ubuntu:     sudo apt install python3.12 python3.12-venv"
         echo "    CentOS:     sudo dnf install python3.12"
         echo "    macOS:      brew install python@3.12"
-        echo "    Conda:      conda create -n clawith python=3.12"
+        echo "    Conda:      conda create -n platform python=3.12"
         echo ""
         echo "  Or set PYTHON_BIN to point to a valid python3.12+ binary:"
         echo "    PYTHON_BIN=/path/to/python3.12 bash setup.sh"
@@ -59,7 +59,7 @@ NPM_MIRROR="--registry https://registry.npmmirror.com"
 
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════${NC}"
-echo -e "${CYAN}  🦞 Clawith — First-time Setup${NC}"
+echo -e "${CYAN}  🦞 Digital Employee Platform — First-time Setup${NC}"
 echo -e "${CYAN}═══════════════════════════════════════${NC}"
 echo ""
 
@@ -133,21 +133,21 @@ if PG_BIN_DIR=$(find_psql 2>/dev/null); then
         ROLE_EXISTS=false
         if psql -h localhost -p $PG_PORT -U "$USER" -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='clawith'" 2>/dev/null | grep -q 1; then
             ROLE_EXISTS=true
-            echo -e "  ${GREEN}✓${NC} Role 'clawith' already exists"
+                echo -e "  ${GREEN}✓${NC} Required PostgreSQL role already exists"
         elif sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='clawith'" 2>/dev/null | grep -q 1; then
             ROLE_EXISTS=true
-            echo -e "  ${GREEN}✓${NC} Role 'clawith' already exists"
+                echo -e "  ${GREEN}✓${NC} Required PostgreSQL role already exists"
         fi
 
         if [ "$ROLE_EXISTS" = false ]; then
             # Try 1: as current user
             if createuser -h localhost -p $PG_PORT clawith 2>/dev/null; then
                 psql -h localhost -p $PG_PORT -U "$USER" -d postgres -c "ALTER ROLE clawith WITH LOGIN PASSWORD 'clawith';" &>/dev/null
-                echo -e "  ${GREEN}✓${NC} Created PostgreSQL role: clawith"
+                echo -e "  ${GREEN}✓${NC} Created required PostgreSQL role"
             # Try 2: via sudo -u postgres (standard Linux setup)
             elif sudo -u postgres createuser clawith 2>/dev/null && \
                  sudo -u postgres psql -c "ALTER ROLE clawith WITH LOGIN PASSWORD 'clawith';" &>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} Created PostgreSQL role: clawith (via sudo)"
+                echo -e "  ${GREEN}✓${NC} Created required PostgreSQL role (via sudo)"
             else
                 echo -e "  ${YELLOW}⚠${NC}  Could not create role in existing PG — will init a local instance"
                 PG_BIN_DIR=""  # Force local PG setup below
@@ -163,11 +163,11 @@ if PG_BIN_DIR=$(find_psql 2>/dev/null); then
             fi
 
             if [ "$DB_EXISTS" = true ]; then
-                echo -e "  ${GREEN}✓${NC} Database 'clawith' already exists"
+                echo -e "  ${GREEN}✓${NC} Required database already exists"
             else
                 if createdb -h localhost -p $PG_PORT -O clawith clawith 2>/dev/null || \
                    sudo -u postgres createdb -O clawith clawith 2>/dev/null; then
-                    echo -e "  ${GREEN}✓${NC} Created database: clawith"
+                    echo -e "  ${GREEN}✓${NC} Created required database"
                 fi
             fi
         fi
@@ -250,11 +250,11 @@ if [ -z "$PG_BIN_DIR" ] && ! (PGPASSWORD=clawith psql -h localhost -p 5432 -U cl
                     sudo -u postgres createuser clawith 2>/dev/null || createuser -h localhost -p $PG_PORT clawith 2>/dev/null || true
                     sudo -u postgres psql -c "ALTER ROLE clawith WITH LOGIN PASSWORD 'clawith';" 2>/dev/null || \
                         psql -h localhost -p $PG_PORT -U postgres -c "ALTER ROLE clawith WITH LOGIN PASSWORD 'clawith';" 2>/dev/null || true
-                    echo -e "  ${GREEN}✓${NC} Created role: clawith"
+                    echo -e "  ${GREEN}✓${NC} Created required role"
                 fi
                 if ! psql -h localhost -p $PG_PORT -U postgres -lqt 2>/dev/null | cut -d\| -f1 | grep -qw clawith; then
                     sudo -u postgres createdb -O clawith clawith 2>/dev/null || createdb -h localhost -p $PG_PORT -O clawith clawith 2>/dev/null || true
-                    echo -e "  ${GREEN}✓${NC} Created database: clawith"
+                    echo -e "  ${GREEN}✓${NC} Created required database"
                 fi
                 PG_MANAGED_BY_US=false  # System manages PG now
             fi
@@ -323,11 +323,11 @@ if [ -z "$PG_BIN_DIR" ] && ! (PGPASSWORD=clawith psql -h localhost -p 5432 -U cl
             if ! psql -h localhost -p "$PG_PORT" -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='clawith'" 2>/dev/null | grep -q 1; then
                 createuser -h localhost -p "$PG_PORT" -U postgres clawith 2>/dev/null || true
                 psql -h localhost -p "$PG_PORT" -U postgres -c "ALTER ROLE clawith WITH LOGIN PASSWORD 'clawith';" &>/dev/null
-                echo -e "  ${GREEN}✓${NC} Created role: clawith"
+                echo -e "  ${GREEN}✓${NC} Created required role"
             fi
             if ! psql -h localhost -p "$PG_PORT" -U postgres -lqt 2>/dev/null | cut -d\| -f1 | grep -qw clawith; then
                 createdb -h localhost -p "$PG_PORT" -U postgres -O clawith clawith 2>/dev/null
-                echo -e "  ${GREEN}✓${NC} Created database: clawith"
+                echo -e "  ${GREEN}✓${NC} Created required database"
             fi
         else
             echo -e "  ${RED}✗${NC} Could not set up PostgreSQL automatically."

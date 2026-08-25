@@ -89,7 +89,16 @@ def render_messages(messages, senders: dict, *, more_available: bool) -> str:
     blocks = []
     for m in kept:
         ts = m.created_at.isoformat() if m.created_at else "—"
-        blocks.append(f"[{ts}] {_sender_label(m, senders)} ({m.role}):\n{_truncate(m.content)}")
+        meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
+        delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+        recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
+        recall_status = str(recall.get("status") or "")
+        content = "[该消息已撤回]" if recall_status == "recalled" else _truncate(m.content)
+        recall_suffix = f" · recall={recall_status}" if recall_status else ""
+        blocks.append(
+            f"[message {m.id}] [{ts}] {_sender_label(m, senders)} ({m.role})"
+            f"{recall_suffix}:\n{content}"
+        )
     body = "\n\n".join(blocks)
     if more_available or dropped_older:
         body += f"\n\n… 还有更早的消息，用 before={encode_cursor(kept[0])} 继续读。"

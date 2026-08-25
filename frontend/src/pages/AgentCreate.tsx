@@ -297,17 +297,17 @@ export default function AgentCreate() {
                                 padding: '12px', background: 'var(--bg-secondary)', borderRadius: '6px',
                                 fontSize: '11px', lineHeight: 1.6, overflow: 'auto', maxHeight: '280px',
                                 border: '1px solid var(--border-default)', whiteSpace: 'pre-wrap',
-                            }}>{`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
+                            }}>{`Please create a skill file at skills/platform_sync.md with the following content, then add "Check the platform inbox using the platform_sync skill and process any pending messages" to your HEARTBEAT.md:
 
 ---
-name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+name: platform_sync
+description: Sync with the platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Platform Sync
 
 ## When to use
-Check for new messages from the Clawith platform during every heartbeat cycle.
+Check for new messages from the platform during every heartbeat cycle.
 You can also proactively send messages to people and agents in your relationships.
 
 ## Instructions
@@ -356,7 +356,7 @@ For agents, the reply appears in your next poll.`}</pre>
                                     <LinearCopyButton
                                         className="btn btn-ghost"
                                         style={{ position: 'absolute', top: '4px', right: '4px', fontSize: '11px', minWidth: '60px' }}
-                                        textToCopy={`Please create a skill file at skills/clawith_sync.md, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to HEARTBEAT.md.\n\n---\nname: clawith_sync\ndescription: Sync with Clawith platform — check inbox, submit results, and send messages.\n---\n\n# Clawith Sync\n\nPoll ${window.location.origin}/api/gateway/poll with X-Api-Key: ${createdApiKey}. Use message history for context. A human sender has sender_user_id; an agent sender has sender_agent_id. Relationships expose display_name for display and exactly one canonical user_id or agent_id for execution. Never execute by display name.\n\nReport each result to ${window.location.origin}/api/gateway/report with {"message_id":"<message id>","result":"<response>"}.\n\nSend proactively to ${window.location.origin}/api/gateway/send-message. For a human use {"user_id":"<User UUID>","channel":"<relationship channel>","content":"<message>"}; for an agent use {"agent_id":"<Agent UUID>","content":"<message>"}. Provide exactly one recipient ID. If a human has multiple channels, choose one from relationships[].channels. Always include X-Idempotency-Key with one stable unique value per logical send and reuse that same key only for retries.`}
+                                        textToCopy={`Please create a skill file at skills/platform_sync.md, then add "Check the platform inbox using the platform_sync skill and process any pending messages" to HEARTBEAT.md.\n\n---\nname: platform_sync\ndescription: Sync with the platform — check inbox, submit results, and send messages.\n---\n\n# Platform Sync\n\nPoll ${window.location.origin}/api/gateway/poll with X-Api-Key: ${createdApiKey}. Use message history for context. A human sender has sender_user_id; an agent sender has sender_agent_id. Relationships expose display_name for display and exactly one canonical user_id or agent_id for execution. Never execute by display name.\n\nReport each result to ${window.location.origin}/api/gateway/report with {"message_id":"<message id>","result":"<response>"}.\n\nSend proactively to ${window.location.origin}/api/gateway/send-message. For a human use {"user_id":"<User UUID>","channel":"<relationship channel>","content":"<message>"}; for an agent use {"agent_id":"<Agent UUID>","content":"<message>"}. Provide exactly one recipient ID. If a human has multiple channels, choose one from relationships[].channels. Always include X-Idempotency-Key with one stable unique value per logical send and reuse that same key only for retries.`}
                                         label={t('common.copy', 'Copy')}
                                         copiedLabel="Copied"
                                     />
@@ -409,7 +409,7 @@ For agents, the reply appears in your next poll.`}</pre>
                 }}
             >
                 <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>{t('openclaw.nativeTitle', 'Platform Hosted')}</div>
-                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on Clawith platform')}</div>
+                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on this platform')}</div>
             </div>
             <div
                 onClick={() => { setAgentType('openclaw'); setStep(0); }}

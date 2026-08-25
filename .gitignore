@@ -30,16 +30,15 @@ backend/agent_data/
 ss-nodes.json
 .data/
 
-# Ignore Antigravity / Claude Code agent configurations
+# Ignore local Antigravity / Claude Code agent configurations.
+# Repository-wide instructions under .agents/ are intentionally tracked.
 .agent/
-.agents/
 _agent/
 _agents/
 
 # Internal docs (generated artefacts etc.) — design specs used to be
 # whitelisted; keep them out of the repo per the team convention.
 docs/
-.agents/rules/deploy.md
 
 # Local worktrees
 .worktrees/

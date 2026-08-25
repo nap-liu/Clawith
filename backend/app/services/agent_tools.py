@@ -110,7 +110,23 @@ from app.services.recipient_resolver import (
     resolve_human_channel_recipient,
     resolve_platform_user_recipient,
 )
-from app.services.turn_runtime import TurnRuntime, deliver_message_to_runtime
+from app.services.im_delivery import (
+    DELIVERY_LEASE,
+    DeliveryReceiptPersistenceError,
+    IMDeliveryPart,
+    IMDeliveryResult,
+    _merge_delivery_into_meta,
+    append_delivery_part,
+    attach_delivery_to_meta,
+    recall_message,
+    register_delivery,
+)
+from app.services.user_output import sanitize_user_visible_text
+from app.services.turn_runtime import (
+    TurnRuntime,
+    deliver_message_to_runtime,
+    deliver_message_with_receipt,
+)
 from app.services.user_project_tools import (
     USER_PROJECT_TOOL_NAMES,
     USER_PROJECT_TOOL_SCHEMAS,
@@ -326,9 +342,12 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
 
 # ContextVar set by each channel handler so send_channel_file knows where to send
 # Value: async callable(file_path: Path) -> None  |  None for web chat (returns URL)
-channel_file_sender: ContextVar = ContextVar("channel_file_sender", default=None)
-channel_audio_sender: ContextVar = ContextVar("channel_audio_sender", default=None)
-channel_video_sender: ContextVar = ContextVar("channel_video_sender", default=None)
+channel_file_sender: ContextVar = ContextVar('channel_file_sender', default=None)
+channel_file_part_recorder: ContextVar = ContextVar(
+    "channel_file_part_recorder", default=None
+)
+channel_audio_sender: ContextVar = ContextVar('channel_audio_sender', default=None)
+channel_video_sender: ContextVar = ContextVar('channel_video_sender', default=None)
 # For web chat: agent_id needed to build download URL
 channel_web_agent_id: ContextVar = ContextVar("channel_web_agent_id", default=None)
 # Set by Feishu channel handler — open_id of the message sender so calendar tool
@@ -809,7 +828,7 @@ AGENT_TOOLS = [
                 "properties": {
                     "user_id": {
                         "type": "string",
-                        "description": "Recipient's canonical Clawith user_id. Provider IDs are resolved internally.",
+                        "description": "Recipient's canonical platform user_id. Provider IDs are resolved internally.",
                     },
                     "message": {
                         "type": "string",
@@ -938,7 +957,7 @@ AGENT_TOOLS = [
         "function": {
             "name": "send_session_message",
             "description": (
-                "Send text only to one human conversation that already exists in Clawith. "
+                "Send text only to one human conversation that already exists on the platform. "
                 "Provide the exact session_id returned by list_sessions/search_sessions; the existing "
                 "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
                 "discovers a person, selects or changes a channel, sends files, or contacts another "
@@ -1021,8 +1040,31 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "recall_message",
+            "description": (
+                "Recall one message previously sent by this digital employee through any IM channel. "
+                "Use only the exact local message_id returned by send_session_message/send_channel_message "
+                "or shown by read_session_messages. Never guess a message ID. Unsupported provider paths "
+                "return a normalized unsupported result without deleting local audit history."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Exact local ChatMessage UUID of the outbound assistant message.",
+                    },
+                },
+                "required": ["message_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_platform_message",
-            "description": "Send a message to a user on the Clawith first-party platform (web or app). The message will appear in their platform chat history and be pushed in real-time if they are online. Use this to proactively notify platform users.",
+            "description": "Send a message to a first-party platform user (web or app). The message will appear in their platform chat history and be pushed in real-time if they are online. Use this to proactively notify platform users.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1335,7 +1377,7 @@ AGENT_TOOLS = [
                     },
                     "folder": {
                         "type": "string",
-                        "description": "Optional CDN folder path, e.g. /agents/reports. Defaults to /clawith.",
+                        "description": "Optional CDN folder path, e.g. /agents/reports.",
                     },
                 },
             },
@@ -2015,7 +2057,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_installed_mcp_servers",
-            "description": "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. No arguments are needed. For MCP bindings installed by you, the platform also returns the installation config saved on your own binding. Shared server credentials are never inferred or copied into the result.",
+            "description": "List a concise summary of every MCP server currently assigned to you. Each item includes the exact mcp_server_id required by refresh_mcp_server and uninstall_mcp_server, display name, transport, tool counts, and uninstallability. Tool definitions and installation credentials are intentionally omitted because your available MCP tools are already provided separately.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -2612,6 +2654,7 @@ _ALWAYS_INCLUDE_CORE = {
 }
 # Channel message tool - available when any channel (Feishu/DingTalk/WeCom) is configured
 _CHANNEL_MESSAGE_TOOL_NAMES = {
+    "recall_message",
     "send_channel_message",
     "send_group_session_message",
     "send_session_message",
@@ -4033,7 +4076,23 @@ async def execute_tool(
                         forced_level="L3" if tool_name in _FORCED_L3_TOOLS else None,
                         idempotency_key=approval_key,
                     )
+                    pending_im_notifications = result_check.pop(
+                        "_pending_im_notifications", []
+                    )
                     await _adb.commit()
+                    if pending_im_notifications:
+                        try:
+                            from app.services.autonomy_service import (
+                                deliver_prepared_creator_notifications,
+                            )
+
+                            await deliver_prepared_creator_notifications(
+                                pending_im_notifications
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[Autonomy] committed creator notification delivery failed"
+                            )
                     if not result_check.get("allowed"):
                         level = result_check.get("level", "L3")
                         logger.info(f"[Autonomy] Tool {tool_name} denied, level: {level}")
@@ -4060,6 +4119,7 @@ async def execute_tool(
         "send_feishu_message",
         "send_platform_message",
         "send_message_to_agent",
+        "send_channel_file",
     }:
         cached_outbound = await _find_outbound_tool_receipt(
             agent_id=agent_id,
@@ -4076,6 +4136,45 @@ async def execute_tool(
             if not (tool_name == "send_message_to_agent" and cached_meta.get("delivery_status") == "recorded"):
                 target = str(cached_meta.get("target_name") or "the recipient")
                 channel = str(cached_meta.get("source_channel") or "the selected channel")
+                delivery = (
+                    cached_meta.get("delivery")
+                    if isinstance(cached_meta.get("delivery"), dict)
+                    else {}
+                )
+                delivery_status = str(
+                    delivery.get("status") or cached_meta.get("delivery_status") or "sent"
+                )
+                if delivery_status == "pending":
+                    try:
+                        updated_at = datetime.fromisoformat(str(delivery.get("updated_at") or ""))
+                        if updated_at.tzinfo is None:
+                            updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        updated_at = None
+                    if updated_at and datetime.now(timezone.utc) - updated_at >= DELIVERY_LEASE:
+                        await register_delivery(
+                            cached_outbound.id,
+                            IMDeliveryResult.unknown(channel, "delivery_lease_expired"),
+                        )
+                        return (
+                            f"❌ The previous delivery to {target} via {channel} is unknown "
+                            f"(message_id: {cached_outbound.id}). It was not retried to avoid duplication."
+                        )
+                    return (
+                        f"⏳ A previous delivery to {target} via {channel} is still pending "
+                        f"(message_id: {cached_outbound.id}). It will not be sent twice."
+                    )
+                if delivery_status in {"failed", "unknown"}:
+                    return (
+                        f"❌ The previous delivery to {target} via {channel} is {delivery_status} "
+                        f"(message_id: {cached_outbound.id}). It was not retried to avoid duplication."
+                    )
+                if delivery_status == "partial":
+                    return (
+                        f"⚠️ The previous delivery to {target} via {channel} was only partially sent "
+                        f"(message_id: {cached_outbound.id}). It was not retried to avoid duplication; "
+                        "known delivered parts can still be recalled."
+                    )
                 return f"✅ Message already sent to {target} via {channel} (idempotent replay)."
 
     # Pre-inject session_id into arguments for AgentBay tools so each
@@ -4337,6 +4436,23 @@ async def execute_tool(
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=turn_anchor_id,
             )
+        elif tool_name == "recall_message":
+            raw_message_id = str(arguments.get("message_id") or "").strip()
+            if not raw_message_id:
+                result = json.dumps(
+                    {"status": "invalid_request", "reason": "message_id_required"},
+                    ensure_ascii=False,
+                )
+            else:
+                result = json.dumps(
+                    await recall_message(
+                        agent_id=agent_id,
+                        message_id=raw_message_id,
+                        user_id=user_id,
+                        current_session_id=session_id,
+                    ),
+                    ensure_ascii=False,
+                )
         elif tool_name == "start_dingtalk_channel_provisioning":
             result = await _start_dingtalk_channel_provisioning_tool(agent_id, user_id, arguments)
         elif tool_name == "get_dingtalk_channel_provisioning_status":
@@ -4366,7 +4482,14 @@ async def execute_tool(
                 result = await _run_with_temp_workspace(
                     agent_id,
                     _agent_tenant_id,
-                    lambda temp_ws: _send_channel_file(agent_id, temp_ws, arguments),
+                    lambda temp_ws: _send_channel_file(
+                        agent_id,
+                        temp_ws,
+                        arguments,
+                        tool_call_id=tool_call_id,
+                        origin_session_id=session_id,
+                        origin_turn_anchor_id=turn_anchor_id,
+                    ),
                     paths=[file_path],
                     source_paths=[file_path],
                 )
@@ -4574,7 +4697,12 @@ async def execute_tool(
             except (ValueError, TypeError):
                 result = "❌ mcp_server_id must be an exact UUID from list_installed_mcp_servers."
             else:
-                result = await refresh_mcp_server(agent_id, _server_id)
+                result = await refresh_mcp_server(
+                    agent_id,
+                    _server_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
         elif tool_name == "uninstall_mcp_server":
             from app.services.agent_mcp_lifecycle import uninstall_mcp_server
 
@@ -5189,7 +5317,7 @@ async def _read_webpage(arguments: dict) -> str:
     include_links = bool(arguments.get("include_links", False))
     max_bytes = 2_000_000
     headers = {
-        "User-Agent": "ClawithBot/1.0 (+https://clawith.ai) Mozilla/5.0",
+        "User-Agent": "PlatformBot/1.0 Mozilla/5.0",
         "Accept": "text/html, text/plain, application/json, application/xml;q=0.9, text/*;q=0.8, */*;q=0.5",
     }
 
@@ -5543,7 +5671,114 @@ async def _bing_search_tool(arguments: dict, agent_id: uuid.UUID | None = None) 
         return f"Bing search error: {str(e)[:200]}"
 
 
-async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
+async def _claim_channel_file_receipt(
+    *,
+    agent_id: uuid.UUID,
+    tool_call_id: str,
+    origin_session_id: str,
+    origin_turn_anchor_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Put the existing tool-call row in pending before any channel side effect."""
+    if not tool_call_id or not origin_session_id:
+        return None
+    operation_key = _build_outbound_operation_key(
+        agent_id=agent_id,
+        origin_session_id=origin_session_id,
+        tool_call_id=tool_call_id,
+        origin_turn_anchor_id=origin_turn_anchor_id,
+    )
+    if not operation_key:
+        return None
+    async with async_session() as db:
+        existing = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.external_event_key == operation_key)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return None
+        candidates = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == str(origin_session_id),
+                    ChatMessage.role == "tool_call",
+                    ChatMessage.external_event_key.is_(None),
+                )
+                .order_by(ChatMessage.created_at.desc())
+                .limit(20)
+                .with_for_update()
+            )
+        ).scalars().all()
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate.content or "")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("name") or "") == "send_channel_file"
+                and str(payload.get("call_id") or "") == tool_call_id
+            ):
+                current_meta = (
+                    candidate.message_meta
+                    if isinstance(candidate.message_meta, dict)
+                    else {}
+                )
+                current_delivery = (
+                    current_meta.get("delivery")
+                    if isinstance(current_meta.get("delivery"), dict)
+                    else {}
+                )
+                candidate.external_event_key = operation_key
+                if str(payload.get("status") or "") != "running" or str(
+                    current_delivery.get("status")
+                    or current_meta.get("delivery_status")
+                    or ""
+                ) not in {"", "pending"}:
+                    await db.commit()
+                    return None
+                candidate.message_meta = attach_delivery_to_meta(
+                    {
+                        **dict(current_meta),
+                        "direction": "outbound",
+                        "artifact_role": "channel_file",
+                        "tool_call_id": tool_call_id,
+                        "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+                    },
+                    IMDeliveryResult.pending("im"),
+                )
+                await db.commit()
+                return candidate.id
+    return None
+
+
+async def record_channel_file_part(part: IMDeliveryPart) -> None:
+    """Persist one observed file artifact through the active tool receipt."""
+    recorder = channel_file_part_recorder.get()
+    if recorder is not None:
+        try:
+            await recorder(part)
+        except DeliveryReceiptPersistenceError:
+            raise
+        except Exception as exc:
+            raise DeliveryReceiptPersistenceError(
+                "provider artifact receipt persistence failed"
+            ) from exc
+
+
+async def _send_channel_file(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    *,
+    tool_call_id: str | None = None,
+    origin_session_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
     """Send a file to a person or back to the current channel.
 
     Priority:
@@ -5553,7 +5788,7 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     """
     raw_rel_path = arguments.get("file_path", "")
     rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
-    accompany_msg = arguments.get("message", "")
+    accompany_msg = sanitize_user_visible_text(str(arguments.get("message") or ""))
     canonical_user_id = str(arguments.get("user_id") or "").strip()
     channel = str(arguments.get("channel") or "").strip().lower() or None
     if not rel_path:
@@ -5592,22 +5827,75 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
 
     # Priority 1: explicit canonical recipient.
     if canonical_user_id:
-        return await _send_file_to_recipient(
-            agent_id,
-            file_path,
-            canonical_user_id,
-            accompany_msg,
-            channel=channel,
+        receipt_id = await _claim_channel_file_receipt(
+            agent_id=agent_id,
+            tool_call_id=str(tool_call_id or ""),
+            origin_session_id=str(origin_session_id or ""),
+            origin_turn_anchor_id=origin_turn_anchor_id,
         )
+        if receipt_id is None:
+            return "Failed to send file: durable delivery receipt unavailable"
+        async def _record_part(part: IMDeliveryPart) -> None:
+            await append_delivery_part(receipt_id, part)
+
+        recorder_token = channel_file_part_recorder.set(_record_part)
+        try:
+            delivery_text, delivery_result = await _send_file_to_recipient(
+                agent_id,
+                file_path,
+                canonical_user_id,
+                accompany_msg,
+                channel=channel,
+            )
+            if not await register_delivery(receipt_id, delivery_result):
+                raise RuntimeError("delivery finalization failed")
+            return delivery_text
+        except Exception as exc:
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.from_exception("im", exc),
+            )
+            safe_error = sanitize_user_visible_text(str(exc)).strip()
+            return f"Failed to send file: {safe_error or type(exc).__name__}"
+        finally:
+            channel_file_part_recorder.reset(recorder_token)
 
     # Priority 2: channel-initiated (ContextVar set by channel webhook handler)
     sender = channel_file_sender.get()
     if sender is not None:
+        receipt_id = await _claim_channel_file_receipt(
+            agent_id=agent_id,
+            tool_call_id=str(tool_call_id or ""),
+            origin_session_id=str(origin_session_id or ""),
+            origin_turn_anchor_id=origin_turn_anchor_id,
+        )
+        if receipt_id is None:
+            return "Failed to send file: durable delivery receipt unavailable"
+        async def _record_part(part: IMDeliveryPart) -> None:
+            await append_delivery_part(receipt_id, part)
+
+        recorder_token = channel_file_part_recorder.set(_record_part)
         try:
-            await sender(file_path, accompany_msg)
+            delivery_result = await sender(file_path, accompany_msg)
+            if not isinstance(delivery_result, IMDeliveryResult):
+                delivery_result = IMDeliveryResult.unsupported_delivery(
+                    "im",
+                    "legacy_channel_file",
+                )
+            if not await register_delivery(receipt_id, delivery_result):
+                raise RuntimeError("delivery finalization failed")
+            if not delivery_result.ok:
+                return f"Failed to send file: {delivery_result.error or delivery_result.status}"
             return f"File '{file_path.name}' sent to user via channel."
         except Exception as e:
-            return f"Failed to send file: {e}"
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.from_exception("im", e),
+            )
+            safe_error = sanitize_user_visible_text(str(e)).strip()
+            return f"Failed to send file: {safe_error or type(e).__name__}"
+        finally:
+            channel_file_part_recorder.reset(recorder_token)
 
     # Priority 3: Web/H5 chat fallback — return a structured platform file
     # delivery payload. The frontend builds the authenticated download URL.
@@ -5630,6 +5918,15 @@ async def _send_channel_media(
     origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Create one audio/video delivery without leaking renderer/IM details."""
+    arguments = dict(arguments)
+    if "message" in arguments:
+        arguments["message"] = sanitize_user_visible_text(
+            str(arguments.get("message") or "")
+        ).strip()
+    if "title" in arguments:
+        arguments["title"] = normalize_media_display_title(
+            sanitize_user_visible_text(str(arguments.get("title") or ""))
+        )
     if not str(tool_call_id or "").strip():
         return json.dumps(
             {
@@ -7034,6 +7331,8 @@ async def _send_media_to_session_under_lifecycle_lock(
                     break
 
         is_cross_session_claim = str(origin_session_id or "") != str(session.id)
+        from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
         claim_meta = {
             "direction": "outbound",
             "source_channel": channel,
@@ -7047,6 +7346,10 @@ async def _send_media_to_session_under_lifecycle_lock(
             "delivery_claim": is_cross_session_claim,
             "delivery_status": "pending",
         }
+        claim_meta = attach_delivery_to_meta(
+            claim_meta,
+            IMDeliveryResult.pending(channel),
+        )
         if receipt is None:
             receipt = ChatMessage(
                 agent_id=agent_id,
@@ -7092,6 +7395,13 @@ async def _send_media_to_session_under_lifecycle_lock(
     code = "MEDIA_SENT"
     uncertain = False
     caption_sent = channel != "dingtalk" or not bool(caption.strip())
+    caption_delivery_result: IMDeliveryResult | None = None
+    media_delivery_parts: list[IMDeliveryPart] = []
+    media_delivery_result = IMDeliveryResult.unsupported_delivery(
+        channel or "web",
+        "platform_session",
+        conversation_ref=str(target_session_id),
+    )
     if channel == "dingtalk":
         from app.services.dingtalk_stream import (
             DINGTALK_VOICE_MAX_BYTES,
@@ -7099,6 +7409,41 @@ async def _send_media_to_session_under_lifecycle_lock(
             _send_dingtalk_native_video,
             _upload_dingtalk_media,
         )
+
+        async def _record_media_part(provider_result: dict) -> None:
+            process_key = str(provider_result.get("processQueryKey") or "") or None
+            part = IMDeliveryPart(
+                transport=(
+                    "dingtalk_openapi_group"
+                    if target_is_group
+                    else "dingtalk_openapi_oto"
+                ),
+                provider_message_id=process_key,
+                conversation_ref=target_id,
+                artifact_role=f"media_{media_kind}",
+                recallable=bool(process_key),
+            )
+            media_delivery_parts.append(part)
+            async with _outbound_media_db_session() as part_db:
+                part_receipt = await part_db.get(
+                    ChatMessage,
+                    receipt_id,
+                    with_for_update=True,
+                )
+                if part_receipt is None:
+                    raise DeliveryReceiptPersistenceError(
+                        "provider artifact receipt persistence failed"
+                    )
+                part_receipt.message_meta = _merge_delivery_into_meta(
+                    part_receipt.message_meta,
+                    IMDeliveryResult(
+                        ok=True,
+                        channel=channel,
+                        parts=(part,),
+                        status="pending",
+                    ),
+                )
+                await part_db.commit()
 
         try:
             if media_kind == "video":
@@ -7110,6 +7455,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                     conversation_type,
                     cover_image_path=cover_path,
                     raise_on_transport_error=True,
+                    on_result=_record_media_part,
                 )
             elif file_path.stat().st_size > DINGTALK_VOICE_MAX_BYTES:
                 sent, code = False, "MEDIA_TOO_LARGE"
@@ -7130,11 +7476,36 @@ async def _send_media_to_session_under_lifecycle_lock(
                     conversation_type,
                     filename=file_path.name,
                     raise_on_transport_error=True,
+                    on_result=_record_media_part,
                 )
-                code = "MEDIA_SENT" if sent else ("MEDIA_SEND_FAILED" if media_id else "MEDIA_UPLOAD_FAILED")
-        except Exception:
+                code = "MEDIA_SENT" if sent else (
+                    "MEDIA_SEND_FAILED" if media_id else "MEDIA_UPLOAD_FAILED"
+                )
+        except Exception as exc:
             logger.opt(exception=True).error("[SessionMedia] Provider result is unknown")
             sent, uncertain, code = False, True, "MEDIA_DELIVERY_STATE_UNKNOWN"
+            media_delivery_result = IMDeliveryResult.unknown(channel, type(exc).__name__)
+        else:
+            if sent:
+                if not media_delivery_parts:
+                    media_delivery_parts.append(
+                        IMDeliveryPart(
+                            transport=(
+                                "dingtalk_openapi_group"
+                                if target_is_group
+                                else "dingtalk_openapi_oto"
+                            ),
+                            conversation_ref=target_id,
+                            artifact_role=f"media_{media_kind}",
+                            recallable=False,
+                        )
+                    )
+                media_delivery_result = IMDeliveryResult.sent(
+                    channel,
+                    *media_delivery_parts,
+                )
+            else:
+                media_delivery_result = IMDeliveryResult.failed(channel, code)
 
         if sent and caption.strip():
             runtime = TurnRuntime(
@@ -7144,15 +7515,50 @@ async def _send_media_to_session_under_lifecycle_lock(
                 external_conv_id=external_conv_id,
                 is_group=target_is_group,
             )
+            caption_operation_key = f"{operation_key}:caption"
+            async with _outbound_media_db_session() as caption_db:
+                caption_row = (
+                    await caption_db.execute(
+                        select(ChatMessage).where(
+                            ChatMessage.external_event_key == caption_operation_key
+                        )
+                    )
+                ).scalar_one_or_none()
+                if caption_row is None:
+                    media_receipt = await caption_db.get(ChatMessage, receipt_id)
+                    caption_row = ChatMessage(
+                        agent_id=agent_id,
+                        user_id=media_receipt.user_id if media_receipt is not None else None,
+                        role="assistant",
+                        content=caption.strip(),
+                        conversation_id=str(target_session_id),
+                        external_event_key=caption_operation_key,
+                        message_meta=attach_delivery_to_meta(
+                            {
+                                "attachments": [],
+                                "media_caption_for": str(receipt_id),
+                                "artifact_role": "media_caption",
+                            },
+                            IMDeliveryResult.pending(channel),
+                        ),
+                    )
+                    caption_db.add(caption_row)
+                    await caption_db.flush()
+                caption_message_id = caption_row.id
+                await caption_db.commit()
             try:
-                caption_sent = await deliver_message_to_runtime(
+                caption_delivery_result = await deliver_message_with_receipt(
                     agent_id=agent_id,
                     runtime=runtime,
                     message=caption.strip(),
-                    require_transport=True,
                 )
-            except Exception:
+                caption_sent = caption_delivery_result.ok
+            except Exception as exc:
                 logger.opt(exception=True).warning("[SessionMedia] Caption delivery failed")
+                caption_delivery_result = IMDeliveryResult.unknown(
+                    channel,
+                    type(exc).__name__,
+                )
                 caption_sent = False
 
     final_status = "sent" if sent else ("unknown" if uncertain else "failed")
@@ -7186,22 +7592,14 @@ async def _send_media_to_session_under_lifecycle_lock(
                     _describe_media_delivery_result(terminal_result),
                     ensure_ascii=False,
                 )
-            return json.dumps(
-                _describe_media_delivery_result(
-                    {
-                        "type": "media_delivery_result",
-                        "version": 1,
-                        "status": "unknown",
-                        "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
-                        "media_kind": media_kind,
-                        "intent_id": intent_id,
-                        "session_id": str(target_session_id),
-                        "channel": channel,
-                        "message_id": str(final_receipt.id),
-                    }
-                ),
-                ensure_ascii=False,
-            )
+            return json.dumps(_describe_media_delivery_result({
+                "type": "media_delivery_result", "version": 1,
+                "status": "unknown", "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                "media_kind": media_kind, "intent_id": intent_id,
+                "session_id": str(target_session_id), "channel": channel,
+                "message_id": str(final_receipt.id),
+            }), ensure_ascii=False)
+        final_meta = _merge_delivery_into_meta(final_meta, media_delivery_result)
         final_meta["delivery_status"] = final_status
         final_meta["delivery_code"] = final_code
         final_meta["caption_status"] = (
@@ -7257,35 +7655,16 @@ async def _send_media_to_session_under_lifecycle_lock(
             ensure_ascii=False,
         )
         caption_row: ChatMessage | None = None
-        if sent and caption_sent and caption.strip():
+        if sent and caption.strip():
             caption_operation_key = f"{operation_key}:caption"
             caption_row = (
                 await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == caption_operation_key))
             ).scalar_one_or_none()
-            if caption_row is None:
-                caption_meta = {
-                    key: value
-                    for key, value in final_meta.items()
-                    if key
-                    not in {
-                        "attachments",
-                        "media_kind",
-                        "delivery_mode",
-                        "caption_status",
-                        "requested_caption",
-                        "delivery_code",
-                        "display_title",
-                    }
-                }
-                # A caption is a normal assistant message. It must not inherit
-                # the media claim's LLM-history suppression marker.
-                caption_meta.pop("delivery_claim", None)
-                caption_meta.update(
-                    {
-                        "attachments": [],
-                        "delivery_status": "sent",
-                        "media_caption_for": str(final_receipt.id),
-                    }
+            if caption_row is None and channel != "dingtalk":
+                caption_delivery_result = IMDeliveryResult.unsupported_delivery(
+                    channel or "web",
+                    "platform_session",
+                    conversation_ref=str(target_session_id),
                 )
                 caption_row = ChatMessage(
                     agent_id=agent_id,
@@ -7294,10 +7673,19 @@ async def _send_media_to_session_under_lifecycle_lock(
                     content=caption.strip(),
                     conversation_id=str(target_session_id),
                     external_event_key=caption_operation_key,
-                    message_meta=caption_meta,
+                    message_meta={
+                        "attachments": [],
+                        "media_caption_for": str(receipt_id),
+                        "artifact_role": "media_caption",
+                    },
                 )
                 db.add(caption_row)
                 await db.flush()
+            if caption_row is not None and caption_delivery_result is not None:
+                caption_row.message_meta = _merge_delivery_into_meta(
+                    caption_row.message_meta,
+                    caption_delivery_result,
+                )
         await db.commit()
         await db.refresh(final_receipt)
         events.append(
@@ -7315,8 +7703,7 @@ async def _send_media_to_session_under_lifecycle_lock(
         )
         if sent:
             from app.services.chat_message_serializer import serialize_chat_message_for_client
-
-            if caption_row is not None:
+            if caption_sent and caption_row is not None:
                 await db.refresh(caption_row)
                 caption_event = serialize_chat_message_for_client(caption_row, source_channel=channel)
                 caption_event["type"] = "assistant_message_committed"
@@ -7460,13 +7847,13 @@ async def _send_file_to_recipient(
     message: str = "",
     *,
     channel: str | None = None,
-) -> str:
+) -> tuple[str, IMDeliveryResult]:
     """Resolve one canonical recipient route and send without name lookup."""
     async with async_session() as db:
         try:
             route = await resolve_human_channel_recipient(db, agent_id, user_id, channel=channel)
         except RecipientResolutionError as exc:
-            return exc.as_json()
+            return exc.as_json(), IMDeliveryResult.failed(channel or "im", exc.code)
         config_result = await db.execute(
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
@@ -7476,33 +7863,54 @@ async def _send_file_to_recipient(
         )
         config = config_result.scalar_one_or_none()
     if not config:
-        return RecipientResolutionError(
+        error = RecipientResolutionError(
             "channel_unconfigured",
             f"Source agent has no configured {route.channel} channel",
-        ).as_json()
+        )
+        return error.as_json(), IMDeliveryResult.failed(route.channel, error.code)
     if route.channel == "feishu":
         return await _send_file_via_feishu(agent_id, config, file_path, route.member, route.user.display_name, message)
     if route.channel == "slack":
-        return await _send_file_via_slack(config, file_path, route.member, route.user.display_name, message)
-    return RecipientResolutionError(
+        return await _send_file_via_slack(
+            config, file_path, route.member, route.user.display_name, message
+        )
+    error = RecipientResolutionError(
         "file_route_unsupported",
         f"File delivery is not implemented for {route.channel}",
         available_channels=[route.channel],
-    ).as_json()
+    )
+    return error.as_json(), IMDeliveryResult.failed(route.channel, error.code)
 
 
 async def _send_file_via_feishu(
     agent_id, config, file_path: Path, member: OrgMember, display_name: str, message: str
-) -> str:
+) -> tuple[str, IMDeliveryResult]:
     """Send a file to an already-authorized internal Feishu endpoint."""
     receive_id = (member.external_id or member.open_id or "").strip()
     id_type = "user_id" if member.external_id else "open_id"
     if not receive_id:
-        return RecipientResolutionError(
+        error = RecipientResolutionError(
             "recipient_unreachable", "Canonical user has no usable Feishu endpoint"
-        ).as_json()
+        )
+        return error.as_json(), IMDeliveryResult.failed("feishu", error.code)
     from app.services.feishu_service import feishu_service
+    delivery_parts: list[IMDeliveryPart] = []
 
+    async def _record_result(artifact_role: str, provider_result: dict) -> None:
+        provider_id = str(
+            (provider_result.get("data") or {}).get("message_id")
+            or provider_result.get("message_id")
+            or ""
+        ) or None
+        part = IMDeliveryPart(
+            transport="feishu_message",
+            provider_message_id=provider_id,
+            conversation_ref=receive_id,
+            artifact_role=artifact_role,
+            recallable=bool(provider_id),
+        )
+        delivery_parts.append(part)
+        await record_channel_file_part(part)
     try:
         await feishu_service.upload_and_send_file(
             config.app_id,
@@ -7511,15 +7919,31 @@ async def _send_file_via_feishu(
             file_path,
             receive_id_type=id_type,
             accompany_msg=message,
+            on_result=_record_result,
         )
-        return f"File '{file_path.name}' sent to {display_name} via Feishu."
+        if not delivery_parts:
+            part = IMDeliveryPart(
+                transport="feishu_message",
+                conversation_ref=receive_id,
+                artifact_role="channel_file",
+                recallable=False,
+            )
+            delivery_parts.append(part)
+            await record_channel_file_part(part)
+        return (
+            f"File '{file_path.name}' sent to {display_name} via Feishu.",
+            IMDeliveryResult.sent("feishu", *delivery_parts),
+        )
+    except DeliveryReceiptPersistenceError:
+        raise
     except Exception as e:
         # If upload fails, try sending a download link as fallback
         import json as _j
         from app.config import get_settings as _gs
 
         _s = _gs()
-        base_url = getattr(_s, "BASE_URL", "").rstrip("/") or ""
+        safe_upload_error = sanitize_user_visible_text(str(e)).strip()[:200] or type(e).__name__
+        base_url = getattr(_s, 'BASE_URL', '').rstrip('/') or ''
         base_abs = _agent_workspace_root(agent_id).resolve()
         try:
             _rel = str(file_path.resolve().relative_to(base_abs))
@@ -7532,34 +7956,58 @@ async def _send_file_via_feishu(
             dl_url = f"{base_url}/api/agents/{agent_id}/files/download?path={_rel}"
             parts.append(f"{file_path.name}\n{dl_url}")
         parts.append(
-            f"File upload failed ({e}). If you need direct file sending, enable im:resource permission in Feishu."
+            f"File upload failed ({safe_upload_error}). If you need direct file sending, "
+            "enable im:resource permission in Feishu."
         )
         try:
-            await feishu_service.send_message(
-                config.app_id,
-                config.app_secret,
-                receive_id,
-                "text",
+            fallback_result = await feishu_service.send_message(
+                config.app_id, config.app_secret,
+                receive_id, "text",
                 _j.dumps({"text": "\n\n".join(parts)}, ensure_ascii=False),
                 receive_id_type=id_type,
             )
-            return f"File upload to Feishu failed, sent download link to {display_name} instead."
-        except Exception:
-            return f"Failed to send file to {display_name} via Feishu: {e}"
+            provider_id = str(
+                (fallback_result.get("data") or {}).get("message_id")
+                or fallback_result.get("message_id")
+                or ""
+            ) or None
+            part = IMDeliveryPart(
+                transport="feishu_message",
+                provider_message_id=provider_id,
+                conversation_ref=receive_id,
+                artifact_role="file_fallback",
+                recallable=bool(provider_id),
+            )
+            await record_channel_file_part(part)
+            return (
+                f"File upload to Feishu failed, sent download link to {display_name} instead.",
+                IMDeliveryResult.sent("feishu", part),
+            )
+        except Exception as fallback_exc:
+            return (
+                f"Failed to send file to {display_name} via Feishu: {e}",
+                IMDeliveryResult.from_exception("feishu", fallback_exc),
+            )
 
 
-async def _send_file_via_slack(config, file_path: Path, member: OrgMember, display_name: str, message: str) -> str:
+async def _send_file_via_slack(
+    config, file_path: Path, member: OrgMember, display_name: str, message: str
+) -> tuple[str, IMDeliveryResult]:
     """Send file to an already-authorized internal Slack endpoint."""
     import httpx
 
     bot_token = config.app_secret or ""
     if not bot_token:
-        return RecipientResolutionError("channel_unconfigured", "Slack bot token is missing").as_json()
+        error = RecipientResolutionError(
+            "channel_unconfigured", "Slack bot token is missing"
+        )
+        return error.as_json(), IMDeliveryResult.failed("slack", error.code)
     slack_user_id = (member.external_id or "").strip()
     if not slack_user_id:
-        return RecipientResolutionError(
+        error = RecipientResolutionError(
             "recipient_unreachable", "Canonical user has no usable Slack endpoint"
-        ).as_json()
+        )
+        return error.as_json(), IMDeliveryResult.failed("slack", error.code)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             # Open a DM channel
@@ -7570,7 +8018,8 @@ async def _send_file_via_slack(config, file_path: Path, member: OrgMember, displ
             )
             dm_data = dm_resp.json()
             if not dm_data.get("ok"):
-                return f"Slack conversations.open failed: {dm_data.get('error')}"
+                error = str(dm_data.get("error") or "conversations_open_failed")
+                return f"Slack conversations.open failed: {error}", IMDeliveryResult.failed("slack", error)
             channel_id = dm_data["channel"]["id"]
 
             # Upload file
@@ -7581,20 +8030,32 @@ async def _send_file_via_slack(config, file_path: Path, member: OrgMember, displ
             )
             ud = upload_url_resp.json()
             if not ud.get("ok"):
-                return f"Slack file upload failed: {ud.get('error')}"
-            await client.post(
-                ud["upload_url"], content=file_path.read_bytes(), headers={"Content-Type": "application/octet-stream"}
-            )
+                error = str(ud.get("error") or "file_upload_failed")
+                return f"Slack file upload failed: {error}", IMDeliveryResult.failed("slack", error)
+            await client.post(ud["upload_url"], content=file_path.read_bytes(),
+                            headers={"Content-Type": "application/octet-stream"})
             complete = await client.post(
                 "https://slack.com/api/files.completeUploadExternal",
                 headers={"Authorization": f"Bearer {bot_token}"},
                 json={"files": [{"id": ud["file_id"]}], "channel_id": channel_id, "initial_comment": message or ""},
             )
             if not complete.json().get("ok"):
-                return f"Slack file upload complete failed: {complete.json().get('error')}"
-            return f"File '{file_path.name}' sent to {display_name} via Slack."
+                error = str(complete.json().get("error") or "file_upload_complete_failed")
+                return f"Slack file upload complete failed: {error}", IMDeliveryResult.failed("slack", error)
+            part = IMDeliveryPart(
+                transport="slack_file",
+                provider_message_id=str(ud["file_id"]),
+                conversation_ref=channel_id,
+                artifact_role="channel_file",
+                recallable=False,
+            )
+            await record_channel_file_part(part)
+            return (
+                f"File '{file_path.name}' sent to {display_name} via Slack.",
+                IMDeliveryResult.sent("slack", part),
+            )
     except Exception as e:
-        return f"Failed to send file via Slack: {e}"
+        return f"Failed to send file via Slack: {e}", IMDeliveryResult.from_exception("slack", e)
 
 
 async def _execute_mcp_tool(
@@ -7624,7 +8085,7 @@ async def _execute_mcp_tool(
         )
 
         async with async_session() as db:
-            # Primary lookup: clawith-prefixed name (e.g.
+            # Primary lookup: legacy-prefixed name (e.g.
             # mcp_shibui_finance_unlock_financial_analysis).
             result = await db.execute(
                 select(Tool).where(Tool.name == tool_name, Tool.type == "mcp", Tool.enabled == True)
@@ -10012,7 +10473,9 @@ async def _send_feishu_message(
 ) -> str:
     """Send Feishu IM by canonical platform user_id."""
     canonical_user_id = (args.get("user_id") or "").strip()
-    message_text = (args.get("message") or "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
     if not canonical_user_id or not message_text:
         return "❌ Please provide canonical user_id and message content"
     try:
@@ -10039,20 +10502,6 @@ async def _send_feishu_message(
                 return RecipientResolutionError(
                     "recipient_unreachable", "Canonical user has no usable Feishu endpoint"
                 ).as_json()
-            try:
-                resp = await feishu_service.send_message(
-                    config.app_id,
-                    config.app_secret,
-                    receive_id=receive_id,
-                    msg_type="text",
-                    content=json.dumps({"text": message_text}, ensure_ascii=False),
-                    receive_id_type=receive_id_type,
-                )
-            except FeishuAPIError as exc:
-                return f"❌ Feishu send failed: {exc.user_message}"
-            if resp.get("code") != 0:
-                return f"❌ Feishu send failed: {resp.get('msg')} (code {resp.get('code')})"
-
             session = await find_or_create_channel_session(
                 db=db,
                 agent_id=agent_id,
@@ -10061,10 +10510,7 @@ async def _send_feishu_message(
                 source_channel="feishu",
                 first_message_title=f"[Agent → {route.user.display_name}]",
             )
-            external_message_id = (
-                str(((resp.get("data") or {}).get("message_id")) or resp.get("message_id") or "") or None
-            )
-            await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=route.user.id,
@@ -10077,10 +10523,55 @@ async def _send_feishu_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
-                external_message_id=external_message_id,
+                delivery_result=IMDeliveryResult.pending("feishu"),
             )
+            receipt_id = receipt.id
             await db.commit()
-            return f"✅ Message sent to {route.user.display_name} via Feishu"
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
+            try:
+                resp = await feishu_service.send_message(
+                    config.app_id,
+                    config.app_secret,
+                    receive_id=receive_id,
+                    msg_type="text",
+                    content=json.dumps({"text": message_text}, ensure_ascii=False),
+                    receive_id_type=receive_id_type,
+                )
+            except FeishuAPIError as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("feishu", exc),
+                )
+                return f"❌ Feishu send failed: {exc.user_message}"
+            if resp.get("code") != 0:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.failed("feishu", str(resp.get("code") or "send_failed")),
+                )
+                return f"❌ Feishu send failed: {resp.get('msg')} (code {resp.get('code')})"
+
+            external_message_id = str(
+                ((resp.get("data") or {}).get("message_id"))
+                or resp.get("message_id")
+                or ""
+            ) or None
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "feishu",
+                    IMDeliveryPart(
+                        transport="feishu_message",
+                        provider_message_id=external_message_id,
+                        conversation_ref=receive_id,
+                        recallable=bool(external_message_id),
+                    ),
+                ),
+            )
+            return (
+                f"✅ Message sent to {route.user.display_name} via Feishu\n"
+                f"message_id: {receipt_id}"
+            )
     except Exception as e:
         logger.exception("[Feishu] canonical send failed")
         return f"❌ Message send error: {str(e)[:200]}"
@@ -10352,8 +10843,12 @@ async def _persist_outbound_channel_message(
     origin_turn_anchor_id: uuid.UUID | None,
     external_message_id: str | None = None,
     delivery_status: str = "sent",
-) -> ChatMessage:
-    """Append/reuse the outbound receipt used by strict on_message binding."""
+    delivery_result: IMDeliveryResult | None = None,
+) -> tuple[ChatMessage, bool]:
+    """Atomically claim one outbound operation and return its send ownership."""
+    content = sanitize_user_visible_text(content or "").strip()
+    if not content:
+        raise ValueError("user-visible message must be non-empty after sanitization")
     operation_key = _build_outbound_operation_key(
         agent_id=agent_id,
         origin_session_id=origin_session_id,
@@ -10361,11 +10856,12 @@ async def _persist_outbound_channel_message(
         origin_turn_anchor_id=origin_turn_anchor_id,
     )
     if operation_key:
+        await _lock_outbound_operation(db, operation_key)
         existing = (
             await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == operation_key))
         ).scalar_one_or_none()
         if existing is not None:
-            return existing
+            return existing, False
 
     if origin_session_id and not origin_source_channel:
         try:
@@ -10375,6 +10871,55 @@ async def _persist_outbound_channel_message(
         if origin is not None:
             origin_source_channel = origin.source_channel
 
+    message_meta = {
+        "direction": "outbound",
+        "source_channel": source_channel,
+        "actor_ref": str(actor_ref),
+        "target_user_id": str(user_id or ""),
+        "target_session_id": str(session.id),
+        "target_name": str(target_name),
+        "origin_session_id": str(origin_session_id or ""),
+        "origin_source_channel": str(origin_source_channel or ""),
+        "tool_call_id": str(tool_call_id or ""),
+        "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+        "external_message_id": str(external_message_id or ""),
+        "delivery_status": delivery_status,
+    }
+    if delivery_result is None:
+        transport_by_channel = {
+            "dingtalk": "dingtalk_openapi_oto",
+            "feishu": "feishu_message",
+            "wecom": "wecom_app",
+            "slack": "slack",
+            "discord": "discord_gateway",
+            "teams": "microsoft_teams",
+            "microsoft_teams": "microsoft_teams",
+            "whatsapp": "whatsapp_cloud",
+            "wechat": "wechat_ilink",
+            "web": "websocket",
+            "miniprogram": "websocket",
+            "wechat_miniprogram": "websocket",
+        }
+        transport = transport_by_channel.get(source_channel, "websocket")
+        recallable_transports = {
+            "dingtalk_openapi_oto",
+            "feishu_message",
+            "wecom_app",
+            "slack",
+            "discord_gateway",
+            "microsoft_teams",
+        }
+        delivery_result = IMDeliveryResult.sent(
+            source_channel,
+            IMDeliveryPart(
+                transport=transport,
+                provider_message_id=external_message_id,
+                conversation_ref=str(actor_ref),
+                recallable=bool(external_message_id) and transport in recallable_transports,
+            ),
+        )
+    message_meta = attach_delivery_to_meta(message_meta, delivery_result)
+
     row = ChatMessage(
         agent_id=agent_id,
         user_id=user_id,
@@ -10382,25 +10927,19 @@ async def _persist_outbound_channel_message(
         content=content,
         conversation_id=str(session.id),
         external_event_key=operation_key,
-        message_meta={
-            "direction": "outbound",
-            "source_channel": source_channel,
-            "actor_ref": str(actor_ref),
-            "target_user_id": str(user_id or ""),
-            "target_session_id": str(session.id),
-            "target_name": str(target_name),
-            "origin_session_id": str(origin_session_id or ""),
-            "origin_source_channel": str(origin_source_channel or ""),
-            "tool_call_id": str(tool_call_id or ""),
-            "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
-            "external_message_id": str(external_message_id or ""),
-            "delivery_status": delivery_status,
-        },
+        message_meta=message_meta,
     )
     db.add(row)
     session.last_message_at = datetime.now(timezone.utc)
     await db.flush()
-    return row
+    return row, True
+
+
+def _duplicate_outbound_claim_result(receipt: ChatMessage) -> str:
+    return (
+        "⏳ This delivery is already claimed and will not be sent twice.\n"
+        f"message_id: {receipt.id}"
+    )
 
 
 _SESSION_MESSAGE_CAPABILITIES = {
@@ -10432,6 +10971,7 @@ def _session_message_result(
     is_group: bool,
     legacy_group_contract: bool,
     mentioned_users: list[str] | None = None,
+    message_id: str | None = None,
 ) -> str:
     if legacy_group_contract:
         payload = {
@@ -10450,7 +10990,20 @@ def _session_message_result(
         }
     if mentioned_users:
         payload["mentioned_users"] = mentioned_users
+    if message_id:
+        payload["message_id"] = message_id
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _session_receipt_replay_status(receipt: ChatMessage) -> str:
+    meta = receipt.message_meta if isinstance(receipt.message_meta, dict) else {}
+    delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+    status = str(delivery.get("status") or meta.get("delivery_status") or "unknown")
+    if status == "sent":
+        return "already_sent"
+    if status in {"pending", "failed", "unknown", "partial"}:
+        return status
+    return "unknown"
 
 
 async def _send_exact_session_message(
@@ -10465,7 +11018,9 @@ async def _send_exact_session_message(
 ) -> str:
     """Authorize and send text through one exact human ChatSession route."""
     raw_session_id = str(args.get("session_id") or "").strip()
-    message_text = str(args.get("message") or "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
     raw_mention_user_ids = args.get("mention_user_ids")
     if not raw_session_id:
         qualifier = "group " if require_group else ""
@@ -10510,13 +11065,14 @@ async def _send_exact_session_message(
                 if existing is not None:
                     meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
                     return _session_message_result(
-                        status="already_sent",
+                        status=_session_receipt_replay_status(existing),
                         session_id=str(existing.conversation_id),
                         channel=str(meta.get("source_channel") or ""),
                         target_name=str(meta.get("target_name") or target_name),
                         is_group=bool(meta.get("target_is_group", require_group)),
                         legacy_group_contract=legacy_group_contract,
                         mentioned_users=list(meta.get("mentioned_users") or []),
+                        message_id=str(existing.id),
                     )
 
             conditions = [
@@ -10604,7 +11160,6 @@ async def _send_exact_session_message(
                 "agent_id": agent_id,
                 "runtime": runtime,
                 "message": message_for_delivery,
-                "require_transport": True,
                 "allow_wecom_group_actor_fallback": False,
             }
             if dingtalk_at_user_ids:
@@ -10614,14 +11169,7 @@ async def _send_exact_session_message(
                         "dingtalk_session_webhook": dingtalk_session_webhook,
                     }
                 )
-            delivered = await deliver_message_to_runtime(
-                **delivery_kwargs,
-            )
-            if not delivered:
-                label = "Group message" if target_is_group else "Session message"
-                return f"❌ {label} delivery failed via {target_channel}; no receipt was persisted."
-
-            receipt = await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=target_user_id,
@@ -10634,14 +11182,47 @@ async def _send_exact_session_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending(target_channel),
             )
-            receipt_meta = dict(receipt.message_meta or {})
-            receipt_meta["target_is_group"] = target_is_group
-            if mentioned_names:
-                receipt_meta["mention_user_ids"] = mention_user_ids
-                receipt_meta["mentioned_users"] = mentioned_names
-            receipt.message_meta = receipt_meta
+            if should_deliver:
+                receipt_meta = dict(receipt.message_meta or {})
+                receipt_meta["target_is_group"] = target_is_group
+                if mentioned_names:
+                    receipt_meta["mention_user_ids"] = mention_user_ids
+                    receipt_meta["mentioned_users"] = mentioned_names
+                receipt.message_meta = receipt_meta
+            receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _session_message_result(
+                    status=_session_receipt_replay_status(receipt),
+                    session_id=str(receipt.conversation_id),
+                    channel=target_channel,
+                    target_name=target_name,
+                    is_group=target_is_group,
+                    legacy_group_contract=legacy_group_contract,
+                    mentioned_users=mentioned_names,
+                    message_id=str(receipt.id),
+                )
+
+        # The provider call runs outside the row/advisory lock. The pending
+        # receipt above is the durable idempotency claim and crash marker.
+        async def _record_part(part: IMDeliveryPart) -> None:
+            await append_delivery_part(receipt_id, part)
+
+        delivery_kwargs["on_part"] = _record_part
+        try:
+            delivery_result = await deliver_message_with_receipt(**delivery_kwargs)
+        except Exception as exc:
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.from_exception(target_channel, exc),
+            )
+            raise
+        await register_delivery(receipt_id, delivery_result)
+        if not delivery_result.ok:
+            label = "Group message" if target_is_group else "Session message"
+            return f"❌ {label} delivery failed via {target_channel}; receipt status is failed."
 
         if target_channel not in _PLATFORM_SESSION_CHANNELS:
             try:
@@ -10668,6 +11249,7 @@ async def _send_exact_session_message(
             is_group=target_is_group,
             legacy_group_contract=legacy_group_contract,
             mentioned_users=mentioned_names,
+            message_id=str(receipt_id),
         )
     except Exception as exc:
         logger.opt(exception=True).error(
@@ -10728,7 +11310,9 @@ async def _send_channel_message(
 ) -> str:
     """Send an external-channel message by canonical platform user_id."""
     canonical_user_id = str(args.get("user_id") or "").strip()
-    message_text = (args.get("message") or "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
     raw_target_channel = (args.get("channel") or "").strip().lower()
     target_channel = "teams" if raw_target_channel == "microsoft_teams" else raw_target_channel
 
@@ -10873,6 +11457,42 @@ async def _send_dingtalk_message(
             # Get agent_id from extra_config (required for DingTalk API)
             agent_id_dingtalk = config.extra_config.get("agent_id") if config.extra_config else None
 
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_r.scalar_one_or_none()
+            platform_user = await get_platform_user_by_org_member(
+                db=db,
+                org_member=target_member,
+                agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+            )
+            conv_id = f"dingtalk_p2p_{user_id}"
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                external_conv_id=conv_id,
+                source_channel="dingtalk",
+                first_message_title=message_text[:30],
+            )
+            receipt, should_deliver = await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                session=sess,
+                content=message_text,
+                source_channel="dingtalk",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("dingtalk"),
+            )
+            receipt_id = receipt.id
+            await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
+
             # 3. Send message via DingTalk service
             result = await send_dingtalk_message(
                 app_id=config.app_id,
@@ -10883,56 +11503,28 @@ async def _send_dingtalk_message(
             )
 
             if result.get("errcode") == 0:
-                try:
-                    # Get agent tenant context
-                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                    agent_obj = agent_r.scalar_one_or_none()
-
-                    # Get or create platform user from OrgMember (unified logic)
-                    platform_user = await get_platform_user_by_org_member(
-                        db=db,
-                        org_member=target_member,
-                        agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
-                    )
-
-                    conv_id = f"dingtalk_p2p_{user_id}"
-                    # 2. Get/Create session
-                    sess = await find_or_create_channel_session(
-                        db=db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        external_conv_id=conv_id,
-                        source_channel="dingtalk",
-                        first_message_title=message_text[:30],
-                    )
-                    await _persist_outbound_channel_message(
-                        db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        session=sess,
-                        content=message_text,
-                        source_channel="dingtalk",
-                        actor_ref=str(user_id),
-                        target_name=member_name,
-                        origin_session_id=origin_session_id,
-                        origin_source_channel=None,
-                        tool_call_id=tool_call_id,
-                        origin_turn_anchor_id=origin_turn_anchor_id,
-                        external_message_id=str(result.get("task_id") or result.get("processQueryKey") or "") or None,
-                    )
-                    await db.commit()
-                    logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
-                except Exception as ex:
-                    logger.error(f"[DingTalk] Failed to save proactive message to session: {ex}")
-                    return (
-                        f"❌ The message reached {member_name}, but its platform routing "
-                        "receipt was not persisted. No exact on_message subscription was armed."
-                    )
-
-                return f"✅ Message sent to {member_name} via DingTalk"
+                process_key = str(result.get("processQueryKey") or "") or None
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.sent(
+                        "dingtalk",
+                        IMDeliveryPart(
+                            transport="dingtalk_openapi_oto",
+                            provider_message_id=process_key,
+                            conversation_ref=str(user_id),
+                            recallable=bool(process_key),
+                        ),
+                    ),
+                )
+                logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
+                return f"✅ Message sent to {member_name} via DingTalk\nmessage_id: {receipt_id}"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
                 logger.error(f"[DingTalk] Send failed: {result}")
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.failed("dingtalk", str(result.get("errcode") or errmsg)),
+                )
                 return f"❌ DingTalk send failed: {errmsg}"
 
     except Exception as e:
@@ -10977,6 +11569,42 @@ async def _send_wecom_message(
 
             logger.info(f"[WeCom] Sending to user_id: {user_id}")
 
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent = agent_r.scalar_one_or_none()
+            platform_user = await get_platform_user_by_org_member(
+                db=db,
+                org_member=target_member,
+                agent_tenant_id=agent.tenant_id if agent else None,
+            )
+            conv_id = f"wecom_p2p_{user_id}"
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                external_conv_id=conv_id,
+                source_channel="wecom",
+                first_message_title=message_text[:30],
+            )
+            receipt, should_deliver = await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                session=sess,
+                content=message_text,
+                source_channel="wecom",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("wecom"),
+            )
+            receipt_id = receipt.id
+            await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
+
             # 3. Send message via WeCom service
             result = await send_wecom_message(
                 config.app_id,
@@ -10987,56 +11615,28 @@ async def _send_wecom_message(
             )
 
             if result.get("errcode") == 0:
-                # Save proactive message to session so it appears in UI
-                try:
-                    # Get agent tenant context
-                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                    agent = agent_r.scalar_one_or_none()
-
-                    # Get or create platform user from OrgMember (unified logic)
-                    platform_user = await get_platform_user_by_org_member(
-                        db=db,
-                        org_member=target_member,
-                        agent_tenant_id=agent.tenant_id if agent else None,
-                    )
-
-                    conv_id = f"wecom_p2p_{user_id}"
-                    sess = await find_or_create_channel_session(
-                        db=db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        external_conv_id=conv_id,
-                        source_channel="wecom",
-                        first_message_title=message_text[:30],
-                    )
-                    await _persist_outbound_channel_message(
-                        db,
-                        agent_id=agent_id,
-                        user_id=platform_user.id,
-                        session=sess,
-                        content=message_text,
-                        source_channel="wecom",
-                        actor_ref=str(user_id),
-                        target_name=member_name,
-                        origin_session_id=origin_session_id,
-                        origin_source_channel=None,
-                        tool_call_id=tool_call_id,
-                        origin_turn_anchor_id=origin_turn_anchor_id,
-                        external_message_id=str(result.get("msgid") or "") or None,
-                    )
-                    await db.commit()
-                    logger.info(f"[WeCom] Proactive message saved to session {sess.id}")
-                except Exception as ex:
-                    logger.error(f"[WeCom] Failed to save proactive message to session: {ex}")
-                    return (
-                        f"❌ The message reached {member_name}, but its platform routing "
-                        "receipt was not persisted. No exact on_message subscription was armed."
-                    )
-
-                return f"✅ Message sent to {member_name} via WeCom"
+                msgid = str(result.get("msgid") or "") or None
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.sent(
+                        "wecom",
+                        IMDeliveryPart(
+                            transport="wecom_app",
+                            provider_message_id=msgid,
+                            conversation_ref=str(user_id),
+                            recallable=bool(msgid),
+                        ),
+                    ),
+                )
+                logger.info(f"[WeCom] Proactive message saved to session {sess.id}")
+                return f"✅ Message sent to {member_name} via WeCom\nmessage_id: {receipt_id}"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
                 logger.error(f"[WeCom] Send failed: {result}")
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.failed("wecom", str(result.get("errcode") or errmsg)),
+                )
                 return f"❌ WeCom send failed: {errmsg}"
 
     except Exception as e:
@@ -11096,49 +11696,82 @@ async def _send_slack_message(
             if not channel_id:
                 return f"❌ Slack DM channel unavailable for {member_name}"
 
-            await _send_slack_messages(bot_token, channel_id, message_text)
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_r.scalar_one_or_none()
+            platform_user = await get_platform_user_by_org_member(
+                db=db,
+                org_member=target_member,
+                agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+            )
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                external_conv_id=f"slack_{channel_id}",
+                source_channel="slack",
+                first_message_title=message_text[:30],
+            )
+            receipt, should_deliver = await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=platform_user.id,
+                session=sess,
+                content=message_text,
+                source_channel="slack",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("slack"),
+            )
+            receipt_id = receipt.id
+            await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
+
+            async def _record_slack_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="slack",
+                    provider_message_id=str(response.get("ts") or "") or None,
+                    conversation_ref=str(response.get("channel") or channel_id),
+                    artifact_role="chunk",
+                    recallable=bool(response.get("ts")),
+                )
+                await append_delivery_part(receipt_id, part)
 
             try:
-                agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                agent_obj = agent_r.scalar_one_or_none()
-                platform_user = await get_platform_user_by_org_member(
-                    db=db,
-                    org_member=target_member,
-                    agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+                slack_responses = await _send_slack_messages(
+                    bot_token,
+                    channel_id,
+                    message_text,
+                    on_result=_record_slack_part,
                 )
-                conv_id = f"slack_{channel_id}"
-                sess = await find_or_create_channel_session(
-                    db=db,
-                    agent_id=agent_id,
-                    user_id=platform_user.id,
-                    external_conv_id=conv_id,
-                    source_channel="slack",
-                    first_message_title=message_text[:30],
+            except Exception as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("slack", exc),
                 )
-                await _persist_outbound_channel_message(
-                    db,
-                    agent_id=agent_id,
-                    user_id=platform_user.id,
-                    session=sess,
-                    content=message_text,
-                    source_channel="slack",
-                    actor_ref=str(user_id),
-                    target_name=member_name,
-                    origin_session_id=origin_session_id,
-                    origin_source_channel=None,
-                    tool_call_id=tool_call_id,
-                    origin_turn_anchor_id=origin_turn_anchor_id,
-                )
-                await db.commit()
-                logger.info(f"[Slack] Proactive message saved to session {sess.id}")
-            except Exception as ex:
-                logger.error(f"[Slack] Failed to save proactive message to session: {ex}")
-                return (
-                    f"❌ The message reached {member_name}, but its platform routing "
-                    "receipt was not persisted. No exact on_message subscription was armed."
-                )
-
-            return f"✅ Message sent to {member_name} via Slack"
+                raise
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "slack",
+                    *(
+                        IMDeliveryPart(
+                            transport="slack",
+                            provider_message_id=str(response.get("ts") or "") or None,
+                            conversation_ref=str(response.get("channel") or channel_id),
+                            artifact_role="chunk",
+                            recallable=bool(response.get("ts")),
+                        )
+                        for response in slack_responses
+                    ),
+                ),
+            )
+            logger.info(f"[Slack] Proactive message saved to session {sess.id}")
+            return f"✅ Message sent to {member_name} via Slack\nmessage_id: {receipt_id}"
     except Exception as e:
         logger.exception("[Slack] Error")
         return f"❌ Slack message error: {str(e)[:200]}"
@@ -11199,18 +11832,8 @@ async def _send_teams_channel_message(
             if not conversation_id:
                 return f"❌ Teams proactive send to {member_name} requires them to message the bot first"
 
-            await _send_teams_message(
-                config,
-                conversation_id,
-                {
-                    "type": "message",
-                    "text": message_text,
-                    "conversation": {"id": conversation_id},
-                },
-            )
-
             actor_ref = str(target_member.external_id or target_member.open_id or platform_user.id)
-            await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -11223,10 +11846,60 @@ async def _send_teams_channel_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("microsoft_teams"),
             )
+            receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
+
+            async def _record_teams_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="microsoft_teams",
+                    provider_message_id=str(response.get("id") or "") or None,
+                    conversation_ref=conversation_id,
+                    artifact_role="chunk",
+                    recallable=bool(response.get("id")),
+                    metadata={"service_url": service_url},
+                )
+                await append_delivery_part(receipt_id, part)
+
+            try:
+                teams_responses = await _send_teams_message(
+                    config,
+                    conversation_id,
+                    {
+                        "type": "message",
+                        "text": message_text,
+                        "conversation": {"id": conversation_id},
+                    },
+                    on_result=_record_teams_part,
+                )
+            except Exception as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("microsoft_teams", exc),
+                )
+                raise
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "microsoft_teams",
+                    *(
+                        IMDeliveryPart(
+                            transport="microsoft_teams",
+                            provider_message_id=str(response.get("id") or "") or None,
+                            conversation_ref=conversation_id,
+                            artifact_role="chunk",
+                            recallable=bool(response.get("id")),
+                            metadata={"service_url": service_url},
+                        )
+                        for response in teams_responses
+                    ),
+                ),
+            )
             logger.info(f"[Teams] Proactive message saved to session {session.id}")
-            return f"✅ Message sent to {member_name} via Teams"
+            return f"✅ Message sent to {member_name} via Teams\nmessage_id: {receipt_id}"
     except Exception as e:
         logger.exception("[Teams] Error")
         return f"❌ Teams message error: {str(e)[:200]}"
@@ -11279,15 +11952,6 @@ async def _send_wechat_channel_message(
             if not token:
                 return "❌ WeChat bot token is missing"
 
-            await send_wechat_text_message(
-                token=token,
-                base_url=base_url,
-                to_user_id=user_id,
-                context_token=context_token,
-                text=message_text,
-                route_tag=route_tag,
-            )
-
             agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent_obj = agent_r.scalar_one_or_none()
             platform_user = await get_platform_user_by_org_member(
@@ -11303,7 +11967,7 @@ async def _send_wechat_channel_message(
                 source_channel="wechat",
                 first_message_title=message_text[:30],
             )
-            await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
@@ -11316,10 +11980,57 @@ async def _send_wechat_channel_message(
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
+                delivery_result=IMDeliveryResult.pending("wechat"),
             )
+            receipt_id = receipt.id
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
+
+            async def _record_wechat_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="wechat_ilink",
+                    provider_message_id=str(response.get("client_id") or "") or None,
+                    conversation_ref=user_id,
+                    artifact_role="chunk",
+                    recallable=False,
+                )
+                await append_delivery_part(receipt_id, part)
+
+            try:
+                wechat_responses = await send_wechat_text_message(
+                    token=token,
+                    base_url=base_url,
+                    to_user_id=user_id,
+                    context_token=context_token,
+                    text=message_text,
+                    route_tag=route_tag,
+                    on_result=_record_wechat_part,
+                )
+            except Exception as exc:
+                await register_delivery(
+                    receipt_id,
+                    IMDeliveryResult.from_exception("wechat", exc),
+                )
+                raise
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.sent(
+                    "wechat",
+                    *(
+                        IMDeliveryPart(
+                            transport="wechat_ilink",
+                            provider_message_id=str(response.get("client_id") or "") or None,
+                            conversation_ref=user_id,
+                            artifact_role="chunk",
+                            recallable=False,
+                        )
+                        for response in wechat_responses
+                    ),
+                ),
+            )
             logger.info(f"[WeChat] Proactive message saved to session {sess.id}")
-            return f"✅ Message sent to {member_name} via WeChat"
+            return f"✅ Message sent to {member_name} via WeChat\nmessage_id: {receipt_id}"
     except Exception as e:
         logger.exception("[WeChat] Error")
         return f"❌ WeChat message error: {str(e)[:200]}"
@@ -11336,7 +12047,9 @@ async def _send_platform_message(
 ) -> str:
     """Send a proactive message to a first-party platform user."""
     canonical_user_id = str(args.get("user_id") or "").strip()
-    message_text = args.get("message", "").strip()
+    message_text = sanitize_user_visible_text(
+        str(args.get("message") or "")
+    ).strip()
 
     if not canonical_user_id or not message_text:
         return "❌ Please provide canonical user_id and message content"
@@ -11356,7 +12069,7 @@ async def _send_platform_message(
 
             session = await ensure_primary_platform_session(db, agent_id, target_user.id)
 
-            await _persist_outbound_channel_message(
+            receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
                 user_id=target_user.id,
@@ -11370,21 +12083,24 @@ async def _send_platform_message(
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=origin_turn_anchor_id,
             )
-            try:
-                from app.api.websocket import maybe_mark_session_read_for_active_viewer
+            if should_deliver:
+                try:
+                    from app.api.websocket import maybe_mark_session_read_for_active_viewer
 
-                await maybe_mark_session_read_for_active_viewer(
-                    db,
-                    agent_id=agent_id,
-                    session_id=str(session.id),
-                    user_id=target_user.id,
-                )
-            except Exception:
-                pass
+                    await maybe_mark_session_read_for_active_viewer(
+                        db,
+                        agent_id=agent_id,
+                        session_id=str(session.id),
+                        user_id=target_user.id,
+                    )
+                except Exception:
+                    pass
             await db.commit()
+            if not should_deliver:
+                return _duplicate_outbound_claim_result(receipt)
 
-            # Push via WebSocket if user has an active connection
             try:
+                # Push via WebSocket if user has an active connection
                 from app.api.websocket import manager as ws_manager
 
                 await ws_manager.send_to_user(
@@ -14295,7 +15011,7 @@ async def _handle_set_trigger(
         # Resolve via resolve_base_url (the same tenant-aware resolver used by
         # list_triggers and the agent's "Platform Base URLs" prompt) so the URL
         # stays consistent across the system and never falls back to a
-        # placeholder domain like try.clawith.ai.
+        # placeholder domain from a legacy deployment.
         if ttype == "webhook":
             from app.core.domain import resolve_base_url
             from app.models.agent import Agent as _AgentModel
@@ -14316,7 +15032,7 @@ async def _handle_set_trigger(
                 "1) External services — give the URL to the user to configure in GitHub/Grafana/etc.; "
                 "a POST wakes you up with the payload.\n\n"
                 "2) Collect info from a standalone page you generate — your report/HTML pages are hosted "
-                "independently (outside the main app). Inject the Clawith SDK and that page can "
+                "independently (outside the main app). Inject the platform SDK and that page can "
                 "(a) identify whoever opens it via company OAuth (incl. mobile), and (b) POST any info "
                 "collected on the page back to THIS hook to wake you. Add to the HTML <head>:\n"
                 f'   <script src="/sdk/clawith.js" data-hook="{hook_token}"></script>\n'
@@ -19916,7 +20632,7 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
       - env        → workspace: download_file(remote_path, local_workspace_path) [single SDK call]
       - env A      → env B:    download to /tmp/<uuid>, upload to env B, cleanup /tmp [transparent]
 
-    The 'local' side of the SDK calls is always the Clawith backend server,
+    The 'local' side of the SDK calls is always the platform backend server,
     which has access to the agent workspace directory.
     """
     if not agent_id:
@@ -20676,7 +21392,7 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 try:
                     owner_user_id = uuid.UUID(str(owner_user_raw))
                 except (TypeError, ValueError):
-                    return "Invalid user_id format. Use a canonical Clawith User UUID."
+                    return "Invalid user_id format. Use a canonical platform User UUID."
                 result = await db.execute(
                     select(UserModel.id).where(
                         UserModel.id == owner_user_id,
@@ -20690,7 +21406,7 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 try:
                     owner_agent_id = uuid.UUID(str(owner_agent_raw))
                 except (TypeError, ValueError):
-                    return "Invalid agent_id format. Use a canonical Clawith Agent UUID."
+                    return "Invalid agent_id format. Use a canonical platform Agent UUID."
                 result = await db.execute(
                     select(AgentModel.id).where(
                         AgentModel.id == owner_agent_id,
@@ -20967,7 +21683,7 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
                 try:
                     target_user_id = uuid.UUID(str(target_user_raw))
                 except (TypeError, ValueError):
-                    return "Invalid user_id format. Use a canonical Clawith User UUID."
+                    return "Invalid user_id format. Use a canonical platform User UUID."
                 target_result = await db.execute(
                     select(UserModel.id).where(
                         UserModel.id == target_user_id,
@@ -20981,7 +21697,7 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
                 try:
                     target_agent_id = uuid.UUID(str(target_agent_raw))
                 except (TypeError, ValueError):
-                    return "Invalid agent_id format. Use a canonical Clawith Agent UUID."
+                    return "Invalid agent_id format. Use a canonical platform Agent UUID."
                 target_result = await db.execute(
                     select(AgentModel.id).where(
                         AgentModel.id == target_agent_id,

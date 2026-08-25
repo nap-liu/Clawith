@@ -1094,7 +1094,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_platform_message",
         "display_name": "Platform Message",
-        "description": "Send a proactive message to a user on the Clawith first-party platform (web or app). The message appears in their platform chat history and is pushed in real-time if they are online.",
+        "description": "Send a proactive message to a first-party platform user (web or app). The message appears in their platform chat history and is pushed in real-time if they are online.",
         "category": "communication",
         "icon": "🌐",
         "is_default": True,
@@ -1129,10 +1129,36 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "recall_message",
+        "display_name": "Recall Message",
+        "description": (
+            "Recall one message previously sent by this digital employee through any IM channel. "
+            "Use only the exact local message_id returned by send_session_message/send_channel_message "
+            "or shown by read_session_messages. Never guess a message ID. Unsupported provider paths "
+            "return a normalized unsupported result without deleting local audit history."
+        ),
+        "category": "communication",
+        "icon": "undo",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "string",
+                    "description": "Exact local ChatMessage UUID of the outbound assistant message.",
+                },
+            },
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "send_session_message",
         "display_name": "Session Message",
         "description": (
-            "Send text only to one human conversation that already exists in Clawith. "
+            "Send text only to one human conversation that already exists on the platform. "
             "Provide the exact session_id returned by list_sessions/search_sessions; the existing "
             "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
             "discovers a person, selects or changes a channel, sends files, or contacts another "
@@ -2075,7 +2101,7 @@ BUILTIN_TOOLS = [
                 "file_path": {"type": "string", "description": "Workspace-relative path to image file"},
                 "url": {"type": "string", "description": "Public URL of image to upload"},
                 "file_name": {"type": "string", "description": "Custom filename (optional)"},
-                "folder": {"type": "string", "description": "CDN folder path (default /clawith)"},
+                "folder": {"type": "string", "description": "Optional CDN folder path"},
             },
         },
         "config": {"private_key": "", "url_endpoint": ""},
@@ -2317,7 +2343,7 @@ BUILTIN_TOOLS = [
                     "label": "Extra Headers JSON",
                     "type": "textarea",
                     "default": "",
-                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Clawith\"\n}",
+                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Platform App\"\n}",
                     "advanced": True,
                 },
                 {
@@ -2501,9 +2527,10 @@ BUILTIN_TOOLS = [
         "name": "list_installed_mcp_servers",
         "display_name": "List Installed MCP Servers",
         "description": (
-            "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. "
-            "No arguments are needed. For MCP bindings installed by you, the platform also returns the installation "
-            "config saved on your own binding. Shared server credentials are never inferred or copied into the result."
+            "List a concise summary of every MCP server currently assigned to you. Each item includes the exact "
+            "mcp_server_id required by refresh_mcp_server and uninstall_mcp_server, display name, transport, tool "
+            "counts, and uninstallability. Tool definitions and installation credentials are intentionally omitted "
+            "because your available MCP tools are already provided separately."
         ),
         "category": "discovery",
         "icon": "📋",
@@ -2930,12 +2957,12 @@ BUILTIN_TOOLS = [
                 "user_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith User UUID. Omit for company or agent objectives.",
+                    "description": "Canonical platform User UUID. Omit for company or agent objectives.",
                 },
                 "agent_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith Agent UUID. Omit for company or user objectives.",
+                    "description": "Canonical platform Agent UUID. Omit for company or user objectives.",
                 },
                 "period_start": {
                     "type": "string",
@@ -3136,12 +3163,12 @@ BUILTIN_TOOLS = [
                 "user_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith User UUID for a natural person.",
+                    "description": "Canonical platform User UUID for a natural person.",
                 },
                 "agent_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith Agent UUID for a digital employee.",
+                    "description": "Canonical platform Agent UUID for a digital employee.",
                 },
                 "source": {
                     "type": "string",
@@ -3170,7 +3197,7 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_id": {"type": "string", "description": "Recipient's canonical Clawith user_id. Provider IDs are resolved internally."},
+                "user_id": {"type": "string", "description": "Recipient's canonical platform user_id. Provider IDs are resolved internally."},
                 "message": {"type": "string", "description": "Message content to send"},
             },
             "required": ["user_id", "message"],

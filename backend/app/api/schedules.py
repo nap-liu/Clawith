@@ -20,6 +20,7 @@ from app.models.schedule import AgentSchedule
 from app.models.user import User
 from app.services.project_service import project_runtime_allows_agent
 from app.services.scheduler import compute_next_run
+from app.services.user_output import sanitize_user_visible_text
 
 router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
 
@@ -109,7 +110,8 @@ async def create_schedule(
     # Validate cron expression
     next_run = compute_next_run(data.cron_expr)
     if not next_run:
-        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {data.cron_expr}")
+        safe_cron_expr = sanitize_user_visible_text(data.cron_expr)
+        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {safe_cron_expr}")
 
     sched = AgentSchedule(
         agent_id=agent_id,

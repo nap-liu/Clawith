@@ -1531,8 +1531,8 @@ async def wecom_org_sync_verify(
 
     Configure URL in WeCom: {BASE_URL}/api/enterprise/org/wecom-verify/{provider_id}
 
-    Required provider config keys (set via Clawith WeCom config page):
-      - verify_token:   the Token string set in both WeCom and Clawith
+    Required provider config keys (set via the platform WeCom config page):
+      - verify_token:   the Token string set in both WeCom and the platform
       - verify_aes_key: the EncodingAESKey provided by WeCom (43 chars, base64url)
     """
     from fastapi.responses import Response as _Response
@@ -1585,7 +1585,7 @@ async def wecom_callback_verify_universal(
     Used to unlock the 企业可信IP configuration in the WeCom admin console.
     Unlike the provider-based endpoint, this accepts the verify_token in the URL
     path and the EncodingAESKey as a query parameter, so any tenant can use the
-    publicly accessible server (e.g. try.clawith.ai) regardless of which server
+    publicly accessible server regardless of which server
     the WeCom provider is actually configured on.
 
     URL format to configure in WeCom App → 接收消息服务器URL:

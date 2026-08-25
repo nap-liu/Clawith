@@ -3155,7 +3155,7 @@
         "list_triggers": "List all your active triggers with details.",
         "send_file_to_agent": "Send a file to a specific person or back to the current conversation.",
         "send_feishu_message": "Send a message to a Feishu user or group.",
-        "send_platform_message": "Send a proactive message to a user on the Clawith platform (web or app).",
+        "send_platform_message": "Send a proactive message to a user on the first-party platform (web or app).",
         "send_message_to_agent": "Send a message to a digital employee colleague and receive a reply.",
         "web_search": "Search the internet using a configurable search engine.",
         "jina_search": "Search the internet using Jina AI.",
@@ -3266,7 +3266,7 @@
           "step2": "Add the same Redirect URL shown below to the Authorized redirect URIs in Google Cloud Console.",
           "step3": "SSO login will use this same OAuth configuration directly.",
           "step4": "For organization sync, click Authorize below using a Google Workspace admin account that has Directory read permission.",
-          "step5": "Clawith will encrypt and store the admin refresh token. Subsequent scheduled syncs will automatically refresh the access token."
+          "step5": "The platform will encrypt and store the admin refresh token. Subsequent scheduled syncs will automatically refresh the access token."
         }
       },
       "companyUrl": "Company URL",
@@ -3399,7 +3399,7 @@
         "syncTitle": "1. User Directory Sync",
         "syncDesc": "Directory sync via the contacts secret works for fetching user IDs. However, fetching full user details (name, avatar, email) requires the self-built app's IP to be whitelisted in WeCom — a setting that must be configured by the WeCom enterprise admin.",
         "ssoTitle": "2. SSO Login (Single Sign-On)",
-        "ssoDesc": "WeCom OAuth requires the callback domain to be ICP-filed with a business entity matching the WeCom enterprise's registration. The platform domain (clawith.ai) is a .ai TLD which cannot be ICP-filed in mainland China, making SSO unavailable on the current domain. Requires either an ICP-filed .com/.cn domain or WeCom ISV (service provider) registration.",
+        "ssoDesc": "WeCom OAuth requires the callback domain to be ICP-filed with a business entity matching the WeCom enterprise's registration. The current platform uses a .ai domain, which cannot be ICP-filed in mainland China. Use an ICP-filed .com/.cn domain or WeCom ISV registration.",
         "messagingTitle": "3. Proactive 1-to-1 Messaging (AI-initiated)",
         "messagingDesc": "Sending messages to individual users requires a valid WeCom API access token, which can only be obtained from a server IP that has been whitelisted in the self-built app's settings. Unlike Feishu, WeCom mandates IP-level restrictions on all API calls — there is no token-only authentication option.",
         "footerText": "Due to the above constraints, WeCom integration currently cannot be easily set up by most users. We are actively exploring alternative approaches — including WeCom ISV (service provider) registration and lower-friction API options — or we may advocate for WeCom to relax these restrictions for SaaS platforms. Configuration will be re-enabled once a viable path is available."
@@ -3445,7 +3445,7 @@
       "ssoDisabledHint": "Seamless enterprise login via Single Sign-On.",
       "ssoDomain": "Custom Access Domain",
       "ssoDomainDesc": "The custom domain users will use to log in via SSO.",
-      "ssoDomainPlaceholder": "e.g. acme.clawith.com",
+      "ssoDomainPlaceholder": "e.g. login.example.com",
       "ssoIpConflict": "In IP mode, only one company can enable SSO; another company is already using it.",
       "ssoTitle": "Enterprise SSO",
       "ssoToggleFailed": "Failed to toggle SSO"
@@ -3467,16 +3467,16 @@
       "saved": "Email templates saved",
       "emailVerification": "Email Verification Code",
       "emailVerificationDesc": "Sent when a user registers and needs to verify their email address.",
-      "emailVerificationSubject": "Verify your Clawith email address",
-      "emailVerificationBody": "Hello {{display_name}},\n\nWelcome to Clawith! Please use the following 6-digit code to verify your email address:\n\nVerification code: {{verification_code}}\n\nThis code expires in {{expiry_minutes}} minutes. If you did not create an account, you can ignore this email.",
+      "emailVerificationSubject": "Verify your platform email address",
+      "emailVerificationBody": "Hello {{display_name}},\n\nWelcome! Please use the following 6-digit code to verify your email address:\n\nVerification code: {{verification_code}}\n\nThis code expires in {{expiry_minutes}} minutes. If you did not create an account, you can ignore this email.",
       "passwordReset": "Password Reset",
       "passwordResetDesc": "Sent when a user requests to reset their password.",
-      "passwordResetSubject": "Reset your Clawith password",
-      "passwordResetBody": "Hello {{display_name}},\n\nWe received a request to reset your Clawith password.\n\nReset link: {{reset_url}}\n\nThis link expires in {{expiry_minutes}} minutes. If you did not request this, you can ignore this email.",
+      "passwordResetSubject": "Reset your platform password",
+      "passwordResetBody": "Hello {{display_name}},\n\nWe received a request to reset your platform password.\n\nReset link: {{reset_url}}\n\nThis link expires in {{expiry_minutes}} minutes. If you did not request this, you can ignore this email.",
       "companyInvitation": "Company Invitation",
       "companyInvitationDesc": "Sent when an admin invites a user to join their company.",
-      "companyInvitationSubject": "{{inviter_name}} invited you to join {{company_name}} on Clawith",
-      "companyInvitationBody": "Hello,\n\n{{inviter_name}} has invited you to join their team '{{company_name}}' on Clawith.\n\nTo accept the invitation and create your account, please click the link below:\n\n{{invite_url}}\n\nIf you don't want to join this team or didn't expect this invitation, you can ignore this email.",
+      "companyInvitationSubject": "{{inviter_name}} invited you to join {{company_name}}",
+      "companyInvitationBody": "Hello,\n\n{{inviter_name}} has invited you to join their team '{{company_name}}' on the platform.\n\nTo accept the invitation and create your account, please click the link below:\n\n{{invite_url}}\n\nIf you don't want to join this team or didn't expect this invitation, you can ignore this email.",
       "clickToInsert": "Click to copy variable"
     },
     "timezone": {
@@ -3815,7 +3815,7 @@
     "basicTitle": "Link OpenClaw Agent",
     "createBtn": "Link Agent",
     "namePlaceholder": "e.g. My OpenClaw Bot",
-    "nativeDesc": "Full agent running on Clawith platform",
+    "nativeDesc": "Full agent running on this platform",
     "nativeTitle": "Platform Hosted",
     "openclawDesc": "Connect your existing OpenClaw agent",
     "openclawTitle": "Link OpenClaw",
@@ -3915,7 +3915,7 @@
     "wechat": {
       "step1": "Click Generate QR Code below to request a fresh WeChat iLink login QR.",
       "step2": "Open WeChat on your phone and scan the QR code, then confirm the bot login on the device.",
-      "step3": "After confirmation, Clawith stores the returned bot token and starts the getupdates long-poll worker automatically.",
+      "step3": "After confirmation, the platform stores the returned bot token and starts the getupdates long-poll worker automatically.",
       "step4": "Send a direct message to the linked WeChat iLink bot to verify inbound polling and outbound replies.",
       "note": "This channel follows the iLink Bot protocol: QR login, token-based long polling, and replies bound to the incoming context_token."
     },
@@ -4068,7 +4068,7 @@
     "ssoConfigDesc": "Configure SSO and custom domain for this company.",
     "ssoEnabled": "Enable SSO",
     "ssoDomain": "Custom Access Domain",
-    "ssoDomainPlaceholder": "e.g. acme.clawith.com",
+    "ssoDomainPlaceholder": "e.g. login.example.com",
     "publicUrl": {
       "title": "Public URL",
       "desc": "The external URL used for webhook callbacks and published page links. Include the protocol (e.g. https://example.com)."
@@ -4176,7 +4176,7 @@
     "nativeTitle": "Create custom teammate",
     "externalTitle": "Link external agent",
     "nativeSubtitle": "Start with the essentials; tune the rest in settings later.",
-    "externalSubtitle": "Create a Clawith connection for an externally running agent.",
+    "externalSubtitle": "Create a platform connection for an externally running agent.",
     "nativeMode": "Platform hosted",
     "externalMode": "External agent",
     "name": "Name",
@@ -4205,7 +4205,7 @@
     "configureModels": "Configure models",
     "creationFailed": "Creation failed",
     "externalCreated": "Connection created",
-    "externalCreatedDesc": "Send the setup instruction below to the external agent so it can sync with Clawith through the gateway.",
+    "externalCreatedDesc": "Send the setup instruction below to the external agent so it can sync with the platform through the gateway.",
     "gatewayKeyEmbedded": "The API key is included in the setup instruction",
     "copyKey": "Copy key",
     "noKeyReturned": "No API key was returned. Open the agent page and generate one there.",

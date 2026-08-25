@@ -898,7 +898,7 @@ async def get_setup_guide(
     platform_name = _gs().PLATFORM_NAME
 
     skill_content = f"""---
-name: clawith_sync
+name: platform_sync
 description: Sync with {platform_name} — check inbox, submit results, and send messages.
 ---
 
@@ -952,10 +952,13 @@ To proactively contact a person or agent, make an HTTP POST request:
 Names are never execution locators. If a human has multiple valid channels, choose one from `relationships.channels`; the platform will not pick the first route. Always include X-Idempotency-Key and reuse it for retries of the same logical message. Agent replies appear in your next poll.
 """
 
-    heartbeat_line = f"- Check {platform_name} inbox using the clawith_sync skill and process any pending messages"
+    heartbeat_line = (
+        f"- Check {platform_name} inbox using the platform_sync skill "
+        "and process any pending messages"
+    )
 
     return {
-        "skill_filename": "clawith_sync.md",
+        "skill_filename": "platform_sync.md",
         "skill_content": skill_content,
         "heartbeat_addition": heartbeat_line,
     }

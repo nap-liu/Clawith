@@ -57,6 +57,83 @@ def _build_wecom_conv_id(sender_id: str, chat_id: str, chat_type: str) -> str:
     return f"wecom_p2p_{sender_id}"
 
 
+async def _persist_wecom_stream_control(
+    *,
+    agent_id: uuid.UUID,
+    sender_id: str,
+    chat_id: str,
+    chat_type: str,
+    message: str,
+    artifact_role: str,
+    send: Callable[[str], Awaitable[None]],
+) -> None:
+    """Persist and deliver one exact WeCom stream control artifact."""
+    from app.models.agent import Agent
+    from app.services.channel_session import find_or_create_channel_session
+    from app.services.channel_user_service import channel_user_service
+    from app.services.im_delivery import (
+        IMDeliveryPart,
+        IMDeliveryResult,
+        persist_and_deliver_message,
+    )
+
+    normalized_type = (chat_type or "single").strip().lower()
+    is_group = normalized_type in {"group", "groupchat", "group_chat"} and bool(chat_id)
+    conv_id = (
+        _build_wecom_conv_id(sender_id, chat_id, normalized_type)
+        if sender_id
+        else "__control_wecom_stream_unknown_sender"
+    )
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        if agent is None:
+            raise RuntimeError("wecom_stream_agent_not_found")
+        if sender_id:
+            platform_user = await channel_user_service.resolve_channel_user(
+                db=db,
+                agent=agent,
+                channel_type="wecom",
+                external_user_id=sender_id,
+                extra_info={"display_name": f"WeCom {sender_id[:8]}"},
+            )
+            platform_user_id = platform_user.id
+        else:
+            platform_user_id = agent.creator_id
+        session = await find_or_create_channel_session(
+            db=db,
+            agent_id=agent_id,
+            user_id=agent.creator_id if is_group else platform_user_id,
+            external_conv_id=conv_id,
+            source_channel="wecom",
+            first_message_title=message,
+            is_group=is_group,
+            group_name=f"WeCom Group {chat_id[:8]}" if is_group else None,
+        )
+        session_id = str(session.id)
+        await db.commit()
+
+    async def _deliver(delivery_message: str, on_part) -> IMDeliveryResult:
+        await send(delivery_message)
+        part = IMDeliveryPart(
+            transport="wecom_aibot_stream",
+            conversation_ref=conv_id,
+            artifact_role=artifact_role,
+            recallable=False,
+        )
+        await on_part(part)
+        return IMDeliveryResult.sent("wecom", part)
+
+    await persist_and_deliver_message(
+        agent_id=agent_id,
+        user_id=platform_user_id,
+        conversation_id=session_id,
+        channel="wecom",
+        message=message,
+        artifact_role=artifact_role,
+        deliver=_deliver,
+    )
+
+
 class WeComStreamManager:
     """Manages WeCom AI Bot WebSocket clients for all agents."""
 
@@ -119,6 +196,9 @@ class WeComStreamManager:
 
             # ── Message handler: text ──
             async def on_text(frame):
+                sender_id = ""
+                chat_id = ""
+                chat_type = "single"
                 try:
                     body = frame.body or {}
                     text_obj = body.get("text", {})
@@ -133,11 +213,26 @@ class WeComStreamManager:
                             f"body_keys={list(body.keys())}"
                         )
                         stream_id = generate_req_id("stream")
-                        await client.reply_stream(
-                            frame,
-                            stream_id,
-                            "Unable to identify the sender for this WeCom message.",
-                            finish=True,
+                        identity_error = (
+                            "Unable to identify the sender for this WeCom message."
+                        )
+
+                        async def _send_identity_error(output: str) -> None:
+                            await client.reply_stream(
+                                frame,
+                                stream_id,
+                                output,
+                                finish=True,
+                            )
+
+                        await _persist_wecom_stream_control(
+                            agent_id=agent_id,
+                            sender_id="",
+                            chat_id="",
+                            chat_type="single",
+                            message=identity_error,
+                            artifact_role="identity_error_ack",
+                            send=_send_identity_error,
                         )
                         return
 
@@ -157,7 +252,10 @@ class WeComStreamManager:
                     #   群聊 → wecom_group_{chat_id}  (不含 sender_id,避免不同成员开多会话)
                     #   P2P  → wecom_p2p_{sender_id}
                     conv_id = _build_wecom_conv_id(sender_id, chat_id, chat_type)
-                    from app.services.channel_commands import is_channel_command, handle_channel_command
+                    from app.services.channel_commands import (
+                        is_channel_command,
+                        prepare_channel_command_reply,
+                    )
                     from app.services.channel_dispatch import (
                         ChannelReactions,
                         channel_session_lock_key,
@@ -170,17 +268,42 @@ class WeComStreamManager:
                     # archive the session and reply inline — no LLM, no lock needed.
                     if is_channel_command(user_text):
                         async with async_session() as _cmd_db:
-                            cmd_result = await handle_channel_command(
+                            cmd_result = await prepare_channel_command_reply(
                                 db=_cmd_db, command=user_text, agent_id=agent_id,
                                 user_id=None, external_conv_id=conv_id,
+                                external_user_id=sender_id,
                                 source_channel="wecom",
+                                provider_event_id=str(
+                                    body.get("msgid")
+                                    or body.get("msg_id")
+                                    or body.get("message_id")
+                                    or ""
+                                ),
                                 is_group=is_group_msg,
                             )
                             await _cmd_db.commit()
+                        if not cmd_result["should_deliver"]:
+                            return
                         _stream_id_cmd = generate_req_id("stream")
-                        await client.reply_stream(
-                            frame, _stream_id_cmd, cmd_result["message"], finish=True
-                        )
+                        from app.services.im_delivery import IMDeliveryResult, register_delivery
+                        try:
+                            await client.reply_stream(
+                                frame, _stream_id_cmd, cmd_result["message"], finish=True
+                            )
+                            await register_delivery(
+                                cmd_result["message_id"],
+                                IMDeliveryResult.unsupported_delivery(
+                                    "wecom",
+                                    "wecom_aibot_stream",
+                                    conversation_ref=conv_id,
+                                ),
+                            )
+                        except Exception as exc:
+                            await register_delivery(
+                                cmd_result["message_id"],
+                                IMDeliveryResult.from_exception("wecom", exc),
+                            )
+                            raise
                         return
 
                     # _work 包裹完整的「用户行写入 → LLM → 回复」全程,reply_stream 留
@@ -192,7 +315,7 @@ class WeComStreamManager:
                         async def _send_thinking_text(text: str) -> None:
                             await client.reply_stream(frame, _stream_id, text, finish=False)
 
-                        reply_text = await _process_wecom_stream_message(
+                        reply_text, assistant_message_id = await _process_wecom_stream_message(
                             agent_id=agent_id,
                             sender_id=sender_id,
                             user_text=user_text,
@@ -207,7 +330,24 @@ class WeComStreamManager:
                             )
                             or None,
                         )
-                        await client.reply_stream(frame, _stream_id, reply_text, finish=True)
+                        from app.services.im_delivery import (
+                            IMDeliveryResult,
+                            register_delivery,
+                        )
+
+                        try:
+                            await client.reply_stream(frame, _stream_id, reply_text, finish=True)
+                            delivery_result = IMDeliveryResult.unsupported_delivery(
+                                "wecom",
+                                "wecom_aibot_stream",
+                                conversation_ref=sender_id,
+                            )
+                        except Exception as exc:
+                            delivery_result = IMDeliveryResult.from_exception("wecom", exc)
+                            raise
+                        finally:
+                            if assistant_message_id is not None:
+                                await register_delivery(assistant_message_id, delivery_result)
                         logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
                         return reply_text or ""
 
@@ -222,10 +362,21 @@ class WeComStreamManager:
                     traceback.print_exc()
                     try:
                         stream_id = generate_req_id("stream")
-                        await client.reply_stream(
-                            frame, stream_id,
-                            f"Processing error: {str(e)[:100]}",
-                            finish=True,
+                        error_message = f"Processing error: {str(e)[:100]}"
+
+                        async def _send_error(output: str) -> None:
+                            await client.reply_stream(
+                                frame, stream_id, output, finish=True
+                            )
+
+                        await _persist_wecom_stream_control(
+                            agent_id=agent_id,
+                            sender_id=sender_id,
+                            chat_id=chat_id,
+                            chat_type=chat_type,
+                            message=error_message,
+                            artifact_role="error_ack",
+                            send=_send_error,
                         )
                     except Exception:
                         pass
@@ -235,12 +386,23 @@ class WeComStreamManager:
                 try:
                     body = frame.body or {}
                     sender_id = _extract_wecom_sender_id(body)
+                    chat_id = _extract_wecom_chat_id(body)
+                    chat_type = _extract_wecom_chat_type(body)
                     logger.info(f"[WeCom Stream] Image message from {sender_id} (not yet handled)")
                     stream_id = generate_req_id("stream")
-                    await client.reply_stream(
-                        frame, stream_id,
-                        "Received your image. Image processing is not yet supported.",
-                        finish=True,
+                    ack = "Received your image. Image processing is not yet supported."
+
+                    async def _send_image_ack(output: str) -> None:
+                        await client.reply_stream(frame, stream_id, output, finish=True)
+
+                    await _persist_wecom_stream_control(
+                        agent_id=agent_id,
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        message=ack,
+                        artifact_role="image_ack",
+                        send=_send_image_ack,
                     )
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error handling image: {e}")
@@ -250,12 +412,23 @@ class WeComStreamManager:
                 try:
                     body = frame.body or {}
                     sender_id = _extract_wecom_sender_id(body)
+                    chat_id = _extract_wecom_chat_id(body)
+                    chat_type = _extract_wecom_chat_type(body)
                     logger.info(f"[WeCom Stream] File message from {sender_id} (not yet handled)")
                     stream_id = generate_req_id("stream")
-                    await client.reply_stream(
-                        frame, stream_id,
-                        "Received your file. File processing is not yet supported.",
-                        finish=True,
+                    ack = "Received your file. File processing is not yet supported."
+
+                    async def _send_file_ack(output: str) -> None:
+                        await client.reply_stream(frame, stream_id, output, finish=True)
+
+                    await _persist_wecom_stream_control(
+                        agent_id=agent_id,
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        message=ack,
+                        artifact_role="file_ack",
+                        send=_send_file_ack,
                     )
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error handling file: {e}")
@@ -263,16 +436,31 @@ class WeComStreamManager:
             # ── Enter chat event: send welcome ──
             async def on_enter_chat(frame):
                 try:
+                    body = frame.body or {}
+                    sender_id = _extract_wecom_sender_id(body)
+                    chat_id = _extract_wecom_chat_id(body)
+                    chat_type = _extract_wecom_chat_type(body)
                     # Look up agent's welcome message
                     from app.models.agent import Agent as AgentModel
                     async with async_session() as db:
                         r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                         agent = r.scalar_one_or_none()
                         welcome = (agent.welcome_message if agent else None) or "Hello! How can I help you?"
-                    await client.reply_welcome(frame, {
-                        "msgtype": "text",
-                        "text": {"content": welcome},
-                    })
+                    async def _send_welcome(output: str) -> None:
+                        await client.reply_welcome(frame, {
+                            "msgtype": "text",
+                            "text": {"content": output},
+                        })
+
+                    await _persist_wecom_stream_control(
+                        agent_id=agent_id,
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        message=welcome,
+                        artifact_role="welcome",
+                        send=_send_welcome,
+                    )
                     logger.info(f"[WeCom Stream] Sent welcome message for agent {agent_id}")
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error sending welcome: {e}")
@@ -479,17 +667,21 @@ async def _process_wecom_stream_message(
                 provider_event_id,
                 len(ingested.execution_ids),
             )
-            return ""
+            return "", None
 
         # Call LLM
         _thinking_chunks: list[str] = []
 
-        async def _noop_thinking_sender(_: str) -> None:
-            return None
-
-        _thinking_sender = BufferedIMThinkingSender(
+        _thinking_sender = BufferedIMThinkingSender.for_callback(
             enabled=send_thinking_text is not None and resolve_im_thinking_enabled(agent_obj, sess),
-            send_text=send_thinking_text or _noop_thinking_sender,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            conversation_id=session_conv_id,
+            channel="wecom",
+            transport="wecom_aibot_stream",
+            conversation_ref=conv_id,
+            send_text=send_thinking_text or (lambda _: asyncio.sleep(0)),
+            turn_anchor_id=ingested.message.id,
         )
 
         async def _collect_thinking(text: str) -> None:
@@ -514,11 +706,15 @@ async def _process_wecom_stream_message(
         # analysis card.
         from app.services.chat_history import persist_assistant_reply
         from app.database import async_session as _areply_session
-        await persist_assistant_reply(
+        from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+        assistant_message_id = await persist_assistant_reply(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
             thinking="".join(_thinking_chunks) or None,
+            message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("wecom")),
             turn_anchor_id=ingested.message.id,
+            required=True,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
@@ -531,7 +727,7 @@ async def _process_wecom_stream_message(
             detail={"channel": "wecom", "user_text": user_text[:200], "reply": reply_text[:500]},
         )
 
-    return reply_text
+    return reply_text, assistant_message_id
 
 
 wecom_stream_manager = WeComStreamManager()

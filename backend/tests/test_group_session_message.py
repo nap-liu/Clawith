@@ -23,6 +23,7 @@ from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
 from app.services import agent_tools, turn_runtime
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
 from app.services.tool_seeder import seed_builtin_tools
 from app.services.turn_runtime import TurnRuntime
 
@@ -240,12 +241,19 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return True
+        return IMDeliveryResult.sent(
+            kwargs["runtime"].source_channel,
+            IMDeliveryPart(
+                transport="dingtalk_openapi_group",
+                provider_message_id="provider-group-1",
+                conversation_ref=kwargs["runtime"].external_conv_id,
+            ),
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
     result = await agent_tools._send_group_session_message(
@@ -257,6 +265,8 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
     )
 
     payload = json.loads(result)
+    message_id = payload.pop("message_id")
+    assert uuid.UUID(message_id)
     assert payload == {
         "status": "sent",
         "session_id": str(target.id),
@@ -273,7 +283,6 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
         is_group=True,
     )
     assert delivered[0]["message"] == "版本今晚发布"
-    assert delivered[0]["require_transport"] is True
     assert delivered[0]["allow_wecom_group_actor_fallback"] is False
 
     async with async_session() as db:
@@ -309,12 +318,19 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return True
+        return IMDeliveryResult.sent(
+            kwargs["runtime"].source_channel,
+            IMDeliveryPart(
+                transport=f"{channel}_test",
+                provider_message_id="provider-person-1",
+                conversation_ref=kwargs["runtime"].external_conv_id,
+            ),
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
     result = await agent_tools._send_session_message(
@@ -325,7 +341,10 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
         origin_turn_anchor_id=uuid.uuid4(),
     )
 
-    assert json.loads(result) == {
+    payload = json.loads(result)
+    message_id = payload.pop("message_id")
+    assert uuid.UUID(message_id)
+    assert payload == {
         "status": "sent",
         "session_id": str(target.id),
         "channel": channel,
@@ -376,7 +395,7 @@ async def test_send_session_message_rejects_person_session_after_relationship_re
     async def fail_if_delivered(**_kwargs):
         raise AssertionError("revoked relationship must block exact-Session delivery")
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_delivered)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_delivered)
     result = await agent_tools._send_session_message(
         owner.id,
         {"session_id": str(target.id), "message": "should not send"},
@@ -413,7 +432,7 @@ async def test_send_group_session_message_rejects_invalid_target_boundaries(monk
         calls += 1
         return True
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_delivered)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_delivered)
 
     result = await agent_tools._send_group_session_message(
         owner.id,
@@ -438,12 +457,18 @@ async def test_send_group_session_message_replay_is_idempotent(monkeypatch):
     async def fake_deliver(**_kwargs):
         nonlocal call_count
         call_count += 1
-        return True
+        return IMDeliveryResult.sent(
+            "dingtalk",
+            IMDeliveryPart(
+                transport="dingtalk_openapi_group",
+                provider_message_id="provider-idempotent-1",
+            ),
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     kwargs = {
         "origin_session_id": str(uuid.uuid4()),
@@ -468,14 +493,68 @@ async def test_send_group_session_message_replay_is_idempotent(monkeypatch):
     assert len(receipts) == 1
 
 
-async def test_failed_transport_does_not_persist_target_receipt(monkeypatch):
+async def test_send_group_session_message_concurrent_replay_reports_pending(monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    call_count = 0
+
+    async def blocked_deliver(**_kwargs):
+        nonlocal call_count
+        call_count += 1
+        provider_started.set()
+        await release_provider.wait()
+        return IMDeliveryResult.sent(
+            "dingtalk",
+            IMDeliveryPart(
+                transport="dingtalk_openapi_group",
+                provider_message_id="provider-concurrent-1",
+            ),
+        )
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", blocked_deliver)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+    kwargs = {
+        "origin_session_id": str(uuid.uuid4()),
+        "tool_call_id": "same-concurrent-tool-call",
+        "origin_turn_anchor_id": uuid.uuid4(),
+    }
+
+    first_task = asyncio.create_task(
+        agent_tools._send_group_session_message(
+            owner.id,
+            {"session_id": str(target.id), "message": "only once"},
+            **kwargs,
+        )
+    )
+    await asyncio.wait_for(provider_started.wait(), timeout=2)
+    replay = json.loads(
+        await agent_tools._send_group_session_message(
+            owner.id,
+            {"session_id": str(target.id), "message": "only once"},
+            **kwargs,
+        )
+    )
+    release_provider.set()
+    first = json.loads(await asyncio.wait_for(first_task, timeout=3))
+
+    assert replay["status"] == "pending"
+    assert first["status"] == "sent"
+    assert call_count == 1
+
+
+async def test_failed_transport_persists_failed_lifecycle_receipt(monkeypatch):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
 
     async def fake_failure(**_kwargs):
-        return False
+        return IMDeliveryResult.failed("dingtalk", "provider_rejected")
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_failure)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_failure)
     result = await agent_tools._send_group_session_message(
         owner.id,
         {"session_id": str(target.id), "message": "provider rejects this"},
@@ -489,7 +568,8 @@ async def test_failed_transport_does_not_persist_target_receipt(monkeypatch):
         receipts = (
             (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == str(target.id)))).scalars().all()
         )
-    assert receipts == []
+    assert len(receipts) == 1
+    assert receipts[0].message_meta["delivery"]["status"] == "failed"
 
 
 async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypatch):
@@ -525,13 +605,17 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return True
+        return IMDeliveryResult.unsupported_delivery(
+            "dingtalk",
+            "dingtalk_session_webhook",
+            conversation_ref=kwargs["runtime"].external_conv_id,
+        )
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr(agent_tools, "resolve_human_channel_recipient", fake_resolve)
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
     result = await agent_tools._send_group_session_message(
@@ -654,7 +738,7 @@ async def test_dingtalk_group_mention_requires_recent_group_webhook(monkeypatch)
     async def fail_if_called(**_kwargs):
         raise AssertionError("delivery must not run without a temporary group webhook")
 
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_called)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_called)
     result = await agent_tools._send_group_session_message(
         owner.id,
         {
@@ -746,10 +830,11 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
             "conversation_type": conversation_type,
             "cover": kwargs.get("cover_image_path"),
         })
+        await kwargs["on_result"]({"processQueryKey": "group-video-process-key"})
         return True, "MEDIA_SENT"
 
     async def fake_caption(**_kwargs):
-        return True
+        return IMDeliveryResult.sent("dingtalk")
 
     live_events = []
 
@@ -760,7 +845,7 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
         "app.services.dingtalk_stream._send_dingtalk_native_video",
         fake_video,
     )
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_caption)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_caption)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     kwargs = {
         "agent_id": owner.id,
@@ -833,6 +918,11 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
     assert receipt.message_meta["target_is_group"] is True
     assert receipt.message_meta["display_title"] == "示例媒体标题"
     assert receipt.message_meta["delivery_claim"] is True
+    assert receipt.message_meta["delivery"]["status"] == "sent"
+    assert receipt.message_meta["delivery"]["parts"][0]["provider_message_id"] == (
+        "group-video-process-key"
+    )
+    assert receipt.message_meta["delivery"]["parts"][0]["recall_status"] == "available"
     assert "delivery_claim" not in caption_row.message_meta
     stored_render = json.loads(json.loads(receipt.content)["result"])
     assert stored_render["message_id"] == str(receipt.id)
@@ -867,7 +957,7 @@ async def test_send_media_caption_failure_is_preserved_on_replay(tmp_path, monke
         return True, "MEDIA_SENT"
 
     async def fail_caption(**_kwargs):
-        return False
+        return IMDeliveryResult.failed("dingtalk", "caption_failed")
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
@@ -876,7 +966,7 @@ async def test_send_media_caption_failure_is_preserved_on_replay(tmp_path, monke
         "app.services.dingtalk_stream._send_dingtalk_native_video",
         fake_video,
     )
-    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_caption)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_caption)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     kwargs = {
         "agent_id": owner.id,
@@ -1020,13 +1110,14 @@ async def test_live_media_delivery_holds_replay_until_one_sent_terminal(
     provider_calls = []
     live_events = []
 
-    async def blocked_provider(*_args, **_kwargs):
+    async def blocked_provider(*_args, **kwargs):
         lifecycle_connection = agent_tools._outbound_media_connection.get()
         assert lifecycle_connection is not None
         assert lifecycle_connection.in_transaction() is False
         provider_calls.append(True)
         provider_started.set()
         await release_provider.wait()
+        await kwargs["on_result"]({"processQueryKey": "live-lock-process-key"})
         return True, "MEDIA_SENT"
 
     async def fake_live_mirror(*args, **_kwargs):
@@ -1121,7 +1212,7 @@ async def test_media_lifecycle_reuses_one_connection_and_leaves_pool_capacity(
     release_provider = asyncio.Event()
     provider_count = 0
 
-    async def blocked_provider(*_args, **_kwargs):
+    async def blocked_provider(*_args, **kwargs):
         nonlocal provider_count
         lifecycle_connection = agent_tools._outbound_media_connection.get()
         assert lifecycle_connection is not None
@@ -1130,6 +1221,9 @@ async def test_media_lifecycle_reuses_one_connection_and_leaves_pool_capacity(
         if provider_count == 2:
             both_in_provider.set()
         await release_provider.wait()
+        await kwargs["on_result"](
+            {"processQueryKey": f"pool-process-key-{provider_count}"}
+        )
         return True, "MEDIA_SENT"
 
     async def fake_live_mirror(*_args, **_kwargs):
@@ -1432,6 +1526,212 @@ async def test_send_media_pending_claim_replay_never_calls_provider(tmp_path, mo
             )
         ).scalar_one()
     assert receipt.message_meta["delivery_status"] == "unknown"
+
+
+async def test_send_channel_media_sanitizes_native_visible_fields(tmp_path, monkeypatch):
+    forbidden = "cla" + "with"
+    media = tmp_path / "demo.mp4"
+    media.write_bytes(b"video")
+    captured = {}
+
+    async def no_tool_config(*_args, **_kwargs):
+        return {}
+
+    async def capture_native(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", no_tool_config)
+    monkeypatch.setattr(agent_tools, "_sniff_media_file_mime", lambda _path: "video/mp4")
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", capture_native)
+
+    await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        tmp_path,
+        {
+            "media_type": "video",
+            "file_path": "demo.mp4",
+            "session_id": str(uuid.uuid4()),
+            "message": f"caption {forbidden.upper()}",
+            "title": f"title {forbidden}",
+        },
+        media_kind="video",
+        tool_call_id="sanitized-native-media",
+    )
+
+    assert forbidden not in captured["caption"].lower()
+    assert forbidden not in str(captured["tool_args"]).lower()
+
+
+async def test_send_channel_media_sanitizes_platform_visible_fields(monkeypatch):
+    forbidden = "cla" + "with"
+    captured = {}
+
+    async def allow_url(url, **_kwargs):
+        return url
+
+    async def no_tool_config(*_args, **_kwargs):
+        return {}
+
+    async def capture_platform(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "validate_media_url", allow_url)
+    monkeypatch.setattr(agent_tools, "_get_tool_config", no_tool_config)
+    monkeypatch.setattr(agent_tools, "_publish_external_media_to_session", capture_platform)
+
+    await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        ws=agent_tools.WORKSPACE_ROOT,
+        arguments={
+            "media_type": "video",
+            "url": "https://media.example/demo.mp4",
+            "url_mode": "external",
+            "session_id": str(uuid.uuid4()),
+            "message": f"caption {forbidden}",
+            "title": f"title {forbidden.upper()}",
+        },
+        media_kind="video",
+        tool_call_id="sanitized-platform-media",
+    )
+
+    assert forbidden not in captured["caption"].lower()
+    assert forbidden not in str(captured["tool_args"]).lower()
+
+
+async def test_send_channel_file_terminal_receipt_replay_never_calls_provider(
+    tmp_path, monkeypatch
+):
+    owner, _ = await _seed_agents()
+    origin = await _seed_session(owner.id, channel="web", is_group=True)
+    call_id = "file-terminal-replay"
+    turn_anchor_id = uuid.uuid4()
+    async with async_session() as db:
+        row = ChatMessage(
+            agent_id=owner.id,
+            user_id=origin.user_id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_channel_file",
+                "call_id": call_id,
+                "args": {"file_path": "workspace/report.pdf"},
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(origin.id),
+            message_meta={"turn_anchor_id": str(turn_anchor_id)},
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    claimed = await agent_tools._claim_channel_file_receipt(
+        agent_id=owner.id,
+        tool_call_id=call_id,
+        origin_session_id=str(origin.id),
+        origin_turn_anchor_id=turn_anchor_id,
+    )
+    assert claimed == row_id
+    assert await agent_tools.register_delivery(
+        row_id,
+        IMDeliveryResult.unsupported_delivery("slack", "slack_file"),
+    )
+
+    workspace = tmp_path / str(owner.id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 test")
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    provider_calls = []
+
+    async def should_not_send(*_args, **_kwargs):
+        provider_calls.append(True)
+        return IMDeliveryResult.unsupported_delivery("slack", "slack_file")
+
+    token = agent_tools.channel_file_sender.set(should_not_send)
+    try:
+        result = await agent_tools._send_channel_file(
+            owner.id,
+            workspace,
+            {"file_path": "workspace/report.pdf"},
+            tool_call_id=call_id,
+            origin_session_id=str(origin.id),
+            origin_turn_anchor_id=turn_anchor_id,
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert "receipt unavailable" in result
+    assert provider_calls == []
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row_id)
+    assert stored.message_meta["delivery"]["status"] == "sent"
+
+
+async def test_send_channel_file_persists_first_part_before_later_timeout(
+    tmp_path, monkeypatch
+):
+    owner, _ = await _seed_agents()
+    origin = await _seed_session(owner.id, channel="web", is_group=True)
+    call_id = "file-partial-timeout"
+    turn_anchor_id = uuid.uuid4()
+    async with async_session() as db:
+        row = ChatMessage(
+            agent_id=owner.id,
+            user_id=origin.user_id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_channel_file",
+                "call_id": call_id,
+                "args": {"file_path": "workspace/report.pdf"},
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(origin.id),
+            message_meta={"turn_anchor_id": str(turn_anchor_id)},
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    workspace = tmp_path / str(owner.id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 test")
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+
+    async def partial_sender(*_args, **_kwargs):
+        await agent_tools.record_channel_file_part(IMDeliveryPart(
+            transport="dingtalk_openapi_oto",
+            provider_message_id="first-provider-part",
+            conversation_ref="staff-1",
+            artifact_role="channel_file",
+        ))
+        raise TimeoutError("second part timed out")
+
+    token = agent_tools.channel_file_sender.set(partial_sender)
+    try:
+        result = await agent_tools._send_channel_file(
+            owner.id,
+            workspace,
+            {"file_path": "workspace/report.pdf"},
+            tool_call_id=call_id,
+            origin_session_id=str(origin.id),
+            origin_turn_anchor_id=turn_anchor_id,
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert "Failed to send file" in result
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row_id)
+    delivery = stored.message_meta["delivery"]
+    assert delivery["status"] == "partial"
+    assert delivery["uncertain"] is True
+    assert [part["provider_message_id"] for part in delivery["parts"]] == [
+        "first-provider-part"
+    ]
 
 
 async def test_send_media_pending_standard_tool_call_replay_becomes_visible_unknown_error(
@@ -1850,12 +2150,16 @@ async def test_wecom_group_failure_never_falls_back_to_personal_message(monkeypa
 async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
     owner, _ = await _seed_agents()
     async with async_session() as db:
-        existing_tool_id = (
-            await db.execute(select(Tool.id).where(Tool.name == "send_group_session_message"))
-        ).scalar_one_or_none()
-        if existing_tool_id is not None:
-            await db.execute(delete(AgentTool).where(AgentTool.tool_id == existing_tool_id))
-            await db.execute(delete(Tool).where(Tool.id == existing_tool_id))
+        existing_tool_ids = (
+            await db.execute(
+                select(Tool.id).where(
+                    Tool.name.in_({"send_group_session_message", "recall_message"})
+                )
+            )
+        ).scalars().all()
+        if existing_tool_ids:
+            await db.execute(delete(AgentTool).where(AgentTool.tool_id.in_(existing_tool_ids)))
+            await db.execute(delete(Tool).where(Tool.id.in_(existing_tool_ids)))
         db.add(
             ChannelConfig(
                 agent_id=owner.id,
@@ -1869,18 +2173,21 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
 
     await seed_builtin_tools()
     async with async_session() as db:
-        assignment = (
-            await db.execute(
-                select(AgentTool)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id == owner.id,
-                    AgentTool.enabled.is_(True),
-                    Tool.name == "send_group_session_message",
+        assigned_names = set(
+            (
+                await db.execute(
+                    select(Tool.name)
+                    .select_from(AgentTool)
+                    .join(Tool, Tool.id == AgentTool.tool_id)
+                    .where(
+                        AgentTool.agent_id == owner.id,
+                        AgentTool.enabled.is_(True),
+                        Tool.name.in_({"send_group_session_message", "recall_message"}),
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-    assert assignment is not None
+            ).scalars().all()
+        )
+    assert assigned_names == {"send_group_session_message", "recall_message"}
 
     tools = await agent_tools.get_agent_tools_for_llm(owner.id)
     runtime_tool = next(tool for tool in tools if tool["function"]["name"] == "send_group_session_message")
@@ -1939,5 +2246,17 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             },
         },
         "required": ["session_id", "message"],
+        "additionalProperties": False,
+    }
+    recall_tool = next(tool for tool in tools if tool["function"]["name"] == "recall_message")
+    assert recall_tool["function"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "string",
+                "description": "Exact local ChatMessage UUID of the outbound assistant message.",
+            },
+        },
+        "required": ["message_id"],
         "additionalProperties": False,
     }

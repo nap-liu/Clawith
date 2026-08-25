@@ -12,7 +12,7 @@ import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from urllib.parse import quote_plus
 
 import httpx
@@ -343,6 +343,7 @@ async def _send_dingtalk_media_message(
     duration_ms: int = 60_000,
     *,
     raise_on_transport_error: bool = False,
+    on_result: Callable[[dict], Awaitable[None]] | None = None,
 ) -> bool:
     """Send a media message via DingTalk proactive message API.
 
@@ -397,6 +398,7 @@ async def _send_dingtalk_media_message(
             "fileType": ext,
         })
 
+    data: dict
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             if conversation_type == "2":
@@ -430,16 +432,21 @@ async def _send_dingtalk_media_message(
                 logger.error(f"[DingTalk] Send media failed: {data}")
                 return False
 
-            logger.info(
-                f"[DingTalk] Sent {media_type} message to {target_id[:16]}... "
-                f"(conv_type={conversation_type})"
-            )
-            return True
     except Exception as e:
         logger.error(f"[DingTalk] Send media error: {e}")
         if raise_on_transport_error:
             raise
         return False
+
+    logger.info(
+        f"[DingTalk] Sent {media_type} message to {target_id[:16]}... "
+        f"(conv_type={conversation_type})"
+    )
+    # Provider I/O is already successful. Observer failures must propagate so
+    # callers cannot reinterpret them as send failures and emit a duplicate.
+    if on_result is not None:
+        await on_result(data)
+    return True
 
 
 def _create_dingtalk_video_thumbnail(video_path: Path) -> Path | None:
@@ -474,6 +481,7 @@ async def _send_dingtalk_native_video(
     cover_image_path: Path | None = None,
     *,
     raise_on_transport_error: bool = False,
+    on_result: Callable[[dict], Awaitable[None]] | None = None,
 ) -> tuple[bool, str]:
     """Upload video + thumbnail and send a real sampleVideo message."""
     if file_path.stat().st_size > DINGTALK_VIDEO_MAX_BYTES:
@@ -504,6 +512,7 @@ async def _send_dingtalk_native_video(
             conversation_type,
             filename=file_path.name,
             pic_media_id=pic_media_id,
+            on_result=on_result,
             **strict_kwargs,
         )
         return sent, "MEDIA_SENT" if sent else "MEDIA_SEND_FAILED"
@@ -723,7 +732,7 @@ class DingTalkStreamManager:
         RETRY_DELAYS = [2, 5, 15, 30, 60]  # exponential backoff, seconds
 
         class ClawithChatbotHandler(dingtalk_stream.ChatbotHandler):
-            """Custom handler that dispatches messages to the Clawith LLM pipeline."""
+            """Custom handler that dispatches messages to the shared LLM pipeline."""
 
             async def process(self, callback: dingtalk_stream.CallbackMessage):
                 """Handle incoming bot message from DingTalk Stream.
@@ -1078,13 +1087,13 @@ class DingTalkStreamManager:
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "DingTalkStream/managed Clawith",
+                "User-Agent": "DingTalkStream/managed-platform",
             },
             json={
                 "clientId": client.credential.client_id,
                 "clientSecret": client.credential.client_secret,
                 "subscriptions": topics,
-                "ua": "dingtalk-sdk-python/clawith-managed",
+                "ua": "dingtalk-sdk-python/platform-managed",
                 "localIp": client.get_host_ip(),
             },
         )

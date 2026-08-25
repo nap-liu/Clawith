@@ -17,7 +17,6 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.agent import Agent as AgentModel
 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.services.channel_commands import is_channel_command
 from app.services.channel_dispatch import (
@@ -84,10 +83,13 @@ async def send_wechat_text_message(
     context_token: str,
     text: str,
     route_tag: str | None = None,
-) -> None:
+    on_result=None,
+) -> list[dict]:
     """Send one or more WeChat iLink text messages."""
+    results: list[dict] = []
     async with httpx.AsyncClient(timeout=20) as client:
         for chunk in split_wechat_text(text):
+            client_id = f"clawith-wechat:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
             resp = await client.post(
                 f"{base_url.rstrip('/')}/ilink/bot/sendmessage",
                 headers=build_wechat_headers(token, route_tag=route_tag),
@@ -95,7 +97,7 @@ async def send_wechat_text_message(
                     "msg": {
                         "from_user_id": "",
                         "to_user_id": to_user_id,
-                        "client_id": f"clawith-wechat:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                        "client_id": client_id,
                         "message_type": 2,
                         "message_state": 2,
                         "context_token": context_token,
@@ -120,6 +122,11 @@ async def send_wechat_text_message(
             errcode = data.get("errcode", 0)
             if ret not in (0, None) or errcode not in (0, None):
                 raise RuntimeError(data.get("errmsg") or f"WeChat sendmessage failed: ret={ret}, errcode={errcode}")
+            result = {"client_id": client_id, "response": data}
+            results.append(result)
+            if on_result is not None:
+                await on_result(result)
+    return results
 
 
 def update_wechat_context_cache(
@@ -217,18 +224,45 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
     # Early-return for channel commands (/new, /reset):
     # archive the session and send a canned reply — no LLM, no lock needed.
     if is_channel_command(user_text):
-        from app.services.channel_commands import handle_channel_command
+        from app.services.channel_commands import prepare_channel_command_reply
         async with async_session() as _cmd_db:
-            cmd_result = await handle_channel_command(
+            cmd_result = await prepare_channel_command_reply(
                 db=_cmd_db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conv_id,
+                external_user_id=from_user_id,
                 source_channel="wechat",
+                provider_event_id=str(
+                    msg.get("message_id")
+                    or msg.get("msg_id")
+                    or msg.get("client_id")
+                    or ""
+                ),
                 is_group=False,
             )
             await _cmd_db.commit()
+        if not cmd_result["should_deliver"]:
+            return
         token = str((config.extra_config or {}).get("bot_token") or "").strip()
         base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
         route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
+        from app.services.im_delivery import (
+            IMDeliveryPart,
+            PersistedDeliveryRecorder,
+        )
+        _cmd_recorder = PersistedDeliveryRecorder(
+            cmd_result["message_id"],
+            "wechat",
+        )
+
+        async def _record_command_part(item: dict) -> None:
+            await _cmd_recorder.append(IMDeliveryPart(
+                transport="wechat_ilink",
+                provider_message_id=str(item.get("client_id") or "") or None,
+                conversation_ref=from_user_id,
+                artifact_role="command_reply",
+                recallable=False,
+            ))
+
         try:
             await send_wechat_text_message(
                 token=token,
@@ -237,8 +271,11 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 context_token=context_token,
                 text=cmd_result["message"],
                 route_tag=route_tag,
+                on_result=_record_command_part,
             )
+            await _cmd_recorder.sent()
         except Exception as _cmd_e:
+            await _cmd_recorder.failed(_cmd_e)
             logger.warning(f"[WeChat] Failed to send command reply: {_cmd_e}")
         return
 
@@ -329,16 +366,12 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
 
             _thinking_chunks: list[str] = []
-            _thinking_sender = BufferedIMThinkingSender(
+            _thinking_sender = BufferedIMThinkingSender.for_runtime(
                 enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                send_text=lambda text: send_wechat_text_message(
-                    token=token,
-                    base_url=base_url,
-                    to_user_id=from_user_id,
-                    context_token=context_token,
-                    text=text,
-                    route_tag=route_tag,
-                ),
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                conversation_id=session_conv_id,
+                turn_anchor_id=ingested.message.id,
             )
 
             async def _collect_thinking(text: str) -> None:
@@ -359,26 +392,66 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             finally:
                 await _thinking_sender.flush()
 
-            await send_wechat_text_message(
-                token=token,
-                base_url=base_url,
-                to_user_id=from_user_id,
-                context_token=context_token,
-                text=reply_text,
-                route_tag=route_tag,
-            )
-
             # Save assistant reply via the shared writer (own session → created_at
             # stamped after the tool loop, ordered after the turn's tool calls).
             from app.services.chat_history import persist_assistant_reply
             from app.database import async_session as _areply_session
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                IMDeliveryResult,
+                append_delivery_part,
+                attach_delivery_to_meta,
+                register_delivery,
+            )
 
-            await persist_assistant_reply(
+            assistant_message_id = await persist_assistant_reply(
                 _areply_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id, content=reply_text,
                 thinking="".join(_thinking_chunks) or None,
+                message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending("wechat")),
                 turn_anchor_id=ingested.message.id,
+                required=True,
             )
+            async def _record_wechat_part(response: dict) -> None:
+                part = IMDeliveryPart(
+                    transport="wechat_ilink",
+                    provider_message_id=str(response.get("client_id") or "") or None,
+                    conversation_ref=from_user_id,
+                    artifact_role="chunk",
+                    recallable=False,
+                )
+                if not await append_delivery_part(assistant_message_id, part):
+                    raise RuntimeError("delivery_part_persistence_failed")
+
+            try:
+                responses = await send_wechat_text_message(
+                    token=token,
+                    base_url=base_url,
+                    to_user_id=from_user_id,
+                    context_token=context_token,
+                    text=reply_text,
+                    route_tag=route_tag,
+                    on_result=_record_wechat_part,
+                )
+                delivery_result = IMDeliveryResult.sent(
+                    "wechat",
+                    *(
+                        IMDeliveryPart(
+                            transport="wechat_ilink",
+                            provider_message_id=str(response.get("client_id") or "") or None,
+                            conversation_ref=from_user_id,
+                            artifact_role="chunk",
+                            recallable=False,
+                        )
+                        for response in responses
+                    ),
+                )
+            except Exception as exc:
+                delivery_result = IMDeliveryResult.from_exception("wechat", exc)
+                raise
+            finally:
+                if assistant_message_id is not None:
+                    await register_delivery(assistant_message_id, delivery_result)
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 

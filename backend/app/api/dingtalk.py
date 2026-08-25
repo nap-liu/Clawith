@@ -38,6 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
@@ -50,8 +51,74 @@ from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.chat_attachments import attachment_from_workspace_path
+from app.services.dingtalk_service import build_dingtalk_markdown_content
+from app.services.user_output import sanitize_user_visible_text
 
 router = APIRouter(tags=["dingtalk"])
+
+
+async def _post_dingtalk_session_webhook(
+    session_webhook: str,
+    payload: dict,
+) -> dict:
+    """Post one session message and reject HTTP or DingTalk business errors."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(session_webhook, json=payload)
+        response.raise_for_status()
+        data = response.json()
+    errcode = data.get("errcode") if isinstance(data, dict) else None
+    if errcode not in (None, 0, "0"):
+        raise RuntimeError(f"dingtalk_session_webhook_error:{errcode}")
+    return data
+
+
+def _dingtalk_markdown_payload(agent_name: str | None, text: str) -> dict:
+    """Build a safe legacy webhook payload for one final reply."""
+    del agent_name
+    content = build_dingtalk_markdown_content(sanitize_user_visible_text(text))
+    return {
+        "msgtype": "markdown",
+        "markdown": {**content, "text": text},
+    }
+
+
+async def _deliver_dingtalk_command_reply(
+    *,
+    message_id,
+    session_webhook: str,
+    conversation_ref: str,
+    message: str,
+):
+    """Deliver and finalize one already-persisted command reply."""
+    from app.services.im_delivery import IMDeliveryResult, register_delivery
+
+    try:
+        await _post_dingtalk_session_webhook(
+            session_webhook,
+            {"msgtype": "text", "text": {"content": message}},
+        )
+        result = IMDeliveryResult.unsupported_delivery(
+            "dingtalk",
+            "dingtalk_session_webhook",
+            conversation_ref=conversation_ref,
+        )
+    except Exception as exc:
+        result = IMDeliveryResult.from_exception("dingtalk", exc)
+    await register_delivery(message_id, result)
+    return result
+
+
+async def _deliver_dingtalk_session_webhook_part(
+    *,
+    session_webhook: str,
+    payload: dict,
+    part,
+) -> None:
+    """Persist a part only after the session webhook confirms success."""
+    from app.services.agent_tools import record_channel_file_part
+
+    await _post_dingtalk_session_webhook(session_webhook, payload)
+    await record_channel_file_part(part)
 
 
 async def _get_tenant_dingtalk_provider(db: AsyncSession, tenant_id: uuid.UUID | None):
@@ -726,17 +793,22 @@ async def process_dingtalk_message(
 
         # Check for channel commands (/new, /reset)
         from app.services.channel_commands import (
-            handle_channel_command,
             is_channel_command,
+            prepare_channel_command_reply,
         )
         if is_channel_command(user_text):
-            cmd_result = await handle_channel_command(
+            cmd_result = await prepare_channel_command_reply(
                 db=db, command=user_text, agent_id=agent_id,
                 user_id=platform_user_id, external_conv_id=conv_id,
+                external_user_id=sender_staff_id,
                 source_channel="dingtalk",
+                provider_event_id=message_id,
                 is_group=conversation_type == "2",
                 group_name=conversation_title or None,
             )
+            if not cmd_result["should_deliver"]:
+                await db.commit()
+                return
             if conversation_type == "2":
                 from app.services.dingtalk_group_mentions import (
                     cache_group_session_webhook,
@@ -750,16 +822,15 @@ async def process_dingtalk_message(
                     expires_at_ms=session_webhook_expires_at_ms,
                 )
             await db.commit()
-            import httpx as _httpx_cmd
-            try:
-                async with _httpx_cmd.AsyncClient(timeout=10) as _cl_cmd:
-                    await _cl_cmd.post(session_webhook, json={
-                        "msgtype": "text",
-                        "text": {"content": cmd_result["message"]},
-                    })
-            except Exception as exc:
+            _cmd_delivery = await _deliver_dingtalk_command_reply(
+                message_id=cmd_result["message_id"],
+                session_webhook=session_webhook,
+                conversation_ref=conv_id,
+                message=cmd_result["message"],
+            )
+            if not _cmd_delivery.ok:
                 logger.error(
-                    f"[DingTalk] Command reply failed: {type(exc).__name__}"
+                    f"[DingTalk] Command reply failed: {_cmd_delivery.error}"
                 )
             return
 
@@ -935,8 +1006,32 @@ async def process_dingtalk_message(
 
             async def _dingtalk_file_sender(file_path: str, msg: str = ""):
                 """Send a file/image/video via DingTalk proactive message API."""
+                from app.services.im_delivery import (
+                    DeliveryReceiptPersistenceError,
+                    IMDeliveryPart,
+                    IMDeliveryResult,
+                )
+                from app.services.agent_tools import record_channel_file_part
+
                 _fp = Path(file_path)
                 _ext = _fp.suffix.lower()
+                _delivery_parts = []
+
+                async def _record_result(provider_result: dict) -> None:
+                    _process_key = str(provider_result.get("processQueryKey") or "") or None
+                    part = IMDeliveryPart(
+                        transport=(
+                            "dingtalk_openapi_group"
+                            if _dt_conv_type == "2"
+                            else "dingtalk_openapi_oto"
+                        ),
+                        provider_message_id=_process_key,
+                        conversation_ref=_dt_target_id,
+                        artifact_role="channel_file",
+                        recallable=bool(_process_key),
+                    )
+                    await record_channel_file_part(part)
+                    _delivery_parts.append(part)
 
                 # Determine media type from extension
                 if _ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
@@ -955,6 +1050,7 @@ async def process_dingtalk_message(
                         _dt_target_id,
                         _fp,
                         _dt_conv_type,
+                        on_result=_record_result,
                     )
                 else:
                     _mid = await _upload_dingtalk_media(
@@ -968,20 +1064,50 @@ async def process_dingtalk_message(
                             _dt_app_key, _dt_app_secret,
                             _dt_target_id, _mid, _media_type,
                             _dt_conv_type, filename=_fp.name,
+                            on_result=_record_result,
                         )
                         _code = "MEDIA_SENT" if _ok else "MEDIA_SEND_FAILED"
                 if _ok:
                     # Also send accompany text if provided
                     if msg:
                         try:
-                            async with httpx.AsyncClient(timeout=10) as _cl:
-                                await _cl.post(session_webhook, json={
+                            part = IMDeliveryPart(
+                                transport="dingtalk_session_webhook",
+                                conversation_ref=_dt_target_id,
+                                artifact_role="file_caption",
+                                recallable=False,
+                            )
+                            await _deliver_dingtalk_session_webhook_part(
+                                session_webhook=session_webhook,
+                                payload={
                                     "msgtype": "text",
                                     "text": {"content": msg},
-                                })
-                        except Exception:
-                            pass
-                    return
+                                },
+                                part=part,
+                            )
+                        except DeliveryReceiptPersistenceError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "[DingTalk] File caption delivery failed: {}",
+                                type(exc).__name__,
+                            )
+                        else:
+                            _delivery_parts.append(part)
+                    if not _delivery_parts:
+                        part = IMDeliveryPart(
+                            transport=(
+                                "dingtalk_openapi_group"
+                                if _dt_conv_type == "2"
+                                else "dingtalk_openapi_oto"
+                            ),
+                            conversation_ref=_dt_target_id,
+                            artifact_role="channel_file",
+                            recallable=False,
+                        )
+                        _delivery_parts.append(part)
+                        await record_channel_file_part(part)
+                    return IMDeliveryResult.sent("dingtalk", *_delivery_parts)
 
                 # Fallback: send a text message with download link
                 from pathlib import Path as _P2
@@ -1002,15 +1128,28 @@ async def process_dingtalk_message(
                     _fallback_parts.append(f"📎 {_fp2.name}\n🔗 {_dl_url}")
                 _fallback_parts.append("⚠️ 文件通过钉钉直接发送失败，请通过上方链接下载。")
                 try:
-                    async with httpx.AsyncClient(timeout=10) as _cl:
-                        await _cl.post(session_webhook, json={
+                    part = IMDeliveryPart(
+                        transport="dingtalk_session_webhook",
+                        conversation_ref=_dt_target_id,
+                        artifact_role="file_fallback",
+                        recallable=False,
+                    )
+                    await _deliver_dingtalk_session_webhook_part(
+                        session_webhook=session_webhook,
+                        payload={
                             "msgtype": "text",
                             "text": {"content": "\n\n".join(_fallback_parts)},
-                        })
+                        },
+                        part=part,
+                    )
+                    return IMDeliveryResult.sent("dingtalk", part)
+                except DeliveryReceiptPersistenceError:
+                    raise
                 except Exception as _fb_err:
                     logger.error(
                         f"[DingTalk] Fallback file text also failed: {type(_fb_err).__name__}"
                     )
+                    raise
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
 
@@ -1065,23 +1204,12 @@ async def process_dingtalk_message(
         # Call LLM
         _thinking_chunks: list[str] = []
 
-        async def _send_thinking_text(text: str) -> None:
-            if not session_webhook:
-                return
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(session_webhook, json={
-                        "msgtype": "text",
-                        "text": {"content": text},
-                    })
-            except Exception as exc:
-                raise RuntimeError(
-                    f"DingTalk thinking delivery failed ({type(exc).__name__})"
-                ) from None
-
-        _thinking_sender = BufferedIMThinkingSender(
+        _thinking_sender = BufferedIMThinkingSender.for_runtime(
             enabled=resolve_im_thinking_enabled(agent_obj, sess),
-            send_text=_send_thinking_text,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            conversation_id=session_conv_id,
+            turn_anchor_id=turn_anchor_id,
         )
 
         async def _collect_thinking(text: str):
@@ -1133,57 +1261,71 @@ async def process_dingtalk_message(
             # append-only message turn.
             from app.database import async_session as _reply_session_factory
             from app.services.chat_history import persist_assistant_reply_row
+            from app.services.im_delivery import (
+                IMDeliveryResult,
+                attach_delivery_to_meta,
+                register_delivery,
+            )
 
             async with _reply_session_factory() as reply_db:
-                await persist_assistant_reply_row(
+                assistant_message_id = await persist_assistant_reply_row(
                     reply_db,
                     agent_id=agent_id,
                     user_id=platform_user_id,
                     conversation_id=session_conv_id,
                     content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending("dingtalk"),
+                    ),
                     turn_anchor_id=turn_anchor_id,
                 )
                 await reply_db.commit()
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
-            # Reply via session webhook (markdown). File/image sending is handled by the
-            # channel_file_sender ContextVar above.
+            # Ordinary final replies use the durable OpenAPI route so DingTalk
+            # returns a processQueryKey that can later be recalled. Native @
+            # messages remain on the temporary sessionWebhook path in the
+            # explicit send_session_message tool and are marked unsupported.
+            from app.services.turn_runtime import TurnRuntime, deliver_message_with_receipt
+
             try:
-                from app.services.channel_dispatch import run_channel_send
-
-                async def _send_reply():
-                    async with httpx.AsyncClient(timeout=10) as client:
-                        try:
-                            response = await client.post(session_webhook, json={
-                                "msgtype": "markdown",
-                                "markdown": {
-                                    "title": agent_obj.name or "AI Reply",
-                                    "text": reply_text,
-                                },
-                            })
-                            response.raise_for_status()
-                            return response
-                        except Exception as markdown_error:
-                            logger.warning(
-                                "[DingTalk] Markdown reply failed; trying text fallback: %s",
-                                type(markdown_error).__name__,
-                            )
-                            response = await client.post(session_webhook, json={
-                                "msgtype": "text",
-                                "text": {"content": reply_text},
-                            })
-                            response.raise_for_status()
-                            return response
-
-                await run_channel_send(
-                    f"im-send:{session_conv_id}",
-                    _send_reply,
+                delivery_result = await deliver_message_with_receipt(
+                    agent_id=agent_id,
+                    runtime=TurnRuntime(
+                        session_found=True,
+                        source_channel="dingtalk",
+                        conversation_id=session_conv_id,
+                        external_conv_id=sess.external_conv_id,
+                        is_group=bool(sess.is_group),
+                    ),
+                    message=reply_text,
                 )
+                if (
+                    not delivery_result.ok
+                    and delivery_result.error == "channel_config_unavailable"
+                    and session_webhook
+                ):
+                    # Legacy/imported bindings can briefly lack OpenAPI credentials.
+                    # Preserve reply availability through the temporary webhook,
+                    # but record that this transport cannot be recalled.
+                    await _post_dingtalk_session_webhook(
+                        session_webhook,
+                        _dingtalk_markdown_payload(agent_obj.name, reply_text),
+                    )
+                    delivery_result = IMDeliveryResult.unsupported_delivery(
+                        "dingtalk",
+                        "dingtalk_session_webhook",
+                        conversation_ref=str(sess.external_conv_id or ""),
+                    )
+                await register_delivery(assistant_message_id, delivery_result)
             except Exception as e:
-                logger.error(
-                    f"[DingTalk] Markdown and fallback text reply failed: {type(e).__name__}"
+                logger.error(f"[DingTalk] OpenAPI reply failed: {type(e).__name__}")
+                await register_delivery(
+                    assistant_message_id,
+                    IMDeliveryResult.from_exception("dingtalk", e),
                 )
 
         # Log activity

@@ -524,6 +524,7 @@ function VersionDisplay() {
       .catch(() => {});
   }, []);
   if (!info.version) return null;
+  const displayCommit = info.commit?.trim().slice(0, 7);
   return (
     <div
       style={{
@@ -535,7 +536,11 @@ function VersionDisplay() {
       }}
     >
       v{info.version}
-      {info.commit && <span style={{ opacity: 0.6 }}> ({info.commit})</span>}
+      {displayCommit && (
+        <span style={{ opacity: 0.6 }} title={info.commit}>
+          {" "}({displayCommit})
+        </span>
+      )}
     </div>
   );
 }

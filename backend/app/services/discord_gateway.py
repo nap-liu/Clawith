@@ -124,35 +124,96 @@ class DiscordGatewayManager:
             # Early-return for channel commands (/new, /reset):
             # archive the session and reply inline — no LLM, no lock needed.
             if is_channel_command(user_text):
-                from app.services.channel_commands import handle_channel_command
+                from app.services.channel_commands import prepare_channel_command_reply
                 async with async_session() as _cmd_db:
-                    cmd_result = await handle_channel_command(
+                    cmd_result = await prepare_channel_command_reply(
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id_om,
+                        external_user_id=sender_id_om,
                         source_channel="discord",
+                        provider_event_id=str(message.id),
                         is_group=message.guild is not None,
+                        external_user_info={"name": message.author.name},
                     )
                     await _cmd_db.commit()
+                if not cmd_result["should_deliver"]:
+                    return
                 try:
+                    from app.services.im_delivery import (
+                        IMDeliveryPart,
+                        PersistedDeliveryRecorder,
+                    )
+                    _cmd_recorder = PersistedDeliveryRecorder(
+                        cmd_result["message_id"],
+                        "discord",
+                    )
                     chunks = [
                         cmd_result["message"][i:i + DISCORD_MSG_LIMIT]
                         for i in range(0, len(cmd_result["message"]), DISCORD_MSG_LIMIT)
                     ]
                     for chunk in chunks:
-                        await message.reply(chunk, mention_author=False)
+                        sent_message = await message.reply(chunk, mention_author=False)
+                        await _cmd_recorder.append(IMDeliveryPart(
+                            transport="discord_gateway",
+                            provider_message_id=str(sent_message.id),
+                            conversation_ref=channel_id_om,
+                            artifact_role="command_reply",
+                        ))
+                    await _cmd_recorder.sent()
                 except Exception as _cmd_e:
+                    await _cmd_recorder.failed(_cmd_e)
                     logger.error(f"[Discord GW] Failed to send command reply: {_cmd_e}")
                 return
 
             async def _work() -> str:
                 # typing 指示器 + 完整处理（用户行写入 → LLM → 回复持久化）包在锁内
                 async with message.channel.typing():
-                    reply = await self._handle_message(agent_id, message, user_text)
+                    handled = await self._handle_message(agent_id, message, user_text)
+                if handled is None:
+                    return ""
+                reply, assistant_message_id = handled
                 # Send reply, chunked if needed
+                from app.services.im_delivery import (
+                    IMDeliveryPart,
+                    IMDeliveryResult,
+                    append_delivery_part,
+                    register_delivery,
+                )
+
+                delivery_result = IMDeliveryResult.failed("discord", "send_failed")
                 if reply:
-                    chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
-                    for chunk in chunks:
-                        await message.reply(chunk, mention_author=False)
+                    try:
+                        chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
+                        sent_messages = []
+                        for chunk in chunks:
+                            sent = await message.reply(chunk, mention_author=False)
+                            sent_messages.append(sent)
+                            part = IMDeliveryPart(
+                                transport="discord_gateway",
+                                provider_message_id=str(sent.id),
+                                conversation_ref=str(sent.channel.id),
+                                artifact_role="chunk",
+                            )
+                            if not await append_delivery_part(assistant_message_id, part):
+                                raise RuntimeError("delivery_part_persistence_failed")
+                        delivery_result = IMDeliveryResult.sent(
+                            "discord",
+                            *(
+                                IMDeliveryPart(
+                                    transport="discord_gateway",
+                                    provider_message_id=str(sent.id),
+                                    conversation_ref=str(sent.channel.id),
+                                    artifact_role="chunk",
+                                )
+                                for sent in sent_messages
+                            ),
+                        )
+                    except Exception as exc:
+                        delivery_result = IMDeliveryResult.from_exception("discord", exc)
+                        raise
+                    finally:
+                        if assistant_message_id is not None:
+                            await register_delivery(assistant_message_id, delivery_result)
                 return reply or ""
 
             # Discord gateway 无 emoji reaction，ChannelReactions 保持空
@@ -185,7 +246,7 @@ class DiscordGatewayManager:
         agent_id: uuid.UUID,
         message: "discord.Message",
         user_text: str,
-    ) -> Optional[str]:
+    ) -> Optional[tuple[str, uuid.UUID | None]]:
         """Process an incoming Discord message through the agent LLM."""
         try:
             from app.models.audit import ChatMessage
@@ -213,7 +274,7 @@ class DiscordGatewayManager:
                 )
                 agent_obj = agent_r.scalar_one_or_none()
                 if not agent_obj:
-                    return "未找到数字员工。"
+                    return "Agent not found.", None
                 creator_id = agent_obj.creator_id
                 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
                 ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
@@ -310,9 +371,12 @@ class DiscordGatewayManager:
 
                 # Call LLM
                 _thinking_chunks: list[str] = []
-                _thinking_sender = BufferedIMThinkingSender(
+                _thinking_sender = BufferedIMThinkingSender.for_runtime(
                     enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                    send_text=message.channel.send,
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    conversation_id=session_conv_id,
+                    turn_anchor_id=ingested.message.id,
                 )
 
                 async def _collect_thinking(text: str) -> None:
@@ -336,22 +400,28 @@ class DiscordGatewayManager:
                 # analysis card.
                 from app.services.chat_history import persist_assistant_reply
                 from app.database import async_session as _areply_session
-                await persist_assistant_reply(
+                from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+                assistant_message_id = await persist_assistant_reply(
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending("discord"),
+                    ),
                     turn_anchor_id=ingested.message.id,
+                    required=True,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()
 
-                return reply_text
+                return reply_text, assistant_message_id
 
         except Exception as e:
             logger.exception(
                 f"[Discord GW] Error handling message for {agent_id}: {e}"
             )
-            return f"An error occurred while processing your message: {str(e)[:100]}"
+            return None
 
     async def stop_client(self, agent_id: uuid.UUID):
         """Stop a running Discord Gateway client."""
