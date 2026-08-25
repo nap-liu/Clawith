@@ -1123,9 +1123,9 @@ BUILTIN_TOOLS = [
             "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
             "discovers a person, selects or changes a channel, sends files, or contacts another "
             "digital employee. If no suitable Session exists, use send_channel_message for an external-IM "
-            "person or send_platform_message for a platform user. For a native DingTalk @, you MUST call "
-            "this tool with mention_user_ids even when replying in the current group; writing @name in a "
-            "normal assistant reply is plain text and does not create an @ action."
+            "person or send_platform_message for a platform user. For a native group mention, you MUST call "
+            "this tool with mention_user_ids or mention_all=true; writing @name or @everyone in a normal "
+            "assistant reply is plain text and does not create a native mention."
         ),
         "category": "communication",
         "icon": "✉️",
@@ -1140,8 +1140,8 @@ BUILTIN_TOOLS = [
                 "message": {
                     "type": "string",
                     "description": (
-                        "Business text to send. When mention_user_ids is present, do not prefix @names "
-                        "or external IDs; the transport renders each native @ exactly once."
+                        "Business text to send. When a native mention option is present, do not prefix "
+                        "@names, @everyone, or external IDs; the transport renders the mention exactly once."
                     ),
                 },
                 "mention_user_ids": {
@@ -1149,9 +1149,16 @@ BUILTIN_TOOLS = [
                     "items": {"type": "string"},
                     "maxItems": 20,
                     "description": (
-                        "Optional canonical platform user_ids to @ in a DingTalk group. "
-                        "Each person must have an active DingTalk route; DingTalk only renders "
-                        "the @ for people who are members of the target group."
+                        "Optional canonical platform user_ids to mention natively in the target group. "
+                        "Each person must be a member of the target group, and the bound channel must "
+                        "support native group mentions."
+                    ),
+                },
+                "mention_all": {
+                    "type": "boolean",
+                    "description": (
+                        "Optionally mention all members of the target group natively. "
+                        "Cannot be combined with mention_user_ids."
                     ),
                 },
             },
@@ -1167,9 +1174,9 @@ BUILTIN_TOOLS = [
         "description": (
             "Compatibility tool for sending text to an existing external-IM group by exact "
             "session_id. Prefer send_session_message for new work; this tool remains available "
-            "for existing workflows and accepts group Sessions only. For a native DingTalk @, you MUST "
-            "call this tool with mention_user_ids even when replying in the current group; writing @name "
-            "in a normal assistant reply is plain text and does not create an @ action."
+            "for existing workflows and accepts group Sessions only. For a native group mention, you MUST "
+            "call this tool with mention_user_ids or mention_all=true; writing @name or @everyone in a normal "
+            "assistant reply is plain text and does not create a native mention."
         ),
         "category": "communication",
         "icon": "📣",
@@ -1184,8 +1191,8 @@ BUILTIN_TOOLS = [
                 "message": {
                     "type": "string",
                     "description": (
-                        "Business text to send. When mention_user_ids is present, do not prefix @names "
-                        "or external IDs; the transport renders each native @ exactly once."
+                        "Business text to send. When a native mention option is present, do not prefix "
+                        "@names, @everyone, or external IDs; the transport renders the mention exactly once."
                     ),
                 },
                 "mention_user_ids": {
@@ -1193,9 +1200,16 @@ BUILTIN_TOOLS = [
                     "items": {"type": "string"},
                     "maxItems": 20,
                     "description": (
-                        "Optional canonical platform user_ids to @ in a DingTalk group. "
-                        "Each person must have an active DingTalk route; DingTalk only renders "
-                        "the @ for people who are members of the target group."
+                        "Optional canonical platform user_ids to mention natively in the target group. "
+                        "Each person must be a member of the target group, and the bound channel must "
+                        "support native group mentions."
+                    ),
+                },
+                "mention_all": {
+                    "type": "boolean",
+                    "description": (
+                        "Optionally mention all members of the target group natively. "
+                        "Cannot be combined with mention_user_ids."
                     ),
                 },
             },

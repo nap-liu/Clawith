@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
@@ -30,6 +30,27 @@ from app.services import session_query
 DELIVERY_META_VERSION = 1
 DELIVERY_LEASE = timedelta(minutes=2)
 RECALL_LEASE = timedelta(minutes=2)
+
+
+@dataclass(frozen=True)
+class MentionIntent:
+    """One native mention request prepared for the selected IM adapter.
+
+    ``target_ids`` are short-lived opaque provider identifiers. Canonical
+    platform user IDs belong in durable message metadata, never in this
+    delivery-only envelope.
+    """
+
+    scope: Literal["users", "all"]
+    target_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.scope not in {"users", "all"}:
+            raise ValueError("invalid mention scope")
+        if self.scope == "users" and not self.target_ids:
+            raise ValueError("user mention requires target_ids")
+        if self.scope == "all" and self.target_ids:
+            raise ValueError("all mention cannot contain target_ids")
 
 
 @dataclass(frozen=True)

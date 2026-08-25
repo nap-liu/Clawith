@@ -138,10 +138,12 @@ def test_session_message_uses_only_exact_session_address(name):
             "session_id",
             "message",
             "mention_user_ids",
+            "mention_all",
         }
         assert schema["required"] == ["session_id", "message"]
         assert schema["additionalProperties"] is False
         assert schema["properties"]["mention_user_ids"]["maxItems"] == 20
+        assert schema["properties"]["mention_all"]["type"] == "boolean"
 
 
 def test_session_message_description_states_its_narrow_delivery_boundary():
@@ -162,10 +164,29 @@ def test_session_message_description_requires_tool_for_native_mentions(name):
     for description in (_agent_description(name), _seed_description(name)):
         assert "MUST call" in description
         assert "normal assistant reply is plain text" in description
+        assert "mention_all=true" in description
     for schema in (_agent_schema(name), _seed_schema(name)):
         message_description = schema["properties"]["message"]["description"]
-        assert "do not prefix @names" in message_description
-        assert "renders each native @ exactly once" in message_description
+        assert "do not prefix" in message_description
+        assert "renders the mention exactly once" in message_description
+
+
+@pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
+def test_session_message_native_mention_schema_is_channel_neutral(name):
+    for description, schema in (
+        (_agent_description(name), _agent_schema(name)),
+        (_seed_description(name), _seed_schema(name)),
+    ):
+        mention_contract = " ".join(
+            [
+                description,
+                schema["properties"]["message"]["description"],
+                schema["properties"]["mention_user_ids"]["description"],
+                schema["properties"]["mention_all"]["description"],
+            ]
+        ).lower()
+        assert "dingtalk" not in mention_contract
+        assert "钉钉" not in mention_contract
 
 
 @pytest.mark.parametrize("name", ["add_contact", "remove_contact"])

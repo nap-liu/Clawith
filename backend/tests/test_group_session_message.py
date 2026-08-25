@@ -23,7 +23,7 @@ from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
 from app.services import agent_tools, turn_runtime
-from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, MentionIntent
 from app.services.tool_seeder import seed_builtin_tools
 from app.services.turn_runtime import TurnRuntime
 
@@ -560,7 +560,10 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(agent_tools, "resolve_human_channel_recipient", fake_resolve)
+    monkeypatch.setattr(
+        "app.services.dingtalk_group_mentions.resolve_human_channel_recipient",
+        fake_resolve,
+    )
     monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
 
@@ -576,9 +579,16 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
     payload = json.loads(result)
     assert payload["status"] == "sent"
     assert payload["mentioned_users"] == ["张三"]
+    assert payload["mentions"] == {
+        "scope": "users",
+        "user_ids": [str(mentioned_user_id)],
+        "display_names": ["张三"],
+    }
     assert delivered[0]["message"] == "请确认今晚发布窗口"
-    assert delivered[0]["dingtalk_at_user_ids"] == ["staff-zhangsan"]
-    assert delivered[0]["dingtalk_session_webhook"] == webhook
+    assert delivered[0]["mention"] == MentionIntent(
+        scope="users",
+        target_ids=("staff-zhangsan",),
+    )
 
     async with async_session() as db:
         receipt = (
@@ -591,6 +601,173 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
         ).scalar_one()
     assert receipt.message_meta["mention_user_ids"] == [str(mentioned_user_id)]
     assert receipt.message_meta["mentioned_users"] == ["张三"]
+    assert receipt.message_meta["mentions"] == {
+        "scope": "users",
+        "user_ids": [str(mentioned_user_id)],
+        "display_names": ["张三"],
+    }
+
+
+async def test_dingtalk_group_session_message_mentions_everyone(monkeypatch):
+    from app.services.dingtalk_group_mentions import cache_group_session_webhook
+
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=all-secret"
+    async with async_session() as db:
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook=webhook,
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+        )
+        await db.commit()
+
+    delivered: list[dict] = []
+
+    async def fail_if_resolved(*_args, **_kwargs):
+        raise AssertionError("@所有人 must not resolve individual group members")
+
+    async def fake_deliver(**kwargs):
+        delivered.append(kwargs)
+        return IMDeliveryResult.unsupported_delivery(
+            "dingtalk",
+            "dingtalk_session_webhook",
+            conversation_ref=kwargs["runtime"].external_conv_id,
+        )
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_group_mentions.resolve_human_channel_recipient",
+        fail_if_resolved,
+    )
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+
+    operation_kwargs = {
+        "origin_session_id": str(uuid.uuid4()),
+        "tool_call_id": "mention-all-once",
+        "origin_turn_anchor_id": uuid.uuid4(),
+    }
+    result = await agent_tools._send_group_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "今晚十点发布，请大家知悉",
+            "mention_all": True,
+        },
+        **operation_kwargs,
+    )
+    replay = await agent_tools._send_group_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "今晚十点发布，请大家知悉",
+            "mention_all": True,
+        },
+        **operation_kwargs,
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "sent"
+    assert payload["mentions"] == {"scope": "all"}
+    assert "mentioned_users" not in payload
+    assert delivered[0]["message"] == "今晚十点发布，请大家知悉"
+    assert delivered[0]["mention"] == MentionIntent(scope="all")
+    assert len(delivered) == 1
+    assert json.loads(replay)["status"] == "already_sent"
+    assert json.loads(replay)["mentions"] == {"scope": "all"}
+
+    async with async_session() as db:
+        receipt = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(target.id),
+                    ChatMessage.content == "@所有人\n今晚十点发布，请大家知悉",
+                )
+            )
+        ).scalar_one()
+    assert receipt.message_meta["mentions"] == {"scope": "all"}
+    assert "mention_user_ids" not in receipt.message_meta
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, None, [], {}])
+async def test_session_message_rejects_non_boolean_mention_all(value):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+
+    result = await agent_tools._send_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "不应发送",
+            "mention_all": value,
+        },
+    )
+
+    assert result == "❌ mention_all must be a boolean"
+
+
+async def test_session_message_rejects_conflicting_native_mentions():
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+
+    result = await agent_tools._send_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "不应发送",
+            "mention_all": True,
+            "mention_user_ids": [str(uuid.uuid4())],
+        },
+    )
+
+    assert result == "❌ mention_all=true cannot be combined with mention_user_ids"
+
+
+@pytest.mark.parametrize(
+    ("channel", "is_group"),
+    [("dingtalk", False), ("feishu", True)],
+)
+async def test_session_message_rejects_unsupported_mention_all_before_persist(
+    monkeypatch,
+    channel,
+    is_group,
+):
+    owner, _ = await _seed_agents()
+    user_id = owner.creator_id if not is_group else None
+    target = await _seed_session(
+        owner.id,
+        channel=channel,
+        external_conv_id=f"{channel}_mention-all-boundary",
+        is_group=is_group,
+        user_id=user_id,
+    )
+
+    async def fail_if_delivered(**_kwargs):
+        raise AssertionError("unsupported mention must fail before delivery")
+
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_delivered)
+    result = await agent_tools._send_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "不应发送",
+            "mention_all": True,
+        },
+    )
+
+    assert result == "❌ 原生 @ 当前仅支持钉钉群 Session。"
+    async with async_session() as db:
+        receipts = (
+            await db.execute(
+                select(ChatMessage).where(ChatMessage.conversation_id == str(target.id))
+            )
+        ).scalars().all()
+    assert receipts == []
 
 
 async def test_dingtalk_webhook_merge_preserves_concurrent_scene_and_model_switches():
@@ -1670,7 +1847,13 @@ async def test_outbound_operation_key_supports_sessionless_agent_turns():
 
 
 async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monkeypatch):
+    from app.services.dingtalk_group_mentions import cache_group_session_webhook
+
     owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        external_conv_id="dingtalk_group_open-conversation-exact",
+    )
     async with async_session() as db:
         db.add(
             ChannelConfig(
@@ -1680,6 +1863,13 @@ async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monke
                 app_secret="ding-secret",
                 is_configured=True,
             )
+        )
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
         )
         await db.commit()
     captured = {}
@@ -1698,21 +1888,208 @@ async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monke
         runtime=TurnRuntime(
             session_found=True,
             source_channel="dingtalk",
-            conversation_id=str(uuid.uuid4()),
-            external_conv_id="dingtalk_group_open-conversation-exact",
+            conversation_id=str(target.id),
+            external_conv_id=target.external_conv_id,
             is_group=True,
         ),
         message="请确认",
-        dingtalk_at_user_ids=["staff-zhangsan"],
-        dingtalk_session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
+        mention=MentionIntent(scope="users", target_ids=("staff-zhangsan",)),
     )
 
     assert sent is True
     assert captured == {
         "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?secret",
         "message": "请确认",
-        "at_user_ids": ["staff-zhangsan"],
+        "mention": MentionIntent(scope="users", target_ids=("staff-zhangsan",)),
     }
+
+
+async def test_dingtalk_runtime_rejects_mention_webhook_owned_by_another_agent(
+    monkeypatch,
+):
+    from app.services.dingtalk_group_mentions import cache_group_session_webhook
+
+    owner, other = await _seed_agents()
+    target = await _seed_session(owner.id)
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=other.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook="https://oapi.dingtalk.com/robot/sendBySession?owned-by-owner",
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+        )
+        await db.commit()
+
+    provider_calls: list[str] = []
+
+    async def fail_native(**_kwargs):
+        provider_calls.append("native")
+        return {"errcode": 0}
+
+    async def fail_proactive(**_kwargs):
+        provider_calls.append("proactive")
+        return {"errcode": 0}
+
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fail_native)
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
+    result = await turn_runtime.deliver_message_with_receipt(
+        agent_id=other.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id=str(target.id),
+            external_conv_id=target.external_conv_id,
+            is_group=True,
+        ),
+        message="不应发送",
+        mention=MentionIntent(scope="all"),
+    )
+
+    assert result.ok is False
+    assert result.error == "dingtalk_session_webhook_unavailable"
+    assert provider_calls == []
+
+
+async def test_dingtalk_runtime_rejects_changed_group_conversation_generation(
+    monkeypatch,
+):
+    from app.services.dingtalk_group_mentions import cache_group_session_webhook
+
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook="https://oapi.dingtalk.com/robot/sendBySession?old-generation",
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+        )
+        await db.commit()
+
+    provider_calls: list[str] = []
+
+    async def fail_native(**_kwargs):
+        provider_calls.append("native")
+        return {"errcode": 0}
+
+    async def fail_proactive(**_kwargs):
+        provider_calls.append("proactive")
+        return {"errcode": 0}
+
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fail_native)
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
+    result = await turn_runtime.deliver_message_with_receipt(
+        agent_id=owner.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id=str(target.id),
+            external_conv_id="dingtalk_group_new-generation",
+            is_group=True,
+        ),
+        message="不应发送",
+        mention=MentionIntent(scope="all"),
+    )
+
+    assert result.ok is False
+    assert result.error == "dingtalk_session_webhook_unavailable"
+    assert provider_calls == []
+
+
+async def test_dingtalk_mention_webhook_safety_window_finishes_receipt_failed(
+    monkeypatch,
+):
+    from app.services.dingtalk_group_mentions import cache_group_session_webhook
+
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook="https://oapi.dingtalk.com/robot/sendBySession?near-expiry",
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 20_000,
+        )
+        await db.commit()
+
+    provider_calls: list[str] = []
+
+    async def fail_native(**_kwargs):
+        provider_calls.append("native")
+        return {"errcode": 0}
+
+    async def fail_proactive(**_kwargs):
+        provider_calls.append("proactive")
+        return {"errcode": 0}
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        agent_tools,
+        "load_group_session_webhook",
+        lambda _session: "valid-during-preflight",
+    )
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fail_native)
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+    result = await agent_tools._send_group_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "不应发送",
+            "mention_all": True,
+        },
+        origin_session_id=str(uuid.uuid4()),
+        tool_call_id="mention-expired-after-preflight",
+        origin_turn_anchor_id=uuid.uuid4(),
+    )
+
+    assert result.startswith("❌ Group message delivery failed via dingtalk")
+    assert provider_calls == []
+    async with async_session() as db:
+        receipts = (
+            await db.execute(
+                select(ChatMessage).where(ChatMessage.conversation_id == str(target.id))
+            )
+        ).scalars().all()
+    assert len(receipts) == 1
+    assert receipts[0].message_meta["mentions"] == {"scope": "all"}
+    assert receipts[0].message_meta["delivery"]["status"] == "failed"
+    assert (
+        receipts[0].message_meta["delivery"]["error"]
+        == "dingtalk_session_webhook_unavailable"
+    )
 
 
 async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkeypatch):
@@ -1747,7 +2124,7 @@ async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkey
     result = await turn_runtime._send_dingtalk_group_mention(
         session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
         message="请确认",
-        at_user_ids=["staff-zhangsan"],
+        mention=MentionIntent(scope="users", target_ids=("staff-zhangsan",)),
     )
 
     assert result == {"errcode": 0}
@@ -1757,6 +2134,80 @@ async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkey
         "text": {"content": "请确认"},
         "at": {"atUserIds": ["staff-zhangsan"], "isAtAll": False},
     }
+
+
+async def test_dingtalk_group_mention_all_payload_contains_native_at_metadata(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+        @staticmethod
+        def json():
+            return {"errcode": 0}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, json):
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        turn_runtime.httpx,
+        "AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    result = await turn_runtime._send_dingtalk_group_mention(
+        session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
+        message="今晚十点发布",
+        mention=MentionIntent(scope="all"),
+    )
+
+    assert result == {"errcode": 0}
+    assert captured["json"] == {
+        "msgtype": "text",
+        "text": {"content": "今晚十点发布"},
+        "at": {"isAtAll": True},
+    }
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id="p2p",
+            external_conv_id="dingtalk_p2p_user-1",
+            is_group=False,
+        ),
+        TurnRuntime(
+            session_found=True,
+            source_channel="feishu",
+            conversation_id="group",
+            external_conv_id="feishu_group_chat-1",
+            is_group=True,
+        ),
+    ],
+)
+async def test_runtime_rejects_unsupported_native_mentions(runtime):
+    result = await turn_runtime.deliver_message_with_receipt(
+        agent_id=uuid.uuid4(),
+        runtime=runtime,
+        message="不应静默发送",
+        mention=MentionIntent(scope="all"),
+    )
+
+    assert result.ok is False
+    assert result.error in {"mention_requires_group", "native_mention_not_supported"}
 
 
 async def test_feishu_runtime_delivers_to_exact_group_conversation(monkeypatch):
@@ -1931,8 +2382,8 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             "message": {
                 "type": "string",
                 "description": (
-                    "Business text to send. When mention_user_ids is present, do not prefix @names "
-                    "or external IDs; the transport renders each native @ exactly once."
+                    "Business text to send. When a native mention option is present, do not prefix "
+                    "@names, @everyone, or external IDs; the transport renders the mention exactly once."
                 ),
             },
             "mention_user_ids": {
@@ -1940,9 +2391,16 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
                 "items": {"type": "string"},
                 "maxItems": 20,
                 "description": (
-                    "Optional canonical platform user_ids to @ in a DingTalk group. "
-                    "Each person must have an active DingTalk route; DingTalk only renders "
-                    "the @ for people who are members of the target group."
+                    "Optional canonical platform user_ids to mention natively in the target group. "
+                    "Each person must be a member of the target group, and the bound channel must "
+                    "support native group mentions."
+                ),
+            },
+            "mention_all": {
+                "type": "boolean",
+                "description": (
+                    "Optionally mention all members of the target group natively. "
+                    "Cannot be combined with mention_user_ids."
                 ),
             },
         },
@@ -1960,8 +2418,8 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             "message": {
                 "type": "string",
                 "description": (
-                    "Business text to send. When mention_user_ids is present, do not prefix @names "
-                    "or external IDs; the transport renders each native @ exactly once."
+                    "Business text to send. When a native mention option is present, do not prefix "
+                    "@names, @everyone, or external IDs; the transport renders the mention exactly once."
                 ),
             },
             "mention_user_ids": {
@@ -1969,9 +2427,16 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
                 "items": {"type": "string"},
                 "maxItems": 20,
                 "description": (
-                    "Optional canonical platform user_ids to @ in a DingTalk group. "
-                    "Each person must have an active DingTalk route; DingTalk only renders "
-                    "the @ for people who are members of the target group."
+                    "Optional canonical platform user_ids to mention natively in the target group. "
+                    "Each person must be a member of the target group, and the bound channel must "
+                    "support native group mentions."
+                ),
+            },
+            "mention_all": {
+                "type": "boolean",
+                "description": (
+                    "Optionally mention all members of the target group natively. "
+                    "Cannot be combined with mention_user_ids."
                 ),
             },
         },
