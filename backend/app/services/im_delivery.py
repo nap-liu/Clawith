@@ -44,6 +44,10 @@ DeliveryClaimObserver = Callable[[uuid.UUID], Awaitable[None]]
 class DeliveryReceiptPersistenceError(RuntimeError):
     """A provider side effect succeeded but its durable receipt did not persist."""
 
+
+class ProviderResponseUncertainError(RuntimeError):
+    """The provider may have accepted a send, but its response was unreadable."""
+
 # A test-only observation seam for proving the database claim is serialized.
 # Production callers leave it unset, so the hot path only pays one ContextVar read.
 delivery_claim_observer: ContextVar[DeliveryClaimObserver | None] = ContextVar(
@@ -56,21 +60,26 @@ delivery_claim_observer: ContextVar[DeliveryClaimObserver | None] = ContextVar(
 class MentionIntent:
     """One native mention request prepared for the selected IM adapter.
 
-    ``target_ids`` are short-lived opaque provider identifiers. Canonical
-    platform user IDs belong in durable message metadata, never in this
-    delivery-only envelope.
+    ``target_ids`` are short-lived opaque provider identifiers and
+    ``target_names`` are their display labels for transports whose mention
+    payload requires an ID-to-name mapping. Canonical platform user IDs belong
+    in durable message metadata, never in this delivery-only envelope.
     """
 
     scope: Literal["users", "all"]
     target_ids: tuple[str, ...] = ()
+    target_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scope not in {"users", "all"}:
             raise ValueError("invalid mention scope")
-        if self.scope == "users" and not self.target_ids:
-            raise ValueError("user mention requires target_ids")
-        if self.scope == "all" and self.target_ids:
-            raise ValueError("all mention cannot contain target_ids")
+        if self.scope == "users":
+            if not self.target_ids:
+                raise ValueError("user mention requires target_ids")
+            if len(self.target_names) != len(self.target_ids):
+                raise ValueError("user mention requires one target name per target id")
+        if self.scope == "all" and (self.target_ids or self.target_names):
+            raise ValueError("all mention cannot contain individual targets")
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,7 @@ class IMDeliveryResult:
                 asyncio.TimeoutError,
                 ConnectionError,
                 DeliveryReceiptPersistenceError,
+                ProviderResponseUncertainError,
                 httpx.TimeoutException,
                 httpx.TransportError,
             ),

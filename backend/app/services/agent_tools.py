@@ -116,7 +116,6 @@ from app.services.im_delivery import (
     register_delivery,
 )
 from app.services.dingtalk_group_mentions import (
-    load_group_session_webhook,
     prepare_group_user_mentions,
 )
 from app.services.user_output import sanitize_user_visible_text
@@ -780,7 +779,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_channel_file",
-            "description": "Send a workspace file to a person or back to the current conversation. Omit user_id only when replying to the current IM/web conversation; that preserves the exact current-session route. Explicit delivery to another person currently supports Feishu and Slack only; provide canonical user_id and choose one of those routes.",
+            "description": "Send a workspace file through an existing conversation or to a person. Omit all targets only for the current conversation. Use exact session_id for another existing person/group Session, or canonical user_id (and channel when needed) for direct person delivery. Never provide both session_id and user_id.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -790,7 +789,11 @@ AGENT_TOOLS = [
                     },
                     "user_id": {
                         "type": "string",
-                        "description": "Canonical platform user_id. Omit only to reply to the current conversation.",
+                        "description": "Canonical platform user_id for direct person delivery. Mutually exclusive with session_id.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Exact existing Session UUID for person or group delivery. Mutually exclusive with user_id.",
                     },
                     "channel": {
                         "type": "string",
@@ -5620,15 +5623,28 @@ async def _send_channel_file(
     """Send a file to a person or back to the current channel.
     
     Priority:
-    1. If canonical user_id is provided, resolve one exact internal route.
-    2. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
-    3. Fall back to a structured web/H5 file delivery result when no explicit recipient is requested.
+    1. If session_id is provided, use that exact existing person/group route.
+    2. If canonical user_id is provided, resolve one exact internal route.
+    3. If the current Session has an exact external file route, use that route.
+    4. If a legacy non-DingTalk channel sender is set, use it directly.
+    5. Fall back to a structured web/H5 result when no explicit target is requested.
     """
     raw_rel_path = arguments.get("file_path", "")
     rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
     accompany_msg = sanitize_user_visible_text(str(arguments.get("message") or ""))
     canonical_user_id = str(arguments.get("user_id") or "").strip()
+    requested_session_id = str(arguments.get("session_id") or "").strip()
     channel = str(arguments.get("channel") or "").strip().lower() or None
+    if canonical_user_id and requested_session_id:
+        return RecipientResolutionError(
+            "ambiguous_file_target",
+            "Cannot provide both session_id and user_id",
+        ).as_json()
+    if channel and not canonical_user_id:
+        return RecipientResolutionError(
+            "channel_requires_user_target",
+            "channel can only be used with user_id",
+        ).as_json()
     if not rel_path:
         return "Error: file_path is required"
     rel_path = _normalize_tool_workspace_rel_path(rel_path)
@@ -5660,7 +5676,45 @@ async def _send_channel_file(
             "message": f"Use send_media with media_type='{detected_kind}'.",
         }, ensure_ascii=False)
 
-    # Priority 1: explicit canonical recipient.
+    async def _deliver_to_exact_session(target_session_id: str) -> str:
+        receipt_id = await _claim_channel_file_receipt(
+            agent_id=agent_id,
+            tool_call_id=str(tool_call_id or ""),
+            origin_session_id=str(origin_session_id or ""),
+            origin_turn_anchor_id=origin_turn_anchor_id,
+        )
+        if receipt_id is None:
+            return "Failed to send file: durable delivery receipt unavailable"
+
+        async def _record_part(part: IMDeliveryPart) -> None:
+            await append_delivery_part(receipt_id, part)
+
+        recorder_token = channel_file_part_recorder.set(_record_part)
+        try:
+            delivery_text, delivery_result = await _send_file_to_session(
+                agent_id,
+                file_path,
+                target_session_id,
+                accompany_msg,
+            )
+            if not await register_delivery(receipt_id, delivery_result):
+                raise RuntimeError("delivery finalization failed")
+            return delivery_text
+        except Exception as exc:
+            await register_delivery(
+                receipt_id,
+                IMDeliveryResult.from_exception("im", exc),
+            )
+            safe_error = sanitize_user_visible_text(str(exc)).strip()
+            return f"Failed to send file: {safe_error or type(exc).__name__}"
+        finally:
+            channel_file_part_recorder.reset(recorder_token)
+
+    # Priority 1: exact existing Session (person or group).
+    if requested_session_id:
+        return await _deliver_to_exact_session(requested_session_id)
+
+    # Priority 2: explicit canonical recipient.
     if canonical_user_id:
         receipt_id = await _claim_channel_file_receipt(
             agent_id=agent_id,
@@ -5695,7 +5749,16 @@ async def _send_channel_file(
         finally:
             channel_file_part_recorder.reset(recorder_token)
 
-    # Priority 2: channel-initiated (ContextVar set by channel webhook handler)
+    # Priority 3: current durable external Session. DingTalk uses the same
+    # proactive route here as explicit cross-session delivery.
+    if origin_session_id and await _supports_exact_file_session_route(
+        agent_id,
+        origin_session_id,
+    ):
+        return await _deliver_to_exact_session(origin_session_id)
+
+    # Priority 4: legacy channel-initiated sender for transports that have not
+    # yet migrated to exact Session routing. DingTalk no longer registers one.
     sender = channel_file_sender.get()
     if sender is not None:
         receipt_id = await _claim_channel_file_receipt(
@@ -5732,7 +5795,7 @@ async def _send_channel_file(
         finally:
             channel_file_part_recorder.reset(recorder_token)
 
-    # Priority 3: Web/H5 chat fallback — return a structured platform file
+    # Priority 5: Web/H5 chat fallback — return a structured platform file
     # delivery payload. The frontend builds the authenticated download URL.
     base_abs = (WORKSPACE_ROOT / str(agent_id)).resolve()
     try:
@@ -5740,6 +5803,26 @@ async def _send_channel_file(
     except ValueError:
         file_rel = rel_path
     return _platform_file_delivery_result(file_path, file_rel, accompany_msg)
+
+
+async def _supports_exact_file_session_route(
+    agent_id: uuid.UUID,
+    session_id: str,
+) -> bool:
+    try:
+        target_session_id = uuid.UUID(session_id)
+    except (TypeError, ValueError):
+        return False
+    async with async_session() as db:
+        channel = (
+            await db.execute(
+                select(ChatSession.source_channel).where(
+                    ChatSession.id == target_session_id,
+                    ChatSession.agent_id == agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+    return str(channel or "").strip() in {"dingtalk", "feishu", "slack"}
 
 
 async def _send_channel_media(
@@ -7418,6 +7501,310 @@ def _platform_file_delivery_result(file_path: Path, rel_path: str, message: str 
     return json.dumps(payload, ensure_ascii=False)
 
 
+async def _send_file_to_session(
+    agent_id: uuid.UUID,
+    file_path: Path,
+    session_id: str,
+    message: str = "",
+) -> tuple[str, IMDeliveryResult]:
+    """Deliver a generic file through one exact Agent-owned IM Session."""
+    try:
+        target_session_id = uuid.UUID(session_id)
+    except (TypeError, ValueError):
+        error = RecipientResolutionError(
+            "session_not_found_or_forbidden",
+            "Target Session does not exist or is not accessible to this Agent",
+        )
+        return error.as_json(), IMDeliveryResult.failed("im", error.code)
+
+    async with async_session() as db:
+        session = (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.id == target_session_id,
+                    ChatSession.agent_id == agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if session is None:
+            error = RecipientResolutionError(
+                "session_not_found_or_forbidden",
+                "Target Session does not exist or is not accessible to this Agent",
+            )
+            return error.as_json(), IMDeliveryResult.failed("im", error.code)
+
+        channel = str(session.source_channel or "").strip()
+        external_conv_id = str(session.external_conv_id or "").strip()
+        if not external_conv_id or "__archived_" in external_conv_id:
+            error = RecipientResolutionError(
+                "session_route_unavailable",
+                "Target Session has no active delivery route",
+            )
+            return error.as_json(), IMDeliveryResult.failed(channel or "im", error.code)
+        config_channel = "microsoft_teams" if channel == "teams" else channel
+        config = (
+            await db.execute(
+                select(ChannelConfig).where(
+                    ChannelConfig.agent_id == agent_id,
+                    ChannelConfig.channel_type == config_channel,
+                    ChannelConfig.is_configured.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+
+    if not config:
+        error = RecipientResolutionError(
+            "channel_unconfigured",
+            f"Source agent has no configured {channel} channel",
+        )
+        return error.as_json(), IMDeliveryResult.failed(channel or "im", error.code)
+
+    if channel == "feishu":
+        expected_prefix = "feishu_group_" if session.is_group else "feishu_p2p_"
+        if not external_conv_id.startswith(expected_prefix):
+            error = RecipientResolutionError(
+                "session_route_mismatch",
+                "Target Session route does not match its person/group type",
+            )
+            return error.as_json(), IMDeliveryResult.failed("feishu", error.code)
+        receive_id = external_conv_id[len(expected_prefix) :].strip()
+        if not receive_id:
+            error = RecipientResolutionError(
+                "session_route_unavailable", "Target Session has no active delivery route"
+            )
+            return error.as_json(), IMDeliveryResult.failed("feishu", error.code)
+        receive_id_type = (
+            "chat_id" if session.is_group else ("open_id" if receive_id.startswith("ou_") else "user_id")
+        )
+        from app.services.feishu_service import feishu_service
+        delivery_parts: list[IMDeliveryPart] = []
+
+        async def _record_feishu_result(
+            artifact_role: str,
+            provider_result: dict,
+        ) -> None:
+            provider_id = str(
+                (provider_result.get("data") or {}).get("message_id")
+                or provider_result.get("message_id")
+                or ""
+            ) or None
+            part = IMDeliveryPart(
+                transport="feishu_message",
+                provider_message_id=provider_id,
+                conversation_ref=receive_id,
+                artifact_role=artifact_role,
+                recallable=bool(provider_id),
+            )
+            delivery_parts.append(part)
+            await record_channel_file_part(part)
+
+        try:
+            await feishu_service.upload_and_send_file(
+                config.app_id,
+                config.app_secret,
+                receive_id,
+                file_path,
+                receive_id_type=receive_id_type,
+                accompany_msg=message,
+                on_result=_record_feishu_result,
+            )
+            if not delivery_parts:
+                part = IMDeliveryPart(
+                    transport="feishu_message",
+                    conversation_ref=receive_id,
+                    artifact_role="channel_file",
+                    recallable=False,
+                )
+                delivery_parts.append(part)
+                await record_channel_file_part(part)
+            return (
+                f"File '{file_path.name}' sent to Session {session.id} via Feishu.",
+                IMDeliveryResult.sent("feishu", *delivery_parts),
+            )
+        except DeliveryReceiptPersistenceError:
+            raise
+        except Exception as exc:
+            return (
+                f"Failed to send file via Feishu: {exc}",
+                IMDeliveryResult.from_exception("feishu", exc),
+            )
+
+    if channel == "slack":
+        if not external_conv_id.startswith("slack_"):
+            error = RecipientResolutionError(
+                "session_route_mismatch", "Target Session route is not a Slack conversation"
+            )
+            return error.as_json(), IMDeliveryResult.failed("slack", error.code)
+        slack_channel_id = external_conv_id[len("slack_") :].strip()
+        if not slack_channel_id:
+            error = RecipientResolutionError(
+                "session_route_unavailable", "Target Session has no active delivery route"
+            )
+            return error.as_json(), IMDeliveryResult.failed("slack", error.code)
+        return await _send_file_via_slack_channel(
+            config,
+            file_path,
+            slack_channel_id,
+            message,
+            display_name=f"Session {session.id}",
+        )
+
+    if channel == "dingtalk":
+        expected_prefix = "dingtalk_group_" if session.is_group else "dingtalk_p2p_"
+        if not external_conv_id.startswith(expected_prefix):
+            error = RecipientResolutionError(
+                "session_route_mismatch",
+                "Target Session route does not match its person/group type",
+            )
+            return error.as_json(), IMDeliveryResult.failed("dingtalk", error.code)
+        target_id = external_conv_id[len(expected_prefix) :].strip()
+        if not target_id:
+            error = RecipientResolutionError(
+                "session_route_unavailable", "Target Session has no active delivery route"
+            )
+            return error.as_json(), IMDeliveryResult.failed("dingtalk", error.code)
+        from app.services.dingtalk_stream import (
+            _send_dingtalk_media_message,
+            _upload_dingtalk_media,
+        )
+
+        media_type = (
+            "image"
+            if file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+            else "file"
+        )
+        media_id = await _upload_dingtalk_media(
+            config.app_id, config.app_secret, str(file_path), media_type
+        )
+        if not media_id:
+            return (
+                "Failed to send file via DingTalk: media upload failed",
+                IMDeliveryResult.failed("dingtalk", "media_upload_failed"),
+            )
+        delivery_parts: list[IMDeliveryPart] = []
+
+        async def _record_dingtalk_result(provider_result: dict) -> None:
+            process_key = str(provider_result.get("processQueryKey") or "") or None
+            part = IMDeliveryPart(
+                transport=(
+                    "dingtalk_openapi_group"
+                    if session.is_group
+                    else "dingtalk_openapi_oto"
+                ),
+                provider_message_id=process_key,
+                conversation_ref=target_id,
+                artifact_role="channel_file",
+                recallable=bool(process_key),
+            )
+            delivery_parts.append(part)
+            await record_channel_file_part(part)
+
+        sent = await _send_dingtalk_media_message(
+            config.app_id,
+            config.app_secret,
+            target_id,
+            media_id,
+            media_type,
+            "2" if session.is_group else "1",
+            filename=file_path.name,
+            raise_on_transport_error=True,
+            on_result=_record_dingtalk_result,
+        )
+        if not sent:
+            return (
+                "Failed to send file via DingTalk: media send failed",
+                IMDeliveryResult.failed("dingtalk", "media_send_failed"),
+            )
+        if not delivery_parts:
+            part = IMDeliveryPart(
+                transport=(
+                    "dingtalk_openapi_group"
+                    if session.is_group
+                    else "dingtalk_openapi_oto"
+                ),
+                conversation_ref=target_id,
+                artifact_role="channel_file",
+                recallable=False,
+            )
+            delivery_parts.append(part)
+            await record_channel_file_part(part)
+        caption_error: str | None = None
+        caption_uncertain = False
+        if message:
+            try:
+                from app.services.turn_runtime import send_dingtalk_proactive_markdown
+
+                result = await send_dingtalk_proactive_markdown(
+                    app_id=config.app_id,
+                    app_secret=config.app_secret,
+                    target_id=target_id,
+                    is_group=bool(session.is_group),
+                    message=message,
+                )
+                if result.get("errcode") != 0:
+                    caption_error = str(
+                        result.get("errmsg")
+                        or result.get("errcode")
+                        or "caption_send_failed"
+                    )
+                    logger.warning(
+                        "[send_channel_file] DingTalk caption delivery failed: {}",
+                        result.get("errcode"),
+                    )
+                else:
+                    process_key = str(result.get("processQueryKey") or "") or None
+                    part = IMDeliveryPart(
+                        transport=(
+                            "dingtalk_openapi_group"
+                            if session.is_group
+                            else "dingtalk_openapi_oto"
+                        ),
+                        provider_message_id=process_key,
+                        conversation_ref=target_id,
+                        artifact_role="file_caption",
+                        recallable=bool(process_key),
+                    )
+                    delivery_parts.append(part)
+                    await record_channel_file_part(part)
+            except DeliveryReceiptPersistenceError:
+                raise
+            except Exception as exc:
+                caption_error = type(exc).__name__
+                caption_uncertain = (
+                    IMDeliveryResult.from_exception("dingtalk", exc).status == "unknown"
+                )
+                logger.warning("[send_channel_file] DingTalk caption delivery failed")
+        if caption_error:
+            caption_status = "unknown" if caption_uncertain else "partial"
+            caption_outcome = (
+                "its caption delivery is uncertain"
+                if caption_uncertain
+                else "its caption failed"
+            )
+            return (
+                f"File '{file_path.name}' sent to Session {session.id} via DingTalk, "
+                f"but {caption_outcome}.",
+                IMDeliveryResult(
+                    ok=False,
+                    channel="dingtalk",
+                    parts=tuple(delivery_parts),
+                    status=caption_status,
+                    error=f"caption_failed:{caption_error}",
+                ),
+            )
+        return (
+            f"File '{file_path.name}' sent to Session {session.id} via DingTalk.",
+            IMDeliveryResult.sent("dingtalk", *delivery_parts),
+        )
+
+    error = RecipientResolutionError(
+        "file_route_unsupported",
+        f"File delivery is not implemented for {channel}",
+        available_channels=[channel] if channel else [],
+    )
+    return error.as_json(), IMDeliveryResult.failed(channel or "im", error.code)
+
+
 async def _send_file_to_recipient(
     agent_id: uuid.UUID,
     file_path: Path,
@@ -7601,30 +7988,68 @@ async def _send_file_via_slack(
                 return f"Slack conversations.open failed: {error}", IMDeliveryResult.failed("slack", error)
             channel_id = dm_data["channel"]["id"]
             
-            # Upload file
+        return await _send_file_via_slack_channel(
+            config,
+            file_path,
+            channel_id,
+            message,
+            display_name=display_name,
+        )
+    except Exception as e:
+        return (
+            f"Failed to send file via Slack: {e}",
+            IMDeliveryResult.from_exception("slack", e),
+        )
+
+
+async def _send_file_via_slack_channel(
+    config,
+    file_path: Path,
+    channel_id: str,
+    message: str,
+    *,
+    display_name: str,
+) -> tuple[str, IMDeliveryResult]:
+    """Upload a generic file to one already-resolved Slack conversation."""
+    import httpx
+
+    bot_token = config.app_secret or ""
+    if not bot_token:
+        error = RecipientResolutionError(
+            "channel_unconfigured", "Slack bot token is missing"
+        )
+        return error.as_json(), IMDeliveryResult.failed("slack", error.code)
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
             upload_url_resp = await client.post(
                 "https://slack.com/api/files.getUploadURLExternal",
                 headers={"Authorization": f"Bearer {bot_token}"},
                 data={"filename": file_path.name, "length": str(file_path.stat().st_size)},
             )
-            ud = upload_url_resp.json()
-            if not ud.get("ok"):
-                error = str(ud.get("error") or "file_upload_failed")
+            upload_data = upload_url_resp.json()
+            if not upload_data.get("ok"):
+                error = str(upload_data.get("error") or "file_upload_failed")
                 return f"Slack file upload failed: {error}", IMDeliveryResult.failed("slack", error)
-            await client.post(ud["upload_url"], content=file_path.read_bytes(),
-                            headers={"Content-Type": "application/octet-stream"})
+            await client.post(
+                upload_data["upload_url"],
+                content=file_path.read_bytes(),
+                headers={"Content-Type": "application/octet-stream"},
+            )
             complete = await client.post(
                 "https://slack.com/api/files.completeUploadExternal",
                 headers={"Authorization": f"Bearer {bot_token}"},
-                json={"files": [{"id": ud["file_id"]}], "channel_id": channel_id,
-                      "initial_comment": message or ""},
+                json={
+                    "files": [{"id": upload_data["file_id"]}],
+                    "channel_id": channel_id,
+                    "initial_comment": message or "",
+                },
             )
             if not complete.json().get("ok"):
                 error = str(complete.json().get("error") or "file_upload_complete_failed")
                 return f"Slack file upload complete failed: {error}", IMDeliveryResult.failed("slack", error)
             part = IMDeliveryPart(
                 transport="slack_file",
-                provider_message_id=str(ud["file_id"]),
+                provider_message_id=str(upload_data["file_id"]),
                 conversation_ref=channel_id,
                 artifact_role="channel_file",
                 recallable=False,
@@ -10666,11 +11091,6 @@ async def _send_exact_session_message(
                 if not target_is_group or target_channel != "dingtalk":
                     return "❌ 原生 @ 当前仅支持钉钉群 Session。"
 
-                if not load_group_session_webhook(session):
-                    return (
-                        "❌ 当前钉钉群 Session 没有可用的临时回复凭证；"
-                        "请让群成员先在群内 @数字员工发送一条消息后重试。"
-                    )
                 if mention_all:
                     mention_intent = MentionIntent(scope="all")
                     mentions_meta = {"scope": "all"}
@@ -10690,6 +11110,7 @@ async def _send_exact_session_message(
                     mention_intent = MentionIntent(
                         scope="users",
                         target_ids=tuple(target_ids),
+                        target_names=tuple(mentioned_names),
                     )
                     mentions_meta = {
                         "scope": "users",
@@ -10718,10 +11139,11 @@ async def _send_exact_session_message(
                 is_group=target_is_group,
             )
             if mention_all:
-                message_for_history = f"@所有人\n{message_text}"
+                message_for_history = f"{message_text}\n\n@所有人"
             elif mentioned_names:
                 message_for_history = (
-                    f"{' '.join(f'@{name}' for name in mentioned_names)}\n{message_text}"
+                    f"{message_text}\n\n"
+                    f"{' '.join(f'@{name}' for name in mentioned_names)}"
                 )
             else:
                 message_for_history = message_text

@@ -1063,7 +1063,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_channel_file",
         "display_name": "Send File",
-        "description": "Send a workspace file to a person or back to the current conversation. Omit user_id only when replying to the current IM/web conversation; that preserves the exact current-session route. Explicit delivery to another person currently supports Feishu and Slack only; provide canonical user_id and choose one of those routes.",
+        "description": "Send a workspace file through an existing conversation or to a person. Omit all targets only for the current conversation. Use exact session_id for another existing person/group Session, or canonical user_id (and channel when needed) for direct person delivery. Never provide both session_id and user_id.",
         "category": "communication",
         "icon": "📎",
         "is_default": True,
@@ -1071,7 +1071,8 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Workspace-relative path to the file, e.g. workspace/report.md"},
-                "user_id": {"type": "string", "description": "Canonical platform user_id. Omit only to reply to the current conversation."},
+                "user_id": {"type": "string", "description": "Canonical platform user_id for direct person delivery. Mutually exclusive with session_id."},
+                "session_id": {"type": "string", "description": "Exact existing Session UUID for person or group delivery. Mutually exclusive with user_id."},
                 "channel": {"type": "string", "enum": ["feishu", "slack"], "description": "Executable explicit file route chosen by the Agent."},
                 "message": {"type": "string", "description": "Optional message to accompany the file"},
             },
@@ -1199,7 +1200,27 @@ BUILTIN_TOOLS = [
             "additionalProperties": False,
         },
         "config": {},
-        "config_schema": {},
+        # The canonical Session-message capability owns the DingTalk mention-card
+        # card template. The compatibility group-only wrapper reads this same
+        # config through the shared delivery runtime, so administrators configure
+        # one value only. As with request_confirmation, standard tool-config
+        # resolution provides agent override -> tenant default -> tool default.
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "card_template_id",
+                    "label": "agent.tools.sessionMessage.cardTemplateId",
+                    "type": "string",
+                    "placeholder": "agent.tools.sessionMessage.cardTemplateIdPlaceholder",
+                    "help_text": "agent.tools.sessionMessage.cardTemplateIdHelp",
+                    "description": (
+                        "用于钉钉群原生 @ 投递的互动卡片模板 ID。模板必须包含唯一的 "
+                        "content 动态 Markdown 字段。可配置企业默认值并按数字员工覆盖；"
+                        "不配置时，带 @ 的钉钉群消息明确失败且不会降级为普通消息。"
+                    ),
+                },
+            ]
+        },
     },
     {
         "name": "send_group_session_message",

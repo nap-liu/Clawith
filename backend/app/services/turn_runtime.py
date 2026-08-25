@@ -20,8 +20,12 @@ from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
 from app.services.channel_dispatch import run_channel_send
-from app.services.dingtalk_group_mentions import load_group_session_webhook_by_id
-from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, MentionIntent
+from app.services.im_delivery import (
+    IMDeliveryPart,
+    IMDeliveryResult,
+    MentionIntent,
+    ProviderResponseUncertainError,
+)
 
 DeliveryPartObserver = Callable[[IMDeliveryPart], Awaitable[None]]
 
@@ -280,12 +284,14 @@ async def deliver_message_with_receipt(
                 runtime,
                 message,
                 mention=mention,
+                on_part=on_part,
             )
         return await _deliver_dingtalk(
             agent_id,
             runtime,
             message,
             mention=mention,
+            on_part=on_part,
         )
 
     delivered: IMDeliveryResult | None = None
@@ -374,6 +380,7 @@ async def _deliver_dingtalk(
     reply: str,
     *,
     mention: MentionIntent | None = None,
+    on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     return await run_channel_send(
         f"im-send:{runtime.conversation_id}",
@@ -382,6 +389,7 @@ async def _deliver_dingtalk(
             runtime,
             reply,
             mention=mention,
+            on_part=on_part,
         ),
     )
 
@@ -392,6 +400,7 @@ async def _deliver_dingtalk_unlocked(
     reply: str,
     *,
     mention: MentionIntent | None = None,
+    on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     """Send one DingTalk message while the caller owns the conversation send lock."""
     if not runtime.external_conv_id:
@@ -402,49 +411,66 @@ async def _deliver_dingtalk_unlocked(
         logger.warning("[turn_runtime] DingTalk channel config missing for agent=%s", agent_id)
         return IMDeliveryResult.failed("dingtalk", "channel_config_unavailable")
 
-    from app.services.dingtalk_card import _parse_target
-    from app.services.dingtalk_service import send_dingtalk_v1_robot_oto_message
+    from app.services.dingtalk_card import _parse_target, send_message_card
 
     space_type, space_id = _parse_target(runtime.external_conv_id, runtime.is_group)
     if not space_id:
         logger.warning("[turn_runtime] DingTalk runtime has empty target: %s", runtime.external_conv_id)
         return IMDeliveryResult.failed("dingtalk", "empty_target")
 
-    async def _send() -> dict:
-        if mention is not None:
-            if space_type == "IM_ROBOT" or not runtime.is_group:
-                return {"errcode": -1, "errmsg": "mention_requires_group"}
-            session_webhook = await load_group_session_webhook_by_id(
-                agent_id=agent_id,
-                conversation_id=runtime.conversation_id,
-                expected_external_conv_id=runtime.external_conv_id,
+    if mention is not None:
+        if space_type == "IM_ROBOT" or not runtime.is_group:
+            return IMDeliveryResult.failed("dingtalk", "mention_requires_group")
+        # The canonical session-message tool owns this transport configuration.
+        # The legacy group-only wrapper consumes the same config through this
+        # shared runtime rather than maintaining a second template setting.
+        from app.services.agent_tools import _get_tool_config
+
+        tool_config = await _get_tool_config(agent_id, "send_session_message") or {}
+        card_template_id = str(tool_config.get("card_template_id") or "").strip()
+        if not card_template_id:
+            logger.warning(
+                "[turn_runtime] DingTalk message-card template missing for agent=%s",
+                agent_id,
             )
-            if not session_webhook:
-                logger.warning(
-                    "[turn_runtime] DingTalk group mention missing temporary session webhook"
-                )
-                return {
-                    "errcode": -1,
-                    "errmsg": "dingtalk_session_webhook_unavailable",
-                }
-            return await _send_dingtalk_group_mention(
-                session_webhook=session_webhook,
-                message=reply,
-                mention=mention,
+            return IMDeliveryResult.failed(
+                "dingtalk",
+                "dingtalk_message_card_template_unavailable",
             )
-        if space_type == "IM_ROBOT":
-            return await send_dingtalk_v1_robot_oto_message(
-                cfg.app_id,
-                cfg.app_secret,
-                [space_id],
-                reply,
-                msg_type="markdown",
-                robot_code=cfg.app_id,
-            )
-        return await _send_dingtalk_group_markdown(
+        at_user_ids = (
+            {"@ALL": "@ALL"}
+            if mention.scope == "all"
+            else dict(zip(mention.target_ids, mention.target_names, strict=True))
+        )
+        out_track_id = f"message.{uuid.uuid4().hex}"
+        delivered_id = await send_message_card(
             app_id=cfg.app_id,
             app_secret=cfg.app_secret,
-            open_conversation_id=space_id,
+            card_template_id=card_template_id,
+            out_track_id=out_track_id,
+            content=reply,
+            external_conv_id=runtime.external_conv_id,
+            at_user_ids=at_user_ids,
+        )
+        if not delivered_id:
+            return IMDeliveryResult.failed("dingtalk", "dingtalk_message_card_delivery_failed")
+        part = IMDeliveryPart(
+            transport="dingtalk_interactive_card",
+            provider_message_id=delivered_id,
+            conversation_ref=space_id,
+            recallable=False,
+            metadata={"mention_scope": mention.scope},
+        )
+        if on_part is not None:
+            await on_part(part)
+        return IMDeliveryResult.sent("dingtalk", part)
+
+    async def _send() -> dict:
+        return await send_dingtalk_proactive_markdown(
+            app_id=cfg.app_id,
+            app_secret=cfg.app_secret,
+            target_id=space_id,
+            is_group=space_type == "IM_GROUP",
             message=reply,
         )
 
@@ -453,61 +479,17 @@ async def _deliver_dingtalk_unlocked(
     if not ok:
         logger.warning("[turn_runtime] DingTalk recovered reply delivery failed: %s", result)
         return IMDeliveryResult.failed("dingtalk", str(result.get("errmsg") or result.get("errcode") or "send_failed"))
-    if mention is not None:
-        return IMDeliveryResult.unsupported_delivery(
-            "dingtalk",
-            "dingtalk_session_webhook",
-            conversation_ref=space_id,
-        )
     process_key = str(result.get("processQueryKey") or "")
     transport = "dingtalk_openapi_oto" if space_type == "IM_ROBOT" else "dingtalk_openapi_group"
-    return IMDeliveryResult.sent(
-        "dingtalk",
-        IMDeliveryPart(
-            transport=transport,
-            provider_message_id=process_key or None,
-            conversation_ref=space_id,
-            recallable=bool(process_key),
-        ),
+    part = IMDeliveryPart(
+        transport=transport,
+        provider_message_id=process_key or None,
+        conversation_ref=space_id,
+        recallable=bool(process_key),
     )
-
-
-async def _send_dingtalk_group_mention(
-    *,
-    session_webhook: str,
-    message: str,
-    mention: MentionIntent,
-) -> dict:
-    """Reply to one DingTalk group with native @ metadata."""
-    at: dict = {"isAtAll": mention.scope == "all"}
-    if mention.scope == "users":
-        at["atUserIds"] = list(mention.target_ids)
-    payload = {
-        "msgtype": "text",
-        "text": {"content": message},
-        "at": at,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(session_webhook, json=payload)
-        try:
-            data = response.json()
-        except ValueError:
-            data = {}
-    except Exception as exc:
-        # httpx exception strings may contain the signed webhook URL. Keep that
-        # credential out of logs and tool-visible errors.
-        return {
-            "errcode": -1,
-            "errmsg": f"temporary webhook request failed ({type(exc).__name__})",
-        }
-    if response.status_code >= 400 or data.get("errcode"):
-        return {
-            "errcode": data.get("errcode", response.status_code),
-            "errmsg": data.get("errmsg") or response.text[:200],
-        }
-    return {"errcode": 0}
-
+    if on_part is not None:
+        await on_part(part)
+    return IMDeliveryResult.sent("dingtalk", part)
 
 async def _deliver_feishu(
     agent_id: uuid.UUID,
@@ -927,6 +909,7 @@ async def _send_dingtalk_group_markdown(
     app_secret: str,
     open_conversation_id: str,
     message: str,
+    raise_on_transport_error: bool = False,
 ) -> dict:
     from app.services.dingtalk_service import build_dingtalk_markdown_content
     from app.services.dingtalk_token import dingtalk_token_manager
@@ -955,9 +938,47 @@ async def _send_dingtalk_group_markdown(
                 headers=headers,
                 json=payload,
             )
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise ProviderResponseUncertainError(
+                    "DingTalk group send returned an unreadable response"
+                ) from exc
         except Exception as exc:
+            if raise_on_transport_error:
+                raise
             return {"errcode": -1, "errmsg": str(exc)}
     if resp.status_code >= 400 or data.get("errcode"):
         return {"errcode": data.get("errcode", resp.status_code), "errmsg": data.get("errmsg") or str(data)}
     return {"errcode": 0, "processQueryKey": data.get("processQueryKey")}
+
+
+async def send_dingtalk_proactive_markdown(
+    *,
+    app_id: str,
+    app_secret: str,
+    target_id: str,
+    is_group: bool,
+    message: str,
+) -> dict:
+    """Send Markdown through durable robot OpenAPI identifiers only."""
+    if is_group:
+        return await _send_dingtalk_group_markdown(
+            app_id=app_id,
+            app_secret=app_secret,
+            open_conversation_id=target_id,
+            message=message,
+            raise_on_transport_error=True,
+        )
+
+    from app.services.dingtalk_service import send_dingtalk_v1_robot_oto_message
+
+    return await send_dingtalk_v1_robot_oto_message(
+        app_id,
+        app_secret,
+        [target_id],
+        message,
+        msg_type="markdown",
+        robot_code=app_id,
+        raise_on_transport_error=True,
+    )

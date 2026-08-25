@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -23,7 +24,12 @@ from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
 from app.services import agent_tools, turn_runtime
-from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, MentionIntent
+from app.services.im_delivery import (
+    DeliveryReceiptPersistenceError,
+    IMDeliveryPart,
+    IMDeliveryResult,
+    MentionIntent,
+)
 from app.services.tool_seeder import seed_builtin_tools
 from app.services.turn_runtime import TurnRuntime
 
@@ -241,14 +247,13 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
-        return IMDeliveryResult.sent(
-            kwargs["runtime"].source_channel,
-            IMDeliveryPart(
-                transport="dingtalk_openapi_group",
-                provider_message_id="provider-group-1",
-                conversation_ref=kwargs["runtime"].external_conv_id,
-            ),
+        part = IMDeliveryPart(
+            transport="dingtalk_openapi_group",
+            provider_message_id="provider-group-1",
+            conversation_ref=kwargs["runtime"].external_conv_id,
         )
+        await kwargs["on_part"](part)
+        return IMDeliveryResult.sent(kwargs["runtime"].source_channel, part)
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
@@ -300,6 +305,7 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
     assert receipt.message_meta["target_session_id"] == str(target.id)
     assert receipt.message_meta["source_channel"] == "dingtalk"
     assert receipt.message_meta["actor_ref"] == target.external_conv_id
+    assert receipt.message_meta["delivery"]["parts"][0]["provider_message_id"] == "provider-group-1"
     assert refreshed is not None and refreshed.last_message_at is not None
 
 
@@ -573,24 +579,9 @@ async def test_failed_transport_persists_failed_lifecycle_receipt(monkeypatch):
 
 
 async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypatch):
-    from app.services.dingtalk_group_mentions import cache_group_session_webhook
-
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
     mentioned_user_id = uuid.uuid4()
-    webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=secret"
-    async with async_session() as db:
-        stored = await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook=webhook,
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
-        )
-        await db.commit()
-        assert stored is not None
-        encrypted_config = dict(stored.im_config or {})
-    assert webhook not in json.dumps(encrypted_config)
 
     delivered: list[dict] = []
 
@@ -606,8 +597,8 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
         return IMDeliveryResult.unsupported_delivery(
-            "dingtalk",
-            "dingtalk_session_webhook",
+        "dingtalk",
+            "dingtalk_interactive_card",
             conversation_ref=kwargs["runtime"].external_conv_id,
         )
 
@@ -642,6 +633,7 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
     assert delivered[0]["mention"] == MentionIntent(
         scope="users",
         target_ids=("staff-zhangsan",),
+        target_names=("张三",),
     )
 
     async with async_session() as db:
@@ -649,7 +641,7 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
             await db.execute(
                 select(ChatMessage).where(
                     ChatMessage.conversation_id == str(target.id),
-                    ChatMessage.content == "@张三\n请确认今晚发布窗口",
+                    ChatMessage.content == "请确认今晚发布窗口\n\n@张三",
                 )
             )
         ).scalar_one()
@@ -663,20 +655,8 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
 
 
 async def test_dingtalk_group_session_message_mentions_everyone(monkeypatch):
-    from app.services.dingtalk_group_mentions import cache_group_session_webhook
-
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
-    webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=all-secret"
-    async with async_session() as db:
-        await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook=webhook,
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
-        )
-        await db.commit()
 
     delivered: list[dict] = []
 
@@ -687,7 +667,7 @@ async def test_dingtalk_group_session_message_mentions_everyone(monkeypatch):
         delivered.append(kwargs)
         return IMDeliveryResult.unsupported_delivery(
             "dingtalk",
-            "dingtalk_session_webhook",
+            "dingtalk_interactive_card",
             conversation_ref=kwargs["runtime"].external_conv_id,
         )
 
@@ -740,7 +720,7 @@ async def test_dingtalk_group_session_message_mentions_everyone(monkeypatch):
             await db.execute(
                 select(ChatMessage).where(
                     ChatMessage.conversation_id == str(target.id),
-                    ChatMessage.content == "@所有人\n今晚十点发布，请大家知悉",
+                    ChatMessage.content == "今晚十点发布，请大家知悉\n\n@所有人",
                 )
             )
         ).scalar_one()
@@ -824,109 +804,39 @@ async def test_session_message_rejects_unsupported_mention_all_before_persist(
     assert receipts == []
 
 
-async def test_dingtalk_webhook_merge_preserves_concurrent_scene_and_model_switches():
-    from app.services.dingtalk_group_mentions import (
-        cache_group_session_webhook,
-        load_group_session_webhook,
-    )
-
+async def test_dingtalk_group_mention_does_not_require_recent_group_webhook(monkeypatch):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
-    selected_model_id = str(uuid.uuid4())
-    webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=concurrent"
+    canonical_user_id = str(uuid.uuid4())
+    delivered: list[dict] = []
 
-    async with async_session() as stale_db:
-        stale = await stale_db.get(ChatSession, target.id)
-        assert stale is not None and stale.im_config == {}
-        stale.im_config = {"stale_write": "must-not-survive"}
+    async def fake_prepare(*_args, **_kwargs):
+        return ["staff-zhangsan"], ["张三"]
 
-        async with async_session() as command_db:
-            locked = (
-                await command_db.execute(select(ChatSession).where(ChatSession.id == target.id).with_for_update())
-            ).scalar_one()
-            locked.im_config = {
-                "scene_key": "warranty",
-                "model_id": selected_model_id,
-            }
-            await command_db.commit()
-
-        merged = await cache_group_session_webhook(
-            stale_db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook=webhook,
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+    async def fake_deliver(**kwargs):
+        delivered.append(kwargs)
+        return IMDeliveryResult.unsupported_delivery(
+            "dingtalk",
+            "dingtalk_interactive_card",
         )
-        assert merged is not None
-        await stale_db.commit()
 
-    async with async_session() as db:
-        refreshed = await db.get(ChatSession, target.id)
-        assert refreshed is not None
-        assert refreshed.im_config["scene_key"] == "warranty"
-        assert refreshed.im_config["model_id"] == selected_model_id
-        assert "stale_write" not in refreshed.im_config
-        assert load_group_session_webhook(refreshed) == webhook
-
-
-async def test_dingtalk_webhook_cache_never_regresses_to_older_callback():
-    from app.services.dingtalk_group_mentions import (
-        cache_group_session_webhook,
-        load_group_session_webhook,
-    )
-
-    owner, _ = await _seed_agents()
-    target = await _seed_session(owner.id)
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    newer_webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=newer"
-    older_webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=older"
-
-    async with async_session() as db:
-        await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook=newer_webhook,
-            expires_at_ms=now_ms + 900_000,
-        )
-        await db.commit()
-
-    async with async_session() as db:
-        await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook=older_webhook,
-            expires_at_ms=now_ms + 600_000,
-        )
-        await db.commit()
-
-    async with async_session() as db:
-        refreshed = await db.get(ChatSession, target.id)
-        assert refreshed is not None
-        assert load_group_session_webhook(refreshed) == newer_webhook
-        assert refreshed.im_config["dingtalk_session_webhook_expires_at_ms"] == (now_ms + 900_000)
-
-
-async def test_dingtalk_group_mention_requires_recent_group_webhook(monkeypatch):
-    owner, _ = await _seed_agents()
-    target = await _seed_session(owner.id)
-
-    async def fail_if_called(**_kwargs):
-        raise AssertionError("delivery must not run without a temporary group webhook")
-
-    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fail_if_called)
+    monkeypatch.setattr(agent_tools, "prepare_group_user_mentions", fake_prepare)
+    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     result = await agent_tools._send_group_session_message(
         owner.id,
         {
             "session_id": str(target.id),
             "message": "请确认",
-            "mention_user_ids": [str(uuid.uuid4())],
+            "mention_user_ids": [canonical_user_id],
         },
     )
 
-    assert result.startswith("❌")
-    assert "先在群内 @数字员工" in result
+    assert json.loads(result)["status"] == "sent"
+    assert delivered[0]["mention"] == MentionIntent(
+        scope="users",
+        target_ids=("staff-zhangsan",),
+        target_names=("张三",),
+    )
 
 
 async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch):
@@ -970,7 +880,297 @@ async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch
         "app_secret": "ding-secret",
         "open_conversation_id": "open-conversation-exact",
         "message": "exact target",
+        "raise_on_transport_error": True,
     }
+
+
+async def test_dingtalk_file_caption_uses_durable_proactive_session_route(
+    tmp_path,
+    monkeypatch,
+):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        external_conv_id="dingtalk_group_open-conversation-file",
+    )
+    app_id = f"ding-file-app-{uuid.uuid4().hex}"
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=app_id,
+                app_secret="ding-file-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 durable file route")
+    captured = {}
+
+    async def fake_upload(*args, **kwargs):
+        captured["upload"] = (args, kwargs)
+        return "media-id"
+
+    async def fake_media_send(*args, **kwargs):
+        captured["media"] = (args, kwargs)
+        return True
+
+    async def fake_caption(**kwargs):
+        captured["caption"] = kwargs
+        return {"errcode": 0, "processQueryKey": "caption-process-key"}
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._upload_dingtalk_media",
+        fake_upload,
+    )
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_media_message",
+        fake_media_send,
+    )
+    monkeypatch.setattr(
+        turn_runtime,
+        "send_dingtalk_proactive_markdown",
+        fake_caption,
+    )
+
+    delivery_text, delivery_result = await agent_tools._send_file_to_session(
+        owner.id,
+        report,
+        str(target.id),
+        "文件说明",
+    )
+    expected_target_id = target.external_conv_id.removeprefix("dingtalk_group_")
+
+    assert delivery_text == f"File 'report.pdf' sent to Session {target.id} via DingTalk."
+    assert delivery_result.ok is True
+    assert [part.artifact_role for part in delivery_result.parts] == [
+        "channel_file",
+        "file_caption",
+    ]
+    assert captured["media"][0][2:6] == (
+        expected_target_id,
+        "media-id",
+        "file",
+        "2",
+    )
+    assert captured["caption"] == {
+        "app_id": app_id,
+        "app_secret": "ding-file-secret",
+        "target_id": expected_target_id,
+        "is_group": True,
+        "message": "文件说明",
+    }
+
+
+async def test_send_file_exact_session_rejects_cross_agent_and_archived_routes(tmp_path):
+    owner, other = await _seed_agents()
+    target = await _seed_session(owner.id)
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 authorization")
+
+    cross_agent_text, cross_agent_result = await agent_tools._send_file_to_session(
+        other.id,
+        report,
+        str(target.id),
+    )
+    cross_agent_payload = json.loads(cross_agent_text)
+    assert cross_agent_payload["code"] == "session_not_found_or_forbidden"
+    assert cross_agent_result.status == "failed"
+
+    archived = await _seed_session(
+        owner.id,
+        external_conv_id="dingtalk_group_old__archived_20260825",
+    )
+    archived_text, archived_result = await agent_tools._send_file_to_session(
+        owner.id,
+        report,
+        str(archived.id),
+    )
+    archived_payload = json.loads(archived_text)
+    assert archived_payload["code"] == "session_route_unavailable"
+    assert archived_result.status == "failed"
+
+
+async def test_send_file_exact_session_rejects_person_group_route_mismatch(tmp_path):
+    owner, _ = await _seed_agents()
+    recipient = await _seed_related_user(owner)
+    target = await _seed_session(
+        owner.id,
+        external_conv_id="dingtalk_group_wrong-kind",
+        is_group=False,
+        user_id=recipient.id,
+    )
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-file-app-{uuid.uuid4().hex}",
+                app_secret="ding-file-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 route mismatch")
+
+    delivery_text, delivery_result = await agent_tools._send_file_to_session(
+        owner.id,
+        report,
+        str(target.id),
+    )
+
+    payload = json.loads(delivery_text)
+    assert payload["code"] == "session_route_mismatch"
+    assert delivery_result.status == "failed"
+
+
+async def test_send_file_targets_exact_dingtalk_person_session(tmp_path, monkeypatch):
+    owner, _ = await _seed_agents()
+    recipient = await _seed_related_user(owner)
+    target = await _seed_session(
+        owner.id,
+        external_conv_id="dingtalk_p2p_staff-person",
+        is_group=False,
+        user_id=recipient.id,
+    )
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-file-app-{uuid.uuid4().hex}",
+                app_secret="ding-file-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 person route")
+    captured = {}
+
+    async def fake_upload(*_args, **_kwargs):
+        return "person-media-id"
+
+    async def fake_media_send(*args, **kwargs):
+        captured["args"] = args
+        await kwargs["on_result"]({"processQueryKey": "person-file-process-key"})
+        return True
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._upload_dingtalk_media",
+        fake_upload,
+    )
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_media_message",
+        fake_media_send,
+    )
+
+    delivery_text, delivery_result = await agent_tools._send_file_to_session(
+        owner.id,
+        report,
+        str(target.id),
+    )
+
+    expected_target = target.external_conv_id.removeprefix("dingtalk_p2p_")
+    assert delivery_text == f"File 'report.pdf' sent to Session {target.id} via DingTalk."
+    assert captured["args"][2:6] == (
+        expected_target,
+        "person-media-id",
+        "file",
+        "1",
+    )
+    assert delivery_result.parts[0].provider_message_id == "person-file-process-key"
+
+
+@pytest.mark.parametrize("failure_mode", ["business_error", "exception"])
+async def test_dingtalk_file_caption_failure_is_reported_as_partial(
+    tmp_path,
+    monkeypatch,
+    failure_mode,
+):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        external_conv_id="dingtalk_group_open-conversation-caption-partial",
+    )
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-file-app-{uuid.uuid4().hex}",
+                app_secret="ding-file-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 partial caption")
+
+    async def fake_upload(*_args, **_kwargs):
+        return "media-id"
+
+    async def fake_media_send(*_args, **_kwargs):
+        return True
+
+    async def fake_caption(**_kwargs):
+        if failure_mode == "exception":
+            raise httpx.ReadTimeout("caption transport unavailable")
+        return {"errcode": 40035, "errmsg": "caption rejected"}
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._upload_dingtalk_media",
+        fake_upload,
+    )
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_media_message",
+        fake_media_send,
+    )
+    monkeypatch.setattr(turn_runtime, "send_dingtalk_proactive_markdown", fake_caption)
+
+    delivery_text, delivery_result = await agent_tools._send_file_to_session(
+        owner.id,
+        report,
+        str(target.id),
+        "文件说明",
+    )
+
+    expected_status = "unknown" if failure_mode == "exception" else "partial"
+    expected_text = (
+        "caption delivery is uncertain"
+        if failure_mode == "exception"
+        else "caption failed"
+    )
+    assert expected_text in delivery_text
+    assert delivery_result.ok is False
+    assert delivery_result.status == expected_status
+    assert delivery_result.error.startswith("caption_failed:")
+    assert [part.artifact_role for part in delivery_result.parts] == ["channel_file"]
+
+    async with async_session() as db:
+        receipt = ChatMessage(
+            agent_id=owner.id,
+            role="assistant",
+            conversation_id=str(target.id),
+            content="文件说明",
+            message_meta=agent_tools.attach_delivery_to_meta(
+                {},
+                IMDeliveryResult.pending("dingtalk"),
+            ),
+        )
+        db.add(receipt)
+        await db.commit()
+        receipt_id = receipt.id
+    assert await agent_tools.register_delivery(receipt_id, delivery_result)
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, receipt_id)
+    assert stored.message_meta["delivery"]["status"] == "partial"
+    assert bool(stored.message_meta["delivery"].get("uncertain")) is (
+        failure_mode == "exception"
+    )
 
 
 async def test_send_video_targets_exact_group_session_with_custom_cover(
@@ -1911,6 +2111,94 @@ async def test_send_channel_file_persists_first_part_before_later_timeout(
     ]
 
 
+async def test_send_channel_file_exact_session_timeout_persists_unknown_without_retry(
+    tmp_path,
+    monkeypatch,
+):
+    owner, _ = await _seed_agents()
+    origin = await _seed_session(owner.id, channel="web", is_group=True)
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_group_timeout-file",
+        is_group=True,
+    )
+    call_id = "file-exact-timeout"
+    turn_anchor_id = uuid.uuid4()
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-file-app-{uuid.uuid4().hex}",
+                app_secret="ding-file-secret",
+                is_configured=True,
+            )
+        )
+        row = ChatMessage(
+            agent_id=owner.id,
+            user_id=origin.user_id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_channel_file",
+                "call_id": call_id,
+                "args": {
+                    "file_path": "workspace/report.pdf",
+                    "session_id": str(target.id),
+                },
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(origin.id),
+            message_meta={"turn_anchor_id": str(turn_anchor_id)},
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+
+    workspace = tmp_path / str(owner.id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 timeout")
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    provider_calls = []
+
+    async def fake_upload(*_args, **_kwargs):
+        return "media-id"
+
+    async def timeout_send(*_args, **_kwargs):
+        provider_calls.append(True)
+        raise httpx.ReadTimeout("provider response timed out")
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._upload_dingtalk_media",
+        fake_upload,
+    )
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_media_message",
+        timeout_send,
+    )
+
+    result = await agent_tools._send_channel_file(
+        owner.id,
+        workspace,
+        {
+            "file_path": "workspace/report.pdf",
+            "session_id": str(target.id),
+        },
+        tool_call_id=call_id,
+        origin_session_id=str(origin.id),
+        origin_turn_anchor_id=turn_anchor_id,
+    )
+
+    assert "Failed to send file" in result
+    assert provider_calls == [True]
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row_id)
+    assert stored.message_meta["delivery"]["status"] == "unknown"
+    assert stored.message_meta["delivery"]["error"] == "ReadTimeout"
+
+
 async def test_send_media_pending_standard_tool_call_replay_becomes_visible_unknown_error(
     tmp_path, monkeypatch
 ):
@@ -2116,9 +2404,9 @@ async def test_outbound_operation_key_supports_sessionless_agent_turns():
     assert ":no-session:unanchored:heartbeat-tool-call" in key
 
 
-async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monkeypatch):
-    from app.services.dingtalk_group_mentions import cache_group_session_webhook
-
+async def test_dingtalk_runtime_uses_interactive_card_for_native_mentions_without_webhook(
+    monkeypatch,
+):
     owner, _ = await _seed_agents()
     target = await _seed_session(
         owner.id,
@@ -2134,26 +2422,28 @@ async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monke
                 is_configured=True,
             )
         )
-        await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
-        )
         await db.commit()
     captured = {}
 
-    async def fake_mention(**kwargs):
+    async def fake_card(**kwargs):
         captured.update(kwargs)
-        return {"errcode": 0}
+        return kwargs["out_track_id"]
 
     async def fail_proactive(**_kwargs):
-        raise AssertionError("native mention must use the temporary session webhook")
+        raise AssertionError("native mention must use the interactive card transport")
 
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fake_mention)
+    async def fake_tool_config(*_args, **_kwargs):
+        return {"card_template_id": "message-template"}
+
+    recorded_parts = []
+
+    async def record_part(part):
+        recorded_parts.append(part)
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_tool_config)
+    monkeypatch.setattr("app.services.dingtalk_card.send_message_card", fake_card)
     monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
-    sent = await turn_runtime.deliver_message_to_runtime(
+    result = await turn_runtime.deliver_message_with_receipt(
         agent_id=owner.id,
         runtime=TurnRuntime(
             session_found=True,
@@ -2163,78 +2453,28 @@ async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monke
             is_group=True,
         ),
         message="请确认",
-        mention=MentionIntent(scope="users", target_ids=("staff-zhangsan",)),
-    )
-
-    assert sent is True
-    assert captured == {
-        "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?secret",
-        "message": "请确认",
-        "mention": MentionIntent(scope="users", target_ids=("staff-zhangsan",)),
-    }
-
-
-async def test_dingtalk_runtime_rejects_mention_webhook_owned_by_another_agent(
-    monkeypatch,
-):
-    from app.services.dingtalk_group_mentions import cache_group_session_webhook
-
-    owner, other = await _seed_agents()
-    target = await _seed_session(owner.id)
-    async with async_session() as db:
-        db.add(
-            ChannelConfig(
-                agent_id=other.id,
-                channel_type="dingtalk",
-                app_id=f"ding-app-{uuid.uuid4().hex}",
-                app_secret="ding-secret",
-                is_configured=True,
-            )
-        )
-        await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook="https://oapi.dingtalk.com/robot/sendBySession?owned-by-owner",
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
-        )
-        await db.commit()
-
-    provider_calls: list[str] = []
-
-    async def fail_native(**_kwargs):
-        provider_calls.append("native")
-        return {"errcode": 0}
-
-    async def fail_proactive(**_kwargs):
-        provider_calls.append("proactive")
-        return {"errcode": 0}
-
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fail_native)
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
-    result = await turn_runtime.deliver_message_with_receipt(
-        agent_id=other.id,
-        runtime=TurnRuntime(
-            session_found=True,
-            source_channel="dingtalk",
-            conversation_id=str(target.id),
-            external_conv_id=target.external_conv_id,
-            is_group=True,
+        mention=MentionIntent(
+            scope="users",
+            target_ids=("staff-zhangsan",),
+            target_names=("张三",),
         ),
-        message="不应发送",
-        mention=MentionIntent(scope="all"),
+        on_part=record_part,
     )
 
-    assert result.ok is False
-    assert result.error == "dingtalk_session_webhook_unavailable"
-    assert provider_calls == []
+    assert result.ok is True
+    assert result.parts[0].transport == "dingtalk_interactive_card"
+    assert result.parts[0].recallable is False
+    assert result.parts[0].provider_message_id == captured["out_track_id"]
+    assert recorded_parts == [result.parts[0]]
+    assert captured["card_template_id"] == "message-template"
+    assert captured["content"] == "请确认"
+    assert captured["external_conv_id"] == target.external_conv_id
+    assert captured["at_user_ids"] == {"staff-zhangsan": "张三"}
 
 
-async def test_dingtalk_runtime_rejects_changed_group_conversation_generation(
+async def test_dingtalk_card_provider_success_does_not_retry_when_part_persistence_fails(
     monkeypatch,
 ):
-    from app.services.dingtalk_group_mentions import cache_group_session_webhook
-
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
     async with async_session() as db:
@@ -2247,50 +2487,86 @@ async def test_dingtalk_runtime_rejects_changed_group_conversation_generation(
                 is_configured=True,
             )
         )
-        await cache_group_session_webhook(
-            db,
+        await db.commit()
+
+    provider_calls = []
+
+    async def fake_tool_config(*_args, **_kwargs):
+        return {"card_template_id": "message-template"}
+
+    async def fake_card(**kwargs):
+        provider_calls.append(kwargs)
+        return kwargs["out_track_id"]
+
+    async def fail_part(_part):
+        raise DeliveryReceiptPersistenceError("database unavailable")
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_tool_config)
+    monkeypatch.setattr("app.services.dingtalk_card.send_message_card", fake_card)
+
+    with pytest.raises(DeliveryReceiptPersistenceError):
+        await turn_runtime.deliver_message_with_receipt(
             agent_id=owner.id,
-            external_conv_id=target.external_conv_id,
-            webhook="https://oapi.dingtalk.com/robot/sendBySession?old-generation",
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+            runtime=TurnRuntime(
+                session_found=True,
+                source_channel="dingtalk",
+                conversation_id=str(target.id),
+                external_conv_id=target.external_conv_id,
+                is_group=True,
+            ),
+            message="请确认",
+            mention=MentionIntent(scope="all"),
+            on_part=fail_part,
+        )
+
+    assert len(provider_calls) == 1
+
+
+async def test_dingtalk_proactive_text_reports_provider_part_immediately(monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
         )
         await db.commit()
 
-    provider_calls: list[str] = []
+    provider_calls = []
+    recorded_parts = []
 
-    async def fail_native(**_kwargs):
-        provider_calls.append("native")
-        return {"errcode": 0}
+    async def fake_send(**kwargs):
+        provider_calls.append(kwargs)
+        return {"errcode": 0, "processQueryKey": "text-process-key"}
 
-    async def fail_proactive(**_kwargs):
-        provider_calls.append("proactive")
-        return {"errcode": 0}
+    async def record_part(part):
+        recorded_parts.append(part)
 
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fail_native)
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
+    monkeypatch.setattr(turn_runtime, "send_dingtalk_proactive_markdown", fake_send)
     result = await turn_runtime.deliver_message_with_receipt(
         agent_id=owner.id,
         runtime=TurnRuntime(
             session_found=True,
             source_channel="dingtalk",
             conversation_id=str(target.id),
-            external_conv_id="dingtalk_group_new-generation",
+            external_conv_id=target.external_conv_id,
             is_group=True,
         ),
-        message="不应发送",
-        mention=MentionIntent(scope="all"),
+        message="普通消息",
+        on_part=record_part,
     )
 
-    assert result.ok is False
-    assert result.error == "dingtalk_session_webhook_unavailable"
-    assert provider_calls == []
+    assert len(provider_calls) == 1
+    assert recorded_parts == [result.parts[0]]
+    assert result.parts[0].provider_message_id == "text-process-key"
 
 
-async def test_dingtalk_mention_webhook_safety_window_finishes_receipt_failed(
-    monkeypatch,
-):
-    from app.services.dingtalk_group_mentions import cache_group_session_webhook
-
+async def test_dingtalk_runtime_mention_all_uses_card_without_webhook(monkeypatch):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
     async with async_session() as db:
@@ -2303,35 +2579,106 @@ async def test_dingtalk_mention_webhook_safety_window_finishes_receipt_failed(
                 is_configured=True,
             )
         )
-        await cache_group_session_webhook(
-            db,
-            agent_id=owner.id,
+        await db.commit()
+
+    captured = {}
+
+    async def fake_tool_config(*_args, **_kwargs):
+        return {"card_template_id": "message-template"}
+
+    async def fake_card(**kwargs):
+        captured.update(kwargs)
+        return kwargs["out_track_id"]
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_tool_config)
+    monkeypatch.setattr("app.services.dingtalk_card.send_message_card", fake_card)
+    result = await turn_runtime.deliver_message_with_receipt(
+        agent_id=owner.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id=str(target.id),
             external_conv_id=target.external_conv_id,
-            webhook="https://oapi.dingtalk.com/robot/sendBySession?near-expiry",
-            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 20_000,
+            is_group=True,
+        ),
+        message="今晚十点发布",
+        mention=MentionIntent(scope="all"),
+    )
+
+    assert result.ok is True
+    assert captured["at_user_ids"] == {"@ALL": "@ALL"}
+
+
+async def test_dingtalk_runtime_rejects_native_mention_without_card_template(
+    monkeypatch,
+):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
         )
         await db.commit()
 
-    provider_calls: list[str] = []
+    async def missing_tool_config(*_args, **_kwargs):
+        return {}
 
-    async def fail_native(**_kwargs):
-        provider_calls.append("native")
-        return {"errcode": 0}
+    async def fail_card(**_kwargs):
+        raise AssertionError("card provider must not be called without a template")
 
-    async def fail_proactive(**_kwargs):
-        provider_calls.append("proactive")
-        return {"errcode": 0}
+    monkeypatch.setattr(agent_tools, "_get_tool_config", missing_tool_config)
+    monkeypatch.setattr("app.services.dingtalk_card.send_message_card", fail_card)
+    result = await turn_runtime.deliver_message_with_receipt(
+        agent_id=owner.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id=str(target.id),
+            external_conv_id=target.external_conv_id,
+            is_group=True,
+        ),
+        message="不应发送",
+        mention=MentionIntent(scope="all"),
+    )
+
+    assert result.ok is False
+    assert result.error == "dingtalk_message_card_template_unavailable"
+
+
+async def test_dingtalk_card_delivery_failure_finishes_receipt_failed_without_webhook(
+    monkeypatch,
+):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+
+    async def fake_tool_config(*_args, **_kwargs):
+        return {"card_template_id": "message-template"}
+
+    async def fail_card(**_kwargs):
+        return None
 
     async def fake_live_mirror(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(
-        agent_tools,
-        "load_group_session_webhook",
-        lambda _session: "valid-during-preflight",
-    )
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fail_native)
-    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_tool_config)
+    monkeypatch.setattr("app.services.dingtalk_card.send_message_card", fail_card)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
     result = await agent_tools._send_group_session_message(
         owner.id,
@@ -2341,12 +2688,11 @@ async def test_dingtalk_mention_webhook_safety_window_finishes_receipt_failed(
             "mention_all": True,
         },
         origin_session_id=str(uuid.uuid4()),
-        tool_call_id="mention-expired-after-preflight",
+        tool_call_id="mention-card-provider-failure",
         origin_turn_anchor_id=uuid.uuid4(),
     )
 
     assert result.startswith("❌ Group message delivery failed via dingtalk")
-    assert provider_calls == []
     async with async_session() as db:
         receipts = (
             await db.execute(
@@ -2358,95 +2704,8 @@ async def test_dingtalk_mention_webhook_safety_window_finishes_receipt_failed(
     assert receipts[0].message_meta["delivery"]["status"] == "failed"
     assert (
         receipts[0].message_meta["delivery"]["error"]
-        == "dingtalk_session_webhook_unavailable"
+        == "dingtalk_message_card_delivery_failed"
     )
-
-
-async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        status_code = 200
-        text = "ok"
-
-        @staticmethod
-        def json():
-            return {"errcode": 0}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def post(self, url, *, json):
-            captured["url"] = url
-            captured["json"] = json
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        turn_runtime.httpx,
-        "AsyncClient",
-        lambda **_kwargs: FakeClient(),
-    )
-
-    result = await turn_runtime._send_dingtalk_group_mention(
-        session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
-        message="请确认",
-        mention=MentionIntent(scope="users", target_ids=("staff-zhangsan",)),
-    )
-
-    assert result == {"errcode": 0}
-    assert captured["url"].endswith("sendBySession?secret")
-    assert captured["json"] == {
-        "msgtype": "text",
-        "text": {"content": "请确认"},
-        "at": {"atUserIds": ["staff-zhangsan"], "isAtAll": False},
-    }
-
-
-async def test_dingtalk_group_mention_all_payload_contains_native_at_metadata(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        status_code = 200
-        text = "ok"
-
-        @staticmethod
-        def json():
-            return {"errcode": 0}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def post(self, url, *, json):
-            captured["url"] = url
-            captured["json"] = json
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        turn_runtime.httpx,
-        "AsyncClient",
-        lambda **_kwargs: FakeClient(),
-    )
-
-    result = await turn_runtime._send_dingtalk_group_mention(
-        session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
-        message="今晚十点发布",
-        mention=MentionIntent(scope="all"),
-    )
-
-    assert result == {"errcode": 0}
-    assert captured["json"] == {
-        "msgtype": "text",
-        "text": {"content": "今晚十点发布"},
-        "at": {"isAtAll": True},
-    }
 
 
 @pytest.mark.parametrize(
@@ -2604,7 +2863,13 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
         existing_tool_ids = (
             await db.execute(
                 select(Tool.id).where(
-                    Tool.name.in_({"send_group_session_message", "recall_message"})
+                    Tool.name.in_(
+                        {
+                            "send_channel_file",
+                            "send_group_session_message",
+                            "recall_message",
+                        }
+                    )
                 )
             )
         ).scalars().all()
@@ -2624,6 +2889,16 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
 
     await seed_builtin_tools()
     async with async_session() as db:
+        session_message_config_schema = (
+            await db.execute(
+                select(Tool.config_schema).where(Tool.name == "send_session_message")
+            )
+        ).scalar_one()
+        seeded_file_schema = (
+            await db.execute(
+                select(Tool.parameters_schema).where(Tool.name == "send_channel_file")
+            )
+        ).scalar_one()
         assigned_names = set(
             (
                 await db.execute(
@@ -2638,9 +2913,14 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
                 )
             ).scalars().all()
         )
+    assert session_message_config_schema["fields"][0]["key"] == "card_template_id"
+    assert session_message_config_schema["fields"][0].get("agent_only") is not True
     assert assigned_names == {"send_group_session_message", "recall_message"}
 
     tools = await agent_tools.get_agent_tools_for_llm(owner.id)
+    file_tool = next(tool for tool in tools if tool["function"]["name"] == "send_channel_file")
+    assert file_tool["function"]["parameters"] == seeded_file_schema
+    assert seeded_file_schema["properties"]["session_id"]["type"] == "string"
     runtime_tool = next(tool for tool in tools if tool["function"]["name"] == "send_group_session_message")
     assert runtime_tool["function"]["parameters"] == {
         "type": "object",

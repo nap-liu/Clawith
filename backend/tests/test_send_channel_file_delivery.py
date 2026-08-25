@@ -67,6 +67,9 @@ async def test_channel_file_claims_pending_before_sender_and_finalizes_receipt(t
         events.append(("finalize", message_id, result.status))
         return True
 
+    async def no_exact_session_route(_agent_id, _session_id):
+        return False
+
     async def file_sender(_path, _message):
         events.append(("send",))
         return IMDeliveryResult.sent(
@@ -81,6 +84,11 @@ async def test_channel_file_claims_pending_before_sender_and_finalizes_receipt(t
 
     monkeypatch.setattr(agent_tools, "_claim_channel_file_receipt", fake_claim)
     monkeypatch.setattr(agent_tools, "register_delivery", fake_register)
+    monkeypatch.setattr(
+        agent_tools,
+        "_supports_exact_file_session_route",
+        no_exact_session_route,
+    )
     token = agent_tools.channel_file_sender.set(file_sender)
     try:
         result = await agent_tools._send_channel_file(
@@ -189,6 +197,200 @@ async def test_send_channel_file_rejects_audio_and_points_to_specialized_tool(tm
     assert payload["status"] == "failed"
     assert payload["code"] == "WRONG_MEDIA_TOOL"
     assert payload["media_kind"] == "audio"
+
+
+@pytest.mark.asyncio
+async def test_send_channel_file_routes_exact_session_before_current_context(
+    tmp_path,
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 exact session")
+    target_session_id = str(uuid.uuid4())
+    receipt_id = uuid.uuid4()
+    captured = {}
+
+    async def fake_session_send(*args):
+        captured["args"] = args
+        return "sent-to-exact-session", IMDeliveryResult.sent("dingtalk")
+
+    async def fake_claim(**_kwargs):
+        return receipt_id
+
+    async def fake_register(candidate_id, result):
+        assert candidate_id == receipt_id
+        assert result.ok
+        return True
+
+    async def current_sender(*_args):
+        raise AssertionError("explicit session_id must not use the current-session sender")
+
+    monkeypatch.setattr(agent_tools, "_send_file_to_session", fake_session_send)
+    monkeypatch.setattr(agent_tools, "_claim_channel_file_receipt", fake_claim)
+    monkeypatch.setattr(agent_tools, "register_delivery", fake_register)
+    token = agent_tools.channel_file_sender.set(current_sender)
+    try:
+        result = await agent_tools._send_channel_file(
+            agent_id,
+            workspace,
+            {
+                "file_path": "workspace/report.pdf",
+                "session_id": target_session_id,
+                "message": "请查收",
+            },
+            tool_call_id="call-exact-file",
+            origin_session_id=str(uuid.uuid4()),
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert result == "sent-to-exact-session"
+    assert captured["args"] == (
+        agent_id,
+        report,
+        target_session_id,
+        "请查收",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_channel_file_routes_current_durable_session_before_legacy_sender(
+    tmp_path,
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    current_session_id = str(uuid.uuid4())
+    receipt_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 durable current session")
+    captured = {}
+
+    async def supports_exact_route(candidate_agent_id, candidate_session_id):
+        assert candidate_agent_id == agent_id
+        assert candidate_session_id == current_session_id
+        return True
+
+    async def fake_session_send(*args):
+        captured["args"] = args
+        return "sent-to-current-session", IMDeliveryResult.sent("dingtalk")
+
+    async def fake_claim(**_kwargs):
+        return receipt_id
+
+    async def fake_register(candidate_id, result):
+        assert candidate_id == receipt_id
+        assert result.ok
+        return True
+
+    async def legacy_sender(*_args):
+        raise AssertionError("durable current Session must win over a legacy sender")
+
+    monkeypatch.setattr(
+        agent_tools,
+        "_supports_exact_file_session_route",
+        supports_exact_route,
+    )
+    monkeypatch.setattr(agent_tools, "_send_file_to_session", fake_session_send)
+    monkeypatch.setattr(agent_tools, "_claim_channel_file_receipt", fake_claim)
+    monkeypatch.setattr(agent_tools, "register_delivery", fake_register)
+    token = agent_tools.channel_file_sender.set(legacy_sender)
+    try:
+        result = await agent_tools._send_channel_file(
+            agent_id,
+            workspace,
+            {
+                "file_path": "workspace/report.pdf",
+                "message": "当前会话附件",
+            },
+            tool_call_id="call-current-file",
+            origin_session_id=current_session_id,
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert result == "sent-to-current-session"
+    assert captured["args"] == (
+        agent_id,
+        report,
+        current_session_id,
+        "当前会话附件",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_code"),
+    [
+        (
+            {"session_id": str(uuid.uuid4()), "user_id": str(uuid.uuid4())},
+            "ambiguous_file_target",
+        ),
+        ({"session_id": str(uuid.uuid4()), "channel": "feishu"}, "channel_requires_user_target"),
+    ],
+)
+async def test_send_channel_file_rejects_ambiguous_session_target(
+    tmp_path,
+    monkeypatch,
+    arguments,
+    expected_code,
+):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 target validation")
+
+    payload = json.loads(
+        await agent_tools._send_channel_file(
+            agent_id,
+            workspace,
+            {"file_path": "workspace/report.pdf", **arguments},
+        )
+    )
+
+    assert payload["code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_send_file_to_session_rejects_non_uuid_without_database_access(
+    tmp_path,
+):
+    delivery_text, delivery_result = await agent_tools._send_file_to_session(
+        uuid.uuid4(),
+        tmp_path / "report.pdf",
+        "not-a-session-uuid",
+    )
+    payload = json.loads(
+        delivery_text
+    )
+
+    assert payload["code"] == "session_not_found_or_forbidden"
+    assert delivery_result.status == "failed"
+
+
+def test_send_channel_file_schema_exposes_exact_session_target_consistently():
+    runtime_schema = next(
+        item["function"]["parameters"]
+        for item in agent_tools.AGENT_TOOLS
+        if item["function"]["name"] == "send_channel_file"
+    )
+    seeded_schema = next(
+        item["parameters_schema"]
+        for item in BUILTIN_TOOLS
+        if item["name"] == "send_channel_file"
+    )
+
+    assert runtime_schema == seeded_schema
+    assert runtime_schema["properties"]["session_id"]["type"] == "string"
+    assert "Session UUID" in runtime_schema["properties"]["session_id"]["description"]
 
 
 @pytest.mark.asyncio
