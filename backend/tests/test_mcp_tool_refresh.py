@@ -640,6 +640,156 @@ async def test_agent_tool_refresh_reuses_agent_scope_service():
     }
 
 
+async def test_shared_agent_refresh_failure_rolls_back_clone_and_returns_original_id():
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        other_agent = Agent(
+            name=f"Other_{uuid.uuid4().hex[:8]}",
+            creator_id=user.id,
+            tenant_id=agent.tenant_id,
+        )
+        db.add(other_agent)
+        tool = Tool(
+            name=f"mcp_{server.name}_shared_failure",
+            display_name="Shared failure",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="shared_failure",
+            source="agent",
+            tenant_id=server.tenant_id,
+        )
+        db.add(tool)
+        await db.flush()
+        db.add_all(
+            [
+                AgentTool(
+                    agent_id=agent.id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    source="user_installed",
+                    installed_by_agent_id=agent.id,
+                ),
+                AgentTool(
+                    agent_id=other_agent.id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    source="user_installed",
+                    installed_by_agent_id=other_agent.id,
+                ),
+            ]
+        )
+        await db.commit()
+
+    from app.services.agent_mcp_lifecycle import (
+        list_installed_mcp_servers,
+        refresh_mcp_server,
+    )
+
+    with patch(
+        "app.services.agent_mcp_lifecycle.refresh_mcp_server_tools",
+        AsyncMock(side_effect=RuntimeError("shared refresh failure")),
+    ):
+        result = json.loads(
+            await refresh_mcp_server(
+                agent.id,
+                server.id,
+                user_id=user.id,
+                session_id="session-123",
+            )
+        )
+
+    assert result == {
+        "ok": False,
+        "error": "refresh_failed",
+        "mcp_server_id": str(server.id),
+        "detail": "RuntimeError: shared refresh failure",
+    }
+
+    async with async_session() as db:
+        server_ids = (
+            await db.execute(
+                select(MCPServer.id).where(MCPServer.name.like(f"{server.name}%"))
+            )
+        ).scalars().all()
+        agent_server_ids = (
+            await db.execute(
+                select(Tool.mcp_server_id)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(AgentTool.agent_id == agent.id)
+            )
+        ).scalars().all()
+        other_server_ids = (
+            await db.execute(
+                select(Tool.mcp_server_id)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(AgentTool.agent_id == other_agent.id)
+            )
+        ).scalars().all()
+
+    assert server_ids == [server.id]
+    assert set(agent_server_ids) == {server.id}
+    assert set(other_server_ids) == {server.id}
+    inventory = json.loads(await list_installed_mcp_servers(agent.id))
+    assert inventory["mcp_servers"][0]["mcp_server_id"] == str(server.id)
+
+
+async def test_anonymous_refresh_does_not_fall_back_to_agent_creator():
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        db.add(
+            MCPServerOverride(
+                mcp_server_id=server.id,
+                scope_type="agent",
+                scope_id=agent.id,
+                headers_template={"X-Phone": "${user.phone}"},
+            )
+        )
+        tool = Tool(
+            name=f"mcp_{server.name}_anonymous",
+            display_name="Anonymous",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="anonymous",
+            source="agent",
+            tenant_id=server.tenant_id,
+        )
+        db.add(tool)
+        await db.flush()
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=tool.id,
+                enabled=True,
+                source="user_installed",
+                installed_by_agent_id=agent.id,
+            )
+        )
+        await db.commit()
+
+    from app.services.agent_mcp_lifecycle import refresh_mcp_server
+
+    with patch("app.services.mcp_refresh_service.MCPClient") as mcp_client:
+        result = json.loads(
+            await refresh_mcp_server(
+                agent.id,
+                server.id,
+                user_id=None,
+                session_id="anonymous-session",
+            )
+        )
+
+    assert result["ok"] is False
+    assert result["error"] == "refresh_failed"
+    assert result["mcp_server_id"] == str(server.id)
+    assert "UnknownPlaceholderError" in result["detail"]
+    assert "${user.phone}" in result["detail"]
+    mcp_client.assert_not_called()
+
+
 async def test_agent_tool_refresh_preserves_original_error_after_rollback():
     user, agent, server = await _make_agent()
     async with async_session() as db:

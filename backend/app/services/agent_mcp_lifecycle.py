@@ -147,7 +147,7 @@ async def refresh_mcp_server(
                 {
                     "ok": False,
                     "error": "agent_refresh_not_isolated",
-                    "mcp_server_id": str(effective_server_id),
+                    "mcp_server_id": str(server_id),
                     "detail": detail,
                 },
                 ensure_ascii=False,
@@ -159,7 +159,7 @@ async def refresh_mcp_server(
                 {
                     "ok": False,
                     "error": "refresh_failed",
-                    "mcp_server_id": str(effective_server_id),
+                    "mcp_server_id": str(server_id),
                     "detail": detail,
                 },
                 ensure_ascii=False,
