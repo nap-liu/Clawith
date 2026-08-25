@@ -11,7 +11,9 @@ from sqlalchemy.orm import load_only
 
 from app.config import get_settings
 from app.core.security import decrypt_data, encrypt_data
+from app.database import async_session
 from app.models.chat_session import ChatSession
+from app.services.recipient_resolver import resolve_human_channel_recipient
 
 _WEBHOOK_KEY = "dingtalk_session_webhook_encrypted"
 _WEBHOOK_EXPIRES_AT_KEY = "dingtalk_session_webhook_expires_at_ms"
@@ -89,3 +91,56 @@ def load_group_session_webhook(session: ChatSession) -> str | None:
         return decrypt_data(encrypted, get_settings().SECRET_KEY).strip() or None
     except ValueError:
         return None
+
+
+async def load_group_session_webhook_by_id(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    expected_external_conv_id: str,
+) -> str | None:
+    """Reload a current webhook for the exact authorized conversation generation."""
+    try:
+        session_id = uuid.UUID(str(conversation_id))
+    except (TypeError, ValueError):
+        return None
+    async with async_session() as db:
+        session = (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.id == session_id,
+                    ChatSession.agent_id == agent_id,
+                    ChatSession.source_channel == "dingtalk",
+                    ChatSession.external_conv_id == expected_external_conv_id,
+                    ChatSession.is_group.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+    return load_group_session_webhook(session) if session is not None else None
+
+
+async def prepare_group_user_mentions(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    canonical_user_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    """Resolve canonical users to ephemeral DingTalk staff IDs and names."""
+    target_ids: list[str] = []
+    display_names: list[str] = []
+    for canonical_user_id in canonical_user_ids:
+        route = await resolve_human_channel_recipient(
+            db,
+            agent_id,
+            canonical_user_id,
+            channel="dingtalk",
+        )
+        staff_id = str(route.member.external_id or "").strip()
+        if not staff_id:
+            raise ValueError("dingtalk_staff_id_unavailable")
+        if staff_id not in target_ids:
+            target_ids.append(staff_id)
+            display_names.append(
+                str(route.user.display_name or route.member.name or "用户")
+            )
+    return target_ids, display_names

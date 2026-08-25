@@ -20,7 +20,8 @@ from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
 from app.services.channel_dispatch import run_channel_send
-from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
+from app.services.dingtalk_group_mentions import load_group_session_webhook_by_id
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, MentionIntent
 
 DeliveryPartObserver = Callable[[IMDeliveryPart], Awaitable[None]]
 
@@ -222,8 +223,7 @@ async def deliver_message_to_runtime(
     origin_actor_ref: str | None = None,
     origin_actor_ref_type: str | None = None,
     allow_wecom_group_actor_fallback: bool = True,
-    dingtalk_at_user_ids: list[str] | None = None,
-    dingtalk_session_webhook: str | None = None,
+    mention: MentionIntent | None = None,
 ) -> bool:
     """Deliver text through the exact transport bound to a loaded Session runtime.
 
@@ -238,8 +238,7 @@ async def deliver_message_to_runtime(
         origin_actor_ref=origin_actor_ref,
         origin_actor_ref_type=origin_actor_ref_type,
         allow_wecom_group_actor_fallback=allow_wecom_group_actor_fallback,
-        dingtalk_at_user_ids=dingtalk_at_user_ids,
-        dingtalk_session_webhook=dingtalk_session_webhook,
+        mention=mention,
     )
     if result.ok:
         return True
@@ -260,8 +259,7 @@ async def deliver_message_with_receipt(
     origin_actor_ref: str | None = None,
     origin_actor_ref_type: str | None = None,
     allow_wecom_group_actor_fallback: bool = True,
-    dingtalk_at_user_ids: list[str] | None = None,
-    dingtalk_session_webhook: str | None = None,
+    mention: MentionIntent | None = None,
     dingtalk_lock_held: bool = False,
     on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
@@ -269,6 +267,10 @@ async def deliver_message_with_receipt(
     if not (message or "").strip():
         return IMDeliveryResult.sent(runtime.source_channel)
     channel = runtime.source_channel
+    if mention is not None and not runtime.is_group:
+        return IMDeliveryResult.failed(channel, "mention_requires_group")
+    if mention is not None and channel != "dingtalk":
+        return IMDeliveryResult.failed(channel, "native_mention_not_supported")
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
@@ -277,15 +279,13 @@ async def deliver_message_with_receipt(
                 agent_id,
                 runtime,
                 message,
-                at_user_ids=dingtalk_at_user_ids,
-                session_webhook=dingtalk_session_webhook,
+                mention=mention,
             )
         return await _deliver_dingtalk(
             agent_id,
             runtime,
             message,
-            at_user_ids=dingtalk_at_user_ids,
-            session_webhook=dingtalk_session_webhook,
+            mention=mention,
         )
 
     delivered: IMDeliveryResult | None = None
@@ -373,8 +373,7 @@ async def _deliver_dingtalk(
     runtime: TurnRuntime,
     reply: str,
     *,
-    at_user_ids: list[str] | None = None,
-    session_webhook: str | None = None,
+    mention: MentionIntent | None = None,
 ) -> IMDeliveryResult:
     return await run_channel_send(
         f"im-send:{runtime.conversation_id}",
@@ -382,8 +381,7 @@ async def _deliver_dingtalk(
             agent_id,
             runtime,
             reply,
-            at_user_ids=at_user_ids,
-            session_webhook=session_webhook,
+            mention=mention,
         ),
     )
 
@@ -393,8 +391,7 @@ async def _deliver_dingtalk_unlocked(
     runtime: TurnRuntime,
     reply: str,
     *,
-    at_user_ids: list[str] | None = None,
-    session_webhook: str | None = None,
+    mention: MentionIntent | None = None,
 ) -> IMDeliveryResult:
     """Send one DingTalk message while the caller owns the conversation send lock."""
     if not runtime.external_conv_id:
@@ -414,6 +411,27 @@ async def _deliver_dingtalk_unlocked(
         return IMDeliveryResult.failed("dingtalk", "empty_target")
 
     async def _send() -> dict:
+        if mention is not None:
+            if space_type == "IM_ROBOT" or not runtime.is_group:
+                return {"errcode": -1, "errmsg": "mention_requires_group"}
+            session_webhook = await load_group_session_webhook_by_id(
+                agent_id=agent_id,
+                conversation_id=runtime.conversation_id,
+                expected_external_conv_id=runtime.external_conv_id,
+            )
+            if not session_webhook:
+                logger.warning(
+                    "[turn_runtime] DingTalk group mention missing temporary session webhook"
+                )
+                return {
+                    "errcode": -1,
+                    "errmsg": "dingtalk_session_webhook_unavailable",
+                }
+            return await _send_dingtalk_group_mention(
+                session_webhook=session_webhook,
+                message=reply,
+                mention=mention,
+            )
         if space_type == "IM_ROBOT":
             return await send_dingtalk_v1_robot_oto_message(
                 cfg.app_id,
@@ -422,17 +440,6 @@ async def _deliver_dingtalk_unlocked(
                 reply,
                 msg_type="markdown",
                 robot_code=cfg.app_id,
-            )
-        if at_user_ids:
-            if not session_webhook:
-                logger.warning(
-                    "[turn_runtime] DingTalk group mention missing temporary session webhook"
-                )
-                return {"errcode": -1, "errmsg": "missing session webhook"}
-            return await _send_dingtalk_group_mention(
-                session_webhook=session_webhook,
-                message=reply,
-                at_user_ids=at_user_ids,
             )
         return await _send_dingtalk_group_markdown(
             app_id=cfg.app_id,
@@ -446,7 +453,7 @@ async def _deliver_dingtalk_unlocked(
     if not ok:
         logger.warning("[turn_runtime] DingTalk recovered reply delivery failed: %s", result)
         return IMDeliveryResult.failed("dingtalk", str(result.get("errmsg") or result.get("errcode") or "send_failed"))
-    if at_user_ids:
+    if mention is not None:
         return IMDeliveryResult.unsupported_delivery(
             "dingtalk",
             "dingtalk_session_webhook",
@@ -469,13 +476,16 @@ async def _send_dingtalk_group_mention(
     *,
     session_webhook: str,
     message: str,
-    at_user_ids: list[str],
+    mention: MentionIntent,
 ) -> dict:
     """Reply to one DingTalk group with native @ metadata."""
+    at: dict = {"isAtAll": mention.scope == "all"}
+    if mention.scope == "users":
+        at["atUserIds"] = list(mention.target_ids)
     payload = {
         "msgtype": "text",
         "text": {"content": message},
-        "at": {"atUserIds": at_user_ids, "isAtAll": False},
+        "at": at,
     }
     try:
         async with httpx.AsyncClient(timeout=20) as client:
