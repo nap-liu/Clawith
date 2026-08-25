@@ -85,7 +85,7 @@ async def test_receive_webhook_success(monkeypatch, client):
         config={"token": "valid_token"},
         is_enabled=True,
     )
-    agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5)
+    agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5, webhook_queue_max=1000)
 
     session = FakeSession(triggers=[trigger], agent=agent)
 
@@ -98,14 +98,29 @@ async def test_receive_webhook_success(monkeypatch, client):
 
     monkeypatch.setattr(webhooks_api, "_record_and_count_hits", fake_record_and_count_hits)
 
-    # receive_webhook no longer calls enqueue_webhook_execution. The merged flow
-    # stores the payload directly into the trigger config (legacy mode here writes
-    # _webhook_pending/_webhook_payload via an UPDATE), and the trigger_daemon
-    # later polls those flags. A successful receive just persists (commit) and
-    # returns {"ok": True}.
+    async def fake_allocate_event_id(_db):
+        return 41
+
+    async def fake_persist_payload(staged, **_kwargs):
+        return {
+            "kind": "webhook_inbox_event_v1",
+            "event_id": 41,
+            "received_at_ms": staged.received_at_ms,
+            "event_key": f"{staged.received_at_ms}_00000000000000000041",
+            "path": "webhook/test/20260825/41/payload.json",
+            "size": staged.size,
+            "sha256": staged.sha256,
+            "content_type": "application/json",
+        }
+
+    monkeypatch.setattr(webhooks_api, "allocate_webhook_event_id", fake_allocate_event_id)
+    monkeypatch.setattr(webhooks_api, "persist_webhook_payload", fake_persist_payload)
+
     async with await client() as ac:
         response = await ac.post("/api/webhooks/t/valid_token", json={"event": "test"})
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert session.committed is True
+    assert trigger.config["_webhook_event"]["event_id"] == 41
+    assert trigger.config["_webhook_payload"] is None

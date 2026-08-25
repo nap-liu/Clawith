@@ -6,7 +6,6 @@ can send events to, which triggers the corresponding agent.
 
 import hashlib
 import hmac
-import json
 import time
 
 from fastapi import APIRouter, Request
@@ -17,11 +16,17 @@ from sqlalchemy import select
 from app.core.events import get_redis
 from app.database import async_session
 from app.models.trigger import AgentTrigger
+from app.services.webhook_inbox import (
+    WebhookPayloadTooLarge,
+    allocate_webhook_event_id,
+    persist_webhook_payload,
+    stage_webhook_payload,
+)
 
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
 RATE_LIMIT = 5       # max hits per minute per token
-MAX_PAYLOAD_SIZE = 65536  # 64KB max payload
+MAX_PAYLOAD_SIZE = 500 * 1024 * 1024  # match the frontend nginx 500MB ceiling
 
 
 async def _record_and_count_hits(token: str) -> int:
@@ -48,7 +53,7 @@ async def receive_webhook(token: str, request: Request):
     - Unique, unguessable URL token
     - Optional HMAC signature verification
     - Rate limiting (5 requests/minute per token)
-    - Payload size limit (64KB)
+    - Payload size limit (500MB, streamed without content truncation)
     """
     # Rate limiting — use per-agent limit if available
     hit_count = await _record_and_count_hits(token)
@@ -59,13 +64,19 @@ async def receive_webhook(token: str, request: Request):
         logger.warning(f"Webhook hard rate limit exceeded for token {token[:8]}...")
         return JSONResponse({"ok": True}, status_code=429)
 
-    # Payload size check
-    body = await request.body()
-    if len(body) > MAX_PAYLOAD_SIZE:
-        logger.warning(f"Webhook payload too large for token {token[:8]}...: {len(body)} bytes")
-        return JSONResponse({"ok": True}, status_code=413)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_PAYLOAD_SIZE:
+                logger.warning(
+                    f"Webhook payload too large for token {token[:8]}...: "
+                    f"{content_length} bytes"
+                )
+                return JSONResponse({"ok": True}, status_code=413)
+        except ValueError:
+            pass
 
-    # Look up trigger
+    # Resolve the target before consuming a potentially large request body.
     async with async_session() as db:
         result = await db.execute(
             select(AgentTrigger).where(
@@ -85,20 +96,6 @@ async def receive_webhook(token: str, request: Request):
 
         if not target:
             # Return 200 OK to avoid leaking whether the token exists
-            return JSONResponse({"ok": True})
-
-        # Join webhook append to the same row-lock domain used by daemon claim
-        # and completion advance.  All three mutate one JSONB config column;
-        # without a fresh locked row, an ingress request can overwrite the
-        # active lock or resurrect a batch that the daemon just consumed.
-        locked_result = await db.execute(
-            select(AgentTrigger)
-            .where(AgentTrigger.id == target.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        target = locked_result.scalar_one_or_none()
-        if not target or not target.is_enabled or (target.config or {}).get("token") != token:
             return JSONResponse({"ok": True})
 
         # Per-agent rate limit check
@@ -129,52 +126,89 @@ async def receive_webhook(token: str, request: Request):
                     pass
                 return JSONResponse({"ok": True}, status_code=429)
 
-        cfg = target.config or {}
+        target_id = target.id
+        target_agent_id = target.agent_id
+        target_name = target.name
+        secret = str((target.config or {}).get("secret") or "") or None
+        queue_max = (agent_obj.webhook_queue_max if agent_obj else None) or 1000
 
-        # HMAC signature verification (optional)
-        secret = cfg.get("secret")
+    try:
+        staged = await stage_webhook_payload(
+            request.stream(),
+            max_bytes=MAX_PAYLOAD_SIZE,
+            secret=secret,
+        )
+    except WebhookPayloadTooLarge as exc:
+        logger.warning(
+            f"Webhook payload too large for token {token[:8]}...: "
+            f"{exc.size} bytes"
+        )
+        return JSONResponse({"ok": True}, status_code=413)
+
+    try:
         if secret:
-            sig_header = request.headers.get("x-hub-signature-256", "")
-            expected_sig = "sha256=" + hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(sig_header, expected_sig):
-                logger.warning(f"Webhook signature mismatch for trigger {target.name}")
-                # Still return 200 to not leak info
+            signature = request.headers.get("x-hub-signature-256", "")
+            if not staged.signature or not hmac.compare_digest(signature, staged.signature):
+                logger.warning(f"Webhook signature mismatch for trigger {target_name}")
                 return JSONResponse({"ok": True})
 
-        # Parse payload
-        try:
-            payload_str = body.decode("utf-8")
-            # Try to pretty-format JSON for readability
-            payload_obj = None
-            try:
-                payload_obj = json.loads(payload_str)
-                payload_str = json.dumps(payload_obj, ensure_ascii=False, indent=2)
-            except json.JSONDecodeError:
-                payload_obj = None
-        except Exception:
-            payload_obj = None
-            payload_str = repr(body[:2000])
+        async with async_session() as db:
+            event_id = await allocate_webhook_event_id(db)
 
-        # Store payload — legacy overwrites, queue/merge accumulates.
-        # The trigger_daemon's _check_trigger_ready polls these config flags
-        # (_webhook_pending / _webhook_queue) to decide a webhook is "due";
-        # it does NOT consult the TriggerExecution table for webhooks, so the
-        # payload must live in the trigger config here.
-        if mode == "legacy":
-            new_config = {**cfg, "_webhook_pending": True, "_webhook_payload": payload_str[:8000]}
-        else:  # queue / merge
-            queue = list(cfg.get("_webhook_queue") or [])
-            queue_max = (agent_obj.webhook_queue_max if agent_obj else None) or 1000
-            if len(queue) >= queue_max:
-                logger.warning(f"Webhook queue full ({queue_max}) for trigger {target.name}")
-                return JSONResponse({"ok": False, "error": "queue full"}, status_code=503)
-            queue.append(payload_str[:8000])
-            new_config = {**cfg, "_webhook_queue": queue}
-        target.config = new_config
-        await db.commit()
+        event_ref = await persist_webhook_payload(
+            staged,
+            agent_id=target_agent_id,
+            trigger_id=target_id,
+            event_id=event_id,
+            content_type=request.headers.get("content-type", "application/octet-stream"),
+        )
 
-        logger.info(f"Webhook queued for trigger {target.name} (agent {target.agent_id})")
+        # Join webhook append to the same row-lock domain used by daemon claim
+        # and completion advance. The JSONB queue stores only immutable file
+        # references, never the request body itself.
+        async with async_session() as db:
+            locked_result = await db.execute(
+                select(AgentTrigger)
+                .where(AgentTrigger.id == target_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            target = locked_result.scalar_one_or_none()
+            cfg = dict(target.config or {}) if target else {}
+            if (
+                not target
+                or not target.is_enabled
+                or cfg.get("token") != token
+                or (str(cfg.get("secret") or "") or None) != secret
+            ):
+                return JSONResponse({"ok": True})
+
+            mode = cfg.get("webhook_mode", "legacy")
+            if mode == "legacy":
+                new_config = {
+                    **cfg,
+                    "_webhook_pending": True,
+                    "_webhook_event": event_ref,
+                    "_webhook_payload": None,
+                }
+            else:  # queue / merge
+                queue = list(cfg.get("_webhook_queue") or [])
+                if len(queue) >= queue_max:
+                    logger.warning(f"Webhook queue full ({queue_max}) for trigger {target.name}")
+                    return JSONResponse(
+                        {"ok": False, "error": "queue full"},
+                        status_code=503,
+                    )
+                queue.append(event_ref)
+                new_config = {**cfg, "_webhook_queue": queue}
+            target.config = new_config
+            await db.commit()
+
+        logger.info(
+            f"Webhook event {event_id} queued for trigger {target_name} "
+            f"(agent {target_agent_id}, bytes={staged.size}, sha256={staged.sha256})"
+        )
+    finally:
+        staged.cleanup()
 
     return JSONResponse({"ok": True})

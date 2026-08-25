@@ -3421,6 +3421,11 @@ def _is_enterprise_info_path(path: str | None) -> bool:
     return normalized == "enterprise_info" or normalized.startswith("enterprise_info/")
 
 
+def _is_webhook_inbox_path(path: str | None) -> bool:
+    normalized = str(path or "").replace("\\", "/").strip().strip("/")
+    return normalized == "webhook" or normalized.startswith("webhook/")
+
+
 async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
     """Get the agent tenant ID for tenant-scoped shared paths."""
     try:
@@ -3509,6 +3514,8 @@ async def _execute_workspace_mutation(
             return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
         if _is_enterprise_info_path(path):
             return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+        if _is_webhook_inbox_path(path):
+            return "❌ webhook/ is a system-managed inbox and is read-only for agents."
         async with async_session() as _wdb:
             write_result = await write_workspace_file(
                 _wdb,
@@ -3542,6 +3549,8 @@ async def _execute_workspace_mutation(
             return f"❌ {source_path} cannot be moved (protected)"
         if _is_enterprise_info_path(source_path) or _is_enterprise_info_path(destination_path):
             return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+        if _is_webhook_inbox_path(source_path) or _is_webhook_inbox_path(destination_path):
+            return "❌ webhook/ is a system-managed inbox and is read-only for agents."
         async with async_session() as _wdb:
             move_result = await move_workspace_path(
                 _wdb,
@@ -3564,6 +3573,8 @@ async def _execute_workspace_mutation(
             return "❌ Focus is no longer stored in focus.md. Use Focus tools instead."
         if _is_enterprise_info_path(path):
             return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+        if _is_webhook_inbox_path(path):
+            return "❌ webhook/ is a system-managed inbox and is read-only for agents."
         async with async_session() as _wdb:
             delete_result = await delete_workspace_file(
                 _wdb,
@@ -3592,6 +3603,8 @@ async def _execute_workspace_mutation(
             return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
         if _is_enterprise_info_path(path):
             return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+        if _is_webhook_inbox_path(path):
+            return "❌ webhook/ is a system-managed inbox and is read-only for agents."
 
         replace_all = arguments.get("replace_all", False)
         storage = get_storage_backend()
@@ -14478,6 +14491,16 @@ async def _handle_update_trigger(
                 public_new = {
                     key: value for key, value in new_config.items() if not str(key).startswith("_")
                 }
+                if trigger.type == "webhook":
+                    # Webhook config updates are patches. The callback token,
+                    # delivery mode and security settings are durable identity;
+                    # omitting one must never reset it or strand queued events.
+                    public_old = {
+                        key: value
+                        for key, value in old_config.items()
+                        if not str(key).startswith("_")
+                    }
+                    public_new = {**public_old, **public_new}
                 if trigger.type == "on_message":
                     raw_agent_id = str(public_new.get("from_agent_id") or "").strip()
                     raw_user_id = str(public_new.get("from_user_id") or "").strip()

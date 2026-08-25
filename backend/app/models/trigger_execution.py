@@ -3,11 +3,14 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Index, Sequence, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+
+
+webhook_event_id_seq = Sequence("webhook_event_id_seq", metadata=Base.metadata)
 
 
 class TriggerExecution(Base):
