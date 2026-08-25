@@ -190,6 +190,10 @@ def build_project_runtime_context(runtime: Mapping[str, object]) -> str:
         criteria = []
     criteria_lines = [f"- {_clean(item)}" for item in criteria if _clean(item)]
     role = _clean(runtime.get("project_member_role_snapshot"))
+    member_config = runtime.get("member_config_snapshot")
+    if not isinstance(member_config, Mapping):
+        member_config = {}
+    project_instruction = _clean(member_config.get("project_instruction"))
     assignment = "project owner" if runtime.get("project_role_snapshot") == "leader" else "project participant"
     sections = [
         "## Project Assignment",
@@ -203,6 +207,8 @@ def build_project_runtime_context(runtime: Mapping[str, object]) -> str:
     ]
     if criteria_lines:
         sections.extend(("Success criteria:", *criteria_lines))
+    if project_instruction:
+        sections.extend(("Project-specific instruction:", project_instruction))
     sections.extend(
         (
             "",
@@ -227,6 +233,23 @@ def build_project_group_task(request: str, *, is_owner: bool) -> str:
         else "As an explicitly mentioned participant, answer within your role and do not wake unrelated members."
     )
     return f"{request.strip()}\n\n---\n{PROJECT_COLLABORATION_CONTRACT}{role_instruction}"
+
+
+def build_project_planning_task(request: str) -> str:
+    """Keep the pre-kickoff conversation advisory and Human-controlled."""
+
+    return (
+        "The project is still in planning. Discuss the request as the project owner and help the Human "
+        "reach an explicit, reviewable plan before execution begins. Clarify the intended outcome, scope, "
+        "constraints, success criteria, assumptions, material risks and trade-offs. Ask only the questions "
+        "whose answers would change the plan; otherwise propose the smallest coherent delivery plan and state "
+        "what the Human should approve or revise. Do not create or update work items, runs, files, milestones, "
+        "members, capabilities, project status or A2A handoffs, and do not begin delivery. Reply only in the "
+        "project conversation.\n\n"
+        f"{PROJECT_COLLABORATION_CONTRACT}\n"
+        "## Human planning request\n\n"
+        f"{request.strip()}"
+    )
 
 
 def build_project_kickoff_task(transcript: str) -> str:

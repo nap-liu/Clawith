@@ -15,6 +15,7 @@ const {
 );
 const {
   normalizeProjectWorkspaceUrl,
+  projectWorkItemCompatibilityTargetFromUrl,
   projectWorkItemUrlPatch,
   projectWorkspaceTabFromUrl,
   projectWorkspaceTabUrlPatch,
@@ -72,6 +73,33 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
   assert.equal(legacyDetail.get("evidence"), "file.md");
   assert.equal(legacyDetail.get("auditEventsPage"), null);
   assert.equal(projectWorkspaceTabFromUrl(legacyDetail), "work");
+  assert.deepEqual(
+    plain(projectWorkItemCompatibilityTargetFromUrl(legacyDetail)),
+    { workItemId: "work-1", anchor: "work-item-review" },
+  );
+
+  const legacyContext = normalizeProjectWorkspaceUrl(
+    new URLSearchParams("tab=detail&workItem=work-context&workItemTab=context"),
+  );
+  assert.equal(legacyContext.get("workItem"), "work-context");
+  assert.equal(legacyContext.get("workItemTab"), null);
+  assert.equal(projectWorkItemCompatibilityTargetFromUrl(legacyContext), null);
+
+  for (const section of ["execution", "conversation", "changes", "review"]) {
+    const legacySection = normalizeProjectWorkspaceUrl(
+      new URLSearchParams(
+        `tab=detail&workItem=work-${section}&workItemTab=${section}`,
+      ),
+    );
+    assert.deepEqual(
+      plain(projectWorkItemCompatibilityTargetFromUrl(legacySection)),
+      {
+        workItemId: `work-${section}`,
+        anchor: `work-item-${section}`,
+      },
+      `legacy ${section} links must keep their exact work item`,
+    );
+  }
 
   const invalidTab = normalizeProjectWorkspaceUrl(
     new URLSearchParams("tab=unknown&workItem=work-1&runsPage=2"),
@@ -80,6 +108,55 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
   assert.equal(invalidTab.get("workItem"), null);
   assert.equal(invalidTab.get("runsPage"), null);
 
+  const legacyMatrix = normalizeProjectWorkspaceUrl(
+    new URLSearchParams(
+      "tab=matrix&capFilter=enabled&capabilityMatrixPage=2&projectToolMatrixPage=3&membersPage=4",
+    ),
+  );
+  assert.equal(legacyMatrix.get("tab"), "capabilities");
+  assert.equal(legacyMatrix.get("capView"), "matrix");
+  assert.equal(legacyMatrix.get("capFilter"), "enabled");
+  assert.equal(legacyMatrix.get("capabilityMatrixPage"), "2");
+  assert.equal(legacyMatrix.get("projectToolMatrixPage"), "3");
+  assert.equal(legacyMatrix.get("membersPage"), null);
+  assert.equal(projectWorkspaceTabFromUrl(legacyMatrix), "capabilities");
+
+  const unknownCapabilityView = normalizeProjectWorkspaceUrl(
+    new URLSearchParams(
+      "tab=capabilities&capView=unknown&toolMember=member-1&projectToolsPage=2",
+    ),
+  );
+  assert.equal(unknownCapabilityView.get("capView"), "list");
+  assert.equal(unknownCapabilityView.get("toolMember"), "member-1");
+  assert.equal(unknownCapabilityView.get("projectToolsPage"), "2");
+
+  const legacyMatrixPatch = projectWorkspaceTabUrlPatch("matrix", {
+    capabilityMatrixPage: "2",
+  });
+  assert.equal(legacyMatrixPatch.tab, "capabilities");
+  assert.equal(legacyMatrixPatch.capView, "matrix");
+  assert.equal(legacyMatrixPatch.capabilityMatrixPage, "2");
+
+  const capabilityListPatch = projectWorkspaceTabUrlPatch("capabilities", {
+    capView: "list",
+    capFilter: "enabled",
+    capabilitiesPage: "3",
+  });
+  assert.equal(capabilityListPatch.tab, "capabilities");
+  assert.equal(capabilityListPatch.capView, "list");
+  assert.equal(capabilityListPatch.capFilter, "enabled");
+  assert.equal(capabilityListPatch.capabilitiesPage, "3");
+
+  const membersPatch = projectWorkspaceTabUrlPatch("members", {
+    member: "member-2",
+    membersPage: "2",
+  });
+  assert.equal(membersPatch.tab, "members");
+  assert.equal(membersPatch.member, "member-2");
+  assert.equal(membersPatch.membersPage, "2");
+  assert.equal(membersPatch.capView, undefined);
+  assert.equal(membersPatch.capabilityMatrixPage, undefined);
+
   const sameTabPatch = projectWorkspaceTabUrlPatch("runs", {});
   assert.ok(
     !("runsPage" in sameTabPatch),
@@ -87,10 +164,12 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
   );
   const workPatch = projectWorkspaceTabUrlPatch("work", {
     workItem: "work-2",
-    workItemTab: "changes",
   });
   assert.equal(workPatch.workItem, "work-2");
-  assert.equal(workPatch.workItemTab, "changes");
+  assert.ok(
+    !("workItemTab" in workPatch),
+    "new work-item links must not generate the retired tab query",
+  );
 
   const switchWorkItem = projectWorkItemUrlPatch("work-2", "work-1");
   assert.equal(switchWorkItem.workItem, "work-2");

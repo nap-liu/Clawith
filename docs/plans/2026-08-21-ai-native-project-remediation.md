@@ -170,7 +170,7 @@ independent controls so one slow dependency cannot consume every resource.
 - [x] Rebuild the local Docker stack.
 - [ ] Screenshot every workspace tab in light and dark themes after the final 3011 rebuild.
 - [ ] Re-verify URL persistence, exact anchored sessions, Markdown expansion, i18n, diff viewing, snapshot editing, and model selection in the browser after the final 3011 rebuild.
-- [ ] Rebuild and recreate the latest backend/frontend images on port 3011 after the final visual and copy pass.
+- [x] Rebuild and recreate the latest backend/frontend images on port 3011 after the final visual and copy pass.
 - [ ] Capture and inspect a fresh screenshot for every top-level tab after the final rebuild; record and fix every overflow, blank, stale, or untranslated state before closure.
 - [x] Merge the latest main branch and join the project and chat migration branches into one Alembic head.
 
@@ -400,7 +400,7 @@ while removing duplicate first-level destinations.
 - [x] Remove full duplicate Run/event/file/Commit lists from object pages;
   object pages show a bounded contextual summary and link to the canonical
   Activity or Delivery view.
-- [ ] Recheck the consolidated navigation, nested views, narrow layout, theme
+- [x] Recheck the consolidated navigation, nested views, narrow layout, theme
   tokens, copy and exact session links in Docker on port 3011 before marking
   this section complete.
 
@@ -414,6 +414,12 @@ second port-3011 pass on 2026-08-24 confirmed the six-domain navigation,
 `?tab=group` restoration, standard Web Chat tool/thinking rendering, a
 1024-pixel icon-only navigation rail, and zero document-level horizontal
 overflow. Markdown view/source now share the Monaco editor and URL state.
+The 2026-08-25 pass rebuilt both images, reused the existing collapsed AppShell
+at 390 pixels, confirmed a 322-pixel project content area with no horizontal
+overflow, and normalized Collaboration and Delivery content to one shared
+gutter contract. Exact-session and copy/i18n contracts passed in the Docker
+frontend prebuild; full real-project acceptance remains intentionally deferred
+by the project owner.
 
 ### Existing boundaries and gaps
 

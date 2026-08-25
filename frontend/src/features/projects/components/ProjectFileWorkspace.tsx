@@ -59,6 +59,7 @@ type Props = {
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canWrite?: boolean;
 };
 
 type TreeNode = {
@@ -445,6 +446,7 @@ export default function ProjectFileWorkspace({
   onSelectedViewChange,
   runAction,
   busyAction,
+  canWrite = true,
 }: Props) {
   const { t } = useTranslation();
   const firstPath = filePath(files[0] || {});
@@ -453,7 +455,7 @@ export default function ProjectFileWorkspace({
       ? requestedPath
       : firstPath;
   const [selectedPath, setSelectedPath] = useState(initialPath);
-  const [creating, setCreating] = useState(!firstPath);
+  const [creating, setCreating] = useState(canWrite && !firstPath);
   const [draftPath, setDraftPath] = useState(firstPath);
   const [content, setContent] = useState<ProjectFileContent | null>(null);
   const [draftContent, setDraftContent] = useState("");
@@ -582,6 +584,7 @@ export default function ProjectFileWorkspace({
   }, [files, requestedPath, selectedPath]);
 
   const startNewFile = () => {
+    if (!canWrite) return;
     setCreating(true);
     setSelectedPath("");
     onSelectedPathChange?.("");
@@ -615,7 +618,7 @@ export default function ProjectFileWorkspace({
   const canEditText = creating || Boolean(content?.is_text);
   const isMarkdown = !creating && /\.(md|markdown)$/i.test(draftPath);
   const markdownPreview = isMarkdown && selectedView !== "source";
-  const editorReadOnly = textReadOnly;
+  const editorReadOnly = textReadOnly || !canWrite;
   const activeEntry = files.find((entry) => filePath(entry) === selectedPath);
   const refreshMediaTicket = () => {
     if (!selectedPath || mediaRecoveryPathRef.current === selectedPath) return;
@@ -711,15 +714,17 @@ export default function ProjectFileWorkspace({
                 <IconDownload size={15} />
               )}
             </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={startNewFile}
-              title={t("projectWorkspaceFiles.newFile")}
-              aria-label={t("projectWorkspaceFiles.newFile")}
-            >
-              <IconPlus size={15} />
-            </Button>
+            {canWrite && (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={startNewFile}
+                title={t("projectWorkspaceFiles.newFile")}
+                aria-label={t("projectWorkspaceFiles.newFile")}
+              >
+                <IconPlus size={15} />
+              </Button>
+            )}
           </header>
           <div
             className="project-file-workspace__tree"
@@ -845,7 +850,7 @@ export default function ProjectFileWorkspace({
                   {htmlPreview ? <IconCode size={17} /> : <IconEye size={17} />}
                 </Button>
               ) : null}
-              {isMarkdown && !textReadOnly ? (
+              {canWrite && isMarkdown && !textReadOnly ? (
                 <Button
                   type="button"
                   variant="ghost"

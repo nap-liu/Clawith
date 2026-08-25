@@ -1384,8 +1384,8 @@ async def call_llm(
     _max_tool_rounds, _token_limit_msg = await _get_agent_config(agent_id)
     if _token_limit_msg:
         return _token_limit_msg
-    if max_tool_rounds_override and max_tool_rounds_override < _max_tool_rounds:
-        _max_tool_rounds = max_tool_rounds_override
+    if max_tool_rounds_override is not None:
+        _max_tool_rounds = max(1, min(200, int(max_tool_rounds_override)))
 
     # Auto-assign fallback tool call logger if none provided but conversation context exists
     if on_tool_call is None and session_id:
@@ -2074,6 +2074,7 @@ async def call_llm_with_failover(
     before_tool_execution=None,
     include_soul: bool = True,
     include_memory: bool = True,
+    max_tool_rounds_override: int | None = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -2200,6 +2201,7 @@ async def call_llm_with_failover(
         context_recovery=_recover_once,
         before_round=_wrapped_before_round,
         before_tool_execution=before_tool_execution,
+        max_tool_rounds_override=max_tool_rounds_override,
     )
 
     # Check if we need to failover
@@ -2291,6 +2293,7 @@ async def call_llm_with_failover(
         context_recovery=None,
         before_round=_wrapped_before_round,
         before_tool_execution=before_tool_execution,
+        max_tool_rounds_override=max_tool_rounds_override,
     )
 
     if primary_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE and fallback_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE:

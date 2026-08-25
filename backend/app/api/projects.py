@@ -67,6 +67,7 @@ from app.schemas.project import (
     ProjectMemberCreate,
     ProjectMemberLifecycleRequest,
     ProjectMemberOut,
+    ProjectMemberToolUpdate,
     ProjectMemberUpdate,
     ProjectMilestoneOut,
     ProjectRunCreate,
@@ -81,6 +82,10 @@ from app.schemas.project import (
     WorkItemDetailOut,
     WorkItemOut,
     WorkItemUpdate,
+)
+from app.services.org_directory import (
+    permission_directory_departments,
+    permission_directory_members,
 )
 from app.services.project_agent_service import (
     create_project_agent,
@@ -106,6 +111,7 @@ from app.services.project_agent_template_service import (
     instantiate_project_agents_from_template,
     instantiate_project_capabilities_from_template,
 )
+from app.services.project_capability_contract import serialize_project_capability
 from app.services.project_collaboration_prompt import build_project_kickoff_task
 from app.services.project_git_service import (
     apply_project_repository_clone,
@@ -126,8 +132,8 @@ from app.services.project_git_service import (
     put_git_remote,
     read_project_file_content,
     reconcile_project_repository_operations,
-    remove_project_repository,
     release_project_repository_clone_lock,
+    remove_project_repository,
     repository_state,
     restore_as_new_commit,
     rollback_project_repository_clone,
@@ -146,17 +152,32 @@ from app.services.project_service import (
     create_project,
     deactivate_project_member,
     deliver_project_a2a,
+    ensure_project_accepts_group_message,
     ensure_project_group_session,
     ensure_project_leader_session,
     ensure_project_running,
     freeze_run_members,
+    project_execution_user_id,
     project_summary,
     reconcile_project_runs,
     replace_access_grants,
     require_owner,
     require_project,
+    resolve_project_execution_user,
     restore_project_member,
+    serialize_project_events,
+    serialize_project_run_member_snapshots,
     serialize_project_runs,
+)
+from app.services.project_skill_assets import (
+    bind_library_skill_to_project_agent,
+    delete_project_skill_asset,
+    export_project_skills_for_template,
+    instantiate_project_skills_from_template,
+    project_skill_deletion_impact,
+    project_skill_manifest,
+    refresh_project_skill_asset,
+    set_project_skill_enabled,
 )
 from app.services.project_template_snapshot import (
     ProjectHeadSnapshot,
@@ -443,6 +464,8 @@ async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict
 async def _build_project_template_definition(
     db: AsyncSession,
     project: Project,
+    *,
+    included_skill_binding_ids: list[uuid.UUID] | None = None,
 ) -> tuple[dict, ProjectHeadSnapshot]:
     """Build one sanitized definition from an immutable project HEAD."""
 
@@ -453,6 +476,12 @@ async def _build_project_template_definition(
             project,
             project_root=snapshot_root,
         )
+        template_skills = await export_project_skills_for_template(
+            db,
+            project,
+            included_binding_ids=included_skill_binding_ids or [],
+            project_root=snapshot_root,
+        )
     return (
         {
             "schema_version": 1,
@@ -460,6 +489,7 @@ async def _build_project_template_definition(
             "success_criteria": list(project.success_criteria or []),
             "settings": sanitize_template_settings(project.settings or {}),
             "agents": template_agents,
+            "skill_assets": template_skills,
             "capabilities": await export_project_capabilities_for_template(db, project),
             "project_snapshot": snapshot.project_files,
         },
@@ -664,6 +694,7 @@ async def get_project_bootstrap_options(
         {
             "id": str(skill.id),
             "capability_id": str(skill.id),
+            "key": skill.folder_name,
             "type": "skill",
             "name": skill.name,
             "description": skill.description,
@@ -676,9 +707,10 @@ async def get_project_bootstrap_options(
         {
             "id": str(server.id),
             "capability_id": str(server.id),
+            "key": server.name,
             "type": "mcp",
             "name": server.display_name or server.name,
-            "description": server.instructions or "",
+            "description": "",
             "source": "shared",
             "owner_agent_id": None,
             "enabled": True,
@@ -689,13 +721,13 @@ async def get_project_bootstrap_options(
         {
             "id": f"{assignment.agent_id}:{tool.id}",
             "capability_id": str(tool.id),
+            "key": tool.name,
             "type": "mcp" if tool.type == "mcp" else "tool",
             "name": tool.display_name or tool.name,
             "description": tool.description,
             "source": "inherited",
             "owner_agent_id": str(assignment.agent_id),
             "enabled": assignment.enabled,
-            "config": assignment.config or {},
         }
         for assignment, tool in inherited_tools
     )
@@ -765,6 +797,7 @@ async def create_project_from_template(
     stored_definition = dict(template.definition or {})
     definition = {**stored_definition, **data.overrides}
     packaged_snapshot = stored_definition.get("project_snapshot")
+    packaged_skill_assets = stored_definition.get("skill_assets", []) if packaged_snapshot is not None else []
     packaged_capabilities = stored_definition.get("capabilities", []) if packaged_snapshot is not None else []
     capabilities_overridden = "capabilities" in data.overrides
     template_capabilities_to_restore = (
@@ -803,6 +836,14 @@ async def create_project_from_template(
             definition.get("agents", []),
         )
         if packaged_snapshot is not None:
+            await instantiate_project_skills_from_template(
+                db,
+                project,
+                current_user.display_name,
+                current_user.id,
+                packaged_skill_assets,
+                [agent.id for agent, _member in created_agents],
+            )
             await instantiate_project_capabilities_from_template(
                 db,
                 project,
@@ -875,10 +916,14 @@ async def create_project_from_template(
                     if isinstance(packaged_snapshot, dict) and isinstance(packaged_snapshot.get("files"), list)
                     else 0,
                     "digital_employee_count": len(created_agents),
+                    "skill_count": len(packaged_skill_assets)
+                    if isinstance(packaged_skill_assets, list)
+                    else 0,
                 },
             )
         await db.flush()
-        summary = await project_summary(db, project)
+        await db.refresh(project)
+        summary = await project_summary(db, project, actor_user_id=current_user.id)
         restored_files = (
             packaged_snapshot.get("files", [])
             if isinstance(packaged_snapshot, dict) and isinstance(packaged_snapshot.get("files"), list)
@@ -888,10 +933,8 @@ async def create_project_from_template(
         summary["template_setup_summary"] = {
             "restored_file_count": len(restored_files),
             "restored_digital_employee_count": len(created_agents),
-            "restored_skill_count": sum(item.get("capability_type") == "skill" for item in portable_capabilities),
-            "restored_connection_count": sum(
-                item.get("capability_type") == "mcp" for item in portable_capabilities
-            ),
+            "restored_skill_count": len(packaged_skill_assets) if isinstance(packaged_skill_assets, list) else 0,
+            "restored_connection_count": sum(item.get("capability_type") == "mcp" for item in portable_capabilities),
             "restored_tool_count": sum(item.get("capability_type") == "tool" for item in portable_capabilities),
         }
         return summary
@@ -927,7 +970,7 @@ async def list_projects(
     if q:
         stmt = stmt.where(or_(Project.name.ilike(f"%{q}%"), Project.goal.ilike(f"%{q}%")))
     projects = (await db.execute(stmt.order_by(Project.updated_at.desc()))).scalars().all()
-    return [await project_summary(db, project) for project in projects]
+    return [await project_summary(db, project, actor_user_id=current_user.id) for project in projects]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -937,7 +980,7 @@ async def post_project(
     db: AsyncSession = Depends(get_db),
 ):
     project = await create_project(db, current_user, data)
-    return await project_summary(db, project)
+    return await project_summary(db, project, actor_user_id=current_user.id)
 
 
 @router.post("/{project_id}/templates", status_code=status.HTTP_201_CREATED)
@@ -955,7 +998,11 @@ async def create_template_from_project(
     # both invisible and a retry can safely return the completed publication.
     await db.refresh(project, with_for_update=True)
     try:
-        definition, snapshot = await _build_project_template_definition(db, project)
+        definition, snapshot = await _build_project_template_definition(
+            db,
+            project,
+            included_skill_binding_ids=data.included_skill_binding_ids,
+        )
     except (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     template_agents = definition["agents"]
@@ -970,6 +1017,7 @@ async def create_template_from_project(
                 data.category,
                 data.version,
                 "published" if data.is_published else "draft",
+                ",".join(sorted(str(value) for value in data.included_skill_binding_ids)),
             )
         ).encode("utf-8")
     ).hexdigest()
@@ -993,8 +1041,7 @@ async def create_template_from_project(
         (
             item
             for item in existing_templates
-            if isinstance(item.definition, dict)
-            and item.definition.get("_publication_key") == publication_key
+            if isinstance(item.definition, dict) and item.definition.get("_publication_key") == publication_key
         ),
         None,
     )
@@ -1024,6 +1071,7 @@ async def create_template_from_project(
             "source_head": snapshot.head,
             "file_count": len(snapshot.project_files["files"]),
             "digital_employee_count": len(template_agents),
+            "skill_count": len(definition["skill_assets"]),
             "excluded_file_count": snapshot.project_files["excluded_file_count"],
         },
     )
@@ -1044,7 +1092,102 @@ async def get_project_template_manifest(
         definition, _snapshot = await _build_project_template_definition(db, project)
     except (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return public_template_definition(definition)
+    result = public_template_definition(definition)
+    skill_rows = await project_skill_manifest(db, project)
+    skill_bindings = {
+        binding.id: binding
+        for binding in (
+            await db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == project.id,
+                    ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                    ProjectCapabilityBinding.capability_type == "skill",
+                )
+            )
+        ).scalars()
+    }
+    result["skills"] = []
+    for item in skill_rows:
+        binding = skill_bindings[uuid.UUID(item["binding_id"])]
+        impact = await project_skill_deletion_impact(db, project, binding)
+        result["skills"].append(
+            {
+                "binding_id": item["binding_id"],
+                "member_id": item["member_id"],
+                "member_agent_id": item["member_agent_id"],
+                "member_name": item["member_name"],
+                "member_role": item["member_role"],
+                "name": item["name"],
+                "version": item["version"],
+                "selected": False,
+                "selection_state": "unselected",
+                "is_enabled": item["is_enabled"],
+                "file_count": item["file_count"],
+                "size_bytes": item["size_bytes"],
+                "affected_members": impact["affected_members"],
+                "affected_member_count": impact["affected_member_count"],
+            }
+        )
+    members = list(
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                )
+            )
+        ).scalars()
+    )
+    capability_bindings = list(
+        (
+            await db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == project.id,
+                    ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                    ProjectCapabilityBinding.capability_type.in_(["tool", "mcp"]),
+                )
+            )
+        ).scalars()
+    )
+    result["capabilities"] = []
+    for binding in capability_bindings:
+        affected = [
+            member
+            for member in members
+            if binding.source == "shared" or member.agent_id == binding.inherited_from_agent_id
+        ]
+        observed = await serialize_project_capability(db, project, binding)
+        result["capabilities"].append(
+            {
+                "binding_id": str(binding.id),
+                "type": binding.capability_type,
+                "key": observed.get("key"),
+                "name": binding.capability_name,
+                "selected": True,
+                "selection_state": "selected",
+                "is_enabled": binding.is_enabled,
+                "availability": observed["availability"],
+                "affected_members": [
+                    {
+                        "member_id": str(member.id),
+                        "agent_id": str(member.agent_id),
+                        "name": member.name_snapshot,
+                        "role": member.role_snapshot,
+                        "is_active": member.is_enabled,
+                    }
+                    for member in affected
+                ],
+                "affected_member_count": len(affected),
+            }
+        )
+    result["asset_summary"] = {
+        **dict(result.get("asset_summary") or {}),
+        "skill_count": len(result["skills"]),
+        "skill_file_count": sum(item["file_count"] for item in result["skills"]),
+        "skill_size_bytes": sum(item["size_bytes"] for item in result["skills"]),
+        "capability_count": len(result["capabilities"]),
+    }
+    return result
 
 
 @router.get("/{project_id}")
@@ -1054,7 +1197,53 @@ async def get_project(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id)
-    return await project_summary(db, project)
+    return await project_summary(db, project, actor_user_id=current_user.id)
+
+
+@router.get("/{project_id}/directory/departments")
+async def get_project_directory_departments(
+    project_id: uuid.UUID,
+    parent_id: uuid.UUID | None = None,
+    search: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return organization departments available to the project owner."""
+    project = await require_owner(db, current_user, project_id)
+    return await permission_directory_departments(
+        db,
+        tenant_id=project.tenant_id,
+        current_user_id=current_user.id,
+        parent_id=parent_id,
+        search=search,
+        limit=limit,
+    )
+
+
+@router.get("/{project_id}/directory/members")
+async def get_project_directory_members(
+    project_id: uuid.UUID,
+    department_id: uuid.UUID | None = None,
+    include_descendants: bool = False,
+    search: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return canonical share candidates available to the project owner."""
+    project = await require_owner(db, current_user, project_id)
+    return await permission_directory_members(
+        db,
+        tenant_id=project.tenant_id,
+        department_id=department_id,
+        include_descendants=include_descendants,
+        search=search,
+        page=page,
+        page_size=page_size,
+        excluded_user_ids={project.owner_user_id},
+    )
 
 
 @router.get("/{project_id}/dashboard")
@@ -1068,7 +1257,7 @@ async def get_project_dashboard(
     # dashboard. This is an idempotent data invariant, not presentation logic.
     if await reconcile_project_runs(db, project.id, tenant_id=project.tenant_id):
         await db.commit()
-    summary = await project_summary(db, project)
+    summary = await project_summary(db, project, actor_user_id=current_user.id)
     work_items = (
         (
             await db.execute(
@@ -1147,7 +1336,7 @@ async def get_project_dashboard(
         "capabilities": capabilities,
         "work_items": work_items,
         "runs": await serialize_project_runs(db, project, list(runs)),
-        "events": events,
+        "events": await serialize_project_events(db, project, list(events)),
         "git": git_state,
         "commits": git_state["commits"],
         "files": files,
@@ -1168,17 +1357,16 @@ async def patch_project(
     db: AsyncSession = Depends(get_db),
 ):
     updates = data.model_dump(exclude_unset=True)
-    acl_change = bool({"visibility", "shared_with_user_ids"} & data.model_fields_set)
+    acl_change = bool({"visibility", "shared_with_user_ids", "execution_user_id"} & data.model_fields_set)
     runtime_change = "status" in data.model_fields_set
     project = (
-        await require_owner(db, current_user, project_id)
+        await require_owner(db, current_user, project_id, lock=True)
         if acl_change or runtime_change
         else await require_project(db, current_user, project_id, edit=True)
     )
     runtime_event_type = None
     target_status = updates.get("status")
     if runtime_change:
-        await db.refresh(project, with_for_update=True)
         if project.status not in {"running", "paused"} or target_status not in {"running", "paused"}:
             raise HTTPException(
                 status_code=409,
@@ -1188,10 +1376,57 @@ async def patch_project(
             runtime_event_type = "project.paused" if target_status == "paused" else "project.resumed"
     shared_ids = updates.pop("shared_with_user_ids", None)
     requested_visibility = updates.pop("visibility", None)
-    if requested_visibility == "shared" and shared_ids is not None and not shared_ids:
+    requested_execution_user_id = updates.pop("execution_user_id", None)
+    normalized_shared_ids = (
+        {user_id for user_id in shared_ids if user_id != project.owner_user_id} if shared_ids is not None else None
+    )
+    if requested_visibility == "shared" and normalized_shared_ids is not None and not normalized_shared_ids:
         raise HTTPException(status_code=422, detail="A shared project requires at least one shared user")
-    if requested_visibility == "private" and shared_ids:
+    if requested_visibility == "private" and normalized_shared_ids:
         raise HTTPException(status_code=422, detail="A private project cannot include shared users")
+    current_shared_ids = set(
+        (
+            await db.execute(
+                select(ProjectAccessGrant.user_id).where(
+                    ProjectAccessGrant.project_id == project.id,
+                    ProjectAccessGrant.tenant_id == project.tenant_id,
+                )
+            )
+        ).scalars()
+    )
+    effective_shared_ids = normalized_shared_ids if normalized_shared_ids is not None else current_shared_ids
+    if normalized_shared_ids is not None:
+        effective_visibility = "shared" if effective_shared_ids else "private"
+    elif requested_visibility == "private":
+        effective_visibility = "private"
+        effective_shared_ids = set()
+    else:
+        effective_visibility = requested_visibility or project.visibility
+    if effective_visibility == "shared" and not effective_shared_ids:
+        raise HTTPException(status_code=422, detail="A shared project requires at least one shared user")
+
+    execution_change = "execution_user_id" in data.model_fields_set
+    if effective_visibility == "private":
+        project.execution_user_id = None
+    else:
+        selected_execution_user_id = requested_execution_user_id if execution_change else project.execution_user_id
+        explicit_selection_required = project.visibility != "shared" or shared_ids is not None
+        if execution_change and selected_execution_user_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="A shared project requires an execution user",
+            )
+        if selected_execution_user_id is None and explicit_selection_required:
+            raise HTTPException(
+                status_code=422,
+                detail="Select an active shared project user for project execution",
+            )
+        if selected_execution_user_id is not None and selected_execution_user_id not in effective_shared_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="Project execution user must remain in shared_with_user_ids",
+            )
+        project.execution_user_id = selected_execution_user_id
     for key, value in updates.items():
         setattr(project, key, value)
     if shared_ids is not None:
@@ -1200,6 +1435,8 @@ async def patch_project(
         await replace_access_grants(db, project, [], actor_user_id=current_user.id)
     elif requested_visibility == "shared" and project.visibility != "shared":
         raise HTTPException(status_code=422, detail="Set shared_with_user_ids when sharing a project")
+    if project.execution_user_id is not None:
+        await resolve_project_execution_user(db, project, project.execution_user_id)
     if runtime_event_type is not None:
         add_event(
             db,
@@ -1213,7 +1450,7 @@ async def patch_project(
         add_event(db, project, "project.updated", "Project settings updated", actor_user_id=current_user.id)
     await db.flush()
     await db.refresh(project)
-    return await project_summary(db, project)
+    return await project_summary(db, project, actor_user_id=current_user.id)
 
 
 @router.get("/{project_id}/settings")
@@ -1606,16 +1843,22 @@ async def patch_project_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_project(db, current_user, project_id, edit=True)
+    project = await require_owner(db, current_user, project_id)
     member = await _load_project_member(db, project, member_id)
-    await _guard_project_agent_member_mutation(db, current_user, project, member)
     updates = data.model_dump(exclude_unset=True)
     requested_enabled = updates.pop("is_enabled", None)
     requested_leader = updates.pop("is_leader", None)
     if requested_enabled is False and requested_leader is True:
         raise HTTPException(status_code=422, detail="A departed member cannot become project owner")
     if "config_snapshot" in updates:
-        member.config_snapshot = updates.pop("config_snapshot")
+        from app.services.project_member_runtime import merge_project_member_runtime_config
+
+        member.config_snapshot = await merge_project_member_runtime_config(
+            db,
+            project,
+            member,
+            updates.pop("config_snapshot"),
+        )
     if requested_enabled is False:
         from app.services.subagent_runtime import cancel_local_subagent_tasks
 
@@ -1663,6 +1906,181 @@ async def patch_project_member(
     return member
 
 
+async def _project_member_tools_payload(
+    db: AsyncSession,
+    project: Project,
+    member: ProjectMemberSnapshot,
+) -> list[dict]:
+    from app.api.tools import (
+        _agent_visible_tool_clause,
+        _globally_visible_tool_clause,
+        _load_agent_tool_assignments,
+        _tool_availability,
+        _tool_record_visible_to_agent,
+    )
+    from app.services.agent_tools import _agent_has_feishu
+    from app.services.tool_enablement import resolved_agent_tool_enabled, tool_is_required
+
+    agent = await db.get(Agent, member.agent_id)
+    if agent is None or agent.tenant_id != project.tenant_id:
+        raise HTTPException(status_code=404, detail="Project member Agent was not found")
+    assignments = await _load_agent_tool_assignments(db, agent.id)
+    tools = (
+        await db.execute(
+            select(Tool)
+            .where(
+                _globally_visible_tool_clause(),
+                _agent_visible_tool_clause(agent.tenant_id, assignments),
+            )
+            .order_by(Tool.category, Tool.name)
+        )
+    ).scalars().all()
+    has_feishu = await _agent_has_feishu(agent.id)
+    config = dict(member.config_snapshot or {})
+    enabled_overrides = {str(name) for name in config.get("enabled_platform_tools", [])}
+    disabled_overrides = {str(name) for name in config.get("disabled_platform_tools", [])}
+    is_project_agent = agent.scope == "project" and agent.project_id == project.id
+    result: list[dict] = []
+    for tool in tools:
+        if tool.category == "feishu" and not has_feishu:
+            continue
+        if (tool.config or {}).get("okr_agent_only") and not agent.is_system:
+            continue
+        assignment = assignments.get(str(tool.id))
+        if not _tool_record_visible_to_agent(tool, agent.tenant_id, assignments):
+            continue
+        base_enabled = resolved_agent_tool_enabled(tool.name, assignment)
+        enabled = (
+            base_enabled
+            if is_project_agent
+            else tool_is_required(tool.name)
+            or tool.name in enabled_overrides
+            or (base_enabled and tool.name not in disabled_overrides)
+        )
+        result.append(
+            {
+                "id": str(tool.id),
+                "name": tool.name,
+                "display_name": tool.display_name,
+                "description": tool.description,
+                "type": tool.type,
+                "category": tool.category,
+                "icon": tool.icon,
+                "enabled": enabled,
+                "is_default": tool.is_default,
+                "mcp_server_name": tool.mcp_server_name,
+                "mcp_server_url": tool.mcp_server_url,
+                "mcp_server_id": str(tool.mcp_server_id) if tool.mcp_server_id else None,
+                "source": tool.source,
+                **_tool_availability(tool.name),
+            }
+        )
+    return result
+
+
+@router.get("/{project_id}/members/{member_id}/tools")
+async def get_project_member_tools(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id)
+    member = await _load_project_member(db, project, member_id)
+    return await _project_member_tools_payload(db, project, member)
+
+
+@router.put("/{project_id}/members/{member_id}/tools")
+async def put_project_member_tools(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    updates: list[ProjectMemberToolUpdate],
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.api.tools import (
+        _agent_visible_tool_clause,
+        _load_agent_tool_assignments,
+        _tool_record_visible_to_agent,
+    )
+    from app.services.project_member_runtime import merge_project_member_runtime_config
+    from app.services.tool_enablement import tool_is_required
+
+    project = await require_owner(db, current_user, project_id)
+    member = await _load_project_member(db, project, member_id)
+    if not member.is_enabled:
+        raise HTTPException(status_code=409, detail="Departed project members cannot change tools")
+    agent = await db.get(Agent, member.agent_id)
+    if agent is None or agent.tenant_id != project.tenant_id:
+        raise HTTPException(status_code=404, detail="Project member Agent was not found")
+    assignments = await _load_agent_tool_assignments(db, agent.id)
+    requested_ids = {update.tool_id for update in updates}
+    tools = (
+        await db.execute(
+            select(Tool).where(
+                Tool.id.in_(requested_ids),
+                _agent_visible_tool_clause(agent.tenant_id, assignments),
+            )
+        )
+    ).scalars().all()
+    tool_by_id = {tool.id: tool for tool in tools}
+    if set(tool_by_id) != requested_ids or any(
+        not _tool_record_visible_to_agent(tool, agent.tenant_id, assignments)
+        for tool in tools
+    ):
+        raise HTTPException(status_code=404, detail="Tool was not found for this project member")
+    for update in updates:
+        tool = tool_by_id[update.tool_id]
+        if not update.enabled and tool_is_required(tool.name):
+            raise HTTPException(status_code=409, detail="Required tools cannot be disabled")
+
+    if agent.scope == "project" and agent.project_id == project.id:
+        for update in updates:
+            assignment = assignments.get(str(update.tool_id))
+            if assignment is None:
+                assignment = AgentTool(
+                    agent_id=agent.id,
+                    tool_id=update.tool_id,
+                    enabled=update.enabled,
+                    source="user_installed",
+                )
+                db.add(assignment)
+            else:
+                assignment.enabled = update.enabled
+    else:
+        config = dict(member.config_snapshot or {})
+        enabled = {str(name) for name in config.get("enabled_platform_tools", [])}
+        disabled = {str(name) for name in config.get("disabled_platform_tools", [])}
+        for update in updates:
+            name = tool_by_id[update.tool_id].name
+            if update.enabled:
+                enabled.add(name)
+                disabled.discard(name)
+            else:
+                disabled.add(name)
+                enabled.discard(name)
+        member.config_snapshot = await merge_project_member_runtime_config(
+            db,
+            project,
+            member,
+            {
+                **config,
+                "enabled_platform_tools": sorted(enabled),
+                "disabled_platform_tools": sorted(disabled),
+            },
+        )
+    add_event(
+        db,
+        project,
+        "member.tools.updated",
+        f"Updated tools for {member.name_snapshot}",
+        actor_user_id=current_user.id,
+        actor_agent_id=member.agent_id,
+    )
+    await db.commit()
+    return await _project_member_tools_payload(db, project, member)
+
+
 @router.put("/{project_id}/leader", response_model=ProjectMemberOut)
 async def put_project_leader(
     project_id: uuid.UUID,
@@ -1708,7 +2126,7 @@ async def list_project_capabilities(
     project_id: uuid.UUID, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     project = await require_project(db, current_user, project_id)
-    return (
+    bindings = list(
         (
             await db.execute(
                 select(ProjectCapabilityBinding)
@@ -1722,6 +2140,7 @@ async def list_project_capabilities(
         .scalars()
         .all()
     )
+    return [await serialize_project_capability(db, project, binding) for binding in bindings]
 
 
 @router.post("/{project_id}/capabilities", response_model=CapabilityOut, status_code=201)
@@ -1731,8 +2150,118 @@ async def create_project_capability(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_project(db, current_user, project_id, edit=True)
-    return await add_capability(db, project, data, actor_user_id=current_user.id)
+    project = await require_owner(db, current_user, project_id)
+    if data.capability_type == "skill":
+        if data.source != "inherited":
+            raise HTTPException(status_code=422, detail="Project Skills must belong to a project digital employee")
+        binding = await bind_library_skill_to_project_agent(
+            db,
+            project,
+            skill_id=data.capability_id,
+            project_agent_id=data.inherited_from_agent_id,
+            is_enabled=data.is_enabled,
+            scope=data.scope,
+            actor_user_id=current_user.id,
+            actor_display_name=current_user.display_name,
+        )
+        add_event(
+            db,
+            project,
+            "capability.bound",
+            f"Bound skill capability {binding.capability_name}",
+            actor_user_id=current_user.id,
+            actor_agent_id=binding.inherited_from_agent_id,
+            metadata={"binding_id": str(binding.id), "source": binding.source},
+        )
+    else:
+        binding = await add_capability(db, project, data, actor_user_id=current_user.id)
+        from app.services.project_member_runtime import sync_project_capability_assignment
+
+        await sync_project_capability_assignment(db, project, binding)
+    await db.refresh(binding)
+    return await serialize_project_capability(db, project, binding)
+
+
+@router.get("/{project_id}/capabilities/{binding_id}/delete-impact")
+async def get_project_skill_delete_impact(
+    project_id: uuid.UUID,
+    binding_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    binding = await _project_capability_binding(db, project, binding_id)
+    return await project_skill_deletion_impact(db, project, binding)
+
+
+@router.delete("/{project_id}/capabilities/{binding_id}")
+async def delete_project_skill_capability(
+    project_id: uuid.UUID,
+    binding_id: uuid.UUID,
+    confirm: bool = Query(default=False),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    binding = await _project_capability_binding(db, project, binding_id)
+    impact = await project_skill_deletion_impact(db, project, binding)
+    if not confirm:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "project_skill_delete_confirmation_required", **impact},
+        )
+    deleted = await delete_project_skill_asset(
+        db,
+        project,
+        binding,
+        actor_user_id=current_user.id,
+        actor_display_name=current_user.display_name,
+    )
+    add_event(
+        db,
+        project,
+        "capability.deleted",
+        f"Deleted project Skill {deleted['skill_name']}",
+        actor_user_id=current_user.id,
+        metadata={
+            "asset_id": deleted["asset_id"],
+            "affected_member_count": deleted["affected_member_count"],
+        },
+    )
+    return {"ok": True, **deleted}
+
+
+@router.post("/{project_id}/capabilities/{binding_id}/refresh")
+async def refresh_project_skill_capability(
+    project_id: uuid.UUID,
+    binding_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    binding = await _project_capability_binding(db, project, binding_id)
+    result = await refresh_project_skill_asset(
+        db,
+        project,
+        binding,
+        actor_user_id=current_user.id,
+        actor_display_name=current_user.display_name,
+    )
+    add_event(
+        db,
+        project,
+        "capability.refreshed",
+        f"Refreshed project Skill {binding.capability_name}",
+        actor_user_id=current_user.id,
+        metadata={
+            "asset_id": result["asset_id"],
+            "affected_member_count": result["affected_member_count"],
+            "changed": result["changed"],
+        },
+    )
+    await db.flush()
+    await db.refresh(binding)
+    return {**result, "capability": await serialize_project_capability(db, project, binding)}
 
 
 @router.patch("/{project_id}/capabilities/{binding_id}", response_model=CapabilityOut)
@@ -1743,7 +2272,47 @@ async def patch_project_capability(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_project(db, current_user, project_id, edit=True)
+    project = await require_owner(db, current_user, project_id)
+    binding = await _project_capability_binding(db, project, binding_id)
+    updates = data.model_dump(exclude_unset=True)
+    if binding.capability_type == "skill":
+        if "config" in updates:
+            raise HTTPException(status_code=422, detail="Project Skill asset metadata cannot be edited directly")
+        if "is_enabled" in updates and updates["is_enabled"] is not None:
+            await set_project_skill_enabled(
+                db,
+                project,
+                binding,
+                enabled=updates.pop("is_enabled"),
+                actor_user_id=current_user.id,
+                actor_display_name=current_user.display_name,
+            )
+        for key, value in updates.items():
+            setattr(binding, key, value)
+    else:
+        for key, value in updates.items():
+            setattr(binding, key, value)
+        from app.services.project_member_runtime import sync_project_capability_assignment
+
+        await sync_project_capability_assignment(db, project, binding)
+    add_event(
+        db,
+        project,
+        "capability.updated",
+        f"Updated capability {binding.capability_name}",
+        actor_user_id=current_user.id,
+        metadata={"binding_id": str(binding.id), "enabled": binding.is_enabled},
+    )
+    await db.flush()
+    await db.refresh(binding)
+    return await serialize_project_capability(db, project, binding)
+
+
+async def _project_capability_binding(
+    db: AsyncSession,
+    project: Project,
+    binding_id: uuid.UUID,
+) -> ProjectCapabilityBinding:
     binding = (
         await db.execute(
             select(ProjectCapabilityBinding).where(
@@ -1755,18 +2324,6 @@ async def patch_project_capability(
     ).scalar_one_or_none()
     if binding is None:
         raise HTTPException(status_code=404, detail="Capability binding not found")
-    for key, value in data.model_dump(exclude_unset=True).items():
-        setattr(binding, key, value)
-    add_event(
-        db,
-        project,
-        "capability.updated",
-        f"Updated capability {binding.capability_name}",
-        actor_user_id=current_user.id,
-        metadata={"binding_id": str(binding.id), "enabled": binding.is_enabled},
-    )
-    await db.flush()
-    await db.refresh(binding)
     return binding
 
 
@@ -2120,7 +2677,7 @@ async def get_work_item_detail(
         "work_item": item,
         "runs": run_payloads,
         "sessions": sessions,
-        "events": events,
+        "events": await serialize_project_events(db, project, list(events)),
         "commits": list(commits_by_hash.values()),
         "files": list(files_by_path.values()),
         "evidence": evidence,
@@ -2356,6 +2913,7 @@ async def create_project_run(
         work_item_id=data.work_item_id,
         agent_id=member.agent_id,
         initiated_by_user_id=current_user.id,
+        execution_user_id=project_execution_user_id(project),
         status="queued",
         trigger_type=data.trigger_type,
         input={
@@ -2447,7 +3005,7 @@ async def list_run_snapshots(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id)
-    return (
+    snapshots = (
         (
             await db.execute(
                 select(ProjectRunMemberSnapshot)
@@ -2462,6 +3020,7 @@ async def list_run_snapshots(
         .scalars()
         .all()
     )
+    return await serialize_project_run_member_snapshots(db, project, list(snapshots))
 
 
 @router.get("/{project_id}/events", response_model=list[ProjectEventOut])
@@ -2481,7 +3040,8 @@ async def list_project_events(
         stmt = stmt.where(ProjectEvent.event_type == event_type)
     if actor_agent_id:
         stmt = stmt.where(ProjectEvent.actor_agent_id == actor_agent_id)
-    return (await db.execute(stmt.order_by(ProjectEvent.created_at.desc()).limit(limit))).scalars().all()
+    events = (await db.execute(stmt.order_by(ProjectEvent.created_at.desc()).limit(limit))).scalars().all()
+    return await serialize_project_events(db, project, list(events))
 
 
 @router.post("/{project_id}/events", response_model=ProjectEventOut, status_code=201)
@@ -2505,7 +3065,7 @@ async def create_project_event(
         metadata=data.metadata,
     )
     await db.flush()
-    return event
+    return (await serialize_project_events(db, project, [event]))[0]
 
 
 def _group_session_payload(session: ChatSession, project: Project) -> dict:
@@ -2884,6 +3444,7 @@ async def confirm_project_kickoff(
         project_id=project.id,
         agent_id=leader.agent_id,
         initiated_by_user_id=current_user.id,
+        execution_user_id=project_execution_user_id(project),
         status="queued",
         trigger_type="leader_kickoff",
         input={
@@ -3068,7 +3629,7 @@ async def create_project_group_message(
     from app.services.subagent_runtime import dispatch_project_run
 
     project = await require_project(db, current_user, project_id, edit=True)
-    ensure_project_running(project)
+    ensure_project_accepts_group_message(project)
     if data.sender_agent_id is not None:
         raise HTTPException(
             status_code=422,
@@ -3088,6 +3649,14 @@ async def create_project_group_message(
         raise HTTPException(status_code=404, detail="Project group session not found")
 
     mention_ids = list(dict.fromkeys(data.mentions))
+    if project.status == "planning" and mention_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Planning discussion is handled by the project owner; "
+                + "start the project before mentioning other members"
+            ),
+        )
     leader = (
         await db.execute(
             select(ProjectMemberSnapshot).where(
@@ -3206,7 +3775,10 @@ async def create_project_group_message(
     execution_content = (data.llm_content or data.content).strip()
     if not execution_content:
         execution_content = "处理项目群聊中附带的文件，并把结论回复到项目群。附件：" + str(data.attachments)
-    from app.services.project_collaboration_prompt import build_project_group_task
+    from app.services.project_collaboration_prompt import (
+        build_project_group_task,
+        build_project_planning_task,
+    )
 
     message_title = execution_content.splitlines()[0].strip()[:96] or "处理项目群聊消息"
     project_runs: list[ProjectRun] = []
@@ -3218,6 +3790,7 @@ async def create_project_group_message(
             work_item_id=data.work_item_id,
             agent_id=agent_id,
             initiated_by_user_id=current_user.id,
+            execution_user_id=project_execution_user_id(project),
             status="queued",
             trigger_type="group_leader_message" if agent_id == default_leader_agent_id else "group_mention",
             input={
@@ -3236,9 +3809,13 @@ async def create_project_group_message(
                     "group_session_id": str(session.id),
                     "project_member_id": str(member.id),
                     "turn_anchor_id": str(message.id),
-                    "task": build_project_group_task(
-                        execution_content,
-                        is_owner=agent_id == default_leader_agent_id,
+                    "task": (
+                        build_project_planning_task(execution_content)
+                        if project.status == "planning"
+                        else build_project_group_task(
+                            execution_content,
+                            is_owner=agent_id == default_leader_agent_id,
+                        )
                     ),
                 },
             },
@@ -3411,6 +3988,7 @@ async def wake_project_agent(
         work_item_id=data.work_item_id,
         agent_id=data.to_agent_id,
         initiated_by_user_id=current_user.id,
+        execution_user_id=project_execution_user_id(project),
         status="queued",
         trigger_type="a2a",
         input={

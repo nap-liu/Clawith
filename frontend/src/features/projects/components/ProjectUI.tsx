@@ -304,14 +304,14 @@ export const ProjectIconButton = forwardRef<
 
 type ProjectProgressBarProps = {
   value: number;
-  label?: string;
+  label: string;
   showValue?: boolean;
   className?: string;
 };
 
 export function ProjectProgressBar({
   value,
-  label = "项目进度",
+  label,
   showValue = true,
   className = "",
 }: ProjectProgressBarProps) {

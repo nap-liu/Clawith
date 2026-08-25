@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import String, and_, func, literal, or_, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.core.permissions import build_visible_agents_query, is_platform_admin_user
@@ -21,7 +20,6 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.audit import AuditLog
-from app.models.org import OrgDepartment, OrgMember
 from app.models.published_page import (
     PublishedPage,
     PublishedPageAccess,
@@ -30,7 +28,10 @@ from app.models.published_page import (
 )
 from app.models.user import Identity, User
 from app.services.notification_service import send_notification
-from app.services.org_directory import canonical_org_member_id_subquery, department_subtree_cte, same_directory_provider
+from app.services.org_directory import (
+    permission_directory_departments,
+    permission_directory_members,
+)
 from app.services.published_page_access import (
     PAGE_SESSION_COOKIE,
     PAGE_SESSION_HOURS,
@@ -790,21 +791,6 @@ async def _manageable_page(db: AsyncSession, page_id: uuid.UUID, user: User) -> 
     return published_page
 
 
-def _directory_department(
-    department: OrgDepartment,
-    child_counts: dict[uuid.UUID, int],
-    member_counts: dict[uuid.UUID, int],
-) -> dict:
-    return {
-        "id": str(department.id),
-        "name": department.name,
-        "parent_id": str(department.parent_id) if department.parent_id else None,
-        "path": department.path,
-        "has_children": child_counts.get(department.id, 0) > 0,
-        "direct_member_count": member_counts.get(department.id, 0),
-    }
-
-
 @router.get("/{page_id}/directory/departments")
 async def get_page_directory_departments(
     page_id: uuid.UUID,
@@ -815,85 +801,14 @@ async def get_page_directory_departments(
     db: AsyncSession = Depends(get_db),
 ):
     published_page = await _manageable_page(db, page_id, current_user)
-    tenant_id = published_page.tenant_id
-    if not tenant_id:
-        return {"items": [], "my_department": None}
-    conditions = [OrgDepartment.tenant_id == tenant_id, OrgDepartment.status == "active"]
-    normalized_search = (search or "").strip()
-    if normalized_search:
-        pattern = f"%{normalized_search}%"
-        conditions.append(or_(OrgDepartment.name.ilike(pattern), OrgDepartment.path.ilike(pattern)))
-    elif parent_id:
-        parent = await db.scalar(select(OrgDepartment).where(
-            OrgDepartment.id == parent_id,
-            OrgDepartment.tenant_id == tenant_id,
-            OrgDepartment.status == "active",
-        ))
-        if not parent:
-            raise HTTPException(404, "Department not found")
-        conditions.extend([
-            OrgDepartment.parent_id == parent_id,
-            OrgDepartment.provider_id == parent.provider_id if parent.provider_id else OrgDepartment.provider_id.is_(None),
-        ])
-    else:
-        conditions.append(OrgDepartment.parent_id.is_(None))
-    departments = (await db.scalars(
-        select(OrgDepartment).where(*conditions).order_by(OrgDepartment.name.asc()).limit(limit)
-    )).all()
-    my_department = None
-    if not normalized_search and parent_id is None:
-        my_department = await db.scalar(
-            select(OrgDepartment)
-            .join(OrgMember, OrgMember.department_id == OrgDepartment.id)
-            .where(
-                OrgMember.tenant_id == tenant_id,
-                OrgMember.status == "active",
-                OrgMember.user_id == current_user.id,
-                OrgDepartment.status == "active",
-            )
-            .order_by(OrgMember.synced_at.desc())
-            .limit(1)
-        )
-    target_ids = {department.id for department in departments}
-    if my_department:
-        target_ids.add(my_department.id)
-    child_counts: dict[uuid.UUID, int] = {}
-    member_counts: dict[uuid.UUID, int] = {}
-    if target_ids:
-        parent_department = aliased(OrgDepartment)
-        child_counts = {
-            row[0]: int(row[1]) for row in (await db.execute(
-                select(OrgDepartment.parent_id, func.count(OrgDepartment.id))
-                .join(parent_department, parent_department.id == OrgDepartment.parent_id)
-                .where(
-                    OrgDepartment.tenant_id == tenant_id,
-                    OrgDepartment.status == "active",
-                    OrgDepartment.parent_id.in_(target_ids),
-                    parent_department.tenant_id == tenant_id,
-                    parent_department.status == "active",
-                    same_directory_provider(OrgDepartment.provider_id, parent_department.provider_id),
-                )
-                .group_by(OrgDepartment.parent_id)
-            )).all() if row[0]
-        }
-        member_counts = {
-            row[0]: int(row[1]) for row in (await db.execute(
-                select(OrgMember.department_id, func.count(func.distinct(OrgMember.user_id)))
-                .join(User, User.id == OrgMember.user_id)
-                .where(
-                    OrgMember.tenant_id == tenant_id,
-                    OrgMember.status == "active",
-                    OrgMember.department_id.in_(target_ids),
-                    User.tenant_id == tenant_id,
-                    User.is_active.is_(True),
-                )
-                .group_by(OrgMember.department_id)
-            )).all() if row[0]
-        }
-    return {
-        "items": [_directory_department(item, child_counts, member_counts) for item in departments],
-        "my_department": _directory_department(my_department, child_counts, member_counts) if my_department else None,
-    }
+    return await permission_directory_departments(
+        db,
+        tenant_id=published_page.tenant_id,
+        current_user_id=current_user.id,
+        parent_id=parent_id,
+        search=search,
+        limit=limit,
+    )
 
 
 @router.get("/{page_id}/directory/members")
@@ -908,80 +823,15 @@ async def get_page_directory_members(
     db: AsyncSession = Depends(get_db),
 ):
     published_page = await _manageable_page(db, page_id, current_user)
-    tenant_id = published_page.tenant_id
-    if not tenant_id:
-        return {"items": [], "page": page, "page_size": page_size, "total": 0, "has_more": False}
-    filters = [
-        OrgMember.tenant_id == tenant_id,
-        OrgMember.status == "active",
-        OrgMember.user_id.is_not(None),
-        User.tenant_id == tenant_id,
-        User.is_active.is_(True),
-    ]
-    canonical_department_ids = None
-    normalized_search = (search or "").strip()
-    if normalized_search:
-        pattern = f"%{normalized_search}%"
-        filters.append(or_(
-            OrgMember.name.ilike(pattern),
-            OrgMember.nickname.ilike(pattern),
-            OrgMember.name_translit_full.ilike(pattern),
-            OrgMember.name_translit_initial.ilike(pattern),
-            OrgMember.department_path.ilike(pattern),
-            OrgMember.title.ilike(pattern),
-            OrgMember.email.ilike(pattern),
-        ))
-    elif department_id:
-        department = await db.scalar(select(OrgDepartment).where(
-            OrgDepartment.id == department_id,
-            OrgDepartment.tenant_id == tenant_id,
-            OrgDepartment.status == "active",
-        ))
-        if not department:
-            raise HTTPException(404, "Department not found")
-        if include_descendants:
-            subtree = department_subtree_cte(
-                tenant_id=tenant_id,
-                department_id=department.id,
-                name="page_permission_picker_department_subtree",
-            )
-            canonical_department_ids = select(subtree.c.department_id)
-            filters.append(OrgMember.department_id.in_(canonical_department_ids))
-        else:
-            canonical_department_ids = [department.id]
-            filters.append(OrgMember.department_id == department.id)
-    canonical = canonical_org_member_id_subquery(
-        tenant_id=tenant_id,
-        department_ids=canonical_department_ids,
-        prefer_directory_profile=True,
+    return await permission_directory_members(
+        db,
+        tenant_id=published_page.tenant_id,
+        department_id=department_id,
+        include_descendants=include_descendants,
+        search=search,
+        page=page,
+        page_size=page_size,
     )
-    base_query = (
-        select(OrgMember)
-        .join(canonical, and_(OrgMember.id == canonical.c.om_id, canonical.c.rn == 1))
-        .join(User, User.id == OrgMember.user_id)
-        .where(*filters)
-    )
-    total = int(await db.scalar(select(func.count()).select_from(base_query.subquery())) or 0)
-    members = (await db.scalars(
-        base_query.order_by(OrgMember.name.asc(), OrgMember.id.asc()).offset((page - 1) * page_size).limit(page_size)
-    )).all()
-    return {
-        "items": [{
-            "id": str(member.user_id),
-            "member_id": str(member.id),
-            "name": member.name,
-            "nickname": member.nickname,
-            "department_id": str(member.department_id) if member.department_id else None,
-            "department_path": member.department_path or "",
-            "title": member.title or "",
-            "avatar_url": member.avatar_url,
-            "email": member.email,
-        } for member in members],
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "has_more": page * page_size < total,
-    }
 
 
 def _validate_access_mode(access_mode: str) -> None:

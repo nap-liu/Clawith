@@ -7,11 +7,14 @@ single platform user never appears twice when identity providers overlap.
 
 import uuid
 
+from fastapi import HTTPException, status
 from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.agent import AgentPermission
 from app.models.org import AgentRelationship, OrgDepartment, OrgMember
+from app.models.user import Identity, User
 
 
 def same_directory_provider(left, right):
@@ -177,10 +180,304 @@ def canonical_org_member_id_subquery(
     if department_ids is not None:
         conditions.append(OrgMember.department_id.in_(department_ids))
 
-    query = select(OrgMember.id.label("om_id"), row_number)
+    query = select(
+        OrgMember.id.label("om_id"),
+        OrgMember.user_id.label("user_id"),
+        row_number,
+    )
     if relationship_counts is not None:
         query = query.outerjoin(
             relationship_counts,
             relationship_counts.c.member_id == OrgMember.id,
         )
     return query.where(*conditions).subquery()
+
+
+def _serialize_picker_department(
+    department: OrgDepartment,
+    *,
+    child_counts: dict[uuid.UUID, int],
+    member_counts: dict[uuid.UUID, int],
+) -> dict:
+    return {
+        "id": str(department.id),
+        "name": department.name,
+        "parent_id": str(department.parent_id) if department.parent_id else None,
+        "path": department.path,
+        "has_children": child_counts.get(department.id, 0) > 0,
+        "direct_member_count": member_counts.get(department.id, 0),
+    }
+
+
+async def permission_directory_departments(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID | None,
+    current_user_id: uuid.UUID,
+    parent_id: uuid.UUID | None = None,
+    search: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """Return the shared lazy department tree after a caller-specific access check."""
+    if not tenant_id:
+        return {"items": [], "my_department": None}
+
+    conditions = [
+        OrgDepartment.tenant_id == tenant_id,
+        OrgDepartment.status == "active",
+    ]
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        conditions.append(
+            or_(
+                OrgDepartment.name.ilike(pattern),
+                OrgDepartment.path.ilike(pattern),
+            )
+        )
+    elif parent_id:
+        parent = await db.scalar(
+            select(OrgDepartment).where(
+                OrgDepartment.id == parent_id,
+                OrgDepartment.tenant_id == tenant_id,
+                OrgDepartment.status == "active",
+            )
+        )
+        if not parent:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Department not found",
+            )
+        conditions.extend(
+            [
+                OrgDepartment.parent_id == parent_id,
+                (
+                    OrgDepartment.provider_id == parent.provider_id
+                    if parent.provider_id is not None
+                    else OrgDepartment.provider_id.is_(None)
+                ),
+            ]
+        )
+    else:
+        conditions.append(OrgDepartment.parent_id.is_(None))
+
+    departments = (
+        await db.scalars(
+            select(OrgDepartment)
+            .where(*conditions)
+            .order_by(OrgDepartment.name.asc())
+            .limit(limit)
+        )
+    ).all()
+    my_department = None
+    if not normalized_search and parent_id is None:
+        my_department = await db.scalar(
+            select(OrgDepartment)
+            .join(OrgMember, OrgMember.department_id == OrgDepartment.id)
+            .where(
+                OrgMember.tenant_id == tenant_id,
+                OrgMember.status == "active",
+                OrgMember.user_id == current_user_id,
+                OrgDepartment.status == "active",
+            )
+            .order_by(OrgMember.synced_at.desc())
+            .limit(1)
+        )
+
+    target_ids = {department.id for department in departments}
+    if my_department:
+        target_ids.add(my_department.id)
+    child_counts: dict[uuid.UUID, int] = {}
+    member_counts: dict[uuid.UUID, int] = {}
+    if target_ids:
+        parent_department = aliased(OrgDepartment)
+        child_counts = {
+            row[0]: int(row[1])
+            for row in (
+                await db.execute(
+                    select(OrgDepartment.parent_id, func.count(OrgDepartment.id))
+                    .join(
+                        parent_department,
+                        parent_department.id == OrgDepartment.parent_id,
+                    )
+                    .where(
+                        OrgDepartment.tenant_id == tenant_id,
+                        OrgDepartment.status == "active",
+                        OrgDepartment.parent_id.in_(target_ids),
+                        parent_department.tenant_id == tenant_id,
+                        parent_department.status == "active",
+                        same_directory_provider(
+                            OrgDepartment.provider_id,
+                            parent_department.provider_id,
+                        ),
+                    )
+                    .group_by(OrgDepartment.parent_id)
+                )
+            ).all()
+            if row[0]
+        }
+        member_counts = {
+            row[0]: int(row[1])
+            for row in (
+                await db.execute(
+                    select(
+                        OrgMember.department_id,
+                        func.count(func.distinct(OrgMember.user_id)),
+                    )
+                    .join(User, User.id == OrgMember.user_id)
+                    .where(
+                        OrgMember.tenant_id == tenant_id,
+                        OrgMember.status == "active",
+                        OrgMember.department_id.in_(target_ids),
+                        User.tenant_id == tenant_id,
+                        User.is_active.is_(True),
+                    )
+                    .group_by(OrgMember.department_id)
+                )
+            ).all()
+            if row[0]
+        }
+
+    return {
+        "items": [
+            _serialize_picker_department(
+                department,
+                child_counts=child_counts,
+                member_counts=member_counts,
+            )
+            for department in departments
+        ],
+        "my_department": (
+            _serialize_picker_department(
+                my_department,
+                child_counts=child_counts,
+                member_counts=member_counts,
+            )
+            if my_department
+            else None
+        ),
+    }
+
+
+async def permission_directory_members(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID | None,
+    department_id: uuid.UUID | None = None,
+    include_descendants: bool = False,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    excluded_user_ids: set[uuid.UUID] | None = None,
+) -> dict:
+    """Return canonical active users after a caller-specific access check."""
+    if not tenant_id:
+        return {
+            "items": [],
+            "page": page,
+            "page_size": page_size,
+            "total": 0,
+            "has_more": False,
+        }
+
+    canonical_department_ids = None
+    normalized_search = (search or "").strip()
+    if not normalized_search and department_id:
+        department = await db.scalar(
+            select(OrgDepartment).where(
+                OrgDepartment.id == department_id,
+                OrgDepartment.tenant_id == tenant_id,
+                OrgDepartment.status == "active",
+            )
+        )
+        if not department:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Department not found",
+            )
+        if include_descendants:
+            subtree = department_subtree_cte(
+                tenant_id=tenant_id,
+                department_id=department.id,
+                name="permission_picker_department_subtree",
+            )
+            canonical_department_ids = select(subtree.c.department_id)
+        else:
+            canonical_department_ids = [department.id]
+
+    canonical = canonical_org_member_id_subquery(
+        tenant_id=tenant_id,
+        department_ids=canonical_department_ids,
+        prefer_directory_profile=True,
+    )
+    profile = aliased(OrgMember)
+    filters = [User.tenant_id == tenant_id, User.is_active.is_(True)]
+    if excluded_user_ids:
+        filters.append(User.id.not_in(excluded_user_ids))
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        filters.append(
+            or_(
+                User.display_name.ilike(pattern),
+                User.title.ilike(pattern),
+                Identity.email.ilike(pattern),
+                Identity.username.ilike(pattern),
+                profile.name.ilike(pattern),
+                profile.nickname.ilike(pattern),
+                profile.name_translit_full.ilike(pattern),
+                profile.name_translit_initial.ilike(pattern),
+                profile.department_path.ilike(pattern),
+                profile.title.ilike(pattern),
+                profile.email.ilike(pattern),
+            )
+        )
+    elif department_id:
+        filters.append(canonical.c.om_id.is_not(None))
+
+    base_query = (
+        select(User, profile, Identity)
+        .select_from(User)
+        .outerjoin(
+            canonical,
+            and_(canonical.c.user_id == User.id, canonical.c.rn == 1),
+        )
+        .outerjoin(profile, profile.id == canonical.c.om_id)
+        .outerjoin(Identity, Identity.id == User.identity_id)
+        .where(*filters)
+    )
+    total = int(
+        await db.scalar(select(func.count()).select_from(base_query.subquery()))
+        or 0
+    )
+    members = (
+        await db.execute(
+            base_query
+            .order_by(func.coalesce(profile.name, User.display_name).asc(), User.id.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+    return {
+        "items": [
+            {
+                "id": str(user.id),
+                "member_id": str(member.id) if member else None,
+                "name": user.display_name,
+                "nickname": member.nickname if member else None,
+                "department_id": (
+                    str(member.department_id)
+                    if member and member.department_id
+                    else None
+                ),
+                "department_path": (member.department_path or "") if member else "",
+                "title": user.title or "",
+                "avatar_url": user.avatar_url,
+                "email": identity.email if identity else None,
+            }
+            for user, member, identity in members
+        ],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "has_more": page * page_size < total,
+    }

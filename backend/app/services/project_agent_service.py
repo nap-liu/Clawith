@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import tempfile
 import uuid
 from pathlib import Path
@@ -31,12 +32,17 @@ from app.services.project_git_service import (
     project_repo_path,
     project_user_git_email,
 )
+from app.services.project_member_runtime import (
+    clone_source_agent_tool_dependencies,
+    initialize_project_agent_tool_policy,
+)
 from app.services.project_service import (
     add_event,
     add_member,
     deactivate_project_member,
     restore_project_member,
 )
+from app.services.project_skill_assets import snapshot_source_agent_skills
 
 
 def _project_root(project: Project) -> Path:
@@ -164,28 +170,59 @@ async def create_project_agent(
         role_description=agent.role_description or "",
     )
 
-    await create_project_agent_workspace(
-        _project_root(project),
-        agent.id,
-        source_agent_id=source.id if source else None,
-        default_soul=default_soul,
-        default_memory=default_memory,
-    )
     layout = project_agent_workspace(_project_root(project), agent.id)
-    # Empty form fields must not erase the professional identity generated for
-    # a new project Agent. An intentional identity reset is an owner-only
-    # update operation, not a side effect of creation.
-    if data.soul is not None and data.soul.strip():
-        await asyncio.to_thread(_write_text_if_changed, layout.soul, data.soul)
-    if data.core_memory is not None and data.core_memory.strip():
-        await asyncio.to_thread(_write_text_if_changed, layout.memory, data.core_memory)
-    commit = await commit_project_changes(
-        project,
-        f"Create project Agent: {agent.name}",
-        [agent.agent_dir],
-        author_name=owner.display_name,
-        author_email=project_user_git_email(owner.id),
-    )
+    try:
+        await create_project_agent_workspace(
+            _project_root(project),
+            agent.id,
+            source_agent_id=source.id if source else None,
+            default_soul=default_soul,
+            default_memory=default_memory,
+        )
+        skill_bindings = (
+            await snapshot_source_agent_skills(
+                db,
+                project,
+                source_agent_id=source.id,
+                project_agent_id=agent.id,
+            )
+            if source is not None
+            else []
+        )
+        tool_bindings = (
+            await clone_source_agent_tool_dependencies(
+                db,
+                project,
+                source_agent_id=source.id,
+                project_agent_id=agent.id,
+                project_defaults_only=True,
+            )
+            if source is not None
+            else []
+        )
+        await initialize_project_agent_tool_policy(
+            db,
+            project,
+            project_agent_id=agent.id,
+        )
+        # Empty form fields must not erase the professional identity generated for
+        # a new project Agent. An intentional identity reset is an owner-only
+        # update operation, not a side effect of creation.
+        if data.soul is not None and data.soul.strip():
+            await asyncio.to_thread(_write_text_if_changed, layout.soul, data.soul)
+        if data.core_memory is not None and data.core_memory.strip():
+            await asyncio.to_thread(_write_text_if_changed, layout.memory, data.core_memory)
+        commit = await commit_project_changes(
+            project,
+            f"Create project Agent: {agent.name}",
+            [agent.agent_dir],
+            author_name=owner.display_name,
+            author_email=project_user_git_email(owner.id),
+        )
+    except Exception:
+        if layout.root.exists():
+            await asyncio.to_thread(shutil.rmtree, layout.root, True)
+        raise
     add_event(
         db,
         project,
@@ -197,6 +234,8 @@ async def create_project_agent(
             "agent_id": str(agent.id),
             "member_id": str(member.id),
             "source_agent_id": str(source.id) if source else None,
+            "skill_count": len(skill_bindings),
+            "tool_dependency_count": len(tool_bindings),
             "commit": commit["commit"],
         },
     )

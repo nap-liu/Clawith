@@ -294,6 +294,8 @@
 
 .pm-projects {
   max-width: 1440px;
+  display: grid;
+  gap: 12px;
   margin: 0 auto;
 }
 .pm-project-card {
@@ -322,6 +324,10 @@
   border-radius: 0 0 10px 10px;
 }
 .pm-project-card:only-child {
+  border-radius: 10px;
+}
+.pm-projects:not(.pm-projects-grid) .pm-project-card {
+  border-bottom-color: var(--border-subtle);
   border-radius: 10px;
 }
 .pm-project-card:hover,
@@ -2126,6 +2132,9 @@
 @media (max-width: 620px) {
   .pm-page {
     padding-inline: 14px;
+  }
+  .pm-projects {
+    gap: 10px;
   }
   .pm-header-actions .pm-button {
     flex: 1;

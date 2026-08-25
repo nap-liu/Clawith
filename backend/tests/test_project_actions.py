@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -38,10 +39,12 @@ import app.models.mcp_server  # noqa: F401
 import app.models.org  # noqa: F401
 import app.models.participant  # noqa: F401
 import app.models.project  # noqa: F401
+import app.models.skill  # noqa: F401
 import app.models.subagent_run  # noqa: F401
 import app.models.tenant  # noqa: F401
 import app.models.tool  # noqa: F401
 import app.models.user  # noqa: F401
+from app.api import files as files_api
 from app.api import projects as projects_api
 from app.core.security import get_current_user
 from app.database import Base, get_db
@@ -49,6 +52,7 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
+from app.models.org import OrgDepartment, OrgMember
 from app.models.project import Project, ProjectAccessGrant, ProjectEvent, ProjectMemberSnapshot
 from app.models.tenant import Tenant
 from app.models.tool import Tool
@@ -62,12 +66,17 @@ TABLES = [
     "identities",
     "tenants",
     "users",
+    "org_departments",
+    "org_members",
     "agent_templates",
     "agents",
+    "agent_permissions",
     "tools",
     "agent_tools",
     "agent_agent_relationships",
     "participants",
+    "skills",
+    "skill_files",
     "project_templates",
     "projects",
     "project_repository_operations",
@@ -82,6 +91,7 @@ TABLES = [
     "chat_messages",
     "chat_compactions",
     "subagent_runs",
+    "workspace_file_revisions",
 ]
 
 
@@ -147,12 +157,19 @@ async def _agent(db: AsyncSession, tenant: Tenant, owner: User, name: str, role:
 
 @pytest.fixture
 async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[ProjectApiEnv]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    database_url = os.environ.get("PROJECT_TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+    engine = create_async_engine(database_url)
+    table_names = list(TABLES)
+    if database_url.startswith("postgresql"):
+        table_names.insert(table_names.index("tools"), "mcp_servers")
     async with engine.begin() as connection:
+        if os.environ.get("PROJECT_TEST_DATABASE_URL"):
+            await connection.exec_driver_sql("DROP SCHEMA public CASCADE")
+            await connection.exec_driver_sql("CREATE SCHEMA public")
         await connection.run_sync(
             lambda sync_connection: Base.metadata.create_all(
                 sync_connection,
-                tables=[Base.metadata.tables[name] for name in TABLES],
+                tables=[Base.metadata.tables[name] for name in table_names],
             )
         )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -231,10 +248,15 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
         "app.services.project_git_service.get_settings",
         lambda: SimpleNamespace(STORAGE_LOCAL_ROOT=str(tmp_path)),
     )
+    monkeypatch.setattr(
+        "app.services.agent_runtime_workspace.get_settings",
+        lambda: SimpleNamespace(STORAGE_LOCAL_ROOT=str(tmp_path), AGENT_DATA_DIR=str(tmp_path)),
+    )
     monkeypatch.setattr(projects_api, "deliver_project_a2a", skip_external_delivery)
 
     test_app = FastAPI()
     test_app.include_router(projects_api.router, prefix="/api")
+    test_app.include_router(files_api.router, prefix="/api")
     test_app.dependency_overrides[get_db] = override_db
     test_app.dependency_overrides[get_current_user] = override_user
 
@@ -326,6 +348,13 @@ async def _create_work_item(
     return response.json()
 
 
+async def _mark_project_running(env: ProjectApiEnv, project_id: str | uuid.UUID) -> None:
+    project = await env.db.get(Project, uuid.UUID(str(project_id)))
+    assert project is not None
+    project.status = "running"
+    await env.db.commit()
+
+
 async def test_private_share_settings_and_audit_are_a_real_api_round_trip(project_api: ProjectApiEnv):
     env = project_api
     project = await _create_project(env, name="Private by default")
@@ -334,6 +363,9 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     assert project["visibility"] == "private"
     assert project["shared_with"] == []
     assert project["status"] == "planning"
+    assert project["access_role"] == "owner"
+    assert project["execution_user_id"] == str(env.owner_id)
+    assert project["execution_user_name"] == "Owner"
 
     env.authenticate_as(env.viewer_id)
     hidden = await env.client.get(f"/api/projects/{project_id}")
@@ -359,15 +391,22 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
 
     shared = await env.client.patch(
         f"/api/projects/{project_id}",
-        json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
     )
     assert shared.status_code == 200, shared.text
     assert shared.json()["visibility"] == "shared"
+    assert shared.json()["execution_user_id"] == str(env.viewer_id)
+    assert shared.json()["execution_user_name"] == "Viewer"
     assert [entry["user_id"] for entry in shared.json()["shared_with"]] == [str(env.viewer_id)]
 
     env.authenticate_as(env.viewer_id)
     visible = await env.client.get(f"/api/projects/{project_id}")
     assert visible.status_code == 200
+    assert visible.json()["access_role"] == "view"
     cannot_edit = await env.client.patch(f"/api/projects/{project_id}", json={"name": "Not allowed"})
     assert cannot_edit.status_code == 404
 
@@ -381,6 +420,9 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     ).scalar_one()
     grant.role = "edit"
     await env.db.commit()
+    editor_contract = await env.client.get(f"/api/projects/{project_id}")
+    assert editor_contract.status_code == 200
+    assert editor_contract.json()["access_role"] == "edit"
     normal_editor_update = await env.client.patch(
         f"/api/projects/{project_id}",
         json={"description": "Editors may update ordinary project fields"},
@@ -422,6 +464,8 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     assert private.status_code == 200
     assert private.json()["visibility"] == "private"
     assert private.json()["shared_with"] == []
+    assert private.json()["execution_user_id"] == str(env.owner_id)
+    assert private.json()["execution_user_name"] == "Owner"
     remaining_grants = (
         (await env.db.execute(select(ProjectAccessGrant).where(ProjectAccessGrant.project_id == uuid.UUID(project_id))))
         .scalars()
@@ -435,10 +479,239 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     assert {"project.created", "project.initialized", "project.settings.updated", "project.updated"} <= event_types
 
 
+async def test_shared_project_execution_user_is_validated_atomically(project_api: ProjectApiEnv):
+    env = project_api
+    project = await _create_project(env, name="Shared execution identity")
+    project_id = project["id"]
+
+    missing_selection = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
+    )
+    assert missing_selection.status_code == 422
+    unchanged = (await env.client.get(f"/api/projects/{project_id}")).json()
+    assert unchanged["visibility"] == "private"
+    assert unchanged["shared_with"] == []
+    assert unchanged["execution_user_id"] == str(env.owner_id)
+
+    configured = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
+    )
+    assert configured.status_code == 200, configured.text
+
+    stored = await env.db.get(Project, uuid.UUID(project_id))
+    assert stored is not None
+    stored.execution_user_id = None
+    await env.db.commit()
+    legacy_acl_change = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"shared_with_user_ids": [str(env.viewer_id)]},
+    )
+    assert legacy_acl_change.status_code == 422
+    legacy_summary = (await env.client.get(f"/api/projects/{project_id}")).json()
+    assert legacy_summary["execution_user_id"] == str(env.owner_id)
+    reconfigured = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
+    )
+    assert reconfigured.status_code == 200, reconfigured.text
+
+    tenant = await env.db.get(Tenant, env.tenant_id)
+    assert tenant is not None
+    alternate = await _user(env.db, tenant, "Alternate")
+    await env.db.commit()
+    invalid_replacement = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"shared_with_user_ids": [str(alternate.id)]},
+    )
+    assert invalid_replacement.status_code == 422
+    still_configured = (await env.client.get(f"/api/projects/{project_id}")).json()
+    assert [entry["user_id"] for entry in still_configured["shared_with"]] == [str(env.viewer_id)]
+    assert still_configured["execution_user_id"] == str(env.viewer_id)
+
+    alternate.is_active = False
+    await env.db.commit()
+    inactive_selection = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={
+            "shared_with_user_ids": [str(env.viewer_id), str(alternate.id)],
+            "execution_user_id": str(alternate.id),
+        },
+    )
+    assert inactive_selection.status_code == 422
+    alternate.is_active = True
+    await env.db.commit()
+
+    replaced = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={
+            "shared_with_user_ids": [str(alternate.id)],
+            "execution_user_id": str(alternate.id),
+        },
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["execution_user_id"] == str(alternate.id)
+    assert replaced.json()["execution_user_name"] == "Alternate"
+
+
+async def test_project_owner_directory_is_tenant_scoped_and_excludes_owner(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    project = await _create_project(env, name="Project share directory")
+    project_id = project["id"]
+
+    root = OrgDepartment(
+        tenant_id=env.tenant_id,
+        name="Product",
+        path="Product",
+        status="active",
+    )
+    env.db.add(root)
+    await env.db.flush()
+    child = OrgDepartment(
+        tenant_id=env.tenant_id,
+        name="Research",
+        path="Product/Research",
+        parent_id=root.id,
+        status="active",
+    )
+    env.db.add(child)
+    await env.db.flush()
+    env.db.add_all(
+        [
+            OrgMember(
+                tenant_id=env.tenant_id,
+                user_id=env.owner_id,
+                name="Owner",
+                email="owner@project.test",
+                department_id=root.id,
+                department_path=root.path,
+                status="active",
+            ),
+            OrgMember(
+                tenant_id=env.tenant_id,
+                user_id=env.viewer_id,
+                name="Viewer",
+                email="viewer@project.test",
+                department_id=child.id,
+                department_path=child.path,
+                status="active",
+            ),
+        ]
+    )
+    outsider_tenant = Tenant(
+        name="Directory outsider",
+        slug=f"directory-outsider-{uuid.uuid4().hex[:8]}",
+    )
+    env.db.add(outsider_tenant)
+    await env.db.flush()
+    outsider = await _user(env.db, outsider_tenant, "DirectoryOutsider")
+    outsider_department = OrgDepartment(
+        tenant_id=outsider_tenant.id,
+        name="Other company",
+        path="Other company",
+        status="active",
+    )
+    env.db.add(outsider_department)
+    await env.db.flush()
+    env.db.add(
+        OrgMember(
+            tenant_id=outsider_tenant.id,
+            user_id=outsider.id,
+            name="Directory outsider",
+            department_id=outsider_department.id,
+            department_path=outsider_department.path,
+            status="active",
+        )
+    )
+    await env.db.commit()
+
+    departments = await env.client.get(
+        f"/api/projects/{project_id}/directory/departments"
+    )
+    assert departments.status_code == 200, departments.text
+    assert [item["id"] for item in departments.json()["items"]] == [str(root.id)]
+    assert departments.json()["items"][0]["has_children"] is True
+    assert departments.json()["my_department"]["id"] == str(root.id)
+
+    members = await env.client.get(
+        f"/api/projects/{project_id}/directory/members",
+        params={"department_id": str(root.id), "include_descendants": "true"},
+    )
+    assert members.status_code == 200, members.text
+    assert [item["id"] for item in members.json()["items"]] == [
+        str(env.viewer_id)
+    ]
+    assert str(env.owner_id) not in {item["id"] for item in members.json()["items"]}
+    assert str(outsider.id) not in {item["id"] for item in members.json()["items"]}
+
+    cross_tenant_department = await env.client.get(
+        f"/api/projects/{project_id}/directory/members",
+        params={"department_id": str(outsider_department.id)},
+    )
+    assert cross_tenant_department.status_code == 404
+
+    env.authenticate_as(env.viewer_id)
+    denied_departments = await env.client.get(
+        f"/api/projects/{project_id}/directory/departments"
+    )
+    denied_members = await env.client.get(
+        f"/api/projects/{project_id}/directory/members",
+        params={"search": "Owner"},
+    )
+    assert denied_departments.status_code == 404
+    assert denied_members.status_code == 404
+
+
+async def test_project_owner_directory_lists_active_users_without_synced_org_profiles(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    project = await _create_project(env, name="Project share without org sync")
+
+    departments = await env.client.get(
+        f"/api/projects/{project['id']}/directory/departments"
+    )
+    assert departments.status_code == 200, departments.text
+    assert departments.json() == {"items": [], "my_department": None}
+
+    members = await env.client.get(
+        f"/api/projects/{project['id']}/directory/members"
+    )
+    assert members.status_code == 200, members.text
+    assert members.json()["total"] == 1
+    assert members.json()["items"] == [
+        {
+            "id": str(env.viewer_id),
+            "member_id": None,
+            "name": "Viewer",
+            "nickname": None,
+            "department_id": None,
+            "department_path": "",
+            "title": "",
+            "avatar_url": None,
+            "email": env.viewer.email,
+        }
+    ]
+    assert str(env.owner_id) not in {
+        item["id"] for item in members.json()["items"]
+    }
+
+
 async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(project_api: ProjectApiEnv):
     env = project_api
     project = await _create_project(env, name="Snapshots and mesh")
     project_id = project["id"]
+    await _mark_project_running(env, project_id)
     worker_id = env.worker_id
     reviewer_id = env.reviewer_id
     source_before = {
@@ -498,13 +771,6 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     assert a2a_response.json()["from_agent_id"] == str(worker_id)
     assert a2a_response.json()["to_agent_id"] == str(reviewer_id)
 
-    # Execution runs are available after the explicit kickoff boundary. This
-    # test focuses on immutable snapshots, so place the fixture in that state
-    # without duplicating the kickoff acceptance test below.
-    stored_project = await env.db.get(Project, uuid.UUID(project_id))
-    assert stored_project is not None
-    stored_project.status = "running"
-    await env.db.commit()
     run_response = await env.client.post(
         f"/api/projects/{project_id}/runs",
         json={"agent_id": str(worker_id), "trigger_type": "manual", "input": {"objective": "Build v1"}},
@@ -521,11 +787,15 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     assert sum(item["is_leader"] for item in frozen) == 1
     worker_frozen = next(item for item in frozen if item["agent_id"] == str(worker_id))
     reviewer_frozen = next(item for item in frozen if item["agent_id"] == str(reviewer_id))
-    assert {item["name"] for item in worker_frozen["capability_snapshot"]} == {
+    assert {item["name"] for item in worker_frozen["member_snapshot"]["capabilities"]["items"]} == {
         "project-shell",
         "worker-private-tool",
     }
-    assert {item["name"] for item in reviewer_frozen["capability_snapshot"]} == {"project-shell"}
+    assert {item["name"] for item in reviewer_frozen["member_snapshot"]["capabilities"]["items"]} == {
+        "project-shell"
+    }
+    assert "member_config_snapshot" not in worker_frozen
+    assert "capability_snapshot" not in worker_frozen
 
     capabilities = (await env.client.get(f"/api/projects/{project_id}/capabilities")).json()
     shared_capability = next(item for item in capabilities if item["capability_name"] == "project-shell")
@@ -544,11 +814,73 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     assert {"run.queued", "capability.updated", "member.snapshot.updated"} <= {event["event_type"] for event in events}
 
 
+async def test_run_event_and_dashboard_expose_frozen_product_summary(project_api: ProjectApiEnv):
+    env = project_api
+    project = await _create_project(env, name="Product snapshot summary")
+    project_id = project["id"]
+    await _mark_project_running(env, project_id)
+
+    members = (await env.client.get(f"/api/projects/{project_id}/members")).json()
+    worker = next(member for member in members if member["agent_id"] == str(env.worker_id))
+    model = (
+        await env.db.execute(select(LLMModel).where(LLMModel.tenant_id == env.tenant_id))
+    ).scalar_one()
+    updated_config = {
+        **worker["config_snapshot"],
+        "primary_model_id": str(model.id),
+        "max_tool_rounds": 23,
+        "project_instruction": "Use the project acceptance criteria.",
+    }
+    patched = await env.client.patch(
+        f"/api/projects/{project_id}/members/{worker['id']}",
+        json={"config_snapshot": updated_config},
+    )
+    assert patched.status_code == 200, patched.text
+
+    created = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"agent_id": str(env.worker_id), "input": {"objective": "Produce the delivery"}},
+    )
+    assert created.status_code == 201, created.text
+    run = created.json()
+    summary = run["member_snapshot"]
+    assert summary["name"] == "Worker"
+    assert summary["configuration"] == {
+        "primary_model": {"name": "Project tenant default", "availability": "available"},
+        "fallback_model": None,
+        "max_tool_rounds": 23,
+        "has_project_instruction": True,
+    }
+    assert summary["capabilities"]["total"] == len(summary["capabilities"]["items"])
+    assert {item["source"] for item in summary["capabilities"]["items"]} <= {"project", "member"}
+    assert "member_config_snapshot" not in summary
+    assert "capability_snapshot" not in summary
+
+    snapshots = (
+        await env.client.get(f"/api/projects/{project_id}/runs/{run['id']}/member-snapshots")
+    ).json()
+    worker_snapshot = next(item for item in snapshots if item["agent_id"] == str(env.worker_id))
+    assert worker_snapshot["member_snapshot"] == summary
+    assert "member_config_snapshot" not in worker_snapshot
+    assert "capability_snapshot" not in worker_snapshot
+
+    events = (await env.client.get(f"/api/projects/{project_id}/events?limit=200")).json()
+    queued_event = next(event for event in events if event["event_type"] == "run.queued")
+    assert queued_event["member_snapshot"] == summary
+
+    dashboard = (await env.client.get(f"/api/projects/{project_id}/dashboard")).json()
+    dashboard_run = next(item for item in dashboard["runs"] if item["id"] == run["id"])
+    dashboard_event = next(item for item in dashboard["events"] if item["event_type"] == "run.queued")
+    assert dashboard_run["member_snapshot"] == summary
+    assert dashboard_event["member_snapshot"] == summary
+
+
 async def test_rest_a2a_requires_action_scope_and_ready_dependencies(project_api: ProjectApiEnv):
     from app.models.project import ProjectRun
 
     env = project_api
     project = await _create_project(env, name="Actionable REST A2A")
+    await _mark_project_running(env, project["id"])
     parent = await _create_work_item(
         env,
         project["id"],
@@ -941,6 +1273,124 @@ async def test_manual_run_requires_kickoff_and_dispatches_default_leader(project
     assert anchor.message_meta["model_id"] == str(tenant.default_model_id)
 
 
+async def test_project_run_and_leader_batch_use_frozen_shared_execution_user(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.project import Project, ProjectRun
+    from app.models.subagent_run import SubagentRun
+    from app.services import subagent_runtime
+
+    env = project_api
+    project = await _create_project(env, name="Frozen shared execution")
+    project_id = uuid.UUID(project["id"])
+    configured = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    await _mark_project_running(env, project_id)
+
+    real_created = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"trigger_type": "manual", "input": {"objective": "Use the selected shared identity"}},
+    )
+    assert real_created.status_code == 201, real_created.text
+    real_child = await env.db.get(
+        SubagentRun,
+        uuid.UUID(real_created.json()["output"]["subagent_session_id"]),
+    )
+    assert real_child is not None and real_child.execution_user_id == env.viewer_id
+
+    real_dispatch = subagent_runtime.dispatch_project_run
+
+    async def defer_dispatch(_run_id: uuid.UUID) -> dict[str, str]:
+        return {"status": "queued"}
+
+    monkeypatch.setattr(subagent_runtime, "dispatch_project_run", defer_dispatch)
+    created = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={
+            "agent_id": str(env.worker_id),
+            "trigger_type": "manual",
+            "input": {"objective": "Freeze this execution identity"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    run_id = uuid.UUID(created.json()["id"])
+    frozen_run = await env.db.get(ProjectRun, run_id)
+    assert frozen_run is not None
+    assert frozen_run.initiated_by_user_id == env.owner_id
+    assert frozen_run.execution_user_id == env.viewer_id
+
+    tenant = await env.db.get(Tenant, env.tenant_id)
+    assert tenant is not None
+    alternate = await _user(env.db, tenant, "Dispatch Alternate")
+    await env.db.commit()
+    alternate_id = alternate.id
+    changed = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={
+            "shared_with_user_ids": [str(env.viewer_id), str(alternate_id)],
+            "execution_user_id": str(alternate_id),
+        },
+    )
+    assert changed.status_code == 200, changed.text
+
+    dispatched_users: list[uuid.UUID] = []
+
+    async def capture_subagent(**kwargs):
+        dispatched_users.append(kwargs["execution_user_id"])
+        return SimpleNamespace(id=uuid.uuid4(), status="queued"), True
+
+    monkeypatch.setattr(subagent_runtime, "create_subagent", capture_subagent)
+    dispatched = await real_dispatch(run_id)
+    assert dispatched["status"] == "queued"
+    assert dispatched_users == [env.viewer_id]
+
+    env.db.expire_all()
+    frozen_run = await env.db.get(ProjectRun, run_id)
+    assert frozen_run is not None
+    group_id = uuid.UUID(frozen_run.input["dispatch"]["group_session_id"])
+    group = await env.db.get(ChatSession, group_id)
+    assert group is not None
+    env.db.add(
+        ChatMessage(
+            agent_id=group.agent_id,
+            sender_agent_id=env.worker_id,
+            role="assistant",
+            content="Participant evidence is ready",
+            conversation_id=str(group.id),
+            message_meta={
+                "kind": "project_subagent_reply",
+                "leader_batch_state": "pending",
+                "source_project_run_ids": [str(run_id)],
+            },
+            created_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+    )
+    await env.db.commit()
+
+    assert await subagent_runtime._dispatch_project_leader_batch(group.id, debounce_seconds=0) is True
+    assert dispatched_users == [env.viewer_id, alternate_id]
+    batch_run = (
+        await env.db.execute(
+            select(ProjectRun).where(
+                ProjectRun.project_id == project_id,
+                ProjectRun.trigger_type == "leader_reply_batch",
+            )
+        )
+    ).scalar_one()
+    assert batch_run.initiated_by_user_id == env.owner_id
+    assert batch_run.execution_user_id == alternate_id
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None and stored_project.execution_user_id == alternate_id
+
+
 async def test_project_run_without_agent_model_uses_exact_project_model(
     project_api: ProjectApiEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -1122,6 +1572,7 @@ async def test_pending_project_dispatch_scan_cannot_starve_after_fifty_active_ru
     env = project_api
     project = await _create_project(env, name="Fair durable dispatch scan")
     project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
     old_created_at = datetime(2026, 1, 1, tzinfo=UTC)
     new_created_at = datetime(2026, 1, 2, tzinfo=UTC)
 
@@ -1258,10 +1709,12 @@ async def test_active_child_inputs_durably_advance_only_their_exact_project_runs
     from app.models.project import ProjectMemberSnapshot, ProjectRun
     from app.models.subagent_run import SubagentRun
     from app.services import subagent_runtime
+    from app.services.project_service import freeze_run_members
 
     env = project_api
     project = await _create_project(env, name="Project run worker state")
     project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
     group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
     leader_member = (
         await env.db.execute(
@@ -1318,6 +1771,10 @@ async def test_active_child_inputs_durably_advance_only_their_exact_project_runs
         finished_at=terminal_finished_at,
     )
     env.db.add_all([anchor, project_run, unrelated_run, terminal_run])
+    await env.db.flush()
+    project_row = await env.db.get(Project, project_id)
+    assert project_row is not None
+    await freeze_run_members(env.db, project_row, project_run)
     await env.db.commit()
     project_run_id = project_run.id
     unrelated_run_id = unrelated_run.id
@@ -1438,6 +1895,7 @@ async def test_project_a2a_delivery_returns_scoped_session_identifiers(
 
     env = project_api
     project = await _create_project(env, name="A2A session identity")
+    await _mark_project_running(env, project["id"])
     work_item = await _create_work_item(
         env,
         project["id"],
@@ -1675,12 +2133,14 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
     from app.models.project import ProjectEvent, ProjectMemberSnapshot, ProjectRun, ProjectWorkItem
     from app.models.subagent_run import SubagentRun
     from app.services import agent_tools, project_runtime_tools, project_service, subagent_runtime
+    from app.services.project_service import freeze_run_members
 
     env = project_api
     monkeypatch.setattr(agent_tools, "async_session", env.session_factory)
     monkeypatch.setattr(project_service, "async_session", env.session_factory)
     project = await _create_project(env, name="Durable exact project A2A")
     project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
 
     dependency = ProjectWorkItem(
         tenant_id=env.tenant_id,
@@ -1750,6 +2210,10 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
         output={},
     )
     env.db.add(parent_run)
+    await env.db.flush()
+    project_row = await env.db.get(Project, project_id)
+    assert project_row is not None
+    await freeze_run_members(env.db, project_row, parent_run)
     await env.db.commit()
 
     raw_result = await agent_tools._send_message_to_agent(
@@ -1881,7 +2345,13 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
         "mode",
         "expected_output",
     }
-    assert "not a status-notification channel" in message_schema["description"]
+    assert message_schema["description"] == (
+        "Send one active project member a review request or assigned task. Include the relevant context, requested "
+        "work, expected result, and related work item when one exists."
+    )
+    assert message_schema["parameters"]["properties"]["mode"]["description"] == (
+        "Choose task_delegate for assigned work and consult for a review or decision."
+    )
     with pytest.raises(ValueError, match="only accepts actionable"):
         await project_runtime_tools.execute_project_runtime_tool(
             "project_message_agent",
@@ -2221,6 +2691,7 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     env = project_api
     project = await _create_project(env, name="Project Agent Group")
     project_id = project["id"]
+    await _mark_project_running(env, project_id)
 
     group_response = await env.client.get(f"/api/projects/{project_id}/group-session")
     assert group_response.status_code == 200, group_response.text
@@ -2381,6 +2852,7 @@ async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     env = project_api
     project = await _create_project(env, name="Recoverable project dispatch")
     project_id = project["id"]
+    await _mark_project_running(env, project_id)
     group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
     real_dispatch = subagent_runtime.dispatch_project_run
 
@@ -2440,6 +2912,85 @@ async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     }
 
 
+async def test_planning_group_message_only_wakes_owner_without_execution_tools(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.project import ProjectRun
+    from app.services.subagent_runtime import prepare_subagent_tools
+
+    env = project_api
+    project = await _create_project(env, name="Human-controlled planning")
+    project_id = project["id"]
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+
+    async def inherited_tools(_agent_id, *, assignment_snapshot=None):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inherited_write_tool",
+                    "description": "Must not be available while planning",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    monkeypatch.setattr("app.services.agent_tools.get_agent_tools_for_llm", inherited_tools)
+    response = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Help me turn this request into a reviewable delivery plan.",
+            "mentions": [],
+            "client_message_id": "planning-owner-only",
+        },
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["awakened_agent_ids"] == [str(env.leader_id)]
+    assert len(body["subagent_runs"]) == 1
+    assert body["subagent_runs"][0]["agent_id"] == str(env.leader_id)
+
+    project_run = await env.db.get(ProjectRun, uuid.UUID(body["subagent_runs"][0]["project_run_id"]))
+    assert project_run is not None
+    assert project_run.trigger_type == "group_leader_message"
+    planning_task = project_run.input["dispatch"]["task"]
+    assert "project is still in planning" in planning_task
+    assert "Do not create or update work items" in planning_task
+    assert "do not begin delivery" in planning_task
+
+    child_session_id = uuid.UUID(body["subagent_runs"][0]["session_id"])
+    assert (
+        await prepare_subagent_tools(
+            env.leader_id,
+            child_session_id,
+            execution_user_id=env.owner_id,
+        )
+        == []
+    )
+
+    mentioned = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Ask the specialist to start now.",
+            "mentions": [str(env.worker_id)],
+        },
+    )
+    assert mentioned.status_code == 422
+    assert "start the project" in mentioned.json()["detail"]
+
+    stored_project = await env.db.get(Project, uuid.UUID(project_id))
+    assert stored_project is not None
+    stored_project.status = "paused"
+    await env.db.commit()
+    paused = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "This must wait until resume.", "mentions": []},
+    )
+    assert paused.status_code == 409
+    assert "resume" in paused.json()["detail"]
+
+
 async def test_planning_leader_session_never_gets_project_runtime_tools(
     project_api: ProjectApiEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -2454,7 +3005,7 @@ async def test_planning_leader_session_never_gets_project_runtime_tools(
     project = await _create_project(env, name="Planning scope isolation")
     project_id = project["id"]
 
-    async def no_normal_tools(_agent_id):
+    async def no_normal_tools(_agent_id, *, assignment_snapshot=None):
         return []
 
     monkeypatch.setattr("app.services.agent_tools.get_agent_tools_for_llm", no_normal_tools)
@@ -2915,6 +3466,7 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
 
     env = project_api
     project = await _create_project(env, name="Passive child reply")
+    await _mark_project_running(env, project["id"])
     group = (await env.client.get(f"/api/projects/{project['id']}/group-session")).json()
     wake = await env.client.post(
         f"/api/projects/{project['id']}/group-sessions/{group['id']}/messages",
@@ -2997,6 +3549,7 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     env = project_api
     project = await _create_project(env, name="Standard group timeline")
     project_id = project["id"]
+    await _mark_project_running(env, project_id)
     group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
     wake = await env.client.post(
         f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
@@ -3153,6 +3706,7 @@ async def test_project_participant_replies_coalesce_into_one_durable_leader_turn
     env = project_api
     project = await _create_project(env, name="Coalesced Leader inbox")
     project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
     dependency = ProjectWorkItem(
         tenant_id=env.tenant_id,
         project_id=project_id,
@@ -3592,7 +4146,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         "send_session_message",
     }
 
-    async def normal_tools_with_collaboration_bypasses(_agent_id):
+    async def normal_tools_with_collaboration_bypasses(_agent_id, *, assignment_snapshot=None):
         return [
             {
                 "type": "function",
@@ -3611,6 +4165,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     )
     project = await _create_project(env, name="Role projected tools")
     project_id = project["id"]
+    await _mark_project_running(env, project_id)
     group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
 
     assigned = await env.client.post(
@@ -3727,7 +4282,29 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         )
     }
     assert "project_write_file" not in projected_names
-    assert "project_message_agent" not in projected_names
+    assert "project_message_agent" in projected_names
+    refreshed_wake = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Worker runtime after member policy change", "mentions": [str(env.worker_id)]},
+    )
+    assert refreshed_wake.status_code == 201, refreshed_wake.text
+    refreshed_child_id = uuid.UUID(
+        next(
+            row
+            for row in refreshed_wake.json()["subagent_runs"]
+            if row["agent_id"] == str(env.worker_id)
+        )["session_id"]
+    )
+    refreshed_names = {
+        item["function"]["name"]
+        for item in await prepare_subagent_tools(
+            env.worker_id,
+            refreshed_child_id,
+            execution_user_id=env.owner_id,
+        )
+    }
+    assert "project_write_file" not in refreshed_names
+    assert "project_message_agent" not in refreshed_names
     with pytest.raises(ValueError, match="not allowed"):
         await execute_project_runtime_tool(
             "project_write_file",
@@ -3795,7 +4372,8 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
             )
         )
     ).scalar_one()
-    worker_member.role_snapshot = "Build traceable deliverables. " + ("role " * 140)
+    stored_professional_role = ("Build traceable deliverables. " + ("role " * 100))[:500]
+    worker_member.role_snapshot = stored_professional_role
     await env.db.commit()
     context = await execute_tool(
         "project_get_context",
@@ -3811,8 +4389,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     context_leader = next(row for row in context_payload["members"] if row["agent_id"] == str(env.leader_id))
     assert context_worker["project_role"] == "participant"
     assert context_leader["project_role"] == "owner"
-    assert len(context_worker["professional_role"]) == 500
-    assert context_worker["professional_role"].endswith("…")
+    assert context_worker["professional_role"] == stored_professional_role.rstrip()
 
     work_items = json.loads(
         await execute_tool(
@@ -3910,7 +4487,7 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
     assert run["work_item_id"] == item_id
     assert run["agent_name"] == "Leader"
     assert run["project_member_id"]
-    assert run["member_snapshot"]["name_snapshot"] == "Leader"
+    assert run["member_snapshot"]["name"] == "Leader"
     assert run["session_id"] == run["subagent_session_id"]
     child_id = uuid.UUID(run["subagent_session_id"])
     child_input = (
@@ -4407,7 +4984,11 @@ async def test_project_head_file_preview_media_range_and_acl(project_api: Projec
 
     shared = await env.client.patch(
         f"/api/projects/{project_id}",
-        json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
     )
     assert shared.status_code == 200
     env.authenticate_as(env.viewer_id)
@@ -4513,7 +5094,11 @@ async def test_project_directory_archive_and_html_preview_use_one_immutable_head
 
     shared = await env.client.patch(
         f"/api/projects/{project_id}",
-        json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
     )
     assert shared.status_code == 200
     env.authenticate_as(env.viewer_id)
@@ -4554,6 +5139,15 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
     project = await _create_project(env, name="Clone target")
     project_id = project["id"]
     initial = (await env.client.get(f"/api/projects/{project_id}/git")).json()
+    initial_repo = project_repo_path(env.tenant_id, uuid.UUID(project_id))
+    initial_files = set(
+        subprocess.run(
+            ["git", "-C", str(initial_repo), "ls-tree", "-r", "--name-only", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
 
     empty = await env.client.get(f"/api/projects/{project_id}/git/remotes")
     assert empty.status_code == 200
@@ -4720,7 +5314,7 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
         assert (await env.db.execute(select(ProjectRepositoryOperation))).scalars().all() == []
 
         # The repository swap stays compensatable until settings and the
-        # audit row are durable. A database failure restores the one-commit
+        # audit row are durable. A database failure restores the generated
         # initialization baseline and leaves the endpoint safely retryable.
         original_commit = AsyncSession.commit
         clone_commit_count = {"value": 0}
@@ -4747,16 +5341,16 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
             capture_output=True,
             text=True,
         ).stdout.splitlines()
-        assert set(restored_files) == {"PROJECT.json", "README.md"}
+        assert set(restored_files) == initial_files
         assert not (restored_repo / "SOURCE.md").exists()
         assert (
             subprocess.run(
-                ["git", "-C", str(restored_repo), "log", "-1", "--format=%s"],
+                ["git", "-C", str(restored_repo), "rev-parse", "HEAD"],
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            == "Initialize AI-native project"
+            == initial["head"]
         )
         assert list(restored_repo.parent.glob(".repo-backup-*")) == []
         failed_settings = (await env.client.get(f"/api/projects/{project_id}/settings")).json()
@@ -4900,7 +5494,11 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
     # may disclose a provider URL or the remote response object.
     shared = await env.client.patch(
         f"/api/projects/{project_id}",
-        json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
     )
     assert shared.status_code == 200, shared.text
     env.authenticate_as(env.viewer_id)
@@ -5048,11 +5646,625 @@ async def test_activity_enum_includes_agent_file_delivery_actions():
     assert {"agent_file_sent", "agent_file_received"} <= enum_values
 
 
+async def test_project_skill_assets_are_owner_managed_and_template_portable(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.mcp_server import MCPServer
+    from app.models.project import ProjectCapabilityBinding, ProjectTemplate
+    from app.models.skill import Skill, SkillFile
+    from app.models.tool import AgentTool
+    from app.services.project_agent_workspace import project_agent_workspace
+    from app.services.storage import get_storage_backend, normalize_storage_key
+
+    env = project_api
+    source = await _create_project(env, name="Project Skill source")
+    source_project_id = uuid.UUID(source["id"])
+    worker_role = env.worker.role_description
+    env.worker.autonomy_policy = {"write": "L2"}
+    source_tool = (await env.db.execute(select(Tool).where(Tool.name == "send_message_to_parent"))).scalar_one()
+    source_tool_id = source_tool.id
+    source_tool_description = source_tool.description
+    env.db.add(
+        AgentTool(
+            agent_id=env.worker_id,
+            tool_id=source_tool_id,
+            enabled=True,
+            config={"api_key": "must-not-cross-project-boundary"},
+            source="user_installed",
+        )
+    )
+    mcp_server = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"private-runtime-{uuid.uuid4().hex[:8]}",
+        display_name="Private Runtime MCP",
+        base_url_template="https://example.invalid/mcp",
+        headers_template={},
+        instructions="Internal protocol instructions must not be product copy.",
+    )
+    env.db.add(mcp_server)
+    await env.db.commit()
+
+    bootstrap_response = await env.client.get("/api/projects/bootstrap-options")
+    assert bootstrap_response.status_code == 200, bootstrap_response.text
+    bootstrap_capabilities = bootstrap_response.json()["capabilities"]
+    bootstrap_tool = next(
+        item for item in bootstrap_capabilities if item["capability_id"] == str(source_tool_id)
+    )
+    assert bootstrap_tool["key"] == source_tool.name
+    assert "config" not in bootstrap_tool
+    bootstrap_mcp = next(
+        item for item in bootstrap_capabilities if item["capability_id"] == str(mcp_server.id)
+    )
+    assert bootstrap_mcp["key"] == mcp_server.name
+    assert bootstrap_mcp["description"] == ""
+    folder = f"release-check-{uuid.uuid4().hex[:8]}"
+    source_prefix = normalize_storage_key(f"{env.worker_id}/skills/{folder}")
+    storage = get_storage_backend()
+    manifest_content = (
+        "---\n"
+        "name: Release Check\n"
+        "version: 3\n"
+        "description: Verify release evidence\n"
+        "---\n\n"
+        "# Release Check\n"
+    )
+    await storage.write_text(f"{source_prefix}/SKILL.md", manifest_content)
+    await storage.write_text(f"{source_prefix}/references/checklist.md", "# Checklist\n")
+
+    created_response = await env.client.post(
+        f"/api/projects/{source_project_id}/agents",
+        json={"source_agent_id": str(env.worker_id), "name": "Project release owner"},
+    )
+    assert created_response.status_code == 201, created_response.text
+    project_agent = created_response.json()
+    project_agent_id = uuid.UUID(project_agent["id"])
+
+    capabilities_response = await env.client.get(f"/api/projects/{source_project_id}/capabilities")
+    assert capabilities_response.status_code == 200, capabilities_response.text
+    skill_binding = next(
+        item
+        for item in capabilities_response.json()
+        if item["capability_type"] == "skill" and item["inherited_from_agent_id"] == str(project_agent_id)
+    )
+    tool_binding = next(
+        item
+        for item in capabilities_response.json()
+        if item["capability_type"] == "tool" and item["inherited_from_agent_id"] == str(project_agent_id)
+    )
+    assert tool_binding["capability_id"] == str(source_tool_id)
+    assert tool_binding["key"] == source_tool.name
+    assert tool_binding["availability"] == "available"
+    assert tool_binding["description"] == source_tool_description
+    assert tool_binding["config"] == {}
+    copied_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == project_agent_id,
+                AgentTool.tool_id == source_tool_id,
+            )
+        )
+    ).scalar_one()
+    assert copied_assignment.enabled is True
+    assert copied_assignment.config == {}
+    source_tool_row = await env.db.get(Tool, source_tool_id)
+    assert source_tool_row is not None
+    source_tool_row.enabled = False
+    await env.db.commit()
+    restricted_capabilities = (
+        await env.client.get(f"/api/projects/{source_project_id}/capabilities")
+    ).json()
+    assert next(item for item in restricted_capabilities if item["id"] == tool_binding["id"])[
+        "availability"
+    ] == "restricted"
+    source_tool_row = await env.db.get(Tool, source_tool_id)
+    assert source_tool_row is not None
+    source_tool_row.enabled = True
+    await env.db.commit()
+    stored_source_binding = await env.db.get(ProjectCapabilityBinding, uuid.UUID(skill_binding["id"]))
+    assert stored_source_binding is not None
+    metadata = stored_source_binding.config["skill_asset"]
+    assert metadata == {
+        "schema_version": 2,
+        "asset_id": metadata["asset_id"],
+        "version": "3",
+        "sha256": metadata["sha256"],
+        "path": f"skills/{folder}",
+        "source": "agent",
+        "source_agent_id": str(env.worker_id),
+        "file_count": 2,
+        "size_bytes": len(manifest_content.encode()) + len("# Checklist\n".encode()),
+    }
+    assert skill_binding["config"] == {}
+    assert skill_binding["availability"] == "available"
+    assert skill_binding["description"] == "Verify release evidence"
+    assert skill_binding["version"] == "3"
+    assert skill_binding["file_count"] == 2
+    assert skill_binding["size_bytes"] == metadata["size_bytes"]
+    source_project = await env.db.get(Project, source_project_id)
+    assert source_project is not None
+    source_layout = project_agent_workspace(
+        project_repo_path(source_project.tenant_id, source_project.id),
+        project_agent_id,
+    )
+    copied_manifest = source_layout.root / "skills" / folder / "SKILL.md"
+    assert copied_manifest.read_text(encoding="utf-8") == manifest_content
+
+    library_folder = f"library-check-{uuid.uuid4().hex[:8]}"
+    library_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Library Check",
+        description="Validate a library-backed release check",
+        category="engineering",
+        folder_name=library_folder,
+        version=5,
+        visibility="tenant",
+        status="published",
+    )
+    env.db.add(library_skill)
+    await env.db.flush()
+    library_skill_id = library_skill.id
+    env.db.add_all(
+        [
+            SkillFile(
+                skill_id=library_skill_id,
+                path="SKILL.md",
+                content="---\nname: Library Check\ndescription: Validate a library check\n---\n",
+            ),
+            SkillFile(skill_id=library_skill_id, path="references/guide.md", content="# Guide\n"),
+        ]
+    )
+    await env.db.commit()
+    rejected_shared_skill = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={"capability_type": "skill", "capability_id": str(library_skill_id), "source": "shared"},
+    )
+    assert rejected_shared_skill.status_code == 422
+    library_binding_response = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "skill",
+            "capability_id": str(library_skill_id),
+            "source": "inherited",
+            "inherited_from_agent_id": str(project_agent_id),
+        },
+    )
+    assert library_binding_response.status_code == 201, library_binding_response.text
+    library_binding = library_binding_response.json()
+    assert library_binding["availability"] == "available"
+    assert library_binding["version"] == "5"
+    assert library_binding["file_count"] == 2
+    assert library_binding["description"] == "Validate a library-backed release check"
+    assert library_binding["config"] == {}
+    library_root = source_layout.root / "skills" / library_folder
+    assert (library_root / "SKILL.md").is_file()
+    hidden_library_root = library_root.with_name(f".{library_root.name}.missing")
+    os.replace(library_root, hidden_library_root)
+    missing_capabilities = (await env.client.get(f"/api/projects/{source_project_id}/capabilities")).json()
+    assert next(item for item in missing_capabilities if item["id"] == library_binding["id"])[
+        "availability"
+    ] == "missing"
+    os.replace(hidden_library_root, library_root)
+    duplicate_library_binding = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "skill",
+            "capability_id": str(library_skill_id),
+            "source": "inherited",
+            "inherited_from_agent_id": str(project_agent_id),
+        },
+    )
+    assert duplicate_library_binding.status_code == 409
+    secret_folder = f"secret-skill-{uuid.uuid4().hex[:8]}"
+    secret_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Unsafe Skill",
+        description="Must not cross the project boundary",
+        category="engineering",
+        folder_name=secret_folder,
+        version=1,
+        visibility="tenant",
+        status="published",
+    )
+    env.db.add(secret_skill)
+    await env.db.flush()
+    secret_skill_id = secret_skill.id
+    env.db.add(
+        SkillFile(
+            skill_id=secret_skill_id,
+            path="SKILL.md",
+            content="---\nname: Unsafe Skill\n---\napi_key = 'abcdefghijklmnop123456'\n",
+        )
+    )
+    await env.db.commit()
+    rejected_secret = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "skill",
+            "capability_id": str(secret_skill_id),
+            "source": "inherited",
+            "inherited_from_agent_id": str(project_agent_id),
+        },
+    )
+    assert rejected_secret.status_code == 422
+    assert not (source_layout.root / "skills" / secret_folder).exists()
+
+    manifest_response = await env.client.get(f"/api/projects/{source_project_id}/template-manifest")
+    assert manifest_response.status_code == 200, manifest_response.text
+    manifest_skill = next(
+        item for item in manifest_response.json()["skills"] if item["binding_id"] == skill_binding["id"]
+    )
+    assert manifest_skill["selected"] is False
+    assert manifest_skill["selection_state"] == "unselected"
+    assert manifest_skill["affected_member_count"] == 1
+    assert {"path", "sha256", "asset_id"}.isdisjoint(manifest_skill)
+    manifest_tool = next(
+        item
+        for item in manifest_response.json()["capabilities"]
+        if item["type"] == "tool" and item["key"] == source_tool.name
+    )
+    assert manifest_tool["selected"] is True
+    assert manifest_tool["affected_member_count"] == 1
+    assert {
+        key: manifest_skill[key]
+        for key in (
+            "binding_id",
+            "member_id",
+            "member_agent_id",
+            "member_name",
+            "member_role",
+            "name",
+            "version",
+            "file_count",
+            "size_bytes",
+        )
+    } == {
+        "binding_id": skill_binding["id"],
+        "member_id": project_agent["member_id"],
+        "member_agent_id": str(project_agent_id),
+        "member_name": "Project release owner",
+        "member_role": worker_role,
+        "name": "Release Check",
+        "version": "3",
+        "file_count": 2,
+        "size_bytes": metadata["size_bytes"],
+    }
+
+    shared = await env.client.patch(
+        f"/api/projects/{source_project_id}",
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id)],
+            "execution_user_id": str(env.viewer_id),
+        },
+    )
+    assert shared.status_code == 200, shared.text
+    grant = (
+        await env.db.execute(
+            select(ProjectAccessGrant).where(
+                ProjectAccessGrant.project_id == source_project_id,
+                ProjectAccessGrant.user_id == env.viewer_id,
+            )
+        )
+    ).scalar_one()
+    grant.role = "edit"
+    await env.db.commit()
+    env.authenticate_as(env.viewer_id)
+    assert (await env.client.get(f"/api/projects/{source_project_id}/capabilities")).status_code == 200
+    denied_create = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={"capability_type": "tool", "capability_name": "editor-tool"},
+    )
+    assert denied_create.status_code == 404
+    denied_patch = await env.client.patch(
+        f"/api/projects/{source_project_id}/capabilities/{skill_binding['id']}",
+        json={"is_enabled": False},
+    )
+    assert denied_patch.status_code == 404
+    env.authenticate_as(env.owner_id)
+
+    default_template_response = await env.client.post(
+        f"/api/projects/{source_project_id}/templates",
+        json={"name": "No Skills by default", "version": "1.0.0"},
+    )
+    assert default_template_response.status_code == 201, default_template_response.text
+    default_template = await env.db.get(ProjectTemplate, uuid.UUID(default_template_response.json()["id"]))
+    assert default_template is not None
+    assert default_template.definition["skill_assets"] == []
+    assert default_template_response.json()["skills"] == []
+
+    selected_template_response = await env.client.post(
+        f"/api/projects/{source_project_id}/templates",
+        json={
+            "name": "Release Skill template",
+            "version": "1.0.0",
+            "included_skill_binding_ids": [skill_binding["id"]],
+        },
+    )
+    assert selected_template_response.status_code == 201, selected_template_response.text
+    selected_template_body = selected_template_response.json()
+    assert selected_template_body["skills"] == [
+        {
+            "name": "Release Check",
+            "version": "3",
+            "member_name": "Project release owner",
+            "member_role": worker_role,
+            "file_count": 2,
+            "size_bytes": metadata["size_bytes"],
+        }
+    ]
+    selected_template = await env.db.get(ProjectTemplate, uuid.UUID(selected_template_body["id"]))
+    assert selected_template is not None
+    packaged_skill = selected_template.definition["skill_assets"][0]
+    assert packaged_skill["sha256"] == metadata["sha256"]
+    assert packaged_skill["digital_employee_index"] == 0
+    assert skill_binding["id"] not in str(packaged_skill)
+    assert str(env.worker_id) not in str(packaged_skill)
+    assert "capability_id" not in packaged_skill
+    packaged_tool = next(
+        item for item in selected_template.definition["capabilities"] if item["capability_type"] == "tool"
+    )
+    assert packaged_tool["capability_id"] == str(source_tool_id)
+    assert "config" not in packaged_tool
+    assert "must-not-cross-project-boundary" not in str(selected_template.definition)
+
+    restored_response = await env.client.post(
+        "/api/projects/from-template",
+        json={"template_id": selected_template_body["id"], "name": "Restored Skill project"},
+    )
+    assert restored_response.status_code == 201, restored_response.text
+    restored = restored_response.json()
+    restored_project_id = uuid.UUID(restored["id"])
+    assert restored["template_setup_summary"]["restored_skill_count"] == 1
+    restored_agents = (await env.client.get(f"/api/projects/{restored_project_id}/agents")).json()
+    assert len(restored_agents) == 1
+    restored_agent_id = uuid.UUID(restored_agents[0]["id"])
+    assert restored_agent_id != project_agent_id
+    restored_binding = (
+        await env.db.execute(
+            select(ProjectCapabilityBinding).where(
+                ProjectCapabilityBinding.project_id == restored_project_id,
+                ProjectCapabilityBinding.capability_type == "skill",
+            )
+        )
+    ).scalar_one()
+    assert restored_binding.capability_id is None
+    assert restored_binding.inherited_from_agent_id == restored_agent_id
+    assert restored_binding.config["skill_asset"]["source"] == "template"
+    assert restored_binding.config["skill_asset"]["source_agent_id"] is None
+    restored_tool_binding = (
+        await env.db.execute(
+            select(ProjectCapabilityBinding).where(
+                ProjectCapabilityBinding.project_id == restored_project_id,
+                ProjectCapabilityBinding.capability_type == "tool",
+            )
+        )
+    ).scalar_one()
+    assert restored_tool_binding.inherited_from_agent_id == restored_agent_id
+    restored_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == restored_agent_id,
+                AgentTool.tool_id == source_tool_id,
+            )
+        )
+    ).scalar_one()
+    assert restored_assignment.enabled is True
+    assert restored_assignment.config == {}
+    restored_project = await env.db.get(Project, restored_project_id)
+    assert restored_project is not None
+    restored_layout = project_agent_workspace(
+        project_repo_path(restored_project.tenant_id, restored_project.id),
+        restored_agent_id,
+    )
+    assert (restored_layout.root / "skills" / folder / "SKILL.md").read_text(encoding="utf-8") == manifest_content
+
+    deactivated = await env.client.post(f"/api/projects/{source_project_id}/agents/{project_agent_id}/deactivate")
+    assert deactivated.status_code == 200, deactivated.text
+    assert copied_manifest.read_text(encoding="utf-8") == manifest_content
+    retained_binding = await env.db.get(ProjectCapabilityBinding, uuid.UUID(skill_binding["id"]))
+    assert retained_binding is not None
+    retained_capabilities = (await env.client.get(f"/api/projects/{source_project_id}/capabilities")).json()
+    assert next(item for item in retained_capabilities if item["id"] == skill_binding["id"])[
+        "availability"
+    ] == "available"
+
+    restored_member = await env.client.post(
+        f"/api/projects/{source_project_id}/agents/{project_agent_id}/restore"
+    )
+    assert restored_member.status_code == 200, restored_member.text
+    second_agent_response = await env.client.post(
+        f"/api/projects/{source_project_id}/agents",
+        json={"source_agent_id": str(env.worker_id), "name": "Second release owner"},
+    )
+    assert second_agent_response.status_code == 201, second_agent_response.text
+    second_agent_id = uuid.UUID(second_agent_response.json()["id"])
+    second_layout = project_agent_workspace(
+        project_repo_path(source_project.tenant_id, source_project.id),
+        second_agent_id,
+    )
+    second_source_binding = (
+        await env.db.execute(
+            select(ProjectCapabilityBinding).where(
+                ProjectCapabilityBinding.project_id == source_project_id,
+                ProjectCapabilityBinding.capability_type == "skill",
+                ProjectCapabilityBinding.inherited_from_agent_id == second_agent_id,
+                ProjectCapabilityBinding.capability_name == "Release Check",
+            )
+        )
+    ).scalar_one()
+    assert second_source_binding.config["skill_asset"]["asset_id"] == metadata["asset_id"]
+    assert os.stat(copied_manifest).st_ino == os.stat(
+        second_layout.root / "skills" / folder / "SKILL.md"
+    ).st_ino
+
+    second_library_response = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "skill",
+            "capability_id": str(library_skill_id),
+            "source": "inherited",
+            "inherited_from_agent_id": str(second_agent_id),
+        },
+    )
+    assert second_library_response.status_code == 201, second_library_response.text
+    second_library_binding = second_library_response.json()
+    first_library_row = await env.db.get(ProjectCapabilityBinding, uuid.UUID(library_binding["id"]))
+    second_library_row = await env.db.get(ProjectCapabilityBinding, uuid.UUID(second_library_binding["id"]))
+    assert first_library_row is not None and second_library_row is not None
+    assert (
+        first_library_row.config["skill_asset"]["asset_id"]
+        == second_library_row.config["skill_asset"]["asset_id"]
+    )
+    second_library_root = second_layout.root / "skills" / library_folder
+    assert os.stat(library_root / "SKILL.md").st_ino == os.stat(second_library_root / "SKILL.md").st_ino
+
+    disabled_response = await env.client.patch(
+        f"/api/projects/{source_project_id}/capabilities/{second_library_binding['id']}",
+        json={"is_enabled": False},
+    )
+    assert disabled_response.status_code == 200, disabled_response.text
+    assert disabled_response.json()["is_enabled"] is False
+    assert disabled_response.json()["availability"] == "available"
+    assert not second_library_root.exists()
+    enabled_response = await env.client.patch(
+        f"/api/projects/{source_project_id}/capabilities/{second_library_binding['id']}",
+        json={"is_enabled": True},
+    )
+    assert enabled_response.status_code == 200, enabled_response.text
+    assert second_library_root.is_dir()
+
+    library_skill = await env.db.get(Skill, library_skill_id)
+    assert library_skill is not None
+    library_skill.version = 6
+    library_manifest_row = (
+        await env.db.execute(
+            select(SkillFile).where(
+                SkillFile.skill_id == library_skill_id,
+                SkillFile.path == "SKILL.md",
+            )
+        )
+    ).scalar_one()
+    refreshed_library_content = (
+        "---\nname: Library Check\nversion: 6\ndescription: Updated library check\n---\n"
+    )
+    library_manifest_row.content = refreshed_library_content
+    await env.db.commit()
+    refresh_response = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities/{library_binding['id']}/refresh"
+    )
+    assert refresh_response.status_code == 200, refresh_response.text
+    assert refresh_response.json()["changed"] is True
+    assert refresh_response.json()["affected_member_count"] == 2
+    assert refresh_response.json()["capability"]["version"] == "6"
+    assert (library_root / "SKILL.md").read_text(encoding="utf-8") == refreshed_library_content
+    assert (second_library_root / "SKILL.md").read_text(encoding="utf-8") == refreshed_library_content
+    assert os.stat(library_root / "SKILL.md").st_ino == os.stat(second_library_root / "SKILL.md").st_ino
+
+    impact_response = await env.client.get(
+        f"/api/projects/{source_project_id}/capabilities/{library_binding['id']}/delete-impact"
+    )
+    assert impact_response.status_code == 200, impact_response.text
+    assert impact_response.json()["affected_member_count"] == 2
+    rejected_delete = await env.client.delete(
+        f"/api/projects/{source_project_id}/capabilities/{library_binding['id']}"
+    )
+    assert rejected_delete.status_code == 409
+    assert rejected_delete.json()["detail"]["affected_member_count"] == 2
+    confirmed_delete = await env.client.delete(
+        f"/api/projects/{source_project_id}/capabilities/{library_binding['id']}?confirm=true"
+    )
+    assert confirmed_delete.status_code == 200, confirmed_delete.text
+    assert confirmed_delete.json()["affected_member_count"] == 2
+    remaining_library_bindings = list(
+        (
+            await env.db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == source_project_id,
+                    ProjectCapabilityBinding.capability_id == library_skill_id,
+                )
+            )
+        ).scalars()
+    )
+    assert remaining_library_bindings == []
+    assert not library_root.exists()
+    assert not second_library_root.exists()
+
+    workspace_manifest_content = (
+        "---\nname: Release Check\nversion: 4\ndescription: Edited in the project Agent Skill page\n---\n"
+    )
+    workspace_write = await env.client.put(
+        f"/api/agents/{project_agent_id}/files/content",
+        params={"path": f"skills/{folder}/SKILL.md"},
+        json={"content": workspace_manifest_content},
+    )
+    assert workspace_write.status_code == 200, workspace_write.text
+    assert copied_manifest.read_text(encoding="utf-8") == workspace_manifest_content
+    workspace_capabilities = (await env.client.get(f"/api/projects/{source_project_id}/capabilities")).json()
+    edited_skill = next(item for item in workspace_capabilities if item["id"] == skill_binding["id"])
+    assert edited_skill["version"] == "4"
+    assert edited_skill["description"] == "Edited in the project Agent Skill page"
+    edited_manifest = (await env.client.get(f"/api/projects/{source_project_id}/template-manifest")).json()
+    edited_manifest_skill = next(
+        item for item in edited_manifest["skills"] if item["binding_id"] == skill_binding["id"]
+    )
+    assert edited_manifest_skill["version"] == "4"
+    assert {"path", "sha256", "asset_id"}.isdisjoint(edited_manifest_skill)
+
+    workspace_delete = await env.client.delete(
+        f"/api/agents/{project_agent_id}/files/content",
+        params={"path": f"skills/{folder}/SKILL.md"},
+    )
+    assert workspace_delete.status_code == 200, workspace_delete.text
+    assert workspace_delete.json()["project_skill_deleted"] is True
+    assert workspace_delete.json()["affected_member_count"] == 2
+    remaining_source_skill_bindings = list(
+        (
+            await env.db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == source_project_id,
+                    ProjectCapabilityBinding.capability_type == "skill",
+                    ProjectCapabilityBinding.capability_name == "Release Check",
+                )
+            )
+        ).scalars()
+    )
+    assert remaining_source_skill_bindings == []
+    assert not copied_manifest.parent.exists()
+    assert not (second_layout.root / "skills" / folder).exists()
+    deletion_events = (await env.client.get(f"/api/projects/{source_project_id}/events?limit=200")).json()
+    file_delete_event = next(
+        event
+        for event in reversed(deletion_events)
+        if event["event_type"] == "capability.deleted"
+        and event["event_metadata"].get("source") == "agent_files"
+    )
+    assert file_delete_event["event_metadata"]["affected_member_count"] == 2
+
+    def fail_template_skill_copy(*_args, **_kwargs):
+        raise OSError("simulated template Skill copy failure")
+
+    monkeypatch.setattr(
+        "app.services.project_skill_assets._write_files",
+        fail_template_skill_copy,
+    )
+    failed_project_name = f"Failed Skill restore {uuid.uuid4().hex[:8]}"
+    with pytest.raises(OSError, match="simulated template Skill copy failure"):
+        await env.client.post(
+            "/api/projects/from-template",
+            json={"template_id": selected_template_body["id"], "name": failed_project_name},
+        )
+    failed_project = (
+        await env.db.execute(select(Project).where(Project.name == failed_project_name))
+    ).scalar_one_or_none()
+    assert failed_project is None
+
+
 async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh_identity(
     project_api: ProjectApiEnv,
 ):
     from app.models.chat_session import ChatSession
-    from app.models.project import ProjectMemberSnapshot
+    from app.models.project import ProjectMemberSnapshot, ProjectTemplate
 
     env = project_api
     source = await _create_project(env, name="Template source")
@@ -5089,7 +6301,19 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
     )
     assert template_response.status_code == 201, template_response.text
     template = template_response.json()
-    exported_agents = template["definition"]["agents"]
+    assert "agents" not in template["definition"]
+    assert template["definition"]["roles"] == [
+        {
+            "key": "digital-employee-1",
+            "name": "Project release specialist",
+            "description": "Own release readiness inside this project",
+        }
+    ]
+    assert template["definition"]["asset_summary"]["digital_employee_count"] == 1
+
+    stored_template = await env.db.get(ProjectTemplate, uuid.UUID(template["id"]))
+    assert stored_template is not None
+    exported_agents = stored_template.definition["agents"]
     assert len(exported_agents) == 1
     exported_agent = exported_agents[0]
     assert {
@@ -5114,8 +6338,8 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
     }
     assert exported_agent["runtime"]["max_tool_rounds"] > 0
     assert exported_agent["member_config"]["enabled_project_tools"] == []
-    assert source_agent["id"] not in str(template["definition"])
-    assert str(source_project_id) not in str(template["definition"])
+    assert source_agent["id"] not in str(stored_template.definition)
+    assert str(source_project_id) not in str(stored_template.definition)
 
     target_response = await env.client.post(
         "/api/projects/from-template",
@@ -5132,7 +6356,7 @@ async def test_project_agent_template_api_round_trip_preserves_assets_with_fresh
     assert target["goal"] == source["goal"]
     assert target["success_criteria"] == source["success_criteria"]
     assert target["template_setup_summary"] == {
-        "restored_file_count": 2,
+        "restored_file_count": len(stored_template.definition["project_snapshot"]["files"]),
         "restored_digital_employee_count": 1,
         "restored_skill_count": 0,
         "restored_connection_count": 0,

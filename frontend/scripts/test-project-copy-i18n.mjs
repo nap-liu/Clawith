@@ -93,37 +93,14 @@ assert.deepEqual(
   leafKeys(en.projectSnapshot),
   "project snapshot translation keys must stay aligned",
 );
-assert.equal(zh.projectSnapshot.policy.fields.mode.label, "推进方式");
-assert.equal(en.projectSnapshot.policy.fields.mode.label, "Work mode");
-assert.equal(
-  zh.projectSnapshot.policy.fields.require_evidence.label,
-  "交付证据",
-);
-assert.equal(
-  en.projectSnapshot.policy.fields.require_evidence.label,
-  "Delivery evidence",
-);
-assert.equal(
-  zh.projectSnapshot.policy.fields.max_parallel_tasks.label,
-  "并行任务数",
-);
-assert.equal(
-  en.projectSnapshot.policy.fields.max_parallel_tasks.label,
-  "Parallel tasks",
-);
 const workspaceSource = readFileSync(
   resolve(projectRoot, "ProjectWorkspacePage.tsx"),
   "utf8",
 );
 assert.doesNotMatch(
   workspaceSource,
-  /key\.replace\(\/_\/g/,
-  "project snapshot controls must not expose internal policy field names",
-);
-assert.doesNotMatch(
-  workspaceSource,
-  /<TextInput[\s\S]{0,240}updateAutonomyField/,
-  "project snapshot policy values must use standard discrete controls",
+  /projectSnapshot\.autonomy|autonomySelectOptions|updateAutonomyField/,
+  "project member details must not expose the disconnected autonomy editor",
 );
 assert.deepEqual(
   leafKeys(zh.projectAudit),
@@ -137,19 +114,87 @@ assert.deepEqual(
 );
 assert.equal(
   zh.projectWorkspaceNav.tabs.projectAgents,
-  "项目成员",
-  "the project member navigation label must use the formal Chinese name",
+  "数字员工",
+  "the team navigation label must name the managed Digital Employees",
 );
 assert.equal(
   en.projectWorkspaceNav.tabs.projectAgents,
-  "Project members",
-  "the project member navigation label must use the formal English name",
+  "Digital Employees",
+  "the team navigation label must name the managed Digital Employees",
 );
 assert.deepEqual(
   leafKeys(zh.projectWorkspaceFiles),
   leafKeys(en.projectWorkspaceFiles),
   "project workspace file translation keys must stay aligned",
 );
+const zhWorkItemSinglePage =
+  zh.projectWorkspacePage.workItems.detail.singlePage;
+const enWorkItemSinglePage =
+  en.projectWorkspacePage.workItems.detail.singlePage;
+assert.deepEqual(
+  leafKeys(zhWorkItemSinglePage),
+  leafKeys(enWorkItemSinglePage),
+  "work-item single-page translation keys must stay aligned",
+);
+const requiredWorkItemSinglePageKeys = [
+  "acceptanceCount",
+  "acceptancePassed",
+  "acceptancePending",
+  "acceptanceTitle",
+  "actions.approve",
+  "actions.assign",
+  "actions.reopen",
+  "actions.retry",
+  "actions.return",
+  "actions.start",
+  "actions.viewBlocker",
+  "actions.viewDelivery",
+  "actions.viewProgress",
+  "activity.delivery",
+  "activity.discussion",
+  "activity.evidence",
+  "activity.execution",
+  "activity.viewDelivery",
+  "activity.viewDiscussion",
+  "activity.viewEvidence",
+  "activity.viewResult",
+  "back",
+  "cancel",
+  "edit",
+  "evidenceCount",
+  "evidencePending",
+  "goal",
+  "next.blocked",
+  "next.done",
+  "next.inProgress",
+  "next.review",
+  "next.todo",
+  "next.unassigned",
+  "nextStep",
+  "noDependencies",
+  "progressEmpty",
+  "progressTitle",
+  "requirements",
+  "save",
+  "viewAllProgress",
+].sort();
+assert.deepEqual(
+  leafKeys(zhWorkItemSinglePage),
+  requiredWorkItemSinglePageKeys,
+  "work-item single-page copy must expose the complete product contract",
+);
+for (const [locale, messages] of [
+  ["zh", zhWorkItemSinglePage],
+  ["en", enWorkItemSinglePage],
+]) {
+  assert.equal(
+    leafValues(messages).some((copy) =>
+      /\b(?:Run|Event|Session|Commit|ID)\b/i.test(copy),
+    ),
+    false,
+    `${locale} work-item single-page copy must not expose technical record terms`,
+  );
+}
 assert.deepEqual(
   leafKeys(zh.projectAgents),
   leafKeys(en.projectAgents),
@@ -158,15 +203,70 @@ assert.deepEqual(
 assert.equal(zh.projectAgents.badge, "项目专用数字员工");
 assert.equal(en.projectAgents.badge, "Project Digital Employee");
 assert.equal(zh.projectAgents.eyebrow, "项目数字员工 / 成员");
-assert.equal(
-  en.projectAgents.eyebrow,
-  "PROJECT DIGITAL EMPLOYEES / MEMBERS",
-);
+assert.equal(en.projectAgents.eyebrow, "PROJECT DIGITAL EMPLOYEES / MEMBERS");
 assert.equal(zh.projectAgents.create.noSource, "没有可复制的数字员工");
 assert.equal(
   en.projectAgents.create.noSource,
   "No Digital Employee is available to copy",
 );
+const zhTeamPage = zh.projectAgents.teamPage;
+const enTeamPage = en.projectAgents.teamPage;
+const requiredTeamPageKeys = [
+  "active",
+  "activeEmptyDescription",
+  "activeEmptyTitle",
+  "capabilities",
+  "capabilitiesDescription",
+  "capabilitiesEmptyDescription",
+  "capabilitiesEmptyTitle",
+  "clearFilters",
+  "count",
+  "departed",
+  "departedEmptyDescription",
+  "departedEmptyTitle",
+  "description",
+  "executionOwner",
+  "listView",
+  "matrixEmptyDescription",
+  "matrixEmptyTitle",
+  "matrixView",
+  "memberType",
+  "noMatchesDescription",
+  "noMatchesTitle",
+  "noMembersDescription",
+  "noMembersTitle",
+  "openSettings",
+  "projectOwned",
+  "readOnly",
+  "responsibility",
+  "standard",
+  "title",
+  "viewModeAria",
+  "workSettings",
+  "workSettingsDescription",
+].sort();
+assert.deepEqual(
+  leafKeys(zhTeamPage),
+  leafKeys(enTeamPage),
+  "team-page translation keys must stay aligned",
+);
+assert.deepEqual(
+  leafKeys(zhTeamPage),
+  requiredTeamPageKeys,
+  "team-page copy must expose the complete product contract",
+);
+for (const [locale, messages] of [
+  ["zh", zhTeamPage],
+  ["en", enTeamPage],
+]) {
+  assert.equal(
+    leafValues(messages).some((copy) =>
+      /\b(?:Agent|Run|Event|Session|Commit|ID)\b|快照代次/i.test(copy),
+    ),
+    false,
+    `${locale} team-page copy must not expose technical implementation terms`,
+  );
+}
 for (const [locale, messages] of [
   ["zh", zh.projectAgents],
   ["en", en.projectAgents],
@@ -177,17 +277,15 @@ for (const [locale, messages] of [
     `${locale} project Digital Employee dialogs must not expose the Agent term`,
   );
 }
-assert.match(zh.projectTemplatePublish.description, /项目数字员工/);
-assert.match(en.projectTemplatePublish.description, /Project Digital Employee/);
 assert.equal(zh.wizard.errors.nameRequired, "数字员工名称不能为空");
-assert.equal(en.wizard.errors.nameRequired, "Digital Employee name is required");
+assert.equal(
+  en.wizard.errors.nameRequired,
+  "Digital Employee name is required",
+);
 assert.equal(zh.projectGraphs.sourceAgent, "源数字员工");
 assert.equal(en.projectGraphs.sourceAgent, "Source Digital Employee");
 assert.equal(zh.projectWorkspaceFiles.agentRoot, "项目数字员工");
-assert.equal(
-  en.projectWorkspaceFiles.agentRoot,
-  "Project Digital Employees",
-);
+assert.equal(en.projectWorkspaceFiles.agentRoot, "Project Digital Employees");
 
 const planningSource = readFileSync(
   resolve(projectRoot, "ProjectPlanningPage.tsx"),

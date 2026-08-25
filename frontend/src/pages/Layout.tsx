@@ -1028,6 +1028,16 @@ export default function Layout() {
   // Sidebar collapse state
   const isSidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
+  const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
+    window.matchMedia("(max-width: 760px)").matches,
+  );
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 760px)");
+    const syncViewport = () => setIsNarrowViewport(media.matches);
+    media.addEventListener("change", syncViewport);
+    return () => media.removeEventListener("change", syncViewport);
+  }, []);
+  const sidebarCollapsed = isSidebarCollapsed || isNarrowViewport;
 
   // Sidebar agent search & pin
   const [sidebarSearch, setSidebarSearch] = useState("");
@@ -1097,13 +1107,13 @@ export default function Layout() {
   });
 
   const openAgentDrawer = useCallback(() => {
-    if (!isSidebarCollapsed) return;
+    if (!sidebarCollapsed) return;
     if (agentDrawerCloseTimerRef.current) {
       clearTimeout(agentDrawerCloseTimerRef.current);
       agentDrawerCloseTimerRef.current = null;
     }
     setAgentDrawerOpen(true);
-  }, [isSidebarCollapsed]);
+  }, [sidebarCollapsed]);
 
   const scheduleCloseAgentDrawer = useCallback(() => {
     if (agentDrawerCloseTimerRef.current)
@@ -1166,8 +1176,8 @@ export default function Layout() {
   );
 
   useEffect(() => {
-    if (!isSidebarCollapsed) setAgentDrawerOpen(false);
-  }, [isSidebarCollapsed]);
+    if (!sidebarCollapsed) setAgentDrawerOpen(false);
+  }, [sidebarCollapsed]);
 
   const updateLangSubmenuPosition = useCallback(() => {
     const el = accountDropdownRef.current;
@@ -1182,7 +1192,7 @@ export default function Layout() {
     const rect = el.getBoundingClientRect();
     const viewportPadding = 12;
     const menuWidth = 304;
-    const preferredLeft = isSidebarCollapsed ? rect.right + 8 : rect.left;
+    const preferredLeft = sidebarCollapsed ? rect.right + 8 : rect.left;
     const left = Math.min(
       Math.max(viewportPadding, preferredLeft),
       Math.max(
@@ -1193,7 +1203,7 @@ export default function Layout() {
     const top = Math.max(viewportPadding, rect.bottom + 8);
     const maxHeight = Math.max(220, window.innerHeight - top - viewportPadding);
     setTenantMenuPos({ top, left, maxHeight });
-  }, [isSidebarCollapsed]);
+  }, [sidebarCollapsed]);
 
   useLayoutEffect(() => {
     if (!showLanguageSubmenu) return;
@@ -1406,7 +1416,7 @@ export default function Layout() {
       (Array.from(agent.name || "?")[0] as string) || "?"
     ).toUpperCase();
     const unreadCount = Number(agent.unread_count || 0);
-    const showPin = !isSidebarCollapsed || options?.drawer;
+    const showPin = !sidebarCollapsed || options?.drawer;
     return (
       <div
         key={agent.id}
@@ -1502,7 +1512,7 @@ export default function Layout() {
   );
 
   const agentDrawer =
-    isSidebarCollapsed &&
+    sidebarCollapsed &&
     agentDrawerOpen &&
     typeof document !== "undefined" &&
     createPortal(
@@ -1534,9 +1544,9 @@ export default function Layout() {
 
   return (
     <div
-      className={`app-layout ${isSidebarCollapsed ? "sidebar-collapsed" : ""}`}
+      className={`app-layout ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
     >
-      <nav className={`sidebar ${isSidebarCollapsed ? "collapsed" : ""}`}>
+      <nav className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
         <div className="sidebar-top">
           <div className="sidebar-logo">
             <button
@@ -1588,12 +1598,12 @@ export default function Layout() {
                 color: "var(--text-tertiary)",
               }}
               title={
-                isSidebarCollapsed
+                sidebarCollapsed
                   ? t("common.expandSidebar")
                   : t("common.collapseSidebar")
               }
             >
-              {isSidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
+              {sidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
             </button>
           </div>
 
@@ -1687,7 +1697,7 @@ export default function Layout() {
           onMouseEnter={openAgentDrawer}
           onMouseLeave={scheduleCloseAgentDrawer}
         >
-          {!isSidebarCollapsed && (
+          {!sidebarCollapsed && (
             <div className="sidebar-agent-header">
               <span>{t("sidebar.agents")}</span>
               <button
@@ -1700,7 +1710,7 @@ export default function Layout() {
               </button>
             </div>
           )}
-          {!isSidebarCollapsed && agentSearchBox(true)}
+          {!sidebarCollapsed && agentSearchBox(true)}
           {agentListContent()}
         </div>
 
@@ -1780,15 +1790,15 @@ export default function Layout() {
                   alignItems: "center",
                   justifyContent: "center",
                   color: "var(--text-tertiary)",
-                  marginLeft: isSidebarCollapsed ? undefined : "auto",
+                  marginLeft: sidebarCollapsed ? undefined : "auto",
                 }}
                 title={
-                  isSidebarCollapsed
+                  sidebarCollapsed
                     ? t("common.expandSidebar")
                     : t("common.collapseSidebar")
                 }
               >
-                {isSidebarCollapsed
+                {sidebarCollapsed
                   ? SidebarIcons.expand
                   : SidebarIcons.collapse}
               </button>

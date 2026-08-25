@@ -14,6 +14,7 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.project import (
     Project,
@@ -27,12 +28,14 @@ from app.models.project import (
 )
 from app.models.skill import Skill
 from app.models.subagent_run import SubagentRun
+from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
 
 PROJECT_EVENT_SUMMARY_MAX_LENGTH = 500
 PROJECT_RUNTIME_STATUS_RUNNING = "running"
 PROJECT_RUNTIME_STATUS_PAUSED = "paused"
+PROJECT_CONVERSATION_STATUSES = frozenset({"planning", PROJECT_RUNTIME_STATUS_RUNNING})
 
 
 def ensure_project_running(project: Project) -> None:
@@ -42,6 +45,20 @@ def ensure_project_running(project: Project) -> None:
         raise HTTPException(
             status_code=409,
             detail="Project runtime is paused or unavailable; resume the project before starting new work",
+        )
+
+
+def ensure_project_accepts_group_message(project: Project) -> None:
+    """Allow Human planning discussion before execution starts.
+
+    Planning messages are routed only to the project owner by the API. All
+    execution, A2A, scheduling, and specialist wakes still require ``running``.
+    """
+
+    if project.status not in PROJECT_CONVERSATION_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail="Project conversation is unavailable; resume the project before sending new messages",
         )
 
 
@@ -89,6 +106,44 @@ def _tenant_id(user: User) -> uuid.UUID:
     if user.tenant_id is None:
         raise HTTPException(status_code=403, detail="A tenant membership is required")
     return user.tenant_id
+
+
+def project_execution_user_id(project: Project) -> uuid.UUID:
+    """Return the configured project principal, with owner fallback for legacy rows."""
+
+    return project.execution_user_id or project.owner_user_id
+
+
+async def resolve_project_execution_user(
+    db: AsyncSession,
+    project: Project,
+    execution_user_id: uuid.UUID | None = None,
+) -> User:
+    """Resolve an active principal that still belongs to the project's human ACL."""
+
+    user_id = execution_user_id or project_execution_user_id(project)
+    user = (
+        await db.execute(
+            select(User).where(
+                User.id == user_id,
+                User.tenant_id == project.tenant_id,
+                User.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=422, detail="Project execution user must be active in the project tenant")
+    if user.id != project.owner_user_id:
+        grant_id = await db.scalar(
+            select(ProjectAccessGrant.id).where(
+                ProjectAccessGrant.project_id == project.id,
+                ProjectAccessGrant.tenant_id == project.tenant_id,
+                ProjectAccessGrant.user_id == user.id,
+            )
+        )
+        if project.visibility != "shared" or grant_id is None:
+            raise HTTPException(status_code=422, detail="Project execution user must be a shared project user")
+    return user
 
 
 def accessible_projects_clause(user: User, *, edit: bool = False):
@@ -386,6 +441,7 @@ async def add_member(
             "fallback_model_id": str(agent.fallback_model_id) if agent.fallback_model_id else None,
             "autonomy_policy": dict(agent.autonomy_policy or {}),
             "max_tool_rounds": agent.max_tool_rounds,
+            "project_instruction": "",
             "source_agent_status": agent.status,
             "enabled_inherited_capability_ids": [str(value) for value in data.enabled_inherited_capability_ids],
             "membership": {
@@ -870,7 +926,10 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
             )
         )
     for capability in capabilities:
-        await add_capability(db, project, capability, actor_user_id=user.id)
+        binding = await add_capability(db, project, capability, actor_user_id=user.id)
+        from app.services.project_member_runtime import sync_project_capability_assignment
+
+        await sync_project_capability_assignment(db, project, binding)
 
     if data.visibility == "shared" and not data.shared_with_user_ids:
         raise HTTPException(status_code=422, detail="shared visibility requires shared_with_user_ids")
@@ -919,7 +978,46 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     return project
 
 
-async def freeze_run_members(db: AsyncSession, project: Project, run: ProjectRun) -> list[ProjectRunMemberSnapshot]:
+async def freeze_run_members(
+    db: AsyncSession,
+    project: Project,
+    run: ProjectRun,
+    *,
+    source_run_id: uuid.UUID | None = None,
+) -> list[ProjectRunMemberSnapshot]:
+    if source_run_id is not None:
+        source_snapshots = (
+            (
+                await db.execute(
+                    select(ProjectRunMemberSnapshot).where(
+                        ProjectRunMemberSnapshot.run_id == source_run_id,
+                        ProjectRunMemberSnapshot.project_id == project.id,
+                        ProjectRunMemberSnapshot.tenant_id == project.tenant_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not source_snapshots:
+            raise HTTPException(status_code=422, detail="Parent project run has no member snapshots")
+        inherited = [
+            ProjectRunMemberSnapshot(
+                tenant_id=project.tenant_id,
+                project_id=project.id,
+                run_id=run.id,
+                project_member_id=snapshot.project_member_id,
+                agent_id=snapshot.agent_id,
+                is_leader=snapshot.is_leader,
+                member_config_snapshot=dict(snapshot.member_config_snapshot or {}),
+                capability_snapshot=list(snapshot.capability_snapshot or []),
+            )
+            for snapshot in source_snapshots
+        ]
+        db.add_all(inherited)
+        await db.flush()
+        return inherited
+
     members = (
         (
             await db.execute(
@@ -946,6 +1044,62 @@ async def freeze_run_members(db: AsyncSession, project: Project, run: ProjectRun
         .scalars()
         .all()
     )
+    agent_tools = (
+        (
+            await db.execute(
+                select(AgentTool, Tool)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id.in_([member.agent_id for member in members]),
+                    Tool.enabled.is_(True),
+                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                )
+            )
+        ).all()
+        if members
+        else []
+    )
+    from app.services.tool_enablement import resolved_agent_tool_enabled, tool_is_required
+
+    tool_rows_by_agent: dict[uuid.UUID, dict[str, tuple[AgentTool, Tool]]] = {}
+    for assignment, tool in agent_tools:
+        tool_rows_by_agent.setdefault(assignment.agent_id, {})[tool.name] = (
+            assignment,
+            tool,
+        )
+    override_names = {
+        str(name)
+        for member in members
+        for key in ("enabled_platform_tools", "disabled_platform_tools")
+        for name in dict(member.config_snapshot or {}).get(key, [])
+    }
+    override_tools = (
+        (
+            await db.execute(
+                select(Tool).where(
+                    Tool.name.in_(override_names),
+                    Tool.enabled.is_(True),
+                    Tool.source.in_(("builtin", "admin")),
+                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                )
+            )
+        ).scalars().all()
+        if override_names
+        else []
+    )
+    override_tool_by_name = {tool.name: tool for tool in override_tools}
+    member_agents = {
+        agent.id: agent
+        for agent in (
+            (
+                await db.execute(
+                    select(Agent).where(Agent.id.in_([member.agent_id for member in members]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
     frozen: list[ProjectRunMemberSnapshot] = []
     for member in members:
         effective = [
@@ -961,6 +1115,58 @@ async def freeze_run_members(db: AsyncSession, project: Project, run: ProjectRun
             for binding in capabilities
             if binding.source == "shared" or binding.inherited_from_agent_id == member.agent_id
         ]
+        member_config = dict(member.config_snapshot or {})
+        member_agent = member_agents.get(member.agent_id)
+        is_project_agent = bool(
+            member_agent
+            and member_agent.scope == "project"
+            and member_agent.project_id == project.id
+        )
+        enabled_overrides = (
+            set()
+            if is_project_agent
+            else {str(name) for name in member_config.get("enabled_platform_tools", [])}
+        )
+        disabled_overrides = (
+            set()
+            if is_project_agent
+            else {str(name) for name in member_config.get("disabled_platform_tools", [])}
+        )
+        frozen_tool_names: set[str] = set()
+        for tool_name, (assignment, tool) in tool_rows_by_agent.get(member.agent_id, {}).items():
+            enabled = (
+                resolved_agent_tool_enabled(tool_name, assignment)
+                if is_project_agent
+                else tool_is_required(tool_name)
+                or tool_name in enabled_overrides
+                or (
+                    resolved_agent_tool_enabled(tool_name, assignment)
+                    and tool_name not in disabled_overrides
+                )
+            )
+            if not enabled:
+                continue
+            effective.append(
+                {
+                    "type": "agent_tool",
+                    "tool_id": str(tool.id),
+                    "name": tool.name,
+                    "config": dict(assignment.config or {}),
+                }
+            )
+            frozen_tool_names.add(tool_name)
+        for tool_name in sorted(enabled_overrides - frozen_tool_names):
+            tool = override_tool_by_name.get(tool_name)
+            if tool is None:
+                continue
+            effective.append(
+                {
+                    "type": "agent_tool",
+                    "tool_id": str(tool.id),
+                    "name": tool.name,
+                    "config": {},
+                }
+            )
         snapshot = ProjectRunMemberSnapshot(
             tenant_id=project.tenant_id,
             project_id=project.id,
@@ -986,6 +1192,125 @@ def _trace_uuid(*values: Any) -> uuid.UUID | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+async def serialize_project_run_member_snapshots(
+    db: AsyncSession,
+    project: Project,
+    snapshots: list[ProjectRunMemberSnapshot],
+) -> list[dict[str, Any]]:
+    """Expose frozen execution facts through one stable product summary.
+
+    The durable snapshots retain IDs, configuration payloads, and assignment
+    details for execution. Public APIs intentionally return model names,
+    product settings, and neutral capability entries instead of that internal
+    persistence structure.
+    """
+
+    if not snapshots:
+        return []
+    member_ids = {snapshot.project_member_id for snapshot in snapshots}
+    members = (
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.id.in_(member_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    member_by_id = {member.id: member for member in members}
+    model_ids = {
+        model_id
+        for snapshot in snapshots
+        for field in ("primary_model_id", "fallback_model_id")
+        if (model_id := _trace_uuid(dict(snapshot.member_config_snapshot or {}).get(field))) is not None
+    }
+    models = (
+        (
+            await db.execute(
+                select(LLMModel).where(
+                    LLMModel.id.in_(model_ids),
+                    or_(LLMModel.tenant_id == project.tenant_id, LLMModel.tenant_id.is_(None)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if model_ids
+        else []
+    )
+    model_names = {model.id: model.label or model.model for model in models}
+
+    def model_summary(config: dict[str, Any], field: str) -> dict[str, Any] | None:
+        raw_value = config.get(field)
+        if raw_value in (None, ""):
+            return None
+        model_id = _trace_uuid(raw_value)
+        name = model_names.get(model_id) if model_id else None
+        return {"name": name, "availability": "available" if name else "missing"}
+
+    payloads: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        member = member_by_id.get(snapshot.project_member_id)
+        config = dict(snapshot.member_config_snapshot or {})
+        capability_items: dict[tuple[str, str], dict[str, str]] = {}
+        for raw_item in list(snapshot.capability_snapshot or []):
+            item = dict(raw_item or {})
+            raw_type = str(item.get("type") or "").strip()
+            capability_type = "tool" if raw_type == "agent_tool" else raw_type
+            if capability_type not in {"tool", "mcp", "skill"}:
+                capability_type = "other"
+            key = str(item.get("key") or item.get("name") or "").strip()
+            if not key:
+                continue
+            name = str(item.get("display_name") or item.get("name") or key).strip()
+            source = "project" if item.get("source") == "shared" else "member"
+            capability_items[(capability_type, key)] = {
+                "type": capability_type,
+                "key": key,
+                "name": name,
+                "source": source,
+            }
+        items = sorted(capability_items.values(), key=lambda item: (item["type"], item["name"], item["key"]))
+        by_type: dict[str, int] = {"tool": 0, "mcp": 0, "skill": 0}
+        for item in items:
+            by_type[item["type"]] = by_type.get(item["type"], 0) + 1
+        member_summary = {
+            "project_member_id": snapshot.project_member_id,
+            "agent_id": snapshot.agent_id,
+            "name": member.name_snapshot if member else None,
+            "responsibility": member.role_snapshot if member else "",
+            "is_leader": snapshot.is_leader,
+            "configuration": {
+                "primary_model": model_summary(config, "primary_model_id"),
+                "fallback_model": model_summary(config, "fallback_model_id"),
+                "max_tool_rounds": config.get("max_tool_rounds"),
+                "has_project_instruction": bool(str(config.get("project_instruction") or "").strip()),
+            },
+            "capabilities": {
+                "total": len(items),
+                "by_type": by_type,
+                "items": items,
+            },
+        }
+        payloads.append(
+            {
+                "id": snapshot.id,
+                "project_id": snapshot.project_id,
+                "run_id": snapshot.run_id,
+                "project_member_id": snapshot.project_member_id,
+                "agent_id": snapshot.agent_id,
+                "is_leader": snapshot.is_leader,
+                "member_snapshot": member_summary,
+                "created_at": snapshot.created_at,
+            }
+        )
+    return payloads
 
 
 def _project_a2a_receipt(result: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -1158,23 +1483,8 @@ async def serialize_project_runs(
         .scalars()
         .all()
     )
-    member_ids = {snapshot.project_member_id for snapshot in snapshots}
-    members = (
-        (
-            await db.execute(
-                select(ProjectMemberSnapshot).where(
-                    ProjectMemberSnapshot.project_id == project.id,
-                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                    ProjectMemberSnapshot.id.in_(member_ids),
-                )
-            )
-        )
-        .scalars()
-        .all()
-        if member_ids
-        else []
-    )
-    member_by_id = {member.id: member for member in members}
+    public_snapshots = await serialize_project_run_member_snapshots(db, project, list(snapshots))
+    public_by_snapshot_id = {payload["id"]: payload["member_snapshot"] for payload in public_snapshots}
     snapshots_by_run: dict[uuid.UUID, list[ProjectRunMemberSnapshot]] = {}
     for snapshot in snapshots:
         snapshots_by_run.setdefault(snapshot.run_id, []).append(snapshot)
@@ -1188,7 +1498,6 @@ async def serialize_project_runs(
             (snapshot for snapshot in snapshots_by_run.get(run.id, []) if snapshot.agent_id == run.agent_id),
             None,
         )
-        member = member_by_id.get(responsible.project_member_id) if responsible else None
         subagent_session_id = _trace_uuid(
             output.get("subagent_session_id"),
             output.get("subagent_run_id"),
@@ -1203,18 +1512,7 @@ async def serialize_project_runs(
             input_data.get("group_session_id"),
             dispatch.get("group_session_id"),
         )
-        member_snapshot = None
-        if responsible is not None:
-            member_snapshot = {
-                "project_member_id": str(responsible.project_member_id),
-                "agent_id": str(responsible.agent_id),
-                "name_snapshot": member.name_snapshot if member else None,
-                "role_snapshot": member.role_snapshot if member else "",
-                "is_leader": responsible.is_leader,
-                "member_config_snapshot": dict(responsible.member_config_snapshot or {}),
-                "capability_snapshot": list(responsible.capability_snapshot or []),
-                "created_at": responsible.created_at,
-            }
+        member_snapshot = public_by_snapshot_id.get(responsible.id) if responsible else None
         payloads.append(
             {
                 "id": run.id,
@@ -1233,7 +1531,7 @@ async def serialize_project_runs(
                 "created_at": run.created_at,
                 "updated_at": run.updated_at,
                 "project_member_id": responsible.project_member_id if responsible else None,
-                "agent_name": member.name_snapshot if member else None,
+                "agent_name": member_snapshot.get("name") if member_snapshot else None,
                 "member_snapshot": member_snapshot,
                 "session_id": visible_session_id,
                 "subagent_session_id": subagent_session_id,
@@ -1243,7 +1541,59 @@ async def serialize_project_runs(
     return payloads
 
 
-async def project_summary(db: AsyncSession, project: Project) -> dict:
+async def serialize_project_events(
+    db: AsyncSession,
+    project: Project,
+    events: list[ProjectEvent],
+) -> list[dict[str, Any]]:
+    """Attach the same frozen product summary to run-linked audit events."""
+
+    if not events:
+        return []
+    run_ids = {event.run_id for event in events if event.run_id is not None}
+    runs = (
+        (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.id.in_(run_ids),
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.tenant_id == project.tenant_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if run_ids
+        else []
+    )
+    run_payloads = await serialize_project_runs(db, project, list(runs))
+    member_summary_by_run = {payload["id"]: payload.get("member_snapshot") for payload in run_payloads}
+    return [
+        {
+            "id": event.id,
+            "project_id": event.project_id,
+            "work_item_id": event.work_item_id,
+            "run_id": event.run_id,
+            "actor_user_id": event.actor_user_id,
+            "actor_agent_id": event.actor_agent_id,
+            "from_agent_id": event.from_agent_id,
+            "to_agent_id": event.to_agent_id,
+            "event_type": event.event_type,
+            "summary": event.summary,
+            "event_metadata": dict(event.event_metadata or {}),
+            "member_snapshot": member_summary_by_run.get(event.run_id),
+            "created_at": event.created_at,
+        }
+        for event in events
+    ]
+
+
+async def project_summary(
+    db: AsyncSession,
+    project: Project,
+    *,
+    actor_user_id: uuid.UUID | None = None,
+) -> dict:
     members = (
         (
             await db.execute(
@@ -1285,10 +1635,24 @@ async def project_summary(db: AsyncSession, project: Project) -> dict:
             select(User.display_name).where(User.id == project.owner_user_id, User.tenant_id == project.tenant_id)
         )
     ).scalar_one_or_none()
+    execution_user_id = project_execution_user_id(project)
+    execution_user_name = (
+        await db.execute(
+            select(User.display_name).where(User.id == execution_user_id, User.tenant_id == project.tenant_id)
+        )
+    ).scalar_one_or_none()
+    access_role = "owner" if actor_user_id == project.owner_user_id else None
+    if access_role is None and actor_user_id is not None:
+        access_role = next(
+            (grant.role for grant, _display_name in grants if grant.user_id == actor_user_id),
+            None,
+        )
     return {
         "id": str(project.id),
         "tenant_id": str(project.tenant_id),
         "owner_user_id": str(project.owner_user_id),
+        "execution_user_id": str(execution_user_id),
+        "execution_user_name": execution_user_name,
         "template_id": str(project.template_id) if project.template_id else None,
         "name": project.name,
         "description": project.description,
@@ -1319,6 +1683,7 @@ async def project_summary(db: AsyncSession, project: Project) -> dict:
         "current_signal": project.settings.get("current_signal"),
         "next_action": project.settings.get("next_action"),
         "owner_name": owner_name,
+        "access_role": access_role,
         "shared_with_names": [display_name for _, display_name in grants],
         "shared_with": [
             {"user_id": str(grant.user_id), "display_name": display_name, "role": grant.role}

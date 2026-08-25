@@ -46,6 +46,7 @@ type GraphNodeData = {
   tone: GraphTone;
   kind: "agent" | "mesh" | "source" | "snapshot" | "run" | "work" | "commit";
   interactive?: boolean;
+  direction?: GraphDirection;
 };
 type ProjectGraphNode = Node<GraphNodeData, "projectGraph">;
 type Selection = {
@@ -145,14 +146,14 @@ function GraphIcon({ kind }: { kind: GraphNodeData["kind"] }) {
 }
 
 function ProjectGraphNodeView({ data, selected }: NodeProps<ProjectGraphNode>) {
-  const vertical = data.kind === "commit";
+  const vertical = data.direction === "vertical" || data.kind === "commit";
   return (
     <div
       className={`project-graph__node is-${data.tone}${selected ? " is-selected" : ""}${data.interactive === false ? " is-static" : ""}`}
     >
       <Handle
         type="target"
-        position={vertical ? Position.Bottom : Position.Left}
+        position={vertical ? Position.Top : Position.Left}
         className="project-graph__handle project-graph__handle--target"
       />
       <span className="project-graph__node-icon">
@@ -166,7 +167,7 @@ function ProjectGraphNodeView({ data, selected }: NodeProps<ProjectGraphNode>) {
       {data.badge && <em>{data.badge}</em>}
       <Handle
         type="source"
-        position={vertical ? Position.Top : Position.Right}
+        position={vertical ? Position.Bottom : Position.Right}
         className="project-graph__handle project-graph__handle--source"
       />
     </div>
@@ -371,6 +372,23 @@ function ProjectGraphViewport({
       className={`project-graph project-graph--${direction}${variant ? ` project-graph--${variant}` : ""}`}
       role="img"
       aria-label={ariaLabel}
+      onKeyDown={(event) => {
+        if (!["Enter", " "].includes(event.key)) return;
+        const target = event.target as HTMLElement;
+        const nodeElement = target.closest<HTMLElement>(
+          ".react-flow__node[data-id]",
+        );
+        const node = nodes.find(
+          (candidate) => candidate.id === nodeElement?.dataset.id,
+        );
+        if (!node || node.data.interactive === false) return;
+        event.preventDefault();
+        onSelect?.({
+          kind: node.data.kind,
+          id: node.id,
+          record: records.get(node.id) || {},
+        });
+      }}
     >
       <ReactFlow<ProjectGraphNode, Edge>
         nodes={nodes}
@@ -591,11 +609,11 @@ export function A2AMeshGraph({
           )
         );
       });
-      const firstY = -((sortedEntries.length - 1) * 132) / 2;
+      const firstX = -((sortedEntries.length - 1) * 286) / 2;
       sortedEntries.forEach((member, index) =>
         positions.set(valueText(member, "agent_id", "id", "member_id"), {
-          x: rank * 350,
-          y: firstY + index * 132,
+          x: firstX + index * 286,
+          y: rank * 170,
         }),
       );
     });
@@ -609,6 +627,7 @@ export function A2AMeshGraph({
         position: positions.get(id) || { x: 0, y: 0 },
         data: {
           kind: "agent",
+          direction: "vertical",
           label:
             valueText(member, "name_snapshot", "agent_name", "name") ||
             t("projectGraphs.unnamedAgent"),
@@ -619,7 +638,6 @@ export function A2AMeshGraph({
                   t("projectGraphs.projectMember"),
                 t,
               ),
-          meta: compactId(id),
           badge: !enabled
             ? t("projectGraphs.disabled")
             : selectedAgentId === id
@@ -717,8 +735,10 @@ export function A2AMeshGraph({
       edges={edges}
       records={records}
       variant="mesh"
-      fitViewPadding={0.22}
-      fitViewMaxZoom={1}
+      direction="vertical"
+      fitViewPadding={0.12}
+      fitViewMinZoom={0.72}
+      fitViewMaxZoom={1.12}
       miniMap={ordered.length > 7}
       onSelect={({ id, record }) => onAgentSelect?.(id, record)}
     />

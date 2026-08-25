@@ -32,6 +32,7 @@ from app.services.project_service import (
     ensure_project_group_session,
     ensure_project_running,
     freeze_run_members,
+    project_execution_user_id,
 )
 
 WORK_ITEM_STATUSES = frozenset({"backlog", "todo", "in_progress", "review", "blocked", "done"})
@@ -564,6 +565,7 @@ async def start_run(
         work_item_id=work_item_id,
         agent_id=member.agent_id,
         initiated_by_user_id=actor.id,
+        execution_user_id=project_execution_user_id(project),
         status="queued",
         trigger_type="group_leader_message" if group_message else "manual",
         input={

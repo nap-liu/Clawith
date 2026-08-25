@@ -1655,6 +1655,12 @@ select:focus {
   min-height: 0;
 }
 
+@media (max-width: 760px) {
+  .sidebar-collapse-btn {
+    display: none !important;
+  }
+}
+
 /* ─── Collapsed Sidebar Overrides ───────────────────── */
 .sidebar.collapsed {
   --sidebar-width: var(--sidebar-width-collapsed);
@@ -9076,16 +9082,16 @@ select:focus {
 
 .session-viewer-drawer-layer--embedded .session-viewer-drawer__context {
   min-height: 34px;
-  padding-inline: 18px;
+  padding-inline: var(--project-content-gutter, 18px);
   background: var(--bg-primary);
 }
 
 .session-viewer-drawer-layer--embedded .session-viewer-drawer__messages {
-  padding-inline: clamp(18px, 3vw, 44px);
+  padding-inline: var(--project-content-gutter, clamp(18px, 3vw, 44px));
 }
 
 .session-viewer-drawer-layer--embedded .session-viewer-drawer__composer {
-  padding-inline: clamp(18px, 3vw, 44px);
+  padding-inline: var(--project-content-gutter, clamp(18px, 3vw, 44px));
 }
 
 .session-viewer-drawer-layer--embedded .session-viewer-drawer__composer-row {

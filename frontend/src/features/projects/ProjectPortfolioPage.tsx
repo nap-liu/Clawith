@@ -455,6 +455,7 @@ export default function ProjectPortfolioPage() {
                 <ProjectProgressBar
                   className="pm-project-progress"
                   value={project.progress}
+                  label={t("projectCockpit.projectProgress")}
                 />
                 <div className="pm-project-update">
                   <strong>

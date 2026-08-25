@@ -9,6 +9,7 @@ import uuid
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 
+from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import String, and_, cast, exists, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -61,11 +62,18 @@ class SubagentError(ValueError):
     """A safe, user-facing Subagent contract error."""
 
 
-def _project_member_origin_tool_call_id(member) -> str:
+def _project_member_origin_tool_call_id(
+    member,
+    execution_user_id: uuid.UUID | None = None,
+    owner_user_id: uuid.UUID | None = None,
+) -> str:
     membership = dict(dict(member.config_snapshot or {}).get("membership") or {})
     generation = max(1, int(membership.get("generation") or 1))
     base = f"project-member:{member.id}"
-    return base if generation == 1 else f"{base}:v{generation}"
+    generation_key = base if generation == 1 else f"{base}:v{generation}"
+    if execution_user_id is not None and owner_user_id is not None and execution_user_id != owner_user_id:
+        return f"{generation_key}:user:{execution_user_id}"
+    return generation_key
 
 
 def _message_meta(row: ChatMessage) -> dict:
@@ -76,11 +84,124 @@ def _run_owned_by_parent(run: SubagentRun, parent_session_id: uuid.UUID) -> bool
     return run.parent_session_id == parent_session_id
 
 
+async def _project_member_runtime_snapshot(
+    db,
+    *,
+    project,
+    agent_id: uuid.UUID,
+    project_run_id: uuid.UUID | None,
+):
+    """Resolve live membership plus either frozen-run or immediate runtime data."""
+
+    from app.models.project import (
+        ProjectCapabilityBinding,
+        ProjectMemberSnapshot,
+        ProjectRun,
+        ProjectRunMemberSnapshot,
+    )
+
+    member = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.agent_id == agent_id,
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        raise SubagentError("目标 Agent 不是当前项目的已启用成员。")
+
+    if project_run_id is not None:
+        project_run = await db.get(ProjectRun, project_run_id)
+        if (
+            project_run is None
+            or project_run.project_id != project.id
+            or project_run.tenant_id != project.tenant_id
+        ):
+            raise SubagentError("项目运行快照不存在或不属于当前项目。")
+        frozen = (
+            await db.execute(
+                select(ProjectRunMemberSnapshot).where(
+                    ProjectRunMemberSnapshot.run_id == project_run.id,
+                    ProjectRunMemberSnapshot.project_id == project.id,
+                    ProjectRunMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectRunMemberSnapshot.project_member_id == member.id,
+                    ProjectRunMemberSnapshot.agent_id == agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if frozen is None:
+            raise SubagentError("项目运行缺少该成员的冻结配置。")
+        return (
+            member,
+            dict(frozen.member_config_snapshot or {}),
+            list(frozen.capability_snapshot or []),
+            bool(frozen.is_leader),
+            True,
+        )
+
+    bindings = (
+        (
+            await db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == project.id,
+                    ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                    ProjectCapabilityBinding.is_enabled.is_(True),
+                    or_(
+                        ProjectCapabilityBinding.source == "shared",
+                        ProjectCapabilityBinding.inherited_from_agent_id == agent_id,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    capabilities = [
+        {
+            "binding_id": str(binding.id),
+            "capability_id": str(binding.capability_id) if binding.capability_id else None,
+            "type": binding.capability_type,
+            "name": binding.capability_name,
+            "source": binding.source,
+            "scope": binding.scope,
+            "config": binding.config,
+        }
+        for binding in bindings
+    ]
+    return member, dict(member.config_snapshot or {}), capabilities, bool(member.is_leader), False
+
+
+def _apply_project_runtime_to_session(
+    child: ChatSession,
+    *,
+    member,
+    member_config: dict,
+    capabilities: list[dict],
+    is_leader: bool,
+    frozen: bool,
+) -> None:
+    child.im_config = {
+        **dict(child.im_config or {}),
+        "project_member_id": str(member.id),
+        "project_membership_generation": max(
+            1,
+            int(dict(member_config.get("membership") or {}).get("generation") or 1),
+        ),
+        "project_role_snapshot": "leader" if is_leader else "participant",
+        "member_config_snapshot": dict(member_config),
+        "capability_snapshot": list(capabilities),
+        "project_run_frozen": frozen,
+    }
+
+
 async def _project_accepts_new_subagent_anchor(
     db,
     run: SubagentRun,
     *,
-    initializing_project_run_id: uuid.UUID | None = None,
+    authorized_project_run_id: uuid.UUID | None = None,
 ) -> bool:
     """Lock and check the authoritative project switch before new work starts.
 
@@ -98,15 +219,35 @@ async def _project_accepts_new_subagent_anchor(
         return False
     if project.status == "running":
         return True
-    if project.status != "initializing" or initializing_project_run_id is None:
+    if project.status not in {"initializing", "planning"}:
+        return False
+    project_run_id = authorized_project_run_id
+    if project_run_id is None and project.status == "planning":
+        raw_project_run_id = await db.scalar(
+            select(ChatMessage.message_meta["project_run_id"].as_string())
+            .where(
+                ChatMessage.conversation_id == str(run.id),
+                ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+                ChatMessage.message_meta["subagent_input_state"].as_string() == INPUT_PENDING,
+            )
+            .order_by(ChatMessage.created_at, ChatMessage.id)
+            .limit(1)
+        )
+        try:
+            project_run_id = uuid.UUID(str(raw_project_run_id))
+        except (TypeError, ValueError):
+            return False
+    if project_run_id is None:
         return False
     trigger_type = await db.scalar(
         select(ProjectRun.trigger_type).where(
-            ProjectRun.id == initializing_project_run_id,
+            ProjectRun.id == project_run_id,
             ProjectRun.project_id == run.project_id,
         )
     )
-    return trigger_type == "leader_kickoff"
+    return (project.status == "initializing" and trigger_type == "leader_kickoff") or (
+        project.status == "planning" and trigger_type == "group_leader_message"
+    )
 
 
 async def _subagent_workload_tenant_id(run_id: uuid.UUID) -> str:
@@ -193,14 +334,20 @@ async def _validate_execution_identity(
     child: ChatSession,
 ) -> Agent:
     """Revalidate the durable principal immediately before unattended work."""
-    from app.services.execution_identity import resolve_execution_user_id
-
     agent = await db.get(Agent, child.agent_id)
     if agent is None:
         raise RuntimeError("Subagent execution Agent no longer exists")
-    await resolve_execution_user_id(db, agent, run.execution_user_id)
     if run.project_id is not None:
-        from app.models.project import ProjectMemberSnapshot
+        from app.models.project import Project, ProjectMemberSnapshot
+        from app.services.project_service import resolve_project_execution_user
+
+        project = await db.get(Project, run.project_id)
+        if project is None:
+            raise RuntimeError("Project no longer exists")
+        try:
+            await resolve_project_execution_user(db, project, run.execution_user_id)
+        except HTTPException as exc:
+            raise RuntimeError("Project execution user is no longer available") from exc
 
         member = await db.get(ProjectMemberSnapshot, run.project_member_id) if run.project_member_id else None
         if (
@@ -211,6 +358,10 @@ async def _validate_execution_identity(
             or bool(dict(child.im_config or {}).get("membership_revoked"))
         ):
             raise RuntimeError("Project member is no longer active")
+    else:
+        from app.services.execution_identity import resolve_execution_user_id
+
+        await resolve_execution_user_id(db, agent, run.execution_user_id)
     return agent
 
 
@@ -240,19 +391,6 @@ async def _resolve_model_name(db, agent: Agent, requested: str | None) -> str | 
     if resolved.status != MODEL_STATUS_OK or resolved.model is None:
         raise SubagentError(f"找不到可用模型 {model_name}。")
     return resolved.model.model
-
-
-async def _project_turn_model_id(db, agent: Agent, project) -> str:
-    from app.services.chat_model_selection import resolve_project_runtime_models
-
-    resolved = await resolve_project_runtime_models(
-        db,
-        agent=agent,
-        project_settings=project.settings,
-    )
-    if resolved.primary_model is None:
-        raise SubagentError("当前 Agent、项目和租户均没有可用的 LLM 模型，请先在项目设置或租户模型池中配置。")
-    return str(resolved.primary_model.id)
 
 
 def _fork_row_meta(row) -> dict:
@@ -377,13 +515,27 @@ async def create_subagent(
         if parent.source_channel == SUBAGENT_CHANNEL:
             raise SubagentError("Subagent 不能继续创建 Subagent。")
 
-        from app.services.execution_identity import resolve_execution_user_id
+        project = None
+        if parent.project_id is not None:
+            from app.models.project import Project
+            from app.services.project_service import resolve_project_execution_user
 
-        resolved_user_id = await resolve_execution_user_id(
-            db,
-            agent,
-            execution_user_id,
-        )
+            project = await db.get(Project, parent.project_id)
+            if project is None:
+                raise SubagentError("项目不存在。")
+            try:
+                resolved_user = await resolve_project_execution_user(db, project, execution_user_id)
+            except HTTPException as exc:
+                raise SubagentError("项目执行用户不可用。") from exc
+            resolved_user_id = resolved_user.id
+        else:
+            from app.services.execution_identity import resolve_execution_user_id
+
+            resolved_user_id = await resolve_execution_user_id(
+                db,
+                agent,
+                execution_user_id,
+            )
 
         async def _load_authorized_existing() -> SubagentRun | None:
             existing_run = (
@@ -420,54 +572,26 @@ async def create_subagent(
             and parent.source_channel not in {"agent", "trigger", SUBAGENT_CHANNEL}
             else None
         )
-        project = None
         project_member = None
         project_capabilities: list[dict] = []
+        project_member_config: dict = {}
+        project_member_is_leader = False
+        project_run_frozen = False
         project_tool_policy_snapshot: dict = {}
         agent_runtime_workspace_snapshot: dict[str, str] = {}
         if parent.project_id is not None:
-            from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
-
-            project = await db.get(Project, parent.project_id)
-            project_member = (
-                await db.execute(
-                    select(ProjectMemberSnapshot).where(
-                        ProjectMemberSnapshot.project_id == parent.project_id,
-                        ProjectMemberSnapshot.agent_id == agent_id,
-                        ProjectMemberSnapshot.is_enabled.is_(True),
-                    )
-                )
-            ).scalar_one_or_none()
-            if project_member is None:
-                raise SubagentError("目标 Agent 不是当前项目的已启用成员。")
-            bindings = (
-                (
-                    await db.execute(
-                        select(ProjectCapabilityBinding).where(
-                            ProjectCapabilityBinding.project_id == parent.project_id,
-                            ProjectCapabilityBinding.is_enabled.is_(True),
-                            or_(
-                                ProjectCapabilityBinding.source == "shared",
-                                ProjectCapabilityBinding.inherited_from_agent_id == agent_id,
-                            ),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
+            (
+                project_member,
+                project_member_config,
+                project_capabilities,
+                project_member_is_leader,
+                project_run_frozen,
+            ) = await _project_member_runtime_snapshot(
+                db,
+                project=project,
+                agent_id=agent_id,
+                project_run_id=project_run_id,
             )
-            project_capabilities = [
-                {
-                    "binding_id": str(binding.id),
-                    "capability_id": str(binding.capability_id) if binding.capability_id else None,
-                    "type": binding.capability_type,
-                    "name": binding.capability_name,
-                    "source": binding.source,
-                    "scope": binding.scope,
-                    "config": binding.config,
-                }
-                for binding in bindings
-            ]
             project_tool_policy_snapshot = (
                 dict(dict((project.settings or {}).get("policies") or {}).get("project_tools") or {})
                 if project is not None
@@ -487,9 +611,6 @@ async def create_subagent(
                 ).as_session_config()
 
         task_metadata = dict(input_metadata or {})
-        if project is not None and canonical_model is None and not task_metadata.get("model_id"):
-            task_metadata["model_id"] = await _project_turn_model_id(db, agent, project)
-
         child = ChatSession(
             id=child_id,
             agent_id=agent_id,
@@ -503,19 +624,14 @@ async def create_subagent(
                 "project_id": str(parent.project_id) if parent.project_id else None,
                 "project_group_session_id": str(parent.id) if parent.project_id else None,
                 "project_member_id": str(project_member.id) if project_member else None,
-                "project_membership_generation": (
-                    max(
-                        1,
-                        int(
-                            dict(dict(project_member.config_snapshot or {}).get("membership") or {}).get("generation")
-                            or 1
-                        ),
-                    )
-                    if project_member
-                    else None
-                ),
+                "project_membership_generation": max(
+                    1,
+                    int(dict(project_member_config.get("membership") or {}).get("generation") or 1),
+                )
+                if project_member
+                else None,
                 "membership_revoked": False,
-                "project_role_snapshot": "leader" if project_member and project_member.is_leader else "participant",
+                "project_role_snapshot": "leader" if project_member_is_leader else "participant",
                 "project_name_snapshot": project.name if project is not None else "",
                 "project_goal_snapshot": project.goal if project is not None else "",
                 "project_success_criteria_snapshot": list(project.success_criteria or [])
@@ -524,8 +640,9 @@ async def create_subagent(
                 "project_member_name_snapshot": project_member.name_snapshot if project_member else agent.name,
                 "project_member_role_snapshot": project_member.role_snapshot if project_member else "",
                 "project_tool_policy_snapshot": project_tool_policy_snapshot,
-                "member_config_snapshot": dict(project_member.config_snapshot or {}) if project_member else {},
+                "member_config_snapshot": project_member_config,
                 "capability_snapshot": project_capabilities,
+                "project_run_frozen": project_run_frozen,
                 "agent_runtime_workspace": agent_runtime_workspace_snapshot,
             },
             created_at=now,
@@ -641,7 +758,7 @@ async def append_subagent_message(
         if not await _project_accepts_new_subagent_anchor(
             db,
             run,
-            initializing_project_run_id=(project_run_id if supplied_metadata.get("project_dispatch") else None),
+            authorized_project_run_id=(project_run_id if supplied_metadata.get("project_dispatch") else None),
         ):
             raise SubagentError("项目已暂停；恢复项目后才能继续这个工作会话。")
         from app.services.confirmation_service import (
@@ -663,13 +780,32 @@ async def append_subagent_message(
                 pending_confirmation,
             )
         now = datetime.now(UTC)
-        if run.project_id is not None and not run.model and not supplied_metadata.get("model_id"):
+        if project_run_id is not None:
             from app.models.project import Project
 
             project = await db.get(Project, run.project_id)
             if project is None:
                 raise SubagentError("项目不存在，不能继续这个工作会话。")
-            supplied_metadata["model_id"] = await _project_turn_model_id(db, agent, project)
+            (
+                active_member,
+                active_member_config,
+                active_capabilities,
+                active_is_leader,
+                active_run_frozen,
+            ) = await _project_member_runtime_snapshot(
+                db,
+                project=project,
+                agent_id=agent.id,
+                project_run_id=project_run_id,
+            )
+            _apply_project_runtime_to_session(
+                child,
+                member=active_member,
+                member_config=active_member_config,
+                capabilities=active_capabilities,
+                is_leader=active_is_leader,
+                frozen=active_run_frozen,
+            )
         supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
         db.add(
             ChatMessage(
@@ -850,7 +986,6 @@ async def prepare_subagent_tools(
     from app.services.agent_tools import get_agent_tools_for_llm
     from app.services.tool_enablement import resolved_agent_tool_enabled
 
-    tools = await get_agent_tools_for_llm(agent_id)
     hidden = {
         "run_subagent",
         "send_message_to_subagent",
@@ -858,7 +993,7 @@ async def prepare_subagent_tools(
         "send_message_to_parent",
         "request_confirmation",
     }
-    child_tools = [tool for tool in tools if tool.get("function", {}).get("name") not in hidden]
+    child_tools: list[dict] = []
     project_tools: list[dict] = []
     is_project_runtime = False
     async with async_session() as db:
@@ -879,6 +1014,19 @@ async def prepare_subagent_tools(
                 execution_user_id=execution_user_id,
             )
             runtime_config = dict(scoped_child.im_config or {})
+            if runtime_config.get("project_run_frozen"):
+                assignment_snapshot = [
+                    item
+                    for item in runtime_config.get("capability_snapshot", [])
+                    if isinstance(item, dict) and item.get("type") == "agent_tool" and item.get("tool_id")
+                ]
+                tools = await get_agent_tools_for_llm(
+                    agent_id,
+                    assignment_snapshot=assignment_snapshot,
+                )
+            else:
+                tools = await get_agent_tools_for_llm(agent_id)
+            child_tools = [tool for tool in tools if tool.get("function", {}).get("name") not in hidden]
             # Builtins remain governed by the normal Agent tool policy. MCP is
             # deny-by-default and re-enabled only by the immutable project
             # snapshot captured when this validated child was created.
@@ -902,6 +1050,12 @@ async def prepare_subagent_tools(
                         )
                     ).scalars()
                 )
+            allowed_mcp_names.update(
+                str(entry.get("name") or "")
+                for entry in runtime_config.get("capability_snapshot", [])
+                if isinstance(entry, dict) and entry.get("type") == "agent_tool"
+            )
+            allowed_mcp_names.intersection_update(all_mcp_names)
             child_tools = [
                 item
                 for item in child_tools
@@ -924,7 +1078,27 @@ async def prepare_subagent_tools(
                 for item in child_tools
                 if item.get("function", {}).get("name") not in project_collaboration_bypass_tools
             ]
-            project_tools = project_runtime_tool_schemas(project, member)
+            if project.status == "planning":
+                # Planning is a Human-controlled conversation with the project
+                # owner.  No inherited or project mutation surface is exposed
+                # until the approved kickoff moves the project to running.
+                child_tools = []
+                project_tools = []
+            else:
+                if runtime_config.get("project_run_frozen"):
+                    from types import SimpleNamespace
+
+                    runtime_member = SimpleNamespace(
+                        is_enabled=True,
+                        is_leader=runtime_config.get("project_role_snapshot") == "leader",
+                        config_snapshot=dict(runtime_config.get("member_config_snapshot") or {}),
+                    )
+                else:
+                    runtime_member = member
+                project_tools = project_runtime_tool_schemas(project, runtime_member)
+        else:
+            tools = await get_agent_tools_for_llm(agent_id)
+            child_tools = [tool for tool in tools if tool.get("function", {}).get("name") not in hidden]
         row = (
             await db.execute(
                 select(Tool, AgentTool)
@@ -982,7 +1156,7 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
                 exists(
                     select(Project.id).where(
                         Project.id == SubagentRun.project_id,
-                        Project.status == "running",
+                        Project.status.in_(["running", "planning"]),
                     )
                 ),
             ),
@@ -1106,7 +1280,16 @@ async def _load_or_start_input(
             run.lease_expires_at = None
             await db.commit()
             return None
-        if not recovering and not await _project_accepts_new_subagent_anchor(db, run):
+        raw_project_run_id = _message_meta(anchor).get("project_run_id")
+        try:
+            project_run_id = uuid.UUID(str(raw_project_run_id))
+        except (TypeError, ValueError):
+            project_run_id = None
+        if not recovering and not await _project_accepts_new_subagent_anchor(
+            db,
+            run,
+            authorized_project_run_id=project_run_id,
+        ):
             # Keep the pending input durable and release this worker.  The
             # canonical claim query will pick it up after the project resumes.
             run.status = RUN_QUEUED
@@ -1600,6 +1783,38 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     active_turn_capacity = None
                     return
                 agent = await _validate_execution_identity(db, run, child)
+                raw_project_run_id = _message_meta(anchor).get("project_run_id")
+                try:
+                    active_project_run_id = uuid.UUID(str(raw_project_run_id)) if raw_project_run_id else None
+                except (TypeError, ValueError):
+                    active_project_run_id = None
+                if child.project_id is not None:
+                    from app.models.project import Project
+
+                    active_project = await db.get(Project, child.project_id)
+                    if active_project is None:
+                        raise RuntimeError("Project Subagent runtime is no longer available")
+                    (
+                        active_member,
+                        active_member_config,
+                        active_capabilities,
+                        active_is_leader,
+                        active_run_frozen,
+                    ) = await _project_member_runtime_snapshot(
+                        db,
+                        project=active_project,
+                        agent_id=agent.id,
+                        project_run_id=active_project_run_id,
+                    )
+                    _apply_project_runtime_to_session(
+                        child,
+                        member=active_member,
+                        member_config=active_member_config,
+                        capabilities=active_capabilities,
+                        is_leader=active_is_leader,
+                        frozen=active_run_frozen,
+                    )
+                    await db.commit()
                 ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
                 if recovering:
                     from app.services.turn_recovery import (
@@ -1630,6 +1845,8 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                 model_name = run.model
                 include_soul = run.soul
                 include_memory = run.memory
+                member_runtime_config = dict(dict(child.im_config or {}).get("member_config_snapshot") or {})
+                max_tool_rounds_override = member_runtime_config.get("max_tool_rounds")
                 from app.services.agent_runtime_workspace import resolve_agent_runtime_workspace
 
                 runtime_workspace = resolve_agent_runtime_workspace(
@@ -1698,6 +1915,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     broadcast_web=True,
                     runtime_session=child,
                     runtime_workspace=runtime_workspace,
+                    max_tool_rounds_override=max_tool_rounds_override,
                 )
             if not str(reply or "").strip() and await _park_subagent_confirmation(
                 run_id,
@@ -1767,6 +1985,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                             broadcast_web=False,
                             runtime_session=child,
                             runtime_workspace=runtime_workspace,
+                            max_tool_rounds_override=max_tool_rounds_override,
                         )
                     corrected_text = str(corrected_reply or "").strip()
                     corrected_failed = (
@@ -2988,7 +3207,7 @@ async def _dispatch_project_leader_batch(
     makes the Leader input idempotent.
     """
     from app.models.project import Project, ProjectMemberSnapshot, ProjectRun
-    from app.services.project_service import add_event, freeze_run_members
+    from app.services.project_service import add_event, freeze_run_members, project_execution_user_id
 
     cutoff = datetime.now(UTC) - timedelta(seconds=max(0.0, debounce_seconds))
     async with async_session() as db:
@@ -3083,12 +3302,23 @@ async def _dispatch_project_leader_batch(
                 project.id,
                 related_work_item_ids,
             )
+            source_snapshot_run_id = None
+            for source_row in source_rows:
+                for raw_run_id in _message_meta(source_row).get("source_project_run_ids", []):
+                    try:
+                        source_snapshot_run_id = uuid.UUID(str(raw_run_id))
+                    except (TypeError, ValueError):
+                        continue
+                    break
+                if source_snapshot_run_id is not None:
+                    break
             project_run = ProjectRun(
                 tenant_id=project.tenant_id,
                 project_id=project.id,
                 work_item_id=work_item_id,
                 agent_id=leader.agent_id,
                 initiated_by_user_id=project.owner_user_id,
+                execution_user_id=project_execution_user_id(project),
                 status="queued",
                 trigger_type="leader_reply_batch",
                 input={
@@ -3113,7 +3343,12 @@ async def _dispatch_project_leader_batch(
             )
             db.add(project_run)
             await db.flush()
-            await freeze_run_members(db, project, project_run)
+            await freeze_run_members(
+                db,
+                project,
+                project_run,
+                source_run_id=source_snapshot_run_id,
+            )
             for row in source_rows:
                 row.message_meta = {
                     **_message_meta(row),
@@ -3138,6 +3373,7 @@ async def _dispatch_project_leader_batch(
             else []
         )
         source_member_by_agent = {member.agent_id: member for member in source_members}
+        batch_execution_user_id = project_run.execution_user_id or project.owner_user_id
         await db.commit()
 
     async with async_session() as db:
@@ -3206,7 +3442,12 @@ async def _dispatch_project_leader_batch(
                 .where(
                     SubagentRun.parent_session_id == group_session_id,
                     SubagentRun.project_member_id == leader.id,
-                    SubagentRun.origin_tool_call_id == _project_member_origin_tool_call_id(leader),
+                    SubagentRun.origin_tool_call_id
+                    == _project_member_origin_tool_call_id(
+                        leader,
+                        batch_execution_user_id,
+                        project.owner_user_id,
+                    ),
                 )
                 .order_by(SubagentRun.id)
                 .limit(1)
@@ -3230,9 +3471,13 @@ async def _dispatch_project_leader_batch(
     if existing_child is None:
         durable_run, created = await create_subagent(
             agent_id=leader.agent_id,
-            execution_user_id=project.owner_user_id,
+            execution_user_id=batch_execution_user_id,
             parent_session_id=str(group_session_id),
-            origin_tool_call_id=_project_member_origin_tool_call_id(leader),
+            origin_tool_call_id=_project_member_origin_tool_call_id(
+                leader,
+                batch_execution_user_id,
+                project.owner_user_id,
+            ),
             task=task,
             mode="async",
             fork=True,
@@ -3262,7 +3507,7 @@ async def _dispatch_project_leader_batch(
                 parent_session_id=str(group_session_id),
                 subagent_id=str(existing_child.id),
                 message=task,
-                execution_user_id=existing_child.execution_user_id,
+                execution_user_id=batch_execution_user_id,
                 origin_tool_call_id=f"project-leader-batch:{batch_id}",
                 project_run_id=project_run.id,
                 input_metadata=input_metadata,
@@ -3504,6 +3749,7 @@ async def enqueue_project_a2a_run(
                 work_item_id=resolved_work_item_id,
                 agent_id=to_agent_id,
                 initiated_by_user_id=execution_user_id,
+                execution_user_id=execution_user_id,
                 status="queued",
                 trigger_type="a2a",
                 input={
@@ -3527,7 +3773,12 @@ async def enqueue_project_a2a_run(
             )
             db.add(run)
             await db.flush()
-            await freeze_run_members(db, project, run)
+            await freeze_run_members(
+                db,
+                project,
+                run,
+                source_run_id=parent_project_run_id,
+            )
         else:
             run.input = {
                 **dict(run.input or {}),
@@ -3649,6 +3900,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         runtime_ready = project is not None and (
             project.status == "running"
             or (project_run.trigger_type == "leader_kickoff" and project.status == "initializing")
+            or (project_run.trigger_type == "group_leader_message" and project.status == "planning")
         )
         if project is not None and not runtime_ready:
             return {"status": "paused"}
@@ -3670,7 +3922,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
             await db.commit()
             return {"status": "failed", "error": project_run.error}
         agent_id = member.agent_id
-        execution_user_id = project.owner_user_id
+        execution_user_id = project_run.execution_user_id or project.owner_user_id
         if project_run.trigger_type == "group_leader_message":
             group_anchor = await db.get(ChatMessage, anchor_id)
             explicit_mentions = (
@@ -3700,7 +3952,12 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 .where(
                     SubagentRun.parent_session_id == parent.id,
                     SubagentRun.project_member_id == member.id,
-                    SubagentRun.origin_tool_call_id == _project_member_origin_tool_call_id(member),
+                    SubagentRun.origin_tool_call_id
+                    == _project_member_origin_tool_call_id(
+                        member,
+                        execution_user_id,
+                        project.owner_user_id,
+                    ),
                 )
                 .order_by(SubagentRun.id)
                 .limit(1)
@@ -3721,6 +3978,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         runtime_ready = current_project is not None and (
             current_project.status == "running"
             or (project_run.trigger_type == "leader_kickoff" and current_project.status == "initializing")
+            or (project_run.trigger_type == "group_leader_message" and current_project.status == "planning")
         )
         if not runtime_ready:
             return {"status": "paused" if current_project is not None else "gone"}
@@ -3732,7 +3990,11 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 agent_id=agent_id,
                 execution_user_id=execution_user_id,
                 parent_session_id=str(group_session_id),
-                origin_tool_call_id=_project_member_origin_tool_call_id(member),
+                origin_tool_call_id=_project_member_origin_tool_call_id(
+                    member,
+                    execution_user_id,
+                    project.owner_user_id,
+                ),
                 task=task,
                 mode="async",
                 fork=True,
@@ -4005,6 +4267,10 @@ async def _pending_project_dispatch_batch(
                     and_(
                         Project.status == "initializing",
                         ProjectRun.trigger_type == "leader_kickoff",
+                    ),
+                    and_(
+                        Project.status == "planning",
+                        ProjectRun.trigger_type == "group_leader_message",
                     ),
                 ),
                 ProjectRun.status.in_(["queued", "running"]),

@@ -201,7 +201,7 @@ async def instantiate_project_agents_from_template(
 
 
 async def export_project_capabilities_for_template(db: AsyncSession, project: Project) -> list[dict]:
-    """Export portable bindings only; private MCP configuration and overrides never cross."""
+    """Export neutral Tool/MCP dependencies; Skill files use their own package."""
 
     agent_ids = list(
         (
@@ -236,15 +236,11 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
     )
     exported: list[dict] = []
     for binding in bindings:
-        if binding.capability_id is None:
+        if binding.capability_id is None or binding.capability_type == "skill":
             continue
         if binding.capability_type == "mcp":
             server = await db.get(MCPServer, binding.capability_id)
             if server is None or server.tenant_id is not None:
-                continue
-        elif binding.capability_type == "skill":
-            skill = await db.get(Skill, binding.capability_id)
-            if skill is None or skill.tenant_id not in {None, project.tenant_id}:
                 continue
         elif binding.capability_type == "tool":
             tool = await db.get(Tool, binding.capability_id)
@@ -322,7 +318,7 @@ async def instantiate_project_capabilities_from_template(
             inherited_agent_id = created_agents[index][0].id
         elif item.get("digital_employee_index") is not None:
             raise ProjectTemplateSnapshotError("Shared project capability cannot have a digital employee owner")
-        await add_capability(
+        binding = await add_capability(
             db,
             project,
             ProjectCapabilityCreate(
@@ -337,6 +333,9 @@ async def instantiate_project_capabilities_from_template(
             ),
             actor_user_id=owner.id,
         )
+        from app.services.project_member_runtime import sync_project_capability_assignment
+
+        await sync_project_capability_assignment(db, project, binding)
 
 
 def _agent_from_template(

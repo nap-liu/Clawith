@@ -27,6 +27,9 @@ class Project(Base):
     owner_user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    execution_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     template_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("project_templates.id", ondelete="SET NULL"), nullable=True
     )
@@ -239,6 +242,9 @@ class ProjectRun(Base):
     )
     initiated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    execution_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True
     )
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="queued", server_default="queued")
     trigger_type: Mapped[str] = mapped_column(String(30), nullable=False, default="manual", server_default="manual")

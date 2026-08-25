@@ -26,7 +26,6 @@ import {
   IconCodeDots,
   IconFile,
   IconFileText,
-  IconFolder,
   IconFilter,
   IconGitBranch,
   IconHistory,
@@ -52,15 +51,19 @@ import {
 
 import { useToast } from "../../components/Toast/ToastProvider";
 import { Drawer } from "../../components/Dialog/DialogProvider";
-import MultiSelectDropdown from "../../components/ui/MultiSelectDropdown";
+import OrgMemberAccessPicker, {
+  type AgentAccessUser,
+} from "../../components/OrgMemberAccessPicker";
 import Pagination from "../../components/Pagination";
 import SessionViewerDrawer, {
   type SessionViewerGroupConfig,
   type SessionViewerTarget,
 } from "../../components/SessionViewerDrawer";
+import i18n from "../../i18n";
 import { enterpriseApi } from "../../services/api";
 import { projectsApi } from "../../services/projects";
-import { useAuthStore } from "../../stores";
+import ToolsTab from "../../pages/agent-detail/tabs/ToolsTab";
+import SkillsTab from "../../pages/agent-detail/tabs/SkillsTab";
 import { projectUserFacingCopy } from "./projectUserFacingCopy";
 import {
   Button,
@@ -85,6 +88,7 @@ import {
   ToggleSwitch,
 } from "./components/ProjectUI";
 import type {
+  ProjectCapabilityOption,
   ProjectOwnedAgent,
   ProjectOwnedAgentPromotion,
   ProjectSummary,
@@ -93,11 +97,9 @@ import type {
 import {
   A2AMeshGraph,
   ProjectGraphLegend,
-  SnapshotLineageGraph,
   WorkDependencyGraph,
 } from "./components/ProjectGraphs";
 import ProjectFileWorkspace from "./components/ProjectFileWorkspace";
-import ProjectGitDiffViewer from "./components/ProjectGitDiffViewer";
 import ProjectEventContent, {
   ProjectEventLabel,
 } from "./components/ProjectEventContent";
@@ -114,6 +116,7 @@ import {
 } from "./projectSessionRouting";
 import {
   normalizeProjectWorkspaceUrl,
+  projectWorkItemCompatibilityTargetFromUrl,
   projectWorkItemUrlPatch,
   projectWorkspaceTabUrlPatch,
   projectWorkspaceTabFromUrl,
@@ -231,12 +234,7 @@ type WorkspaceData = {
 };
 
 type WorkspaceDomain =
-  | "overview"
-  | "work"
-  | "collaboration"
-  | "delivery"
-  | "team"
-  | "activity";
+  "overview" | "work" | "collaboration" | "delivery" | "team" | "activity";
 
 type WorkspaceDomainDefinition = {
   id: WorkspaceDomain;
@@ -299,7 +297,6 @@ const WORKSPACE_DOMAINS: WorkspaceDomainDefinition[] = [
         id: "capabilities",
         labelKey: "projectWorkspaceNav.tabs.capabilities",
       },
-      { id: "matrix", labelKey: "projectWorkspaceNav.tabs.matrix" },
     ],
   },
   {
@@ -354,7 +351,7 @@ const dateLabel = (value: unknown): string => {
   const date = new Date(String(value));
   return Number.isNaN(date.getTime())
     ? String(value)
-    : new Intl.DateTimeFormat("zh-CN", {
+    : new Intl.DateTimeFormat(i18n.language, {
         month: "short",
         day: "numeric",
         hour: "2-digit",
@@ -363,6 +360,11 @@ const dateLabel = (value: unknown): string => {
 };
 const compactId = (value: string): string =>
   value.length > 12 ? value.slice(0, 8) : value;
+const fileSizeLabel = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+};
 const statusLabel = (
   status: string,
   t: ReturnType<typeof useTranslation>["t"],
@@ -396,52 +398,54 @@ const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
   {
     name: "project_list_files",
     label: "View workspace",
-    description:
-      "Review project deliverables and their versions in the workspace.",
+    description: "Review project deliverables and their versions.",
     participant: true,
   },
   {
     name: "project_read_file",
     label: "Read workspace file",
-    description: "Read a committed project text deliverable.",
+    description: "Read a project text file. The file must already exist.",
     participant: true,
   },
   {
     name: "project_update_work_item",
     label: "Update work item",
-    description: "Update assigned work items.",
+    description: "Update the status, progress, or evidence of an existing work item.",
     descriptionKey: "projectTerminology.workspace.ownerToolDescription",
     participant: true,
   },
   {
     name: "project_write_file",
     label: "Write workspace file",
-    description: "Save a workspace file and record its version.",
+    description: "Save a file at a specified path in the project workspace.",
     participant: true,
   },
   {
     name: "project_message_agent",
     label: "Contact Digital Employee",
     description:
-      "Send a collaboration message to a selected Project Digital Employee.",
+      "Start a collaboration request with one active member of the current project.",
     participant: true,
   },
   {
     name: "project_update_plan",
     label: "Update project plan",
-    description: "Update the goal, success criteria, and current progress.",
+    description:
+      "Update the goal, success criteria, and current progress. Available to the execution lead.",
     participant: false,
   },
   {
     name: "project_create_work_item",
     label: "Create work item",
-    description: "Create and assign a new work item.",
+    description:
+      "Create and assign a work item. Available to the execution lead.",
     participant: false,
   },
   {
     name: "project_set_member_enabled",
     label: "Manage project members",
-    description: "Enable or disable project members.",
+    description:
+      "Activate or deactivate a member other than the execution lead. Available to the execution lead.",
     descriptionKey:
       "projectTerminology.workspace.memberLifecycleToolDescription",
     participant: false,
@@ -449,27 +453,29 @@ const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
   {
     name: "project_set_capability_enabled",
     label: "Manage project capabilities",
-    description: "Enable or disable an existing project capability.",
+    description:
+      "Enable or disable a capability already added to the project. Available to the execution lead.",
     participant: false,
   },
   {
     name: "project_create_milestone",
     label: "Create delivery milestone",
-    description: "Record a recoverable delivery version.",
+    description:
+      "Record the current delivery state for later review or recovery. Requires an existing project result.",
     participant: false,
   },
   {
     name: "project_set_status",
     label: "Update project status",
     description:
-      "Pause, wait, complete, or stop the project with an auditable status transition.",
+      "Set the project to waiting, paused, completed, or failed. Available to the execution lead.",
     participant: false,
   },
   {
     name: "project_restore_commit",
-    label: "Restore as a new commit",
+    label: "Restore project version",
     description:
-      "Restore an earlier version as a new commit without resetting history.",
+      "Create a new current version from an earlier version while retaining existing history.",
     participant: false,
   },
 ] as const;
@@ -585,8 +591,8 @@ function runAgentName(
 function sameGitCommit(left: string, right: string): boolean {
   return Boolean(
     left &&
-      right &&
-      (left === right || left.startsWith(right) || right.startsWith(left)),
+    right &&
+    (left === right || left.startsWith(right) || right.startsWith(left)),
   );
 }
 
@@ -675,7 +681,6 @@ function SectionHeading({
 
 export default function ProjectWorkspacePage() {
   const { t } = useTranslation();
-  const currentUser = useAuthStore((state) => state.user);
   const routeParams = useParams<{ projectId?: string; id?: string }>();
   const projectId = routeParams.projectId || routeParams.id || "";
   const [searchParams, setSearchParams] = useSearchParams();
@@ -698,6 +703,7 @@ export default function ProjectWorkspacePage() {
   );
   const [sessionTarget, setSessionTarget] =
     useState<ProjectSessionTarget | null>(null);
+  const canEdit = data ? data.project.access_role !== "view" : false;
   const refreshingRef = useRef(0);
   useEffect(() => {
     if (normalizedSearchParams.toString() === searchParams.toString()) return;
@@ -1049,10 +1055,10 @@ export default function ProjectWorkspacePage() {
   }, [load]);
   const fastRefresh = Boolean(
     data &&
-      (["initializing", "running"].includes(data.project.status) ||
-        data.runs.some((run) =>
-          ["queued", "running"].includes(text(run, "status")),
-        )),
+    (["initializing", "running"].includes(data.project.status) ||
+      data.runs.some((run) =>
+        ["queued", "running"].includes(text(run, "status")),
+      )),
   );
   useEffect(() => {
     const refresh = () => {
@@ -1246,10 +1252,12 @@ export default function ProjectWorkspacePage() {
             : traceValue(records, "session_mode", "mode"),
         kind,
         readOnly:
-          source.member_enabled === false || source.is_enabled === false,
+          !canEdit ||
+          source.member_enabled === false ||
+          source.is_enabled === false,
       });
     },
-    [data, openSessionTarget, t, toast],
+    [canEdit, data, openSessionTarget, t, toast],
   );
   const groupMembers = useMemo(() => {
     const sources = [
@@ -1350,6 +1358,7 @@ export default function ProjectWorkspacePage() {
     data.commits[0] ||
     null;
   const activeDomain = workspaceDomainForTab(tab);
+  const isOwner = data.project.access_role === "owner";
   const selectWorkItem = (id: string) =>
     updateWorkspaceUrl(
       projectWorkItemUrlPatch(id || undefined, selectedWorkItemId || undefined),
@@ -1387,6 +1396,7 @@ export default function ProjectWorkspacePage() {
             onOpenSession={openSession}
             runAction={runAction}
             busyAction={busyAction}
+            canManage={canEdit}
           />
         ) : (
           <WorkBoard
@@ -1397,6 +1407,7 @@ export default function ProjectWorkspacePage() {
             onSelect={selectWorkItem}
             runAction={runAction}
             busyAction={busyAction}
+            canManage={canEdit}
           />
         );
       case "group":
@@ -1407,6 +1418,9 @@ export default function ProjectWorkspacePage() {
             members={data.members}
             groupSession={data.groupSession}
             groupConfig={groupConfig}
+            canSend={
+              canEdit && ["planning", "running"].includes(data.project.status)
+            }
           />
         );
       case "mesh":
@@ -1428,6 +1442,7 @@ export default function ProjectWorkspacePage() {
             projectAgents={data.projectAgents}
             runAction={runAction}
             busyAction={busyAction}
+            canWrite={canEdit}
           />
         );
       case "milestones":
@@ -1445,6 +1460,7 @@ export default function ProjectWorkspacePage() {
             onOpenSession={openSession}
             runAction={runAction}
             busyAction={busyAction}
+            canManage={canEdit}
           />
         );
       case "runs":
@@ -1457,6 +1473,7 @@ export default function ProjectWorkspacePage() {
             onOpenSession={openSession}
             runAction={runAction}
             busyAction={busyAction}
+            canManage={canEdit}
           />
         );
       case "members":
@@ -1465,20 +1482,16 @@ export default function ProjectWorkspacePage() {
             projectId={projectId}
             projectAgents={data.projectAgents}
             members={data.members}
-            runs={data.runs}
-            canManage={
-              Boolean(
-                currentUser?.id && data.project.owner_id === currentUser.id,
-              ) ||
-              (!data.project.owner_id && data.project.editable !== false)
-            }
+            capabilities={data.capabilities}
+            policies={data.policies}
+            events={data.events}
+            canManage={isOwner}
             selectedId={selectedMemberId}
             onSelect={selectMember}
             onOpenWorkspace={(path) =>
               navigateWorkspace("files", { file: path })
             }
             onNavigate={navigateWorkspace}
-            onOpenSession={openSession}
             runAction={runAction}
             busyAction={busyAction}
           />
@@ -1486,17 +1499,14 @@ export default function ProjectWorkspacePage() {
       case "capabilities":
         return (
           <CapabilitiesPanel
-            projectId={projectId}
             members={data.members}
             capabilities={data.capabilities}
             policies={data.policies}
-            runAction={runAction}
-            busyAction={busyAction}
           />
         );
       case "matrix":
         return (
-          <CapabilityMatrix
+          <CapabilitiesPanel
             members={data.members}
             capabilities={data.capabilities}
             policies={data.policies}
@@ -1570,33 +1580,30 @@ export default function ProjectWorkspacePage() {
             )}
           </p>
         </div>
-        {currentUser?.id === data.project.owner_id &&
-          ["running", "paused"].includes(data.project.status) && (
-            <Button
-              variant={
-                data.project.status === "paused" ? "primary" : "secondary"
-              }
-              disabled={busyAction === "project-runtime"}
-              onClick={() =>
-                setRuntimeDialog(
-                  data.project.status === "paused" ? "resume" : "pause",
-                )
-              }
-            >
-              {busyAction === "project-runtime" ? (
-                <IconLoader2 className="project-workspace__spinner" size={16} />
-              ) : data.project.status === "paused" ? (
-                <IconPlayerPlay size={16} />
-              ) : (
-                <IconPlayerPause size={16} />
-              )}
-              {t(
-                data.project.status === "paused"
-                  ? "projectRuntime.resumeAction"
-                  : "projectRuntime.pauseAction",
-              )}
-            </Button>
-          )}
+        {isOwner && ["running", "paused"].includes(data.project.status) && (
+          <Button
+            variant={data.project.status === "paused" ? "primary" : "secondary"}
+            disabled={busyAction === "project-runtime"}
+            onClick={() =>
+              setRuntimeDialog(
+                data.project.status === "paused" ? "resume" : "pause",
+              )
+            }
+          >
+            {busyAction === "project-runtime" ? (
+              <IconLoader2 className="project-workspace__spinner" size={16} />
+            ) : data.project.status === "paused" ? (
+              <IconPlayerPlay size={16} />
+            ) : (
+              <IconPlayerPause size={16} />
+            )}
+            {t(
+              data.project.status === "paused"
+                ? "projectRuntime.resumeAction"
+                : "projectRuntime.pauseAction",
+            )}
+          </Button>
+        )}
         <Button
           variant="secondary"
           onClick={() => navigateWorkspace("policies")}
@@ -1660,7 +1667,7 @@ export default function ProjectWorkspacePage() {
                 className="project-workspace__domain-tabs"
               />
             )}
-            {data.project.status === "planning" && (
+            {data.project.status === "planning" && isOwner && (
               <section
                 className="project-workspace__planning-banner"
                 role="status"
@@ -1803,7 +1810,7 @@ export default function ProjectWorkspacePage() {
           t("projectTerminology.dynamicCopy.digitalEmployee")
         }
         target={sessionTarget}
-        interactive
+        interactive={canEdit}
         groupConfig={sessionTarget?.kind === "group" ? groupConfig : undefined}
         onClose={closeSessionTarget}
       />
@@ -2191,6 +2198,7 @@ function WorkBoard({
   onSelect,
   runAction,
   busyAction,
+  canManage,
 }: {
   projectId: string;
   items: RecordValue[];
@@ -2203,6 +2211,7 @@ function WorkBoard({
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canManage: boolean;
 }) {
   const { t } = useTranslation();
   const { get, update } = useContext(WorkspaceNavigationContext);
@@ -2313,17 +2322,19 @@ function WorkBoard({
               onChange={(next) => update({ workView: next })}
               ariaLabel={t("projectWorkspacePage.workItems.views.aria")}
             />
-            <Button
-              variant="primary"
-              onClick={() => setShowCreate((value) => !value)}
-            >
-              <IconPlus size={16} />
-              {t("projectWorkspacePage.workItems.actions.create")}
-            </Button>
+            {canManage && (
+              <Button
+                variant="primary"
+                onClick={() => setShowCreate((value) => !value)}
+              >
+                <IconPlus size={16} />
+                {t("projectWorkspacePage.workItems.actions.create")}
+              </Button>
+            )}
           </>
         }
       />
-      {showCreate && (
+      {canManage && showCreate && (
         <form className="project-workspace__action-panel" onSubmit={submit}>
           <header>
             <div>
@@ -2514,9 +2525,11 @@ function WorkBoard({
           title={t("projectWorkspacePage.workItems.empty.title")}
           description={t("projectWorkspacePage.workItems.empty.description")}
           action={
-            <Button variant="primary" onClick={() => setShowCreate(true)}>
-              {t("projectWorkspacePage.workItems.actions.createFirst")}
-            </Button>
+            canManage ? (
+              <Button variant="primary" onClick={() => setShowCreate(true)}>
+                {t("projectWorkspacePage.workItems.actions.createFirst")}
+              </Button>
+            ) : undefined
           }
         />
       )}
@@ -2528,12 +2541,14 @@ function GroupChatPanel({
   project,
   groupSession,
   groupConfig,
+  canSend,
 }: {
   projectId: string;
   project: ProjectSummary;
   members: RecordValue[];
   groupSession: RecordValue | null;
   groupConfig: SessionViewerGroupConfig;
+  canSend: boolean;
 }) {
   const { t } = useTranslation();
   const sessionId = text(
@@ -2559,6 +2574,7 @@ function GroupChatPanel({
               project: project.name,
             }),
           mode: "group",
+          readOnly: !canSend,
         }
       : null;
   return target ? (
@@ -2567,7 +2583,7 @@ function GroupChatPanel({
       agentId={agentId}
       agentName={t("projectWorkspacePage.session.projectChat")}
       target={target}
-      interactive
+      interactive={canSend}
       groupConfig={groupConfig}
       onClose={() => undefined}
     />
@@ -2707,13 +2723,6 @@ function MeshPanel({
     </>
   );
 }
-
-type WorkItemDetailTab =
-  | "context"
-  | "execution"
-  | "conversation"
-  | "changes"
-  | "review";
 
 function reportedPercent(...sources: RecordValue[]): number | null {
   for (const source of sources) {
@@ -2980,6 +2989,7 @@ function WorkItemDetail({
   onOpenSession,
   runAction,
   busyAction,
+  canManage,
 }: {
   projectId: string;
   items: RecordValue[];
@@ -2998,34 +3008,27 @@ function WorkItemDetail({
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canManage: boolean;
 }) {
   const { t } = useTranslation();
-  const { get, update } = useContext(WorkspaceNavigationContext);
   const item = selectedId
     ? items.find((entry) => text(entry, "id", "work_item_id") === selectedId)
     : undefined;
   const itemId = text(item || {}, "id", "work_item_id");
-  const requestedDetailTab = get("workItemTab") as WorkItemDetailTab;
-  const detailTab: WorkItemDetailTab = [
-    "context",
-    "execution",
-    "conversation",
-    "changes",
-    "review",
-  ].includes(requestedDetailTab)
-    ? requestedDetailTab
-    : "context";
   const [assignee, setAssignee] = useState("");
   const [status, setStatus] = useState("todo");
   const [priority, setPriority] = useState("medium");
-  const selectedEvidencePath = get("evidence");
+  const [editing, setEditing] = useState(false);
   const [associationPayload, setAssociationPayload] =
     useState<RecordValue | null>(null);
+
   useEffect(() => {
     setAssignee(text(item || {}, "assignee_agent_id"));
     setStatus(text(item || {}, "status") || "todo");
     setPriority(text(item || {}, "priority") || "medium");
+    setEditing(false);
   }, [item]);
+
   useEffect(() => {
     let active = true;
     setAssociationPayload(null);
@@ -3045,8 +3048,23 @@ function WorkItemDetail({
       active = false;
     };
   }, [itemId, projectId]);
-  const save = () =>
-    void runAction(
+
+  useEffect(() => {
+    if (!itemId) return;
+    const target = projectWorkItemCompatibilityTargetFromUrl(
+      new URLSearchParams(window.location.search),
+    );
+    if (!target || target.workItemId !== itemId) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(target.anchor)?.scrollIntoView({
+        block: "start",
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [associationPayload, itemId]);
+
+  const save = async () => {
+    const saved = await runAction(
       "save-work",
       () =>
         projectsApi.patchWorkItem(projectId, itemId, {
@@ -3056,6 +3074,9 @@ function WorkItemDetail({
         }),
       t("projectWorkspacePage.workItems.feedback.saved"),
     );
+    if (saved) setEditing(false);
+  };
+
   const startRun = () =>
     void runAction(
       "run-work",
@@ -3070,6 +3091,34 @@ function WorkItemDetail({
         }),
       t("projectWorkspacePage.workItems.feedback.runCreated"),
     );
+
+  const approve = () =>
+    void runAction(
+      "review-approve",
+      () =>
+        projectsApi.patchWorkItem(projectId, itemId, {
+          status: "done",
+        }),
+      t("projectWorkspacePage.workItems.feedback.approved"),
+    );
+
+  const returnForChanges = () =>
+    void runAction(
+      "review-return",
+      () =>
+        projectsApi.patchWorkItem(projectId, itemId, {
+          status: "blocked",
+        }),
+      t("projectWorkspacePage.workItems.feedback.returned"),
+    );
+
+  const cancelEdit = () => {
+    setAssignee(text(item || {}, "assignee_agent_id"));
+    setStatus(text(item || {}, "status") || "todo");
+    setPriority(text(item || {}, "priority") || "medium");
+    setEditing(false);
+  };
+
   const currentAssigneeId = text(item || {}, "assignee_agent_id");
   const memberOptions = members
     .filter(
@@ -3079,11 +3128,11 @@ function WorkItemDetail({
     )
     .map((member) => ({
       value: text(member, "agent_id"),
-      label: `${text(member, "name_snapshot", "agent_name")}${
-        member.is_enabled === false
+      label:
+        text(member, "name_snapshot", "agent_name") +
+        (member.is_enabled === false
           ? t("projectWorkspacePage.workItems.historicalAssigneeSuffix")
-          : ""
-      }`,
+          : ""),
       disabled: member.is_enabled === false,
     }));
   const statusOptions = [
@@ -3092,7 +3141,6 @@ function WorkItemDetail({
     { value: "in_progress", label: t("projectGraphs.status.in_progress") },
     { value: "review", label: t("projectGraphs.status.review") },
     { value: "blocked", label: t("projectGraphs.status.blocked") },
-    { value: "done", label: t("projectGraphs.status.done") },
   ];
   const priorityOptions = [
     { value: "low", label: t("projectWorkspacePage.priority.low") },
@@ -3109,10 +3157,13 @@ function WorkItemDetail({
   );
   const matchesWorkItem = (entry: RecordValue) => {
     if (!itemId) return false;
-    const records = traceRecords(entry);
     return (
-      traceValue(records, "work_item_id", "project_work_item_id", "task_id") ===
-      itemId
+      traceValue(
+        traceRecords(entry),
+        "work_item_id",
+        "project_work_item_id",
+        "task_id",
+      ) === itemId
     );
   };
   const explicitlyRelatedRunIds = new Set([
@@ -3154,25 +3205,46 @@ function WorkItemDetail({
       .map((event) => traceValue(traceRecords(event), "path", "file_path"))
       .filter(Boolean),
   );
-  const derivedCommits = commits.filter((commit) => {
-    if (matchesWorkItem(commit)) return true;
-    const commitId = text(commit, "commit", "hash", "commit_hash", "id");
-    return [...relatedEventCommitIds].some((eventCommitId) =>
-      sameGitCommit(commitId, eventCommitId),
-    );
-  });
   const relatedCommits = Array.isArray(associationPayload?.commits)
     ? pickCollection(associationPayload || {}, "commits")
-    : derivedCommits;
-  const derivedFiles = files.filter(
-    (file) =>
-      matchesWorkItem(file) ||
-      relatedEventPaths.has(text(file, "path", "id", "name")),
-  );
+    : commits.filter((commit) => {
+        if (matchesWorkItem(commit)) return true;
+        const commitId = text(commit, "commit", "hash", "commit_hash", "id");
+        return [...relatedEventCommitIds].some((eventCommitId) =>
+          sameGitCommit(commitId, eventCommitId),
+        );
+      });
   const relatedFiles = Array.isArray(associationPayload?.files)
     ? pickCollection(associationPayload || {}, "files")
-    : derivedFiles;
+    : files.filter(
+        (file) =>
+          matchesWorkItem(file) ||
+          relatedEventPaths.has(text(file, "path", "id", "name")),
+      );
   const dtoSessions = pickCollection(associationPayload || {}, "sessions");
+  const sessionSources = [
+    ...dtoSessions,
+    ...relatedRuns,
+    ...relatedEvents,
+  ].filter((entry, index, source) => {
+    const route = sessionRouteOf(entry, inferredSessionIntent(entry));
+    if (!route) return false;
+    const identity = [route.sessionId, route.anchorMessageId || ""].join(":");
+    return (
+      source.findIndex((candidate) => {
+        const candidateRoute = sessionRouteOf(
+          candidate,
+          inferredSessionIntent(candidate),
+        );
+        return (
+          candidateRoute &&
+          [candidateRoute.sessionId, candidateRoute.anchorMessageId || ""].join(
+            ":",
+          ) === identity
+        );
+      }) === index
+    );
+  });
   const dtoEvidenceRecords = Array.isArray(associationPayload?.evidence)
     ? (associationPayload.evidence as unknown[]).map((entry) =>
         typeof entry === "string" || typeof entry === "number"
@@ -3200,85 +3272,25 @@ function WorkItemDetail({
     dtoEvidenceRecords.length || Array.isArray(associationPayload?.evidence)
       ? dtoEvidenceRecords
       : derivedEvidenceRecords;
-  const evidenceItems = Array.from(
-    new Set(
-      evidenceRecords
-        .map((entry) => text(entry, "label", "description", "value", "path"))
-        .filter(Boolean),
-    ),
-  );
   const displayEvidenceRecords = evidenceRecords.filter(
     (entry, index, source) => {
       const label = text(entry, "label", "description", "value", "path");
       const route = sessionRouteOf(entry, inferredSessionIntent(entry));
       return (
         Boolean(label) &&
-        source.findIndex(
-          (candidate) =>
+        source.findIndex((candidate) => {
+          const candidateRoute = sessionRouteOf(
+            candidate,
+            inferredSessionIntent(candidate),
+          );
+          return (
             text(candidate, "label", "description", "value", "path") ===
-              label &&
-            sessionRouteOf(candidate, inferredSessionIntent(candidate))
-              ?.sessionId === route?.sessionId,
-        ) === index
+              label && candidateRoute?.sessionId === route?.sessionId
+          );
+        }) === index
       );
     },
   );
-  const sessionSources = [
-    ...dtoSessions,
-    ...relatedRuns,
-    ...relatedEvents,
-  ].filter((entry, index, source) => {
-    const intent = inferredSessionIntent(entry);
-    const route = sessionRouteOf(entry, intent);
-    const routeIdentity = route
-      ? [
-          route.sessionId,
-          route.anchorMessageId || "",
-          closestTraceValue(
-            traceRecords(entry),
-            "project_run_id",
-            "run_id",
-            "subagent_run_id",
-          ),
-        ].join(":")
-      : "";
-    return (
-      Boolean(route) &&
-      source.findIndex((candidate) => {
-        const candidateRoute = sessionRouteOf(
-          candidate,
-          inferredSessionIntent(candidate),
-        );
-        if (!candidateRoute) return false;
-        return (
-          [
-            candidateRoute.sessionId,
-            candidateRoute.anchorMessageId || "",
-            closestTraceValue(
-              traceRecords(candidate),
-              "project_run_id",
-              "run_id",
-              "subagent_run_id",
-            ),
-          ].join(":") === routeIdentity
-        );
-      }) === index
-    );
-  });
-  // Object details stay contextual and bounded. Canonical Activity and
-  // Delivery views own full-history browsing and pagination.
-  const visibleRelatedRuns = relatedRuns.slice(0, 5);
-  const visibleRelatedEvents = relatedEvents.slice(0, 5);
-  const visibleSessionSources = sessionSources.slice(0, 5);
-  const visibleRelatedFiles = relatedFiles.slice(0, 5);
-  const visibleRelatedCommits = relatedCommits.slice(0, 5);
-  const { pageItems: visibleEvidenceRecords, pagination: evidencePagination } =
-    useWorkspacePagination(
-      displayEvidenceRecords,
-      "workItemEvidence",
-      10,
-      [10, 20, 50],
-    );
   const acceptanceCriteria = Array.isArray(item?.acceptance_criteria)
     ? (item.acceptance_criteria as unknown[]).map(String).filter(Boolean)
     : text(item || {}, "acceptance", "acceptance_criteria")
@@ -3288,43 +3300,70 @@ function WorkItemDetail({
   const dependencyIds = Array.isArray(item?.dependency_ids)
     ? (item.dependency_ids as unknown[]).map(String)
     : [];
-  const latestRun = relatedRuns[0];
-  const latestCommit = relatedCommits[0];
-  const selectedFile =
-    relatedFiles.find(
-      (entry) => text(entry, "path", "id") === selectedEvidencePath,
-    ) || visibleRelatedFiles[0];
   const activeAssigneeName =
-    memberNameByAgentId.get(text(item || {}, "assignee_agent_id")) ||
-    t("projectGraphs.unassigned");
-  const detailTabs = [
-    {
-      value: "context" as const,
-      label: t("projectWorkspacePage.workItems.detail.tabs.context"),
-    },
-    {
-      value: "execution" as const,
-      label: t("projectWorkspacePage.workItems.detail.tabs.execution", {
-        runs: relatedRuns.length,
-        events: relatedEvents.length,
-      }),
-    },
-    {
-      value: "conversation" as const,
-      label: t("projectWorkspacePage.workItems.detail.tabs.conversation"),
-      count: sessionSources.length,
-    },
-    {
-      value: "changes" as const,
-      label: t("projectWorkspacePage.workItems.detail.tabs.changes"),
-      count: relatedCommits.length + relatedFiles.length,
-    },
-    {
-      value: "review" as const,
-      label: t("projectWorkspacePage.workItems.detail.tabs.review"),
-      count: evidenceItems.length,
-    },
-  ];
+    memberNameByAgentId.get(currentAssigneeId) || t("projectGraphs.unassigned");
+  const workStatus = text(item || {}, "status", "state") || "todo";
+
+  const discussionSources = sessionSources.filter((source) => {
+    const intent = inferredSessionIntent(source);
+    const route = sessionRouteOf(source, intent);
+    return intent === "a2a" || route?.kind === "group";
+  });
+  type ActivityPreview = {
+    kind: "execution" | "discussion" | "delivery";
+    source: RecordValue;
+    createdAt: string;
+    key: string;
+  };
+  const deliverySources = relatedFiles.length ? relatedFiles : relatedCommits;
+  const recentActivity: ActivityPreview[] = [
+    ...relatedRuns.slice(0, 1).map((source) => ({
+      kind: "execution" as const,
+      source,
+      createdAt: text(source, "updated_at", "created_at", "finished_at"),
+      key: ["execution", text(source, "id", "run_id")].join(":"),
+    })),
+    ...discussionSources.slice(0, 1).map((source) => {
+      const route = sessionRouteOf(source, inferredSessionIntent(source));
+      return {
+        kind: "discussion" as const,
+        source,
+        createdAt: text(source, "updated_at", "created_at"),
+        key: [
+          "discussion",
+          route?.sessionId || "",
+          route?.anchorMessageId || "",
+        ].join(":"),
+      };
+    }),
+    ...deliverySources.slice(0, 1).map((source) => ({
+      kind: "delivery" as const,
+      source,
+      createdAt: text(source, "updated_at", "created_at"),
+      key: [
+        "delivery",
+        text(source, "path", "commit", "hash", "commit_hash", "id"),
+      ].join(":"),
+    })),
+  ]
+    .sort(
+      (left, right) =>
+        new Date(right.createdAt || 0).getTime() -
+        new Date(left.createdAt || 0).getTime(),
+    )
+    .slice(0, 3);
+
+  const nextKey = !currentAssigneeId
+    ? "unassigned"
+    : ["in_progress", "running"].includes(workStatus)
+      ? "inProgress"
+      : workStatus === "blocked"
+        ? "blocked"
+        : workStatus === "review"
+          ? "review"
+          : ["done", "completed"].includes(workStatus)
+            ? "done"
+            : "todo";
 
   if (!item)
     return (
@@ -3336,689 +3375,120 @@ function WorkItemDetail({
       />
     );
 
-  let detailContent: ReactNode = null;
-  if (item && detailTab === "context")
-    detailContent = (
-      <div className="project-workspace__item-context-grid">
-        <section className="project-workspace__item-copy">
-          <span className="project-workspace__item-kicker">
-            {t("projectWorkspacePage.workItems.detail.context.taskDescription")}
-          </span>
-          <h3>
-            {t("projectWorkspacePage.workItems.detail.context.deliverable")}
-          </h3>
-          <p>
-            {text(item, "description", "context") ||
-              t("projectWorkspacePage.workItems.noDescription")}
-          </p>
-          <div className="project-workspace__item-trace-note">
-            <strong>
-              {t(
-                "projectWorkspacePage.workItems.detail.context.inputsDependencies",
-              )}
-            </strong>
-            {dependencyIds.length ? (
-              <ul>
-                {dependencyIds.map((id) => {
-                  const dependency = items.find(
-                    (entry) => text(entry, "id", "work_item_id") === id,
-                  );
-                  return (
-                    <li key={id}>
-                      <code>{compactId(id)}</code>
-                      <span>
-                        {text(dependency || {}, "title", "name") ||
-                          t(
-                            "projectWorkspacePage.workItems.detail.context.relatedWorkItem",
-                          )}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : (
-              <p>
-                {t(
-                  "projectWorkspacePage.workItems.detail.context.noDependencies",
-                )}
-              </p>
+  const openActivity = (activity: ActivityPreview) => {
+    if (activity.kind === "delivery") {
+      const path = text(activity.source, "path");
+      if (path) {
+        onNavigate("files", { file: path });
+        return;
+      }
+      onNavigate("git", {
+        commit: text(activity.source, "commit", "hash", "commit_hash", "id"),
+      });
+      return;
+    }
+    const intent = inferredSessionIntent(activity.source);
+    if (sessionRouteOf(activity.source, intent)) {
+      onOpenSession(activity.source, text(item, "title", "name"), intent);
+      return;
+    }
+    onNavigate("runs");
+  };
+
+  const nextActions = (() => {
+    if (!canManage) {
+      if (["done", "completed"].includes(workStatus))
+        return (
+          <Button variant="primary" onClick={() => onNavigate("files")}>
+            {t(
+              "projectWorkspacePage.workItems.detail.singlePage.actions.viewDelivery",
             )}
-          </div>
-        </section>
-        <section className="project-workspace__item-criteria">
-          <span className="project-workspace__item-kicker">
-            ACCEPTANCE CRITERIA
-          </span>
-          <h3>{t("projectWorkspacePage.workItems.fields.acceptance")}</h3>
-          {acceptanceCriteria.length ? (
-            <ol>
-              {acceptanceCriteria.map((criterion, index) => (
-                <li key={`${criterion}-${index}`}>
-                  <IconCircleCheck size={16} />
-                  <span>
-                    <strong>{criterion}</strong>
-                    <small>
-                      {text(item, "status") === "done"
-                        ? t(
-                            "projectWorkspacePage.workItems.detail.context.verifyEvidence",
-                          )
-                        : t(
-                            "projectWorkspacePage.workItems.detail.context.awaitEvidence",
-                          )}
-                    </small>
-                  </span>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <ProjectEmptyState
-              title={t("projectWorkspacePage.workItems.noAcceptance")}
-              description={t(
-                "projectWorkspacePage.workItems.detail.context.defineAcceptance",
-              )}
-            />
-          )}
-        </section>
-        <aside className="project-workspace__item-control">
-          <span className="project-workspace__item-kicker">
-            {t("projectWorkspacePage.workItems.detail.control.kicker")}
-          </span>
-          <h3>{t("projectWorkspacePage.workItems.detail.control.title")}</h3>
-          <ProjectField label={t("projectTerminology.owner")}>
-            <ProjectSelect
-              value={assignee}
-              options={memberOptions}
-              onChange={setAssignee}
-              ariaLabel={t("projectTerminology.projectOwner")}
-              placeholder={t("projectGraphs.unassigned")}
-            />
-          </ProjectField>
-          <ProjectField
-            label={t("projectWorkspacePage.workItems.fields.status")}
-          >
-            <ProjectSelect
-              value={status}
-              options={statusOptions}
-              onChange={setStatus}
-              ariaLabel={t("projectWorkspacePage.workItems.fields.status")}
-            />
-          </ProjectField>
-          <ProjectField
-            label={t("projectWorkspacePage.workItems.fields.priority")}
-          >
-            <ProjectSelect
-              value={priority}
-              options={priorityOptions}
-              onChange={setPriority}
-              ariaLabel={t("projectWorkspacePage.workItems.fields.priority")}
-            />
-          </ProjectField>
-          <footer>
-            <Button
-              variant="secondary"
-              onClick={startRun}
-              disabled={busyAction === "run-work"}
-            >
-              {busyAction === "run-work" && (
-                <IconLoader2 className="project-workspace__spinner" size={16} />
-              )}
-              {assignee
-                ? t("projectWorkspacePage.workItems.actions.createRun")
-                : t("projectTerminology.workspace.runByOwner")}
-            </Button>
-            <Button
-              variant="primary"
-              onClick={save}
-              disabled={busyAction === "save-work"}
-            >
-              {busyAction === "save-work" ? (
-                <IconLoader2 className="project-workspace__spinner" size={16} />
-              ) : (
-                <IconDeviceFloppy size={16} />
-              )}
-              {t("common.save")}
-            </Button>
-          </footer>
-        </aside>
-      </div>
-    );
-  if (item && detailTab === "execution")
-    detailContent =
-      relatedRuns.length || relatedEvents.length ? (
-        <div className="project-workspace__item-execution">
-          {visibleRelatedRuns.map((run) => (
-            <article key={text(run, "id", "run_id")}>
-              <span className="project-workspace__item-event-icon">
-                <IconBolt size={17} />
-              </span>
-              <div>
-                <header>
-                  <strong>
-                    {text(obj(run.input), "objective") ||
-                      t(
-                        "projectWorkspacePage.workItems.detail.execution.runWorkItem",
-                      )}
-                  </strong>
-                  <StatusPill status={text(run, "status")} />
-                </header>
-                <ProjectEventContent
-                  content={
-                    text(obj(run.output), "summary", "result", "message") ||
-                    text(run, "error")
-                  }
-                  empty={t(
-                    "projectWorkspacePage.workItems.detail.execution.snapshotFrozen",
-                  )}
-                />
-                <footer>
-                  <span className="project-workspace__trace-agent">
-                    <b>
-                      {runAgentName(
-                        run,
-                        members,
-                        t("projectWorkspacePage.members.employeeNotRecorded"),
-                      ).slice(0, 1)}
-                    </b>
-                    {runAgentName(
-                      run,
-                      members,
-                      t("projectWorkspacePage.members.employeeNotRecorded"),
-                    )}
-                  </span>
-                  <code>{compactId(text(run, "id", "run_id"))}</code>
-                  <time>{dateLabel(run.started_at || run.created_at)}</time>
-                  <SessionButton
-                    source={run}
-                    onOpen={onOpenSession}
-                    intent={inferredSessionIntent(run)}
-                  />
-                </footer>
-              </div>
-            </article>
-          ))}
-          {visibleRelatedEvents.map((event) => (
-            <article key={text(event, "id", "event_id")}>
-              <span className="project-workspace__item-event-icon">
-                <IconActivityHeartbeat size={17} />
-              </span>
-              <div>
-                <header>
-                  <strong>
-                    <ProjectEventLabel
-                      eventType={text(event, "event_type", "type")}
-                    />
-                  </strong>
-                </header>
-                <ProjectEventContent
-                  eventType={text(event, "event_type", "type")}
-                  content={text(event, "detail", "summary", "message")}
-                />
-                <footer>
-                  <time>{dateLabel(event.created_at)}</time>
-                  <SessionButton source={event} onOpen={onOpenSession} />
-                </footer>
-              </div>
-            </article>
-          ))}
-          {(relatedRuns.length > visibleRelatedRuns.length ||
-            relatedEvents.length > visibleRelatedEvents.length) && (
-            <footer className="project-workspace__item-canonical-link">
-              <Button variant="secondary" onClick={() => onNavigate("runs")}>
-                {t("projectWorkspacePage.workItems.detail.execution.viewAll")}{" "}
-                <IconArrowRight size={14} />
-              </Button>
-            </footer>
-          )}
-        </div>
-      ) : (
-        <ProjectEmptyState
-          icon={<IconHistory size={22} />}
-          title={t(
-            "projectWorkspacePage.workItems.detail.execution.emptyTitle",
-          )}
-          description={t(
-            "projectWorkspacePage.workItems.detail.execution.emptyDescription",
-          )}
-        />
+          </Button>
+        );
+      if (recentActivity.length)
+        return (
+          <Button variant="primary" onClick={() => onNavigate("runs")}>
+            {t(
+              "projectWorkspacePage.workItems.detail.singlePage.actions.viewProgress",
+            )}
+          </Button>
+        );
+      return null;
+    }
+    if (!currentAssigneeId)
+      return (
+        <Button variant="primary" onClick={() => setEditing(true)}>
+          {t("projectWorkspacePage.workItems.detail.singlePage.actions.assign")}
+        </Button>
       );
-  if (item && detailTab === "conversation")
-    detailContent = sessionSources.length ? (
-      <div className="project-workspace__item-sessions">
-        {visibleSessionSources.map((source) => {
-          const intent = inferredSessionIntent(source);
-          const route = sessionRouteOf(source, intent);
-          const records = traceRecords(source);
-          const agentId =
-            route?.agentId ||
-            traceValue(
-              records,
-              "agent_id",
-              "execution_agent_id",
-              "subagent_agent_id",
-              "actor_agent_id",
-            );
-          const agentMember = members.find(
-            (member) => text(member, "agent_id") === agentId,
-          );
-          const sessionSource =
-            agentMember?.is_enabled === false
-              ? { ...source, member_enabled: false }
-              : source;
-          const kindLabel =
-            intent === "a2a"
-              ? t("projectWorkspacePage.session.a2a")
-              : route?.kind === "group"
-                ? t("projectWorkspacePage.session.projectChat")
-                : t("projectWorkspacePage.session.run");
-          return (
-            <article
-              key={[
-                route?.sessionId || "session",
-                route?.anchorMessageId || "tail",
-                closestTraceValue(
-                  records,
-                  "project_run_id",
-                  "run_id",
-                  "subagent_run_id",
-                ) || "run",
-              ].join(":")}
-            >
-              <span>
-                <IconMessageCircle size={18} />
-              </span>
-              <div>
-                <strong>
-                  {route?.kind === "group"
-                    ? kindLabel
-                    : `${memberNameByAgentId.get(agentId) || traceValue(records, "agent_name", "agent_name_snapshot") || t("projectTerminology.dynamicCopy.digitalEmployee")} · ${kindLabel}`}
-                </strong>
-                <p>
-                  {traceValue(
-                    records,
-                    "objective",
-                    "summary",
-                    "message",
-                    "task",
-                  ) ||
-                    t(
-                      "projectWorkspacePage.workItems.detail.conversation.preserved",
-                    )}
-                </p>
-                <code>{route?.sessionId}</code>
-              </div>
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  onOpenSession(
-                    sessionSource,
-                    `${text(item, "title")} · ${kindLabel}`,
-                    intent,
-                  )
-                }
-              >
-                {t("projectWorkspacePage.session.open")}
-              </Button>
-            </article>
-          );
-        })}
-        {sessionSources.length > visibleSessionSources.length && (
-          <footer className="project-workspace__item-canonical-link">
-            <Button variant="secondary" onClick={() => onNavigate("runs")}>
-              {t("projectWorkspacePage.workItems.detail.conversation.viewAll")}{" "}
-              <IconArrowRight size={14} />
-            </Button>
-          </footer>
-        )}
-      </div>
-    ) : (
-      <ProjectEmptyState
-        icon={<IconMessageCircle size={22} />}
-        title={t(
-          "projectWorkspacePage.workItems.detail.conversation.emptyTitle",
-        )}
-        description={t(
-          "projectWorkspacePage.workItems.detail.conversation.emptyDescription",
-        )}
-      />
-    );
-  if (item && detailTab === "changes")
-    detailContent =
-      relatedFiles.length || relatedCommits.length ? (
-        <div className="project-workspace__item-changes">
-          <aside>
-            <header>
-              <strong>
-                {t("projectWorkspacePage.workItems.detail.changes.fileCount", {
-                  count: relatedFiles.length,
-                })}
-              </strong>
-              <span>
-                {t(
-                  "projectWorkspacePage.workItems.detail.changes.commitCount",
-                  {
-                    count: relatedCommits.length,
-                  },
-                )}
-              </span>
-            </header>
-            {visibleRelatedFiles.map((file) => {
-              const path = text(file, "path", "id", "name");
-              return (
-                <Button
-                  variant="ghost"
-                  className={
-                    text(selectedFile || {}, "path", "id", "name") === path
-                      ? "is-active"
-                      : ""
-                  }
-                  key={path}
-                  onClick={() => update({ evidence: path })}
-                >
-                  <IconFile size={15} />
-                  <span>{path}</span>
-                  <code>
-                    {compactId(text(file, "commit_hash", "commit")) ||
-                      t("projectWorkspacePage.workItems.detail.changes.traced")}
-                  </code>
-                </Button>
-              );
-            })}
-            {visibleRelatedCommits.map((commit) => {
-              const commitId = text(
-                commit,
-                "commit",
-                "hash",
-                "commit_hash",
-                "id",
-              );
-              return (
-                <Button
-                  variant="ghost"
-                  key={commitId}
-                  onClick={() => onNavigate("git", { commit: commitId })}
-                >
-                  <IconBrandGit size={15} />
-                  <span>
-                    {text(commit, "message", "title") ||
-                      t(
-                        "projectWorkspacePage.workItems.detail.changes.projectCommit",
-                      )}
-                  </span>
-                  <code>{compactId(commitId)}</code>
-                </Button>
-              );
-            })}
-            {(relatedFiles.length > visibleRelatedFiles.length ||
-              relatedCommits.length > visibleRelatedCommits.length) && (
-              <Button variant="secondary" onClick={() => onNavigate("files")}>
-                {t("projectWorkspacePage.workItems.detail.changes.viewAll")}{" "}
-                <IconArrowRight size={14} />
-              </Button>
+    if (workStatus === "review")
+      return (
+        <>
+          <Button
+            variant="secondary"
+            disabled={busyAction === "review-return"}
+            onClick={returnForChanges}
+          >
+            {busyAction === "review-return" && (
+              <IconLoader2 className="project-workspace__spinner" size={16} />
             )}
-          </aside>
-          <section>
-            <header>
-              <code>
-                {text(
-                  selectedFile || latestCommit || {},
-                  "path",
-                  "message",
-                  "title",
-                ) ||
-                  t(
-                    "projectWorkspacePage.workItems.detail.changes.relatedChange",
-                  )}
-              </code>
-              <Button
-                variant="ghost"
-                onClick={() =>
-                  onNavigate(
-                    selectedFile ? "files" : "git",
-                    selectedFile
-                      ? { file: text(selectedFile, "path", "id") }
-                      : {
-                          commit: text(
-                            latestCommit || {},
-                            "commit",
-                            "hash",
-                            "commit_hash",
-                            "id",
-                          ),
-                        },
-                  )
-                }
-              >
-                {t(
-                  selectedFile
-                    ? "projectWorkspacePage.workItems.detail.changes.openWorkspace"
-                    : "projectWorkspacePage.workItems.detail.changes.viewGit",
-                )}{" "}
-                <IconArrowRight size={14} />
-              </Button>
-            </header>
-            {selectedFile ? (
-              <ProjectGitDiffViewer
-                projectId={projectId}
-                commit={
-                  text(selectedFile, "commit_hash", "commit") ||
-                  text(
-                    latestCommit || {},
-                    "commit",
-                    "hash",
-                    "commit_hash",
-                    "id",
-                  )
-                }
-                path={text(selectedFile, "path", "id", "name")}
-              />
+            {t(
+              "projectWorkspacePage.workItems.detail.singlePage.actions.return",
+            )}
+          </Button>
+          <Button
+            variant="primary"
+            disabled={busyAction === "review-approve"}
+            onClick={approve}
+          >
+            {busyAction === "review-approve" ? (
+              <IconLoader2 className="project-workspace__spinner" size={16} />
             ) : (
-              <div className="project-workspace__item-change-summary">
-                <IconBrandGit size={24} />
-                <strong>
-                  {text(latestCommit || {}, "message", "title") ||
-                    t(
-                      "projectWorkspacePage.workItems.detail.changes.relatedCommit",
-                    )}
-                </strong>
-                <code>
-                  {text(
-                    latestCommit || {},
-                    "commit",
-                    "hash",
-                    "commit_hash",
-                    "id",
-                  )}
-                </code>
-              </div>
+              <IconCircleCheck size={16} />
             )}
-          </section>
-        </div>
-      ) : (
-        <ProjectEmptyState
-          icon={<IconCodeDots size={22} />}
-          title={t("projectWorkspacePage.workItems.detail.changes.emptyTitle")}
-          description={t(
-            "projectWorkspacePage.workItems.detail.changes.emptyDescription",
-          )}
-          action={
-            <Button variant="secondary" onClick={() => onNavigate("files")}>
-              {t("projectWorkspacePage.workItems.detail.changes.openWorkspace")}
-            </Button>
-          }
-        />
+            {t(
+              "projectWorkspacePage.workItems.detail.singlePage.actions.approve",
+            )}
+          </Button>
+        </>
       );
-  if (item && detailTab === "review")
-    detailContent = (
-      <div className="project-workspace__item-review">
-        <section>
-          <div className="project-workspace__item-review-summary">
-            <span>
-              <IconShieldCheck size={22} />
-            </span>
-            <div>
-              <span className="project-workspace__item-kicker">
-                VERIFIABLE RESULT
-              </span>
-              <h3>
-                {t("projectWorkspacePage.workItems.detail.review.coverage")}
-              </h3>
-              <p>
-                {t("projectWorkspacePage.workItems.detail.review.summary", {
-                  criteria: acceptanceCriteria.length,
-                  runs: relatedRuns.length,
-                  evidence:
-                    evidenceItems.length +
-                    relatedCommits.length +
-                    relatedFiles.length,
-                })}
-              </p>
-            </div>
-            <StatusPill status={text(item, "status")} />
-          </div>
-          <div className="project-workspace__item-review-list">
-            {displayEvidenceRecords.length ? (
-              visibleEvidenceRecords.map((evidence, index) => (
-                <article
-                  key={`${text(evidence, "value", "label", "path")}-${index}`}
-                >
-                  <IconCircleCheck size={17} />
-                  <div>
-                    <ProjectEventContent
-                      content={text(
-                        evidence,
-                        "label",
-                        "description",
-                        "value",
-                        "path",
-                      )}
-                      maxChars={220}
-                    />
-                  </div>
-                  <SessionButton
-                    source={evidence}
-                    onOpen={onOpenSession}
-                    intent={inferredSessionIntent(evidence)}
-                  />
-                </article>
-              ))
-            ) : acceptanceCriteria.length ? (
-              acceptanceCriteria.map((criterion, index) => (
-                <article key={`${criterion}-${index}`}>
-                  <IconCircleCheck size={17} />
-                  <div>
-                    <ProjectEventContent content={criterion} maxChars={220} />
-                    <p>
-                      {relatedRuns.length || relatedCommits.length
-                        ? t(
-                            "projectWorkspacePage.workItems.detail.review.verifyResult",
-                          )
-                        : t(
-                            "projectWorkspacePage.workItems.detail.review.noResult",
-                          )}
-                    </p>
-                  </div>
-                </article>
-              ))
-            ) : (
-              <ProjectEmptyState
-                title={t(
-                  "projectWorkspacePage.workItems.detail.review.noEvidence",
-                )}
-                description={t(
-                  "projectWorkspacePage.workItems.detail.review.noEvidenceDescription",
-                )}
-              />
-            )}
-            {evidencePagination}
-          </div>
-        </section>
-        <aside>
-          <h3>{t("projectWorkspacePage.workItems.detail.review.approval")}</h3>
-          <dl>
-            <div>
-              <dt>{t("projectTerminology.owner")}</dt>
-              <dd>{activeAssigneeName}</dd>
-            </div>
-            <div>
-              <dt>
-                {t("projectWorkspacePage.workItems.detail.review.relatedRuns")}
-              </dt>
-              <dd>{relatedRuns.length}</dd>
-            </div>
-            <div>
-              <dt>
-                {t("projectWorkspacePage.workItems.detail.review.sessions")}
-              </dt>
-              <dd>{sessionSources.length}</dd>
-            </div>
-            <div>
-              <dt>
-                {t("projectWorkspacePage.workItems.detail.review.commitsFiles")}
-              </dt>
-              <dd>
-                {relatedCommits.length} / {relatedFiles.length}
-              </dd>
-            </div>
-            <div>
-              <dt>
-                {t("projectWorkspacePage.workItems.detail.review.latestRun")}
-              </dt>
-              <dd>
-                {latestRun ? compactId(text(latestRun, "id", "run_id")) : "—"}
-              </dd>
-            </div>
-            <div>
-              <dt>
-                {t("projectWorkspacePage.workItems.detail.review.lastUpdated")}
-              </dt>
-              <dd>{dateLabel(item.updated_at)}</dd>
-            </div>
-          </dl>
-          <footer>
-            <Button
-              variant="secondary"
-              disabled={busyAction === "review-return"}
-              onClick={() =>
-                void runAction(
-                  "review-return",
-                  () =>
-                    projectsApi.patchWorkItem(projectId, itemId, {
-                      status: "blocked",
-                    }),
-                  t("projectWorkspacePage.workItems.feedback.returned"),
-                )
-              }
-            >
-              {busyAction === "review-return" && (
-                <IconLoader2 className="project-workspace__spinner" size={16} />
-              )}
-              {t("projectWorkspacePage.workItems.actions.return")}
-            </Button>
-            <Button
-              variant="primary"
-              disabled={busyAction === "review-approve"}
-              onClick={() =>
-                void runAction(
-                  "review-approve",
-                  () =>
-                    projectsApi.patchWorkItem(projectId, itemId, {
-                      status: "done",
-                    }),
-                  t("projectWorkspacePage.workItems.feedback.approved"),
-                )
-              }
-            >
-              {busyAction === "review-approve" ? (
-                <IconLoader2 className="project-workspace__spinner" size={16} />
-              ) : (
-                <IconCircleCheck size={16} />
-              )}
-              {t("projectWorkspacePage.workItems.actions.approve")}
-            </Button>
-          </footer>
-        </aside>
-      </div>
+    if (["done", "completed"].includes(workStatus))
+      return (
+        <Button variant="primary" onClick={() => onNavigate("files")}>
+          {t(
+            "projectWorkspacePage.workItems.detail.singlePage.actions.viewDelivery",
+          )}
+        </Button>
+      );
+    if (["in_progress", "running"].includes(workStatus))
+      return (
+        <Button variant="primary" onClick={() => onNavigate("runs")}>
+          {t(
+            "projectWorkspacePage.workItems.detail.singlePage.actions.viewProgress",
+          )}
+        </Button>
+      );
+    if (workStatus === "blocked")
+      return (
+        <Button variant="primary" onClick={() => onNavigate("runs")}>
+          {t(
+            "projectWorkspacePage.workItems.detail.singlePage.actions.viewBlocker",
+          )}
+        </Button>
+      );
+    return (
+      <Button
+        variant="primary"
+        disabled={busyAction === "run-work"}
+        onClick={startRun}
+      >
+        {busyAction === "run-work" && (
+          <IconLoader2 className="project-workspace__spinner" size={16} />
+        )}
+        {t("projectWorkspacePage.workItems.detail.singlePage.actions.start")}
+      </Button>
     );
+  })();
 
   return (
     <>
@@ -4027,70 +3497,363 @@ function WorkItemDetail({
         aria-label={t("projectWorkspaceNav.tabs.work")}
       >
         <Button type="button" variant="ghost" onClick={() => onSelect("")}>
-          {t("projectWorkspaceNav.tabs.work")}
+          {t("projectWorkspacePage.workItems.detail.singlePage.back")}
         </Button>
-        <IconChevronRight size={14} />
-        <span title={text(item, "title", "name")}>
-          {text(item, "title", "name")}
-        </span>
       </nav>
       <section className="project-workspace__item-shell">
-        <header className="project-workspace__item-meta">
-          <StatusPill status={text(item, "status", "state")} />
+        <header className="project-workspace__item-heading">
           <div>
-            <small>{t("projectTerminology.owner")}</small>
-            <strong>{activeAssigneeName}</strong>
+            <h2>{text(item, "title", "name")}</h2>
+          </div>
+          {canManage && !editing && (
+            <Button variant="secondary" onClick={() => setEditing(true)}>
+              <IconSettings size={16} />
+              {t("projectWorkspacePage.workItems.detail.singlePage.edit")}
+            </Button>
+          )}
+        </header>
+
+        <dl className="project-workspace__item-properties">
+          <div>
+            <dt>{t("projectWorkspacePage.workItems.fields.status")}</dt>
+            <dd>
+              <StatusPill status={workStatus} />
+            </dd>
           </div>
           <div>
-            <small>{t("projectWorkspacePage.workItems.fields.priority")}</small>
-            <strong>
+            <dt>{t("projectTerminology.owner")}</dt>
+            <dd>{activeAssigneeName}</dd>
+          </div>
+          <div>
+            <dt>{t("projectWorkspacePage.workItems.fields.priority")}</dt>
+            <dd>
               {priorityOptions.find(
                 (option) => option.value === text(item, "priority"),
               )?.label ||
                 text(item, "priority") ||
                 t("projectWorkspacePage.priority.medium")}
-            </strong>
+            </dd>
           </div>
           <div>
-            <small>
-              {t("projectWorkspacePage.workItems.detail.meta.dependencies")}
-            </small>
-            <strong>
-              {dependencyIds.length
-                ? t(
-                    "projectWorkspacePage.workItems.detail.meta.dependencyCount",
-                    {
-                      count: dependencyIds.length,
-                    },
-                  )
-                : t("projectWorkspacePage.workItems.detail.meta.none")}
-            </strong>
+            <dt>{t("projectWorkspacePage.workItems.columns.updated")}</dt>
+            <dd>{dateLabel(item.updated_at)}</dd>
           </div>
-          <div>
-            <small>
-              {t("projectWorkspacePage.workItems.detail.review.latestRun")}
-            </small>
-            <code>
-              {latestRun ? compactId(text(latestRun, "id", "run_id")) : "—"}
-            </code>
+        </dl>
+
+        {editing ? (
+          <section className="project-workspace__item-edit-panel">
+            <div className="project-workspace__item-edit-grid">
+              <ProjectField label={t("projectTerminology.owner")}>
+                <ProjectSelect
+                  value={assignee}
+                  options={memberOptions}
+                  onChange={setAssignee}
+                  ariaLabel={t("projectTerminology.projectOwner")}
+                  placeholder={t("projectGraphs.unassigned")}
+                />
+              </ProjectField>
+              <ProjectField
+                label={t("projectWorkspacePage.workItems.fields.status")}
+              >
+                <ProjectSelect
+                  value={status}
+                  options={statusOptions}
+                  onChange={setStatus}
+                  ariaLabel={t("projectWorkspacePage.workItems.fields.status")}
+                />
+              </ProjectField>
+              <ProjectField
+                label={t("projectWorkspacePage.workItems.fields.priority")}
+              >
+                <ProjectSelect
+                  value={priority}
+                  options={priorityOptions}
+                  onChange={setPriority}
+                  ariaLabel={t(
+                    "projectWorkspacePage.workItems.fields.priority",
+                  )}
+                />
+              </ProjectField>
+            </div>
+            <footer>
+              <Button variant="secondary" onClick={cancelEdit}>
+                {t("projectWorkspacePage.workItems.detail.singlePage.cancel")}
+              </Button>
+              <Button
+                variant="primary"
+                disabled={busyAction === "save-work"}
+                onClick={() => void save()}
+              >
+                {busyAction === "save-work" ? (
+                  <IconLoader2
+                    className="project-workspace__spinner"
+                    size={16}
+                  />
+                ) : (
+                  <IconDeviceFloppy size={16} />
+                )}
+                {t("projectWorkspacePage.workItems.detail.singlePage.save")}
+              </Button>
+            </footer>
+          </section>
+        ) : (
+          <section className="project-workspace__item-next-step">
+            <div>
+              <strong>
+                {t("projectWorkspacePage.workItems.detail.singlePage.nextStep")}
+              </strong>
+              <p>
+                {t(
+                  "projectWorkspacePage.workItems.detail.singlePage.next." +
+                    nextKey,
+                )}
+              </p>
+            </div>
+            <div className="project-workspace__item-next-actions">
+              {nextActions}
+            </div>
+          </section>
+        )}
+
+        <div className="project-workspace__item-layout">
+          <div className="project-workspace__item-primary">
+            <section className="project-workspace__item-section">
+              <header>
+                <h3>
+                  {t("projectWorkspacePage.workItems.detail.singlePage.goal")}
+                </h3>
+              </header>
+              <p>
+                {projectUserFacingCopy(
+                  text(item, "description", "context") ||
+                    t("projectWorkspacePage.workItems.noDescription"),
+                  t,
+                )}
+              </p>
+            </section>
+
+            <section className="project-workspace__item-section">
+              <header>
+                <h3>
+                  {t(
+                    "projectWorkspacePage.workItems.detail.singlePage.requirements",
+                  )}
+                </h3>
+              </header>
+              {dependencyIds.length ? (
+                <ul className="project-workspace__item-dependencies">
+                  {dependencyIds.map((id) => {
+                    const dependency = items.find(
+                      (entry) => text(entry, "id", "work_item_id") === id,
+                    );
+                    return (
+                      <li key={id}>
+                        <Button variant="ghost" onClick={() => onSelect(id)}>
+                          <IconChevronRight size={15} />
+                          {text(dependency || {}, "title", "name") ||
+                            t(
+                              "projectWorkspacePage.workItems.detail.context.relatedWorkItem",
+                            )}
+                        </Button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p>
+                  {t(
+                    "projectWorkspacePage.workItems.detail.singlePage.noDependencies",
+                  )}
+                </p>
+              )}
+            </section>
+
+            <section
+              id="work-item-review"
+              className="project-workspace__item-section"
+            >
+              <header>
+                <h3>
+                  {t(
+                    "projectWorkspacePage.workItems.detail.singlePage.acceptanceTitle",
+                  )}
+                </h3>
+                <span>
+                  {acceptanceCriteria.length
+                    ? t(
+                        "projectWorkspacePage.workItems.detail.singlePage.acceptanceCount",
+                        { count: acceptanceCriteria.length },
+                      )
+                    : t("projectWorkspacePage.workItems.noAcceptance")}
+                </span>
+              </header>
+              {acceptanceCriteria.length ? (
+                <ul className="project-workspace__item-acceptance-list">
+                  {acceptanceCriteria.map((criterion, index) => (
+                    <li
+                      className={
+                        ["done", "completed"].includes(workStatus)
+                          ? "is-passed"
+                          : ""
+                      }
+                      key={criterion + "-" + index}
+                    >
+                      <IconCircleCheck size={17} />
+                      <span>{criterion}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>
+                  {t(
+                    "projectWorkspacePage.workItems.detail.context.defineAcceptance",
+                  )}
+                </p>
+              )}
+              <div className="project-workspace__item-evidence">
+                <strong>
+                  {displayEvidenceRecords.length
+                    ? t(
+                        "projectWorkspacePage.workItems.detail.singlePage.evidenceCount",
+                        { count: displayEvidenceRecords.length },
+                      )
+                    : t(
+                        "projectWorkspacePage.workItems.detail.singlePage.evidencePending",
+                      )}
+                </strong>
+                {displayEvidenceRecords.slice(0, 3).map((evidence, index) => (
+                  <article
+                    key={
+                      text(evidence, "label", "description", "value", "path") +
+                      "-" +
+                      index
+                    }
+                  >
+                    <ProjectEventContent
+                      content={text(
+                        evidence,
+                        "label",
+                        "description",
+                        "value",
+                        "path",
+                      )}
+                      maxChars={180}
+                    />
+                    <SessionButton
+                      source={evidence}
+                      onOpen={onOpenSession}
+                      intent={inferredSessionIntent(evidence)}
+                    />
+                  </article>
+                ))}
+              </div>
+            </section>
           </div>
-          <div>
-            <small>{t("projectWorkspacePage.workItems.columns.updated")}</small>
-            <strong>{dateLabel(item.updated_at)}</strong>
-          </div>
-        </header>
-        <div className="project-workspace__item-title">
-          <code>{compactId(itemId)}</code>
-          <h3>{text(item, "title", "name")}</h3>
+
+          <aside className="project-workspace__item-side">
+            <span id="work-item-conversation" />
+            <span id="work-item-changes" />
+            <section
+              id="work-item-execution"
+              className="project-workspace__item-section"
+            >
+              <header>
+                <h3>
+                  {t(
+                    "projectWorkspacePage.workItems.detail.singlePage.progressTitle",
+                  )}
+                </h3>
+              </header>
+              {recentActivity.length ? (
+                <>
+                  <div className="project-workspace__item-activity-list">
+                    {recentActivity.map((activity) => {
+                      const activityLabel = t(
+                        "projectWorkspacePage.workItems.detail.singlePage.activity." +
+                          activity.kind,
+                      );
+                      const activityContent =
+                        activity.kind === "execution"
+                          ? text(
+                              obj(activity.source.output),
+                              "summary",
+                              "result",
+                              "message",
+                            ) ||
+                            text(activity.source, "error") ||
+                            statusLabel(text(activity.source, "status"), t)
+                          : activity.kind === "discussion"
+                            ? traceValue(
+                                traceRecords(activity.source),
+                                "objective",
+                                "summary",
+                                "message",
+                                "task",
+                              ) || activityLabel
+                            : text(
+                                activity.source,
+                                "path",
+                                "message",
+                                "title",
+                              ) || activityLabel;
+                      const ActivityIcon =
+                        activity.kind === "execution"
+                          ? IconBolt
+                          : activity.kind === "discussion"
+                            ? IconMessageCircle
+                            : IconFile;
+                      return (
+                        <article key={activity.key}>
+                          <span>
+                            <ActivityIcon size={17} />
+                          </span>
+                          <div>
+                            <strong>{activityLabel}</strong>
+                            <ProjectEventContent
+                              content={activityContent}
+                              maxChars={140}
+                            />
+                            {activity.createdAt && (
+                              <time>{dateLabel(activity.createdAt)}</time>
+                            )}
+                          </div>
+                          <Button
+                            variant="secondary"
+                            onClick={() => openActivity(activity)}
+                          >
+                            {t(
+                              "projectWorkspacePage.workItems.detail.singlePage.activity." +
+                                (activity.kind === "execution"
+                                  ? "viewResult"
+                                  : activity.kind === "discussion"
+                                    ? "viewDiscussion"
+                                    : "viewDelivery"),
+                            )}
+                          </Button>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  <Button
+                    variant="secondary"
+                    onClick={() => onNavigate("runs")}
+                  >
+                    {t(
+                      "projectWorkspacePage.workItems.detail.singlePage.viewAllProgress",
+                    )}
+                    <IconArrowRight size={14} />
+                  </Button>
+                </>
+              ) : (
+                <p>
+                  {t(
+                    "projectWorkspacePage.workItems.detail.singlePage.progressEmpty",
+                  )}
+                </p>
+              )}
+            </section>
+          </aside>
         </div>
-        <ProjectSegmentedControl
-          className="project-workspace__item-tabs"
-          value={detailTab}
-          options={detailTabs}
-          onChange={(next) => update({ workItemTab: next })}
-          ariaLabel={t("projectWorkspacePage.workItems.detail.tabs.aria")}
-        />
-        <div className="project-workspace__item-content">{detailContent}</div>
       </section>
     </>
   );
@@ -4103,6 +3866,7 @@ function FilesPanel({
   projectAgents,
   runAction,
   busyAction,
+  canWrite,
 }: {
   projectId: string;
   files: RecordValue[];
@@ -4114,6 +3878,7 @@ function FilesPanel({
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canWrite: boolean;
 }) {
   const { get, update } = useContext(WorkspaceNavigationContext);
   const workspaceEmployees = new Map<string, string>();
@@ -4139,6 +3904,7 @@ function FilesPanel({
       onSelectedViewChange={(view) => update({ fileView: view })}
       runAction={runAction}
       busyAction={busyAction}
+      canWrite={canWrite}
     />
   );
 }
@@ -4156,6 +3922,7 @@ function MilestonesPanel({
   onOpenSession,
   runAction,
   busyAction,
+  canManage,
 }: {
   projectId: string;
   milestones: RecordValue[];
@@ -4173,6 +3940,7 @@ function MilestonesPanel({
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canManage: boolean;
 }) {
   const { t, i18n } = useTranslation();
   const { get, update } = useContext(WorkspaceNavigationContext);
@@ -4349,38 +4117,40 @@ function MilestonesPanel({
         title={t("projectWorkspaceNav.tabs.milestones")}
         description=""
       />
-      <form
-        className="project-workspace__inline-create"
-        onSubmit={createMilestone}
-      >
-        <ProjectField
-          label={t("projectWorkspacePage.milestones.fields.description")}
-          labelFor="project-milestone-message"
-          required
+      {canManage && (
+        <form
+          className="project-workspace__inline-create"
+          onSubmit={createMilestone}
         >
-          <TextInput
-            id="project-milestone-message"
-            value={message}
-            onChange={(event) => setMessage(event.target.value)}
-            placeholder={t(
-              "projectWorkspacePage.milestones.fields.placeholder",
-            )}
+          <ProjectField
+            label={t("projectWorkspacePage.milestones.fields.description")}
+            labelFor="project-milestone-message"
             required
-          />
-        </ProjectField>
-        <Button
-          variant="primary"
-          type="submit"
-          disabled={!message.trim() || busyAction === "create-milestone"}
-        >
-          {busyAction === "create-milestone" ? (
-            <IconLoader2 className="project-workspace__spinner" size={16} />
-          ) : (
-            <IconFlag size={16} />
-          )}
-          {t("projectWorkspacePage.milestones.actions.create")}
-        </Button>
-      </form>
+          >
+            <TextInput
+              id="project-milestone-message"
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder={t(
+                "projectWorkspacePage.milestones.fields.placeholder",
+              )}
+              required
+            />
+          </ProjectField>
+          <Button
+            variant="primary"
+            type="submit"
+            disabled={!message.trim() || busyAction === "create-milestone"}
+          >
+            {busyAction === "create-milestone" ? (
+              <IconLoader2 className="project-workspace__spinner" size={16} />
+            ) : (
+              <IconFlag size={16} />
+            )}
+            {t("projectWorkspacePage.milestones.actions.create")}
+          </Button>
+        </form>
+      )}
       {milestoneRecords.length ? (
         <div className="project-workspace__milestone-list">
           {visibleMilestones.map((event) => {
@@ -4562,6 +4332,7 @@ function RunsPanel({
   onOpenSession,
   runAction,
   busyAction,
+  canManage,
 }: {
   projectId: string;
   runs: RecordValue[];
@@ -4574,6 +4345,7 @@ function RunsPanel({
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canManage: boolean;
 }) {
   const { t } = useTranslation();
   const { get, update } = useContext(WorkspaceNavigationContext);
@@ -4705,7 +4477,7 @@ function RunsPanel({
                     onOpen={onOpenSession}
                     intent={sessionIntent}
                   />
-                  {["failed", "cancelled"].includes(runStatus) && (
+                  {canManage && ["failed", "cancelled"].includes(runStatus) && (
                     <Button
                       variant="secondary"
                       disabled={busyAction === retryKey}
@@ -4738,7 +4510,7 @@ function RunsPanel({
                       {t("projectWorkspacePage.actions.retry")}
                     </Button>
                   )}
-                  {nextStatus && (
+                  {canManage && nextStatus && (
                     <Button
                       variant="secondary"
                       disabled={busyAction === `run-${runId}`}
@@ -4772,27 +4544,28 @@ function RunsPanel({
                       )}
                     </Button>
                   )}
-                  {!["succeeded", "failed", "cancelled"].includes(
-                    runStatus,
-                  ) && (
-                    <Button
-                      variant="ghost"
-                      disabled={busyAction === `finish-${runId}`}
-                      onClick={() =>
-                        void runAction(
-                          `finish-${runId}`,
-                          () =>
-                            projectsApi.patchRun(projectId, runId, {
-                              status: "succeeded",
-                            }),
-                          t("projectWorkspacePage.runs.feedback.completed"),
-                        )
-                      }
-                    >
-                      <IconCircleCheck size={15} />
-                      {t("projectWorkspacePage.runs.actions.complete")}
-                    </Button>
-                  )}
+                  {canManage &&
+                    !["succeeded", "failed", "cancelled"].includes(
+                      runStatus,
+                    ) && (
+                      <Button
+                        variant="ghost"
+                        disabled={busyAction === `finish-${runId}`}
+                        onClick={() =>
+                          void runAction(
+                            `finish-${runId}`,
+                            () =>
+                              projectsApi.patchRun(projectId, runId, {
+                                status: "succeeded",
+                              }),
+                            t("projectWorkspacePage.runs.feedback.completed"),
+                          )
+                        }
+                      >
+                        <IconCircleCheck size={15} />
+                        {t("projectWorkspacePage.runs.actions.complete")}
+                      </Button>
+                    )}
                 </div>
               </article>
             );
@@ -4813,26 +4586,28 @@ function MembersPanel({
   projectId,
   projectAgents,
   members,
-  runs,
+  capabilities,
+  policies,
+  events,
   canManage,
   selectedId,
   onSelect,
   onOpenWorkspace,
   onNavigate,
-  onOpenSession,
   runAction,
   busyAction,
 }: {
   projectId: string;
   projectAgents: ProjectOwnedAgent[];
   members: RecordValue[];
-  runs: RecordValue[];
+  capabilities: RecordValue[];
+  policies: RecordValue | null;
+  events: RecordValue[];
   canManage: boolean;
   selectedId: string;
   onSelect: (id: string) => void;
   onOpenWorkspace: (path: string) => void;
   onNavigate: (tab: WorkspaceTab, patch?: WorkspaceUrlPatch) => void;
-  onOpenSession: OpenSession;
   runAction: (
     key: string,
     action: () => Promise<unknown>,
@@ -4840,24 +4615,25 @@ function MembersPanel({
   ) => Promise<boolean>;
   busyAction: string;
 }) {
-  const toast = useToast();
   const { t } = useTranslation();
   const activeMembers = useMemo(
     () => members.filter((entry) => entry.is_enabled !== false),
     [members],
   );
+  const collaborationEvents = useMemo(
+    () => events.filter(isProjectA2ARecord),
+    [events],
+  );
   const departedMembers = members.filter((entry) => entry.is_enabled === false);
-  const { pageItems: visibleMembers, pagination: membersPagination } =
-    useWorkspacePagination(members, "members", 10, [10, 20, 50]);
-  const visibleActiveMembers = visibleMembers.filter(
-    (entry) => entry.is_enabled !== false,
-  );
-  const visibleDepartedMembers = visibleMembers.filter(
-    (entry) => entry.is_enabled === false,
-  );
   const member =
-    members.find(
-      (entry) => text(entry, "id", "member_id", "agent_id") === selectedId,
+    members.find((entry) =>
+      [
+        text(entry, "id"),
+        text(entry, "member_id"),
+        text(entry, "agent_id"),
+      ]
+        .filter(Boolean)
+        .includes(selectedId),
     ) ||
     activeMembers[0] ||
     departedMembers[0];
@@ -4872,11 +4648,22 @@ function MembersPanel({
     }>
   >([]);
   const [availableAgents, setAvailableAgents] = useState<RecordValue[]>([]);
+  const [availableCapabilities, setAvailableCapabilities] = useState<
+    ProjectCapabilityOption[]
+  >([]);
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [agentsError, setAgentsError] = useState("");
   const [agentDrawerMode, setAgentDrawerMode] = useState<
     "create" | "edit" | null
   >(null);
+  const [settingsOpen, setSettingsOpen] = useState(Boolean(selectedId));
+  const [capabilitySection, setCapabilitySection] = useState<
+    "config" | "tools" | "mcp" | "skill"
+  >("config");
+  const [addingCapabilityKind, setAddingCapabilityKind] = useState<
+    "mcp" | "skill" | null
+  >(null);
+  const [capabilityToAddId, setCapabilityToAddId] = useState("");
   const [createKind, setCreateKind] = useState<"copy" | "blank">("copy");
   const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
   const [promoteDialogOpen, setPromoteDialogOpen] = useState(false);
@@ -4895,6 +4682,7 @@ function MembersPanel({
   }, [member]);
 
   useEffect(() => {
+    if (!settingsOpen || !canManage) return;
     let active = true;
     void enterpriseApi
       .llmModels()
@@ -4912,17 +4700,20 @@ function MembersPanel({
     return () => {
       active = false;
     };
-  }, []);
+  }, [canManage, settingsOpen]);
 
   useEffect(() => {
+    if ((!settingsOpen && agentDrawerMode !== "create") || !canManage) return;
     let mounted = true;
     setAgentsLoading(true);
     setAgentsError("");
     void projectsApi
       .bootstrapOptions()
       .then((options) => {
-        if (mounted)
+        if (mounted) {
           setAvailableAgents(options.agents.map((agent) => ({ ...agent })));
+          setAvailableCapabilities(options.capabilities);
+        }
       })
       .catch((error) => {
         if (mounted)
@@ -4936,15 +4727,17 @@ function MembersPanel({
     return () => {
       mounted = false;
     };
-  }, [t]);
+  }, [agentDrawerMode, canManage, settingsOpen, t]);
 
   const memberId = text(member || {}, "id", "member_id");
   const agentId = text(member || {}, "agent_id");
-  const projectAgentById = useMemo(
-    () => new Map(projectAgents.map((entry) => [entry.id, entry])),
-    [projectAgents],
+  const projectAgent = useMemo(
+    () =>
+      projectAgents.find(
+        (entry) => entry.id === agentId || entry.member_id === memberId,
+      ) || null,
+    [agentId, memberId, projectAgents],
   );
-  const projectAgent = projectAgentById.get(agentId) || null;
   const memberName =
     text(member || {}, "name_snapshot", "agent_name", "name") ||
     t("projectAgents.defaultRole");
@@ -4962,6 +4755,25 @@ function MembersPanel({
       (agent) => text(agent, "id", "agent_id") === candidateAgentId,
     ) || candidates[0];
   const selectedCandidateId = text(selectedCandidate || {}, "id", "agent_id");
+  const candidateCapabilities = useMemo(
+    () =>
+      availableCapabilities.filter(
+        (capability) =>
+          capability.source === "agent" &&
+          capability.owner_agent_id === selectedCandidateId,
+      ),
+    [availableCapabilities, selectedCandidateId],
+  );
+
+  useEffect(() => {
+    setCapabilitySection("config");
+    setAddingCapabilityKind(null);
+    setCapabilityToAddId("");
+  }, [memberId]);
+
+  useEffect(() => {
+    if (selectedId && memberId) setSettingsOpen(true);
+  }, [memberId, selectedId]);
 
   useEffect(() => {
     if (agentDrawerMode !== "edit" || !projectAgent) return;
@@ -4972,20 +4784,6 @@ function MembersPanel({
       coreMemory: projectAgent.core_memory,
     });
   }, [agentDrawerMode, projectAgent]);
-  const memberRuns = runs.filter((run) => {
-    const records = traceRecords(run);
-    return [
-      traceValue(
-        records,
-        "agent_id",
-        "execution_agent_id",
-        "subagent_agent_id",
-      ),
-      traceValue(records, "assignee_agent_id", "actor_agent_id"),
-    ].includes(agentId);
-  });
-  const membership = obj(configDraft.membership);
-  const autonomyPolicy = obj(configDraft.autonomy_policy);
   const modelOptions = [
     { value: "", label: t("projectSnapshot.followSourceAgent") },
     ...memberModels.map((model) => ({
@@ -4993,105 +4791,11 @@ function MembersPanel({
       label: model.label || `${model.provider} · ${model.model}`,
     })),
   ];
-  const autonomyOptions = [
-    { value: "L1", label: t("agent.settings.autonomy.l1Auto") },
-    { value: "L2", label: t("agent.settings.autonomy.l2Notify") },
-    { value: "L3", label: t("agent.settings.autonomy.l3Approve") },
-  ];
-  const autonomyModeOptions = [
-    {
-      value: "autonomous",
-      label: t("projectSnapshot.policy.modeOptions.autonomous"),
-    },
-    {
-      value: "balanced",
-      label: t("projectSnapshot.policy.modeOptions.balanced"),
-    },
-    {
-      value: "review",
-      label: t("projectSnapshot.policy.modeOptions.review"),
-    },
-  ];
-  const autonomyActionLabel = (key: string) =>
-    t(`projectSnapshot.actions.${key}.label`, {
-      defaultValue: t(`projectSnapshot.policy.fields.${key}.label`, {
-        defaultValue: t("projectSnapshot.policy.customAction"),
-      }),
-    });
-  const autonomyActionDescription = (key: string) =>
-    t(`projectSnapshot.actions.${key}.description`, {
-      defaultValue: t(`projectSnapshot.policy.fields.${key}.description`, {
-        defaultValue: t("projectSnapshot.actionFallback"),
-      }),
-    });
-  const autonomySelectOptions = (key: string, value: unknown) => {
-    const currentValue = String(value ?? "");
-    if (key === "mode") {
-      return autonomyModeOptions.some((option) => option.value === currentValue)
-        ? autonomyModeOptions
-        : [
-            {
-              value: currentValue || "balanced",
-              label: t("projectSnapshot.policy.keepCurrent"),
-            },
-            ...autonomyModeOptions,
-          ].filter(
-            (option, index, options) =>
-              options.findIndex(
-                (candidate) => candidate.value === option.value,
-              ) === index,
-          );
-    }
-    if (key === "max_parallel_tasks" || typeof value === "number") {
-      const values = [1, 2, 3, 4, 6, 8, 12, 16];
-      const currentNumber = Number(value);
-      if (Number.isFinite(currentNumber) && currentNumber > 0) {
-        values.push(currentNumber);
-      }
-      return [...new Set(values)]
-        .sort((left, right) => left - right)
-        .map((count) => ({
-          value: String(count),
-          label: t("projectSnapshot.policy.parallelTasks", { count }),
-        }));
-    }
-    if (autonomyOptions.some((option) => option.value === currentValue)) {
-      return autonomyOptions;
-    }
-    return [
-      ...(currentValue
-        ? [
-            {
-              value: currentValue,
-              label: t("projectSnapshot.policy.keepCurrent"),
-            },
-          ]
-        : []),
-      ...autonomyOptions,
-    ].filter(
-      (option, index, options) =>
-        options.findIndex((candidate) => candidate.value === option.value) ===
-        index,
-    );
-  };
-  const lifecycleLabel = (value: string) =>
-    t(`projectSnapshot.lifecycle.${value}`, {
-      defaultValue: value || t("projectSnapshot.unknown"),
-    });
-  const sourceStatusLabel = (value: string) =>
-    t(`projectSnapshot.sourceStatusLabels.${value}`, {
-      defaultValue: value || t("projectSnapshot.unknown"),
-    });
   const updateConfigField = (key: string, value: unknown) =>
     setConfigDraft((current) => ({ ...current, [key]: value }));
-  const updateAutonomyField = (key: string, value: unknown) =>
-    setConfigDraft((current) => ({
-      ...current,
-      autonomy_policy: { ...obj(current.autonomy_policy), [key]: value },
-    }));
 
   const saveSnapshot = () => {
-    if (departed) return;
+    if (!canManage || departed) return;
     const maxToolRoundsRaw = text(configDraft, "max_tool_rounds").trim();
     const maxToolRounds = maxToolRoundsRaw ? Number(maxToolRoundsRaw) : null;
     const payload = {
@@ -5233,223 +4937,396 @@ function MembersPanel({
         : t("projectWorkspacePage.members.feedback.restored"),
     );
   };
-
-  const renderMemberGroup = (
-    label: string,
-    entries: RecordValue[],
-    historical = false,
-    total = entries.length,
-  ) =>
-    entries.length ? (
-      <section className="project-workspace__member-group">
-        <header>
-          <span>{label}</span>
-          <ProjectCountBadge>{total}</ProjectCountBadge>
-        </header>
-        {entries.map((entry) => {
-          const id = text(entry, "id", "member_id", "agent_id");
-          const owned = projectAgentById.has(text(entry, "agent_id"));
-          const name =
-            text(entry, "agent_name", "name_snapshot", "name") ||
-            t("projectTerminology.dynamicCopy.digitalEmployee");
+  const memberCapabilities = capabilities.filter((capability) => {
+    const inheritedAgentId = text(
+      capability,
+      "inherited_from_agent_id",
+      "owner_agent_id",
+    );
+    if (inheritedAgentId) return inheritedAgentId === agentId;
+    return text(capability, "source") === "shared";
+  });
+  const capabilitiesByKind = (kind: "tool" | "mcp" | "skill") =>
+    memberCapabilities.filter(
+      (capability) =>
+        text(capability, "capability_type", "kind", "type") === kind,
+    );
+  const platformTools = capabilitiesByKind("tool");
+  const memberMcps = capabilitiesByKind("mcp");
+  const memberSkills = capabilitiesByKind("skill");
+  const effectiveProjectToolCount = member
+    ? PROJECT_TOOL_REGISTRY.filter(
+        (tool) => projectToolResolution(tool, member, policies).effective,
+      ).length
+    : 0;
+  const configCount = [
+    text(configDraft, "primary_model_id"),
+    text(configDraft, "fallback_model_id"),
+    text(configDraft, "project_instruction"),
+    text(configDraft, "max_tool_rounds"),
+  ].filter(Boolean).length;
+  const renderCapabilityRows = (
+    items: RecordValue[],
+    kind: "mcp" | "skill",
+  ) => {
+    if (!items.length) {
+      return (
+        <div className="project-workspace__member-capability-empty">
+          <span>{t(`projectAgents.capabilityPackage.empty.${kind}`)}</span>
+        </div>
+      );
+    }
+    return (
+      <div className="project-workspace__member-capability-list">
+        {items.map((capability, index) => {
+          const bindingEnabled = capability.is_enabled !== false;
+          const availability = ["available", "missing", "restricted"].includes(
+            text(capability, "availability"),
+          )
+            ? text(capability, "availability")
+            : "available";
+          const status =
+            availability === "missing"
+              ? "missing"
+              : availability === "restricted" || !bindingEnabled || departed
+                ? "restricted"
+                : "available";
+          const bindingId = text(
+            capability,
+            "id",
+            "binding_id",
+            "capability_id",
+          );
+          const actionKey = `member-capability-${memberId}-${bindingId}`;
+          let capabilityName =
+            text(capability, "name", "capability_name") ||
+            t("projectWorkspacePage.capabilities.capability");
+          let description = text(
+            capability,
+            "description",
+            "purpose",
+            "summary",
+          );
           return (
-            <Button
-              variant="ghost"
-              key={id}
-              className={`${text(member || {}, "id", "member_id", "agent_id") === id ? "is-active" : ""}${historical ? " is-departed" : ""}`}
-              onClick={() => onSelect(id)}
+            <div
+              className="project-workspace__member-capability-row"
+              key={
+                bindingId || `${kind}-${capabilityName}-${index}`
+              }
             >
-              <span>{name.slice(0, 1)}</span>
+              <span className={`is-${kind}`}>
+                {kind === "mcp" ? (
+                  <IconCodeDots size={16} />
+                ) : kind === "skill" ? (
+                  <IconBolt size={16} />
+                ) : (
+                  <IconTool size={16} />
+                )}
+              </span>
               <div>
-                <strong title={name}>{name}</strong>
-                <small>
-                  {owned ? `${t("projectAgents.badge")} · ` : ""}
-                  {bool(entry, "is_leader")
-                    ? `${t("projectTerminology.owner")} · `
-                    : ""}
-                  {projectUserFacingCopy(
-                    text(entry, "role_snapshot", "role") ||
-                      t("projectAgents.defaultRole"),
-                    t,
-                  )}
-                </small>
+                <strong>{capabilityName}</strong>
+                {description ? <p>{description}</p> : null}
+                {kind === "skill" ? (
+                  <>
+                    <small>
+                      {t("projectAgents.capabilityPackage.projectAsset", {
+                        name: memberName,
+                      })}
+                    </small>
+                    <small>
+                      {t("projectAgents.capabilityPackage.skillFiles", {
+                        version:
+                          text(capability, "version") ||
+                          text(
+                            obj(obj(capability.config).skill_asset),
+                            "version",
+                          ) ||
+                          "—",
+                        count:
+                          num(capability, "file_count") ||
+                          num(
+                            obj(obj(capability.config).skill_asset),
+                            "file_count",
+                          ),
+                        size: fileSizeLabel(
+                          num(capability, "size_bytes") ||
+                            num(
+                              obj(obj(capability.config).skill_asset),
+                              "size_bytes",
+                            ),
+                        ),
+                      })}
+                    </small>
+                  </>
+                ) : null}
               </div>
-              {historical ? (
-                <ProjectStatusBadge tone="neutral">
-                  {t("projectAgents.status.departed")}
+              <div className="project-workspace__member-capability-controls">
+                <ProjectStatusBadge
+                  tone={status === "available" ? "success" : "warning"}
+                >
+                  {t(`projectAgents.capabilityPackage.status.${status}`)}
                 </ProjectStatusBadge>
-              ) : bool(entry, "is_leader") ? (
-                <ProjectStatusBadge tone="info">
-                  {t("projectTerminology.ownerBadge")}
-                </ProjectStatusBadge>
-              ) : (
-                <ProjectStatusBadge tone="success">
-                  {t("projectAgents.status.active")}
-                </ProjectStatusBadge>
-              )}
-              <IconChevronRight size={15} />
-            </Button>
+                {canManage && !departed && bindingId ? (
+                  <ToggleSwitch
+                    checked={bindingEnabled}
+                    disabled={busyAction === actionKey}
+                    ariaLabel={t(
+                      bindingEnabled
+                        ? "projectWorkspacePage.capabilities.actions.disable"
+                        : "projectWorkspacePage.capabilities.actions.enable",
+                      { name: capabilityName },
+                    )}
+                    onChange={(checked) =>
+                      void runAction(
+                        actionKey,
+                        () =>
+                          projectsApi.patchCapability(projectId, bindingId, {
+                            is_enabled: checked,
+                          }),
+                        t(
+                          checked
+                            ? "projectWorkspacePage.capabilities.feedback.enabled"
+                            : "projectWorkspacePage.capabilities.feedback.disabled",
+                        ),
+                      )
+                    }
+                  />
+                ) : null}
+              </div>
+            </div>
           );
         })}
+      </div>
+    );
+  };
+  const addableCapabilities = (kind: "mcp" | "skill") => {
+    const boundIds = new Set(
+      memberCapabilities
+        .filter(
+          (capability) =>
+            text(capability, "capability_type", "kind", "type") === kind,
+        )
+        .map((capability) => text(capability, "capability_id"))
+        .filter(Boolean),
+    );
+    const seen = new Set<string>();
+    return availableCapabilities.filter((capability) => {
+      const id = capability.capability_id || capability.id;
+      if (
+        capability.kind !== kind ||
+        (kind === "mcp" && capability.source === "agent") ||
+        !id ||
+        boundIds.has(id) ||
+        seen.has(id)
+      )
+        return false;
+      seen.add(id);
+      return true;
+    });
+  };
+  const addMemberCapability = (kind: "mcp" | "skill") => {
+    const candidates = addableCapabilities(kind);
+    const candidate =
+      candidates.find(
+        (entry) =>
+          (entry.capability_id || entry.id) === capabilityToAddId,
+      ) || candidates[0];
+    if (!candidate || !agentId) return;
+    const capabilityId = candidate.capability_id || candidate.id;
+    const actionKey = `add-member-capability-${memberId}-${kind}`;
+    void runAction(
+      actionKey,
+      () =>
+        projectsApi.createCapability(projectId, {
+          capability_type: kind,
+          capability_id: capabilityId,
+          capability_name: candidate.name,
+          source: "inherited",
+          inherited_from_agent_id: agentId,
+          is_enabled: true,
+        }),
+      t("projectAgents.capabilityPackage.added", { name: candidate.name }),
+    ).then((succeeded) => {
+      if (succeeded) {
+        setAddingCapabilityKind(null);
+        setCapabilityToAddId("");
+      }
+    });
+  };
+  const renderCapabilityGroup = (
+    kind: "mcp" | "skill",
+    items: RecordValue[],
+    title: string,
+  ) => {
+    const candidates = addableCapabilities(kind);
+    const actionKey = `add-member-capability-${memberId}-${kind}`;
+    const selectedCapabilityId =
+      capabilityToAddId ||
+      (candidates[0]?.capability_id || candidates[0]?.id || "");
+    const loadingCandidates = agentsLoading;
+    return (
+      <section className="project-workspace__member-capability-group">
+        <header>
+          <h4>{title}</h4>
+          {canManage && !departed ? (
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setAddingCapabilityKind((current) =>
+                  current === kind ? null : kind,
+                );
+                setCapabilityToAddId("");
+              }}
+            >
+              <IconPlus size={15} />
+              {t("projectAgents.capabilityPackage.add")}
+            </Button>
+          ) : null}
+        </header>
+        {addingCapabilityKind === kind ? (
+          <div className="project-workspace__member-capability-add">
+            {loadingCandidates ? (
+              <span>
+                <IconLoader2
+                  className="project-workspace__spinner"
+                  size={15}
+                />
+                {t("projectAgents.capabilityPackage.loading")}
+              </span>
+            ) : candidates.length ? (
+              <>
+                <ProjectSelect
+                  value={selectedCapabilityId}
+                  options={candidates.map((capability) => ({
+                    value: capability.capability_id || capability.id,
+                    label: capability.name,
+                  }))}
+                  onChange={setCapabilityToAddId}
+                  ariaLabel={t("projectAgents.capabilityPackage.select", {
+                    kind: title,
+                  })}
+                />
+                <Button
+                  variant="primary"
+                  disabled={busyAction === actionKey}
+                  onClick={() => addMemberCapability(kind)}
+                >
+                  {busyAction === actionKey ? (
+                    <IconLoader2
+                      className="project-workspace__spinner"
+                      size={15}
+                    />
+                  ) : (
+                    <IconPlus size={15} />
+                  )}
+                  {t("projectAgents.capabilityPackage.confirmAdd")}
+                </Button>
+              </>
+            ) : (
+              <span>
+                {agentsError ||
+                  t("projectAgents.capabilityPackage.noCandidates")}
+              </span>
+            )}
+          </div>
+        ) : null}
+        {renderCapabilityRows(items, kind)}
       </section>
-    ) : null;
+    );
+  };
 
   return (
     <>
       <SectionHeading
         eyebrow={t("projectAgents.eyebrow")}
-        title={t("projectAgents.sectionTitle")}
-        description={t("projectAgents.sectionDescription")}
+        title={t("projectAgents.teamPage.title")}
+        description={t("projectAgents.teamPage.description")}
         className="project-workspace__member-page-heading"
         actions={
-          canManage ? (
-            <Button
-              variant="primary"
-              onClick={() => {
-                resetAgentDraft();
-                setAgentDrawerMode("create");
-              }}
-            >
-              <IconPlus size={16} />
-              {t("projectAgents.actions.create")}
-            </Button>
+          member || canManage ? (
+            <>
+              {member ? (
+                <Button
+                  variant="ghost"
+                  onClick={() =>
+                    onNavigate("runs", {
+                      runMember: agentId,
+                      runsPage: undefined,
+                    })
+                  }
+                >
+                  {t("projectAgents.viewActivity")}
+                  <IconArrowRight size={14} />
+                </Button>
+              ) : null}
+              {projectAgent && canManage ? (
+                <Button
+                  variant="secondary"
+                  onClick={openPromoteDialog}
+                  disabled={busyAction === "promote-project-agent"}
+                >
+                  <IconSparkles size={16} />
+                  {t("projectAgents.actions.promote")}
+                </Button>
+              ) : null}
+              {canManage ? (
+                <Button
+                  variant="primary"
+                  onClick={() => {
+                    resetAgentDraft();
+                    setAgentDrawerMode("create");
+                  }}
+                >
+                  <IconPlus size={16} />
+                  {t("projectAgents.actions.create")}
+                </Button>
+              ) : null}
+            </>
           ) : null
         }
       />
       {members.length ? (
         <>
-          <div
-            className="project-workspace__member-summary"
-            aria-label={t("projectWorkspacePage.members.summaryAria")}
-          >
-            <article>
-              <span>{t("projectAgents.summary")}</span>
-              <strong>{projectAgents.length}</strong>
-              <small>{t("projectAgents.summaryDescription")}</small>
-            </article>
-            <article>
-              <span>{t("projectAgents.activeMembers")}</span>
-              <strong>{activeMembers.length}</strong>
-              <small>{t("projectAgents.activeMembersDescription")}</small>
-            </article>
-            <article>
-              <span>{t("projectAgents.departedMembers")}</span>
-              <strong>{departedMembers.length}</strong>
-              <small>{t("projectAgents.departedMembersDescription")}</small>
-            </article>
-          </div>
-          <div className="project-workspace__member-layout">
-            <div className="project-workspace__member-list">
-              {renderMemberGroup(
-                t("projectAgents.activeMembers"),
-                visibleActiveMembers,
-                false,
-                activeMembers.length,
-              )}
-              {renderMemberGroup(
-                t("projectAgents.departedMembers"),
-                visibleDepartedMembers,
-                true,
-                departedMembers.length,
-              )}
-              {membersPagination}
-            </div>
-            <div className="project-workspace__snapshot-graph">
-              <div className="project-workspace__snapshot-heading">
-                <div>
-                  <strong>{memberName}</strong>
-                  <small>
-                    {departed
-                      ? t("projectAgents.snapshot.historicalDescription")
-                      : t("projectAgents.snapshot.currentDescription")}
-                  </small>
-                </div>
-                <div className="project-workspace__snapshot-heading-actions">
-                  <Button
-                    variant="ghost"
-                    onClick={() =>
-                      onNavigate("runs", {
-                        runMember: agentId,
-                        runsPage: undefined,
-                      })
-                    }
-                  >
-                    {t("projectAgents.viewActivity")}
-                    <IconArrowRight size={14} />
-                  </Button>
-                  <ProjectStatusBadge tone={departed ? "neutral" : "success"}>
-                    {departed
-                      ? t("projectAgents.status.departed")
-                      : t("projectAgents.status.active")}
-                  </ProjectStatusBadge>
-                </div>
-              </div>
-              <SnapshotLineageGraph
-                member={member || null}
-                runs={memberRuns}
-                onNodeSelect={({ id, record }) => {
-                  const recordIntent = inferredSessionIntent(record);
-                  const source =
-                    id.startsWith("run:") &&
-                    sessionRouteOf(record, recordIntent)
-                      ? record
-                      : null;
-                  if (!source) {
-                    toast.warning(
-                      t("projectAgents.snapshot.sessionUnavailable"),
-                    );
-                    return;
-                  }
-                  const sourceIntent = inferredSessionIntent(source);
-                  onOpenSession(
-                    departed
-                      ? { ...source, status: "disabled", member_enabled: false }
-                      : source,
-                    `${memberName} · ${
-                      id.startsWith("run:")
-                        ? t("projectAgents.snapshot.runHistory")
-                        : t("projectAgents.snapshot.recentCollaboration")
-                    }`,
-                    sourceIntent,
-                  );
-                }}
-              />
-              <ProjectGraphLegend />
-            </div>
-          </div>
-          <section
-            className={`project-workspace__action-panel project-workspace__member-editor${departed ? " is-readonly" : ""}`}
-          >
+          <section className="project-workspace__team-relationships">
             <header>
               <div>
-                <span>
-                  {departed
-                    ? t("projectAgents.snapshot.historicalLabel")
-                    : t("projectAgents.snapshot.currentLabel")}
-                </span>
-                <h3>
-                  {departed
-                    ? t("projectAgents.snapshot.viewTitle", {
-                        name: memberName,
-                      })
-                    : t("projectAgents.snapshot.editTitle", {
-                        name: memberName,
-                      })}
-                </h3>
+                <h3>{t("projectWorkspacePage.mesh.title")}</h3>
+                <p>{t("projectTerminology.workspace.meshDescription")}</p>
               </div>
-              <div className="project-workspace__member-actions">
-                {projectAgent && (
-                  <>
-                    {canManage ? (
-                      <Button
-                        variant="secondary"
-                        onClick={openPromoteDialog}
-                        disabled={busyAction === "promote-project-agent"}
-                      >
-                        <IconSparkles size={15} />
-                        {t("projectAgents.actions.promote")}
-                      </Button>
-                    ) : null}
+              <Button
+                variant="ghost"
+                onClick={() => onNavigate("audit", { auditScope: "a2a" })}
+              >
+                {t("projectMesh.viewEvents")}
+                <IconArrowRight size={14} />
+              </Button>
+            </header>
+            <div className="project-workspace__team-relationships-graph">
+              <A2AMeshGraph
+                members={members}
+                events={collaborationEvents}
+                selectedAgentId={agentId}
+                onAgentSelect={(_, selectedMember) => {
+                  onSelect(
+                    text(selectedMember, "id", "member_id", "agent_id"),
+                  );
+                  setSettingsOpen(true);
+                }}
+              />
+            </div>
+          </section>
+          {settingsOpen && (
+            <section
+              id="project-member-work-settings"
+              className={`project-workspace__action-panel project-workspace__member-editor${departed ? " is-readonly" : ""}`}
+            >
+              <header>
+                <div>
+                  <span>{t("projectAgents.teamPage.workSettings")}</span>
+                  <h3>{memberName}</h3>
+                </div>
+                <div className="project-workspace__member-actions">
+                  {projectAgent && (
                     <Button
                       variant="secondary"
                       onClick={() => {
@@ -5459,306 +5336,264 @@ function MembersPanel({
                     >
                       <IconSettings size={15} />
                       {canManage
-                        ? t("projectAgents.actions.manage")
+                        ? t("projectAgents.actions.edit")
                         : t("projectAgents.actions.view")}
                     </Button>
-                  </>
-                )}
-                {departed ? (
-                  canManage ? (
-                    <Button
-                      variant="secondary"
-                      disabled={busyAction === "restore-member"}
-                      onClick={restoreMember}
-                    >
-                      {busyAction === "restore-member" ? (
-                        <IconLoader2
-                          className="project-workspace__spinner"
-                          size={16}
-                        />
-                      ) : (
-                        <IconRestore size={15} />
-                      )}
-                      {projectAgent
-                        ? t("projectAgents.actions.restore")
-                        : t("projectWorkspacePage.members.actions.restore")}
-                    </Button>
-                  ) : null
-                ) : !bool(member || {}, "is_leader") ? (
-                  canManage ? (
-                    <>
+                  )}
+                  {departed ? (
+                    canManage ? (
                       <Button
                         variant="secondary"
-                        disabled={busyAction === "leader"}
-                        onClick={() =>
-                          void runAction(
-                            "leader",
-                            () => projectsApi.setLeader(projectId, agentId),
-                            t("projectTerminology.workspace.ownerChanged"),
-                          )
-                        }
+                        disabled={busyAction === "restore-member"}
+                        onClick={restoreMember}
                       >
-                        <IconFlag size={15} />
-                        {t("projectTerminology.setOwner")}
-                      </Button>
-                      <Button
-                        variant="danger"
-                        onClick={() => setRemoveDialogOpen(true)}
-                      >
-                        <IconTrash size={15} />
-                        {projectAgent
-                          ? t("projectAgents.actions.deactivate")
-                          : t("projectWorkspacePage.members.actions.remove")}
-                      </Button>
-                    </>
-                  ) : null
-                ) : (
-                  <ProjectStatusBadge tone="info">
-                    {t("projectTerminology.currentOwner")}
-                  </ProjectStatusBadge>
-                )}
-              </div>
-            </header>
-            {departed && (
-              <div className="project-workspace__member-history-note">
-                <IconArchive size={17} />
-                <div>
-                  <strong>
-                    {t("projectWorkspacePage.members.historical.title")}
-                  </strong>
-                  <p>
-                    {t("projectWorkspacePage.members.historical.description")}
-                  </p>
-                </div>
-              </div>
-            )}
-            <div className="project-workspace__snapshot-explainer">
-              <article>
-                <span>1</span>
-                <div>
-                  <strong>{t("projectSnapshot.sourceLayerTitle")}</strong>
-                  <p>{t("projectSnapshot.sourceLayerDescription")}</p>
-                </div>
-              </article>
-              <IconArrowRight size={16} />
-              <article>
-                <span>2</span>
-                <div>
-                  <strong>{t("projectSnapshot.projectLayerTitle")}</strong>
-                  <p>{t("projectSnapshot.projectLayerDescription")}</p>
-                </div>
-              </article>
-              <IconArrowRight size={16} />
-              <article>
-                <span>3</span>
-                <div>
-                  <strong>{t("projectSnapshot.runLayerTitle")}</strong>
-                  <p>{t("projectSnapshot.runLayerDescription")}</p>
-                </div>
-              </article>
-            </div>
-            <div className="project-workspace__snapshot-form">
-              <ProjectField
-                label={t("projectWorkspacePage.members.fields.primaryModel")}
-                hint={t("projectWorkspacePage.members.fields.primaryModelHint")}
-              >
-                <ProjectSelect
-                  value={text(configDraft, "primary_model_id")}
-                  options={modelOptions}
-                  onChange={(value) =>
-                    updateConfigField("primary_model_id", value || null)
-                  }
-                  ariaLabel={t(
-                    "projectWorkspacePage.members.fields.primaryModelAria",
-                  )}
-                  disabled={departed}
-                />
-              </ProjectField>
-              <ProjectField
-                label={t("projectWorkspacePage.members.fields.fallbackModel")}
-              >
-                <ProjectSelect
-                  value={text(configDraft, "fallback_model_id")}
-                  options={modelOptions}
-                  onChange={(value) =>
-                    updateConfigField("fallback_model_id", value || null)
-                  }
-                  ariaLabel={t(
-                    "projectWorkspacePage.members.fields.fallbackModelAria",
-                  )}
-                  disabled={departed}
-                />
-              </ProjectField>
-              <ProjectField
-                label={t("projectWorkspacePage.members.fields.maxToolRounds")}
-                labelFor="project-member-max-tool-rounds"
-              >
-                <TextInput
-                  id="project-member-max-tool-rounds"
-                  type="number"
-                  min="1"
-                  max="200"
-                  value={text(configDraft, "max_tool_rounds")}
-                  onChange={(event) =>
-                    updateConfigField("max_tool_rounds", event.target.value)
-                  }
-                  disabled={departed}
-                />
-              </ProjectField>
-              <ProjectField
-                className="is-wide"
-                label={t("projectWorkspacePage.members.fields.instructions")}
-                labelFor="project-member-instruction"
-                hint={
-                  departed
-                    ? t("projectWorkspacePage.members.fields.departedHint")
-                    : t("projectWorkspacePage.members.fields.instructionsHint")
-                }
-              >
-                <ProjectTextarea
-                  id="project-member-instruction"
-                  value={text(configDraft, "project_instruction")}
-                  onChange={(event) =>
-                    updateConfigField("project_instruction", event.target.value)
-                  }
-                  rows={3}
-                  disabled={departed}
-                />
-              </ProjectField>
-              <section className="project-workspace__snapshot-policy is-wide">
-                <header>
-                  <div>
-                    <strong>{t("projectSnapshot.autonomyTitle")}</strong>
-                    <small>{t("projectSnapshot.autonomyDescription")}</small>
-                  </div>
-                  <ProjectCountBadge>
-                    {Object.keys(autonomyPolicy).length}
-                  </ProjectCountBadge>
-                </header>
-                {Object.entries(autonomyPolicy).length ? (
-                  <div>
-                    {Object.entries(autonomyPolicy).map(([key, value]) => (
-                      <ProjectField
-                        key={key}
-                        label={autonomyActionLabel(key)}
-                        hint={autonomyActionDescription(key)}
-                      >
-                        {key === "require_evidence" ||
-                        typeof value === "boolean" ? (
-                          <ToggleSwitch
-                            checked={value === true || value === "true"}
-                            onChange={(checked) =>
-                              updateAutonomyField(key, checked)
-                            }
-                            ariaLabel={autonomyActionLabel(key)}
-                            disabled={departed}
+                        {busyAction === "restore-member" ? (
+                          <IconLoader2
+                            className="project-workspace__spinner"
+                            size={16}
                           />
                         ) : (
-                          <ProjectSelect
-                            value={String(value)}
-                            options={autonomySelectOptions(key, value)}
-                            onChange={(nextValue) =>
-                              updateAutonomyField(
-                                key,
-                                key === "max_parallel_tasks" ||
-                                  typeof value === "number"
-                                  ? Number(nextValue)
-                                  : nextValue,
-                              )
-                            }
-                            ariaLabel={autonomyActionLabel(key)}
-                            disabled={departed}
-                          />
+                          <IconRestore size={15} />
                         )}
-                      </ProjectField>
-                    ))}
-                  </div>
-                ) : (
-                  <p>{t("projectSnapshot.noAutonomyOverrides")}</p>
-                )}
-              </section>
-              <dl className="project-workspace__snapshot-facts is-wide">
-                <div>
-                  <dt>{t("projectSnapshot.memberStatus")}</dt>
-                  <dd>
-                    {lifecycleLabel(
-                      text(membership, "state") ||
-                        (departed ? "departed" : "active"),
-                    )}
-                  </dd>
-                </div>
-                <div>
-                  <dt>{t("projectWorkspacePage.members.facts.generation")}</dt>
-                  <dd>{text(membership, "generation") || "1"}</dd>
-                </div>
-                <div>
-                  <dt>{t("projectSnapshot.sourceStatus")}</dt>
-                  <dd>
-                    {sourceStatusLabel(
-                      text(configDraft, "source_agent_status"),
-                    )}
-                  </dd>
-                </div>
-                <div>
-                  <dt>
-                    {t(
-                      "projectWorkspacePage.members.facts.inheritedCapabilities",
-                    )}
-                  </dt>
-                  <dd>
-                    {
-                      stringList(configDraft.enabled_inherited_capability_ids)
-                        .length
-                    }{" "}
-                    {t("projectWorkspacePage.units.items")}
-                  </dd>
-                </div>
-                <div>
-                  <dt>
-                    {t("projectWorkspacePage.members.facts.disabledTools")}
-                  </dt>
-                  <dd>
-                    {stringList(configDraft.disabled_project_tools).length}{" "}
-                    {t("projectWorkspacePage.units.items")}
-                  </dd>
-                </div>
-                <div>
-                  <dt>{t("projectWorkspacePage.members.facts.updated")}</dt>
-                  <dd>
-                    {dateLabel(membership.changed_at || member?.updated_at)}
-                  </dd>
-                </div>
-              </dl>
-            </div>
-            {!departed && (
-              <footer>
-                <span className="project-workspace__switch-copy">
-                  {t("projectWorkspacePage.members.projectOnlyHint")}
-                </span>
-                <Button
-                  variant="primary"
-                  onClick={saveSnapshot}
-                  disabled={busyAction === "save-member"}
-                >
-                  {busyAction === "save-member" ? (
-                    <IconLoader2
-                      className="project-workspace__spinner"
-                      size={16}
-                    />
+                        {projectAgent
+                          ? t("projectAgents.actions.restore")
+                          : t("projectWorkspacePage.members.actions.restore")}
+                      </Button>
+                    ) : null
+                  ) : !bool(member || {}, "is_leader") ? (
+                    canManage ? (
+                      <>
+                        <Button
+                          variant="secondary"
+                          disabled={busyAction === "leader"}
+                          onClick={() =>
+                            void runAction(
+                              "leader",
+                              () => projectsApi.setLeader(projectId, agentId),
+                              t("projectTerminology.workspace.ownerChanged"),
+                            )
+                          }
+                        >
+                          <IconFlag size={15} />
+                          {t("projectTerminology.setOwner")}
+                        </Button>
+                        <Button
+                          variant="danger"
+                          onClick={() => setRemoveDialogOpen(true)}
+                        >
+                          <IconTrash size={15} />
+                          {projectAgent
+                            ? t("projectAgents.actions.deactivate")
+                            : t("projectWorkspacePage.members.actions.remove")}
+                        </Button>
+                      </>
+                    ) : null
                   ) : (
-                    <IconDeviceFloppy size={16} />
+                    <ProjectStatusBadge tone="info">
+                      {t("projectTerminology.currentOwner")}
+                    </ProjectStatusBadge>
                   )}
-                  {t("projectWorkspacePage.members.actions.saveSnapshot")}
-                </Button>
-              </footer>
-            )}
-          </section>
+                </div>
+              </header>
+              {departed && (
+                <div className="project-workspace__member-history-note">
+                  <IconArchive size={17} />
+                  <div>
+                    <strong>
+                      {t("projectWorkspacePage.members.historical.title")}
+                    </strong>
+                    <p>
+                      {t("projectWorkspacePage.members.historical.description")}
+                    </p>
+                  </div>
+                </div>
+              )}
+              <nav
+                className="project-workspace__member-capability-rail"
+                aria-label={t("projectAgents.capabilityPackage.title")}
+              >
+                {(
+                  [
+                    {
+                      value: "config",
+                      icon: <IconSettings size={16} />,
+                      count: configCount,
+                    },
+                    {
+                      value: "tools",
+                      icon: <IconTool size={16} />,
+                      count: effectiveProjectToolCount + platformTools.length,
+                    },
+                    {
+                      value: "mcp",
+                      icon: <IconCodeDots size={16} />,
+                      count: memberMcps.length,
+                    },
+                    {
+                      value: "skill",
+                      icon: <IconBolt size={16} />,
+                      count: memberSkills.length,
+                    },
+                  ] as const
+                ).map((section) => (
+                  <button
+                    key={section.value}
+                    type="button"
+                    className={
+                      capabilitySection === section.value ? "is-active" : ""
+                    }
+                    aria-pressed={capabilitySection === section.value}
+                    onClick={() => setCapabilitySection(section.value)}
+                  >
+                    {section.icon}
+                    <strong>
+                      {t(
+                        `projectAgents.capabilityPackage.sections.${section.value}`,
+                      )}
+                    </strong>
+                    <small>
+                      {t("projectAgents.capabilityPackage.count", {
+                        count: section.count,
+                      })}
+                    </small>
+                  </button>
+                ))}
+              </nav>
+              <div className="project-workspace__member-capability-body">
+                {capabilitySection === "config" ? (
+                  <>
+                    <div className="project-workspace__snapshot-form">
+                <ProjectField
+                  label={t("projectWorkspacePage.members.fields.primaryModel")}
+                  hint={t(
+                    "projectWorkspacePage.members.fields.primaryModelHint",
+                  )}
+                >
+                  <ProjectSelect
+                    value={text(configDraft, "primary_model_id")}
+                    options={modelOptions}
+                    onChange={(value) =>
+                      updateConfigField("primary_model_id", value || null)
+                    }
+                    ariaLabel={t(
+                      "projectWorkspacePage.members.fields.primaryModelAria",
+                    )}
+                    disabled={departed || !canManage}
+                  />
+                </ProjectField>
+                <ProjectField
+                  label={t("projectWorkspacePage.members.fields.fallbackModel")}
+                >
+                  <ProjectSelect
+                    value={text(configDraft, "fallback_model_id")}
+                    options={modelOptions}
+                    onChange={(value) =>
+                      updateConfigField("fallback_model_id", value || null)
+                    }
+                    ariaLabel={t(
+                      "projectWorkspacePage.members.fields.fallbackModelAria",
+                    )}
+                    disabled={departed || !canManage}
+                  />
+                </ProjectField>
+                <ProjectField
+                  label={t("projectWorkspacePage.members.fields.maxToolRounds")}
+                  labelFor="project-member-max-tool-rounds"
+                >
+                  <TextInput
+                    id="project-member-max-tool-rounds"
+                    type="number"
+                    min="1"
+                    max="200"
+                    value={text(configDraft, "max_tool_rounds")}
+                    onChange={(event) =>
+                      updateConfigField("max_tool_rounds", event.target.value)
+                    }
+                    disabled={departed || !canManage}
+                  />
+                </ProjectField>
+                <ProjectField
+                  className="is-wide"
+                  label={t("projectWorkspacePage.members.fields.instructions")}
+                  labelFor="project-member-instruction"
+                  hint={
+                    departed
+                      ? t("projectWorkspacePage.members.fields.departedHint")
+                      : t(
+                          "projectWorkspacePage.members.fields.instructionsHint",
+                        )
+                  }
+                >
+                  <ProjectTextarea
+                    id="project-member-instruction"
+                    value={text(configDraft, "project_instruction")}
+                    onChange={(event) =>
+                      updateConfigField(
+                        "project_instruction",
+                        event.target.value,
+                      )
+                    }
+                    rows={3}
+                    disabled={departed || !canManage}
+                  />
+                </ProjectField>
+                    </div>
+                    {canManage && !departed && (
+                      <footer>
+                        <Button
+                          variant="primary"
+                          onClick={saveSnapshot}
+                          disabled={busyAction === "save-member"}
+                        >
+                          {busyAction === "save-member" ? (
+                            <IconLoader2
+                              className="project-workspace__spinner"
+                              size={16}
+                            />
+                          ) : (
+                            <IconDeviceFloppy size={16} />
+                          )}
+                          {t(
+                            "projectWorkspacePage.members.actions.saveSnapshot",
+                          )}
+                        </Button>
+                      </footer>
+                    )}
+                  </>
+                ) : capabilitySection === "tools" ? (
+                  <ToolsTab
+                    agentId={projectAgent?.id || agentId}
+                    agentName={memberName}
+                    canManage={canManage && !departed}
+                    canConfigure={
+                      Boolean(projectAgent) && canManage && !departed
+                    }
+                    scope="project"
+                    projectContext={
+                      projectAgent ? undefined : { projectId, memberId }
+                    }
+                  />
+                ) : capabilitySection === "mcp" ? (
+                  renderCapabilityGroup(
+                    "mcp",
+                    memberMcps,
+                    t("projectAgents.capabilityPackage.sections.mcp"),
+                  )
+                ) : (
+                  <SkillsTab
+                    agentId={projectAgent?.id || agentId}
+                    canManage={Boolean(projectAgent) && canManage && !departed}
+                  />
+                )}
+              </div>
+            </section>
+          )}
         </>
       ) : (
         <EmptyState
           icon={<IconUsers size={22} />}
-          title={t("projectWorkspacePage.members.emptyTitle")}
-          description={t("projectTerminology.workspace.addMemberBeforeOwner")}
+          title={t("projectAgents.teamPage.noMembersTitle")}
+          description={t("projectAgents.teamPage.noMembersDescription")}
           action={
             canManage ? (
               <Button
@@ -5817,12 +5652,7 @@ function MembersPanel({
           </header>
           <div className="project-workspace__agent-drawer-body">
             {projectAgent ? (
-              <div className="project-workspace__agent-asset-location">
-                <IconFolder size={18} />
-                <div>
-                  <span>{t("projectAgents.assetLocation")}</span>
-                  <code>{projectAgent.agent_dir}</code>
-                </div>
+              <div className="project-workspace__member-files-action">
                 <Button
                   variant="ghost"
                   onClick={() => {
@@ -5892,27 +5722,67 @@ function MembersPanel({
                         />
                       </ProjectField>
                       {selectedCandidate && (
-                        <div className="project-workspace__member-candidate">
-                          <span>
-                            {(text(selectedCandidate, "name") || "A").slice(
-                              0,
-                              1,
-                            )}
-                          </span>
-                          <div>
-                            <strong>
-                              {text(selectedCandidate, "name") ||
-                                t("projectAgents.unnamed")}
-                            </strong>
-                            <p>
-                              {projectUserFacingCopy(
-                                text(selectedCandidate, "role_description") ||
-                                  t("projectAgents.defaultRole"),
-                                t,
+                        <>
+                          <div className="project-workspace__member-candidate">
+                            <span>
+                              {(text(selectedCandidate, "name") || "A").slice(
+                                0,
+                                1,
                               )}
-                            </p>
+                            </span>
+                            <div>
+                              <strong>
+                                {text(selectedCandidate, "name") ||
+                                  t("projectAgents.unnamed")}
+                              </strong>
+                              <p>
+                                {projectUserFacingCopy(
+                                  text(
+                                    selectedCandidate,
+                                    "role_description",
+                                  ) || t("projectAgents.defaultRole"),
+                                  t,
+                                )}
+                              </p>
+                            </div>
                           </div>
-                        </div>
+                          <section className="project-workspace__capability-preview">
+                            <header>
+                              <strong>
+                                {t(
+                                  "projectAgents.capabilityPackage.carryPreview",
+                                )}
+                              </strong>
+                            </header>
+                            <div>
+                              {(["tool", "mcp", "skill"] as const).map(
+                                (kind) => (
+                                  <span key={kind}>
+                                    <strong>
+                                      {candidateCapabilities.filter(
+                                        (capability) =>
+                                          capability.kind === kind,
+                                      ).length ||
+                                        (kind === "skill"
+                                          ? num(selectedCandidate, "skill_count")
+                                          : kind === "mcp"
+                                            ? num(
+                                                selectedCandidate,
+                                                "mcp_count",
+                                              )
+                                            : 0)}
+                                    </strong>
+                                    <small>
+                                      {t(
+                                        `projectAgents.capabilityPackage.sections.${kind === "tool" ? "tools" : kind}`,
+                                      )}
+                                    </small>
+                                  </span>
+                                ),
+                              )}
+                            </div>
+                          </section>
+                        </>
                       )}
                     </>
                   ) : (
@@ -6017,26 +5887,17 @@ function MembersPanel({
           </div>
           <footer>
             {agentDrawerMode === "edit" && canManage && projectAgent ? (
-              <>
-                <Button
-                  variant="secondary"
-                  onClick={openPromoteDialog}
-                  disabled={busyAction === "promote-project-agent"}
-                >
-                  {t("projectAgents.actions.promote")}
-                </Button>
-                <Button
-                  variant="primary"
-                  onClick={saveProjectAgent}
-                  disabled={
-                    agentDraft.name.trim().length < 2 ||
-                    busyAction === "save-project-agent"
-                  }
-                >
-                  <IconDeviceFloppy size={16} />
-                  {t("projectAgents.actions.save")}
-                </Button>
-              </>
+              <Button
+                variant="primary"
+                onClick={saveProjectAgent}
+                disabled={
+                  agentDraft.name.trim().length < 2 ||
+                  busyAction === "save-project-agent"
+                }
+              >
+                <IconDeviceFloppy size={16} />
+                {t("projectAgents.actions.save")}
+              </Button>
             ) : agentDrawerMode === "create" ? (
               <>
                 <Button
@@ -6211,6 +6072,9 @@ function ProjectToolsControl({
   policies,
   runAction,
   busyAction,
+  canManage,
+  fixedMemberId,
+  compact = false,
 }: {
   projectId: string;
   members: RecordValue[];
@@ -6221,6 +6085,9 @@ function ProjectToolsControl({
     success: string,
   ) => Promise<boolean>;
   busyAction: string;
+  canManage: boolean;
+  fixedMemberId?: string;
+  compact?: boolean;
 }) {
   const { t } = useTranslation();
   const { get, update } = useContext(WorkspaceNavigationContext);
@@ -6229,15 +6096,17 @@ function ProjectToolsControl({
     [members],
   );
   const requestedMemberId = get("toolMember");
-  const selectedMemberId = activeMembers.some(
-    (member) => text(member, "id", "member_id") === requestedMemberId,
-  )
-    ? requestedMemberId
-    : text(activeMembers[0] || {}, "id", "member_id");
+  const selectedMemberId = fixedMemberId
+    ? fixedMemberId
+    : activeMembers.some(
+          (member) => text(member, "id", "member_id") === requestedMemberId,
+        )
+      ? requestedMemberId
+      : text(activeMembers[0] || {}, "id", "member_id");
   const member =
-    activeMembers.find(
+    members.find(
       (entry) => text(entry, "id", "member_id") === selectedMemberId,
-    ) || activeMembers[0];
+    ) || (fixedMemberId ? undefined : activeMembers[0]);
   const memberId = text(member || {}, "id", "member_id");
   const memberName =
     text(member || {}, "name_snapshot", "agent_name", "name") ||
@@ -6284,14 +6153,17 @@ function ProjectToolsControl({
       t("projectManagementTools.updated", { name: memberName }),
     );
   };
+  const renderedTools = compact ? PROJECT_TOOL_REGISTRY : visibleTools;
   return (
-    <section className="project-workspace__project-tools">
+    <section
+      className={`project-workspace__project-tools${compact ? " is-compact" : ""}`}
+    >
       <header className="project-workspace__subsection-heading">
         <div>
           <h3>{t("projectManagementTools.title")}</h3>
-          <p>{t("projectManagementTools.description")}</p>
+          {!compact ? <p>{t("projectManagementTools.description")}</p> : null}
         </div>
-        {member && (
+        {member && !compact ? (
           <div className="project-workspace__project-tool-member">
             <ProjectSelect
               value={memberId}
@@ -6310,33 +6182,16 @@ function ProjectToolsControl({
               {effectiveCount} / {PROJECT_TOOL_REGISTRY.length}
             </ProjectCountBadge>
           </div>
-        )}
+        ) : member ? (
+          <ProjectCountBadge>
+            {effectiveCount} / {PROJECT_TOOL_REGISTRY.length}
+          </ProjectCountBadge>
+        ) : null}
       </header>
-      <div className="project-workspace__tool-baselines">
-        <article>
-          <strong>{t("projectTerminology.owner")}</strong>
-          <span>
-            {t("projectManagementTools.toolCount", {
-              count: PROJECT_TOOL_REGISTRY.length,
-            })}
-          </span>
-          <small>{t("projectManagementTools.ownerDescription")}</small>
-        </article>
-        <article>
-          <strong>{t("projectTerminology.workspace.projectMembers")}</strong>
-          <span>
-            {t("projectManagementTools.toolCount", {
-              count: PROJECT_TOOL_REGISTRY.filter((tool) => tool.participant)
-                .length,
-            })}
-          </span>
-          <small>{t("projectManagementTools.memberDescription")}</small>
-        </article>
-      </div>
       {member ? (
         <>
           <div className="project-workspace__project-tool-grid">
-            {visibleTools.map((tool) => {
+            {renderedTools.map((tool) => {
               const resolution = projectToolResolution(tool, member, policies);
               const blockedLabel = !resolution.roleCeiling
                 ? t("projectTerminology.ownerDedicated")
@@ -6372,27 +6227,33 @@ function ProjectToolsControl({
                         )}
                       </strong>
                     </div>
-                    <ToggleSwitch
-                      checked={resolution.effective}
-                      onChange={(checked) => toggleTool(tool, checked)}
-                      ariaLabel={t(
-                        resolution.effective
-                          ? "projectManagementTools.disableTool"
-                          : "projectManagementTools.enableTool",
-                        {
-                          name: t(
-                            `projectManagementTools.registry.${tool.name}.label`,
-                            { defaultValue: tool.label },
-                          ),
-                        },
-                      )}
-                      disabled={
-                        !resolution.roleCeiling ||
-                        resolution.policyBlocked ||
-                        resolution.snapshotBlocked ||
-                        busyAction === actionKey
-                      }
-                    />
+                    {canManage ? (
+                      <ToggleSwitch
+                        checked={resolution.effective}
+                        onChange={(checked) => toggleTool(tool, checked)}
+                        ariaLabel={t(
+                          resolution.effective
+                            ? "projectManagementTools.disableTool"
+                            : "projectManagementTools.enableTool",
+                          {
+                            name: t(
+                              `projectManagementTools.registry.${tool.name}.label`,
+                              { defaultValue: tool.label },
+                            ),
+                          },
+                        )}
+                        disabled={
+                          !resolution.roleCeiling ||
+                          resolution.policyBlocked ||
+                          resolution.snapshotBlocked ||
+                          busyAction === actionKey
+                        }
+                      />
+                    ) : (
+                      <ProjectStatusBadge tone={tone}>
+                        {blockedLabel}
+                      </ProjectStatusBadge>
+                    )}
                   </header>
                   <p>
                     {tool.descriptionKey
@@ -6402,21 +6263,11 @@ function ProjectToolsControl({
                           { defaultValue: tool.description },
                         )}
                   </p>
-                  <footer>
-                    <ProjectStatusBadge tone={tone}>
-                      {blockedLabel}
-                    </ProjectStatusBadge>
-                    <small>
-                      {tool.participant
-                        ? t("projectTerminology.workspace.projectMembers")
-                        : t("projectTerminology.owner")}
-                    </small>
-                  </footer>
                 </article>
               );
             })}
           </div>
-          {toolsPagination}
+          {!compact ? toolsPagination : null}
         </>
       ) : (
         <ProjectEmptyState
@@ -6430,26 +6281,17 @@ function ProjectToolsControl({
 }
 
 function CapabilitiesPanel({
-  projectId,
   members,
   capabilities,
   policies,
-  runAction,
-  busyAction,
 }: {
-  projectId: string;
   members: RecordValue[];
   capabilities: RecordValue[];
   policies: RecordValue | null;
-  runAction: (
-    key: string,
-    action: () => Promise<unknown>,
-    success: string,
-  ) => Promise<boolean>;
-  busyAction: string;
 }) {
   const { t } = useTranslation();
   const { get, update } = useContext(WorkspaceNavigationContext);
+  const view = get("capView") === "matrix" ? "matrix" : "list";
   const requestedFilter = get("capFilter");
   const filter = ["all", "skill", "mcp", "project", "agent"].includes(
     requestedFilter,
@@ -6481,164 +6323,197 @@ function CapabilitiesPanel({
     <>
       <SectionHeading
         eyebrow="CAPABILITY CONTROL"
-        title={t("projectWorkspaceNav.tabs.capabilities")}
-        description={t("projectWorkspacePage.capabilities.description")}
-      />
-      <ProjectSegmentedControl
-        className="project-workspace__filters"
-        value={filter}
-        options={[
-          { value: "all", label: t("common.all") },
-          { value: "skill", label: "Skill" },
-          { value: "mcp", label: "MCP" },
-          {
-            value: "project",
-            label: t("projectWorkspacePage.capabilities.projectShared"),
-          },
-          {
-            value: "agent",
-            label: t("projectWorkspacePage.capabilities.inherited"),
-          },
-        ]}
-        onChange={(value) =>
-          update({ capFilter: value, capabilitiesPage: undefined })
+        title={t("projectAgents.teamPage.capabilities")}
+        description={t("projectAgents.teamPage.capabilitiesDescription")}
+        actions={
+          <ProjectSegmentedControl
+            value={view}
+            options={[
+              {
+                value: "list",
+                label: t("projectAgents.teamPage.listView"),
+              },
+              {
+                value: "matrix",
+                label: t("projectAgents.teamPage.matrixView"),
+              },
+            ]}
+            onChange={(nextView) =>
+              update({
+                capView: nextView === "matrix" ? "matrix" : undefined,
+              })
+            }
+            ariaLabel={t("projectAgents.teamPage.viewModeAria")}
+          />
         }
-        ariaLabel={t("projectWorkspacePage.capabilities.filterAria")}
       />
-      {filteredCapabilities.length ? (
-        <>
-          <div className="project-workspace__cap-grid">
-            {visibleCapabilities.map((cap) => {
-              const id = text(cap, "id", "binding_id", "capability_id");
-              const capabilityType = text(
-                cap,
-                "capability_type",
-                "kind",
-                "type",
-              );
-              const enabled = cap.is_enabled !== false;
-              const scopeCount = Object.keys(obj(cap.scope)).length;
-              const inheritedFromAgentId = text(cap, "inherited_from_agent_id");
-              const departedOwner = Boolean(
-                inheritedFromAgentId &&
-                  departedAgentIds.has(inheritedFromAgentId),
-              );
-              return (
-                <article
-                  key={id}
-                  className={departedOwner ? "is-readonly" : ""}
-                >
-                  <header>
-                    <span className={`is-${capabilityType || "skill"}`}>
-                      {capabilityType === "mcp" ? (
-                        <IconCodeDots size={17} />
-                      ) : (
-                        <IconTool size={17} />
-                      )}
-                    </span>
-                    <div>
-                      <strong>{text(cap, "name", "capability_name")}</strong>
-                      <small>
-                        {text(cap, "version") ||
-                          capabilityType.toUpperCase() ||
-                          t(
-                            "projectWorkspacePage.capabilities.capability",
-                          )}{" "}
-                        ·{" "}
-                        {text(cap, "source") === "agent"
-                          ? t(
-                              "projectWorkspacePage.capabilities.inheritedFrom",
-                              {
-                                name:
-                                  inheritedFromAgentId ||
-                                  t(
-                                    "projectTerminology.dynamicCopy.digitalEmployee",
-                                  ),
-                                departed: departedOwner
-                                  ? t(
-                                      "projectWorkspacePage.capabilities.departedSuffix",
-                                    )
-                                  : "",
-                              },
-                            )
-                          : t(
-                              "projectWorkspacePage.capabilities.projectShared",
-                            )}
-                      </small>
-                    </div>
-                    <ToggleSwitch
-                      checked={departedOwner ? false : enabled}
-                      ariaLabel={t(
-                        enabled
-                          ? "projectWorkspacePage.capabilities.actions.disable"
-                          : "projectWorkspacePage.capabilities.actions.enable",
-                        { name: text(cap, "name", "capability_name") },
-                      )}
-                      disabled={departedOwner || busyAction === `cap-${id}`}
-                      onChange={(checked) =>
-                        void runAction(
-                          `cap-${id}`,
-                          () =>
-                            projectsApi.patchCapability(projectId, id, {
-                              is_enabled: checked,
-                            }),
-                          checked
-                            ? t(
-                                "projectWorkspacePage.capabilities.feedback.enabled",
-                              )
-                            : t(
-                                "projectWorkspacePage.capabilities.feedback.disabled",
-                              ),
-                        )
-                      }
-                    />
-                  </header>
-                  <p>
-                    {departedOwner
-                      ? t(
-                          "projectWorkspacePage.capabilities.departedDescription",
-                        )
-                      : text(cap, "description") ||
-                        t("projectWorkspacePage.capabilities.noDescription")}
-                  </p>
-                  <footer>
-                    <span>
-                      {scopeCount
-                        ? t("projectWorkspacePage.capabilities.scopeCount", {
-                            count: scopeCount,
-                          })
-                        : t("projectWorkspacePage.capabilities.noScope")}
-                    </span>
-                    {departedOwner ? (
-                      <ProjectStatusBadge tone="neutral">
-                        {t("projectWorkspacePage.members.historical.title")}
-                      </ProjectStatusBadge>
-                    ) : (
-                      text(cap, "risk_level") && (
-                        <em>{text(cap, "risk_level")} risk</em>
-                      )
-                    )}
-                  </footer>
-                </article>
-              );
-            })}
-          </div>
-          {pagination}
-        </>
-      ) : (
-        <EmptyState
-          icon={<IconTool size={22} />}
-          title={t("projectWorkspacePage.capabilities.empty.title")}
-          description={t("projectWorkspacePage.capabilities.empty.description")}
+      {view === "matrix" ? (
+        <CapabilityMatrix
+          members={members}
+          capabilities={capabilities}
+          policies={policies}
         />
+      ) : (
+        <>
+          {capabilities.length ? (
+            <>
+              <ProjectSegmentedControl
+                className="project-workspace__filters"
+                value={filter}
+                options={[
+                  { value: "all", label: t("common.all") },
+                  { value: "skill", label: "Skill" },
+                  { value: "mcp", label: "MCP" },
+                  {
+                    value: "project",
+                    label: t("projectWorkspacePage.capabilities.projectShared"),
+                  },
+                  {
+                    value: "agent",
+                    label: t("projectWorkspacePage.capabilities.inherited"),
+                  },
+                ]}
+                onChange={(value) =>
+                  update({ capFilter: value, capabilitiesPage: undefined })
+                }
+                ariaLabel={t("projectWorkspacePage.capabilities.filterAria")}
+              />
+              {filteredCapabilities.length ? (
+                <>
+                  <div className="project-workspace__cap-grid">
+                    {visibleCapabilities.map((cap) => {
+                      const id = text(cap, "id", "binding_id", "capability_id");
+                      const capabilityType = text(
+                        cap,
+                        "capability_type",
+                        "kind",
+                        "type",
+                      );
+                      const enabled = cap.is_enabled !== false;
+                      const scopeCount = Object.keys(obj(cap.scope)).length;
+                      const inheritedFromAgentId = text(
+                        cap,
+                        "inherited_from_agent_id",
+                      );
+                      const inheritedFromMember = members.find(
+                        (member) => text(member, "agent_id") === inheritedFromAgentId,
+                      );
+                      const inheritedFromName = text(
+                        inheritedFromMember || {},
+                        "name_snapshot",
+                        "agent_name",
+                        "name",
+                      );
+                      const departedOwner = Boolean(
+                        inheritedFromAgentId &&
+                        departedAgentIds.has(inheritedFromAgentId),
+                      );
+                      return (
+                        <article
+                          key={id}
+                          className={departedOwner ? "is-readonly" : ""}
+                        >
+                          <header>
+                            <span className={`is-${capabilityType || "skill"}`}>
+                              {capabilityType === "mcp" ? (
+                                <IconCodeDots size={17} />
+                              ) : (
+                                <IconTool size={17} />
+                              )}
+                            </span>
+                            <div>
+                              <strong>
+                                {text(cap, "name", "capability_name")}
+                              </strong>
+                              <small>
+                                {text(cap, "version") ||
+                                  capabilityType.toUpperCase() ||
+                                  t(
+                                    "projectWorkspacePage.capabilities.capability",
+                                  )}{" "}
+                                ·{" "}
+                                {inheritedFromAgentId
+                                  ? t(
+                                      "projectWorkspacePage.capabilities.inheritedFrom",
+                                      {
+                                        name: inheritedFromName ||
+                                          t("projectTerminology.dynamicCopy.digitalEmployee"),
+                                        departed: departedOwner
+                                          ? t(
+                                              "projectWorkspacePage.capabilities.departedSuffix",
+                                            )
+                                          : "",
+                                      },
+                                    )
+                                  : t(
+                                      "projectWorkspacePage.capabilities.projectShared",
+                                    )}
+                              </small>
+                            </div>
+                            <ProjectStatusBadge
+                              tone={
+                                enabled && !departedOwner
+                                  ? "success"
+                                  : "neutral"
+                              }
+                            >
+                              {t(
+                                enabled && !departedOwner
+                                  ? "projectManagementTools.status.available"
+                                  : "projectManagementTools.status.memberDisabled",
+                              )}
+                            </ProjectStatusBadge>
+                          </header>
+                          <p>
+                            {departedOwner
+                              ? t(
+                                  "projectWorkspacePage.capabilities.departedDescription",
+                                )
+                              : text(cap, "description") ||
+                                t(
+                                  "projectWorkspacePage.capabilities.noDescription",
+                                )}
+                          </p>
+                          <footer>
+                            <span>
+                              {scopeCount
+                                ? t(
+                                    "projectWorkspacePage.capabilities.scopeCount",
+                                    {
+                                      count: scopeCount,
+                                    },
+                                  )
+                                : t(
+                                    "projectWorkspacePage.capabilities.noScope",
+                                  )}
+                            </span>
+                            {departedOwner ? (
+                              <ProjectStatusBadge tone="neutral">
+                                {t(
+                                  "projectWorkspacePage.members.historical.title",
+                                )}
+                              </ProjectStatusBadge>
+                            ) : null}
+                          </footer>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  {pagination}
+                </>
+              ) : (
+                <EmptyState
+                  icon={<IconTool size={22} />}
+                  title={t("projectAgents.teamPage.capabilitiesEmptyTitle")}
+                  description={t(
+                    "projectAgents.teamPage.capabilitiesEmptyDescription",
+                  )}
+                />
+              )}
+            </>
+          ) : null}
+        </>
       )}
-      <ProjectToolsControl
-        projectId={projectId}
-        members={members}
-        policies={policies}
-        runAction={runAction}
-        busyAction={busyAction}
-      />
     </>
   );
 }
@@ -6698,8 +6573,8 @@ function CapabilityBindingsMatrix({
               </ProjectDataTableHead>
               <ProjectDataTableBody>
                 {visibleCapabilities.map((cap) => {
-                  const assignments = obj(cap.assignments);
                   const inheritedAgentId = text(cap, "inherited_from_agent_id");
+                  const shared = text(cap, "source") === "shared";
                   const inherited =
                     Boolean(inheritedAgentId) ||
                     ["agent", "inherited"].includes(text(cap, "source"));
@@ -6722,8 +6597,6 @@ function CapabilityBindingsMatrix({
                       </ProjectDataTableCell>
                       {members.map((member) => {
                         const id = text(member, "agent_id", "id", "member_id");
-                        const explicitlyAssigned =
-                          Object.prototype.hasOwnProperty.call(assignments, id);
                         const enabled = cap.is_enabled !== false;
                         const resolved: "yes" | "no" | "unknown" =
                           member.is_enabled === false || !enabled
@@ -6732,11 +6605,9 @@ function CapabilityBindingsMatrix({
                               ? inheritedAgentId === id
                                 ? "yes"
                                 : "no"
-                              : explicitlyAssigned
-                                ? assignments[id] === false
-                                  ? "no"
-                                  : "yes"
-                                : "unknown";
+                              : shared
+                                ? "yes"
+                                : "no";
                         return (
                           <ProjectDataTableCell key={id}>
                             <span
@@ -6747,7 +6618,7 @@ function CapabilityBindingsMatrix({
                               ) : resolved === "no" ? (
                                 <IconX size={16} />
                               ) : (
-                                <IconClock size={16} />
+                                <span aria-hidden="true">—</span>
                               )}
                               <small>
                                 {member.is_enabled === false
@@ -6781,10 +6652,8 @@ function CapabilityBindingsMatrix({
       ) : (
         <EmptyState
           icon={<IconCodeDots size={22} />}
-          title={t("projectWorkspacePage.capabilities.matrixEmpty.title")}
-          description={t(
-            "projectWorkspacePage.capabilities.matrixEmpty.description",
-          )}
+          title={t("projectAgents.teamPage.matrixEmptyTitle")}
+          description={t("projectAgents.teamPage.matrixEmptyDescription")}
         />
       )}
     </>
@@ -6957,79 +6826,67 @@ function ProjectVisibilitySettings({
   onReload: () => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const currentUser = useAuthStore((state) => state.user);
   const toast = useToast();
+  const canManageAccess = project.access_role === "owner";
   const [visibility, setVisibility] = useState<"private" | "shared">(
     project.visibility,
   );
   const [sharedUserIds, setSharedUserIds] = useState<string[]>(
     project.shared_with_user_ids || [],
   );
-  const [shareTargets, setShareTargets] = useState<
-    Array<{
-      id: string;
-      name: string;
-      email?: string | null;
-      avatar_url?: string | null;
-    }>
-  >([]);
-  const [targetsLoading, setTargetsLoading] = useState(true);
-  const [targetsError, setTargetsError] = useState("");
+  const [sharedUsers, setSharedUsers] = useState<AgentAccessUser[]>(() =>
+    (project.shared_with_user_ids || []).map((userId, index) => ({
+      id: userId,
+      name: project.shared_with_names?.[index] || userId,
+      access_level: "use",
+    })),
+  );
+  const [executionUserId, setExecutionUserId] = useState(
+    project.execution_user_id || "",
+  );
+  const [memberPickerOpen, setMemberPickerOpen] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [saving, setSaving] = useState(false);
   const [permissionDenied, setPermissionDenied] = useState(
-    project.editable === false,
+    project.access_role !== "owner",
   );
 
   useEffect(() => {
     setVisibility(project.visibility);
     setSharedUserIds(project.shared_with_user_ids || []);
-    setPermissionDenied(project.editable === false);
+    setSharedUsers(
+      (project.shared_with_user_ids || []).map((userId, index) => ({
+        id: userId,
+        name: project.shared_with_names?.[index] || userId,
+        access_level: "use",
+      })),
+    );
+    setExecutionUserId(project.execution_user_id || "");
+    setPermissionDenied(!canManageAccess);
     setSaveError("");
   }, [
-    project.editable,
+    canManageAccess,
     project.shared_with_user_ids,
+    project.shared_with_names,
+    project.execution_user_id,
     project.updated_at,
     project.visibility,
   ]);
 
-  useEffect(() => {
-    let active = true;
-    setTargetsLoading(true);
-    setTargetsError("");
-    void projectsApi
-      .bootstrapOptions()
-      .then((options) => {
-        if (active) setShareTargets(options.users);
-      })
-      .catch((error) => {
-        if (active)
-          setTargetsError(
-            errorMessage(error, t("projectWorkspacePage.errors.requestFailed")),
-          );
-      })
-      .finally(() => {
-        if (active) setTargetsLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [t]);
-
-  const isOwner = Boolean(
-    currentUser?.id && project.owner_id === currentUser.id,
-  );
-  const knownNonOwner = Boolean(
-    currentUser?.id && project.owner_id && !isOwner,
-  );
-  const readOnly =
-    permissionDenied || project.editable === false || knownNonOwner;
+  const readOnly = permissionDenied || !canManageAccess;
   const sharedWithoutMembers =
     visibility === "shared" && sharedUserIds.length === 0;
+  const sharedWithoutExecutionUser =
+    visibility === "shared" &&
+    (!executionUserId || !sharedUserIds.includes(executionUserId));
   const save = async () => {
     if (readOnly) return;
     if (sharedWithoutMembers) {
       setSaveError(t("projectWorkspacePage.visibility.memberRequired"));
+      return;
+    }
+    if (sharedWithoutExecutionUser) {
+      setSaveError(t("projectWorkspacePage.visibility.executionUserRequired"));
       return;
     }
     setSaving(true);
@@ -7038,6 +6895,8 @@ function ProjectVisibilitySettings({
       await projectsApi.update(projectId, {
         visibility,
         shared_with_user_ids: visibility === "shared" ? sharedUserIds : [],
+        execution_user_id:
+          visibility === "shared" ? executionUserId : null,
       });
       toast.success(
         t(
@@ -7064,18 +6923,18 @@ function ProjectVisibilitySettings({
       setSaving(false);
     }
   };
-  const shareOptions = shareTargets
-    .filter((user) => user.id !== project.owner_id)
-    .map((user) => ({
-      value: user.id,
-      label: user.name,
-      description: user.email || undefined,
-      avatarUrl: user.avatar_url,
-      avatarFallback: user.name.trim().slice(-2) || "?",
-    }));
+  const selectedUsers = sharedUsers.filter((user) =>
+    sharedUserIds.includes(user.id),
+  );
 
   return (
     <section className="project-workspace__visibility-settings">
+      <header className="project-workspace__settings-section-heading">
+        <div>
+          <h3>{t("projectWorkspacePage.visibility.title")}</h3>
+          <p>{t("projectWorkspacePage.visibility.description")}</p>
+        </div>
+      </header>
       <div className="project-workspace__visibility-body">
         <ProjectField
           label={
@@ -7124,41 +6983,71 @@ function ProjectVisibilitySettings({
               : undefined
           }
         >
-          <MultiSelectDropdown
-            options={shareOptions}
-            values={sharedUserIds}
-            onChange={setSharedUserIds}
-            emptyLabel={
-              targetsLoading
-                ? t("projectWorkspacePage.visibility.loadingMembers")
-                : t("projectWorkspacePage.visibility.selectMembers")
+          <button
+            type="button"
+            className="project-workspace__member-picker-trigger"
+            onClick={() => setMemberPickerOpen(true)}
+            disabled={readOnly || visibility !== "shared"}
+            aria-label={t("projectWorkspacePage.visibility.selectMembersAria")}
+          >
+            <span>
+              <IconUsers size={17} />
+              {selectedUsers.length
+                  ? t("projectWorkspacePage.visibility.selectedMembers", {
+                      count: selectedUsers.length,
+                    })
+                  : t("projectWorkspacePage.visibility.selectMembers")}
+            </span>
+            <IconChevronRight size={17} />
+          </button>
+          {selectedUsers.length > 0 && (
+            <div className="project-workspace__selected-members" aria-live="polite">
+              {selectedUsers.slice(0, 4).map((user) => (
+                <span key={user.id}>{user.name}</span>
+              ))}
+              {selectedUsers.length > 4 && <span>+{selectedUsers.length - 4}</span>}
+            </div>
+          )}
+        </ProjectField>
+        <ProjectField
+          label={t("projectWorkspacePage.visibility.executionUser")}
+          hint={t("projectWorkspacePage.visibility.executionUserHint")}
+          error={
+            sharedWithoutExecutionUser
+              ? t(
+                  "projectWorkspacePage.visibility.executionUserRequiredShort",
+                )
+              : undefined
+          }
+        >
+          <ProjectSelect
+            value={visibility === "shared" ? executionUserId : "owner"}
+            options={
+              visibility === "shared"
+                ? selectedUsers.map((user) => ({
+                    value: user.id,
+                    label: user.name,
+                  }))
+                : [
+                    {
+                      value: "owner",
+                      label:
+                        project.owner_name ||
+                        t("projectWorkspacePage.visibility.executionUserOwner"),
+                    },
+                  ]
             }
-            selectedLabel={(count) =>
-              t("projectWorkspacePage.visibility.selectedMembers", { count })
-            }
-            searchPlaceholder={t(
-              "projectWorkspacePage.visibility.searchMembers",
+            onChange={setExecutionUserId}
+            ariaLabel={t("projectWorkspacePage.visibility.executionUser")}
+            disabled={readOnly || visibility !== "shared"}
+            placeholder={t(
+              "projectWorkspacePage.visibility.selectExecutionUser",
             )}
-            noOptionsLabel={
-              targetsError
-                ? t("projectWorkspacePage.visibility.membersUnavailable")
-                : t("projectWorkspacePage.visibility.noMembers")
-            }
-            noMatchesLabel={t("projectWorkspacePage.visibility.noMatches")}
-            ariaLabel={t("projectWorkspacePage.visibility.selectMembersAria")}
-            disabled={readOnly || visibility !== "shared" || targetsLoading}
           />
         </ProjectField>
       </div>
       <footer>
         <div>
-          {targetsError && (
-            <small className="is-warning">
-              {t("projectWorkspacePage.visibility.membersLoadFailed", {
-                error: targetsError,
-              })}
-            </small>
-          )}
           {readOnly && (
             <small className="is-warning">
               {t("projectWorkspacePage.visibility.readOnly")}
@@ -7170,19 +7059,41 @@ function ProjectVisibilitySettings({
             </small>
           )}
         </div>
-        <Button
-          variant="secondary"
-          onClick={() => void save()}
-          disabled={readOnly || saving || sharedWithoutMembers}
-        >
-          {saving ? (
-            <IconLoader2 className="project-workspace__spinner" size={16} />
-          ) : (
-            <IconLock size={16} />
-          )}
-          {t("projectWorkspacePage.visibility.save")}
-        </Button>
+        {!readOnly && (
+          <Button
+            variant="secondary"
+            onClick={() => void save()}
+            disabled={
+              readOnly ||
+              saving ||
+              sharedWithoutMembers ||
+              sharedWithoutExecutionUser
+            }
+          >
+            {saving ? (
+              <IconLoader2 className="project-workspace__spinner" size={16} />
+            ) : (
+              <IconLock size={16} />
+            )}
+            {t("projectWorkspacePage.visibility.save")}
+          </Button>
+        )}
       </footer>
+      <OrgMemberAccessPicker
+        open={memberPickerOpen}
+        agentId={projectId}
+        directoryBaseUrl={`/projects/${projectId}/directory`}
+        membersOnly
+        users={selectedUsers}
+        departments={[]}
+        onClose={() => setMemberPickerOpen(false)}
+        onSave={async (users) => {
+          setSharedUsers(users);
+          const userIds = users.map((user) => user.id);
+          setSharedUserIds(userIds);
+          if (!userIds.includes(executionUserId)) setExecutionUserId("");
+        }}
+      />
     </section>
   );
 }
@@ -7207,11 +7118,9 @@ function PoliciesPanel({
   busyAction: string;
 }) {
   const { t } = useTranslation();
-  const currentUser = useAuthStore((state) => state.user);
   const toast = useToast();
-  const isOwner = Boolean(
-    currentUser?.id && project.owner_id === currentUser.id,
-  );
+  const isOwner = project.access_role === "owner";
+  const canManageSettings = project.access_role !== "view";
   const governance = obj(policies?.policies);
   const [model, setModel] = useState("default");
   const [models, setModels] = useState<
@@ -7225,7 +7134,6 @@ function PoliciesPanel({
   >([]);
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelsError, setModelsError] = useState("");
-  const [approval, setApproval] = useState("risk");
   const [parallel, setParallel] = useState("4");
   const [a2aLimit, setA2aLimit] = useState("12");
   const [loopGuard, setLoopGuard] = useState(true);
@@ -7237,11 +7145,13 @@ function PoliciesPanel({
     useState<ProjectTemplateManifest | null>(null);
   const [templateManifestLoading, setTemplateManifestLoading] = useState(false);
   const [templateManifestError, setTemplateManifestError] = useState("");
+  const [includedTemplateSkillIds, setIncludedTemplateSkillIds] = useState<
+    string[]
+  >([]);
   useEffect(() => {
     const nextRuntime = obj(policies?.runtime);
     const nextGovernance = obj(policies?.policies);
     setModel(text(nextRuntime, "model", "default_model") || "default");
-    setApproval(text(nextGovernance, "approval_policy") || "risk");
     setParallel(text(nextRuntime, "max_parallel_runs") || "4");
     setA2aLimit(text(nextGovernance, "max_a2a_wakes") || "12");
     setLoopGuard(nextGovernance.loop_guard !== false);
@@ -7254,6 +7164,7 @@ function PoliciesPanel({
     if (!isOwner) return;
     setTemplateManifestLoading(true);
     setTemplateManifestError("");
+    setIncludedTemplateSkillIds([]);
     try {
       setTemplateManifest(await projectsApi.getTemplateManifest(projectId));
     } catch (error) {
@@ -7305,7 +7216,12 @@ function PoliciesPanel({
       label: item.label || `${item.provider} · ${item.model}`,
     })),
   ];
-  const save = () =>
+  useEffect(() => {
+    if (modelsLoading || modelsError || model === "default") return;
+    if (!models.some((item) => item.id === model)) setModel("default");
+  }, [model, models, modelsError, modelsLoading]);
+  const save = () => {
+    if (!canManageSettings) return;
     void runAction(
       "save-policies",
       () =>
@@ -7313,24 +7229,13 @@ function PoliciesPanel({
           runtime: { model, max_parallel_runs: Number(parallel) },
           policies: {
             ...governance,
-            approval_policy: approval,
             max_a2a_wakes: Number(a2aLimit),
             loop_guard: loopGuard,
           },
         }),
       t("projectWorkspacePage.policies.feedback.saved"),
     );
-  const approvalOptions = [
-    { value: "risk", label: t("projectWorkspacePage.policies.approval.risk") },
-    {
-      value: "all_writes",
-      label: t("projectWorkspacePage.policies.approval.allWrites"),
-    },
-    {
-      value: "manual",
-      label: t("projectWorkspacePage.policies.approval.manual"),
-    },
-  ];
+  };
   const publishTemplate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const name = templateName.trim();
@@ -7346,6 +7251,7 @@ function PoliciesPanel({
       await projectsApi.createTemplateFromProject(projectId, {
         name,
         is_published: true,
+        included_skill_binding_ids: includedTemplateSkillIds,
       });
       toast.success(t("projectTemplatePublish.success"));
       setTemplateDialogOpen(false);
@@ -7360,7 +7266,7 @@ function PoliciesPanel({
   return (
     <>
       <SectionHeading
-        eyebrow="POLICIES / SAFETY"
+        eyebrow={t("projectWorkspacePage.policies.eyebrow")}
         title={t("projectWorkspaceNav.tabs.policies")}
         description=""
         actions={
@@ -7378,18 +7284,23 @@ function PoliciesPanel({
                 {t("projectTemplatePublish.action")}
               </Button>
             )}
-            <Button
-              variant="primary"
-              onClick={save}
-              disabled={busyAction === "save-policies"}
-            >
-              {busyAction === "save-policies" ? (
-                <IconLoader2 className="project-workspace__spinner" size={16} />
-              ) : (
-                <IconDeviceFloppy size={16} />
-              )}
-              {t("projectWorkspacePage.policies.actions.save")}
-            </Button>
+            {canManageSettings && (
+              <Button
+                variant="primary"
+                onClick={save}
+                disabled={busyAction === "save-policies"}
+              >
+                {busyAction === "save-policies" ? (
+                  <IconLoader2
+                    className="project-workspace__spinner"
+                    size={16}
+                  />
+                ) : (
+                  <IconDeviceFloppy size={16} />
+                )}
+                {t("projectWorkspacePage.policies.actions.save")}
+              </Button>
+            )}
           </>
         }
       />
@@ -7398,7 +7309,14 @@ function PoliciesPanel({
         project={project}
         onReload={onReload}
       />
-      <div className="project-workspace__settings-grid">
+      <section className="project-workspace__runtime-settings">
+        <header className="project-workspace__settings-section-heading">
+          <div>
+            <h3>{t("projectWorkspacePage.policies.runtimeTitle")}</h3>
+            <p>{t("projectWorkspacePage.policies.runtimeDescription")}</p>
+          </div>
+        </header>
+        <div className="project-workspace__settings-grid">
         <ProjectField
           label={t("projectWorkspacePage.policies.fields.defaultModel")}
           hint={
@@ -7414,22 +7332,14 @@ function PoliciesPanel({
             options={modelOptions}
             onChange={setModel}
             ariaLabel={t("projectWorkspacePage.policies.fields.defaultModel")}
-            disabled={modelsLoading || Boolean(modelsError)}
+            disabled={
+              !canManageSettings || modelsLoading || Boolean(modelsError)
+            }
             placeholder={t(
               modelsLoading
                 ? "projectWorkspacePage.policies.loadingModels"
                 : "projectWorkspacePage.policies.selectModel",
             )}
-          />
-        </ProjectField>
-        <ProjectField
-          label={t("projectWorkspacePage.policies.fields.approval")}
-        >
-          <ProjectSelect
-            value={approval}
-            options={approvalOptions}
-            onChange={setApproval}
-            ariaLabel={t("projectWorkspacePage.policies.fields.approval")}
           />
         </ProjectField>
         <ProjectField
@@ -7443,6 +7353,7 @@ function PoliciesPanel({
             max="32"
             value={parallel}
             onChange={(event) => setParallel(event.target.value)}
+            disabled={!canManageSettings}
           />
         </ProjectField>
         <ProjectField
@@ -7456,24 +7367,31 @@ function PoliciesPanel({
             max="100"
             value={a2aLimit}
             onChange={(event) => setA2aLimit(event.target.value)}
+            disabled={!canManageSettings}
           />
         </ProjectField>
-        <div className="project-workspace__switch-setting">
-          <span>
-            <strong>
-              {t("projectWorkspacePage.policies.fields.loopGuard")}
-            </strong>
-            <small>
-              {t("projectWorkspacePage.policies.fields.loopGuardHint")}
-            </small>
-          </span>
-          <ToggleSwitch
-            checked={loopGuard}
-            onChange={setLoopGuard}
-            ariaLabel={t("projectWorkspacePage.policies.fields.loopGuard")}
-          />
+        <ProjectField
+          label={t("projectWorkspacePage.policies.fields.loopGuard")}
+          hint={t("projectWorkspacePage.policies.fields.loopGuardHint")}
+        >
+          <div className="project-workspace__toggle-field">
+            <span>
+              {t(
+                loopGuard
+                  ? "projectWorkspacePage.policies.fields.enabled"
+                  : "projectWorkspacePage.policies.fields.disabled",
+              )}
+            </span>
+            <ToggleSwitch
+              checked={loopGuard}
+              onChange={setLoopGuard}
+              ariaLabel={t("projectWorkspacePage.policies.fields.loopGuard")}
+              disabled={!canManageSettings}
+            />
+          </div>
+        </ProjectField>
         </div>
-      </div>
+      </section>
       <ProjectDialog
         open={templateDialogOpen}
         onClose={() => {
@@ -7585,6 +7503,86 @@ function PoliciesPanel({
                     </dd>
                   </div>
                 </dl>
+                <section className="project-workspace__template-skill-files">
+                  <header>
+                    <strong>
+                      {t("projectTemplatePublish.manifest.skillFilesTitle")}
+                    </strong>
+                    <span>
+                      {t("projectTemplatePublish.manifest.selectedCount", {
+                        count: includedTemplateSkillIds.length,
+                      })}
+                    </span>
+                  </header>
+                  <p>
+                    {t("projectTemplatePublish.manifest.skillFilesHint")}
+                  </p>
+                  {templateManifest.skills.length ? (
+                    <div>
+                      {templateManifest.skills.map((skill, index) => {
+                        const selectionId =
+                          skill.binding_id ||
+                          skill.id ||
+                          `${skill.name}-${index}`;
+                        const checked =
+                          includedTemplateSkillIds.includes(selectionId);
+                        return (
+                          <label
+                            className="project-workspace__template-skill-row"
+                            key={selectionId}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={publishingTemplate}
+                              onChange={(event) =>
+                                setIncludedTemplateSkillIds((current) =>
+                                  event.target.checked
+                                    ? [...current, selectionId]
+                                    : current.filter(
+                                        (id) => id !== selectionId,
+                                      ),
+                                )
+                              }
+                            />
+                            <span>
+                              <strong>{skill.name}</strong>
+                              <small>
+                                {skill.member_name ||
+                                  skill.owner_agent_name ||
+                                  t(
+                                    "projectTemplatePublish.manifest.projectShared",
+                                  )}
+                              </small>
+                            </span>
+                            <span>
+                              <strong>
+                                {t(
+                                  "projectTemplatePublish.manifest.filesAndSize",
+                                  {
+                                    count: skill.file_count || 0,
+                                    size: fileSizeLabel(skill.size_bytes || 0),
+                                  },
+                                )}
+                              </strong>
+                              <small>
+                                {t(
+                                  checked
+                                    ? "projectTemplatePublish.manifest.carriedImpact"
+                                    : "projectTemplatePublish.manifest.notCarriedImpact",
+                                )}
+                              </small>
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="project-workspace__template-skill-empty">
+                      {t("projectTemplatePublish.manifest.noSkillFiles")}
+                    </div>
+                  )}
+                </section>
                 <p>{t("projectTemplatePublish.manifest.exclusions")}</p>
               </>
             ) : null}
@@ -7656,11 +7654,8 @@ function GitRepositoryControls({
   onReload: () => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const currentUser = useAuthStore((state) => state.user);
   const toast = useToast();
-  const isOwner = Boolean(
-    currentUser?.id && project.owner_id === currentUser.id,
-  );
+  const isOwner = project.access_role === "owner";
   const [remotes, setRemotes] = useState<Array<{ name: string; url: string }>>(
     [],
   );
@@ -8441,16 +8436,18 @@ function GitPanel({
                 </dd>
               </div>
             </dl>
-            <div className="project-workspace__git-actions">
-              <Button variant="secondary" onClick={() => onDialog("branch")}>
-                <IconGitBranch size={16} />
-                {t("projectGit.createBranch")}
-              </Button>
-              <Button variant="danger" onClick={() => onDialog("restore")}>
-                <IconRestore size={16} />
-                {t("projectGit.restoreVersion")}
-              </Button>
-            </div>
+            {project.access_role === "owner" && (
+              <div className="project-workspace__git-actions">
+                <Button variant="secondary" onClick={() => onDialog("branch")}>
+                  <IconGitBranch size={16} />
+                  {t("projectGit.createBranch")}
+                </Button>
+                <Button variant="danger" onClick={() => onDialog("restore")}>
+                  <IconRestore size={16} />
+                  {t("projectGit.restoreVersion")}
+                </Button>
+              </div>
+            )}
           </aside>
         </div>
       ) : (
@@ -8560,8 +8557,8 @@ function AuditPanel({
               { replace: true },
             )
           }
-          placeholder="搜索事件、会话或 Commit"
-          aria-label="搜索审计事件"
+          placeholder={t("projectWorkspacePage.audit.searchPlaceholder")}
+          aria-label={t("projectWorkspacePage.audit.searchAria")}
         />
         <ProjectSelect
           value={actor}
@@ -8587,8 +8584,8 @@ function AuditPanel({
               auditEventsPage: undefined,
             })
           }
-          ariaLabel="筛选事件类型"
-          placeholder="全部事件"
+          ariaLabel={t("projectWorkspacePage.audit.typeFilterAria")}
+          placeholder={t("projectWorkspacePage.audit.allTypes")}
         />
         <Button
           variant="ghost"
@@ -8604,11 +8601,11 @@ function AuditPanel({
           }
         >
           <IconFilter size={15} />
-          清除筛选
+          {t("projectWorkspacePage.audit.clearFilters")}
         </Button>
         <Button variant="secondary" onClick={() => void onRefresh()}>
           <IconRefresh size={16} />
-          刷新
+          {t("projectWorkspacePage.audit.refresh")}
         </Button>
       </div>
 
@@ -8720,11 +8717,15 @@ function AuditPanel({
       ) : (
         <EmptyState
           icon={<IconHistory size={22} />}
-          title={events.length ? "没有符合条件的事件" : "还没有审计事件"}
+          title={
+            events.length
+              ? t("projectWorkspacePage.audit.noMatchesTitle")
+              : t("projectWorkspacePage.audit.emptyTitle")
+          }
           description={
             events.length
-              ? "调整或清除筛选条件后重试。"
-              : "项目操作发生后，审计事件会按时间和因果链显示。"
+              ? t("projectWorkspacePage.audit.noMatchesDescription")
+              : t("projectWorkspacePage.audit.emptyDescription")
           }
         />
       )}
@@ -8751,6 +8752,7 @@ function GitActionDialog({
     success: string,
   ) => Promise<boolean>;
 }) {
+  const { t } = useTranslation();
   const hash = text(commit, "commit", "hash", "commit_hash", "id");
   const [branchName, setBranchName] = useState(
     `restore/${new Date().toISOString().slice(0, 10)}`,
@@ -8769,8 +8771,8 @@ function GitActionDialog({
       `git-${mode}`,
       promise,
       mode === "restore"
-        ? "Restore 提交已创建；原历史保持不变"
-        : "新分支已创建",
+        ? t("projectGit.dialog.restoreSuccess")
+        : t("projectGit.dialog.branchSuccess"),
     ).then((succeeded) => {
       if (succeeded) onClose();
     });
@@ -8779,34 +8781,51 @@ function GitActionDialog({
     <ProjectDialog
       open
       onClose={onClose}
-      ariaLabel={mode === "restore" ? "恢复到此版本" : "从此版本创建分支"}
+      ariaLabel={
+        mode === "restore"
+          ? t("projectGit.dialog.restoreTitle")
+          : t("projectGit.dialog.branchTitle")
+      }
       className="project-workspace__git-dialog"
     >
       <form className="project-workspace__modal" onSubmit={submit}>
         <header>
           <div>
-            <span>VERSION HISTORY</span>
+            <span>{t("projectGit.dialog.eyebrow")}</span>
             <h2 id="project-git-dialog-title">
-              {mode === "restore" ? "恢复到此版本" : "从此版本创建分支"}
+              {mode === "restore"
+                ? t("projectGit.dialog.restoreTitle")
+                : t("projectGit.dialog.branchTitle")}
             </h2>
           </div>
-          <ProjectIconButton aria-label="关闭" onClick={onClose}>
+          <ProjectIconButton
+            aria-label={t("projectGit.dialog.close")}
+            onClick={onClose}
+          >
             <IconX size={18} />
           </ProjectIconButton>
         </header>
         <p>
           {mode === "restore" ? (
             <>
-              将项目内容恢复到 <code>{hash}</code>，并保存为一个新版本。
+              {t("projectGit.dialog.restoreDescriptionBefore")}
+              <code>{hash}</code>
+              {t("projectGit.dialog.restoreDescriptionAfter")}
             </>
           ) : (
             <>
-              将从 <code>{hash}</code> 创建新分支。
+              {t("projectGit.dialog.branchDescriptionBefore")}
+              <code>{hash}</code>
+              {t("projectGit.dialog.branchDescriptionAfter")}
             </>
           )}
         </p>
         {mode === "branch" && (
-          <ProjectField label="分支名称" labelFor="project-git-branch" required>
+          <ProjectField
+            label={t("projectGit.dialog.branchName")}
+            labelFor="project-git-branch"
+            required
+          >
             <TextInput
               id="project-git-branch"
               value={branchName}
@@ -8818,7 +8837,7 @@ function GitActionDialog({
         )}
         <footer>
           <Button type="button" variant="secondary" onClick={onClose}>
-            取消
+            {t("projectGit.dialog.cancel")}
           </Button>
           <Button
             type="submit"
@@ -8828,7 +8847,9 @@ function GitActionDialog({
             {busy === `git-${mode}` && (
               <IconLoader2 className="project-workspace__spinner" size={16} />
             )}
-            {mode === "restore" ? "恢复到此版本" : "创建分支"}
+            {mode === "restore"
+              ? t("projectGit.dialog.restoreSubmit")
+              : t("projectGit.dialog.branchSubmit")}
           </Button>
         </footer>
       </form>

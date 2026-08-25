@@ -619,17 +619,82 @@ async def delete_git_remote(project: Project, name: str) -> dict[str, str]:
     return await asyncio.to_thread(_delete_remote, project, name)
 
 
-def _assert_replaceable_baseline(repo: Path) -> None:
+def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
+    """Allow clone only over the generated pre-delivery project baseline.
+
+    Project creation records the initialization commit in settings, then may
+    add one system-owned member-directory commit so every selected member has
+    a project-local identity.  Those generated assets are still part of the
+    replaceable planning baseline; any other commit or path is user output and
+    must make clone fail closed.
+    """
+
     if _git(repo, "status", "--porcelain").stdout.strip():
         raise HTTPException(status_code=409, detail="Project repository has uncommitted changes")
-    count = _git(repo, "rev-list", "--count", "HEAD").stdout.strip()
-    files = {line for line in _git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines() if line}
-    subject = _git(repo, "log", "-1", "--format=%s").stdout.strip()
-    if count != "1" or files != {"PROJECT.json", "README.md"} or subject != "Initialize AI-native project":
+    configured_head = str(dict((project.settings or {}).get("git") or {}).get("head") or "")
+    baseline_exists = bool(
+        _COMMIT_RE.fullmatch(configured_head)
+        and _git(repo, "cat-file", "-e", f"{configured_head}^{{commit}}", check=False).returncode == 0
+    )
+    baseline_files = (
+        {line for line in _git(repo, "ls-tree", "-r", "--name-only", configured_head).stdout.splitlines() if line}
+        if baseline_exists
+        else set()
+    )
+    baseline_subject = _git(repo, "log", "-1", "--format=%s", configured_head).stdout.strip() if baseline_exists else ""
+    baseline_is_ancestor = bool(
+        baseline_exists
+        and _git(repo, "merge-base", "--is-ancestor", configured_head, "HEAD", check=False).returncode == 0
+    )
+    generated_subjects = (
+        _git(repo, "log", "--format=%s", f"{configured_head}..HEAD").stdout.splitlines() if baseline_is_ancestor else []
+    )
+    generated_authors = (
+        _git(repo, "log", "--format=%ae", f"{configured_head}..HEAD").stdout.splitlines()
+        if baseline_is_ancestor
+        else []
+    )
+    generated_paths = (
+        {line for line in _git(repo, "diff", "--name-only", configured_head, "HEAD").stdout.splitlines() if line}
+        if baseline_is_ancestor
+        else set()
+    )
+    generated_only = (
+        all(subject == "Ensure project member directories" for subject in generated_subjects)
+        and all(author == _DEFAULT_PROJECT_AUTHOR_EMAIL for author in generated_authors)
+        and all(path.startswith(".agents/") for path in generated_paths)
+    )
+    if (
+        baseline_files != {"PROJECT.json", "README.md"}
+        or baseline_subject != "Initialize AI-native project"
+        or not baseline_is_ancestor
+        or not generated_only
+    ):
         raise HTTPException(
             status_code=409,
             detail="Clone is only allowed before the project repository contains user output",
         )
+
+
+def _copy_generated_member_baseline(repo: Path, candidate: Path) -> None:
+    """Carry the current project's generated member identities into a clone."""
+
+    source = repo / ".agents"
+    if not source.is_dir():
+        return
+    if source.is_symlink() or any(path.is_symlink() for path in source.rglob("*")):
+        raise HTTPException(status_code=409, detail="Generated project member assets contain a symbolic link")
+    shutil.copytree(source, candidate / ".agents", dirs_exist_ok=True)
+    _git(candidate, "add", "--", ".agents")
+    if _git(candidate, "diff", "--cached", "--quiet", "--", ".agents", check=False).returncode == 0:
+        return
+    _commit_with_author(
+        candidate,
+        "-m",
+        "Ensure project member directories",
+        author_name=None,
+        author_email=None,
+    )
 
 
 def _restore_clone_backup(operation: ProjectRepositoryCloneOperation) -> None:
@@ -678,7 +743,7 @@ def _stage_clone_repository(
     try:
         if staging_root.exists() or backup.exists():
             raise RuntimeError("Clone operation paths already exist")
-        _assert_replaceable_baseline(repo)
+        _assert_replaceable_baseline(project, repo)
         if branch and _git(repo, "check-ref-format", "--branch", branch, check=False).returncode != 0:
             raise HTTPException(status_code=422, detail="Invalid Git branch name")
         old_head = _git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -706,6 +771,7 @@ def _stage_clone_repository(
             raise HTTPException(status_code=422, detail=f"Git clone failed: {detail[:500]}")
         if not (candidate / ".git").is_dir():
             raise HTTPException(status_code=422, detail="Cloned source is not a Git repository")
+        _copy_generated_member_baseline(repo, candidate)
         if _git(candidate, "fsck", "--no-dangling", check=False).returncode != 0:
             raise HTTPException(status_code=422, detail="Cloned Git repository failed validation")
         verified_head = _git(candidate, "rev-parse", "--verify", "HEAD", check=False)

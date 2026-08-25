@@ -15,6 +15,15 @@ export type ProjectWorkspaceTab =
 
 export type ProjectWorkspaceUrlPatch = Record<string, string | undefined>;
 
+export type ProjectWorkItemCompatibilityTarget = {
+  workItemId: string;
+  anchor:
+    | "work-item-execution"
+    | "work-item-conversation"
+    | "work-item-changes"
+    | "work-item-review";
+};
+
 const PROJECT_WORKSPACE_TABS = new Set<ProjectWorkspaceTab>([
   "cockpit",
   "work",
@@ -46,6 +55,41 @@ const WORK_ITEM_OBJECT_QUERY_KEYS = [
   "workItemEvidencePageSize",
 ] as const;
 
+const LEGACY_WORK_ITEM_ANCHORS = {
+  execution: "work-item-execution",
+  conversation: "work-item-conversation",
+  changes: "work-item-changes",
+  review: "work-item-review",
+} as const;
+
+function legacyWorkItemAnchor(
+  value: string | null,
+): ProjectWorkItemCompatibilityTarget["anchor"] | undefined {
+  if (
+    !value ||
+    !Object.prototype.hasOwnProperty.call(LEGACY_WORK_ITEM_ANCHORS, value)
+  ) {
+    return undefined;
+  }
+  return LEGACY_WORK_ITEM_ANCHORS[
+    value as keyof typeof LEGACY_WORK_ITEM_ANCHORS
+  ];
+}
+
+const CAPABILITY_QUERY_KEYS = [
+  "capView",
+  "capFilter",
+  "capabilitiesPage",
+  "capabilitiesPageSize",
+  "toolMember",
+  "projectToolsPage",
+  "projectToolsPageSize",
+  "capabilityMatrixPage",
+  "capabilityMatrixPageSize",
+  "projectToolMatrixPage",
+  "projectToolMatrixPageSize",
+] as const;
+
 const TAB_QUERY_KEYS: Record<ProjectWorkspaceTab, readonly string[]> = {
   cockpit: [],
   work: [
@@ -66,20 +110,8 @@ const TAB_QUERY_KEYS: Record<ProjectWorkspaceTab, readonly string[]> = {
   ],
   runs: ["runMember", "runsPage", "runsPageSize"],
   members: ["member", "membersPage", "membersPageSize"],
-  capabilities: [
-    "capFilter",
-    "capabilitiesPage",
-    "capabilitiesPageSize",
-    "toolMember",
-    "projectToolsPage",
-    "projectToolsPageSize",
-  ],
-  matrix: [
-    "capabilityMatrixPage",
-    "capabilityMatrixPageSize",
-    "projectToolMatrixPage",
-    "projectToolMatrixPageSize",
-  ],
+  capabilities: CAPABILITY_QUERY_KEYS,
+  matrix: CAPABILITY_QUERY_KEYS,
   policies: [],
   git: ["commit", "gitCommitsPage", "gitCommitsPageSize"],
   audit: [
@@ -126,6 +158,7 @@ export function projectWorkspaceTabFromUrl(
 ): ProjectWorkspaceTab {
   const requested = params.get("tab");
   if (requested === "detail") return "work";
+  if (requested === "matrix") return "capabilities";
   return PROJECT_WORKSPACE_TABS.has(requested as ProjectWorkspaceTab)
     ? (requested as ProjectWorkspaceTab)
     : "cockpit";
@@ -154,13 +187,41 @@ export function normalizeProjectWorkspaceUrl(
     UUID_QUERY_VALUE_PATTERN.test(legacyAuditQuery)
       ? { auditEvent: legacyAuditQuery, auditQ: undefined }
       : {};
+  const legacyWorkItemTab = params.get("workItemTab");
+  const legacyWorkItemTabPatch = legacyWorkItemAnchor(legacyWorkItemTab)
+    ? {}
+    : { workItemTab: undefined };
+  const capabilityViewPatch =
+    tab === "capabilities"
+      ? {
+          capView:
+            requested === "matrix" || params.get("capView") === "matrix"
+              ? "matrix"
+              : "list",
+        }
+      : {};
   return applyUrlPatch(
     params,
     projectWorkspaceTabUrlPatch(tab, {
       ...legacyCollectionPatch,
       ...legacyAuditEventPatch,
+      ...legacyWorkItemTabPatch,
+      ...capabilityViewPatch,
     }),
   );
+}
+
+/** Resolve an inbound tabbed detail link without adding a new query key. */
+export function projectWorkItemCompatibilityTargetFromUrl(
+  params: URLSearchParams,
+): ProjectWorkItemCompatibilityTarget | null {
+  const workItemId = params.get("workItem");
+  const anchor = legacyWorkItemAnchor(params.get("workItemTab"));
+  if (!workItemId || !anchor) return null;
+  return {
+    workItemId,
+    anchor,
+  };
 }
 
 /**
@@ -174,14 +235,24 @@ export function projectWorkspaceTabUrlPatch(
   nextTab: ProjectWorkspaceTab,
   patch: ProjectWorkspaceUrlPatch = {},
 ): ProjectWorkspaceUrlPatch {
-  const destinationKeys = new Set(TAB_QUERY_KEYS[nextTab]);
+  const canonicalTab = nextTab === "matrix" ? "capabilities" : nextTab;
+  const destinationKeys = new Set(TAB_QUERY_KEYS[canonicalTab]);
   const cleanup = Object.fromEntries(
     [
       ...TAB_SCOPED_QUERY_KEYS.filter((key) => !destinationKeys.has(key)),
       ...RETIRED_QUERY_KEYS,
     ].map((key) => [key, undefined]),
   );
-  return { ...cleanup, tab: nextTab, ...patch };
+  if (canonicalTab !== "capabilities") {
+    return { ...cleanup, tab: canonicalTab, ...patch };
+  }
+  const { capView, ...capabilityPatch } = patch;
+  return {
+    ...cleanup,
+    tab: canonicalTab,
+    ...capabilityPatch,
+    capView: nextTab === "matrix" || capView === "matrix" ? "matrix" : "list",
+  };
 }
 
 /**

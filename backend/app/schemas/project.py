@@ -65,6 +65,7 @@ class ProjectUpdate(BaseModel):
     ) = None
     settings: dict | None = None
     shared_with_user_ids: list[uuid.UUID] | None = None
+    execution_user_id: uuid.UUID | None = None
 
 
 class ProjectSettingsUpdate(BaseModel):
@@ -105,6 +106,11 @@ class ProjectMemberUpdate(BaseModel):
     is_enabled: bool | None = None
     is_leader: bool | None = None
     config_snapshot: dict | None = None
+
+
+class ProjectMemberToolUpdate(BaseModel):
+    tool_id: uuid.UUID
+    enabled: bool
 
 
 class ProjectMemberLifecycleRequest(BaseModel):
@@ -219,6 +225,14 @@ class CapabilityOut(BaseModel):
     capability_type: str
     capability_id: uuid.UUID | None
     capability_name: str
+    key: str | None = None
+    asset_id: str | None = None
+    affected_member_count: int = 0
+    description: str = ""
+    availability: Literal["available", "missing", "restricted"] = "missing"
+    version: str | None = None
+    file_count: int = 0
+    size_bytes: int = 0
     source: str
     inherited_from_agent_id: uuid.UUID | None
     is_enabled: bool
@@ -243,6 +257,7 @@ class ProjectTemplateFromProjectCreate(BaseModel):
     category: str = "general"
     version: str = "1.0.0"
     is_published: bool = False
+    included_skill_binding_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class ProjectTemplateOut(BaseModel):
@@ -336,6 +351,41 @@ class ProjectRunUpdate(BaseModel):
     error: str | None = None
 
 
+class ProjectFrozenModelSummary(BaseModel):
+    name: str | None = None
+    availability: Literal["available", "missing"]
+
+
+class ProjectFrozenMemberConfigSummary(BaseModel):
+    primary_model: ProjectFrozenModelSummary | None = None
+    fallback_model: ProjectFrozenModelSummary | None = None
+    max_tool_rounds: int | None = None
+    has_project_instruction: bool = False
+
+
+class ProjectFrozenCapabilityItem(BaseModel):
+    type: Literal["tool", "mcp", "skill", "other"]
+    key: str
+    name: str
+    source: Literal["project", "member"]
+
+
+class ProjectFrozenCapabilitySummary(BaseModel):
+    total: int = 0
+    by_type: dict[str, int] = Field(default_factory=dict)
+    items: list[ProjectFrozenCapabilityItem] = Field(default_factory=list)
+
+
+class ProjectFrozenMemberSummary(BaseModel):
+    project_member_id: uuid.UUID
+    agent_id: uuid.UUID
+    name: str | None = None
+    responsibility: str = ""
+    is_leader: bool = False
+    configuration: ProjectFrozenMemberConfigSummary
+    capabilities: ProjectFrozenCapabilitySummary
+
+
 class ProjectRunOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -359,7 +409,7 @@ class ProjectRunOut(BaseModel):
     # child session); ``subagent_session_id`` is always the worker child.
     project_member_id: uuid.UUID | None = None
     agent_name: str | None = None
-    member_snapshot: dict | None = None
+    member_snapshot: ProjectFrozenMemberSummary | None = None
     session_id: uuid.UUID | None = None
     subagent_session_id: uuid.UUID | None = None
     group_session_id: uuid.UUID | None = None
@@ -388,16 +438,13 @@ class ProjectMilestoneOut(BaseModel):
 
 
 class ProjectRunMemberSnapshotOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: uuid.UUID
     project_id: uuid.UUID
     run_id: uuid.UUID
     project_member_id: uuid.UUID
     agent_id: uuid.UUID
     is_leader: bool
-    member_config_snapshot: dict
-    capability_snapshot: list
+    member_snapshot: ProjectFrozenMemberSummary
     created_at: datetime
 
 
@@ -424,6 +471,7 @@ class ProjectEventOut(BaseModel):
     event_type: str
     summary: str
     event_metadata: dict
+    member_snapshot: ProjectFrozenMemberSummary | None = None
     created_at: datetime
 
 

@@ -16,8 +16,8 @@
       "platform": "平台"
     },
     "ownerBadge": "负责人",
-    "setOwner": "设为负责人",
-    "currentOwner": "当前负责人",
+    "setOwner": "设为执行负责人",
+    "currentOwner": "当前执行负责人",
     "ownerOnly": "仅负责人",
     "ownerDedicated": "负责人专用",
     "portfolioSearch": "搜索项目、目标或负责人",
@@ -78,11 +78,11 @@
       "planningStarted": "方案已确认，负责人开始推进项目",
       "projectDescriptionFallback": "项目说明将在与负责人的方案讨论中逐步收敛。",
       "workItemsAfterPlanning": "在项目群聊中与负责人确认方案后，工作项会自动出现在这里。",
-      "meshDescription": "成员可直接唤醒、咨询、委派或请求评审；负责人无需承担消息转发。",
+      "meshDescription": "查看团队成员之间的协作关系与分工。",
       "workItemsAfterBreakdown": "负责人拆解目标后，工作项会显示在这里。",
       "runByOwner": "由负责人执行",
       "runsAfterKickoff": "在项目群聊中确认目标并启动负责人后，运行记录会自动生成并持续保留。",
-      "ownerChanged": "项目负责人已切换",
+      "ownerChanged": "执行负责人已切换",
       "addMemberBeforeOwner": "先添加一个数字员工，再从在岗成员中指定负责人。",
       "memberOwner": "{{name}} · 负责人",
       "ownerToolDescription": "参与者仅更新本人工作项；负责人可编辑和指派。",
@@ -128,10 +128,10 @@
       "workspace": "工作区",
       "milestones": "交付里程碑",
       "runs": "运行控制",
-      "projectAgents": "项目成员",
+      "projectAgents": "数字员工",
       "capabilities": "能力中心",
-      "matrix": "能力矩阵",
-      "policies": "运行与安全策略",
+      "matrix": "可用范围",
+      "policies": "项目设置",
       "git": "Git 历史与恢复",
       "audit": "项目事件审计"
     }
@@ -208,9 +208,21 @@
       "items": "项"
     },
     "mesh": {
-      "title": "数字员工协作网络",
+      "title": "协作网络",
       "emptyTitle": "项目还没有数字员工成员",
-      "emptyDescription": "添加成员后，A2A 直连拓扑会显示在这里。"
+      "emptyDescription": "添加成员后，协作关系将显示在这里。"
+    },
+    "audit": {
+      "searchPlaceholder": "搜索事件、会话或 Commit",
+      "searchAria": "搜索审计事件",
+      "typeFilterAria": "筛选事件类型",
+      "allTypes": "全部事件",
+      "clearFilters": "清除筛选",
+      "refresh": "刷新",
+      "noMatchesTitle": "没有符合条件的事件",
+      "emptyTitle": "还没有审计事件",
+      "noMatchesDescription": "调整或清除筛选条件后重试。",
+      "emptyDescription": "项目操作发生后，审计事件会按时间和因果链显示。"
     },
     "workItems": {
       "title": "目标与任务",
@@ -257,17 +269,65 @@
         "updated": "更新于"
       },
       "feedback": {
-        "created": "工作项已创建并持久化",
-        "saved": "工作项状态与指派已保存",
-        "runCreated": "工作项运行已创建",
-        "returned": "工作项已退回修改",
-        "approved": "工作项已验收通过"
+        "created": "任务已创建",
+        "saved": "任务修改已保存",
+        "runCreated": "任务已开始推进",
+        "returned": "任务已退回修改",
+        "approved": "任务已验收通过"
       },
       "empty": {
         "title": "目标还没有拆成工作项",
         "description": "创建工作项后，项目成员即可开始推进。"
       },
       "detail": {
+        "singlePage": {
+          "back": "返回任务列表",
+          "goal": "任务目标",
+          "requirements": "开始前需要",
+          "noDependencies": "无需前置任务，可直接开始。",
+          "acceptanceTitle": "验收标准",
+          "acceptanceCount": "{{count}} 条验收标准",
+          "acceptancePending": "等待验收",
+          "acceptancePassed": "已满足验收标准",
+          "evidenceCount": "已有 {{count}} 项验收依据",
+          "evidencePending": "成果就绪后，可在这里查看验收依据。",
+          "nextStep": "下一步",
+          "progressTitle": "最近进展",
+          "progressEmpty": "任务尚未开始",
+          "viewAllProgress": "查看全部进展",
+          "edit": "编辑任务",
+          "save": "保存修改",
+          "cancel": "取消",
+          "next": {
+            "unassigned": "先指派一名数字员工，明确由谁推进。",
+            "todo": "确认任务目标和验收标准后开始推进。",
+            "inProgress": "继续推进，并及时补充成果和进展。",
+            "blocked": "先解决当前阻碍，再恢复推进。",
+            "review": "核对成果是否符合验收标准。",
+            "done": "任务已完成，可查看最终成果。"
+          },
+          "actions": {
+            "assign": "指派任务",
+            "start": "开始推进",
+            "viewProgress": "查看进展",
+            "viewBlocker": "查看阻碍",
+            "retry": "重新推进",
+            "approve": "确认完成",
+            "return": "退回修改",
+            "viewDelivery": "查看成果",
+            "reopen": "重新打开"
+          },
+          "activity": {
+            "execution": "任务推进",
+            "discussion": "协作沟通",
+            "delivery": "交付成果",
+            "evidence": "验收依据",
+            "viewResult": "查看进展",
+            "viewDiscussion": "查看沟通",
+            "viewDelivery": "查看成果",
+            "viewEvidence": "查看依据"
+          }
+        },
         "tabs": {
           "aria": "工作项详情分区",
           "context": "上下文与验收",
@@ -387,16 +447,16 @@
       "employeeNotRecorded": "未记录数字员工",
       "summaryAria": "项目成员概览",
       "emptyTitle": "项目还没有成员",
-      "projectOnlyHint": "源数字员工保持稳定，修改只在当前项目生效",
+      "projectOnlyHint": "修改仅影响当前项目，不会改变原数字员工",
       "feedback": {
-        "snapshotSaved": "项目成员快照已更新；源数字员工未改变",
+        "snapshotSaved": "工作设置已保存",
         "removed": "成员已退出项目",
         "restored": "成员已恢复，可继续参与项目"
       },
       "actions": {
         "restore": "恢复成员",
         "remove": "移出项目",
-        "saveSnapshot": "保存快照"
+        "saveSnapshot": "保存工作设置"
       },
       "historical": {
         "title": "历史只读",
@@ -456,6 +516,8 @@
       }
     },
     "visibility": {
+      "title": "访问范围",
+      "description": "设置项目访问范围、共享成员和运行身份。",
       "label": "可见范围",
       "shared": "已共享",
       "private": "仅自己可见",
@@ -469,6 +531,12 @@
       "loadingMembers": "正在读取组织成员…",
       "selectMembers": "选择共享成员",
       "selectedMembers": "已选择 {{count}} 名成员",
+      "executionUser": "运行身份",
+      "executionUserHint": "项目运行使用所选成员已授权的资源。",
+      "executionUserOwner": "项目所有者",
+      "selectExecutionUser": "选择运行身份",
+      "executionUserRequired": "请选择项目运行身份。",
+      "executionUserRequiredShort": "请选择一名共享成员",
       "searchMembers": "搜索组织成员",
       "membersUnavailable": "组织成员暂不可用",
       "noMembers": "暂无可共享成员",
@@ -477,36 +545,35 @@
       "membersLoadFailed": "组织成员读取失败：{{error}}",
       "readOnly": "当前账号不能管理此项目的可见范围。",
       "permissionDeniedDraft": "你没有管理此项目可见范围的权限，草稿已保留。",
-      "save": "保存可见范围",
+      "save": "保存访问设置",
       "feedback": {
         "shared": "项目共享范围已保存",
         "private": "项目已设为仅自己可见"
       }
     },
     "policies": {
+      "eyebrow": "项目设置",
+      "runtimeTitle": "运行设置",
+      "runtimeDescription": "设置项目使用的模型、并行数量和成员协作边界。",
       "defaultTenantModel": "跟随租户默认模型",
       "loadingModels": "正在读取模型…",
       "selectModel": "选择模型",
       "modelsLoadFailed": "模型读取失败：{{error}}",
       "actions": {
-        "save": "保存策略"
+        "save": "保存运行设置"
       },
       "feedback": {
-        "saved": "项目策略已保存，新运行将使用最新版本"
-      },
-      "approval": {
-        "risk": "仅高风险操作",
-        "allWrites": "所有写操作",
-        "manual": "手动审批"
+        "saved": "项目设置已保存"
       },
       "fields": {
         "defaultModel": "默认模型",
         "defaultModelHint": "使用当前租户已启用的模型。",
-        "approval": "审批策略",
-        "maxParallelRuns": "最大并行 Run",
-        "maxA2AWakes": "单次 Run 最大 A2A 唤醒",
-        "loopGuard": "循环保护",
-        "loopGuardHint": "阻止重复唤醒与无界委派"
+        "maxParallelRuns": "并行任务数",
+        "maxA2AWakes": "单次协作上限",
+        "loopGuard": "防止重复协作",
+        "loopGuardHint": "限制成员之间重复发起相同协作。",
+        "enabled": "已开启",
+        "disabled": "已关闭"
       }
     },
     "repository": {
@@ -602,7 +669,7 @@
     "viewRiskEvents": "查看风险事件"
   },
   "projectMesh": {
-    "viewEvents": "查看 A2A 事件",
+    "viewEvents": "查看协作记录",
     "recentIssue": "最近协作异常"
   },
   "projectWorkspaceFiles": {
@@ -713,12 +780,78 @@
     "badge": "项目专用数字员工",
     "unnamed": "未命名数字员工",
     "defaultRole": "项目成员",
+    "teamPage": {
+      "title": "数字员工",
+      "description": "明确由谁推进项目，并管理每位数字员工在当前项目中的职责和能力。",
+      "count": "{{count}} 位数字员工",
+      "responsibility": "项目职责",
+      "executionOwner": "执行负责人",
+      "memberType": "员工类型",
+      "projectOwned": "项目专属数字员工",
+      "standard": "标准数字员工",
+      "workSettings": "数字员工详情",
+      "workSettingsDescription": "查看该数字员工在当前项目中的职责、能力和工作方式。",
+      "openSettings": "查看数字员工详情",
+      "capabilities": "可用能力",
+      "capabilitiesDescription": "查看项目能力及其成员覆盖。",
+      "listView": "能力清单",
+      "matrixView": "可用范围",
+      "viewModeAria": "选择能力查看方式",
+      "active": "在岗",
+      "departed": "已退出",
+      "activeEmptyTitle": "没有在岗的数字员工",
+      "activeEmptyDescription": "恢复一位已退出的数字员工，或创建新的数字员工。",
+      "departedEmptyTitle": "没有已退出的数字员工",
+      "departedEmptyDescription": "停用或移出的数字员工会保留在这里，便于查看历史。",
+      "noMembersTitle": "项目还没有数字员工",
+      "noMembersDescription": "创建第一位数字员工，明确由谁推进项目。",
+      "noMatchesTitle": "没有符合条件的数字员工",
+      "noMatchesDescription": "调整或清除筛选条件后重试。",
+      "clearFilters": "清除筛选",
+      "capabilitiesEmptyTitle": "还没有可用能力",
+      "capabilitiesEmptyDescription": "添加项目能力后，可在这里管理数字员工的可用范围。",
+      "matrixEmptyTitle": "暂无可用范围",
+      "matrixEmptyDescription": "添加数字员工和能力后，可在这里比较每位数字员工能做什么。",
+      "readOnly": "你可以查看团队设置，但不能修改。"
+    },
+    "capabilityPackage": {
+      "title": "成员能力包",
+      "sections": {
+        "config": "配置",
+        "tools": "工具",
+        "mcp": "MCP",
+        "skill": "Skill"
+      },
+      "count": "{{count}} 项",
+      "platformTools": "平台工具",
+      "projectSkills": "项目 Skill",
+      "projectAsset": "项目资产 · {{name}}",
+      "skillFiles": "{{version}} · {{count}} 个文件 · {{size}}",
+      "carryPreview": "可带入能力预览",
+      "add": "添加",
+      "confirmAdd": "添加能力",
+      "select": "选择{{kind}}",
+      "toolPickerAria": "选择平台工具",
+      "loading": "正在读取平台能力",
+      "noCandidates": "没有可添加的平台能力",
+      "added": "已为成员添加 {{name}}",
+      "status": {
+        "available": "可用",
+        "restricted": "受限",
+        "missing": "缺失"
+      },
+      "empty": {
+        "tool": "没有平台工具",
+        "mcp": "没有 MCP",
+        "skill": "没有项目 Skill"
+      }
+    },
     "actions": {
       "create": "创建项目数字员工",
       "edit": "编辑项目数字员工",
       "manage": "管理与提升",
       "view": "查看项目数字员工",
-      "openWorkspace": "在工作区打开",
+      "openWorkspace": "查看成员文件",
       "save": "保存修改",
       "promote": "升级为标准数字员工",
       "deactivate": "停用项目数字员工",
@@ -741,7 +874,11 @@
       "title": "项目数字员工",
       "description": "身份设定和核心记忆由项目负责人维护。"
     },
-    "workspaceDescription": "项目数字员工的身份、核心记忆和文件保存在工作区的 .agents/<id>/ 中，是可追溯的项目资产。",
+    "projectCopyRequired": {
+      "title": "请创建项目数字员工",
+      "description": "复制后即可在当前项目中独立设置能力，不会改变原数字员工。"
+    },
+    "workspaceDescription": "成员配置和文件属于当前项目。",
     "sectionTitle": "项目数字员工与成员",
     "sectionDescription": "从现有数字员工固化快照或直接创建项目专用数字员工；项目负责人可维护其身份与核心记忆，并按需提升为标准数字员工。",
     "summary": "项目数字员工",
@@ -751,7 +888,7 @@
     "departedMembers": "历史成员",
     "departedMembersDescription": "保留身份、快照与历史记录",
     "viewActivity": "查看完整活动",
-    "assetLocation": "项目资产目录",
+    "assetLocation": "成员文件",
     "status": {
       "active": "在岗",
       "departed": "已退出"
@@ -841,43 +978,51 @@
       },
       "project_list_files": {
         "label": "查看工作区",
-        "description": "查看项目工作区中的成果文件和版本。"
+        "description": "查看项目成果文件及其版本。"
       },
       "project_read_file": {
         "label": "读取工作区文件",
-        "description": "读取一个已提交的项目文本成果。"
+        "description": "读取指定的项目文本文件；文件必须已经存在。"
       },
       "project_update_work_item": {
         "label": "更新工作项",
-        "description": "更新本人负责的工作项；负责人可编辑和指派全部工作项。"
+        "description": "更新已有工作项的状态、进展或证据。"
       },
       "project_write_file": {
         "label": "写入工作区文件",
-        "description": "保存工作区文件并记录版本。"
+        "description": "在项目工作区的指定位置保存文件。"
       },
       "project_message_agent": {
         "label": "联系数字员工",
-        "description": "向指定项目数字员工发送协作消息。"
+        "description": "向当前项目的一位在岗成员发起协作。"
       },
       "project_update_plan": {
         "label": "更新项目计划",
-        "description": "更新目标、成功标准和当前进展。"
+        "description": "更新目标、成功标准和当前进展；仅执行负责人可用。"
       },
       "project_create_work_item": {
         "label": "创建工作项",
-        "description": "创建并安排新的工作项。"
+        "description": "创建并指派工作项；仅执行负责人可用。"
       },
       "project_set_member_enabled": {
         "label": "管理项目成员",
-        "description": "启用或停用非负责人的项目成员。"
+        "description": "启用或停用非执行负责人成员；仅执行负责人可用。"
       },
       "project_set_capability_enabled": {
         "label": "管理项目能力",
-        "description": "启用或停用已有的项目能力。"
+        "description": "启用或停用已添加的项目能力；仅执行负责人可用。"
       },
       "project_create_milestone": {
         "label": "创建交付里程碑",
-        "description": "记录一个可恢复的交付版本。"
+        "description": "记录当前交付状态，供后续查看或恢复；需要项目已有成果。"
+      },
+      "project_set_status": {
+        "label": "更新项目状态",
+        "description": "将项目设为等待、暂停、完成或失败；仅执行负责人可用。"
+      },
+      "project_restore_commit": {
+        "label": "恢复项目版本",
+        "description": "基于历史版本创建新的当前版本，并保留现有历史。"
       }
     }
   },
@@ -957,13 +1102,49 @@
     "createBranch": "从此创建分支",
     "restoreVersion": "恢复到此版本",
     "emptyTitle": "还没有提交历史",
-    "emptyDescription": "工作区文件保存后，版本记录会显示在这里。"
+    "emptyDescription": "工作区文件保存后，版本记录会显示在这里。",
+    "diff": {
+      "emptyTree": "空树",
+      "loadFallback": "无法读取 Git 变更",
+      "noCommitTitle": "没有关联版本",
+      "noCommitDescription": "该文件尚未关联版本记录。",
+      "loadFailed": "Git 变更加载失败",
+      "retry": "重试",
+      "loading": "正在读取文件变更",
+      "noFileChange": "该 Commit 没有修改此文件",
+      "status": {
+        "added": "新增",
+        "deleted": "删除",
+        "modified": "修改"
+      },
+      "rootCommit": "根提交",
+      "binaryTitle": "二进制文件变更",
+      "binaryDescription": "二进制文件不支持在线对比。",
+      "loadingEditor": "正在载入差异视图…",
+      "truncated": "内容较大，当前仅展示部分差异。"
+    },
+    "dialog": {
+      "eyebrow": "版本历史",
+      "restoreTitle": "恢复到此版本",
+      "branchTitle": "从此版本创建分支",
+      "close": "关闭",
+      "restoreDescriptionBefore": "将项目内容恢复到 ",
+      "restoreDescriptionAfter": "，并保存为一个新版本。",
+      "branchDescriptionBefore": "将从 ",
+      "branchDescriptionAfter": " 创建新分支。",
+      "branchName": "分支名称",
+      "cancel": "取消",
+      "restoreSubmit": "恢复到此版本",
+      "branchSubmit": "创建分支",
+      "restoreSuccess": "恢复提交已创建；原历史保持不变",
+      "branchSuccess": "新分支已创建"
+    }
   },
   "projectTemplatePublish": {
     "action": "发布为项目模板",
     "eyebrow": "项目模板",
     "title": "发布为项目模板",
-    "description": "模板会保留当前已提交的项目成果与目录结构，以及脱敏后的项目数字员工身份、记忆、工作区、能力和策略设置；不包含未提交内容、会话、运行、事件、审计、凭证或私密连接。",
+    "description": "模板会保留已提交的项目成果、团队配置和本次勾选的 Skill 文件。",
     "name": "模板名称",
     "namePlaceholder": "输入模板名称",
     "close": "关闭",
@@ -982,7 +1163,15 @@
       "sharedConnections": "共享 MCP",
       "capabilities": "共享能力",
       "none": "无",
-      "exclusions": "会话、运行记录、审计记录、凭证和私密 MCP 不会发布；使用模板后可按需重新连接。"
+      "skillFilesTitle": "Skill 文件",
+      "skillFilesHint": "默认不携带。勾选需要随模板保留的 Skill 文件。",
+      "selectedCount": "已选 {{count}} 项",
+      "projectShared": "项目共享",
+      "filesAndSize": "{{count}} 个文件 · {{size}}",
+      "carriedImpact": "新项目将获得这些文件",
+      "notCarriedImpact": "新项目不会获得这些文件",
+      "noSkillFiles": "没有可携带的 Skill 文件",
+      "exclusions": "未勾选的 Skill 文件不会随模板发布。"
     }
   },
   "projectTemplates": {
@@ -1199,42 +1388,13 @@
     "clearMemberFilter": "{{name}} 的运行 · 清除筛选"
   },
   "projectSnapshot": {
-    "followSourceAgent": "跟随源数字员工",
+    "followSourceAgent": "使用项目默认模型",
     "sourceLayerTitle": "源数字员工",
     "sourceLayerDescription": "平台中的稳定配置，项目修改不会反向影响它。",
     "projectLayerTitle": "项目成员快照",
     "projectLayerDescription": "加入项目时复制，可在本项目独立调整模型、指令和权限。",
     "runLayerTitle": "Run 冻结快照",
     "runLayerDescription": "每次执行永久记录当时的成员与能力配置，便于追溯。",
-    "autonomyTitle": "操作自主级别",
-    "autonomyDescription": "决定每类操作是直接执行、执行后通知，还是先等待审批。",
-    "noAutonomyOverrides": "当前没有项目级自主策略覆盖，将沿用源数字员工快照。",
-    "actionFallback": "该操作沿用数字员工的项目自主策略。",
-    "policy": {
-      "customAction": "其他项目操作",
-      "keepCurrent": "保留当前设置",
-      "parallelTasks_one": "同时处理 {{count}} 个任务",
-      "parallelTasks_other": "同时处理 {{count}} 个任务",
-      "fields": {
-        "mode": {
-          "label": "推进方式",
-          "description": "选择任务是自主推进、协作推进，还是审核后推进。"
-        },
-        "require_evidence": {
-          "label": "交付证据",
-          "description": "完成任务时必须附带可核验的结果或依据。"
-        },
-        "max_parallel_tasks": {
-          "label": "并行任务数",
-          "description": "限制该成员可以同时推进的任务数量。"
-        }
-      },
-      "modeOptions": {
-        "autonomous": "自主推进",
-        "balanced": "协作推进",
-        "review": "审核后推进"
-      }
-    },
     "memberStatus": "项目成员状态",
     "sourceStatus": "加入时源数字员工状态",
     "unknown": "未记录",
@@ -1249,60 +1409,6 @@
       "running": "运行中",
       "error": "当时处于异常状态",
       "disabled": "当时已停用"
-    },
-    "actions": {
-      "read_files": {
-        "label": "读取文件",
-        "description": "读取项目工作区和知识库中的文件。"
-      },
-      "write_workspace_files": {
-        "label": "修改工作区文件",
-        "description": "创建或修改当前项目仓库中的文件。"
-      },
-      "send_feishu_message": {
-        "label": "发送飞书消息",
-        "description": "通过飞书向用户发送消息。"
-      },
-      "send_external_message": {
-        "label": "发送外部消息",
-        "description": "通过项目外部渠道发送消息。"
-      },
-      "manage_relationships": {
-        "label": "维护关系数据",
-        "description": "新增或调整联系人与业务关系。"
-      },
-      "modify_soul": {
-        "label": "修改数字员工长期设定",
-        "description": "调整数字员工的身份、性格或长期行为配置。"
-      },
-      "access_business_system_read": {
-        "label": "读取业务系统",
-        "description": "查询已连接业务系统中的数据。"
-      },
-      "access_business_system_write": {
-        "label": "写入业务系统",
-        "description": "在已连接业务系统中新增或修改数据。"
-      },
-      "delete_files": {
-        "label": "删除文件",
-        "description": "删除项目工作区中的文件。"
-      },
-      "create_calendar_event": {
-        "label": "创建日历事件",
-        "description": "在已连接日历中创建日程。"
-      },
-      "financial_operations": {
-        "label": "执行财务操作",
-        "description": "发起可能影响资金或账务的操作。"
-      },
-      "web_search": {
-        "label": "搜索互联网",
-        "description": "通过网络检索公开信息。"
-      },
-      "manage_tasks": {
-        "label": "管理任务",
-        "description": "创建、更新或关闭任务。"
-      }
     }
   },
   "projectAudit": {
@@ -1950,7 +2056,7 @@
     },
     "skills": {
       "title": "技能定义",
-      "description": "技能定义了数字员工在特定场景下的行为方式。每个.md文件是一个技能。建议使用YAML frontmatter（name + description）来定义技能元数据。",
+      "description": "管理此数字员工在任务中使用的 Skill。",
       "skillFiles": "技能文件",
       "noSkills": "暂未定义技能",
       "newSkill": "新建技能",
@@ -1965,13 +2071,28 @@
       "disabled": "已禁用",
       "skillFormat": "技能格式：",
       "importFromGithub": "从 GitHub URL 导入",
-      "githubUrlDesc": "粘贴指向技能目录的 GitHub URL（必须包含 SKILL.md）。",
+      "githubUrlDesc": "粘贴 Skill 的 GitHub 地址。",
       "importPreset": "从预设导入",
-      "importDesc": "选择一个预设技能导入到此数字员工。所有技能文件将被复制到数字员工的技能文件夹。",
+      "importDesc": "选择预设 Skill 添加到当前数字员工。",
       "importedSuccess": "已导入 \"{{name}}\" ({{count}} 个文件)",
       "importFailed": "导入失败",
       "importing": "导入中...",
-      "importBtn": "导入"
+      "importBtn": "导入",
+      "importFromUrl": "从 URL 导入",
+      "browseClawhub": "浏览 ClawHub",
+      "browseClawhubDescription": "为此数字员工搜索并安装 Skill。",
+      "searchSkills": "搜索 Skill...",
+      "searching": "搜索中...",
+      "search": "搜索",
+      "searchClawhubHint": "在 ClawHub 中搜索 Skill",
+      "install": "安装",
+      "installing": "安装中...",
+      "updated": "更新于 {{date}}",
+      "githubUrlPlaceholder": "https://github.com/owner/repo/tree/main/path/to/skill",
+      "loading": "加载中...",
+      "noPresetSkills": "暂无可用的预设 Skill",
+      "default": "默认",
+      "close": "关闭"
     },
     "toolMgmt": {
       "title": "工具管理",
@@ -2393,9 +2514,17 @@
       "enableDisableAll": "启用/禁用所有 {{category}} 工具",
       "builtin": "内置",
       "categoryFallbackDescription": "该分类下的工具",
+      "toolCount": "{{count}} 个工具",
       "groupSummary": "共 {{total}} 个工具 · 已启用 {{enabled}} 个",
       "groupShown": "显示 {{count}} 个",
       "groupConfigured": "已配置 {{count}} 个",
+      "alwaysAvailable": "始终可用",
+      "managePublishedContent": "管理已发布内容",
+      "editMcpService": "编辑 MCP 服务",
+      "close": "关闭",
+      "advancedSettings": "高级设置",
+      "hideAdvancedSettings": "收起高级设置",
+      "testError": "错误：{{message}}",
       "configurePerAgent": "配置员工级设置",
       "removeTool": "从员工移除",
       "confirmDelete": "确定从该员工移除 \"{{name}}\" 吗？",
@@ -2438,6 +2567,25 @@
       "noMatchingTools": "未找到匹配的工具",
       "searchTools": "搜索工具...",
       "sourceTabs": "工具来源",
+      "schemas": {
+        "agentbay": {
+          "title": "AgentBay 设置",
+          "apiKey": "AgentBay API Key",
+          "apiKeyPlaceholder": "输入 AgentBay API Key",
+          "osType": "云电脑操作系统"
+        },
+        "atlassian": {
+          "title": "Atlassian 连接设置",
+          "apiKey": "Atlassian API Token",
+          "apiKeyPlaceholder": "输入 Atlassian API Token",
+          "cloudId": "Cloud ID（选填）",
+          "cloudIdPlaceholder": "例如：bcc01-abc-123"
+        },
+        "os": {
+          "linux": "Linux",
+          "windows": "Windows"
+        }
+      },
       "reqConfirm": {
         "cardTemplateId": "钉钉确认卡片模板 ID",
         "cardTemplateIdPlaceholder": "钉钉互动卡片模板 ID;模板须含 title/summary/action_preview/risk/status/buttons 变量",
@@ -3119,6 +3267,13 @@
       "builtIn": "内置",
       "configured": "已配置",
       "default": "默认",
+      "defaultCount": "{{count}} 个默认启用",
+      "editMcpServer": "编辑 MCP 服务",
+      "unknownDigitalEmployee": "未知数字员工",
+      "globalConfigDescription": "所有数字员工共用的公司设置",
+      "globalCategoryConfigDescription": "该分类下所有工具共用的公司设置",
+      "advancedSettings": "高级设置",
+      "hideAdvancedSettings": "收起高级设置",
       "toolNames": {
         "list_files": "列出文件",
         "read_file": "读取文件",
@@ -3157,8 +3312,8 @@
         "search_clawhub": "搜索 ClawHub",
         "install_skill": "安装技能",
         "search_skill_market": "搜索 Skill 市场",
-        "install_skill_from_market": "安装市场 Skill",
-        "publish_skill_to_market": "发布 Skill 到市场",
+        "install_skill_from_market": "添加市场 Skill",
+        "publish_skill_to_market": "发布 Skill",
         "agentbay_browser_navigate": "AgentBay: 浏览器访问",
         "agentbay_browser_screenshot": "AgentBay: 浏览器截图",
         "agentbay_browser_click": "AgentBay: 浏览器点击",
@@ -3190,7 +3345,7 @@
         "agentbay_computer_dismiss_dialog": "AgentBay: 关闭弹窗",
         "agentbay_computer_list_visible_apps": "AgentBay: 列出运行应用",
         "atlassian_rovo": "Atlassian Rovo (Jira / Confluence / Compass)",
-        "withdraw_skill_from_market": "从市场下架 Skill"
+        "withdraw_skill_from_market": "下架 Skill"
       },
       "toolDescriptions": {
         "list_files": "列出工作区目录中的文件和文件夹。",
@@ -3230,8 +3385,8 @@
         "search_clawhub": "在 ClawHub 技能注册表中搜索匹配查询的技能。",
         "install_skill": "将技能安装到此数字员工的工作区。",
         "search_skill_market": "搜索当前可见的企业内和公开 Skill。",
-        "install_skill_from_market": "通过 L3 审批后，将市场 Skill 安装到此智能体。",
-        "publish_skill_to_market": "通过 L3 审批后，将智能体 Skill 文件夹发布到企业或公开市场。",
+        "install_skill_from_market": "将已选择的市场 Skill 添加到当前数字员工。",
+        "publish_skill_to_market": "将当前数字员工的 Skill 发布到公司或公开市场。",
         "agentbay_browser_navigate": "[ENV: Browser] 在 AgentBay 无头浏览器环境中访问指定网址。",
         "agentbay_browser_screenshot": "[ENV: Browser] 对无头浏览器当前页面进行截图。",
         "agentbay_browser_click": "[ENV: Browser] 在无头浏览器中点击元素。",
@@ -3263,7 +3418,7 @@
         "agentbay_computer_dismiss_dialog": "[ENV: Cloud Desktop] 仅通过 Escape 安全关闭当前应用内弹窗或对话框。",
         "agentbay_computer_list_visible_apps": "[ENV: Cloud Desktop] 列出云桌面中正在运行的应用程序。",
         "atlassian_rovo": "连接到 Atlassian Rovo MCP 服务器以访问 Jira、Confluence 和 Compass。",
-        "withdraw_skill_from_market": "通过 L3 审批后，下架由此智能体发布的市场副本；来源 Skill 和已安装副本不受影响，可再次上架。"
+        "withdraw_skill_from_market": "从市场下架当前数字员工发布的 Skill；已有安装结果不受影响。"
       },
       "configureSettings": "配置设置",
       "import": "导入",
@@ -3646,6 +3801,7 @@
     "executionSubtitle": "选择后续后台执行所使用的用户权限",
     "search": "搜索姓名、拼音或部门路径...",
     "organization": "组织架构",
+    "allMembers": "全部成员",
     "myDepartment": "我的部门",
     "directOnly": "仅直属成员",
     "includeDescendants": "包含下级成员",

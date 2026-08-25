@@ -159,15 +159,27 @@ def _seed(
     }
 
 
-_PROJECT_ID = {"type": "string", "description": "Exact project UUID."}
-_LIMIT_50 = {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}
-_OFFSET = {"type": "integer", "minimum": 0, "maximum": 5000, "default": 0}
+_PROJECT_ID = {"type": "string", "description": "Exact project identifier returned by a project result."}
+_LIMIT_50 = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 50,
+    "default": 20,
+    "description": "Maximum number of results to return.",
+}
+_OFFSET = {
+    "type": "integer",
+    "minimum": 0,
+    "maximum": 5000,
+    "default": 0,
+    "description": "Starting position. Use next_offset from the previous result to continue.",
+}
 
 USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_search",
         "Search Projects",
-        "Search projects by name, goal, status, or scope. Continue with the returned next_offset.",
+        "Find projects by name, goal, status, or ownership scope.",
         {
             "query": {"type": "string", "maxLength": 200},
             "scope": {
@@ -190,11 +202,11 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_work_item_list",
         "List Project Work Items",
-        "List project work items with status, priority, assignment, and due dates. Continue with the returned next_offset.",
+        "List project work items with status, priority, assignment, and due dates.",
         {
             "project_id": _PROJECT_ID,
             "status": {"type": "string", "enum": _WORK_ITEM_STATUSES},
-            "assignee_agent_id": {"type": "string"},
+            "assignee_agent_id": {"type": "string", "description": "Exact project member identifier."},
             "offset": _OFFSET,
             "limit": _LIMIT_50,
         },
@@ -206,19 +218,19 @@ USER_PROJECT_TOOL_SEEDS = [
         "Read one work item's description, acceptance criteria, dependencies, and status.",
         {
             "project_id": _PROJECT_ID,
-            "work_item_id": {"type": "string", "description": "Exact work item UUID."},
+            "work_item_id": {"type": "string", "description": "Exact work item identifier."},
         },
         ["project_id", "work_item_id"],
     ),
     _seed(
         "user_project_run_list",
         "List Project Runs",
-        "List project run status, assignment, trigger type, and timing. Continue with the returned next_offset.",
+        "List project work progress with status, assigned member, how the work started, and timing.",
         {
             "project_id": _PROJECT_ID,
-            "run_id": {"type": "string"},
-            "work_item_id": {"type": "string"},
-            "agent_id": {"type": "string"},
+            "run_id": {"type": "string", "description": "Exact work progress identifier."},
+            "work_item_id": {"type": "string", "description": "Exact related work item identifier."},
+            "agent_id": {"type": "string", "description": "Exact project member identifier."},
             "status": {"type": "string", "enum": _RUN_STATUSES},
             "offset": _OFFSET,
             "limit": _LIMIT_50,
@@ -228,7 +240,7 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_member_list",
         "List Project Members",
-        "List project members, responsibilities, availability, and the project owner. Continue with the returned next_offset.",
+        "List project members, responsibilities, availability, and the designated project lead.",
         {
             "project_id": _PROJECT_ID,
             "include_disabled": {"type": "boolean", "default": False},
@@ -240,17 +252,21 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_milestone_list",
         "List Project Milestones",
-        "List project delivery milestones and their verified Git commits. Continue with the returned next_offset.",
+        "List project delivery milestones and their saved version identifiers.",
         {"project_id": _PROJECT_ID, "offset": _OFFSET, "limit": _LIMIT_50},
         ["project_id"],
     ),
     _seed(
         "user_project_file_list",
         "List Project Files",
-        "List committed files in a project workspace. Continue with the returned next_offset.",
+        "List files currently saved in a project workspace.",
         {
             "project_id": _PROJECT_ID,
-            "path_prefix": {"type": "string", "maxLength": 1024},
+            "path_prefix": {
+                "type": "string",
+                "maxLength": 1024,
+                "description": "Optional project-relative folder or path prefix.",
+            },
             "offset": _OFFSET,
             "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
         },
@@ -259,30 +275,56 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_file_read",
         "Read Project File",
-        "Read bounded UTF-8 text from one committed project file.",
+        "Read text from one saved project file, up to the requested character limit.",
         {
             "project_id": _PROJECT_ID,
-            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
-            "max_chars": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 12000},
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Exact path returned by the project file list.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20000,
+                "default": 12000,
+                "description": "Maximum number of characters to return.",
+            },
         },
         ["project_id", "path"],
     ),
     _seed(
         "user_project_git_get",
-        "Get Project Git State",
-        "Read Git HEAD, branches, file count, and recent commit summaries. Continue with the returned next_offset.",
+        "Get Project Version History",
+        "Read the current saved version, file count, and recent version history.",
         {"project_id": _PROJECT_ID, "offset": _OFFSET, "limit": _LIMIT_50},
         ["project_id"],
     ),
     _seed(
         "user_project_git_diff",
-        "Get Project Git Diff",
-        "Read bounded Git change statistics or a path-specific patch for one commit.",
+        "Compare Project Versions",
+        "Read file change statistics for one saved version, or detailed text changes for one file.",
         {
             "project_id": _PROJECT_ID,
-            "commit": {"type": "string", "minLength": 7, "maxLength": 64},
-            "parent": {"type": "string", "minLength": 7, "maxLength": 64},
-            "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "commit": {
+                "type": "string",
+                "minLength": 7,
+                "maxLength": 64,
+                "description": "Exact saved version identifier to inspect.",
+            },
+            "parent": {
+                "type": "string",
+                "minLength": 7,
+                "maxLength": 64,
+                "description": "Optional earlier saved version to compare against.",
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "Optional exact project-relative file path for detailed text changes.",
+            },
             "max_patch_bytes": {
                 "type": "integer",
                 "minimum": 1,
@@ -295,10 +337,13 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_message_list",
         "List Project Messages",
-        "Read recent messages from a project's group conversation. Continue with the returned next_before_message_id.",
+        "Read recent messages from the project's shared conversation.",
         {
             "project_id": _PROJECT_ID,
-            "before_message_id": {"type": "string", "description": "Oldest message UUID from the previous page."},
+            "before_message_id": {
+                "type": "string",
+                "description": "Use next_before_message_id from the previous result to read older messages.",
+            },
             "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20},
             "max_chars_per_message": {
                 "type": "integer",
@@ -312,7 +357,8 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_work_item_create",
         "Create Project Work Item",
-        "Create one project work item with delivery criteria and assignment.",
+        "Create one project work item with delivery criteria and assignment. This records the work but does not "
+        "start it.",
         {
             "project_id": _PROJECT_ID,
             "title": {"type": "string", "minLength": 1, "maxLength": 500},
@@ -328,12 +374,16 @@ USER_PROJECT_TOOL_SEEDS = [
                 "items": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "maxItems": 30,
             },
-            "assignee_agent_id": {"type": "string"},
-            "parent_id": {"type": "string"},
+            "assignee_agent_id": {
+                "type": "string",
+                "description": "Identifier of an active project member responsible for the work.",
+            },
+            "parent_id": {"type": "string", "description": "Optional parent work item identifier."},
             "dependency_ids": {
                 "type": "array",
                 "items": {"type": "string"},
                 "maxItems": 100,
+                "description": "Work item identifiers that must be completed first.",
             },
             "due_at": {"type": ["string", "null"], "format": "date-time"},
         },
@@ -345,7 +395,7 @@ USER_PROJECT_TOOL_SEEDS = [
         "Update selected fields on one project work item.",
         {
             "project_id": _PROJECT_ID,
-            "work_item_id": {"type": "string"},
+            "work_item_id": {"type": "string", "description": "Exact work item identifier."},
             "title": {"type": "string", "minLength": 1, "maxLength": 500},
             "description": {"type": "string", "maxLength": 20000},
             "status": {"type": "string", "enum": _WORK_ITEM_STATUSES},
@@ -355,11 +405,15 @@ USER_PROJECT_TOOL_SEEDS = [
                 "items": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "maxItems": 30,
             },
-            "assignee_agent_id": {"type": ["string", "null"]},
+            "assignee_agent_id": {
+                "type": ["string", "null"],
+                "description": "Active project member identifier, or null to leave the work unassigned.",
+            },
             "dependency_ids": {
                 "type": "array",
                 "items": {"type": "string"},
                 "maxItems": 100,
+                "description": "Work item identifiers that must be completed first.",
             },
             "due_at": {"type": ["string", "null"], "format": "date-time"},
         },
@@ -368,11 +422,17 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_run_start",
         "Start Project Run",
-        "Start one project run for a work item or a bounded instruction.",
+        "Start work in a running project using either a work item or a clear instruction. An active project member "
+        "must be assigned to perform the work.",
         {
             "project_id": _PROJECT_ID,
-            "work_item_id": {"type": "string"},
-            "agent_id": {"type": "string"},
+            "work_item_id": {"type": "string", "description": "Exact work item identifier to start."},
+            "agent_id": {
+                "type": "string",
+                "description": (
+                    "Active project member to perform the work. Defaults to the work item assignee or project lead."
+                ),
+            },
             "title": {"type": "string", "maxLength": 120},
             "instruction": {"type": "string", "maxLength": 10000},
         },
@@ -381,18 +441,19 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_message_send",
         "Send Project Group Message",
-        "Send text to a project's group conversation and notify its project owner.",
+        "Send a message to the project's shared conversation for the project lead to act on. The project must be "
+        "running.",
         {
             "project_id": _PROJECT_ID,
             "content": {"type": "string", "minLength": 1, "maxLength": 10000},
-            "work_item_id": {"type": "string"},
+            "work_item_id": {"type": "string", "description": "Optional related work item identifier."},
         },
         ["project_id", "content"],
     ),
     _seed(
         "user_project_milestone_create",
         "Create Project Milestone",
-        "Create one named delivery milestone for selected project paths.",
+        "Create one named delivery checkpoint from selected project files.",
         {
             "project_id": _PROJECT_ID,
             "message": {"type": "string", "minLength": 1, "maxLength": 500},
@@ -401,6 +462,7 @@ USER_PROJECT_TOOL_SEEDS = [
                 "items": {"type": "string", "minLength": 1, "maxLength": 1024},
                 "minItems": 1,
                 "maxItems": 100,
+                "description": "Project-relative file paths to include in the checkpoint.",
             },
         },
         ["project_id", "message", "paths"],
@@ -408,10 +470,15 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_file_write",
         "Write Project Text File",
-        "Write one project text file and create its Git commit.",
+        "Save one project text file as a new project version.",
         {
             "project_id": _PROJECT_ID,
-            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Writable project-relative file path.",
+            },
             "content": {"type": "string", "maxLength": 50000},
         },
         ["project_id", "path", "content"],
@@ -419,7 +486,8 @@ USER_PROJECT_TOOL_SEEDS = [
     _seed(
         "user_project_status_update",
         "Update Project Status",
-        "Pause or resume project work.",
+        "Pause or resume project work. The project must already be running or paused, and only the project owner "
+        "can change it.",
         {
             "project_id": _PROJECT_ID,
             "status": {"type": "string", "enum": ["running", "paused"]},

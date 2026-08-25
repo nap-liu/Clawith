@@ -158,55 +158,75 @@ def _schema(name: str, description: str, properties: dict, required: list[str] |
 PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "project_get_context": _schema(
         "project_get_context",
-        "Read the current project's goal, plan signals, status, Git head, and each member's project and professional roles.",
+        "Read the project's goal, current plan, status, saved version, and member responsibilities.",
         {},
     ),
     "project_list_work_items": _schema(
         "project_list_work_items",
-        "List project work items with assignee role, latest progress, and bounded evidence. "
-        "Optionally return only work assigned to this Agent.",
+        "List project work items with assignee responsibility, latest progress, and evidence. "
+        "Optionally return only work assigned to this member.",
         {"mine_only": {"type": "boolean", "default": False}},
     ),
     "project_list_files": _schema(
         "project_list_files",
-        "List committed project artifact paths and commit identifiers.",
+        "List files currently saved in the project workspace and their version identifiers.",
         {},
     ),
     "project_read_file": _schema(
         "project_read_file",
-        "Read one committed text artifact from the project Git repository.",
+        "Read text from one saved project file. Use a path returned by the project file list.",
         {
-            "path": {"type": "string"},
-            "max_chars": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 20000},
+            "path": {"type": "string", "description": "Exact project-relative file path."},
+            "max_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100000,
+                "default": 20000,
+                "description": "Maximum number of characters to return.",
+            },
         },
         ["path"],
     ),
     "project_create_work_item": _schema(
         "project_create_work_item",
-        "Create one traceable work item without waking the assignee.",
+        "Create one project work item. This records the work but does not start it. Available to the project lead.",
         {
             "title": {"type": "string"},
             "description": {"type": "string"},
             "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-            "assignee_agent_id": {"type": "string"},
+            "assignee_agent_id": {
+                "type": "string",
+                "description": "Identifier of an active project member responsible for the work.",
+            },
             "priority": {"type": "string", "enum": sorted(WORK_ITEM_PRIORITIES)},
-            "dependency_ids": {"type": "array", "items": {"type": "string"}},
+            "dependency_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Work item identifiers that must be completed first.",
+            },
         },
         ["title", "description", "acceptance_criteria"],
     ),
     "project_update_work_item": _schema(
         "project_update_work_item",
-        "Update one work item. Participants may only update their assigned item's "
-        "status, progress note and evidence; Leaders may also edit or assign it.",
+        "Update one project work item. Members may report status, progress, and evidence for their own assigned "
+        "work; the project lead may also change its content, priority, dependencies, or assignee.",
         {
-            "work_item_id": {"type": "string"},
+            "work_item_id": {"type": "string", "description": "Exact work item identifier."},
             "title": {"type": "string"},
             "description": {"type": "string"},
             "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-            "assignee_agent_id": {"type": ["string", "null"]},
+            "assignee_agent_id": {
+                "type": ["string", "null"],
+                "description": "Active project member identifier, or null to leave the work unassigned.",
+            },
             "status": {"type": "string", "enum": sorted(WORK_ITEM_STATUSES)},
             "priority": {"type": "string", "enum": sorted(WORK_ITEM_PRIORITIES)},
-            "dependency_ids": {"type": "array", "items": {"type": "string"}},
+            "dependency_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Work item identifiers that must be completed first.",
+            },
             "progress_note": {"type": "string"},
             "evidence": {"type": "array", "items": {"type": "string"}},
         },
@@ -214,55 +234,56 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     ),
     "project_write_file": _schema(
         "project_write_file",
-        "Write one project-relative file and atomically create a Git commit.",
-        {"path": {"type": "string"}, "content": {"type": "string"}},
+        "Save text to one project file as a new project version.",
+        {
+            "path": {"type": "string", "description": "Project-relative file path."},
+            "content": {"type": "string", "description": "Complete text content to save."},
+        },
         ["path", "content"],
     ),
     "project_message_agent": _schema(
         "project_message_agent",
-        "Request one professional judgment or delegate one concrete project task to exactly one enabled Agent; "
-        "never broadcasts. Project A2A is not a status-notification channel: do not use it for FYI, progress "
-        "announcements, acknowledgements, or asking a downstream role to wait. Record passive progress on the "
-        "work item or project timeline instead. Every request must identify the evidence/context, the decision or "
-        "work required from the recipient's role, and the expected output. Provide work_item_id whenever the "
-        "message advances a concrete work item.",
+        "Send one active project member a review request or assigned task. Include the relevant context, requested "
+        "work, expected result, and related work item when one exists.",
         {
-            "agent_id": {"type": "string"},
+            "agent_id": {"type": "string", "description": "Identifier of the active project member to contact."},
             "work_item_id": {
                 "type": "string",
                 "description": (
-                    "Exact related project work item UUID. Required for task delegation unless "
-                    "the current Run is already linked to that work item."
+                    "Exact related work item identifier. Required for delegated work unless the current work is "
+                    "already associated with that item."
                 ),
             },
             "title": {
                 "type": "string",
                 "maxLength": 120,
-                "description": "Concise, durable name for this professional question or delegated action.",
+                "description": "Concise title for the review request or assigned task.",
             },
             "message": {
                 "type": "string",
-                "description": (
-                    "Actionable handoff containing evidence/context, the professional question or decision need, "
-                    "and the expected result. Status-only or FYI messages are not allowed."
-                ),
+                "description": "Context, requested work, and expected result.",
             },
             "mode": {
                 "type": "string",
                 "enum": ["task_delegate", "consult"],
-                "description": "Use task_delegate for asynchronous work with a result; use consult for a focused decision now.",
+                "description": (
+                    "Choose task_delegate for assigned work and consult for a review or decision."
+                ),
             },
             "expected_output": {
                 "type": "string",
-                "description": "The concrete decision, review, analysis or artifact the recipient must return.",
+                "description": "Expected review, decision, analysis, or deliverable.",
             },
-            "new_conversation": {"type": "boolean"},
+            "new_conversation": {
+                "type": "boolean",
+                "description": "Start a separate conversation instead of continuing the existing one.",
+            },
         },
         ["agent_id", "title", "message", "mode", "expected_output"],
     ),
     "project_update_plan": _schema(
         "project_update_plan",
-        "Update project planning fields without changing ownership, sharing or credentials.",
+        "Update the project goal, success criteria, current signal, or next action. Available to the project lead.",
         {
             "goal": {"type": "string"},
             "success_criteria": {"type": "array", "items": {"type": "string"}},
@@ -272,40 +293,66 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     ),
     "project_set_member_enabled": _schema(
         "project_set_member_enabled",
-        "Enable or disable one project member who is not the project owner.",
-        {"agent_id": {"type": "string"}, "is_enabled": {"type": "boolean"}},
+        "Activate or deactivate one project member who is not the project lead. Available to the project lead.",
+        {
+            "agent_id": {"type": "string", "description": "Exact project member identifier."},
+            "is_enabled": {"type": "boolean"},
+        },
         ["agent_id", "is_enabled"],
     ),
     "project_set_capability_enabled": _schema(
         "project_set_capability_enabled",
-        "Enable or disable one existing project capability binding.",
-        {"binding_id": {"type": "string"}, "is_enabled": {"type": "boolean"}},
+        "Enable or disable a capability already available to the project. Available to the project lead.",
+        {
+            "binding_id": {
+                "type": "string",
+                "description": "Exact identifier of the project capability entry.",
+            },
+            "is_enabled": {"type": "boolean"},
+        },
         ["binding_id", "is_enabled"],
     ),
     "project_create_milestone": _schema(
         "project_create_milestone",
-        "Create one named Git milestone commit without rewriting history.",
+        "Create a named delivery checkpoint, optionally limited to selected project files. Available to the "
+        "project lead.",
         {
             "message": {"type": "string"},
-            "paths": {"type": "array", "items": {"type": "string"}},
-            "related_work_item_ids": {"type": "array", "items": {"type": "string"}},
-            "related_run_ids": {"type": "array", "items": {"type": "string"}},
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Project-relative paths to include in the checkpoint.",
+            },
+            "related_work_item_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Work item identifiers associated with this checkpoint.",
+            },
+            "related_run_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Work progress identifiers associated with this checkpoint.",
+            },
         },
         ["message"],
     ),
     "project_set_status": _schema(
         "project_set_status",
-        "Explicitly pause, wait, complete, or fail the project and audit the transition.",
+        "Change the project to waiting, paused, completed, or failed. Available to the project lead.",
         {
             "status": {"type": "string", "enum": ["waiting", "paused", "completed", "failed"]},
-            "reason": {"type": "string"},
+            "reason": {"type": "string", "description": "Reason for the status change."},
         },
         ["status"],
     ),
     "project_restore_commit": _schema(
         "project_restore_commit",
-        "Restore one earlier Git tree as a new commit; never resets or rewrites history.",
-        {"commit": {"type": "string"}, "message": {"type": "string"}},
+        "Restore project files from an earlier saved version while keeping later versions available. Available to "
+        "the project lead when project policy permits; otherwise human approval is required.",
+        {
+            "commit": {"type": "string", "description": "Exact saved version identifier to restore."},
+            "message": {"type": "string", "description": "Reason for restoring this version."},
+        },
         ["commit"],
     ),
 }

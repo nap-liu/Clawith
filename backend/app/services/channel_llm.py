@@ -136,6 +136,7 @@ async def _call_agent_llm(
     release_db_before_dispatch: bool = False,
     runtime_session: "ChatSession | None" = None,
     runtime_workspace: "AgentRuntimeWorkspace | None" = None,
+    max_tool_rounds_override: int | None = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -226,7 +227,31 @@ async def _call_agent_llm(
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
         )
-        if turn_model_id:
+        from app.models.chat_session import ChatSession
+
+        if runtime_session is None:
+            try:
+                runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
+            except (TypeError, ValueError):
+                runtime_session = None
+        runtime_config = dict(runtime_session.im_config or {}) if runtime_session is not None else {}
+        if (
+            runtime_session is not None
+            and runtime_session.source_channel == "subagent"
+            and runtime_session.project_id is not None
+            and isinstance(runtime_config.get("member_config_snapshot"), dict)
+        ):
+            from app.models.project import Project
+            from app.services.chat_model_selection import resolve_project_member_runtime_models
+
+            project = await db.get(Project, runtime_session.project_id)
+            resolved_models = await resolve_project_member_runtime_models(
+                db,
+                agent=agent,
+                member_config=runtime_config.get("member_config_snapshot"),
+                project_settings=project.settings if project is not None else {},
+            )
+        elif turn_model_id:
             resolved_models = await resolve_runtime_models(
                 db,
                 agent=agent,
@@ -236,7 +261,6 @@ async def _call_agent_llm(
             # Compatibility for project child inputs created before per-turn
             # model snapshots were introduced.  Keep the fallback inside the
             # unified channel path so retries and compaction use the same model.
-            from app.models.chat_session import ChatSession
             from app.models.project import Project
             from app.services.chat_model_selection import resolve_project_runtime_models
 
@@ -484,6 +508,7 @@ async def _call_agent_llm(
                 before_tool_execution=before_tool_execution,
                 include_soul=include_soul,
                 include_memory=include_memory,
+                max_tool_rounds_override=max_tool_rounds_override,
             )
     finally:
         try:

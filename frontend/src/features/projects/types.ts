@@ -12,6 +12,8 @@ export type ProjectStatus =
 
 export type ProjectVisibility = "private" | "shared";
 
+export type ProjectAccessRole = "owner" | "edit" | "view";
+
 export interface ProjectMemberSummary {
   agent_id: string;
   agent_name: string;
@@ -36,9 +38,11 @@ export interface ProjectSummary {
   next_action?: string | null;
   owner_id?: string | null;
   owner_name?: string | null;
-  editable?: boolean | null;
+  access_role: ProjectAccessRole;
   shared_with_user_ids?: string[];
   shared_with_names?: string[];
+  execution_user_id?: string | null;
+  execution_user_name?: string | null;
   updated_at: string;
   created_at: string;
 }
@@ -50,9 +54,21 @@ export interface ProjectListResponse {
 
 export interface ProjectTemplateCapability {
   id?: string;
+  binding_id?: string;
   name: string;
   version?: string | null;
   source?: string | null;
+  owner_agent_id?: string | null;
+  owner_agent_name?: string | null;
+  member_id?: string | null;
+  member_agent_id?: string | null;
+  member_name?: string | null;
+  member_role?: string | null;
+  path?: string | null;
+  is_enabled?: boolean;
+  file_count?: number;
+  size_bytes?: number;
+  files_available?: boolean;
 }
 
 export interface ProjectTemplateRole {
@@ -106,6 +122,7 @@ export interface ProjectTemplateFromProjectPayload {
   category?: string;
   version?: string;
   is_published?: boolean;
+  included_skill_binding_ids?: string[];
 }
 
 export interface ProjectAgentOption {
@@ -168,6 +185,9 @@ export interface ProjectCapabilityOption {
   capability_id?: string | null;
   name: string;
   description?: string | null;
+  internal_name?: string | null;
+  category?: string | null;
+  mcp_server_name?: string | null;
   kind: CapabilityKind;
   source: CapabilitySource;
   owner_agent_id?: string | null;

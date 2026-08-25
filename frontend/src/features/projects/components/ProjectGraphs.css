@@ -47,6 +47,10 @@
   outline: none;
 }
 
+.project-graph--mesh .react-flow__node-projectGraph {
+  width: 258px;
+}
+
 .project-graph .react-flow__node-projectGraph:focus-visible {
   outline: 2px solid var(--info);
   outline-offset: 3px;

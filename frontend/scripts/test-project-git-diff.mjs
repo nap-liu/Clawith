@@ -39,10 +39,15 @@ assert.match(
   /if \(params\.path\) query\.set\(["']path["']/,
   "one-file diff must be supported",
 );
+assert.doesNotMatch(
+  workspace,
+  /<ProjectGitDiffViewer/,
+  "work-item detail must not duplicate the Delivery diff browser",
+);
 assert.match(
   workspace,
-  /<ProjectGitDiffViewer[\s\S]*commit=/,
-  "work-item changes must render the real Git diff viewer",
+  /activity\.kind === "delivery"[\s\S]*onNavigate\("files"[\s\S]*onNavigate\("git"/,
+  "work-item delivery summaries must link to the canonical Delivery views",
 );
 assert.match(
   viewer,

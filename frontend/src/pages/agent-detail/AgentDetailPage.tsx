@@ -16,7 +16,7 @@ import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
 import { getChatToolRenderType } from '../../components/ChatToolCallRenderer';
@@ -100,7 +100,6 @@ import {
     IconRobot,
     IconSend,
     IconSettings,
-    IconTools,
     IconUser,
     IconWorld,
     IconBolt,
@@ -146,7 +145,6 @@ const mergeSessionsById = (first: any[], second: any[]) => {
         return true;
     });
 };
-const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
 const trimLeadingPictograph = (value: string) => value.replace(/^\p{Extended_Pictographic}\s*/u, '');
 const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
     const clean = trimLeadingPictograph(value || 'Trigger execution').trim();
@@ -154,9 +152,6 @@ const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
     if (legacyMatch) return isZh ? `内心独白：${legacyMatch[1]}` : `Reflection: ${legacyMatch[1]}`;
     return clean;
 };
-const safeDisplayIcon = (icon?: string | null, fallback: React.ReactNode = <IconTools size={18} stroke={1.8} />) =>
-    icon && !EMOJI_RE.test(icon) ? icon : fallback;
-
 // React Router unmounts this page while an agent turn can keep running on the
 // server. Keep only the affected runtime keys long enough for the next mount to
 // close the durable-history gap; ordinary completed sessions never enter here.
@@ -4388,24 +4383,6 @@ export default function AgentDetailPage() {
     const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
     const [logFilter, setLogFilter] = useState<string>('user'); // 'user' | 'backend' | 'heartbeat' | 'schedule' | 'messages'
 
-    // Import skill from presets
-    const [showImportSkillModal, setShowImportSkillModal] = useState(false);
-    const [importingSkillId, setImportingSkillId] = useState<string | null>(null);
-    const { data: globalSkillsForImport } = useQuery({
-        queryKey: ['global-skills-for-import'],
-        queryFn: () => skillApi.list(),
-        enabled: showImportSkillModal,
-    });
-    // Agent-level import from ClawHub / URL
-    const [showAgentClawhub, setShowAgentClawhub] = useState(false);
-    const [agentClawhubQuery, setAgentClawhubQuery] = useState('');
-    const [agentClawhubResults, setAgentClawhubResults] = useState<any[]>([]);
-    const [agentClawhubSearching, setAgentClawhubSearching] = useState(false);
-    const [agentClawhubInstalling, setAgentClawhubInstalling] = useState<string | null>(null);
-    const [showAgentUrlImport, setShowAgentUrlImport] = useState(false);
-    const [agentUrlInput, setAgentUrlInput] = useState('');
-    const [agentUrlImporting, setAgentUrlImporting] = useState(false);
-
     const { data: backgroundTasks = [] } = useQuery({
         queryKey: ['tasks', id],
         queryFn: () => taskApi.list(id!),
@@ -6212,32 +6189,7 @@ export default function AgentDetailPage() {
                 {/* ── Skills Tab ── */}
                 {
                     activeTab === 'skills' && id && (
-                        <SkillsTab
-                            agentId={id}
-                            canManage={canManage}
-                            safeDisplayIcon={safeDisplayIcon}
-                            showAgentClawhub={showAgentClawhub}
-                            setShowAgentClawhub={setShowAgentClawhub}
-                            agentClawhubQuery={agentClawhubQuery}
-                            setAgentClawhubQuery={setAgentClawhubQuery}
-                            agentClawhubResults={agentClawhubResults}
-                            setAgentClawhubResults={setAgentClawhubResults}
-                            agentClawhubSearching={agentClawhubSearching}
-                            setAgentClawhubSearching={setAgentClawhubSearching}
-                            agentClawhubInstalling={agentClawhubInstalling}
-                            setAgentClawhubInstalling={setAgentClawhubInstalling}
-                            showAgentUrlImport={showAgentUrlImport}
-                            setShowAgentUrlImport={setShowAgentUrlImport}
-                            agentUrlInput={agentUrlInput}
-                            setAgentUrlInput={setAgentUrlInput}
-                            agentUrlImporting={agentUrlImporting}
-                            setAgentUrlImporting={setAgentUrlImporting}
-                            showImportSkillModal={showImportSkillModal}
-                            setShowImportSkillModal={setShowImportSkillModal}
-                            globalSkillsForImport={globalSkillsForImport}
-                            importingSkillId={importingSkillId}
-                            setImportingSkillId={setImportingSkillId}
-                        />
+                        <SkillsTab agentId={id} canManage={canManage} />
                     )
                 }
 

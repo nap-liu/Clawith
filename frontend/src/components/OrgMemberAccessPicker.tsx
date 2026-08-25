@@ -53,7 +53,7 @@ type DirectoryDepartmentsResponse = {
 
 type DirectoryMember = {
     id: string;
-    member_id: string;
+    member_id: string | null;
     name: string;
     nickname?: string | null;
     department_id: string | null;
@@ -122,6 +122,7 @@ export default function OrgMemberAccessPicker({
         subtitle: t(singleSelect ? 'accessPicker.executionSubtitle' : 'accessPicker.subtitle'),
         search: t('accessPicker.search'),
         organization: t('accessPicker.organization'),
+        allMembers: t('accessPicker.allMembers'),
         myDepartment: t('accessPicker.myDepartment'),
         directOnly: t('accessPicker.directOnly'),
         includeDescendants: t('accessPicker.includeDescendants'),
@@ -207,8 +208,10 @@ export default function OrgMemberAccessPicker({
             if (!parentId && response.my_department) {
                 setMyDepartment(response.my_department);
                 mergeDepartments([response.my_department]);
-                setSelectedDepartmentId(current => current || response.my_department?.id || null);
-            } else if (!parentId && !response.my_department && response.items.length > 0) {
+                if (!membersOnly) {
+                    setSelectedDepartmentId(current => current || response.my_department?.id || null);
+                }
+            } else if (!parentId && !membersOnly && !response.my_department && response.items.length > 0) {
                 setSelectedDepartmentId(current => current || response.items[0].id);
             }
         } catch (error) {
@@ -216,7 +219,7 @@ export default function OrgMemberAccessPicker({
         } finally {
             loadingParentsRef.current.delete(key);
         }
-    }, [directoryUrl, mergeDepartments]);
+    }, [directoryUrl, membersOnly, mergeDepartments]);
 
     useEffect(() => {
         if (!open) {
@@ -295,7 +298,7 @@ export default function OrgMemberAccessPicker({
                 `${directoryUrl}/members?${params}`,
             );
         },
-        enabled: open && (singleSelect || !!debouncedMemberSearch || !!selectedDepartmentId),
+        enabled: open && (membersOnly || singleSelect || !!debouncedMemberSearch || !!selectedDepartmentId),
         staleTime: 15_000,
     });
 
@@ -557,9 +560,24 @@ export default function OrgMemberAccessPicker({
                                     )) : <div className="org-access-picker__empty">{labels.noDepartments}</div>
                             ) : (
                                 <>
+                                    {membersOnly && (
+                                        <button
+                                            type="button"
+                                            className={`org-access-picker__tree-row${selectedDepartmentId === null ? ' is-selected' : ''}`}
+                                            onClick={() => {
+                                                setSelectedDepartmentId(null);
+                                                setMemberSearch('');
+                                                setIncludeDescendants(false);
+                                            }}
+                                        >
+                                            <span className="org-access-picker__tree-spacer" />
+                                            <span className="org-access-picker__tree-name"><span>{labels.allMembers}</span></span>
+                                        </button>
+                                    )}
                                     {renderTree(ROOT_KEY)}
                                     {treeError && <div className="org-access-picker__error">{treeError}</div>}
-                                    {!treeError && !(childrenByParent[ROOT_KEY]?.length) && <div className="org-access-picker__empty">{labels.loading}</div>}
+                                    {!treeError && childrenByParent[ROOT_KEY] === undefined && <div className="org-access-picker__empty">{labels.loading}</div>}
+                                    {!treeError && childrenByParent[ROOT_KEY]?.length === 0 && <div className="org-access-picker__empty">{labels.noDepartments}</div>}
                                 </>
                             )}
                         </div>
@@ -571,7 +589,9 @@ export default function OrgMemberAccessPicker({
                                 <div className="org-access-picker__path">
                                     {debouncedMemberSearch
                                         ? labels.companySearchResults
-                                        : compactDepartmentPath(selectedDepartment?.path || myDepartment?.path)}
+                                        : selectedDepartmentId
+                                            ? compactDepartmentPath(selectedDepartment?.path || myDepartment?.path)
+                                            : labels.allMembers}
                                 </div>
                                 <strong>{memberData?.total ?? 0} {labels.members}</strong>
                             </div>

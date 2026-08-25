@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
@@ -192,6 +192,73 @@ async def resolve_project_runtime_models(
         RuntimeLLMModel.from_orm(selected) if selected is not None else None,
         None,
     )
+
+
+async def resolve_project_member_runtime_models(
+    db: AsyncSession,
+    *,
+    agent: Agent,
+    member_config: dict | None,
+    project_settings: dict | None,
+) -> RuntimeModelResolution:
+    """Resolve models only from the frozen member config and project defaults."""
+
+    tenant_id = getattr(agent, "tenant_id", None)
+    if tenant_id is None:
+        return RuntimeModelResolution(None, None)
+    enabled_models = (
+        (
+            await db.execute(
+                select(LLMModel).where(
+                    or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None)),
+                    LLMModel.enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {model.id: model for model in enabled_models}
+    config = dict(member_config or {})
+
+    def _configured_model(key: str) -> LLMModel | None:
+        raw = config.get(key)
+        if not raw:
+            return None
+        try:
+            return by_id.get(uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            return None
+
+    primary_orm = _configured_model("primary_model_id")
+    fallback_orm = _configured_model("fallback_model_id")
+    if primary_orm is None and fallback_orm is not None:
+        primary_orm, fallback_orm = fallback_orm, None
+    if primary_orm is not None:
+        return RuntimeModelResolution(
+            RuntimeLLMModel.from_orm(primary_orm),
+            RuntimeLLMModel.from_orm(fallback_orm) if fallback_orm is not None else None,
+        )
+
+    # An intentionally empty member override uses project/tenant defaults, but
+    # never re-reads the mutable source Agent model selection.
+    runtime_settings = dict(dict(project_settings or {}).get("runtime") or {})
+    configured = str(runtime_settings.get("model") or runtime_settings.get("default_model") or "").strip()
+    project_model = None
+    if configured and configured.casefold() != "default":
+        try:
+            project_model = by_id.get(uuid.UUID(configured))
+        except (TypeError, ValueError):
+            named = [model for model in enabled_models if _normalized_model_name(model.model) == configured.casefold()]
+            if len(named) == 1:
+                project_model = named[0]
+    if project_model is not None:
+        return RuntimeModelResolution(RuntimeLLMModel.from_orm(project_model), None)
+
+    tenant = await db.get(Tenant, tenant_id)
+    tenant_default = by_id.get(tenant.default_model_id) if tenant is not None else None
+    selected = tenant_default or (sorted(enabled_models, key=lambda model: str(model.id))[0] if enabled_models else None)
+    return RuntimeModelResolution(RuntimeLLMModel.from_orm(selected) if selected is not None else None, None)
 
 
 async def load_turn_model_id(

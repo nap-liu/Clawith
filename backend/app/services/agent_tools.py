@@ -2889,7 +2889,11 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
     return result
 
 
-async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
+async def get_agent_tools_for_llm(
+    agent_id: uuid.UUID,
+    *,
+    assignment_snapshot: list[dict] | None = None,
+) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
 
     Falls back to hardcoded AGENT_TOOLS if DB not ready.
@@ -2949,9 +2953,22 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
         )
 
         async with async_session() as db:
-            # Get agent-specific assignments
-            agent_tools_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
-            assignments = {str(at.tool_id): at for at in agent_tools_r.scalars().all()}
+            # A ProjectRun supplies the exact enabled assignment snapshot. An
+            # immediate child without a ProjectRun continues to read live rows.
+            if assignment_snapshot is None:
+                agent_tools_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
+                assignments = {str(at.tool_id): at for at in agent_tools_r.scalars().all()}
+            else:
+                from types import SimpleNamespace
+
+                assignments = {
+                    str(item["tool_id"]): SimpleNamespace(
+                        enabled=True,
+                        config=dict(item.get("config") or {}),
+                    )
+                    for item in assignment_snapshot
+                    if isinstance(item, dict) and item.get("tool_id")
+                }
             assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
 
             visible_clauses = [Tool.source == "builtin"]
@@ -2996,7 +3013,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 at = assignments.get(tid)
                 enabled = resolved_agent_tool_enabled(t.name, at)
                 if not enabled:
-                    if at and not at.enabled and not tool_is_required(t.name):
+                    if (assignment_snapshot is not None or (at and not at.enabled)) and not tool_is_required(t.name):
                         explicitly_disabled_names.add(t.name)
                     continue
 

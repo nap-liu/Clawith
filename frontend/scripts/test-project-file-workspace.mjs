@@ -140,8 +140,8 @@ assert.match(
 );
 assert.match(
   workspacePage,
-  /projectAgents\.actions\.promote[\s\S]*openPromoteDialog/,
-  "project member details must expose the Project Digital Employee upgrade action",
+  /openPromoteDialog[\s\S]*projectAgents\.actions\.promote/,
+  "the selected Project Digital Employee must expose one direct upgrade action",
 );
 assert.match(
   workspacePage,

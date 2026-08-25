@@ -113,7 +113,7 @@ async def claim_pending_trigger_executions(
                 ),
             )
             .order_by(TriggerExecution.scheduled_at.asc())
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=TriggerExecution, skip_locked=True)
             .limit(limit)
         )
         rows = result.all()

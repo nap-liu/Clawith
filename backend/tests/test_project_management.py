@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models.agent  # noqa: F401
@@ -19,7 +20,7 @@ import app.models.tenant  # noqa: F401
 import app.models.user  # noqa: F401
 from app.database import Base
 from app.models.agent import Agent
-from app.models.project import ProjectAccessGrant, ProjectRun
+from app.models.project import ProjectAccessGrant, ProjectMemberSnapshot, ProjectRun
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
@@ -52,10 +53,13 @@ TABLES = [
     "users",
     "agent_templates",
     "agents",
+    "tools",
+    "agent_tools",
     "agent_agent_relationships",
     "participants",
     "project_templates",
     "projects",
+    "project_repository_operations",
     "project_access_grants",
     "project_member_snapshots",
     "project_capability_bindings",
@@ -274,6 +278,30 @@ async def test_run_freezes_member_and_effective_capability_snapshots(db, monkeyp
     assert len(snapshots) == 2
     assert sum(snapshot.is_leader for snapshot in snapshots) == 1
     assert all(snapshot.capability_snapshot[0]["name"] == "project-shell" for snapshot in snapshots)
+
+    worker_member = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.agent_id == worker.id,
+            )
+        )
+    ).scalar_one()
+    worker_member.config_snapshot = {**dict(worker_member.config_snapshot or {}), "project_instruction": "later edit"}
+    inherited_run = ProjectRun(
+        tenant_id=tenant.id,
+        project_id=project.id,
+        initiated_by_user_id=owner.id,
+        status="queued",
+        trigger_type="a2a",
+    )
+    db.add(inherited_run)
+    await db.flush()
+    inherited = await freeze_run_members(db, project, inherited_run, source_run_id=run.id)
+    inherited_worker = next(snapshot for snapshot in inherited if snapshot.agent_id == worker.id)
+    original_worker = next(snapshot for snapshot in snapshots if snapshot.agent_id == worker.id)
+    assert inherited_worker.member_config_snapshot == original_worker.member_config_snapshot
+    assert inherited_worker.member_config_snapshot.get("project_instruction") != "later edit"
 
     resolved = await resolve_agent_recipient(db, leader.id, worker.id, project_id=project.id)
     assert resolved.source_agent.id == leader.id

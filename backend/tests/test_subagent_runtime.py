@@ -13,7 +13,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 
-from app.api.tools import AgentToolUpdate, update_agent_tools
+from app.api.tools import AgentToolUpdate, get_agent_tools_with_config, update_agent_tools
 from app.api.websocket import _has_active_subagent_event_turn
 from app.database import async_session, engine
 from app.models.agent import Agent
@@ -23,14 +23,26 @@ from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer  # noqa: F401 - register Tool FK target
 from app.models.participant import Participant  # noqa: F401
-from app.models.project import Project, ProjectMemberSnapshot
+from app.models.project import Project, ProjectMemberSnapshot, ProjectRun
 from app.models.subagent_run import SubagentRun
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
+from app.services import channel_llm
 from app.services import subagent_runtime as runtime
+from app.services.agent_tools import get_agent_tools_for_llm
+from app.services.project_collaboration_prompt import build_project_runtime_context
+from app.services.project_member_runtime import (
+    clone_source_agent_tool_dependencies,
+    merge_project_member_runtime_config,
+)
+from app.services.project_service import freeze_run_members
 from app.services.tool_enablement import SUBAGENT_TOOL_NAMES
 from app.services.tool_seeder import seed_builtin_tools
+from app.services.user_project_tools import (
+    USER_PROJECT_TOOL_NAMES,
+    USER_PROJECT_TOOL_SEEDS,
+)
 from app.services.workload_capacity import WorkloadCapacity, WorkloadKind
 
 pytestmark = pytest.mark.asyncio
@@ -38,6 +50,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 async def _dispose_engine_between_tests():
+    await engine.dispose()
     yield
     await engine.dispose()
 
@@ -159,6 +172,286 @@ async def _make_context(*, parent_channel: str = "web", project: bool = False):
         return agent.id, user.id, parent.id, anchor.id
 
 
+async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and_tools(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context(parent_channel="project", project=True)
+    tool_name = f"frozen_tool_{uuid.uuid4().hex[:10]}"
+    async with async_session() as db:
+        parent = await db.get(ChatSession, parent_id)
+        project = await db.get(Project, parent.project_id)
+        member = (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.agent_id == agent_id,
+                )
+            )
+        ).scalar_one()
+        frozen_model = LLMModel(
+            tenant_id=project.tenant_id,
+            provider="openai",
+            model=f"Frozen-{uuid.uuid4().hex[:8]}",
+            api_key_encrypted="unused",
+            label="Frozen model",
+            enabled=True,
+            context_window=128000,
+        )
+        tool = Tool(
+            name=tool_name,
+            display_name="Frozen tool",
+            description="Read frozen evidence",
+            type="builtin",
+            source="builtin",
+            enabled=True,
+            parameters_schema={"type": "object", "properties": {}},
+        )
+        db.add_all([frozen_model, tool])
+        await db.flush()
+        member.config_snapshot = {
+            **dict(member.config_snapshot or {}),
+            "primary_model_id": str(frozen_model.id),
+            "max_tool_rounds": 7,
+            "project_instruction": "Use the release checklist captured at run start.",
+        }
+        assignment = AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True)
+        db.add(assignment)
+        project_run = ProjectRun(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            agent_id=agent_id,
+            initiated_by_user_id=user_id,
+            execution_user_id=user_id,
+            status="queued",
+            trigger_type="manual",
+        )
+        db.add(project_run)
+        await db.flush()
+        await freeze_run_members(db, project, project_run)
+        member.config_snapshot = {
+            **dict(member.config_snapshot or {}),
+            "primary_model_id": None,
+            "max_tool_rounds": 99,
+            "project_instruction": "This later edit must not affect the old run.",
+        }
+        assignment.enabled = False
+        await db.commit()
+        project_run_id = project_run.id
+
+    child, created = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id=f"frozen-runtime-{uuid.uuid4()}",
+        task="Review the frozen release evidence",
+        mode="async",
+        turn_anchor_id=anchor_id,
+        project_run_id=project_run_id,
+        input_metadata={"project_dispatch": True},
+    )
+    assert created is True
+    async with async_session() as db:
+        child_session = await db.get(ChatSession, child.id)
+        runtime_config = dict(child_session.im_config or {})
+    assert runtime_config["project_run_frozen"] is True
+    assert runtime_config["member_config_snapshot"]["primary_model_id"] == str(frozen_model.id)
+    assert runtime_config["member_config_snapshot"]["max_tool_rounds"] == 7
+    assert "release checklist captured at run start" in build_project_runtime_context(runtime_config)
+    tool_names = {
+        item["function"]["name"]
+        for item in await runtime.prepare_subagent_tools(
+            agent_id,
+            child.id,
+            execution_user_id=user_id,
+        )
+    }
+    assert tool_name in tool_names
+
+    model_dispatches: list[dict] = []
+
+    async def fake_provider_dispatch(**kwargs):
+        model_dispatches.append(kwargs)
+        return "Frozen model selected"
+
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_provider_dispatch)
+    async with async_session() as db:
+        child_session = await db.get(ChatSession, child.id)
+        await channel_llm._call_agent_llm(
+            db,
+            agent_id,
+            "Verify the saved release decision",
+            session_id=str(child.id),
+            user_id=user_id,
+            prepared_tools=[],
+            include_soul=False,
+            include_memory=False,
+            broadcast_web=False,
+            runtime_session=child_session,
+            max_tool_rounds_override=7,
+        )
+    assert model_dispatches[0]["primary_model"].id == frozen_model.id
+    assert model_dispatches[0]["max_tool_rounds_override"] == 7
+
+    invocations: list[dict] = []
+
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del _agent_id, _session_id, execution_user_id
+        return []
+
+    async def fake_llm(_db, _agent_id, _text, **kwargs):
+        invocations.append(kwargs)
+        return "结论：冻结配置已生效；依据是当前运行保存的发布检查清单。"
+
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
+    assert await runtime._claim_subagent(child.id) == child.id
+    await runtime.execute_claimed_subagent(child.id)
+    assert invocations[0]["max_tool_rounds_override"] == 7
+    assert invocations[0]["runtime_session"].im_config["member_config_snapshot"]["primary_model_id"] == str(
+        frozen_model.id
+    )
+
+
+async def test_project_agent_tool_clone_groups_mcp_server_and_excludes_credentials_and_legacy_rows():
+    source_agent_id, user_id, parent_id, _anchor_id = await _make_context(parent_channel="project", project=True)
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        parent = await db.get(ChatSession, parent_id)
+        project = await db.get(Project, parent.project_id)
+        target = Agent(
+            name=f"Project copy {suffix}",
+            creator_id=user_id,
+            tenant_id=project.tenant_id,
+            scope="project",
+            project_id=project.id,
+            agent_dir=f".agents/{suffix}",
+            status="idle",
+        )
+        server = MCPServer(
+            tenant_id=project.tenant_id,
+            name=f"server-{suffix}",
+            display_name="Evidence service",
+            base_url_template="https://example.invalid/mcp",
+            headers_template={},
+        )
+        db.add_all([target, server])
+        await db.flush()
+        mcp_tools = [
+            Tool(
+                name=f"mcp_{suffix}_{index}",
+                display_name=f"Evidence query {index}",
+                type="mcp",
+                source="admin",
+                tenant_id=project.tenant_id,
+                mcp_server_id=server.id,
+                enabled=True,
+                parameters_schema={"type": "object", "properties": {}},
+            )
+            for index in range(2)
+        ]
+        legacy = Tool(
+            name=f"legacy_mcp_{suffix}",
+            display_name="Legacy MCP",
+            type="mcp",
+            source="admin",
+            tenant_id=project.tenant_id,
+            enabled=True,
+            parameters_schema={"type": "object", "properties": {}},
+        )
+        db.add_all([*mcp_tools, legacy])
+        await db.flush()
+        db.add_all(
+            [
+                AgentTool(
+                    agent_id=source_agent_id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    config={"secret": "must-not-copy"},
+                )
+                for tool in [*mcp_tools, legacy]
+            ]
+        )
+        await db.flush()
+
+        bindings = await clone_source_agent_tool_dependencies(
+            db,
+            project,
+            source_agent_id=source_agent_id,
+            project_agent_id=target.id,
+        )
+        target_assignments = (
+            (
+                await db.execute(select(AgentTool).where(AgentTool.agent_id == target.id))
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(bindings) == 1
+    assert bindings[0].capability_type == "mcp"
+    assert bindings[0].capability_id == server.id
+    assert bindings[0].capability_name == "Evidence service"
+    assert {row.tool_id for row in target_assignments} == {tool.id for tool in mcp_tools}
+    assert all(row.config == {} for row in target_assignments)
+
+
+async def test_project_member_runtime_model_validation_preserves_tenant_boundary_and_global_catalog():
+    agent_id, _user_id, parent_id, _anchor_id = await _make_context(parent_channel="project", project=True)
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        parent = await db.get(ChatSession, parent_id)
+        project = await db.get(Project, parent.project_id)
+        member = (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.agent_id == agent_id,
+                )
+            )
+        ).scalar_one()
+        other_tenant = Tenant(name=f"other-{suffix}", slug=f"other-{suffix}")
+        db.add(other_tenant)
+        await db.flush()
+        other_model = LLMModel(
+            tenant_id=other_tenant.id,
+            provider="openai",
+            model=f"Other-{suffix}",
+            api_key_encrypted="unused",
+            label="Other model",
+            enabled=True,
+        )
+        global_model = LLMModel(
+            tenant_id=None,
+            provider="openai",
+            model=f"Global-{suffix}",
+            api_key_encrypted="unused",
+            label="Global model",
+            enabled=True,
+        )
+        db.add_all([other_model, global_model])
+        await db.flush()
+
+        with pytest.raises(HTTPException) as denied:
+            await merge_project_member_runtime_config(
+                db,
+                project,
+                member,
+                {"primary_model_id": str(other_model.id)},
+            )
+        assert denied.value.status_code == 422
+        merged = await merge_project_member_runtime_config(
+            db,
+            project,
+            member,
+            {
+                "primary_model_id": str(global_model.id),
+                "max_tool_rounds": 12,
+                "project_instruction": "Use only tenant-visible evidence.",
+            },
+        )
+
+    assert merged["primary_model_id"] == str(global_model.id)
+    assert merged["max_tool_rounds"] == 12
+
+
 @pytest.mark.parametrize(
     ("corrected_reply", "still_low_value"),
     (
@@ -258,8 +551,19 @@ async def test_child_parent_message_tool_respects_standard_agent_tool_toggle(mon
     async with async_session() as db:
         tool = (await db.execute(select(Tool).where(Tool.name == "send_message_to_parent"))).scalar_one()
         tool_id = tool.id
-        assignment = AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=False)
-        db.add(assignment)
+        assignment = (
+            await db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == agent_id,
+                    AgentTool.tool_id == tool_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if assignment is None:
+            assignment = AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=False)
+            db.add(assignment)
+        else:
+            assignment.enabled = False
         await db.commit()
 
     # Startup seeding must preserve an explicit manual opt-out.
@@ -341,6 +645,96 @@ async def test_subagent_panel_group_toggle_updates_all_four_tools():
         )
         assert len(enabled) == 4
         assert all(assignment.enabled is True for assignment in enabled)
+
+
+async def test_standard_agent_project_tool_group_reports_disabled_partial_enabled():
+    agent_id, user_id, _, _ = await _make_context()
+    await seed_builtin_tools()
+
+    async with async_session() as db:
+        user = await db.get(User, user_id)
+        project_tools = (
+            (
+                await db.execute(
+                    select(Tool).where(Tool.name.in_(USER_PROJECT_TOOL_NAMES))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {tool.name for tool in project_tools} == set(USER_PROJECT_TOOL_NAMES)
+        assert {tool.category for tool in project_tools} == {"project_management"}
+
+        async def assert_group_contract(state: str, enabled_count: int) -> None:
+            response = await get_agent_tools_with_config(
+                agent_id,
+                current_user=user,
+                db=db,
+            )
+            group = [
+                tool for tool in response if tool["category"] == "project_management"
+            ]
+            expected = {
+                "key": "project_management",
+                "state": state,
+                "member_count": len(USER_PROJECT_TOOL_NAMES),
+                "enabled_count": enabled_count,
+                "complete": True,
+            }
+            assert {tool["name"] for tool in group} == set(USER_PROJECT_TOOL_NAMES)
+            assert all(tool["capability_group"] == expected for tool in group)
+
+        await assert_group_contract("disabled", 0)
+
+        first_tool = project_tools[0]
+        db.add(AgentTool(agent_id=agent_id, tool_id=first_tool.id, enabled=True))
+        await db.commit()
+        await assert_group_contract("partial", 1)
+
+        await update_agent_tools(
+            agent_id,
+            [AgentToolUpdate(tool_id=str(first_tool.id), enabled=True)],
+            current_user=user,
+            db=db,
+        )
+        await assert_group_contract("enabled", len(USER_PROJECT_TOOL_NAMES))
+
+        expected_descriptions = {
+            seed["name"]: seed["description"] for seed in USER_PROJECT_TOOL_SEEDS
+        }
+        persisted_descriptions = {
+            tool.name: tool.description
+            for tool in (
+                (
+                    await db.execute(
+                        select(Tool).where(Tool.name.in_(USER_PROJECT_TOOL_NAMES))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        }
+        assert persisted_descriptions == expected_descriptions
+        assert persisted_descriptions["user_project_run_start"] == (
+            "Start work in a running project using either a work item or a clear instruction. An active project "
+            "member must be assigned to perform the work."
+        )
+        assert persisted_descriptions["user_project_status_update"] == (
+            "Pause or resume project work. The project must already be running or paused. Requires project owner "
+            "permission."
+        )
+        assert persisted_descriptions["user_project_git_diff"] == (
+            "Read file change statistics for one saved version, or detailed text changes for one file. Requires "
+            "access to the project."
+        )
+
+    llm_tools = await get_agent_tools_for_llm(agent_id)
+    llm_descriptions = {
+        tool["function"]["name"]: tool["function"]["description"]
+        for tool in llm_tools
+        if tool["function"]["name"] in USER_PROJECT_TOOL_NAMES
+    }
+    assert llm_descriptions == expected_descriptions
 
 
 async def test_create_uses_one_id_readable_model_and_idempotent_fork():

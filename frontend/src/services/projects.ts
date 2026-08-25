@@ -125,6 +125,13 @@ function normalizeProject(value: unknown): ProjectSummary {
       : typeof source.can_edit === "boolean"
         ? source.can_edit
         : null;
+  const accessRole = ["owner", "edit", "view"].includes(
+    string(source.access_role),
+  )
+    ? (string(source.access_role) as "owner" | "edit" | "view")
+    : editable
+      ? "edit"
+      : "view";
   return {
     id: string(source.id),
     name: string(source.name, "未命名项目"),
@@ -157,7 +164,7 @@ function normalizeProject(value: unknown): ProjectSummary {
     next_action: string(source.next_action || settings.next_action) || null,
     owner_id: string(source.owner_id || source.owner_user_id) || null,
     owner_name: string(source.owner_name) || null,
-    editable,
+    access_role: accessRole,
     shared_with_user_ids: (array(source.shared_with_user_ids).length
       ? array(source.shared_with_user_ids)
       : sharedWith.map((item) => item.user_id || item.id)
@@ -167,6 +174,8 @@ function normalizeProject(value: unknown): ProjectSummary {
     shared_with_names: array(source.shared_with_names)
       .map((item) => string(item))
       .filter(Boolean),
+    execution_user_id: string(source.execution_user_id) || null,
+    execution_user_name: string(source.execution_user_name) || null,
     created_at: string(source.created_at, new Date(0).toISOString()),
     updated_at: string(
       source.updated_at || source.created_at,
@@ -193,9 +202,30 @@ function normalizeTemplateCapability(
   const source = record(value);
   return {
     id: string(source.id) || undefined,
+    binding_id:
+      string(source.binding_id || source.project_capability_binding_id) ||
+      undefined,
     name: string(source.name || source.display_name, "未命名能力"),
     version: string(source.version) || null,
     source: string(source.source) || null,
+    owner_agent_id:
+      string(source.owner_agent_id || source.inherited_from_agent_id) || null,
+    owner_agent_name:
+      string(
+        source.owner_agent_name || source.member_name || source.agent_name,
+      ) || null,
+    member_id: string(source.member_id) || null,
+    member_agent_id: string(source.member_agent_id) || null,
+    member_name:
+      string(source.member_name || source.owner_agent_name) || null,
+    member_role: string(source.member_role) || null,
+    path: string(source.path) || null,
+    is_enabled: source.is_enabled !== false,
+    file_count: number(source.file_count || source.files_count),
+    size_bytes: number(source.size_bytes || source.total_size_bytes),
+    files_available: boolean(
+      source.files_available ?? source.has_files ?? source.file_count,
+    ),
   };
 }
 
@@ -380,7 +410,7 @@ export const projectsApi = {
       return {
         id: string(mcp.id),
         name: string(mcp.display_name || mcp.name, "未命名 MCP"),
-        description: string(mcp.description || mcp.transport) || null,
+        description: string(mcp.description) || null,
         kind: "mcp" as const,
         source: "project" as const,
         version: string(mcp.version) || null,
@@ -396,6 +426,12 @@ export const projectsApi = {
         capability_id: string(capability.capability_id) || null,
         name: string(capability.name || capability.display_name, "未命名能力"),
         description: string(capability.description) || null,
+        internal_name:
+          string(
+            capability.key || capability.internal_name || capability.tool_name,
+          ) || null,
+        category: string(capability.category) || null,
+        mcp_server_name: string(capability.mcp_server_name) || null,
         kind:
           capability.kind === "mcp" || capability.type === "mcp"
             ? ("mcp" as const)
@@ -500,6 +536,7 @@ export const projectsApi = {
     payload: {
       visibility?: "private" | "shared";
       shared_with_user_ids?: string[];
+      execution_user_id?: string | null;
       status?: "running" | "paused";
     },
   ): Promise<ProjectSummary> {
@@ -607,6 +644,31 @@ export const projectsApi = {
   listCapabilities: (projectId: string) =>
     fetchJson<JsonRecord[]>(
       `/projects/${encodeURIComponent(projectId)}/capabilities`,
+    ),
+  async listAgentToolCatalog(agentId: string) {
+    const encodedAgentId = encodeURIComponent(agentId);
+    try {
+      return await fetchJson<JsonRecord[]>(
+        `/tools/agents/${encodedAgentId}/with-config`,
+      );
+    } catch {
+      return fetchJson<JsonRecord[]>(`/tools/agents/${encodedAgentId}`);
+    }
+  },
+  createCapability: (
+    projectId: string,
+    payload: {
+      capability_type: "skill" | "mcp" | "tool";
+      capability_id: string;
+      capability_name: string;
+      source: "shared" | "inherited";
+      inherited_from_agent_id?: string | null;
+      is_enabled: boolean;
+    },
+  ) =>
+    fetchJson<JsonRecord>(
+      `/projects/${encodeURIComponent(projectId)}/capabilities`,
+      { method: "POST", body: JSON.stringify(payload) },
     ),
   listWorkItems: (projectId: string) =>
     fetchJson<JsonRecord[]>(

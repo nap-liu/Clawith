@@ -187,6 +187,7 @@ def public_template_definition(definition: object) -> dict:
         if key in source
     }
     capabilities = source.get("capabilities") if isinstance(source.get("capabilities"), list) else []
+    skill_assets = source.get("skill_assets") if isinstance(source.get("skill_assets"), list) else []
     result["roles"] = [
         {
             "key": f"digital-employee-{index + 1}",
@@ -196,11 +197,22 @@ def public_template_definition(definition: object) -> dict:
         for index, item in enumerate(agents)
         if isinstance(item, dict)
     ]
-    result["skills"] = [
-        {"name": str(item.get("capability_name") or "Skill")}
-        for item in capabilities
-        if isinstance(item, dict) and item.get("capability_type") == "skill" and item.get("source") == "shared"
-    ]
+    result["skills"] = []
+    for item in skill_assets:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("digital_employee_index")
+        member = agents[index] if isinstance(index, int) and 0 <= index < len(agents) else {}
+        result["skills"].append(
+            {
+                "name": str(item.get("name") or "Skill"),
+                "version": str(item.get("version") or "1"),
+                "member_name": str(member.get("name") or "") if isinstance(member, dict) else "",
+                "member_role": str(member.get("role_description") or "") if isinstance(member, dict) else "",
+                "file_count": item.get("file_count", 0),
+                "size_bytes": item.get("size_bytes", 0),
+            }
+        )
     result["mcp_servers"] = [
         {"name": str(item.get("capability_name") or "MCP")}
         for item in capabilities
@@ -218,6 +230,16 @@ def public_template_definition(definition: object) -> dict:
     )
     digital_employee_file_count = 0
     digital_employee_size_bytes = 0
+    skill_file_count = sum(
+        item.get("file_count", 0)
+        for item in skill_assets
+        if isinstance(item, dict) and isinstance(item.get("file_count"), int)
+    )
+    skill_size_bytes = sum(
+        item.get("size_bytes", 0)
+        for item in skill_assets
+        if isinstance(item, dict) and isinstance(item.get("size_bytes"), int)
+    )
     for agent in agents:
         if not isinstance(agent, dict):
             continue
@@ -237,14 +259,16 @@ def public_template_definition(definition: object) -> dict:
     return result | {
         "asset_summary": {
             "file_count": project_file_count,
-            "total_file_count": project_file_count + digital_employee_file_count,
+            "total_file_count": project_file_count + digital_employee_file_count + skill_file_count,
             "digital_employee_file_count": digital_employee_file_count,
             "digital_employee_count": len(agents),
-            "total_size_bytes": project_size_bytes + digital_employee_size_bytes,
+            "total_size_bytes": project_size_bytes + digital_employee_size_bytes + skill_size_bytes,
             "excluded_file_count": tree.get("excluded_file_count", 0)
             if isinstance(tree.get("excluded_file_count"), int)
             else 0,
             "skill_count": len(result.get("skills", [])) if isinstance(result.get("skills"), list) else 0,
+            "skill_file_count": skill_file_count,
+            "skill_size_bytes": skill_size_bytes,
             "mcp_server_count": len(result.get("mcp_servers", []))
             if isinstance(result.get("mcp_servers"), list)
             else 0,
