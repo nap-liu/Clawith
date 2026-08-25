@@ -115,11 +115,16 @@ from app.services.im_delivery import (
     DeliveryReceiptPersistenceError,
     IMDeliveryPart,
     IMDeliveryResult,
+    MentionIntent,
     _merge_delivery_into_meta,
     append_delivery_part,
     attach_delivery_to_meta,
     recall_message,
     register_delivery,
+)
+from app.services.dingtalk_group_mentions import (
+    load_group_session_webhook,
+    prepare_group_user_mentions,
 )
 from app.services.user_output import sanitize_user_visible_text
 from app.services.turn_runtime import (
@@ -962,9 +967,9 @@ AGENT_TOOLS = [
                 "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
                 "discovers a person, selects or changes a channel, sends files, or contacts another "
                 "digital employee. If no suitable Session exists, use send_channel_message for an external-IM "
-                "person or send_platform_message for a platform user. For a native DingTalk @, you MUST call "
-                "this tool with mention_user_ids even when replying in the current group; writing @name in a "
-                "normal assistant reply is plain text and does not create an @ action."
+                "person or send_platform_message for a platform user. For a native group mention, you MUST call "
+                "this tool with mention_user_ids or mention_all=true; writing @name or @everyone in a normal "
+                "assistant reply is plain text and does not create a native mention."
             ),
             "parameters": {
                 "type": "object",
@@ -976,8 +981,8 @@ AGENT_TOOLS = [
                     "message": {
                         "type": "string",
                         "description": (
-                            "Business text to send. When mention_user_ids is present, do not prefix @names "
-                            "or external IDs; the transport renders each native @ exactly once."
+                            "Business text to send. When a native mention option is present, do not prefix "
+                            "@names, @everyone, or external IDs; the transport renders the mention exactly once."
                         ),
                     },
                     "mention_user_ids": {
@@ -985,9 +990,16 @@ AGENT_TOOLS = [
                         "items": {"type": "string"},
                         "maxItems": 20,
                         "description": (
-                            "Optional canonical platform user_ids to @ in a DingTalk group. "
-                            "Each person must have an active DingTalk route; DingTalk only renders "
-                            "the @ for people who are members of the target group."
+                            "Optional canonical platform user_ids to mention natively in the target group. "
+                            "Each person must be a member of the target group, and the bound channel must "
+                            "support native group mentions."
+                        ),
+                    },
+                    "mention_all": {
+                        "type": "boolean",
+                        "description": (
+                            "Optionally mention all members of the target group natively. "
+                            "Cannot be combined with mention_user_ids."
                         ),
                     },
                 },
@@ -1003,9 +1015,9 @@ AGENT_TOOLS = [
             "description": (
                 "Compatibility tool for sending text to an existing external-IM group by exact "
                 "session_id. Prefer send_session_message for new work; this tool remains available "
-                "for existing workflows and accepts group Sessions only. For a native DingTalk @, you MUST "
-                "call this tool with mention_user_ids even when replying in the current group; writing @name "
-                "in a normal assistant reply is plain text and does not create an @ action."
+                "for existing workflows and accepts group Sessions only. For a native group mention, you MUST "
+                "call this tool with mention_user_ids or mention_all=true; writing @name or @everyone in a normal "
+                "assistant reply is plain text and does not create a native mention."
             ),
             "parameters": {
                 "type": "object",
@@ -1017,8 +1029,8 @@ AGENT_TOOLS = [
                     "message": {
                         "type": "string",
                         "description": (
-                            "Business text to send. When mention_user_ids is present, do not prefix @names "
-                            "or external IDs; the transport renders each native @ exactly once."
+                            "Business text to send. When a native mention option is present, do not prefix "
+                            "@names, @everyone, or external IDs; the transport renders the mention exactly once."
                         ),
                     },
                     "mention_user_ids": {
@@ -1026,9 +1038,16 @@ AGENT_TOOLS = [
                         "items": {"type": "string"},
                         "maxItems": 20,
                         "description": (
-                            "Optional canonical platform user_ids to @ in a DingTalk group. "
-                            "Each person must have an active DingTalk route; DingTalk only renders "
-                            "the @ for people who are members of the target group."
+                            "Optional canonical platform user_ids to mention natively in the target group. "
+                            "Each person must be a member of the target group, and the bound channel must "
+                            "support native group mentions."
+                        ),
+                    },
+                    "mention_all": {
+                        "type": "boolean",
+                        "description": (
+                            "Optionally mention all members of the target group natively. "
+                            "Cannot be combined with mention_user_ids."
                         ),
                     },
                 },
@@ -10988,6 +11007,7 @@ def _session_message_result(
     is_group: bool,
     legacy_group_contract: bool,
     mentioned_users: list[str] | None = None,
+    mentions: dict | None = None,
     message_id: str | None = None,
 ) -> str:
     if legacy_group_contract:
@@ -11007,6 +11027,8 @@ def _session_message_result(
         }
     if mentioned_users:
         payload["mentioned_users"] = mentioned_users
+    if mentions:
+        payload["mentions"] = mentions
     if message_id:
         payload["message_id"] = message_id
     return json.dumps(payload, ensure_ascii=False)
@@ -11039,6 +11061,13 @@ async def _send_exact_session_message(
         str(args.get("message") or "")
     ).strip()
     raw_mention_user_ids = args.get("mention_user_ids")
+    if "mention_all" in args:
+        raw_mention_all = args["mention_all"]
+        if type(raw_mention_all) is not bool:
+            return "❌ mention_all must be a boolean"
+        mention_all = raw_mention_all
+    else:
+        mention_all = False
     if not raw_session_id:
         qualifier = "group " if require_group else ""
         return f"❌ Please provide the exact {qualifier}session_id"
@@ -11054,6 +11083,8 @@ async def _send_exact_session_message(
             return "❌ mention_user_ids cannot contain empty values"
         if len(mention_user_ids) > 20:
             return "❌ mention_user_ids supports at most 20 people"
+    if mention_all and mention_user_ids:
+        return "❌ mention_all=true cannot be combined with mention_user_ids"
     try:
         target_session_id = uuid.UUID(raw_session_id)
     except (TypeError, ValueError):
@@ -11069,8 +11100,8 @@ async def _send_exact_session_message(
     target_channel = ""
     target_is_group = require_group
     mentioned_names: list[str] = []
-    dingtalk_at_user_ids: list[str] = []
-    dingtalk_session_webhook: str | None = None
+    mention_intent: MentionIntent | None = None
+    mentions_meta: dict | None = None
 
     try:
         async with async_session() as db:
@@ -11081,6 +11112,9 @@ async def _send_exact_session_message(
                 ).scalar_one_or_none()
                 if existing is not None:
                     meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
+                    replay_mentions = meta.get("mentions")
+                    if not isinstance(replay_mentions, dict):
+                        replay_mentions = None
                     return _session_message_result(
                         status=_session_receipt_replay_status(existing),
                         session_id=str(existing.conversation_id),
@@ -11089,6 +11123,7 @@ async def _send_exact_session_message(
                         is_group=bool(meta.get("target_is_group", require_group)),
                         legacy_group_contract=legacy_group_contract,
                         mentioned_users=list(meta.get("mentioned_users") or []),
+                        mentions=replay_mentions,
                         message_id=str(existing.id),
                     )
 
@@ -11118,34 +11153,39 @@ async def _send_exact_session_message(
                 label = "Group Session" if target_is_group else "Session"
                 return f"❌ {label} delivery is not supported for channel: {target_channel or 'unknown'}"
 
-            if mention_user_ids:
+            if mention_all or mention_user_ids:
                 if not target_is_group or target_channel != "dingtalk":
-                    return "❌ @指定人当前仅支持钉钉群 Session。"
-                from app.services.dingtalk_group_mentions import (
-                    load_group_session_webhook,
-                )
+                    return "❌ 原生 @ 当前仅支持钉钉群 Session。"
 
-                dingtalk_session_webhook = load_group_session_webhook(session)
-                if not dingtalk_session_webhook:
+                if not load_group_session_webhook(session):
                     return (
                         "❌ 当前钉钉群 Session 没有可用的临时回复凭证；请让群成员先在群内 @数字员工发送一条消息后重试。"
                     )
-                for mention_user_id in mention_user_ids:
+                if mention_all:
+                    mention_intent = MentionIntent(scope="all")
+                    mentions_meta = {"scope": "all"}
+                else:
                     try:
-                        route = await resolve_human_channel_recipient(
+                        target_ids, mentioned_names = await prepare_group_user_mentions(
                             db,
-                            agent_id,
-                            mention_user_id,
-                            channel="dingtalk",
+                            agent_id=agent_id,
+                            canonical_user_ids=mention_user_ids,
                         )
                     except RecipientResolutionError as exc:
                         return exc.as_json()
-                    staff_id = str(route.member.external_id or "").strip()
-                    if not staff_id:
-                        return "❌ 指定用户缺少可用的钉钉 userId，无法 @。"
-                    if staff_id not in dingtalk_at_user_ids:
-                        dingtalk_at_user_ids.append(staff_id)
-                        mentioned_names.append(str(route.user.display_name or route.member.name or "用户"))
+                    except ValueError as exc:
+                        if str(exc) == "dingtalk_staff_id_unavailable":
+                            return "❌ 指定用户缺少可用的钉钉 userId，无法 @。"
+                        raise
+                    mention_intent = MentionIntent(
+                        scope="users",
+                        target_ids=tuple(target_ids),
+                    )
+                    mentions_meta = {
+                        "scope": "users",
+                        "user_ids": mention_user_ids,
+                        "display_names": mentioned_names,
+                    }
 
             if target_is_group:
                 target_name = str(session.group_name or session.title or "group")
@@ -11167,25 +11207,23 @@ async def _send_exact_session_message(
                 external_conv_id=external_conv_id or None,
                 is_group=target_is_group,
             )
-            message_for_history = (
-                f"{' '.join(f'@{name}' for name in mentioned_names)}\n{message_text}"
-                if mentioned_names
-                else message_text
-            )
-            message_for_delivery = message_text if dingtalk_at_user_ids else message_for_history
+            if mention_all:
+                message_for_history = f"@所有人\n{message_text}"
+            elif mentioned_names:
+                message_for_history = (
+                    f"{' '.join(f'@{name}' for name in mentioned_names)}\n{message_text}"
+                )
+            else:
+                message_for_history = message_text
+            message_for_delivery = message_text if mention_intent is not None else message_for_history
             delivery_kwargs = {
                 "agent_id": agent_id,
                 "runtime": runtime,
                 "message": message_for_delivery,
                 "allow_wecom_group_actor_fallback": False,
             }
-            if dingtalk_at_user_ids:
-                delivery_kwargs.update(
-                    {
-                        "dingtalk_at_user_ids": dingtalk_at_user_ids,
-                        "dingtalk_session_webhook": dingtalk_session_webhook,
-                    }
-                )
+            if mention_intent is not None:
+                delivery_kwargs["mention"] = mention_intent
             receipt, should_deliver = await _persist_outbound_channel_message(
                 db,
                 agent_id=agent_id,
@@ -11204,6 +11242,8 @@ async def _send_exact_session_message(
             if should_deliver:
                 receipt_meta = dict(receipt.message_meta or {})
                 receipt_meta["target_is_group"] = target_is_group
+                if mentions_meta:
+                    receipt_meta["mentions"] = mentions_meta
                 if mentioned_names:
                     receipt_meta["mention_user_ids"] = mention_user_ids
                     receipt_meta["mentioned_users"] = mentioned_names
@@ -11211,6 +11251,10 @@ async def _send_exact_session_message(
             receipt_id = receipt.id
             await db.commit()
             if not should_deliver:
+                replay_meta = receipt.message_meta if isinstance(receipt.message_meta, dict) else {}
+                replay_mentions = replay_meta.get("mentions")
+                if not isinstance(replay_mentions, dict):
+                    replay_mentions = None
                 return _session_message_result(
                     status=_session_receipt_replay_status(receipt),
                     session_id=str(receipt.conversation_id),
@@ -11219,6 +11263,7 @@ async def _send_exact_session_message(
                     is_group=target_is_group,
                     legacy_group_contract=legacy_group_contract,
                     mentioned_users=mentioned_names,
+                    mentions=replay_mentions,
                     message_id=str(receipt.id),
                 )
 
@@ -11266,6 +11311,7 @@ async def _send_exact_session_message(
             is_group=target_is_group,
             legacy_group_contract=legacy_group_contract,
             mentioned_users=mentioned_names,
+            mentions=mentions_meta,
             message_id=str(receipt_id),
         )
     except Exception as exc:
