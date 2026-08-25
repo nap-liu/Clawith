@@ -52,7 +52,7 @@ async def stage_webhook_payload(
     """Stream a request body to a temporary file and compute exact digests."""
     received_at_ms = time.time_ns() // 1_000_000
     received_at = datetime.fromtimestamp(received_at_ms / 1000, tz=timezone.utc)
-    fd, raw_path = tempfile.mkstemp(prefix="clawith-webhook-", suffix=".payload")
+    fd, raw_path = tempfile.mkstemp(prefix="webhook-inbox-", suffix=".payload")
     os.close(fd)
     path = Path(raw_path)
     size = 0
