@@ -2520,9 +2520,10 @@ BUILTIN_TOOLS = [
         "name": "list_installed_mcp_servers",
         "display_name": "List Installed MCP Servers",
         "description": (
-            "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. "
-            "No arguments are needed. For MCP bindings installed by you, the platform also returns the installation "
-            "config saved on your own binding. Shared server credentials are never inferred or copied into the result."
+            "List a concise summary of every MCP server currently assigned to you. Each item includes the exact "
+            "mcp_server_id required by refresh_mcp_server and uninstall_mcp_server, display name, transport, tool "
+            "counts, and uninstallability. Tool definitions and installation credentials are intentionally omitted "
+            "because your available MCP tools are already provided separately."
         ),
         "category": "discovery",
         "icon": "📋",

@@ -2031,7 +2031,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_installed_mcp_servers",
-            "description": "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. No arguments are needed. For MCP bindings installed by you, the platform also returns the installation config saved on your own binding. Shared server credentials are never inferred or copied into the result.",
+            "description": "List a concise summary of every MCP server currently assigned to you. Each item includes the exact mcp_server_id required by refresh_mcp_server and uninstall_mcp_server, display name, transport, tool counts, and uninstallability. Tool definitions and installation credentials are intentionally omitted because your available MCP tools are already provided separately.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -4520,7 +4520,12 @@ async def execute_tool(
             except (ValueError, TypeError):
                 result = "❌ mcp_server_id must be an exact UUID from list_installed_mcp_servers."
             else:
-                result = await refresh_mcp_server(agent_id, _server_id)
+                result = await refresh_mcp_server(
+                    agent_id,
+                    _server_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
         elif tool_name == "uninstall_mcp_server":
             from app.services.agent_mcp_lifecycle import uninstall_mcp_server
             try:

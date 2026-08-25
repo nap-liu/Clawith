@@ -35,6 +35,7 @@ async def _make_agent() -> tuple[User, Agent, MCPServer]:
         identity = Identity(
             username=f"u_{suffix}",
             email=f"u-{suffix}@x.local",
+            phone=f"1{int(suffix, 16):010d}",
             password_hash="x",
         )
         db.add(identity)
@@ -66,13 +67,22 @@ async def _make_agent() -> tuple[User, Agent, MCPServer]:
 async def test_agent_refresh_uses_override_and_preserves_existing_assignment(monkeypatch):
     user, agent, server = await _make_agent()
     async with async_session() as db:
+        expected_phone = await db.scalar(
+            select(Identity.phone)
+            .join(User, User.identity_id == Identity.id)
+            .where(User.id == user.id)
+        )
         db.add(
             MCPServerOverride(
                 mcp_server_id=server.id,
                 scope_type="agent",
                 scope_id=agent.id,
                 url_template="https://agent.example/mcp",
-                headers_template={"X-Agent": "yes"},
+                headers_template={
+                    "X-Agent": "yes",
+                    "X-Phone": "${user.phone}",
+                    "X-Session": "${session.id}",
+                },
             )
         )
         existing = Tool(
@@ -134,6 +144,7 @@ async def test_agent_refresh_uses_override_and_preserves_existing_assignment(mon
             server.id,
             agent_id=agent.id,
             user_id=user.id,
+            session_id="session-123",
             assign_to_agent=True,
         )
         await db.commit()
@@ -141,7 +152,11 @@ async def test_agent_refresh_uses_override_and_preserves_existing_assignment(mon
     assert captured == {
         "url": "https://agent.example/mcp",
         "api_key": None,
-        "headers": {"X-Agent": "yes"},
+        "headers": {
+            "X-Agent": "yes",
+            "X-Phone": expected_phone,
+            "X-Session": "session-123",
+        },
     }
     assert result.discovered == 2
     assert result.created == 1
@@ -531,7 +546,14 @@ async def test_agent_tool_refresh_splits_historical_self_installed_server():
             ]
 
     with patch("app.services.mcp_refresh_service.MCPClient", FakeClient):
-        result = json.loads(await refresh_mcp_server(agent.id, server.id))
+        result = json.loads(
+            await refresh_mcp_server(
+                agent.id,
+                server.id,
+                user_id=user.id,
+                session_id="session-123",
+            )
+        )
 
     assert result["ok"] is True
     assert result["mcp_server_id"] != str(server.id)
@@ -557,7 +579,7 @@ async def test_agent_tool_refresh_splits_historical_self_installed_server():
 
 
 async def test_agent_tool_refresh_reuses_agent_scope_service():
-    _user, agent, server = await _make_agent()
+    user, agent, server = await _make_agent()
     async with async_session() as db:
         tool = Tool(
             name=f"mcp_{server.name}_seed",
@@ -591,7 +613,14 @@ async def test_agent_tool_refresh_reuses_agent_scope_service():
         "app.services.agent_mcp_lifecycle.refresh_mcp_server_tools",
         AsyncMock(return_value=refreshed),
     ) as refresh:
-        result = json.loads(await refresh_mcp_server(agent.id, server.id))
+        result = json.loads(
+            await refresh_mcp_server(
+                agent.id,
+                server.id,
+                user_id=user.id,
+                session_id="session-123",
+            )
+        )
 
     assert result == {
         "ok": True,
@@ -603,3 +632,59 @@ async def test_agent_tool_refresh_reuses_agent_scope_service():
         "effective": "next_turn",
     }
     refresh.assert_awaited_once()
+    assert refresh.await_args.kwargs == {
+        "agent_id": agent.id,
+        "user_id": user.id,
+        "session_id": "session-123",
+        "assign_to_agent": True,
+    }
+
+
+async def test_agent_tool_refresh_preserves_original_error_after_rollback():
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        tool = Tool(
+            name=f"mcp_{server.name}_seed",
+            display_name="Seed",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="seed",
+            source="agent",
+            tenant_id=server.tenant_id,
+        )
+        db.add(tool)
+        await db.flush()
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=tool.id,
+                enabled=True,
+                source="user_installed",
+                installed_by_agent_id=agent.id,
+            )
+        )
+        await db.commit()
+
+    from app.services.agent_mcp_lifecycle import refresh_mcp_server
+
+    with patch(
+        "app.services.agent_mcp_lifecycle.refresh_mcp_server_tools",
+        AsyncMock(side_effect=RuntimeError("primary refresh failure")),
+    ):
+        result = json.loads(
+            await refresh_mcp_server(
+                agent.id,
+                server.id,
+                user_id=user.id,
+                session_id="session-123",
+            )
+        )
+
+    assert result == {
+        "ok": False,
+        "error": "refresh_failed",
+        "mcp_server_id": str(server.id),
+        "detail": "RuntimeError: primary refresh failure",
+    }
