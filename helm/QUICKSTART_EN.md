@@ -1,4 +1,4 @@
-# Clawith Helm Deployment Quick Start Guide
+# Digital Employee Platform Helm Deployment Quick Start Guide
 
 ## 📋 Directory Structure
 
@@ -28,7 +28,7 @@ helm/
 - ❌ **Does NOT support OpenClaw Agent hosting mode**
 - If you need to use OpenClaw Agent hosting, please use Docker Compose or other deployment methods
 
-Native Agent is the built-in proxy mode of Clawith, suitable for Kubernetes environments. OpenClaw Agent hosting mode is currently only supported in Docker Compose environments.
+Native Agent is the platform's built-in proxy mode, suitable for Kubernetes environments. OpenClaw Agent hosting mode is currently only supported in Docker Compose environments.
 
 ## 🚀 Quick Start
 

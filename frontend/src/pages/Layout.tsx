@@ -243,10 +243,11 @@ function VersionDisplay() {
         fetch('/api/version').then(r => r.json()).then(setInfo).catch(() => {});
     }, []);
     if (!info.version) return null;
+    const displayCommit = info.commit?.trim().slice(0, 7);
     return (
         <div style={{ textAlign: 'center', fontSize: '10px', color: 'var(--text-quaternary)', marginTop: '8px', letterSpacing: '0.3px' }}>
             v{info.version}
-            {info.commit && <span style={{ opacity: 0.6 }}> ({info.commit})</span>}
+            {displayCommit && <span style={{ opacity: 0.6 }} title={info.commit}> ({displayCommit})</span>}
         </div>
     );
 }

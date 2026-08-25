@@ -138,6 +138,20 @@ async def deliver_reply_to_origin(
                     message_id = candidate.id
                     break
         if message_id is not None:
+            if not runtime.session_found:
+                if require_transport:
+                    return False
+                from app.services.im_delivery import register_delivery
+
+                await register_delivery(
+                    message_id,
+                    IMDeliveryResult.unsupported_delivery(
+                        runtime.source_channel or "web",
+                        "websocket",
+                        conversation_ref=str(conversation_id),
+                    ),
+                )
+                return True
             from app.services.im_delivery import deliver_persisted_message
 
             result = await deliver_persisted_message(
@@ -246,6 +260,7 @@ async def deliver_message_with_receipt(
     origin_actor_ref_type: str | None = None,
     allow_wecom_group_actor_fallback: bool = True,
     mention: MentionIntent | None = None,
+    dingtalk_lock_held: bool = False,
     on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     """Deliver through one exact Session route and preserve provider receipts."""
@@ -259,6 +274,13 @@ async def deliver_message_with_receipt(
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
+        if dingtalk_lock_held:
+            return await _deliver_dingtalk_unlocked(
+                agent_id,
+                runtime,
+                message,
+                mention=mention,
+            )
         return await _deliver_dingtalk(
             agent_id,
             runtime,
@@ -906,6 +928,7 @@ async def _send_dingtalk_group_markdown(
     open_conversation_id: str,
     message: str,
 ) -> dict:
+    from app.services.dingtalk_service import build_dingtalk_markdown_content
     from app.services.dingtalk_token import dingtalk_token_manager
 
     access_token = await dingtalk_token_manager.get_token(app_id, app_secret)
@@ -920,7 +943,10 @@ async def _send_dingtalk_group_markdown(
         "robotCode": app_id,
         "openConversationId": open_conversation_id,
         "msgKey": "sampleMarkdown",
-        "msgParam": json.dumps({"title": "Notification", "text": message}, ensure_ascii=False),
+        "msgParam": json.dumps(
+            build_dingtalk_markdown_content(message),
+            ensure_ascii=False,
+        ),
     }
     async with httpx.AsyncClient(timeout=30) as client:
         try:

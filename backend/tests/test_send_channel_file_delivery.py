@@ -14,6 +14,8 @@ from app.services.media_tool_contract import (
 )
 from app.services.storage_runtime.local import LocalStorageBackend
 from app.services.tool_seeder import BUILTIN_TOOLS
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
+from app.services.im_delivery import DeliveryReceiptPersistenceError
 
 
 @pytest.mark.asyncio
@@ -44,6 +46,104 @@ async def test_send_channel_file_web_fallback_returns_platform_delivery_json(tmp
         "mime_type": "application/pdf",
         "size": len(b"%PDF-1.4 test"),
     }
+
+
+@pytest.mark.asyncio
+async def test_channel_file_claims_pending_before_sender_and_finalizes_receipt(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    report = workspace / "workspace" / "report.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-1.4 test")
+    receipt_id = uuid.uuid4()
+    events = []
+
+    async def fake_claim(**kwargs):
+        events.append(("claim", kwargs["tool_call_id"]))
+        return receipt_id
+
+    async def fake_register(message_id, result):
+        events.append(("finalize", message_id, result.status))
+        return True
+
+    async def file_sender(_path, _message):
+        events.append(("send",))
+        return IMDeliveryResult.sent(
+            "slack",
+            IMDeliveryPart(
+                transport="slack_file",
+                provider_message_id="F1",
+                conversation_ref="D1",
+                recallable=False,
+            ),
+        )
+
+    monkeypatch.setattr(agent_tools, "_claim_channel_file_receipt", fake_claim)
+    monkeypatch.setattr(agent_tools, "register_delivery", fake_register)
+    token = agent_tools.channel_file_sender.set(file_sender)
+    try:
+        result = await agent_tools._send_channel_file(
+            agent_id,
+            workspace,
+            {"file_path": "workspace/report.pdf"},
+            tool_call_id="call-file-1",
+            origin_session_id=str(uuid.uuid4()),
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert "sent to user" in result
+    assert events == [
+        ("claim", "call-file-1"),
+        ("send",),
+        ("finalize", receipt_id, "sent"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feishu_receipt_failure_after_provider_success_does_not_send_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    from app.services.feishu_service import feishu_service
+
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"%PDF-1.4 test")
+    provider_calls = 0
+
+    async def upload_and_send(*_args, on_result, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        await on_result(
+            "channel_file",
+            {"code": 0, "data": {"message_id": "provider-file-id"}},
+        )
+
+    async def fail_receipt(_part):
+        raise RuntimeError("database unavailable")
+
+    fallback = AsyncMock()
+    monkeypatch.setattr(feishu_service, "upload_and_send_file", upload_and_send)
+    monkeypatch.setattr(feishu_service, "send_message", fallback)
+    recorder_token = agent_tools.channel_file_part_recorder.set(fail_receipt)
+    try:
+        with pytest.raises(DeliveryReceiptPersistenceError):
+            await agent_tools._send_file_via_feishu(
+                uuid.uuid4(),
+                SimpleNamespace(app_id="app", app_secret="secret"),
+                report,
+                SimpleNamespace(external_id="user-1", open_id=None),
+                "Recipient",
+                "caption",
+            )
+    finally:
+        agent_tools.channel_file_part_recorder.reset(recorder_token)
+
+    assert provider_calls == 1
+    fallback.assert_not_awaited()
 
 
 @pytest.mark.asyncio

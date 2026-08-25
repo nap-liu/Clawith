@@ -100,7 +100,7 @@ _STDERR_LIMIT = 5000
 
 # Allow the patched sandbox a bounded interval after the caller's existing
 # `timeout` deadline to kill/reap the foreground process group and serialize
-# the final response. The public Clawith contract remains one timeout value.
+# the final response. The public platform contract remains one timeout value.
 _SHELL_TIMEOUT_RESPONSE_GRACE_SECONDS = 10.0
 
 # CDP domains that escape per-conversation isolation in the SHARED container:

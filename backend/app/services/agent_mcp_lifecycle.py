@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections import defaultdict
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.database import async_session
 from app.models.agent import Agent
@@ -22,96 +21,68 @@ from app.services.mcp_refresh_service import (
 )
 
 
-def _normalized_configs(
-    items: list[tuple[AgentTool, Tool, MCPServer]],
-    agent_id: uuid.UUID,
-) -> list[dict]:
-    """Return distinct per-assignment configs without reading shared secrets."""
-    configs: list[dict] = []
-    seen: set[str] = set()
-    for assignment, _tool, _server in items:
-        if not (
-            assignment.source == "user_installed"
-            and assignment.installed_by_agent_id == agent_id
-        ):
-            continue
-        config = dict(assignment.config or {})
-        if not config:
-            continue
-        marker = json.dumps(config, ensure_ascii=False, sort_keys=True, default=str)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        configs.append(config)
-    return configs
-
-
 async def list_installed_mcp_servers(agent_id: uuid.UUID) -> str:
-    """List the current Agent's installed MCP servers with exact server IDs."""
+    """List concise server-level MCP inventory with exact lifecycle IDs."""
     async with async_session() as db:
         rows = (
             await db.execute(
-                select(AgentTool, Tool, MCPServer)
+                select(
+                    MCPServer.id.label("mcp_server_id"),
+                    MCPServer.display_name,
+                    MCPServer.transport,
+                    func.count(AgentTool.id).label("tool_count"),
+                    func.count(AgentTool.id)
+                    .filter(AgentTool.enabled.is_(True))
+                    .label("enabled_tool_count"),
+                    func.count(AgentTool.id)
+                    .filter(
+                        AgentTool.source == "user_installed",
+                        AgentTool.installed_by_agent_id == agent_id,
+                    )
+                    .label("removable_count"),
+                )
+                .select_from(AgentTool)
                 .join(Tool, Tool.id == AgentTool.tool_id)
-                .outerjoin(MCPServer, MCPServer.id == Tool.mcp_server_id)
-                .where(AgentTool.agent_id == agent_id, Tool.type == "mcp")
-                .order_by(MCPServer.name, Tool.name)
+                .join(MCPServer, MCPServer.id == Tool.mcp_server_id)
+                .where(
+                    AgentTool.agent_id == agent_id,
+                    Tool.type == "mcp",
+                )
+                .group_by(
+                    MCPServer.id,
+                    MCPServer.display_name,
+                    MCPServer.transport,
+                )
+                .order_by(MCPServer.display_name, MCPServer.id)
             )
         ).all()
 
-        grouped: dict[uuid.UUID, list[tuple[AgentTool, Tool, MCPServer]]] = defaultdict(list)
-        legacy_tools: list[dict] = []
-        for assignment, tool, server in rows:
-            if server is None:
-                legacy_tools.append(
-                    {
-                        "tool_id": str(tool.id),
-                        "tool_name": tool.name,
-                        "display_name": tool.display_name,
-                        "mcp_server_name": tool.mcp_server_name,
-                    }
-                )
-                continue
-            grouped[server.id].append((assignment, tool, server))
-
-        servers: list[dict] = []
-        for server_id, items in grouped.items():
-            server = items[0][2]
-            removable = any(
-                assignment.source == "user_installed"
-                and assignment.installed_by_agent_id == agent_id
-                for assignment, _tool, _server in items
-            )
-            item: dict = {
-                "mcp_server_id": str(server_id),
-                "name": server.name,
-                "display_name": server.display_name,
-                "transport": server.transport,
-                "tool_count": len(items),
-                "enabled_tool_count": sum(1 for assignment, _, _ in items if assignment.enabled),
-                "installed_by_current_agent": removable,
-                "removable": removable,
-                "tools": [
-                    {
-                        "tool_id": str(tool.id),
-                        "name": tool.name,
-                        "display_name": tool.display_name,
-                        "enabled": assignment.enabled,
-                    }
-                    for assignment, tool, _server in items
-                ],
+        servers = [
+            {
+                "mcp_server_id": str(row.mcp_server_id),
+                "display_name": row.display_name,
+                "transport": row.transport,
+                "tool_count": row.tool_count,
+                "enabled_tool_count": row.enabled_tool_count,
+                "removable": row.removable_count > 0,
             }
-            if removable:
-                configs = _normalized_configs(items, agent_id)
-                if len(configs) == 1:
-                    item["config"] = configs[0]
-                elif configs:
-                    item["configs"] = configs
-            servers.append(item)
+            for row in rows
+        ]
+
+        legacy_tool_count = await db.scalar(
+            select(func.count(AgentTool.id))
+            .select_from(AgentTool)
+            .join(Tool, Tool.id == AgentTool.tool_id)
+            .where(
+                AgentTool.agent_id == agent_id,
+                Tool.type == "mcp",
+                Tool.mcp_server_id.is_(None),
+            )
+        )
 
         result: dict = {"mcp_servers": servers}
-        if legacy_tools:
-            result["legacy_tools"] = legacy_tools
+        if legacy_tool_count:
+            result["legacy_tool_count"] = legacy_tool_count
             result["legacy_notice"] = (
                 "These historical MCP tools have no mcp_server_id. "
                 "Re-import the same MCP configuration to attach an exact server ID."
@@ -119,7 +90,13 @@ async def list_installed_mcp_servers(agent_id: uuid.UUID) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 
-async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
+async def refresh_mcp_server(
+    agent_id: uuid.UUID,
+    server_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID | None,
+    session_id: str,
+) -> str:
     """Refresh one MCP server installed exclusively by the current Agent."""
     async with async_session() as db:
         agent = (
@@ -146,38 +123,44 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
                 ensure_ascii=False,
             )
 
+        effective_server_id = server_id
         try:
             server = await ensure_agent_mcp_server_isolated(
                 db,
                 server,
                 agent_id,
             )
+            effective_server_id = server.id
             result = await refresh_mcp_server_tools(
                 db,
-                server.id,
+                effective_server_id,
                 agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
                 assign_to_agent=True,
             )
             await db.commit()
         except PermissionError as exc:
+            detail = str(exc)
             await db.rollback()
             return json.dumps(
                 {
                     "ok": False,
                     "error": "agent_refresh_not_isolated",
-                    "mcp_server_id": str(server.id),
-                    "detail": str(exc),
+                    "mcp_server_id": str(server_id),
+                    "detail": detail,
                 },
                 ensure_ascii=False,
             )
         except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"[:500]
             await db.rollback()
             return json.dumps(
                 {
                     "ok": False,
                     "error": "refresh_failed",
-                    "mcp_server_id": str(server.id),
-                    "detail": str(exc)[:500],
+                    "mcp_server_id": str(server_id),
+                    "detail": detail,
                 },
                 ensure_ascii=False,
             )
@@ -185,7 +168,7 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
         return json.dumps(
             {
                 "ok": True,
-                "mcp_server_id": str(server.id),
+                "mcp_server_id": str(effective_server_id),
                 **result.to_dict(),
                 "effective": "next_turn",
             },

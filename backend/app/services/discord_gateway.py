@@ -124,23 +124,44 @@ class DiscordGatewayManager:
             # Early-return for channel commands (/new, /reset):
             # archive the session and reply inline — no LLM, no lock needed.
             if is_channel_command(user_text):
-                from app.services.channel_commands import handle_channel_command
+                from app.services.channel_commands import prepare_channel_command_reply
                 async with async_session() as _cmd_db:
-                    cmd_result = await handle_channel_command(
+                    cmd_result = await prepare_channel_command_reply(
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id_om,
+                        external_user_id=sender_id_om,
                         source_channel="discord",
+                        provider_event_id=str(message.id),
                         is_group=message.guild is not None,
+                        external_user_info={"name": message.author.name},
                     )
                     await _cmd_db.commit()
+                if not cmd_result["should_deliver"]:
+                    return
                 try:
+                    from app.services.im_delivery import (
+                        IMDeliveryPart,
+                        PersistedDeliveryRecorder,
+                    )
+                    _cmd_recorder = PersistedDeliveryRecorder(
+                        cmd_result["message_id"],
+                        "discord",
+                    )
                     chunks = [
                         cmd_result["message"][i:i + DISCORD_MSG_LIMIT]
                         for i in range(0, len(cmd_result["message"]), DISCORD_MSG_LIMIT)
                     ]
                     for chunk in chunks:
-                        await message.reply(chunk, mention_author=False)
+                        sent_message = await message.reply(chunk, mention_author=False)
+                        await _cmd_recorder.append(IMDeliveryPart(
+                            transport="discord_gateway",
+                            provider_message_id=str(sent_message.id),
+                            conversation_ref=channel_id_om,
+                            artifact_role="command_reply",
+                        ))
+                    await _cmd_recorder.sent()
                 except Exception as _cmd_e:
+                    await _cmd_recorder.failed(_cmd_e)
                     logger.error(f"[Discord GW] Failed to send command reply: {_cmd_e}")
                 return
 
@@ -350,9 +371,12 @@ class DiscordGatewayManager:
 
                 # Call LLM
                 _thinking_chunks: list[str] = []
-                _thinking_sender = BufferedIMThinkingSender(
+                _thinking_sender = BufferedIMThinkingSender.for_runtime(
                     enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                    send_text=message.channel.send,
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    conversation_id=session_conv_id,
+                    turn_anchor_id=ingested.message.id,
                 )
 
                 async def _collect_thinking(text: str) -> None:

@@ -707,6 +707,7 @@ async def test_update_agent_trigger_disables():
         row = (await db.execute(select(AgentTrigger).where(
             AgentTrigger.agent_id == agent.id, AgentTrigger.name == "to_disable"))).scalar_one_or_none()
     assert row is not None and row.is_enabled is False
+    assert row.execution_user_id == user.id
 
 
 async def test_set_agent_tool_config_sets_config():

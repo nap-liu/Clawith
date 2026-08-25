@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.core.security import create_access_token, hash_password
 from app.models.user import User, Identity
 from app.models.identity import IdentityProvider
+from app.services.user_output import sanitize_user_visible_text
 
 settings = get_settings()
 
@@ -121,7 +122,7 @@ class FeishuService:
 
         code = data.get("code")
         msg = data.get("msg", "")
-        if code is not None and code != 0:
+        if resp.status_code >= 400 or (code is not None and code != 0):
             logger.warning(
                 f"[Feishu] {stage} business failure "
                 f"(message_id={message_id}, code={code}, msg={msg})"
@@ -558,21 +559,27 @@ class FeishuService:
                                   action_type: str, details: str, approval_id: str) -> dict:
         """Send an interactive approval card to the agent creator via Feishu."""
         import json
+        safe_agent_name = sanitize_user_visible_text(agent_name).strip() or "智能体"
+        safe_action_type = sanitize_user_visible_text(action_type).strip() or "操作"
+        safe_details = sanitize_user_visible_text(details)
         card_content = json.dumps({
             "type": "template",
             "data": {
                 "template_id": "",  # Use custom card
                 "template_variable": {
-                    "agent_name": agent_name,
-                    "action_type": action_type,
-                    "details": details,
+                    "agent_name": safe_agent_name,
+                    "action_type": safe_action_type,
+                    "details": safe_details,
                     "approval_id": approval_id,
                 }
             }
         })
         # Simplified — in production, use Feishu interactive card JSON
         text_content = json.dumps({
-            "text": f"🔴 [{agent_name}] 请求审批\n操作: {action_type}\n详情: {details}\n\n请在 Clawith 平台审批。"
+            "text": (
+                f"🔴 {safe_agent_name}: 请求审批\n"
+                f"操作: {safe_action_type}\n详情: {safe_details}\n\n请在平台审批。"
+            )
         })
         return await self.send_message(app_id, app_secret, creator_open_id, "text", text_content)
 
@@ -602,7 +609,8 @@ class FeishuService:
     async def upload_and_send_file(self, app_id: str, app_secret: str,
                                     receive_id: str, file_path,
                                     receive_id_type: str = "open_id",
-                                    accompany_msg: str = "") -> dict:
+                                    accompany_msg: str = "",
+                                    on_result=None) -> dict:
         """Upload a local file to Feishu and send it as a file message.
 
         Returns the send_message response dict.
@@ -615,7 +623,10 @@ class FeishuService:
             token_resp = await client.post(FEISHU_APP_TOKEN_URL, json={
                 "app_id": app_id, "app_secret": app_secret,
             })
-            app_token = token_resp.json().get("app_access_token", "")
+            token_data = self._parse_api_response(token_resp, stage="file_token")
+            app_token = token_data.get("app_access_token", "")
+            if not app_token:
+                raise RuntimeError("Feishu file token response missing app_access_token")
             headers = {"Authorization": f"Bearer {app_token}"}
 
             # Upload file
@@ -632,9 +643,7 @@ class FeishuService:
                 data={"file_type": feishu_file_type, "file_name": fp.name},
                 headers=headers,
             )
-            upload_data = upload_resp.json()
-            if upload_data.get("code") != 0:
-                raise RuntimeError(f"Feishu file upload failed: {upload_data.get('msg')}")
+            upload_data = self._parse_api_response(upload_resp, stage="file_upload")
             file_key = upload_data["data"]["file_key"]
 
             # Send text accompany message first if provided
@@ -645,12 +654,12 @@ class FeishuService:
                           "content": _json.dumps({"text": accompany_msg})},
                     headers=headers,
                 )
-                if text_resp.status_code != 200:
-                    logger.error(
-                        f"[Feishu] Failed to send text accompany message: "
-                        f"status={text_resp.status_code}, body={text_resp.text}, "
-                        f"receive_id={receive_id}, receive_id_type={receive_id_type}"
-                    )
+                text_data = self._parse_api_response(
+                    text_resp,
+                    stage="file_caption",
+                )
+                if on_result is not None:
+                    await on_result("file_caption", text_data)
 
             # Send file message
             resp = await client.post(
@@ -659,14 +668,10 @@ class FeishuService:
                       "content": _json.dumps({"file_key": file_key})},
                 headers=headers,
             )
-            if resp.status_code != 200:
-                logger.error(
-                    f"[Feishu] Failed to send file message: "
-                    f"status={resp.status_code}, body={resp.text}, "
-                    f"receive_id={receive_id}, receive_id_type={receive_id_type}, "
-                    f"file_key={file_key}"
-                )
-            return resp.json()
+            result = self._parse_api_response(resp, stage="file_message")
+            if on_result is not None:
+                await on_result("channel_file", result)
+            return result
 
     # --- Bitable (多维表格) API ---
 

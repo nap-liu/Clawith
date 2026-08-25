@@ -1,19 +1,25 @@
 """Schedule API — CRUD for agent cron jobs."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
+from app.core.permissions import (
+    check_agent_access,
+    is_agent_creator,
+    is_agent_expired,
+    is_platform_admin_user,
+)
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
 from app.services.scheduler import compute_next_run
+from app.services.user_output import sanitize_user_visible_text
 
 router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
 
@@ -108,7 +114,8 @@ async def create_schedule(
     # Validate cron expression
     next_run = compute_next_run(data.cron_expr)
     if not next_run:
-        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {data.cron_expr}")
+        safe_cron_expr = sanitize_user_visible_text(data.cron_expr)
+        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {safe_cron_expr}")
 
     sched = AgentSchedule(
         agent_id=agent_id,
@@ -134,7 +141,7 @@ async def update_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a schedule."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, access = await check_agent_access(db, current_user, agent_id)
 
     result = await db.execute(
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
@@ -150,6 +157,14 @@ async def update_schedule(
     }
     if non_identity_fields and not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can manage schedules")
+    identity_admin = access == "manage" and (
+        current_user.role == "org_admin" or is_platform_admin_user(current_user)
+    )
+    if updates and not non_identity_fields and not (
+        is_agent_creator(current_user, agent) or identity_admin
+    ):
+        raise HTTPException(status_code=403, detail="Manage access is required")
+    identity_reassigned = False
     if "execution_user_id" in updates:
         if updates["execution_user_id"] is None:
             raise HTTPException(status_code=422, detail="execution_user_id cannot be null")
@@ -179,10 +194,21 @@ async def update_schedule(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ExecutionIdentityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        identity_reassigned = True
         updates.pop("execution_user_id")
         updates.pop("expected_execution_user_id", None)
     elif "expected_execution_user_id" in updates:
         raise HTTPException(status_code=422, detail="expected_execution_user_id requires execution_user_id")
+    if data.model_fields_set and not identity_reassigned:
+        from app.services.execution_identity import align_background_execution_user
+
+        await align_background_execution_user(
+            db,
+            agent_id=agent_id,
+            resource_type="schedule",
+            resource_id=sched.id,
+            execution_user_id=current_user.id,
+        )
     for field, value in updates.items():
         setattr(sched, field, value)
 
@@ -239,22 +265,15 @@ async def trigger_schedule(
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    # Fire in background
-    import asyncio
-    from app.services.scheduler import _execute_schedule
-    asyncio.create_task(
-        _execute_schedule(
-            sched.id,
-            sched.agent_id,
-            sched.instruction,
-            sched.execution_user_id,
-        )
-    )
+    from app.services.background_manual_run import run_background_resource
 
-    # Update tracking
-    sched.last_run_at = datetime.now(timezone.utc)
-    sched.run_count = (sched.run_count or 0) + 1
-    await db.flush()
+    await run_background_resource(
+        db,
+        actor_user_id=current_user.id,
+        agent_id=agent_id,
+        resource_type="schedule",
+        resource=str(sched.id),
+    )
 
     return {"status": "triggered", "schedule_id": str(schedule_id)}
 

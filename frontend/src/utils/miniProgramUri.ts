@@ -14,7 +14,7 @@ const PATH_SEGMENT = /^(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+$/;
 const QUERY = /^(?:[A-Za-z0-9._~!$&'()*+,;=:@/?-]|%[0-9A-Fa-f]{2})*$/;
 
 /**
- * Parse the Clawith mini-program environment URI profile.
+ * Parse the platform mini-program environment URI profile.
  *
  * The profile follows RFC 3986's hierarchical URI shape:
  * `miniprogram://<action>/<path>[?query]`. It deliberately validates the raw
