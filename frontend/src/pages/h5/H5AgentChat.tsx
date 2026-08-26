@@ -62,7 +62,9 @@ import {
     buildPreviewImagesFromAttachments,
     downloadChatAttachment,
     extractChatImageDataMarkers,
+    getChatQuotedMessageTypeLabel,
     normalizeChatAttachmentFields,
+    partitionChatQuotedContent,
     resolveEffectiveChatModelId,
     splitAttachmentFileNames,
     stripChatImageDataMarkers,
@@ -2443,23 +2445,31 @@ export default function H5AgentChat() {
         const msg = entry.msg;
         const rawDisplayContent = msg.fileName ? stripAttachmentDisplayPrefix(msg.content) : msg.content;
         const displayContent = stripChatImageDataMarkers(rawDisplayContent);
+        const quotedMessage = msg.quoted_message;
         const filePreviewImages = msg.previewImages || (msg.imageUrl ? [buildPreviewImage(msg.imageUrl, msg.fileName)] : []);
         const inlinePreviewImages = filePreviewImages.length > 0 ? [] : extractChatImageDataMarkers(rawDisplayContent);
-        const previewImages = filePreviewImages.length > 0 ? filePreviewImages : inlinePreviewImages;
+        const allPreviewImages = filePreviewImages.length > 0 ? filePreviewImages : inlinePreviewImages;
+        const hasCanonicalAttachments = Array.isArray(msg.attachments);
+        const allAttachments: ChatMessageAttachment[] = hasCanonicalAttachments ? msg.attachments || [] : [];
+        const {
+            attachments,
+            quotedAttachments,
+            previewImages,
+            quotedPreviewImages,
+        } = partitionChatQuotedContent(quotedMessage, allAttachments, allPreviewImages);
         const previewedImageNames = new Set(previewImages.map((image) => image.filename).filter(Boolean));
-        const mediaAttachments: ChatMessageAttachment[] = msg.role === 'user' && Array.isArray(msg.attachments)
-            ? msg.attachments.filter((attachment: ChatMessageAttachment) => (
-                attachment.kind === 'audio' || attachment.kind === 'video'
-            ))
+        const mediaAttachments = msg.role === 'user'
+            ? attachments.filter((attachment) => attachment.kind === 'audio' || attachment.kind === 'video')
             : [];
+        const quotedMediaAttachments = quotedAttachments.filter((attachment) => attachment.kind === 'audio' || attachment.kind === 'video');
         const fileChips: Array<{
             name: string;
             path?: string;
             kind?: ChatMessageAttachment['kind'];
             mimeType?: string;
-        }> = Array.isArray(msg.attachments)
-            ? msg.attachments
-                .filter((attachment: ChatMessageAttachment) => !['image', 'audio', 'video'].includes(attachment.kind))
+        }> = hasCanonicalAttachments
+            ? attachments
+                .filter((attachment) => !['image', 'audio', 'video'].includes(attachment.kind))
                 .map((attachment: ChatMessageAttachment) => ({
                     name: attachment.display_name,
                     path: attachment.path,
@@ -2469,6 +2479,14 @@ export default function H5AgentChat() {
             : splitAttachmentFileNames(msg.fileName)
                 .filter((name) => !previewedImageNames.has(name))
                 .map((name) => ({ name }));
+        const quotedFileChips = quotedAttachments
+            .filter((attachment) => !['image', 'audio', 'video'].includes(attachment.kind))
+            .map((attachment) => ({
+                name: attachment.display_name,
+                path: attachment.path,
+                kind: attachment.kind,
+                mimeType: attachment.mime_type,
+            }));
         if (entry.type === 'special_render') {
             return (
                 <article className={`h5-chat__message h5-chat__message--assistant h5-chat__message--special-render h5-chat__message--${entry.renderType}`}>
@@ -2496,6 +2514,36 @@ export default function H5AgentChat() {
         return (
             <article className={`h5-chat__message h5-chat__message--${msg.role}`}>
                 <div className="h5-chat__bubble">
+                    {quotedMessage ? (
+                        <div className="conversation-quoted-message">
+                            <div className="conversation-quoted-message__header">
+                                <span>↪ {quotedMessage.sender_name || '引用消息'}</span>
+                                <span>{getChatQuotedMessageTypeLabel(quotedMessage.message_type)}</span>
+                            </div>
+                            {quotedPreviewImages.length > 0 ? (
+                                <div className="h5-chat__image-grid">
+                                    {quotedPreviewImages.map((image, index) => (
+                                        <button key={`${image.src}-${index}`} type="button" className="h5-chat__bubble-image-button" onClick={() => setImagePreview({ images: quotedPreviewImages, index })} aria-label="预览引用图片">
+                                            <img className="h5-chat__bubble-image" src={image.src} alt={image.alt || image.filename || '图片'} loading="lazy" draggable={false} onError={() => markAttachmentUnavailable(image.path || image.src)} />
+                                        </button>
+                                    ))}
+                                </div>
+                            ) : null}
+                            {quotedMediaAttachments.length > 0 ? (
+                                <div className="h5-chat__media-list">
+                                    {quotedMediaAttachments.map((attachment, index) => <ChatMediaCard key={`${attachment.path}-${index}`} agentId={agentId || ''} messageId={String(msg.id || '')} attachment={attachment} mode="h5" onUnavailable={() => markAttachmentUnavailable(attachment.path)} />)}
+                                </div>
+                            ) : null}
+                            {quotedFileChips.length > 0 ? (
+                                <div className="h5-chat__file-chip-list">
+                                    {quotedFileChips.map((file, index) => <button key={`${file.path}-${index}`} type="button" className="h5-chat__file-chip" disabled={unavailableAttachmentKeys.has(file.path)} onClick={() => void handleAttachmentDownload(file.path, file.name)}><ChatAttachmentIcon name={file.name} kind={file.kind} mimeType={file.mimeType} /><span>{file.name}</span></button>)}
+                                </div>
+                            ) : null}
+                            {quotedMessage.text ? <MarkdownRenderer className="h5-chat__markdown" content={quotedMessage.text} imagePreviewMode="mobile" allowImageDownload={false} protectImages onLinkClick={handleMarkdownLinkClick} /> : null}
+                            {!quotedMessage.text && quotedMessage.attachments.length === 0 ? <div className="conversation-quoted-message__unavailable">{quotedMessage.content_status === 'failed' ? '引用内容获取失败' : '引用内容不可用'}</div> : null}
+                            {quotedMessage.content_status === 'partial' ? <div className="conversation-quoted-message__unavailable">部分引用内容未能获取</div> : null}
+                        </div>
+                    ) : null}
                     {previewImages.length > 0 ? (
                         <div className="h5-chat__image-grid">
                             {previewImages.map((image, index) => (

@@ -2,7 +2,7 @@
 
 Provides Config CRUD and message handling for DingTalk bots using Stream mode.
 
-Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
+Known limitation — outbound quoted reply (Phase 2 #3, 2026-05-08):
     DingTalk's robot APIs do NOT expose a "reply to a specific message" /
     "quote message" capability. We confirmed this directly from the
     official docs:
@@ -28,7 +28,11 @@ Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
         link back to the source message in the DingTalk UI, which is
         actively misleading.
 
-    Feishu's quoted reply ships in feishu_service.send_message via the
+    This limitation applies only to outbound provider-native quoting. Inbound
+    user replies can carry ``text.repliedMsg`` and are normalized by the Stream
+    adapter so the quoted content remains available to the shared turn loop.
+
+    Feishu's outbound quoted reply ships in feishu_service.send_message via the
     POST /open-apis/im/v1/messages/{message_id}/reply endpoint — see that
     function's docstring. Until DingTalk OpenAPI gains an equivalent,
     DingTalk replies stay plain.
@@ -383,6 +387,7 @@ async def process_dingtalk_message(
     sender_id: str = "",
     conversation_title: str = "",
     channel_reactions=None,
+    quoted_message: dict | None = None,
 ):
     """Process an incoming DingTalk bot message and reply via session webhook.
 
@@ -832,6 +837,25 @@ async def process_dingtalk_message(
             ingest_incoming_chat_message,
             load_history_prefix_before_anchor,
         )
+        from app.services.quoted_message import normalize_quoted_message
+
+        normalized_quote = normalize_quoted_message(quoted_message)
+        own_attachments = [
+            attachment_from_workspace_path(path)
+            for path in (saved_file_paths or [])
+        ]
+        quoted_attachments = (
+            list(normalized_quote.get("attachments") or [])
+            if normalized_quote is not None
+            else []
+        )
+        inbound_meta = {
+            "sender_display_name": platform_user.display_name,
+            "sender_nickname": sender_nick or None,
+            "attachments": [*own_attachments, *quoted_attachments],
+        }
+        if normalized_quote is not None:
+            inbound_meta["quoted_message"] = normalized_quote
 
         ingested = await ingest_incoming_chat_message(
             db,
@@ -843,28 +867,32 @@ async def process_dingtalk_message(
             provider_event_id=message_id or None,
             channel_config_id=_early_cfg.id if _early_cfg else None,
             actor_ref=sender_staff_id,
-            message_meta={
-                "sender_display_name": platform_user.display_name,
-                "sender_nickname": sender_nick or None,
-                "attachments": [
-                    attachment_from_workspace_path(path)
-                    for path in (saved_file_paths or [])
-                ],
-            },
+            message_meta=inbound_meta,
         )
-        if await finish_blocked_confirmation_ingest(db, ingested):
-            if saved_file_paths:
+
+        async def _delete_unconsumed_uploads() -> None:
+            stored_paths = {
+                item["path"]
+                for item in [*own_attachments, *quoted_attachments]
+                if item.get("path")
+            }
+            if stored_paths:
                 from app.services.storage import (
                     agent_storage_key,
                     get_storage_backend,
                 )
 
                 storage = get_storage_backend()
-                for workspace_path in saved_file_paths:
+                for workspace_path in stored_paths:
                     await storage.delete(
                         agent_storage_key(agent_id, workspace_path)
                     )
+
+        if await finish_blocked_confirmation_ingest(db, ingested):
+            await _delete_unconsumed_uploads()
             return
+        if not ingested.created:
+            await _delete_unconsumed_uploads()
         turn_anchor_id = ingested.message.id
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
@@ -1048,16 +1076,17 @@ async def process_dingtalk_message(
             _cas_token = _cas.set(_dingtalk_audio_sender)
             _cvs_token = _cvs.set(_dingtalk_video_sender)
 
+        from app.services.quoted_message import render_quoted_message_for_llm
         from app.services.sender_attribution import wrap_with_sender
 
         # Group chats get a platform-injected <sender> prefix (spec §4.0/§4.1).
         # DingTalk P2P had no prefix before this iteration and we keep it that
         # way — agent_context's "## Current Conversation" handles the single-
         # speaker session-level identity.
-        llm_user_text = user_text
+        llm_user_text = render_quoted_message_for_llm(user_text, normalized_quote)
         if conversation_type == "2":
             llm_user_text = wrap_with_sender(
-                user_text,
+                llm_user_text,
                 platform_user_id,
                 platform_user.display_name or sender_nick,
             )
@@ -1121,7 +1150,7 @@ async def process_dingtalk_message(
             if _cvs_token is not None:
                 _cvs.reset(_cvs_token)
 
-        has_media = bool(saved_file_paths)
+        has_media = bool(own_attachments or quoted_attachments)
         logger.info(
             f"[DingTalk] LLM reply ({('media' if has_media else 'text')} input): "
             f"{reply_text[:100]}"
