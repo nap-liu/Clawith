@@ -362,15 +362,194 @@ async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatc
 
     scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=2))
     await first_ready.wait()
-    record = (await list_active_turns(owner_user_id=owner_id))[0]
+    records = await list_active_turns(owner_user_id=owner_id)
+    record = next(item for item in records if item.session_id == str(anchors[0].id))
     await cancel_active_turn(record.turn_id, owner_user_id=owner_id)
 
     stats = await scanner
-    assert resumed_ids == [anchors[0].id, anchors[1].id]
+    assert set(resumed_ids) == {anchors[0].id, anchors[1].id}
     assert stats.scanned == 2
     assert stats.skipped == 1
     assert stats.resumed == 1
     await reset_active_turns_for_testing()
+
+
+async def test_startup_recovery_runs_anchors_with_bounded_parallelism(monkeypatch):
+    """Independent recovery turns overlap while respecting the configured cap."""
+    from types import SimpleNamespace
+
+    from app.services import turn_recovery
+
+    anchors = [
+        SimpleNamespace(id=uuid.uuid4())
+        for _ in range(4)
+    ]
+    first_wave_ready = asyncio.Event()
+    release = asyncio.Event()
+    in_flight = 0
+    peak_in_flight = 0
+
+    async def fake_load(_db, *, limit):
+        assert limit == len(anchors)
+        return anchors
+
+    async def fake_resume(_anchor):
+        nonlocal in_flight, peak_in_flight
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        if in_flight == 2:
+            first_wave_ready.set()
+        try:
+            await release.wait()
+            return True
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery, "RECOVERY_CONCURRENCY", 2)
+    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+
+    scanner = asyncio.create_task(
+        turn_recovery.startup_turn_resume_once(limit=len(anchors))
+    )
+    await asyncio.wait_for(first_wave_ready.wait(), timeout=1)
+    assert peak_in_flight == 2
+    release.set()
+
+    stats = await asyncio.wait_for(scanner, timeout=1)
+    assert stats.scanned == 4
+    assert stats.resumed == 4
+    assert stats.skipped == 0
+    assert stats.failed == 0
+    assert peak_in_flight == 2
+
+
+async def test_startup_recovery_failure_does_not_cancel_siblings(monkeypatch):
+    """One recovery exception is isolated and the rest of the batch completes."""
+    from types import SimpleNamespace
+
+    from app.services import turn_recovery
+
+    anchors = [SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())]
+    successful_anchor = asyncio.Event()
+
+    async def fake_load(_db, *, limit):
+        assert limit == 2
+        return anchors
+
+    async def fake_resume(anchor):
+        if anchor is anchors[0]:
+            raise RuntimeError("isolated recovery failure")
+        successful_anchor.set()
+        return True
+
+    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+
+    stats = await turn_recovery.startup_turn_resume_once(limit=2)
+    assert successful_anchor.is_set()
+    assert stats.resumed == 1
+    assert stats.failed == 1
+    assert stats.skipped == 0
+
+
+async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkeypatch):
+    """Application shutdown collects recovery children and releases batch ownership."""
+    import os
+    from types import SimpleNamespace
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.services import turn_recovery
+
+    anchor = SimpleNamespace(id=uuid.uuid4())
+    recovery_started = asyncio.Event()
+
+    async def fake_load(_db, *, limit):
+        assert limit == 1
+        return [anchor]
+
+    async def fake_resume(_anchor):
+        recovery_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+
+    scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=1))
+    await asyncio.wait_for(recovery_started.wait(), timeout=1)
+    scanner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await scanner
+
+    probe_engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
+    try:
+        async with probe_engine.connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": turn_recovery.RECOVERY_ADVISORY_LOCK_KEY},
+            )
+            if acquired:
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": turn_recovery.RECOVERY_ADVISORY_LOCK_KEY},
+                )
+    finally:
+        await probe_engine.dispose()
+    assert acquired is True
+
+
+async def test_concurrent_startup_scanners_resume_one_durable_turn_once(monkeypatch):
+    """The global batch lock and durable assistant boundary prevent duplicate recovery."""
+    from app.services import turn_recovery
+
+    agent_id, user_id = await _make_agent_with_model()
+    conversation_id = f"dual_scanner_{uuid.uuid4().hex}"
+    anchor_id = await _make_user_anchor(
+        agent_id,
+        user_id,
+        conv=conversation_id,
+        content="recover exactly once",
+    )
+    deliveries: list[uuid.UUID] = []
+
+    async def fake_llm(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        return "one recovered reply"
+
+    async def fake_deliver(*, message_id, **_kwargs):
+        deliveries.append(uuid.UUID(str(message_id)))
+        return True
+
+    monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_llm)
+    monkeypatch.setattr(
+        turn_recovery,
+        "deliver_recovered_reply_to_origin",
+        fake_deliver,
+    )
+
+    first, second = await asyncio.gather(
+        turn_recovery.startup_turn_resume_once(limit=10),
+        turn_recovery.startup_turn_resume_once(limit=10),
+    )
+
+    assert sorted((first.scanned, second.scanned)) == [0, 1]
+    assert first.resumed + second.resumed == 1
+    assert len(deliveries) == 1
+    async with async_session() as db:
+        assistant_rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conversation_id,
+                    ChatMessage.role == "assistant",
+                )
+            )
+        ).scalars().all()
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0].message_meta["turn_anchor_id"] == str(anchor_id)
 
 
 async def test_stop_command_cancels_recovery_without_local_running_task(monkeypatch):
