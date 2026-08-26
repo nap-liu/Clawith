@@ -55,10 +55,15 @@ async def _execute_task_impl(
 
     # Step 1: Mark as doing
     async with async_session() as db:
-        result = await db.execute(select(Task).where(Task.id == task_id))
+        result = await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
         task = result.scalar_one_or_none()
         if not task:
             logger.warning(f"[TaskExec] Task {task_id} not found")
+            return
+        if task.status == "doing":
+            logger.info(f"[TaskExec] Task {task_id} is already running; duplicate skipped")
             return
 
         task_execution_user_id = (

@@ -139,11 +139,10 @@ async def build_placeholder_context_for_call(
 ):
     """Build a PlaceholderContext for runtime MCP tool invocation.
 
-    Sentinel handling: when ``user_id == agent_id`` (the convention used by
-    trigger_daemon-driven LLM calls to mean "no human user"), fall back to
-    ``Agent.creator_id`` for ``${user.*}`` resolution. This matches the
-    brainstorm decision: cron/interval/poll-triggered MCP calls should
-    identify themselves as the agent's owner, not the agent itself.
+    Sentinel handling: only the legacy ``user_id == agent_id`` convention falls
+    back to ``Agent.creator_id`` for ``${user.*}`` resolution. A genuine
+    ``None`` remains anonymous. Durable background entrypoints resolve their
+    designed creator fallback before entering the shared MCP tool boundary.
     """
     from app.models.agent import Agent
     from app.models.user import User
@@ -162,7 +161,7 @@ async def build_placeholder_context_for_call(
 
     # Sentinel detection: trigger-daemon path passes user_id=agent_id
     effective_user_id = user_id
-    if effective_user_id is None or effective_user_id == agent_id:
+    if effective_user_id == agent_id:
         effective_user_id = agent.creator_id
 
     # Load user (with identity) for ${user.*}

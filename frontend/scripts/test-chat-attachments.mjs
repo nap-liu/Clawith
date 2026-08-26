@@ -33,12 +33,44 @@ const {
     collectMarkdownImages,
     extractChatImageDataMarkers,
     getChatAttachmentIconKind,
+    getChatQuotedMessageTypeLabel,
     isPreviewableImageName,
     normalizeChatAttachmentFields,
+    normalizeChatQuotedMessage,
+    partitionChatQuotedContent,
     resolveEffectiveChatModelId,
     splitAttachmentFileNames,
     stripChatImageDataMarkers,
 } = module.exports;
+
+{
+    const quotedMessage = normalizeChatQuotedMessage({
+        message_type: 'RICH_TEXT',
+        content_status: 'partial',
+        text: '引用正文',
+        attachments: [
+            { display_name: '引用图片.png', path: 'workspace/uploads/quote.png', kind: 'image' },
+        ],
+    });
+    const partitioned = partitionChatQuotedContent(
+        quotedMessage,
+        [
+            ...quotedMessage.attachments,
+            { display_name: '当前文件.pdf', path: 'workspace/uploads/current.pdf', kind: 'file' },
+        ],
+        [
+            { src: '/quote', path: 'workspace/uploads/quote.png' },
+            { src: '/current', path: 'workspace/uploads/current.png' },
+        ],
+    );
+
+    assert.equal(quotedMessage.message_type, 'rich_text');
+    assert.equal(getChatQuotedMessageTypeLabel(quotedMessage.message_type), '富文本');
+    assert.equal(partitioned.quotedAttachments.length, 1);
+    assert.equal(partitioned.attachments[0].display_name, '当前文件.pdf');
+    assert.equal(partitioned.quotedPreviewImages[0].src, '/quote');
+    assert.equal(partitioned.previewImages[0].src, '/current');
+}
 
 {
     const cases = [

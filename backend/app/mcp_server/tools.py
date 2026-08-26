@@ -1,4 +1,4 @@
-"""Clawith MCP Server — the five public tool implementations.
+"""Platform MCP server public tool implementations.
 
 Every tool opens its own short-lived ``async with async_session() as db:`` so
 the MCP request-scoped session is never shared across concurrent requests.  All

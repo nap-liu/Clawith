@@ -293,7 +293,6 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         user_text="please enrich my identity",
         conversation_id=f"conversation-{suffix}",
         conversation_type="1",
-        session_webhook="https://example.invalid/dingtalk-webhook",
         sender_nick="DingTalk Nickname",
         message_id=f"message-{suffix}",
     )
@@ -303,7 +302,6 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         user_text="refresh my bound identity",
         conversation_id=f"conversation-{suffix}",
         conversation_type="1",
-        session_webhook="https://example.invalid/dingtalk-webhook",
         sender_nick="Updated DingTalk Nickname",
         message_id=f"message-bound-{suffix}",
     )

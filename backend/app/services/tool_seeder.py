@@ -114,6 +114,34 @@ def _global_builtin_config(tool_data: dict) -> dict:
 BUILTIN_TOOLS = [
     REQUEST_CONFIRMATION_TOOL_SEED,
     {
+        "name": "run_background_resource",
+        "display_name": "Run Background Resource",
+        "description": (
+            "Manually queue one task, trigger, or schedule for immediate testing. "
+            "The run uses the current conversation user's permissions."
+        ),
+        "category": "general",
+        "icon": "▶️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "resource_type": {
+                    "type": "string",
+                    "enum": ["trigger", "task", "schedule"],
+                },
+                "resource": {
+                    "type": "string",
+                    "description": "Exact UUID, or an exact unique title/name.",
+                },
+            },
+            "required": ["resource_type", "resource"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
         "name": "run_subagent",
         "display_name": "Run Subagent",
         "description": (
@@ -228,10 +256,10 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "set_execution_user",
-        "display_name": "调整后台任务执行人",
+        "display_name": "Set Background Execution User",
         "description": (
-            "调整指定后台任务的执行人。用于在需要时将后续执行交由另一位有权限的用户；"
-            "已经开始的执行不受影响。"
+            "Set the user permissions used by future runs of a background resource. "
+            "Runs that are already active or queued are not affected."
         ),
         "category": "general",
         "icon": "🔐",
@@ -249,11 +277,16 @@ BUILTIN_TOOLS = [
                 },
                 "execution_user_id": {
                     "type": "string",
-                    "description": "Exact canonical user_id to use for future execution.",
+                    "description": (
+                        "Canonical user_id for future runs; the target user must be able "
+                        "to access the current Agent."
+                    ),
                 },
                 "expected_execution_user_id": {
                     "type": ["string", "null"],
-                    "description": "调整前读取到的当前执行人 ID；当前未设置时传 null。",
+                    "description": (
+                        "Execution user ID read before this change; pass null when it is unset."
+                    ),
                 },
                 "reason": {
                     "type": "string",
@@ -964,7 +997,7 @@ BUILTIN_TOOLS = [
                 "webhook_mode": {
                     "type": "string",
                     "enum": ["legacy", "queue", "merge"],
-                    "description": "Webhook processing mode (type=webhook only). Pick by scenario: legacy (default) = keep only the newest payload (overwrite earlier ones) — for low-frequency events where only the latest matters (e.g. a status ping). queue = handle each trigger one-by-one in FIFO order, serial, zero loss — for when EVERY event must be processed individually and in order (e.g. each reader's feedback, each ticket, each order). merge = accumulate all pending triggers and process them together in one session — for when you want to review/summarize multiple events at once (e.g. batch several alerts into one analysis).",
+                    "description": "Webhook processing mode (type=webhook only). Every authenticated submission accepted by the endpoint is stored byte-for-byte in this agent's webhook/ inbox; the wake context provides its event ID, millisecond timestamp, file path, size, and SHA-256, and you should read the referenced file before processing it. legacy (default) wakes from only the newest event while older inbox files remain discoverable. queue wakes once per event in FIFO order. merge wakes once for the batch captured when execution starts. Choose the mode when creating the trigger; if changing it later, briefly pause upstream submissions and do not switch during an active webhook run.",
                 },
             },
             "required": ["name", "type", "config", "reason"],
@@ -983,12 +1016,12 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Name of the trigger to update"},
-                "config": {"type": "object", "description": "New config (replaces existing config)"},
+                "config": {"type": "object", "description": "New config. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged."},
                 "reason": {"type": "string", "description": "New reason text"},
                 "webhook_mode": {
                     "type": "string",
                     "enum": ["legacy", "queue", "merge"],
-                    "description": "For type=webhook only: switch the processing mode of an EXISTING webhook trigger (legacy/queue/merge — see set_trigger.webhook_mode for what each means). Preserves the existing webhook URL/token and any already-queued payloads.",
+                    "description": "For an existing webhook trigger only. Briefly pause upstream submissions and switch only when no webhook run is active and no event is pending or queued. The change is immediate and affects subsequent scheduling; it does not convert or drain in-flight work. The existing URL token, secret, and stored webhook inbox files remain unchanged. legacy uses the newest event, queue processes FIFO, and merge processes the batch captured when execution starts.",
                 },
             },
             "required": ["name"],
@@ -1030,7 +1063,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_channel_file",
         "display_name": "Send File",
-        "description": "Send a workspace file to a person or back to the current conversation. Omit user_id only when replying to the current IM/web conversation; that preserves the exact current-session route. Explicit delivery to another person currently supports Feishu and Slack only; provide canonical user_id and choose one of those routes.",
+        "description": "Send a workspace file through an existing conversation or to a person. Omit all targets only for the current conversation. Use exact session_id for another existing person/group Session, or canonical user_id (and channel when needed) for direct person delivery. Never provide both session_id and user_id.",
         "category": "communication",
         "icon": "📎",
         "is_default": True,
@@ -1038,7 +1071,8 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Workspace-relative path to the file, e.g. workspace/report.md"},
-                "user_id": {"type": "string", "description": "Canonical platform user_id. Omit only to reply to the current conversation."},
+                "user_id": {"type": "string", "description": "Canonical platform user_id for direct person delivery. Mutually exclusive with session_id."},
+                "session_id": {"type": "string", "description": "Exact existing Session UUID for person or group delivery. Mutually exclusive with user_id."},
                 "channel": {"type": "string", "enum": ["feishu", "slack"], "description": "Executable explicit file route chosen by the Agent."},
                 "message": {"type": "string", "description": "Optional message to accompany the file"},
             },
@@ -1054,7 +1088,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_platform_message",
         "display_name": "Platform Message",
-        "description": "Send a proactive message to a user on the Clawith first-party platform (web or app). The message appears in their platform chat history and is pushed in real-time if they are online.",
+        "description": "Send a proactive message to a first-party platform user (web or app). The message appears in their platform chat history and is pushed in real-time if they are online.",
         "category": "communication",
         "icon": "🌐",
         "is_default": True,
@@ -1118,7 +1152,7 @@ BUILTIN_TOOLS = [
         "name": "send_session_message",
         "display_name": "Session Message",
         "description": (
-            "Send text only to one human conversation that already exists in Clawith. "
+            "Send text only to one human conversation that already exists on the platform. "
             "Provide the exact session_id returned by list_sessions/search_sessions; the existing "
             "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
             "discovers a person, selects or changes a channel, sends files, or contacts another "
@@ -1166,7 +1200,27 @@ BUILTIN_TOOLS = [
             "additionalProperties": False,
         },
         "config": {},
-        "config_schema": {},
+        # The canonical Session-message capability owns the DingTalk mention-card
+        # card template. The compatibility group-only wrapper reads this same
+        # config through the shared delivery runtime, so administrators configure
+        # one value only. As with request_confirmation, standard tool-config
+        # resolution provides agent override -> tenant default -> tool default.
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "card_template_id",
+                    "label": "agent.tools.sessionMessage.cardTemplateId",
+                    "type": "string",
+                    "placeholder": "agent.tools.sessionMessage.cardTemplateIdPlaceholder",
+                    "help_text": "agent.tools.sessionMessage.cardTemplateIdHelp",
+                    "description": (
+                        "用于钉钉群原生 @ 投递的互动卡片模板 ID。模板必须包含唯一的 "
+                        "content 动态 Markdown 字段。可配置企业默认值并按数字员工覆盖；"
+                        "不配置时，带 @ 的钉钉群消息明确失败且不会降级为普通消息。"
+                    ),
+                },
+            ]
+        },
     },
     {
         "name": "send_group_session_message",
@@ -2075,7 +2129,7 @@ BUILTIN_TOOLS = [
                 "file_path": {"type": "string", "description": "Workspace-relative path to image file"},
                 "url": {"type": "string", "description": "Public URL of image to upload"},
                 "file_name": {"type": "string", "description": "Custom filename (optional)"},
-                "folder": {"type": "string", "description": "CDN folder path (default /clawith)"},
+                "folder": {"type": "string", "description": "Optional CDN folder path"},
             },
         },
         "config": {"private_key": "", "url_endpoint": ""},
@@ -2317,7 +2371,7 @@ BUILTIN_TOOLS = [
                     "label": "Extra Headers JSON",
                     "type": "textarea",
                     "default": "",
-                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Clawith\"\n}",
+                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Platform App\"\n}",
                     "advanced": True,
                 },
                 {
@@ -2501,9 +2555,10 @@ BUILTIN_TOOLS = [
         "name": "list_installed_mcp_servers",
         "display_name": "List Installed MCP Servers",
         "description": (
-            "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. "
-            "No arguments are needed. For MCP bindings installed by you, the platform also returns the installation "
-            "config saved on your own binding. Shared server credentials are never inferred or copied into the result."
+            "List a concise summary of every MCP server currently assigned to you. Each item includes the exact "
+            "mcp_server_id required by refresh_mcp_server and uninstall_mcp_server, display name, transport, tool "
+            "counts, and uninstallability. Tool definitions and installation credentials are intentionally omitted "
+            "because your available MCP tools are already provided separately."
         ),
         "category": "discovery",
         "icon": "📋",
@@ -2930,12 +2985,12 @@ BUILTIN_TOOLS = [
                 "user_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith User UUID. Omit for company or agent objectives.",
+                    "description": "Canonical platform User UUID. Omit for company or agent objectives.",
                 },
                 "agent_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith Agent UUID. Omit for company or user objectives.",
+                    "description": "Canonical platform Agent UUID. Omit for company or user objectives.",
                 },
                 "period_start": {
                     "type": "string",
@@ -3136,12 +3191,12 @@ BUILTIN_TOOLS = [
                 "user_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith User UUID for a natural person.",
+                    "description": "Canonical platform User UUID for a natural person.",
                 },
                 "agent_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Canonical Clawith Agent UUID for a digital employee.",
+                    "description": "Canonical platform Agent UUID for a digital employee.",
                 },
                 "source": {
                     "type": "string",
@@ -3170,7 +3225,7 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_id": {"type": "string", "description": "Recipient's canonical Clawith user_id. Provider IDs are resolved internally."},
+                "user_id": {"type": "string", "description": "Recipient's canonical platform user_id. Provider IDs are resolved internally."},
                 "message": {"type": "string", "description": "Message content to send"},
             },
             "required": ["user_id", "message"],

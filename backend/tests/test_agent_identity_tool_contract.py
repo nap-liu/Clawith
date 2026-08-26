@@ -66,6 +66,8 @@ def _seed_description(name: str) -> str:
 @pytest.mark.parametrize(
     "name",
     [
+        "run_background_resource",
+        "set_execution_user",
         "set_trigger",
         "update_trigger",
         "cancel_trigger",

@@ -70,6 +70,7 @@ import {
     type ChatAttachedFile,
     type ChatMessageAttachment,
     type ChatPreviewImage,
+    type ChatQuotedMessage,
 } from '../../utils/chatAttachments';
 import { createClientId } from '../../utils/clientId';
 import {
@@ -189,7 +190,6 @@ type ExecutionIdentityRailProps = {
     users: ExecutionUserOption[];
     canReassign: boolean;
     isPending: boolean;
-    isZh: boolean;
     onChoose: () => void;
 };
 
@@ -203,9 +203,9 @@ function ExecutionIdentityRail({
     users,
     canReassign,
     isPending,
-    isZh,
     onChoose,
 }: ExecutionIdentityRailProps) {
+    const { t } = useTranslation();
     const effectiveExecutionUserId = executionUserId || creatorId || '';
     const labelFor = (userId?: string | null, preferredName?: string | null) => {
         if (preferredName) return preferredName;
@@ -218,18 +218,18 @@ function ExecutionIdentityRail({
     return (
         <div className="execution-identity-rail" onClick={(event) => event.stopPropagation()}>
             <span className="execution-identity-person" title={creatorId || undefined}>
-                <span className="execution-identity-label">{isZh ? '创建人' : 'Created by'}</span>
+                <span className="execution-identity-label">{t('agent.aware.executionIdentity.createdBy')}</span>
                 <span className="execution-identity-value">{creatorLabel}</span>
             </span>
             <span className="execution-identity-arrow" aria-hidden="true">→</span>
             <span className="execution-identity-person">
-                <span className="execution-identity-label">{isZh ? '执行人' : 'Runs as'}</span>
+                <span className="execution-identity-label">{t('agent.aware.executionIdentity.runsAs')}</span>
                 {canReassign ? (
                     <button
                         type="button"
                         className="execution-identity-picker-trigger"
-                        aria-label={isZh ? '执行人' : 'Execution user'}
-                        title={isZh ? '选择后续后台执行所使用的用户权限' : 'Choose the user for future background runs'}
+                        aria-label={t('agent.aware.executionIdentity.executionUser')}
+                        title={t('agent.aware.executionIdentity.chooseExecutionUser')}
                         disabled={isPending || !effectiveExecutionUserId}
                         onClick={onChoose}
                     >
@@ -1641,16 +1641,15 @@ export default function AgentDetailPage() {
                     ? ['tasks', id]
                     : ['schedules', id];
             queryClient.invalidateQueries({ queryKey });
-            toast.success(i18n.language?.startsWith('zh') ? '执行人已更新' : 'Execution user updated');
+            toast.success(t('agent.aware.executionIdentity.updated'));
         },
         onError: (err: any) => {
             toast.error(
-                i18n.language?.startsWith('zh') ? '更新执行人失败' : 'Failed to update execution user',
+                t('agent.aware.executionIdentity.updateFailed'),
                 { details: String(err?.detail || err?.message || err) },
             );
         },
     });
-
     // ── Aware tab data: structured Focus ──
     const { data: focusRecords = [], refetch: refetchFocusItems } = useQuery({
         queryKey: ['focus', id],
@@ -2263,6 +2262,7 @@ export default function AgentDetailPage() {
                 role: m.role, content: m.content || '',
                 ...(Object.prototype.hasOwnProperty.call(m, 'display_content') && { display_content: m.display_content || '' }),
                 ...(Object.prototype.hasOwnProperty.call(m, 'attachments') && { attachments: m.attachments || [] }),
+                ...(m.quoted_message && { quoted_message: m.quoted_message }),
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.toolCallId && { toolCallId: m.toolCallId }),
                 ...(m.thinking && { thinking: m.thinking }),
@@ -2450,7 +2450,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; streaming?: boolean; _streaming?: boolean; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; quoted_message?: ChatQuotedMessage; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; streaming?: boolean; _streaming?: boolean; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const chatMessagesSnapshotRef = useRef<ChatMsg[]>(chatMessages);
     const historyMsgsSnapshotRef = useRef<any[]>(historyMsgs);
@@ -2832,6 +2832,7 @@ export default function AgentDetailPage() {
                 role: 'user', content: d.content || '',
                 ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
                 ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
+                ...(d.quoted_message ? { quoted_message: d.quoted_message } : {}),
                 ...(d.sender_name ? { sender_name: d.sender_name } : {}),
                 ...(d.user_id ? { sender_user_id: String(d.user_id) } : {}),
                 timestamp: d.created_at || new Date().toISOString(),
@@ -3543,6 +3544,7 @@ export default function AgentDetailPage() {
                         content: d.content,
                         ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
                         ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
+                        ...(d.quoted_message ? { quoted_message: d.quoted_message } : {}),
                         ...(d.sender_name ? { sender_name: d.sender_name } : {}),
                         ...((d.sender_user_id || d.user_id) ? { sender_user_id: d.sender_user_id || d.user_id } : {}),
                         ...(d.sender_agent_id ? { sender_agent_id: d.sender_agent_id } : {}),
@@ -4051,6 +4053,7 @@ export default function AgentDetailPage() {
                 role: m.role, content: m.content || '',
                 ...(Object.prototype.hasOwnProperty.call(m, 'display_content') && { display_content: m.display_content || '' }),
                 ...(Object.prototype.hasOwnProperty.call(m, 'attachments') && { attachments: m.attachments || [] }),
+                ...(m.quoted_message && { quoted_message: m.quoted_message }),
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.toolCallId && { toolCallId: m.toolCallId }),
                 ...(m.thinking && { thinking: m.thinking }),
@@ -5772,7 +5775,6 @@ export default function AgentDetailPage() {
                                                             users={executionUsers}
                                                             canReassign={canReassignExecutionUser}
                                                             isPending={reassignExecutionUser.isPending}
-                                                            isZh={!!isZh}
                                                             onChoose={() => setExecutionUserPickerTarget({
                                                                 resourceType: 'trigger',
                                                                 resourceId: trig.id,
@@ -5930,10 +5932,10 @@ export default function AgentDetailPage() {
                                 <div className="background-resource-header">
                                     <div>
                                         <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>
-                                            {isZh ? '后台任务身份' : 'Background task identities'}
+                                            {t('agent.aware.executionIdentity.title')}
                                         </h4>
                                         <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                            {isZh ? '查看任务的创建人，以及后续执行所使用的用户权限' : 'See who created each task and whose permissions future runs use'}
+                                            {t('agent.aware.executionIdentity.description')}
                                         </span>
                                     </div>
                                     <span className="background-resource-count">
@@ -5943,7 +5945,7 @@ export default function AgentDetailPage() {
 
                                 {backgroundTasks.length === 0 && schedules.length === 0 ? (
                                     <div className="background-resource-empty">
-                                        {isZh ? '暂无任务或计划任务' : 'No tasks or schedules'}
+                                        {t('agent.aware.executionIdentity.empty')}
                                     </div>
                                 ) : (
                                     <div className="background-resource-list">
@@ -5951,7 +5953,7 @@ export default function AgentDetailPage() {
                                             <div key={`task-${task.id}`} className="background-resource-row">
                                                 <div className="background-resource-main">
                                                     <div className="background-resource-title-row">
-                                                        <span className="background-resource-kind">{isZh ? '任务' : 'Task'}</span>
+                                                        <span className="background-resource-kind">{t('agent.aware.executionIdentity.task')}</span>
                                                         <span className="background-resource-title">{task.title}</span>
                                                     </div>
                                                     <div className="background-resource-meta">
@@ -5968,7 +5970,6 @@ export default function AgentDetailPage() {
                                                     users={executionUsers}
                                                     canReassign={canReassignExecutionUser}
                                                     isPending={reassignExecutionUser.isPending}
-                                                    isZh={!!isZh}
                                                     onChoose={() => setExecutionUserPickerTarget({
                                                         resourceType: 'task',
                                                         resourceId: task.id,
@@ -5982,14 +5983,16 @@ export default function AgentDetailPage() {
                                             <div key={`schedule-${schedule.id}`} className="background-resource-row">
                                                 <div className="background-resource-main">
                                                     <div className="background-resource-title-row">
-                                                        <span className="background-resource-kind schedule">{isZh ? '计划' : 'Schedule'}</span>
+                                                        <span className="background-resource-kind schedule">{t('agent.aware.executionIdentity.schedule')}</span>
                                                         <span className="background-resource-title">{schedule.name}</span>
                                                     </div>
                                                     <div className="background-resource-meta">
-                                                        <span>{schedule.is_enabled ? (isZh ? '已启用' : 'Enabled') : (isZh ? '已停用' : 'Disabled')}</span>
+                                                        <span>{schedule.is_enabled
+                                                            ? t('agent.aware.executionIdentity.enabled')
+                                                            : t('agent.aware.executionIdentity.disabled')}</span>
                                                         <span className="background-resource-cron">{schedule.cron_expr}</span>
                                                         {schedule.next_run_at && (
-                                                            <span>{isZh ? '下次' : 'Next'} {new Date(schedule.next_run_at).toLocaleString()}</span>
+                                                            <span>{t('agent.aware.executionIdentity.next')} {new Date(schedule.next_run_at).toLocaleString()}</span>
                                                         )}
                                                     </div>
                                                 </div>
@@ -6001,7 +6004,6 @@ export default function AgentDetailPage() {
                                                     users={executionUsers}
                                                     canReassign={canReassignExecutionUser}
                                                     isPending={reassignExecutionUser.isPending}
-                                                    isZh={!!isZh}
                                                     onChoose={() => setExecutionUserPickerTarget({
                                                         resourceType: 'schedule',
                                                         resourceId: schedule.id,

@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import math
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 from loguru import logger
@@ -22,8 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import async_session
-from app.models.audit import ChatMessage
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_ACTIVE_STATUSES,
@@ -44,7 +45,13 @@ from app.models.org import OrgMember
 from app.models.tenant import Tenant
 from app.services.channel_session import find_or_create_channel_session
 from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
-
+from app.services.im_delivery import (
+    DELIVERY_LEASE,
+    IMDeliveryPart,
+    IMDeliveryResult,
+    attach_delivery_to_meta,
+)
+from app.services.user_output import sanitize_user_visible_text
 
 StreamStarter = Callable[[uuid.UUID, str, str], Awaitable[None]]
 StreamStopper = Callable[[uuid.UUID], Awaitable[None]]
@@ -74,6 +81,15 @@ class PollingWindow:
     next_poll_at: datetime
     poll_interval_seconds: int
     max_poll_attempts: int
+
+
+@dataclass(frozen=True)
+class WelcomeDeliveryClaim:
+    provisioning_id: uuid.UUID
+    message_id: uuid.UUID
+    attempt_id: str
+    dingtalk_user_id: str
+    message: str
 
 
 class DingTalkRegistrationError(RuntimeError):
@@ -558,7 +574,8 @@ async def _build_dingtalk_binding_welcome_message(
 ) -> str:
     agent = await db.get(Agent, session.agent_id)
     agent_name = _as_string(getattr(agent, "name", None)) or DINGTALK_BINDING_WELCOME_FALLBACK_NAME
-    return f"你好，我是{agent_name}。钉钉通道已配置完成，之后可以直接在这里和我对话。"
+    message = f"你好，我是{agent_name}。钉钉通道已配置完成，之后可以直接在这里和我对话。"
+    return sanitize_user_visible_text(message)
 
 
 async def _find_requester_dingtalk_member(
@@ -585,16 +602,47 @@ async def _find_requester_dingtalk_member(
     return result.scalars().first()
 
 
-async def _persist_welcome_message_history(
+def _welcome_operation_key(session_id: uuid.UUID) -> str:
+    return f"dingtalk-provisioning-welcome:{session_id}"
+
+
+def _welcome_delivery(message: ChatMessage) -> dict[str, Any]:
+    meta = message.message_meta if isinstance(message.message_meta, dict) else {}
+    delivery = meta.get("delivery")
+    return delivery if isinstance(delivery, dict) else {}
+
+
+def _welcome_result_from_sent_message(
+    message: ChatMessage,
+    *,
+    dingtalk_user_id: str,
+) -> dict[str, Any]:
+    process_query_key = ""
+    for part in _welcome_delivery(message).get("parts") or []:
+        if isinstance(part, dict) and part.get("send_status") == "sent":
+            process_query_key = _as_string(part.get("provider_message_id"))
+            if process_query_key:
+                break
+    return {
+        "status": "sent",
+        "user_id": dingtalk_user_id,
+        "process_query_key": process_query_key,
+        "message_id": str(message.id),
+    }
+
+
+async def _claim_welcome_message_delivery(
     db: AsyncSession,
     session: DingTalkChannelProvisioningSession,
     *,
     dingtalk_user_id: str,
     message: str,
     now: datetime,
-) -> None:
+) -> WelcomeDeliveryClaim | dict[str, Any]:
+    """Persist one exclusive send attempt before the provider side effect."""
     if not session.requested_by_user_id:
-        return
+        raise ValueError("welcome delivery requires a requesting user")
+
     chat_session = await find_or_create_channel_session(
         db=db,
         agent_id=session.agent_id,
@@ -603,17 +651,101 @@ async def _persist_welcome_message_history(
         source_channel="dingtalk",
         first_message_title=message[:30],
     )
-    db.add(
-        ChatMessage(
+    row = (
+        await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.external_event_key == _welcome_operation_key(session.id))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        status = _as_string(_welcome_delivery(row).get("status"))
+        if status == "sent":
+            return _welcome_result_from_sent_message(
+                row,
+                dingtalk_user_id=dingtalk_user_id,
+            )
+        # A committed pending receipt means a previous worker may already have
+        # reached DingTalk. Once its lease is due, never duplicate that send.
+        if status in {"pending", "unknown", "partial"}:
+            row.message_meta = attach_delivery_to_meta(
+                row.message_meta,
+                IMDeliveryResult.unknown("dingtalk", "previous_attempt_outcome_unknown"),
+            )
+            return {
+                "status": "failed",
+                "user_id": dingtalk_user_id,
+                "error": "先前欢迎消息投递结果未知，为避免重复发送已停止重试",
+                "error_code": "delivery_unknown",
+                "retryable": False,
+                "message_id": str(row.id),
+            }
+
+    attempt_id = str(uuid.uuid4())
+    pending_meta = attach_delivery_to_meta(
+        {"artifact_role": "channel_welcome"},
+        IMDeliveryResult.pending("dingtalk"),
+    )
+    pending_meta["delivery"]["attempt_id"] = attempt_id
+    pending_meta["delivery"]["attempt_started_at"] = now.isoformat()
+    if row is None:
+        row = ChatMessage(
             agent_id=session.agent_id,
             user_id=session.requested_by_user_id,
             role="assistant",
             content=message,
             conversation_id=str(chat_session.id),
+            external_event_key=_welcome_operation_key(session.id),
+            message_meta=pending_meta,
         )
-    )
+        db.add(row)
+        await db.flush()
+    else:
+        row.message_meta = pending_meta
     chat_session.last_message_at = now
+    # A crashed request becomes due after the lease and is converted to unknown
+    # by the branch above, so recovery cannot duplicate a provider-side send.
+    session.welcome_next_retry_at = now + DELIVERY_LEASE
     await db.flush()
+    return WelcomeDeliveryClaim(
+        provisioning_id=session.id,
+        message_id=row.id,
+        attempt_id=attempt_id,
+        dingtalk_user_id=dingtalk_user_id,
+        message=message,
+    )
+
+
+async def _finalize_welcome_message_delivery(
+    db: AsyncSession,
+    claim: WelcomeDeliveryClaim,
+    *,
+    delivery_result: IMDeliveryResult,
+    welcome_result: dict[str, Any],
+    now: datetime,
+) -> bool:
+    session = (
+        await db.execute(
+            select(DingTalkChannelProvisioningSession)
+            .where(DingTalkChannelProvisioningSession.id == claim.provisioning_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    row = (
+        await db.execute(
+            select(ChatMessage).where(ChatMessage.id == claim.message_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if session is None or row is None:
+        return False
+    delivery = _welcome_delivery(row)
+    if delivery.get("attempt_id") != claim.attempt_id:
+        return False
+
+    row.message_meta = attach_delivery_to_meta(row.message_meta, delivery_result)
+    _record_welcome_attempt(session, welcome_result, now=now)
+    await db.flush()
+    return True
 
 
 async def _send_dingtalk_binding_welcome_message(
@@ -625,6 +757,7 @@ async def _send_dingtalk_binding_welcome_message(
     welcome_sender: WelcomeSender | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
+    base = _as_utc(now or _now())
     member = await _find_requester_dingtalk_member(db, session)
     if not member:
         logger.info(
@@ -639,6 +772,21 @@ async def _send_dingtalk_binding_welcome_message(
 
     sender = welcome_sender or _default_welcome_sender
     message = await _build_dingtalk_binding_welcome_message(db, session)
+    prepared = await _claim_welcome_message_delivery(
+        db,
+        session,
+        dingtalk_user_id=dingtalk_user_id,
+        message=message,
+        now=base,
+    )
+    if isinstance(prepared, dict):
+        _record_welcome_attempt(session, prepared, now=base)
+        await db.commit()
+        return prepared
+
+    # The pending receipt and lease are committed before the external call.
+    await db.commit()
+
     try:
         send_result = await sender(
             client_id,
@@ -648,38 +796,76 @@ async def _send_dingtalk_binding_welcome_message(
         )
     except Exception as exc:
         logger.warning(f"[DingTalk Provisioning] Welcome message send failed: {exc}")
-        return {
+        # Once control entered the provider adapter, an exception cannot prove
+        # that DingTalk did not accept the message. Preserve exactly-once
+        # behavior by making every exceptional outcome terminally unknown.
+        delivery_result = IMDeliveryResult.unknown("dingtalk", type(exc).__name__)
+        welcome_result = {
             "status": "failed",
             "user_id": dingtalk_user_id,
             "error": type(exc).__name__,
             "error_code": type(exc).__name__,
-            "retryable": True,
+            "retryable": False,
+            "message_id": str(prepared.message_id),
         }
+    else:
+        if send_result.get("errcode") in (0, "0"):
+            process_query_key = _as_string(send_result.get("processQueryKey"))
+            delivery_result = IMDeliveryResult.sent(
+                "dingtalk",
+                IMDeliveryPart(
+                    transport="dingtalk_openapi_oto",
+                    provider_message_id=process_query_key or None,
+                    conversation_ref=dingtalk_user_id,
+                    artifact_role="channel_welcome",
+                    recallable=bool(process_query_key),
+                ),
+            )
+            welcome_result = {
+                "status": "sent",
+                "user_id": dingtalk_user_id,
+                "process_query_key": process_query_key,
+                "message_id": str(prepared.message_id),
+            }
+        else:
+            error = _as_string(send_result.get("errmsg")) or str(send_result)[:200]
+            error_code = send_result.get("errcode")
+            logger.warning(f"[DingTalk Provisioning] Welcome message send failed: {error}")
+            delivery_result = IMDeliveryResult.failed(
+                "dingtalk",
+                str(error_code or error or "send_failed"),
+            )
+            welcome_result = {
+                "status": "failed",
+                "user_id": dingtalk_user_id,
+                "error": error,
+                "error_code": str(error_code) if error_code is not None else "",
+                "retryable": _is_retryable_welcome_failure(error_code, error),
+                "message_id": str(prepared.message_id),
+            }
 
-    if send_result.get("errcode") not in (0, "0"):
-        error = _as_string(send_result.get("errmsg")) or str(send_result)[:200]
-        error_code = send_result.get("errcode")
-        logger.warning(f"[DingTalk Provisioning] Welcome message send failed: {error}")
+    finalized = await _finalize_welcome_message_delivery(
+        db,
+        prepared,
+        delivery_result=delivery_result,
+        welcome_result=welcome_result,
+        now=base,
+    )
+    if not finalized:
+        await db.rollback()
+        logger.error(
+            f"[DingTalk Provisioning] Lost welcome delivery attempt ownership for session {session.id}"
+        )
         return {
             "status": "failed",
             "user_id": dingtalk_user_id,
-            "error": error,
-            "error_code": str(error_code) if error_code is not None else "",
-            "retryable": _is_retryable_welcome_failure(error_code, error),
+            "error": "delivery_attempt_ownership_lost",
+            "error_code": "delivery_attempt_ownership_lost",
+            "retryable": False,
+            "message_id": str(prepared.message_id),
         }
-
-    await _persist_welcome_message_history(
-        db,
-        session,
-        dingtalk_user_id=dingtalk_user_id,
-        message=message,
-        now=_as_utc(now or _now()),
-    )
-    return {
-        "status": "sent",
-        "user_id": dingtalk_user_id,
-        "process_query_key": _as_string(send_result.get("processQueryKey")),
-    }
+    await db.commit()
+    return welcome_result
 
 
 async def _configure_dingtalk_channel(
@@ -944,7 +1130,7 @@ async def retry_due_dingtalk_welcome_messages(
     """Retry due completion messages for already-configured DingTalk channels."""
     base = _as_utc(now or _now())
     stmt = (
-        select(DingTalkChannelProvisioningSession)
+        select(DingTalkChannelProvisioningSession.id)
         .join(Agent, Agent.id == DingTalkChannelProvisioningSession.agent_id)
         .join(Tenant, Tenant.id == Agent.tenant_id)
         .where(
@@ -956,14 +1142,34 @@ async def retry_due_dingtalk_welcome_messages(
             Tenant.is_active.is_(True),
         )
         .order_by(DingTalkChannelProvisioningSession.welcome_next_retry_at.asc())
-        .with_for_update(skip_locked=True)
     )
     if limit:
         stmt = stmt.limit(limit)
 
     result = await db.execute(stmt)
-    sessions = result.scalars().all()
-    for session in sessions:
+    session_ids = list(result.scalars())
+    processed_count = 0
+    for session_id in session_ids:
+        session = (
+            await db.execute(
+                select(DingTalkChannelProvisioningSession)
+                .where(
+                    DingTalkChannelProvisioningSession.id == session_id,
+                    DingTalkChannelProvisioningSession.status
+                    == DINGTALK_PROVISIONING_STATUS_CONFIGURED,
+                    DingTalkChannelProvisioningSession.welcome_status
+                    == DINGTALK_WELCOME_STATUS_PENDING,
+                    DingTalkChannelProvisioningSession.welcome_next_retry_at.is_not(None),
+                    DingTalkChannelProvisioningSession.welcome_next_retry_at <= base,
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if session is None:
+            await db.commit()
+            continue
+
+        processed_count += 1
         config_result = await db.execute(
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == session.agent_id,
@@ -984,6 +1190,7 @@ async def retry_due_dingtalk_welcome_messages(
             session.welcome_next_retry_at = None
             session.welcome_last_error = error
             session.last_error = error
+            await db.commit()
             continue
 
         welcome_result = await _send_dingtalk_binding_welcome_message(
@@ -994,7 +1201,9 @@ async def retry_due_dingtalk_welcome_messages(
             welcome_sender=welcome_sender,
             now=base,
         )
-        _record_welcome_attempt(session, welcome_result, now=base)
+        if welcome_result is None:
+            _record_welcome_attempt(session, None, now=base)
+            await db.commit()
         if session.welcome_status == DINGTALK_WELCOME_STATUS_SENT:
             logger.info(
                 f"[DingTalk Provisioning] Welcome message delivered for session {session.id} "
@@ -1016,8 +1225,7 @@ async def retry_due_dingtalk_welcome_messages(
                 f"{session.welcome_last_error}"
             )
 
-    await db.flush()
-    return len(sessions)
+    return processed_count
 
 
 async def poll_due_dingtalk_provisioning_sessions(

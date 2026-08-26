@@ -120,18 +120,53 @@ async def test_inventory_uses_existing_assignment_provenance_and_exact_server_id
         await db.commit()
         server_id = server.id
 
-    owner = json.loads(await list_installed_mcp_servers(owner_id))["mcp_servers"][0]
-    other = json.loads(await list_installed_mcp_servers(other_id))["mcp_servers"][0]
+    owner_raw = await list_installed_mcp_servers(owner_id)
+    other_raw = await list_installed_mcp_servers(other_id)
+    owner = json.loads(owner_raw)["mcp_servers"][0]
+    other = json.loads(other_raw)["mcp_servers"][0]
 
-    assert owner["mcp_server_id"] == str(server_id)
-    assert owner["installed_by_current_agent"] is True
-    assert owner["removable"] is True
-    assert owner["config"]["api_key"] == "owner-secret"
-    assert owner["config"]["headers"]["X-Debug"] == "kept"
-    assert other["mcp_server_id"] == str(server_id)
-    assert other["installed_by_current_agent"] is False
-    assert other["removable"] is False
-    assert "config" not in other and "configs" not in other
+    assert owner == {
+        "mcp_server_id": str(server_id),
+        "display_name": "Inventory",
+        "transport": "http",
+        "tool_count": 1,
+        "enabled_tool_count": 1,
+        "removable": True,
+    }
+    assert other == {**owner, "removable": False}
+    assert "owner-secret" not in owner_raw
+    assert "must-not-project" not in other_raw
+    assert "tools" not in owner and "config" not in owner and "configs" not in owner
+
+
+async def test_refresh_dispatch_passes_current_turn_identity_and_session():
+    _tenant_id, (agent_id,) = await _make_agents(1)
+    async with async_session() as db:
+        user_id = await db.scalar(select(Agent.creator_id).where(Agent.id == agent_id))
+    server_id = uuid.uuid4()
+    expected = json.dumps({"ok": True})
+
+    with patch(
+        "app.services.agent_mcp_lifecycle.refresh_mcp_server",
+        AsyncMock(return_value=expected),
+    ) as refresh, patch("app.services.activity_logger.log_activity", AsyncMock()):
+        from app.services.agent_tools import execute_tool
+
+        result = await execute_tool(
+            "refresh_mcp_server",
+            {"mcp_server_id": str(server_id)},
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id="current-session",
+        )
+
+    assert result == expected
+    refresh.assert_awaited_once_with(
+        agent_id,
+        server_id,
+        user_id=user_id,
+        session_id="current-session",
+    )
 
 
 async def test_uninstall_only_detaches_current_agent_and_preserves_shared_server():
@@ -450,4 +485,48 @@ def test_builtin_and_runtime_tool_contracts_are_exact_and_default():
     assert set(refresh_schema["properties"]) == {"mcp_server_id"}
     for name in runtime:
         assert seeded[name]["parameters_schema"] == runtime[name]["parameters"]
+        assert seeded[name]["description"] == runtime[name]["description"]
         assert seeded[name]["is_default"] is True
+
+
+async def test_seeded_inventory_contract_is_visible_to_the_llm():
+    from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
+    from app.services.tool_seeder import seed_builtin_tools
+
+    _tenant_id, (agent_id,) = await _make_agents(1)
+    expected_description = next(
+        item["function"]["description"]
+        for item in AGENT_TOOLS
+        if item.get("function", {}).get("name") == "list_installed_mcp_servers"
+    )
+
+    await seed_builtin_tools()
+
+    async with async_session() as db:
+        persisted_tool = await db.scalar(
+            select(Tool).where(Tool.name == "list_installed_mcp_servers")
+        )
+        assignment = await db.scalar(
+            select(AgentTool).where(
+                AgentTool.agent_id == agent_id,
+                AgentTool.tool_id == persisted_tool.id,
+            )
+        )
+        if assignment is None:
+            db.add(
+                AgentTool(
+                    agent_id=agent_id,
+                    tool_id=persisted_tool.id,
+                    enabled=True,
+                )
+            )
+            await db.commit()
+    visible_tools = await get_agent_tools_for_llm(agent_id)
+    visible_description = next(
+        item["function"]["description"]
+        for item in visible_tools
+        if item.get("function", {}).get("name") == "list_installed_mcp_servers"
+    )
+
+    assert persisted_tool.description == expected_description
+    assert visible_description == expected_description

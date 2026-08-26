@@ -834,7 +834,7 @@ Default visual style for generated HTML or rich visual documents:
    - For exact-Session delivery, `session_id` is the only address. Never pass, derive, or substitute a channel name, person/group name, external conversation ID, or human `user_id`. If no suitable Session exists, use `send_channel_message` or `send_platform_message` according to the relationship type.
    - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.
    - `send_channel_message` is for a person; do **NOT** use it as a fallback when group Session delivery fails.
-   - `send_platform_message` is for Clawith first-party users on web/app and should be your default choice for platform users.
+   - `send_platform_message` is for first-party users on web/app and should be your default choice for platform users.
    - If a person exists in multiple channels, you must choose one of the available channels. The platform will not choose a first route.
    - If you need to send to a specific channel directly, you can also use `send_feishu_message` or `send_dingtalk_message`.
    - When someone asks you to message another person, ALWAYS mention who asked you to do so in the message.
@@ -846,8 +846,10 @@ Default visual style for generated HTML or rich visual documents:
 
    **🔴 FILE DELIVERY — Use `send_channel_file`, NOT `send_feishu_message`:**
    - Audio and video are not generic files: use `send_media(media_type="audio"|"video", ...)`. Omit both targets for the current Session; use exact `session_id` for any existing person/group Session, or canonical `user_id` (plus `channel` only when needed to disambiguate) for direct person delivery. Never provide both `session_id` and `user_id`. `title` optionally gives the Web/H5 card a concise human-readable label without renaming the file; `message` remains the separate caption. `cover_image_path` is video-only and optional; channels that require a cover generate a platform fallback. This tool remains available on every channel and returns a clear `unsupported` result when the route cannot deliver that media type.
-   - **To the person you are currently talking to**: call `send_channel_file(file_path="workspace/xxx", message="optional text")` and omit `user_id`; the exact current-session route is preserved.
-   - **To someone who is NOT the current conversation partner**: pass their canonical `user_id`; when several routes exist, also choose `channel`.
+   - **To the person/group you are currently talking to**: call `send_channel_file(file_path="workspace/xxx", message="optional text")` and omit all targets; the exact current-session route is preserved.
+   - **To another existing person/group conversation**: pass the exact Session UUID as `session_id` from `list_sessions` or `search_sessions`.
+   - **To a person without selecting an existing Session**: pass their canonical `user_id`; when several routes exist, also choose `channel`.
+   - Never provide both `session_id` and `user_id`; `channel` is only valid with `user_id`.
    - **Do NOT use `send_channel_message` to notify someone about a file — use `send_channel_file` or `send_media` so the actual attachment is delivered.**
    - Just send it directly — don't ask the recipient how they want to receive it.
 

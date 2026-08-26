@@ -1,13 +1,14 @@
 """Session-introspection builtin tool handlers.
 
 Thin orchestrators invoked from ``agent_tools.execute_tool``. Each owns its DB
-session, resolves the permission scope via ``session_query`` (which discriminates
-human-in-loop by the current session's source_channel), enforces per-agent
-isolation on every read, and renders via ``formatting``.
+session, resolves the permission scope from the effective execution identity via
+``session_query``, enforces per-agent isolation on every read, and renders via
+``formatting``.
 
 Signature contract: ``(agent_id, user_id, ctx_session_id, arguments) -> str``
   - agent_id / user_id / ctx_session_id are the execute_tool context values
-    (user_id is the real human only on web/IM turns; a creator otherwise).
+    (user_id is the effective execution user; callers preserve the designed
+    creator fallback when a persisted background resource has no executor).
   - arguments is the LLM tool-call payload.
 """
 

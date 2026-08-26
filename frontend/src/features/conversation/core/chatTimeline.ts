@@ -1,4 +1,9 @@
-import type { ChatMessageAttachment, ChatPreviewImage } from '../../../utils/chatAttachments';
+import {
+    normalizeChatQuotedMessage,
+    type ChatMessageAttachment,
+    type ChatPreviewImage,
+    type ChatQuotedMessage,
+} from '../../../utils/chatAttachments';
 import { createClientId } from '../../../utils/clientId';
 import { getChatToolRenderIdentity, getChatToolRenderType } from '../../../components/ChatToolCallRenderer';
 
@@ -13,6 +18,7 @@ export type ConversationMessage = {
     created_at?: string | null;
     display_content?: string;
     attachments?: ChatMessageAttachment[];
+    quoted_message?: ChatQuotedMessage;
     toolCallId?: string;
     toolName?: string;
     toolArgs?: any;
@@ -111,6 +117,7 @@ export function mapHistoryMessage(raw: any, makeId: () => string = defaultMakeId
         };
     }
 
+    const quotedMessage = normalizeChatQuotedMessage(raw.quoted_message);
     return {
         id: String(raw.id || makeId()),
         role: raw.role,
@@ -123,6 +130,7 @@ export function mapHistoryMessage(raw: any, makeId: () => string = defaultMakeId
         sender_agent_id: raw.sender_agent_id || undefined,
         ...(Object.prototype.hasOwnProperty.call(raw, 'display_content') ? { display_content: raw.display_content || '' } : {}),
         ...(Object.prototype.hasOwnProperty.call(raw, 'attachments') ? { attachments: raw.attachments || [] } : {}),
+        ...(quotedMessage ? { quoted_message: quotedMessage } : {}),
     };
 }
 

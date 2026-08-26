@@ -164,6 +164,39 @@ async def _send_slack_messages(
     return results
 
 
+async def _persist_and_send_slack_assistant(
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    external_conv_id: str,
+    text: str,
+    turn_anchor_id: uuid.UUID,
+    artifact_role: str,
+) -> uuid.UUID:
+    """Persist one visible Slack message before sending and record every chunk."""
+    from app.services.im_delivery import persist_and_deliver_runtime_message
+    from app.services.turn_runtime import TurnRuntime
+
+    message_id, result = await persist_and_deliver_runtime_message(
+        agent_id=agent_id,
+        user_id=user_id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="slack",
+            conversation_id=conversation_id,
+            external_conv_id=external_conv_id,
+            is_group=not external_conv_id.removeprefix("slack_").startswith("D"),
+        ),
+        message=text,
+        turn_anchor_id=turn_anchor_id,
+        artifact_role=artifact_role,
+    )
+    if not result.ok:
+        raise RuntimeError(result.error or "slack_delivery_failed")
+    return message_id
+
+
 @router.post("/channel/slack/{agent_id}/webhook")
 async def slack_event_webhook(
     agent_id: uuid.UUID,
@@ -232,29 +265,58 @@ async def slack_event_webhook(
     # Early-return for channel commands (/new, /reset):
     # Must run BEFORE find_or_create_channel_session to avoid creating a
     # ghost session that is immediately archived.
-    from app.services.channel_commands import is_channel_command, handle_channel_command
+    from app.services.channel_commands import is_channel_command, prepare_channel_command_reply
     if is_channel_command(user_text):
-        if event_id in _processed_slack_events:
-            return {"ok": True}
-        if event_id:
-            _processed_slack_events.add(event_id)
-            if len(_processed_slack_events) > 1000:
-                _processed_slack_events.clear()
         from app.database import async_session as _async_session
         async with _async_session() as _cmd_db:
-            cmd_result = await handle_channel_command(
+            cmd_result = await prepare_channel_command_reply(
                 db=_cmd_db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conv_id,
+                external_user_id=sender_id,
                 source_channel="slack",
+                provider_event_id=event_id,
                 is_group=_is_group_slack,
             )
             await _cmd_db.commit()
+        if not cmd_result["should_deliver"]:
+            return {"ok": True}
         _bot_token_cmd = config.app_secret or ""
         if _bot_token_cmd and channel_id:
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                PersistedDeliveryRecorder,
+            )
+            _cmd_recorder = PersistedDeliveryRecorder(
+                cmd_result["message_id"],
+                "slack",
+            )
+
+            async def _record_command_part(item: dict) -> None:
+                await _cmd_recorder.append(IMDeliveryPart(
+                    transport="slack",
+                    provider_message_id=str(item.get("ts") or "") or None,
+                    conversation_ref=channel_id,
+                    artifact_role="command_reply",
+                    recallable=bool(item.get("ts")),
+                ))
+
             try:
-                await _send_slack_messages(_bot_token_cmd, channel_id, cmd_result["message"])
+                await _send_slack_messages(
+                    _bot_token_cmd,
+                    channel_id,
+                    cmd_result["message"],
+                    on_result=_record_command_part,
+                )
+                await _cmd_recorder.sent()
             except Exception as _cmd_e:
+                await _cmd_recorder.failed(_cmd_e)
                 logger.error(f"[Slack] Failed to send command reply: {_cmd_e}")
+        else:
+            from app.services.im_delivery import IMDeliveryResult, register_delivery
+            await register_delivery(
+                cmd_result["message_id"],
+                IMDeliveryResult.failed("slack", "command_route_unavailable"),
+            )
         return {"ok": True}
 
     logger.info(f"[Slack] Message from={sender_id}, channel={channel_id}: {user_text[:80]}")
@@ -371,10 +433,7 @@ async def slack_event_webhook(
         # Files were present but all downloads failed — still send ack so user knows we got the file event
         _file_names = ", ".join(_sf.get("name", "file") for _sf in slack_files)
         _failed_file_content = f"[file-download-failed:{_file_names}]"
-        from app.services.chat_history import (
-            ingest_incoming_chat_message,
-            persist_assistant_reply_row,
-        )
+        from app.services.chat_history import ingest_incoming_chat_message
 
         _failed_file_ingested = await ingest_incoming_chat_message(
             db,
@@ -394,17 +453,15 @@ async def slack_event_webhook(
             logger.info("[Slack] Failed-download file event %s routed to on_message", event_id)
             return {"ok": True}
         _ack = f"收到了文件 {_file_names}，不过我暂时无法下载其内容，请检查 Slack App 是否已授权 files:read 权限。"
-        await persist_assistant_reply_row(
-            db,
+        await _persist_and_send_slack_assistant(
             agent_id=agent_id,
             user_id=platform_user_id,
-            content=_ack,
             conversation_id=session_conv_id,
+            external_conv_id=conv_id,
+            text=_ack,
             turn_anchor_id=_failed_file_ingested.message.id,
+            artifact_role="file_ack",
         )
-        await db.commit()
-        if _bot_token and channel_id:
-            await _send_slack_messages(_bot_token, channel_id, _ack)
         return {"ok": True}
 
     if _file_user_messages and not user_text:
@@ -438,17 +495,15 @@ async def slack_event_webhook(
             return {"ok": True}
         await _asyncio.sleep(_random.uniform(1.0, 2.0))
         _ack = _random.choice(_FILE_ACK_MESSAGES)
-        from app.services.chat_history import persist_assistant_reply_row
-
-        await persist_assistant_reply_row(
-            db,
+        await _persist_and_send_slack_assistant(
             agent_id=agent_id,
             user_id=platform_user_id,
-            content=_ack,
             conversation_id=session_conv_id,
+            external_conv_id=conv_id,
+            text=_ack,
             turn_anchor_id=_file_ingested.message.id,
+            artifact_role="file_ack",
         )
-        await db.commit()
         # Mirror this inbound file message to anyone viewing the session on web in
         # real time (matches what a reload renders: the [file:...] row).
         from app.services.channel_llm import broadcast_channel_user_message
@@ -456,8 +511,6 @@ async def slack_event_webhook(
             agent_id, session_conv_id, message=_file_ingested.message,
             sender_name=_slack_real_name or None, user_id=platform_user_id,
         )
-        if _bot_token and channel_id:
-            await _send_slack_messages(_bot_token, channel_id, _ack)
         return {"ok": True}
 
     # Append uploaded file paths to user message for context
@@ -520,6 +573,9 @@ async def slack_event_webhook(
         # Set channel_file_sender contextvar for agent → user file delivery
         from app.services.agent_tools import channel_file_sender as _cfs_s
         async def _slack_file_sender(file_path, msg: str = ""):
+            from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
+            from app.services.agent_tools import record_channel_file_part
+
             from pathlib import Path as _P
             _fp = _P(file_path)
             if not _bot_token or not channel_id:
@@ -545,6 +601,15 @@ async def slack_event_webhook(
                 )
                 if not _complete.json().get("ok"):
                     raise RuntimeError(f"Slack upload complete error: {_complete.json()}")
+                part = IMDeliveryPart(
+                    transport="slack_file",
+                    provider_message_id=_file_id,
+                    conversation_ref=channel_id,
+                    artifact_role="channel_file",
+                    recallable=False,
+                )
+                await record_channel_file_part(part)
+                return IMDeliveryResult.sent("slack", part)
         _cfs_s_token = _cfs_s.set(_slack_file_sender)
 
         # 在锁内加载历史，避免并发请求读取到对方尚未写入的历史（race condition）
@@ -562,14 +627,12 @@ async def slack_event_webhook(
         from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
         _thinking_chunks: list[str] = []
 
-        async def _send_thinking_text(text: str) -> None:
-            bot_token = config.app_secret or ""
-            if bot_token and channel_id:
-                await _send_slack_messages(bot_token, channel_id, text)
-
-        _thinking_sender = BufferedIMThinkingSender(
+        _thinking_sender = BufferedIMThinkingSender.for_runtime(
             enabled=resolve_im_thinking_enabled(agent_obj, sess),
-            send_text=_send_thinking_text,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            conversation_id=session_conv_id,
+            turn_anchor_id=ingested.message.id,
         )
 
         async def _collect_thinking(text: str):

@@ -50,7 +50,7 @@ class PlatformService:
             return str(request.base_url).rstrip("/")
 
         # 4. Absolute fallback — honest local default, never a placeholder
-        # domain (a fictional URL like try.clawith.ai would leak into agent
+        # domain (a fictional deployment URL would leak into agent
         # output and channel callbacks). Aligns with core.domain.resolve_base_url.
         return "http://localhost:8000"
 
@@ -73,7 +73,7 @@ class PlatformService:
         base_url = await self.get_public_base_url(db, request)
         
         # Parse protocol and host
-        # Example: http://1.2.3.4:8000 or http://clawith.ai
+        # Example: http://1.2.3.4:8000 or a configured platform hostname.
         parts = base_url.split("://")
         if len(parts) < 2:
             return base_url
@@ -95,7 +95,7 @@ class PlatformService:
             if host == "localhost":
                 return f"{protocol}://{host}{port}"
                 
-            # Generic logic: if host has a subdomain (e.g. try.clawith.ai), 
+            # Generic logic: if the configured host has a subdomain,
             # we strip the first component to form a base for tenant subdomains.
             h_parts = host.split(".")
             if len(h_parts) > 2:

@@ -18,6 +18,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.services.channel_llm import _call_agent_llm
 from app.services.chat_history import (
+    is_incomplete_delivery_progress,
     load_recoverable_history_for_turn,
     load_recoverable_messages_for_turn,
     persist_assistant_reply_row,
@@ -420,6 +421,8 @@ async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
         # LLM invocation for the same event.
         return False
     if row.role == "assistant":
+        if is_incomplete_delivery_progress(row):
+            return True
         # Persisted assistant output is the durable completion boundary. Without a
         # separate delivery receipt, startup cannot distinguish "persisted before
         # send" from "already sent"; retrying here duplicates every recent IM reply

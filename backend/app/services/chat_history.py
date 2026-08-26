@@ -43,6 +43,7 @@ from app.models.chat_compaction import ChatCompaction
 from app.models.user import User
 from app.services.chat_attachments import normalize_chat_message_attachments
 from app.services.sender_attribution import wrap_with_sender
+from app.services.user_output import sanitize_user_visible_text
 
 if TYPE_CHECKING:
     from app.services.confirmation_service import PendingConfirmation
@@ -126,49 +127,7 @@ async def _load_active_compaction_marker(
     return result.scalar_one_or_none()
 
 
-async def _build_compacted_recall_correction(
-    db: AsyncSession,
-    *,
-    agent_id: uuid.UUID,
-    conversation_id: str,
-    created_at: datetime,
-) -> _SyntheticSummaryMessage | None:
-    """Tell the model which summarized assistant rows were later recalled."""
-    result = await db.execute(
-        select(ChatMessage.id, ChatMessage.message_meta).where(
-            ChatMessage.agent_id == agent_id,
-            ChatMessage.conversation_id == conversation_id,
-            ChatMessage.role == "assistant",
-            ChatMessage.compacted_into.is_not(None),
-        )
-    )
-    recalled_ids = []
-    for message_id, message_meta in result.all():
-        delivery = message_meta.get("delivery") if isinstance(message_meta, dict) else {}
-        recall = delivery.get("recall") if isinstance(delivery, dict) else {}
-        if isinstance(recall, dict) and recall.get("status") == "recalled":
-            recalled_ids.append(str(message_id))
-    if not recalled_ids:
-        return None
-    body = (
-        "<delivery-corrections>\n"
-        "The following earlier assistant messages were recalled after the conversation summary was "
-        "created. Their content remains audit history but was later withdrawn and is no longer visible "
-        "to the human; do not rely on it as current delivered context:\n"
-        + "\n".join(f"- {message_id}" for message_id in recalled_ids)
-        + "\n</delivery-corrections>"
-    )
-    return _SyntheticSummaryMessage(
-        role="user",
-        content=body,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-        created_at=created_at,
-    )
-
-
-async def _prepend_compaction_context(
-    db: AsyncSession,
+def _prepend_compaction_context(
     rows: list[Any],
     *,
     marker: ChatCompaction,
@@ -182,14 +141,6 @@ async def _prepend_compaction_context(
             conversation_id=conversation_id,
         )
     ]
-    correction = await _build_compacted_recall_correction(
-        db,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-        created_at=marker.created_at,
-    )
-    if correction is not None:
-        prefix.append(correction)
     rows[0:0] = prefix
 
 
@@ -263,8 +214,7 @@ async def load_messages_for_session(
     rows = all_active_rows
 
     if marker is not None:
-        await _prepend_compaction_context(
-            db,
+        _prepend_compaction_context(
             rows,
             marker=marker,
             agent_id=agent_id,
@@ -303,10 +253,13 @@ async def load_recoverable_messages_for_turn(
         for row in result.scalars().all()
         if row.id == turn_anchor_id
         or not (
-            isinstance(getattr(row, "message_meta", None), dict)
-            and (
-                row.message_meta.get("consumed_by_onmessage")
-                or row.message_meta.get("kind") == "subagent_parent_message"
+            is_incomplete_delivery_progress(row)
+            or (
+                isinstance(getattr(row, "message_meta", None), dict)
+                and (
+                    row.message_meta.get("consumed_by_onmessage")
+                    or row.message_meta.get("kind") == "subagent_parent_message"
+                )
             )
         )
     ]
@@ -346,8 +299,7 @@ async def load_recoverable_messages_for_turn(
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
     if marker is not None:
-        await _prepend_compaction_context(
-            db,
+        _prepend_compaction_context(
             rows,
             marker=marker,
             agent_id=agent_id,
@@ -355,6 +307,17 @@ async def load_recoverable_messages_for_turn(
         )
 
     return rows
+
+
+def is_incomplete_delivery_progress(row: Any) -> bool:
+    """Return whether an assistant row is visible progress, not turn completion."""
+    if getattr(row, "role", None) != "assistant":
+        return False
+    meta = row.message_meta if isinstance(getattr(row, "message_meta", None), dict) else {}
+    return (
+        meta.get("artifact_role") in {"thinking", "streaming_card"}
+        and meta.get("turn_status") != "completed"
+    )
 
 
 def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
@@ -376,7 +339,10 @@ def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
 
     last_assistant_idx = -1
     for idx, row in enumerate(rows):
-        if getattr(row, "role", None) == "assistant":
+        if (
+            getattr(row, "role", None) == "assistant"
+            and not is_incomplete_delivery_progress(row)
+        ):
             last_assistant_idx = idx
 
     if last_assistant_idx < 0 and not any(getattr(row, "role", None) == "tool_call" for row in rows):
@@ -403,7 +369,10 @@ def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
             )
             if any(
                 (
-                    getattr(rows[later_idx], "role", None) == "assistant"
+                    (
+                        getattr(rows[later_idx], "role", None) == "assistant"
+                        and not is_incomplete_delivery_progress(rows[later_idx])
+                    )
                     or _is_confirmation_tool_call_row(rows[later_idx])
                 )
                 for later_idx in range(idx + 1, next_user_idx)
@@ -529,7 +498,7 @@ def build_llm_message_from_row(
     )
     delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
     recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
-    recalled = message.role == "assistant" and recall.get("status") == "recalled"
+    recalled = message.role in {"assistant", "tool_call"} and recall.get("status") == "recalled"
     if recalled:
         content = "[该消息已撤回，不应视为仍对用户可见]"
     attachments: list[dict[str, Any]] = []
@@ -543,6 +512,12 @@ def build_llm_message_from_row(
             message.content,
             meta,
             source_channel,
+        )
+        from app.services.quoted_message import render_quoted_message_for_llm
+
+        content = render_quoted_message_for_llm(
+            content,
+            meta.get("quoted_message"),
         )
         legacy_image_markers = (
             extract_image_data_markers(message.content)
@@ -587,6 +562,12 @@ def build_llm_messages_from_rows(
     """
     out: list[dict[str, Any]] = []
     for m in rows:
+        meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
+        delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
+        recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
+        if m.role == "tool_call" and recall.get("status") == "recalled":
+            out.append({"role": "assistant", "content": "[该消息已撤回，不应视为仍对用户可见]"})
+            continue
         if m.role == "tool_call":
             out.extend(expand_tool_call_row(m))
             continue
@@ -663,7 +644,9 @@ async def mark_latest_incomplete_turn_cancelled(
             .limit(1)
         )
     ).scalar_one_or_none()
-    if latest is None or latest.role == "assistant":
+    if latest is None or (
+        latest.role == "assistant" and not is_incomplete_delivery_progress(latest)
+    ):
         return None
     latest_meta = latest.message_meta if isinstance(latest.message_meta, dict) else {}
     if (
@@ -1441,7 +1424,8 @@ async def persist_assistant_reply_row(
     sender_agent_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Persist a non-empty assistant reply in the caller's transaction."""
-    if not (content or "").strip():
+    content = sanitize_user_visible_text(content or "")
+    if not content.strip():
         raise ValueError("assistant reply content must be non-empty")
     if turn_anchor_id is not None:
         await lock_turn_anchor_for_finalization(
@@ -1469,7 +1453,7 @@ async def persist_assistant_reply_row(
         conversation_id=conversation_id,
         message_meta=final_meta,
     )
-    _capped = cap_thinking(thinking)
+    _capped = cap_thinking(sanitize_user_visible_text(thinking)) if thinking else None
     if _capped:
         msg.thinking = _capped
     db.add(msg)

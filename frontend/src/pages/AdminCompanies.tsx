@@ -135,7 +135,7 @@ function PlatformTab() {
     const [systemEmailConfig, setSystemEmailConfig] = useState({
         SYSTEM_EMAIL_ENABLED: false,
         SYSTEM_EMAIL_FROM_ADDRESS: '',
-        SYSTEM_EMAIL_FROM_NAME: 'Clawith',
+        SYSTEM_EMAIL_FROM_NAME: 'Digital Employee Platform',
         SYSTEM_SMTP_HOST: '',
         SYSTEM_SMTP_PORT: 465,
         SYSTEM_SMTP_USERNAME: '',
@@ -201,7 +201,7 @@ function PlatformTab() {
                             ? !!d.value.SYSTEM_EMAIL_ENABLED
                             : !!(d.value.SYSTEM_EMAIL_FROM_ADDRESS && d.value.SYSTEM_SMTP_HOST),
                         SYSTEM_EMAIL_FROM_ADDRESS: d.value.SYSTEM_EMAIL_FROM_ADDRESS || '',
-                        SYSTEM_EMAIL_FROM_NAME: d.value.SYSTEM_EMAIL_FROM_NAME || 'Clawith',
+                        SYSTEM_EMAIL_FROM_NAME: d.value.SYSTEM_EMAIL_FROM_NAME || 'Digital Employee Platform',
                         SYSTEM_SMTP_HOST: d.value.SYSTEM_SMTP_HOST || '',
                         SYSTEM_SMTP_PORT: d.value.SYSTEM_SMTP_PORT || 465,
                         SYSTEM_SMTP_USERNAME: d.value.SYSTEM_SMTP_USERNAME || '',
@@ -727,7 +727,7 @@ function PlatformTab() {
                             className="form-input"
                             value={systemEmailConfig.SYSTEM_EMAIL_FROM_NAME}
                             onChange={e => setSystemEmailConfig({ ...systemEmailConfig, SYSTEM_EMAIL_FROM_NAME: e.target.value })}
-                            placeholder="Clawith"
+                            placeholder="Digital Employee Platform"
                             style={{ fontSize: '13px' }}
                         />
                     </div>

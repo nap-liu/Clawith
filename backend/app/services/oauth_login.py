@@ -136,7 +136,7 @@ async def exchange_oauth_code_for_user(
     *,
     tenant_id: str | None = None,
 ) -> OAuthCodeLoginResult:
-    """Exchange a code and resolve a Clawith user through the shared SSO path.
+    """Exchange a code and resolve a platform user through the shared SSO path.
 
     ``redirect_uri`` is intentionally absent.  Callers can validate it locally,
     but it must never change the provider token request for this login flow.

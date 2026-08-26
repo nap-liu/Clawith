@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import time
 import asyncio
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from loguru import logger
 
@@ -36,6 +38,89 @@ class BufferedIMThinkingSender:
     _next_send_at: float = 0.0
     _flush_task: asyncio.Task | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @classmethod
+    def for_runtime(
+        cls,
+        *,
+        enabled: bool,
+        agent_id: uuid.UUID,
+        user_id: uuid.UUID,
+        conversation_id: str,
+        turn_anchor_id: uuid.UUID | None = None,
+        delivery_kwargs: dict[str, Any] | None = None,
+        **buffer_kwargs: Any,
+    ) -> "BufferedIMThinkingSender":
+        """Build a sender whose every visible segment uses the normalized outbox."""
+
+        async def _send(text: str) -> None:
+            from app.services.im_delivery import persist_and_deliver_runtime_message
+            from app.services.turn_runtime import load_turn_runtime
+
+            runtime = await load_turn_runtime(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+            )
+            await persist_and_deliver_runtime_message(
+                agent_id=agent_id,
+                user_id=user_id,
+                runtime=runtime,
+                message=text,
+                turn_anchor_id=turn_anchor_id,
+                artifact_role="thinking",
+                **dict(delivery_kwargs or {}),
+            )
+
+        return cls(enabled=enabled, send_text=_send, **buffer_kwargs)
+
+    @classmethod
+    def for_callback(
+        cls,
+        *,
+        enabled: bool,
+        agent_id: uuid.UUID,
+        user_id: uuid.UUID,
+        conversation_id: str,
+        channel: str,
+        transport: str,
+        conversation_ref: str,
+        send_text: SendText,
+        turn_anchor_id: uuid.UUID | None = None,
+        recallable: bool = False,
+        **buffer_kwargs: Any,
+    ) -> "BufferedIMThinkingSender":
+        """Build a sender around an exact callback-only transport adapter."""
+
+        async def _send(text: str) -> None:
+            from app.services.im_delivery import (
+                IMDeliveryPart,
+                IMDeliveryResult,
+                persist_and_deliver_message,
+            )
+
+            async def _deliver(delivery_message: str, on_part) -> IMDeliveryResult:
+                await send_text(delivery_message)
+                part = IMDeliveryPart(
+                    transport=transport,
+                    conversation_ref=conversation_ref,
+                    artifact_role="thinking",
+                    recallable=recallable,
+                )
+                await on_part(part)
+                return IMDeliveryResult.sent(channel, part)
+
+            await persist_and_deliver_message(
+                agent_id=agent_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                channel=channel,
+                message=text,
+                deliver=_deliver,
+                turn_anchor_id=turn_anchor_id,
+                artifact_role="thinking",
+            )
+
+        return cls(enabled=enabled, send_text=_send, **buffer_kwargs)
 
     async def push(self, text: str) -> None:
         should_schedule = False

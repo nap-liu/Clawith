@@ -4,7 +4,7 @@ import { IconWorld } from '@tabler/icons-react';
 import { readSavedTheme } from '../../utils/themeMode';
 
 interface Props {
-    /** When provided, replaces the Clawith brand with a "← BACK" pill button */
+    /** When provided, replaces the platform brand with a "← BACK" pill button */
     onBack?: () => void;
     /** When provided, renders the language toggle in the top-right corner */
     onToggleLang?: () => void;

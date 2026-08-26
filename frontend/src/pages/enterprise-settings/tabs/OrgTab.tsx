@@ -329,7 +329,7 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                                 className="form-input"
                                 value={ssoDomain}
                                 onChange={e => setSsoDomain(e.target.value)}
-                                placeholder={t('enterprise.identity.ssoDomainPlaceholder', 'e.g. acme.clawith.com')}
+                                placeholder={t('enterprise.identity.ssoDomainPlaceholder', 'e.g. login.example.com')}
                                 style={{ fontSize: '13px', width: '100%', maxWidth: '400px' }}
                             />
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
@@ -809,7 +809,7 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                                         )}
                                     </div>
                                     <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                        Sign in with a Google Workspace admin account to grant directory read access. Clawith will securely store a refresh token and use it for scheduled sync.
+                                        Sign in with a Google Workspace admin account to grant directory read access. The platform will securely store a refresh token and use it for scheduled sync.
                                     </div>
                                 </div>
                             </div>
