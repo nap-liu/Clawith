@@ -75,9 +75,9 @@ async def project_runtime_allows_agent(db: AsyncSession, agent: Agent) -> bool:
     with the same switch used by Project Runs and collaboration.
     """
 
-    if agent.scope != "project":
+    if getattr(agent, "scope", "standard") != "project":
         return True
-    if agent.project_id is None:
+    if getattr(agent, "project_id", None) is None:
         return False
     status_value = await db.scalar(select(Project.status).where(Project.id == agent.project_id))
     return status_value == PROJECT_RUNTIME_STATUS_RUNNING
@@ -878,14 +878,164 @@ async def replace_access_grants(
     project.visibility = "shared" if unique_ids else "private"
 
 
+async def _validate_project_create_inputs(
+    db: AsyncSession,
+    user: User,
+    data: ProjectCreate,
+    tenant_id: uuid.UUID,
+) -> list[ProjectMemberCreate]:
+    """Validate every external reference before creating managed storage."""
+
+    git_config = dict((data.settings or {}).get("git") or {})
+    git_mode = git_config.get("mode") or git_config.get("repository_mode", "managed")
+    if git_mode != "managed":
+        raise HTTPException(status_code=501, detail="External Git repositories require a connector")
+    shared_user_ids = set(data.shared_with_user_ids)
+    shared_user_ids.discard(user.id)
+    if data.visibility == "shared" and not shared_user_ids:
+        raise HTTPException(status_code=422, detail="shared visibility requires shared_with_user_ids")
+    if shared_user_ids:
+        valid_user_ids = set(
+            (
+                await db.execute(
+                    select(User.id).where(
+                        User.id.in_(shared_user_ids),
+                        User.tenant_id == tenant_id,
+                        User.is_active.is_(True),
+                    )
+                )
+            ).scalars()
+        )
+        if valid_user_ids != shared_user_ids:
+            raise HTTPException(status_code=422, detail="Every shared user must be active in the project tenant")
+
+    members = [member.model_copy(deep=True) for member in data.members]
+    member_ids = [member.agent_id for member in members]
+    if len(member_ids) != len(set(member_ids)):
+        raise HTTPException(status_code=422, detail="A project cannot include the same digital employee twice")
+    leader_count = sum(member.is_leader for member in members)
+    if leader_count > 1:
+        raise HTTPException(status_code=422, detail="A project can have only one leader")
+    if members and leader_count == 0:
+        members[0] = members[0].model_copy(update={"is_leader": True})
+
+    if member_ids:
+        from app.core.permissions import build_visible_agents_query
+
+        sources = (
+            (
+                await db.execute(
+                    build_visible_agents_query(user, tenant_id=tenant_id).where(Agent.id.in_(set(member_ids)))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        sources_by_id = {source.id: source for source in sources}
+        if set(sources_by_id) != set(member_ids):
+            raise HTTPException(status_code=422, detail="源数字员工不可用")
+        if any(source.agent_type != "native" for source in sources):
+            raise HTTPException(status_code=422, detail="仅原生数字员工可复制到项目")
+
+    inherited_sources = {
+        capability.inherited_from_agent_id
+        for capability in data.capabilities
+        if capability.source == "inherited"
+    }
+    if None in inherited_sources or not inherited_sources.issubset(set(member_ids)):
+        raise HTTPException(status_code=422, detail="Inherited capability source must be a selected project member")
+
+    for capability in data.capabilities:
+        await _resolve_capability(db, tenant_id, capability)
+
+    selected_tool_ids = {
+        capability_id
+        for member in members
+        for capability_id in member.enabled_inherited_capability_ids
+    }
+    explicit_tool_ids = {
+        capability.capability_id
+        for capability in data.capabilities
+        if capability.capability_type == "tool" and capability.capability_id is not None
+    }
+    tool_ids = selected_tool_ids | explicit_tool_ids
+    if tool_ids:
+        available_tool_ids = set(
+            (
+                await db.execute(
+                    select(Tool.id).where(
+                        Tool.id.in_(tool_ids),
+                        Tool.enabled.is_(True),
+                        or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+        if available_tool_ids != tool_ids:
+            raise HTTPException(status_code=422, detail="One or more selected tools are unavailable")
+
+    for capability_id in set(data.shared_capability_ids):
+        skill_exists = await db.scalar(
+            select(Skill.id).where(
+                Skill.id == capability_id,
+                or_(Skill.tenant_id == tenant_id, Skill.tenant_id.is_(None)),
+            )
+        )
+        if skill_exists is not None:
+            continue
+        mcp_exists = await db.scalar(
+            select(MCPServer.id).where(
+                MCPServer.id == capability_id,
+                or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None)),
+            )
+        )
+        if mcp_exists is None:
+            raise HTTPException(status_code=422, detail=f"Capability {capability_id} is unavailable")
+    return members
+
+
 async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> Project:
     tenant_id = _tenant_id(user)
+    members = await _validate_project_create_inputs(db, user, data, tenant_id)
+    project_id = uuid.uuid4()
+    try:
+        return await _create_project_uncompensated(
+            db,
+            user,
+            data,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            members=members,
+        )
+    except Exception:
+        from app.services.project_git_service import remove_project_repository
+
+        cleanup_target = Project(id=project_id, tenant_id=tenant_id)
+        try:
+            await remove_project_repository(cleanup_target)
+        except Exception:
+            # Preserve the original create failure. Storage cleanup is
+            # idempotent and is retried by the API transaction boundary.
+            pass
+        raise
+
+
+async def _create_project_uncompensated(
+    db: AsyncSession,
+    user: User,
+    data: ProjectCreate,
+    *,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    members: list[ProjectMemberCreate],
+) -> Project:
     settings = dict(data.settings or {})
     settings["planning"] = {
         **dict(settings.get("planning") or {}),
         "conversation_mode": "project_group",
     }
     project = Project(
+        id=project_id,
         tenant_id=tenant_id,
         owner_user_id=user.id,
         template_id=data.template_id,
@@ -897,19 +1047,16 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
         status=data.status,
         settings=settings,
     )
-    db.add(project)
-    await db.flush()
-
     from app.services.project_git_service import (
         initialize_project_repo,
         project_user_git_email,
         reconcile_project_repository_operations,
     )
 
+    db.add(project)
+    await db.flush()
     git_config = dict((project.settings or {}).get("git") or {})
     git_mode = git_config.get("mode") or git_config.get("repository_mode", "managed")
-    if git_mode != "managed":
-        raise HTTPException(status_code=501, detail="External Git repositories require a connector")
     git_state = await initialize_project_repo(
         project,
         author_name=user.display_name,
@@ -920,14 +1067,6 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
         "git": {**git_config, "mode": git_mode, **git_state},
     }
     await reconcile_project_repository_operations(project.id, db=db)
-
-    members = list(data.members)
-    if members:
-        leader_count = sum(member.is_leader for member in members)
-        if leader_count > 1:
-            raise HTTPException(status_code=422, detail="A project can have only one leader")
-        if leader_count == 0:
-            members[0].is_leader = True
 
     # A newly created project owns independent digital employees. The selected
     # standard employees are sources for a one-time copy, never live members of

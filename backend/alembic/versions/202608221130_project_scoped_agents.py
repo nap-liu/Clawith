@@ -65,6 +65,56 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Older releases do not understand project scope and would expose these
+    # rows in the global Agent directory. A rollback therefore removes the new
+    # project domain before dropping its discriminator columns. Production
+    # rollback requires the release backup made before migration so project
+    # data can be restored when this version is promoted again.
+    # Project runtime writes also appear in established audit/session tables.
+    # Remove only rows that point at project Agents before deleting the owning
+    # project. The catalog loop keeps this compatible with every pre-project
+    # table that has a NO ACTION/RESTRICT Agent reference, without encoding a
+    # second copy of the platform schema here.
+    op.execute("DELETE FROM project_run_member_snapshots")
+    op.execute("DELETE FROM project_member_snapshots")
+    op.execute(
+        """
+        DO $$
+        DECLARE
+            reference record;
+        BEGIN
+            FOR reference IN
+                SELECT namespace.nspname AS schema_name,
+                       relation.relname AS table_name,
+                       attribute.attname AS column_name
+                  FROM pg_constraint constraint_row
+                  JOIN pg_class relation
+                    ON relation.oid = constraint_row.conrelid
+                  JOIN pg_namespace namespace
+                    ON namespace.oid = relation.relnamespace
+                  JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY key_column(attnum, ord)
+                    ON true
+                  JOIN pg_attribute attribute
+                    ON attribute.attrelid = constraint_row.conrelid
+                   AND attribute.attnum = key_column.attnum
+                 WHERE constraint_row.contype = 'f'
+                   AND constraint_row.confrelid = 'agents'::regclass
+                   AND constraint_row.confdeltype IN ('a', 'r')
+                   AND relation.relname NOT LIKE 'project_%'
+            LOOP
+                EXECUTE format(
+                    'DELETE FROM %I.%I WHERE %I IN (SELECT id FROM agents WHERE scope = ''project'')',
+                    reference.schema_name,
+                    reference.table_name,
+                    reference.column_name
+                );
+            END LOOP;
+        END
+        $$
+        """
+    )
+    op.execute("DELETE FROM projects")
+    op.execute("DELETE FROM agents WHERE scope = 'project'")
     op.drop_index("ix_agents_source_agent_id", table_name="agents")
     op.drop_index("ix_agents_project_id", table_name="agents")
     op.drop_constraint("ck_agents_project_scope", "agents", type_="check")

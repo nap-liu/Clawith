@@ -53,9 +53,12 @@ TABLES = [
     "users",
     "agent_templates",
     "agents",
+    "agent_permissions",
     "tools",
     "agent_tools",
     "agent_agent_relationships",
+    "org_departments",
+    "org_members",
     "participants",
     "project_templates",
     "projects",
@@ -221,11 +224,7 @@ async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatc
     assert (await require_project(db, viewer, project.id, edit=True)).id == project.id
 
 
-async def test_run_freezes_member_and_effective_capability_snapshots(db, monkeypatch):
-    async def fake_git(_project, **_kwargs):
-        return {"mode": "managed", "head": "b" * 40, "default_branch": "main"}
-
-    monkeypatch.setattr("app.services.project_git_service.initialize_project_repo", fake_git)
+async def test_run_freezes_member_and_effective_capability_snapshots(db):
     tenant = await _tenant(db, "Snapshot")
     owner = await _user(db, tenant, "Owner")
     leader = Agent(
@@ -281,9 +280,21 @@ async def test_run_freezes_member_and_effective_capability_snapshots(db, monkeyp
 
     worker_member = (
         await db.execute(
-            select(ProjectMemberSnapshot).where(
+            select(ProjectMemberSnapshot)
+            .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
+            .where(
                 ProjectMemberSnapshot.project_id == project.id,
-                ProjectMemberSnapshot.agent_id == worker.id,
+                Agent.source_agent_id == worker.id,
+            )
+        )
+    ).scalar_one()
+    leader_member = (
+        await db.execute(
+            select(ProjectMemberSnapshot)
+            .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
+            .where(
+                ProjectMemberSnapshot.project_id == project.id,
+                Agent.source_agent_id == leader.id,
             )
         )
     ).scalar_one()
@@ -298,14 +309,19 @@ async def test_run_freezes_member_and_effective_capability_snapshots(db, monkeyp
     db.add(inherited_run)
     await db.flush()
     inherited = await freeze_run_members(db, project, inherited_run, source_run_id=run.id)
-    inherited_worker = next(snapshot for snapshot in inherited if snapshot.agent_id == worker.id)
-    original_worker = next(snapshot for snapshot in snapshots if snapshot.agent_id == worker.id)
+    inherited_worker = next(snapshot for snapshot in inherited if snapshot.agent_id == worker_member.agent_id)
+    original_worker = next(snapshot for snapshot in snapshots if snapshot.agent_id == worker_member.agent_id)
     assert inherited_worker.member_config_snapshot == original_worker.member_config_snapshot
     assert inherited_worker.member_config_snapshot.get("project_instruction") != "later edit"
 
-    resolved = await resolve_agent_recipient(db, leader.id, worker.id, project_id=project.id)
-    assert resolved.source_agent.id == leader.id
-    assert resolved.target_agent.id == worker.id
+    resolved = await resolve_agent_recipient(
+        db,
+        leader_member.agent_id,
+        worker_member.agent_id,
+        project_id=project.id,
+    )
+    assert resolved.source_agent.id == leader_member.agent_id
+    assert resolved.target_agent.id == worker_member.agent_id
     assert resolved.relationship is None
     with pytest.raises(RecipientResolutionError) as not_globally_related:
         await resolve_agent_recipient(db, leader.id, worker.id)

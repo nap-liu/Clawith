@@ -936,15 +936,30 @@ async def create_project_from_template(
             else []
         )
         portable_capabilities = [item for item in template_capabilities_to_restore if isinstance(item, dict)]
+        restored_tool_ids = {
+            str(item.get("capability_id"))
+            for item in portable_capabilities
+            if item.get("capability_type") == "tool" and item.get("capability_id")
+        }
+        restored_connection_ids = {
+            str(item.get("capability_id"))
+            for item in portable_capabilities
+            if item.get("capability_type") == "mcp" and item.get("capability_id")
+        }
         summary["template_setup_summary"] = {
             "restored_file_count": len(restored_files),
             "restored_digital_employee_count": len(created_agents),
             "restored_skill_count": len(packaged_skill_assets) if isinstance(packaged_skill_assets, list) else 0,
-            "restored_connection_count": sum(item.get("capability_type") == "mcp" for item in portable_capabilities),
-            "restored_tool_count": sum(item.get("capability_type") == "tool" for item in portable_capabilities),
+            "restored_connection_count": len(restored_connection_ids),
+            "restored_tool_count": len(restored_tool_ids),
         }
+        # Project rows and their managed repository form one product-level
+        # creation boundary. Commit here so a database commit failure can still
+        # compensate the repository before the request dependency exits.
+        await db.commit()
         return summary
     except Exception:
+        await db.rollback()
         try:
             await remove_project_repository(project)
         except Exception:
@@ -986,7 +1001,17 @@ async def post_project(
     db: AsyncSession = Depends(get_db),
 ):
     project = await create_project(db, current_user, data)
-    return await project_summary(db, project, actor_user_id=current_user.id)
+    try:
+        summary = await project_summary(db, project, actor_user_id=current_user.id)
+        await db.commit()
+        return summary
+    except Exception:
+        await db.rollback()
+        try:
+            await remove_project_repository(project)
+        except Exception:
+            logger.exception("Failed to compensate project storage for project {}", project.id)
+        raise
 
 
 @router.post("/{project_id}/templates", status_code=status.HTTP_201_CREATED)
@@ -1187,7 +1212,10 @@ async def get_project_template_manifest(
                 "member_indexes": set(),
             },
         )
-        grouped["is_enabled"] = grouped["is_enabled"] or bool(item.get("is_enabled", True))
+        item_enabled = bool(item.get("is_enabled", True))
+        grouped["is_enabled"] = grouped["is_enabled"] or item_enabled
+        if not item_enabled:
+            continue
         if item.get("source") == "shared":
             grouped["member_indexes"].update(range(len(members)))
         else:
@@ -1222,8 +1250,8 @@ async def get_project_template_manifest(
                 "key": observed.get("key"),
                 "name": grouped["name"],
                 "description": observed["description"],
-                "selected": True,
-                "selection_state": "selected",
+                "selected": grouped["is_enabled"],
+                "selection_state": "selected" if grouped["is_enabled"] else "unselected",
                 "is_enabled": grouped["is_enabled"],
                 "availability": observed["availability"],
                 "affected_members": [
@@ -2095,6 +2123,7 @@ async def put_project_member_tools(
 
     if agent.scope == "project" and agent.project_id == project.id:
         for update in updates:
+            tool = tool_by_id[update.tool_id]
             assignment = assignments.get(str(update.tool_id))
             if assignment is None:
                 assignment = AgentTool(
@@ -2106,6 +2135,27 @@ async def put_project_member_tools(
                 db.add(assignment)
             else:
                 assignment.enabled = update.enabled
+            capability_type = "mcp" if tool.type == "mcp" else "tool"
+            capability_id = tool.mcp_server_id if capability_type == "mcp" else tool.id
+            if capability_id is not None:
+                matching_bindings = (
+                    (
+                        await db.execute(
+                            select(ProjectCapabilityBinding).where(
+                                ProjectCapabilityBinding.project_id == project.id,
+                                ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                                ProjectCapabilityBinding.capability_type == capability_type,
+                                ProjectCapabilityBinding.capability_id == capability_id,
+                                ProjectCapabilityBinding.source == "inherited",
+                                ProjectCapabilityBinding.inherited_from_agent_id == agent.id,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for binding in matching_bindings:
+                    binding.is_enabled = update.enabled
     else:
         config = dict(member.config_snapshot or {})
         enabled = {str(name) for name in config.get("enabled_platform_tools", [])}

@@ -152,14 +152,15 @@ async def _load_accessible_session(
     session_id: uuid.UUID,
 ) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
     """Resolve one session and the web picker scope that can display it."""
-    candidate = await db.get(ChatSession, session_id)
+    get_row = getattr(db, "get", None)
+    candidate = await get_row(ChatSession, session_id) if callable(get_row) else None
     project_access: str | None = None
     if candidate is not None and candidate.agent_id == agent_id:
         from app.services.project_service import project_session_access_mode
 
         project_access = await project_session_access_mode(db, current_user, candidate)
     if project_access is not None:
-        agent = await db.get(Agent, agent_id)
+        agent = await get_row(Agent, agent_id)
         if (
             agent is None
             or agent.is_deleted

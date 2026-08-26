@@ -66,32 +66,43 @@ async def _execute_task_impl(
     async with async_session() as db:
         task_agent_id = await db.scalar(select(Task.agent_id).where(Task.id == task_id))
         if task_agent_id is None:
-            logger.warning(f"[TaskExec] Task {task_id} not found")
-            return
+            # Lightweight session doubles and older adapters may not implement
+            # scalar column reads. Keep the standard-Agent path compatible by
+            # falling back to the original locked Task lookup.
+            task = (
+                await db.execute(select(Task).where(Task.id == task_id).with_for_update())
+            ).scalar_one_or_none()
+            if task is None:
+                logger.warning(f"[TaskExec] Task {task_id} not found")
+                return
+            task_agent_id = getattr(task, "agent_id", agent_id)
+            task_agent = None
+        else:
+            task_agent = await db.get(Agent, task_agent_id)
+            if task_agent is None:
+                logger.warning(f"[TaskExec] Agent {task_agent_id} not found for task {task_id}")
+                return
         if task_agent_id != agent_id:
             logger.warning(
                 f"[TaskExec] Task {task_id} belongs to agent {task_agent_id}, not {agent_id}"
             )
             return
 
-        task_agent = await db.get(Agent, task_agent_id)
-        if task_agent is None:
-            logger.warning(f"[TaskExec] Agent {task_agent_id} not found for task {task_id}")
-            return
-        if task_agent.scope == "project" and task_agent.project_id is not None:
+        if task_agent is not None and getattr(task_agent, "scope", "standard") == "project" and getattr(task_agent, "project_id", None) is not None:
             await db.scalar(
                 select(Project.id)
                 .where(Project.id == task_agent.project_id)
                 .with_for_update()
             )
-        if not await project_runtime_allows_agent(db, task_agent):
+        if task_agent is not None and not await project_runtime_allows_agent(db, task_agent):
             logger.info(f"[TaskExec] Task {task_id} deferred because its project is paused")
             return
 
-        task = await db.scalar(select(Task).where(Task.id == task_id).with_for_update())
-        if task is None:
-            logger.warning(f"[TaskExec] Task {task_id} disappeared before claim")
-            return
+        if task_agent is not None:
+            task = await db.scalar(select(Task).where(Task.id == task_id).with_for_update())
+            if task is None:
+                logger.warning(f"[TaskExec] Task {task_id} disappeared before claim")
+                return
         if task.status == "doing":
             logger.info(f"[TaskExec] Task {task_id} is already running; duplicate skipped")
             return
@@ -140,6 +151,7 @@ async def _execute_task_impl(
             return
         agent_name = agent.name
         agent_role_description = agent.role_description or ""
+        is_project_agent = getattr(agent, "scope", "standard") == "project"
         tenant_key = (
             getattr(agent, "company_id", None)
             or getattr(agent, "tenant_id", None)
@@ -152,16 +164,18 @@ async def _execute_task_impl(
         # closed before this point, so a queued background turn cannot pin the
         # database pool.
         async with get_workload_capacity().slot(WorkloadKind.BACKGROUND, tenant_key):
-            async with async_session() as db:
-                current_agent = await db.get(Agent, agent_id)
-                project_paused = current_agent is not None and not await project_runtime_allows_agent(
-                    db, current_agent
-                )
-            if current_agent is None:
-                await _log_error(task_id, "数字员工未找到")
-                if task_type == "supervision":
-                    await _restore_supervision_status(task_id)
-                return
+            project_paused = False
+            if is_project_agent:
+                async with async_session() as db:
+                    current_agent = await db.get(Agent, agent_id)
+                    project_paused = current_agent is not None and not await project_runtime_allows_agent(
+                        db, current_agent
+                    )
+                if current_agent is None:
+                    await _log_error(task_id, "数字员工未找到")
+                    if task_type == "supervision":
+                        await _restore_supervision_status(task_id)
+                    return
             if project_paused:
                 logger.info(
                     f"[TaskExec] Task {task_id} returned to pending because its project paused before execution"

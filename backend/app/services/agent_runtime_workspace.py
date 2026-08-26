@@ -8,6 +8,7 @@ querying project state or duplicating scope conditionals.
 from __future__ import annotations
 
 import uuid
+import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -20,6 +21,19 @@ from app.services.storage_runtime.facade import normalize_storage_key
 
 PROJECT_AGENT_SCOPE = "project"
 PROJECT_AGENT_RUNTIME_CONFIG_KEY = "agent_runtime_workspace"
+_LEGACY_AGENT_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _normalize_standard_agent_id(agent_id: uuid.UUID | str) -> uuid.UUID | str:
+    """Preserve legacy opaque test/adapter IDs without weakening path safety."""
+
+    raw = str(agent_id).strip()
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        if not _LEGACY_AGENT_KEY_RE.fullmatch(raw):
+            raise ValueError("Invalid standard Agent identifier") from None
+        return raw
 
 
 def _normalize_relative_path(path: str) -> str:
@@ -41,7 +55,7 @@ def _normalize_relative_path(path: str) -> str:
 class AgentRuntimeWorkspace:
     """Canonical local and storage roots for one Agent execution."""
 
-    agent_id: uuid.UUID
+    agent_id: uuid.UUID | str
     local_root: Path
     storage_prefix: str
     project_id: uuid.UUID | None = None
@@ -103,7 +117,7 @@ _active_workspace: ContextVar[AgentRuntimeWorkspace | None] = ContextVar(
 
 
 def standard_agent_runtime_workspace(agent_id: uuid.UUID | str) -> AgentRuntimeWorkspace:
-    normalized_agent_id = uuid.UUID(str(agent_id))
+    normalized_agent_id = _normalize_standard_agent_id(agent_id)
     settings = get_settings()
     local_root = Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR).expanduser().resolve()
     return AgentRuntimeWorkspace(
@@ -152,9 +166,9 @@ def resolve_agent_runtime_workspace(
     session_config: Mapping[str, object] | None = None,
 ) -> AgentRuntimeWorkspace:
     """Resolve a runtime route from already-loaded Agent/session identity."""
-    normalized_agent_id = uuid.UUID(str(agent_id))
     if str(agent_scope or "").strip().lower() != PROJECT_AGENT_SCOPE:
-        return standard_agent_runtime_workspace(normalized_agent_id)
+        return standard_agent_runtime_workspace(agent_id)
+    normalized_agent_id = uuid.UUID(str(agent_id))
     if tenant_id is None or agent_project_id is None or session_project_id is None:
         raise ValueError("Project Agent execution requires tenant and project scope")
 
@@ -179,7 +193,7 @@ def resolve_agent_runtime_workspace(
 
 
 def current_agent_runtime_workspace(agent_id: uuid.UUID | str) -> AgentRuntimeWorkspace:
-    normalized_agent_id = uuid.UUID(str(agent_id))
+    normalized_agent_id = _normalize_standard_agent_id(agent_id)
     active = _active_workspace.get()
     if active is None:
         return standard_agent_runtime_workspace(normalized_agent_id)

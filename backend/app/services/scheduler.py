@@ -97,6 +97,7 @@ async def _execute_schedule(
 
             agent_name = agent.name
             role_description = agent.role_description or ""
+            is_project_agent = getattr(agent, "scope", "standard") == "project"
             tenant_key = (
                 getattr(agent, "company_id", None) or getattr(agent, "tenant_id", None) or execution_user_id or agent_id
             )
@@ -107,11 +108,12 @@ async def _execute_schedule(
         # Admission can queue for a bounded period, so it must happen only
         # after the agent read session has returned its connection.
         async with get_workload_capacity().slot(WorkloadKind.SCHEDULED, tenant_key):
-            async with async_session() as db:
-                current_agent = await db.get(Agent, agent_id)
-                if current_agent is None or not await project_runtime_allows_agent(db, current_agent):
-                    logger.info(f"Schedule {schedule_id}: project paused while waiting for capacity, deferring")
-                    return ScheduleExecutionOutcome.RETRYABLE
+            if is_project_agent:
+                async with async_session() as db:
+                    current_agent = await db.get(Agent, agent_id)
+                    if current_agent is None or not await project_runtime_allows_agent(db, current_agent):
+                        logger.info(f"Schedule {schedule_id}: project paused while waiting for capacity, deferring")
+                        return ScheduleExecutionOutcome.RETRYABLE
             static_prompt, dynamic_prompt = await build_agent_context(
                 agent_id,
                 agent_name,

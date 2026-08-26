@@ -27,7 +27,7 @@ from typing import Any, AsyncIterator
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models.agent  # noqa: F401
@@ -71,6 +71,7 @@ TABLES = [
     "agent_templates",
     "agents",
     "agent_permissions",
+    "mcp_servers",
     "tools",
     "agent_tools",
     "agent_agent_relationships",
@@ -103,6 +104,9 @@ class ProjectApiEnv:
     tenant_id: uuid.UUID
     owner_id: uuid.UUID
     viewer_id: uuid.UUID
+    source_leader_id: uuid.UUID
+    source_worker_id: uuid.UUID
+    source_reviewer_id: uuid.UUID
     leader_id: uuid.UUID
     worker_id: uuid.UUID
     reviewer_id: uuid.UUID
@@ -160,8 +164,6 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
     database_url = os.environ.get("PROJECT_TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
     engine = create_async_engine(database_url)
     table_names = list(TABLES)
-    if database_url.startswith("postgresql"):
-        table_names.insert(table_names.index("tools"), "mcp_servers")
     async with engine.begin() as connection:
         if os.environ.get("PROJECT_TEST_DATABASE_URL"):
             await connection.exec_driver_sql("DROP SCHEMA public CASCADE")
@@ -268,6 +270,9 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
             tenant_id=tenant_id,
             owner_id=owner_id,
             viewer_id=viewer_id,
+            source_leader_id=leader_id,
+            source_worker_id=worker_id,
+            source_reviewer_id=reviewer_id,
             leader_id=leader_id,
             worker_id=worker_id,
             reviewer_id=reviewer_id,
@@ -298,9 +303,9 @@ async def _create_project(
             "goal": "Deliver a traceable result",
             "success_criteria": ["Evidence is committed", "Review is recorded"],
             "members": [
-                {"agent_id": str(leader_id or env.leader_id), "is_leader": True},
-                {"agent_id": str(env.worker_id)},
-                {"agent_id": str(env.reviewer_id)},
+                {"agent_id": str(leader_id or env.source_leader_id), "is_leader": True},
+                {"agent_id": str(env.source_worker_id)},
+                {"agent_id": str(env.source_reviewer_id)},
             ],
             "capabilities": [
                 {
@@ -313,7 +318,7 @@ async def _create_project(
                     "capability_type": "tool",
                     "capability_name": "worker-private-tool",
                     "source": "inherited",
-                    "inherited_from_agent_id": str(env.worker_id),
+                    "inherited_from_agent_id": str(env.source_worker_id),
                     "scope": {"paths": ["deliverables/**"]},
                 },
             ],
@@ -325,7 +330,15 @@ async def _create_project(
         },
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    project = response.json()
+    member_ids_by_name = {
+        member["agent_name"]: uuid.UUID(member["agent_id"])
+        for member in project["members"]
+    }
+    env.leader_id = member_ids_by_name.get("Leader", env.leader_id)
+    env.worker_id = member_ids_by_name.get("Worker", env.worker_id)
+    env.reviewer_id = member_ids_by_name.get("Reviewer", env.reviewer_id)
+    return project
 
 
 async def _create_work_item(
@@ -353,6 +366,60 @@ async def _mark_project_running(env: ProjectApiEnv, project_id: str | uuid.UUID)
     assert project is not None
     project.status = "running"
     await env.db.commit()
+
+
+async def test_project_create_validates_before_managed_storage(project_api: ProjectApiEnv):
+    env = project_api
+    response = await env.client.post(
+        "/api/projects",
+        json={"name": "Invalid share", "visibility": "shared", "shared_with_user_ids": []},
+    )
+
+    assert response.status_code == 422
+    tenant_storage = env.storage_root / "_projects" / str(env.tenant_id)
+    assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
+
+
+async def test_project_create_removes_managed_storage_after_service_failure(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    env = project_api
+
+    async def fail_agent_copy(*_args, **_kwargs):
+        raise RuntimeError("forced project Agent failure")
+
+    monkeypatch.setattr("app.services.project_agent_service.create_project_agent", fail_agent_copy)
+    with pytest.raises(RuntimeError, match="forced project Agent failure"):
+        await env.client.post(
+            "/api/projects",
+            json={
+                "name": "Compensated failure",
+                "members": [{"agent_id": str(env.leader_id), "is_leader": True}],
+            },
+        )
+
+    tenant_storage = env.storage_root / "_projects" / str(env.tenant_id)
+    assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
+    assert await env.db.scalar(select(func.count()).select_from(Project)) == 0
+
+
+async def test_project_create_removes_managed_storage_after_commit_failure(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    env = project_api
+
+    async def fail_commit():
+        raise RuntimeError("forced commit failure")
+
+    monkeypatch.setattr(env.db, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="forced commit failure"):
+        await env.client.post("/api/projects", json={"name": "Commit failure"})
+
+    tenant_storage = env.storage_root / "_projects" / str(env.tenant_id)
+    assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
+    assert await env.db.scalar(select(func.count()).select_from(Project)) == 0
 
 
 async def test_private_share_settings_and_audit_are_a_real_api_round_trip(project_api: ProjectApiEnv):
@@ -1189,7 +1256,7 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     assert lifecycle_events[1].event_metadata["old_sessions_remain_read_only"] is True
 
 
-async def test_project_editor_can_remove_and_restore_participant_but_viewer_cannot(
+async def test_only_project_owner_can_remove_and_restore_project_agent_members(
     project_api: ProjectApiEnv,
 ):
     from app.models.chat_session import ChatSession
@@ -1242,6 +1309,13 @@ async def test_project_editor_can_remove_and_restore_participant_but_viewer_cann
     removed = await env.client.post(
         f"/api/projects/{project_id}/members/{reviewer['id']}/remove",
         json={"reason": "editor staffing"},
+    )
+    assert removed.status_code == 404
+
+    env.authenticate_as(env.owner_id)
+    removed = await env.client.post(
+        f"/api/projects/{project_id}/members/{reviewer['id']}/remove",
+        json={"reason": "owner staffing"},
     )
     assert removed.status_code == 200, removed.text
     viewer_user = await env.db.get(User, env.viewer_id)
@@ -1315,7 +1389,22 @@ async def test_manual_run_requires_kickoff_and_dispatches_default_leader(project
         )
     ).scalar_one()
     assert tenant is not None and tenant.default_model_id is not None
-    assert anchor.message_meta["model_id"] == str(tenant.default_model_id)
+    tenant_model = await env.db.get(LLMModel, tenant.default_model_id)
+    assert tenant_model is not None
+    assert child.model is None
+    from app.services.chat_model_selection import resolve_project_member_runtime_models
+
+    project_agent = await env.db.get(Agent, env.leader_id)
+    assert project_agent is not None
+    resolved_models = await resolve_project_member_runtime_models(
+        env.db,
+        agent=project_agent,
+        member_config=child_session.im_config["member_config_snapshot"],
+        project_settings=stored_project.settings,
+    )
+    assert resolved_models.primary_model is not None
+    assert resolved_models.primary_model.id == tenant_model.id
+    assert "model_id" not in anchor.message_meta
 
 
 async def test_project_run_and_leader_batch_use_frozen_shared_execution_user(
@@ -1489,7 +1578,8 @@ async def test_project_run_without_agent_model_uses_exact_project_model(
     ).scalar_one()
     assert child is not None and child.project_id == project_id
     assert project_run is not None and project_run.status in {"queued", "running"}
-    assert anchor.message_meta["model_id"] == str(selected.id)
+    assert child.model is None
+    assert "model_id" not in anchor.message_meta
 
     # Historical project child inputs did not carry a per-turn model snapshot.
     # The unified channel path must still resolve the same project model rather
@@ -1509,8 +1599,20 @@ async def test_project_run_without_agent_model_uses_exact_project_model(
     monkeypatch.setattr("app.services.llm.call_llm_with_failover", _fake_llm)
     monkeypatch.setattr("app.services.channel_llm.is_agent_expired", lambda _agent: False)
     from app.services.channel_llm import _call_agent_llm
+    from app.services.agent_runtime_workspace import resolve_agent_runtime_workspace
 
     async with env.session_factory() as runtime_db:
+        runtime_agent = await runtime_db.get(Agent, env.worker_id)
+        runtime_session = await runtime_db.get(ChatSession, child_id)
+        assert runtime_agent is not None and runtime_session is not None
+        runtime_workspace = resolve_agent_runtime_workspace(
+            agent_id=runtime_agent.id,
+            agent_scope=runtime_agent.scope,
+            agent_project_id=runtime_agent.project_id,
+            tenant_id=runtime_agent.tenant_id,
+            session_project_id=runtime_session.project_id,
+            session_config=runtime_session.im_config,
+        )
         reply = await _call_agent_llm(
             runtime_db,
             env.worker_id,
@@ -1520,12 +1622,14 @@ async def test_project_run_without_agent_model_uses_exact_project_model(
             turn_anchor_id=anchor.id,
             prepared_tools=[],
             broadcast_web=False,
+            runtime_session=runtime_session,
+            runtime_workspace=runtime_workspace,
         )
     assert reply == "project model works"
     assert captured["primary_model"].id == selected.id
 
 
-async def test_project_run_without_any_tenant_model_fails_without_child(project_api: ProjectApiEnv):
+async def test_project_run_without_any_tenant_model_keeps_a_durable_unresolved_child(project_api: ProjectApiEnv):
     from app.models.project import ProjectRun
     from app.models.subagent_run import SubagentRun
 
@@ -1572,10 +1676,10 @@ async def test_project_run_without_any_tenant_model_fails_without_child(project_
     payload = response.json()
     project_run = await env.db.get(ProjectRun, uuid.UUID(payload["id"]))
     children = (await env.db.execute(select(SubagentRun).where(SubagentRun.project_id == project_id))).scalars().all()
-    assert project_run is not None and project_run.status == "failed"
-    assert "没有可用的 LLM 模型" in str(project_run.error)
-    assert payload["output"].get("subagent_session_id") is None
-    assert children == []
+    assert project_run is not None and project_run.status in {"queued", "running"}
+    assert project_run.error is None
+    assert payload["output"].get("subagent_session_id")
+    assert len(children) == 1 and children[0].model is None
 
 
 async def test_project_run_reconcile_persists_finished_terminal_state(project_api: ProjectApiEnv):
@@ -2642,6 +2746,10 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
         output={"session_id": str(a2a_session_id)},
     )
     env.db.add(failure_run)
+    await env.db.flush()
+    project_row = await env.db.get(Project, project_id)
+    assert project_row is not None
+    await freeze_run_members(env.db, project_row, failure_run)
     await env.db.commit()
     failure_run_id = failure_run.id
     await subagent_runtime.append_subagent_message(
@@ -4472,7 +4580,7 @@ async def test_work_item_mutations_update_dashboard_and_audit(project_api: Proje
             "title": "Review evidence",
             "parent_id": parent.json()["id"],
             "dependency_ids": [parent.json()["id"]],
-            "assignee_agent_id": str(env.reviewer.id),
+            "assignee_agent_id": str(env.reviewer_id),
             "status": "todo",
         },
     )
@@ -5578,26 +5686,26 @@ async def test_concurrent_member_file_deliveries_keep_their_exact_parent_session
     env = project_api
     project = await _create_project(env, name="Concurrent exact file routing")
     project_id = uuid.UUID(project["id"])
-    senders = [env.worker, env.reviewer]
-    routes: list[tuple[Agent, ChatSession, ChatSession]] = []
+    senders = [(env.worker_id, "Worker"), (env.reviewer_id, "Reviewer")]
+    routes: list[tuple[uuid.UUID, str, ChatSession, ChatSession]] = []
 
-    for index, sender in enumerate(senders):
+    for index, (sender_id, sender_name) in enumerate(senders):
         member = (
             await env.db.execute(
                 select(ProjectMemberSnapshot).where(
                     ProjectMemberSnapshot.project_id == project_id,
-                    ProjectMemberSnapshot.agent_id == sender.id,
+                    ProjectMemberSnapshot.agent_id == sender_id,
                 )
             )
         ).scalar_one()
-        access_agent_id = min(sender.id, env.leader_id, key=str)
-        peer_agent_id = max(sender.id, env.leader_id, key=str)
+        access_agent_id = min(sender_id, env.leader_id, key=str)
+        peer_agent_id = max(sender_id, env.leader_id, key=str)
         decoy = ChatSession(
             project_id=project_id,
             agent_id=access_agent_id,
             peer_agent_id=peer_agent_id,
             source_channel="agent",
-            title=f"{sender.name} old thread",
+            title=f"{sender_name} old thread",
             external_conv_id=f"a2a-decoy-{index}",
         )
         parent = ChatSession(
@@ -5605,14 +5713,14 @@ async def test_concurrent_member_file_deliveries_keep_their_exact_parent_session
             agent_id=access_agent_id,
             peer_agent_id=peer_agent_id,
             source_channel="agent",
-            title=f"{sender.name} current thread",
+            title=f"{sender_name} current thread",
             external_conv_id=f"a2a-current-{index}",
         )
         child = ChatSession(
             project_id=project_id,
-            agent_id=sender.id,
+            agent_id=sender_id,
             source_channel="subagent",
-            title=f"{sender.name} project child",
+            title=f"{sender_name} project child",
             external_conv_id=f"subagent-file-{index}",
         )
         env.db.add_all([decoy, parent, child])
@@ -5629,23 +5737,23 @@ async def test_concurrent_member_file_deliveries_keep_their_exact_parent_session
                 status="running",
             )
         )
-        routes.append((sender, parent, child))
+        routes.append((sender_id, sender_name, parent, child))
     await env.db.commit()
 
-    async def deliver(index: int, sender: Agent, child: ChatSession) -> uuid.UUID:
+    async def deliver(index: int, sender_id: uuid.UUID, sender_name: str, child: ChatSession) -> uuid.UUID:
         async with env.session_factory() as db:
             scope = await resolve_a2a_file_origin_scope(
                 db,
                 origin_session_id=child.id,
-                sender_agent_id=sender.id,
+                sender_agent_id=sender_id,
             )
             session_id = await append_a2a_file_delivery_message(
                 db,
-                sender_agent_id=sender.id,
+                sender_agent_id=sender_id,
                 target_agent_id=env.leader_id,
                 sender_creator_id=env.owner_id,
-                sender_name=sender.name,
-                target_name=env.leader.name,
+                sender_name=sender_name,
+                target_name="Leader",
                 project_id=scope.project_id,
                 preferred_session_id=scope.preferred_session_id,
                 source_path=f"workspace/report-{index}.md",
@@ -5662,9 +5770,9 @@ async def test_concurrent_member_file_deliveries_keep_their_exact_parent_session
             return session_id
 
     delivered_session_ids = await asyncio.gather(
-        *(deliver(index, sender, child) for index, (sender, _parent, child) in enumerate(routes))
+        *(deliver(index, sender_id, sender_name, child) for index, (sender_id, sender_name, _parent, child) in enumerate(routes))
     )
-    assert delivered_session_ids == [route[1].id for route in routes]
+    assert delivered_session_ids == [route[2].id for route in routes]
 
     messages = (
         (
@@ -5679,7 +5787,7 @@ async def test_concurrent_member_file_deliveries_keep_their_exact_parent_session
         .scalars()
         .all()
     )
-    assert {uuid.UUID(row.conversation_id) for row in messages} == {route[1].id for route in routes}
+    assert {uuid.UUID(row.conversation_id) for row in messages} == {route[2].id for route in routes}
     assert {row.sender_agent_id for row in messages} == {env.worker_id, env.reviewer_id}
     assert all(len(row.message_meta["attachments"]) == 1 for row in messages)
 
@@ -5712,7 +5820,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     source_tool_description = source_tool.description
     env.db.add(
         AgentTool(
-            agent_id=env.worker_id,
+            agent_id=env.source_worker_id,
             tool_id=source_tool_id,
             enabled=True,
             config={"api_key": "must-not-cross-project-boundary"},
@@ -5744,7 +5852,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     env.db.add(source_mcp_tool)
     await env.db.flush()
     source_mcp_assignment = AgentTool(
-        agent_id=env.worker_id,
+        agent_id=env.source_worker_id,
         tool_id=source_mcp_tool.id,
         enabled=True,
         config={"token": "must-not-cross-project-boundary"},
@@ -5767,7 +5875,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     assert bootstrap_mcp["key"] == mcp_server.name
     assert bootstrap_mcp["description"] == ""
     folder = f"release-check-{uuid.uuid4().hex[:8]}"
-    source_prefix = normalize_storage_key(f"{env.worker_id}/skills/{folder}")
+    source_prefix = normalize_storage_key(f"{env.source_worker_id}/skills/{folder}")
     storage = get_storage_backend()
     manifest_content = (
         "---\n"
@@ -5782,7 +5890,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
 
     created_response = await env.client.post(
         f"/api/projects/{source_project_id}/agents",
-        json={"source_agent_id": str(env.worker_id), "name": "Project release owner"},
+        json={"source_agent_id": str(env.source_worker_id), "name": "Project release owner"},
     )
     assert created_response.status_code == 201, created_response.text
     project_agent = created_response.json()
@@ -5870,7 +5978,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     source_assignment = (
         await env.db.execute(
             select(AgentTool).where(
-                AgentTool.agent_id == env.worker_id,
+                AgentTool.agent_id == env.source_worker_id,
                 AgentTool.tool_id == source_tool_id,
             )
         )
@@ -5915,7 +6023,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         "sha256": metadata["sha256"],
         "path": f"skills/{folder}",
         "source": "agent",
-        "source_agent_id": str(env.worker_id),
+        "source_agent_id": str(env.source_worker_id),
         "file_count": 2,
         "size_bytes": len(manifest_content.encode()) + len("# Checklist\n".encode()),
     }
@@ -6048,7 +6156,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         if item["type"] == "tool" and item["key"] == source_tool.name
     )
     assert manifest_tool["selected"] is True
-    assert manifest_tool["affected_member_count"] == 2
+    assert manifest_tool["affected_member_count"] == 1
     assert {
         key: manifest_skill[key]
         for key in (
@@ -6143,7 +6251,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     assert packaged_skill["sha256"] == metadata["sha256"]
     assert packaged_skill["digital_employee_index"] == 3
     assert skill_binding["id"] not in str(packaged_skill)
-    assert str(env.worker_id) not in str(packaged_skill)
+    assert str(env.source_worker_id) not in str(packaged_skill)
     assert "capability_id" not in packaged_skill
     packaged_tool = next(
         item for item in selected_template.definition["capabilities"] if item["capability_type"] == "tool"
@@ -6226,7 +6334,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     assert restored_member.status_code == 200, restored_member.text
     second_agent_response = await env.client.post(
         f"/api/projects/{source_project_id}/agents",
-        json={"source_agent_id": str(env.worker_id), "name": "Second release owner"},
+        json={"source_agent_id": str(env.source_worker_id), "name": "Second release owner"},
     )
     assert second_agent_response.status_code == 201, second_agent_response.text
     second_agent_id = uuid.UUID(second_agent_response.json()["id"])
@@ -6901,9 +7009,19 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
             "name": "Legacy member template source",
             "goal": "Preserve the actual member setup",
             "members": [
-                {"agent_id": str(env.leader_id), "is_leader": True},
-                {"agent_id": str(env.worker_id)},
-                {"agent_id": str(env.reviewer_id)},
+                {
+                    "agent_id": str(env.leader_id),
+                    "is_leader": True,
+                    "enabled_inherited_capability_ids": [str(common_tool.id), str(mcp_tool.id)],
+                },
+                {
+                    "agent_id": str(env.worker_id),
+                    "enabled_inherited_capability_ids": [str(common_tool.id)],
+                },
+                {
+                    "agent_id": str(env.reviewer_id),
+                    "enabled_inherited_capability_ids": [str(common_tool.id)],
+                },
             ],
             "capabilities": [],
         },
@@ -6912,8 +7030,11 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
     source_project_id = source_response.json()["id"]
     members_response = await env.client.get(f"/api/projects/{source_project_id}/members")
     assert members_response.status_code == 200, members_response.text
+    member_agent_ids = {
+        item["name_snapshot"]: item["agent_id"] for item in members_response.json()
+    }
     reviewer_member = next(
-        item for item in members_response.json() if item["agent_id"] == str(env.reviewer_id)
+        item for item in members_response.json() if item["name_snapshot"] == env.reviewer.name
     )
     disable_response = await env.client.put(
         f"/api/projects/{source_project_id}/members/{reviewer_member['id']}/tools",
@@ -6937,15 +7058,15 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
     assert common_manifest["availability"] == "available"
     assert common_manifest["affected_member_count"] == 2
     assert {item["agent_id"] for item in common_manifest["affected_members"]} == {
-        str(env.leader_id),
-        str(env.worker_id),
+        member_agent_ids["Leader"],
+        member_agent_ids["Worker"],
     }
     mcp_manifest = next(
         item for item in manifest["capabilities"] if item["capability_id"] == str(server.id)
     )
     assert mcp_manifest["key"] == server.name
     assert mcp_manifest["affected_member_count"] == 1
-    assert mcp_manifest["affected_members"][0]["agent_id"] == str(env.leader_id)
+    assert mcp_manifest["affected_members"][0]["agent_id"] == member_agent_ids["Leader"]
     assert "must-not-enter-template" not in json.dumps(manifest)
 
     template_response = await env.client.post(
@@ -6956,7 +7077,7 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
     stored_template = await env.db.get(ProjectTemplate, uuid.UUID(template_response.json()["id"]))
     assert stored_template is not None
     assert len(stored_template.definition["agents"]) == 3
-    assert len(stored_template.definition["capabilities"]) == 3
+    assert len(stored_template.definition["capabilities"]) == 4
     assert "must-not-enter-template" not in json.dumps(stored_template.definition)
 
     restored_response = await env.client.post(
@@ -6970,7 +7091,7 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
     assert restored_response.status_code == 201, restored_response.text
     restored = restored_response.json()
     assert restored["template_setup_summary"]["restored_digital_employee_count"] == 3
-    assert restored["template_setup_summary"]["restored_tool_count"] == 2
+    assert restored["template_setup_summary"]["restored_tool_count"] == 1
     assert restored["template_setup_summary"]["restored_connection_count"] == 1
     target_project_id = uuid.UUID(restored["id"])
     target_agents = (await env.client.get(f"/api/projects/{target_project_id}/agents")).json()
@@ -6986,7 +7107,7 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
             )
         ).scalars()
     )
-    assert len(restored_bindings) == 3
+    assert len(restored_bindings) == 4
     restored_assignments = list(
         (
             await env.db.execute(select(AgentTool).where(AgentTool.agent_id.in_(target_agent_ids)))
@@ -6995,8 +7116,9 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
     restored_dependency_assignments = [
         item for item in restored_assignments if item.tool_id in {common_tool.id, mcp_tool.id}
     ]
-    assert len(restored_dependency_assignments) == 3
-    assert all(item.enabled and item.config in ({}, None) for item in restored_dependency_assignments)
+    assert len(restored_dependency_assignments) == 4
+    assert sum(item.enabled for item in restored_dependency_assignments) == 3
+    assert all(item.config in ({}, None) for item in restored_dependency_assignments)
 
 
 @pytest.mark.parametrize("invalid_agents", [None, {}, "not-a-list"])

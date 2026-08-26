@@ -189,8 +189,22 @@ async def _bind_file_workspace(
         yield agent
 
 
+async def _resolve_workspace_agent(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID,
+    candidate: object,
+) -> Agent:
+    """Keep endpoint functions callable outside FastAPI dependency injection."""
+
+    if getattr(candidate, "id", None) == agent_id:
+        return candidate  # type: ignore[return-value]
+    agent, _access = await check_agent_access(db, current_user, agent_id)
+    return agent
+
+
 def _runtime_workspace(agent: Agent):
-    if agent.scope != "project":
+    if getattr(agent, "scope", "standard") != "project":
         return standard_agent_runtime_workspace(agent.id)
     if agent.project_id is None or agent.tenant_id is None:
         raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
@@ -209,7 +223,7 @@ async def _record_project_skill_change(
 ) -> None:
     normalized = normalize_storage_key(path)
     parts = Path(normalized).parts
-    if agent.scope != "project" or len(parts) < 2 or parts[0] != "skills":
+    if getattr(agent, "scope", "standard") != "project" or len(parts) < 2 or parts[0] != "skills":
         return
     from app.models.project import Project
     from app.services.project_git_service import commit_project_changes, project_user_git_email
@@ -250,7 +264,7 @@ async def _delete_bound_project_skill(
     parts = Path(normalized).parts
     is_skill_root = len(parts) == 2 and parts[0] == "skills"
     is_skill_manifest = len(parts) == 3 and parts[0] == "skills" and parts[2] == "SKILL.md"
-    if agent.scope != "project" or not (is_skill_root or is_skill_manifest):
+    if getattr(agent, "scope", "standard") != "project" or not (is_skill_root or is_skill_manifest):
         return None
 
     from app.models.project import Project, ProjectCapabilityBinding
@@ -394,7 +408,7 @@ async def list_files(
     """List files and directories in an agent's file system."""
     # Adopt upstream's storage-backend listing; keep our is_creator so the
     # CREATOR_ONLY_FILES filter (below) still hides secrets.md from non-creators.
-    agent = workspace_agent
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     storage = get_storage_backend()
     storage_key, is_enterprise = _visible_storage_key(agent_id, path, current_user.tenant_id)
@@ -457,7 +471,7 @@ async def read_file(
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Read the content of a file."""
-    agent = workspace_agent
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
@@ -1211,7 +1225,7 @@ async def write_file(
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Write content to a file (create or overwrite)."""
-    agent = workspace_agent
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
@@ -1381,7 +1395,7 @@ async def delete_file(
     # Upstream: only managers/admins may delete workspace files. Ours: creator-only
     # files (e.g. secrets.md) are protected even from non-creator managers. Apply both.
     await _require_agent_file_delete_access(db, current_user, agent_id)
-    agent = workspace_agent
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
@@ -1436,7 +1450,7 @@ async def import_skill_to_agent(
     Copies all files from the global skill registry into
     <agent_workspace>/skills/<folder_name>/.
     """
-    agent = workspace_agent
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     _agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
         raise HTTPException(status_code=403, detail="需要数字员工管理权限")

@@ -145,14 +145,24 @@ def downgrade() -> None:
             batch.drop_constraint("fk_chat_sessions_project_id_projects", type_="foreignkey")
             batch.drop_column("project_id")
     else:
+        inspector = sa.inspect(bind)
+
+        def drop_foreign_key(table_name: str, constrained_columns: tuple[str, ...]) -> None:
+            foreign_key = next(
+                (
+                    item
+                    for item in inspector.get_foreign_keys(table_name)
+                    if tuple(item.get("constrained_columns") or []) == constrained_columns
+                ),
+                None,
+            )
+            if foreign_key and foreign_key.get("name"):
+                op.drop_constraint(foreign_key["name"], table_name, type_="foreignkey")
+
         op.drop_constraint("uq_subagent_runs_project_group_member", "subagent_runs", type_="unique")
-        op.drop_constraint(
-            "fk_subagent_runs_project_member_id_project_member_snapshots",
-            "subagent_runs",
-            type_="foreignkey",
-        )
-        op.drop_constraint("fk_subagent_runs_project_id_projects", "subagent_runs", type_="foreignkey")
+        drop_foreign_key("subagent_runs", ("project_member_id",))
+        drop_foreign_key("subagent_runs", ("project_id",))
         op.drop_column("subagent_runs", "project_member_id")
         op.drop_column("subagent_runs", "project_id")
-        op.drop_constraint("fk_chat_sessions_project_id_projects", "chat_sessions", type_="foreignkey")
+        drop_foreign_key("chat_sessions", ("project_id",))
         op.drop_column("chat_sessions", "project_id")

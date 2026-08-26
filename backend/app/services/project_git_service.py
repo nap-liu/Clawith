@@ -659,9 +659,17 @@ def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
         if baseline_is_ancestor
         else set()
     )
+    generated_subjects_only = all(
+        subject == "Ensure project member directories" or subject.startswith("Create project Agent: ")
+        for subject in generated_subjects
+    )
+    generated_authors_only = all(
+        author in {_DEFAULT_PROJECT_AUTHOR_EMAIL, project_user_git_email(project.owner_user_id)}
+        for author in generated_authors
+    )
     generated_only = (
-        all(subject == "Ensure project member directories" for subject in generated_subjects)
-        and all(author == _DEFAULT_PROJECT_AUTHOR_EMAIL for author in generated_authors)
+        generated_subjects_only
+        and generated_authors_only
         and all(path.startswith(".agents/") for path in generated_paths)
     )
     if (
