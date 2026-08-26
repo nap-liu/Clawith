@@ -1,8 +1,20 @@
 """DingTalk service for sending messages via Open API."""
 
 import json
+
 import httpx
 from loguru import logger
+
+from app.services.im_text import project_nonempty_message_summary
+
+
+def build_dingtalk_markdown_content(
+    message: str,
+    max_title_chars: int = 128,
+) -> dict[str, str]:
+    """Map visible message text to DingTalk's Markdown content fields."""
+    title = project_nonempty_message_summary(message, max_chars=max_title_chars)
+    return {"title": title, "text": message}
 
 
 async def get_dingtalk_access_token(app_id: str, app_secret: str) -> dict:
@@ -41,7 +53,10 @@ async def send_dingtalk_v1_robot_oto_message(
     # Map text to standard templates
     if msg_type == "markdown":
         msg_key = "sampleMarkdown"
-        msg_param = json.dumps({"title": "Notification", "text": message})
+        msg_param = json.dumps(
+            build_dingtalk_markdown_content(message),
+            ensure_ascii=False,
+        )
     else:
         msg_key = "sampleText"
         msg_param = json.dumps({"content": message})
@@ -133,7 +148,11 @@ async def send_dingtalk_message(
         # Use Work Notification
         msg_body = {
             "msgtype": msg_type,
-            msg_type: {"content": message} if msg_type == "text" else {"title": "Notification", "text": message}
+            msg_type: (
+                {"content": message}
+                if msg_type == "text"
+                else build_dingtalk_markdown_content(message)
+            ),
         }
         if not agent_id:
             agent_id = app_id
