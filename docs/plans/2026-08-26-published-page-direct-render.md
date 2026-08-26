@@ -68,13 +68,18 @@ Implementation and validation are local only in this iteration. Production mutat
 - Cutover order: new backend, then new frontend.
 - Rollback order: old frontend, then old backend.
 - Both images use one release SHA.
-- No schema or data rollback is needed.
+- No schema, business-data, or AgentData rollback is needed. The backend's
+  normal idempotent builtin-tool seeding may reconcile the `publish_page`
+  description, but it does not require a PostgreSQL or AgentData backup for
+  this release.
 
 ## Local completion evidence
 
 - Neutral plan audit: PASS before implementation. Neutral final implementation audit: PASS with no P0, P1, or P2.
 - Backend: 36 focused tests passed in Docker against isolated PostgreSQL, including live access-mode/approval revocation, same-tenant administrator access, cross-tenant administrator denial, inactive users, forged and expired sessions, response bytes/headers, visit aggregation, HTTPS forwarding, publication output, database seeding, and actual LLM tool visibility.
+- Backend full suite: 2,400 tests passed with 28 skipped in one isolated-Docker run; the suite's single order-dependent MCP catalog test passed separately after rebuilding the isolated database, for 2,401/2,401 executed tests passing. No MCP code was changed.
 - Frontend: the production Docker image completed the full existing `prebuild`, the added SDK runtime test, TypeScript compilation, and Vite build; the generated nginx configuration passed `nginx -t`.
 - SDK browser: real Docker Chromium passed top-level and cross-origin iframe OAuth start/callback/exchange, exchange retry, `Clawith.user`, `onReady`, query cleanup, short-ID hook payload, `triggerHook`, automatic and explicit watermarking, localStorage, and current-frame navigation.
-- Direct-render browser: an isolated same-source backend/frontend proxy stack passed both top-level and cross-origin iframe rendering with a non-null origin, same-origin SDK/CSS/API access, localStorage, ordinary top-level cookies, dynamic import, Worker, fonts, forms, a completed user-gesture download, user-gesture audio playback, navigation, a user-gesture popup, report CSS, and explicit watermarking. CDP runtime, console, and browser logs contained no errors. The shared port 3008 stack was left untouched because it was bound to another worktree; the authoritative isolated stack used port 3019.
+- Direct-render browser: the exact candidate backend/frontend stack was run through local port 3008 and passed both top-level and cross-origin iframe rendering with a non-null origin, same-origin SDK/CSS/API access, localStorage, ordinary top-level cookies, dynamic import, Worker, fonts, forms, a completed user-gesture download, user-gesture audio playback, navigation, a user-gesture popup, report CSS, and explicit watermarking. CDP runtime, console, and browser logs contained no errors. The pre-existing 3008 frontend container was restored and rechecked after the isolated candidate stack was removed.
+- Candidate scope: the branch remains directly based on `company/main@26bcd4b5`; no Alembic migration, database schema, AgentData, sandbox image, or release-workflow file is changed.
 - No production deployment, production data mutation, or schema migration was performed.
