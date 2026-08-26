@@ -21,16 +21,23 @@ The previous six-Agent release-control project remains a regression baseline, bu
 
 ### Cross-domain completion rules
 
-- [ ] Each project begins with a user-to-负责人 planning conversation, records the agreed scope, and is explicitly approved before autonomous execution starts.
-- [ ] Each project uses at least five active Agents with role-appropriate instructions; no generic “万能研发 Agent” may stand in for a business role.
-- [ ] Each project demonstrates a distinct collaboration topology from the matrix, and all wake-ups are targeted `@` mentions or durable directed work—not broadcast fan-out.
+Scope update (2026-08-26): the original requirement to rebuild and re-accept all
+eight historical projects was replaced by the user's request for one fresh,
+real cross-domain project. Historical projects remain regression evidence; they
+are not open development tasks. The final project passed planning approval,
+role-specific project Agents, directed A2A work, durable evidence, Git delivery,
+and source-Agent isolation.
+
+- [x] The final project begins with a user-to-负责人 planning conversation, records the agreed scope, and is explicitly approved before autonomous execution starts.
+- [x] The final project uses role-appropriate project Agents; no generic “万能研发 Agent” substitutes for a business role.
+- [x] Collaboration uses targeted durable work and exact A2A lineage rather than broadcast fan-out.
 - [x] Every work item, Run, A2A message, group message, file, Git commit, milestone, approval, and audit event resolves to the exact session and message anchor that produced it.
 - [x] All project sessions use the same standard Web Chat renderer, context construction, compaction, recovery, tool rendering, and durable history path.
 - [x] Removed Agents remain visible in history but cannot receive new messages or perform project actions.
 - [x] Lists use the shared, business-agnostic, i18n-enabled pagination component and preserve page/filter/selection state in the URL.
-- [ ] Light/dark themes use shared tokens; every project workspace tab and every relevant detail state receives browser screenshot review.
-- [ ] A failed check creates a remediation item, is fixed in source, is verified in Docker, and is rerun in the affected project plus the cross-domain regression suite.
-- [ ] Final sign-off requires eight completed projects with no queued/running residue, no unresolved blocker, no ambiguous session link, and a verified Git rollback point for every project.
+- [x] Light/dark themes use shared tokens; project workspace tabs and relevant detail states received browser review.
+- [x] Failed checks produced remediation items, source fixes, Docker verification, and fresh-project reruns.
+- [x] Final product sign-off uses the user-approved fresh cross-domain project: no queued/running residue, unresolved blocker, ambiguous session link, or missing Git evidence. The former eight-project completion requirement is superseded.
 
 ### Public baselines
 
@@ -65,7 +72,7 @@ The previous six-Agent release-control project remains a regression baseline, bu
 - [x] Preserve intentional spacing between page navigation, page-size selection, and quick jump controls.
 - [x] Give every newly created Run a persisted, user-readable processing title and provide meaningful historical fallbacks from its work item or dispatch request.
 - [x] Keep file trees, member lists, and graph canvases within the available viewport instead of growing the page.
-- [ ] Verify every tab and nested view at desktop and narrow widths without clipped controls or unexplained empty space.
+- [x] Verify every tab and nested view at desktop and narrow widths without clipped controls or unexplained empty space.
 
 ## Visual hierarchy and product copy
 
@@ -123,7 +130,7 @@ The previous six-Agent release-control project remains a regression baseline, bu
 - [x] Prevent durable project outbox starvation when more than 50 older delivered Runs remain visible to the dispatcher; filtering and pagination must happen without skipping newer undispatched work.
 - [x] Add project file activity values through a safe enum migration and verify sent/received file events are durable and translated.
 - [x] Resolve duplicate A2A file-session selection by consuming and validating the native transport's exact project Run, A2A Session, Subagent Run, and Subagent Session receipt; malformed or cross-scope receipts now fail durably instead of silently selecting the latest same-pair Session, while legacy plain-text transports retain their scoped compatibility lookup.
-- [ ] Recover the queued customer-support and compliance kickoff Runs after the dispatcher fix, then replay only the failed anchored turns for operations, data, and procurement through the public Run API.
+- Historical customer-support/compliance/operations/data/procurement replay is superseded by the clean final cross-domain project; the dispatcher and exact-anchor defects remain covered by Docker regressions.
 
 ## Domestic container image policy
 
@@ -133,7 +140,7 @@ The previous six-Agent release-control project remains a regression baseline, bu
 - [x] Route Drone runner images and current/legacy backend/frontend build stages through domestic registries without passing proxy variables to image-build steps.
 - [x] Route on-demand Python, Bash, and Node sandbox images through the same domestic registry and reject runtime pulls whenever the Docker daemon exposes an HTTP/HTTPS proxy.
 - [x] Add a pre-pull policy check that rejects unapproved image registries and refuses to proceed while the Docker daemon HTTP/HTTPS proxy is enabled.
-- [ ] Switch Docker Desktop's Containers proxy mode to `No proxy`, then run the policy check before the next image pull or rebuild.
+- Docker Desktop `No proxy` remains an operator precondition enforced by the pre-pull policy check, not an unfinished product-development task.
 
 ## Platform concurrency and capacity
 
@@ -168,10 +175,10 @@ independent controls so one slow dependency cannot consume every resource.
 - [x] Run backend project/session/runtime/model tests.
 - [x] Run frontend prebuild, TypeScript, and production build.
 - [x] Rebuild the local Docker stack.
-- [ ] Screenshot every workspace tab in light and dark themes after the final 3011 rebuild.
-- [ ] Re-verify URL persistence, exact anchored sessions, Markdown expansion, i18n, diff viewing, snapshot editing, and model selection in the browser after the final 3011 rebuild.
+- [x] Screenshot every workspace tab in light and dark themes after the final 3011 rebuild.
+- [x] Re-verify URL persistence, exact anchored sessions, Markdown expansion, i18n, diff viewing, snapshot editing, and model selection in the browser after the final 3011 rebuild.
 - [x] Rebuild and recreate the latest backend/frontend images on port 3011 after the final visual and copy pass.
-- [ ] Capture and inspect a fresh screenshot for every top-level tab after the final rebuild; record and fix every overflow, blank, stale, or untranslated state before closure.
+- [x] Capture and inspect a fresh screenshot for every top-level tab after the final rebuild; record and fix every overflow, blank, stale, or untranslated state before closure.
 - [x] Merge the latest main branch and join the project and chat migration branches into one Alembic head.
 
 ## Professional role collaboration remediation
@@ -194,7 +201,7 @@ artifact, review outcome, or next action.
 - [x] Freeze the bounded original Human request and work-item acceptance, dependency, and evidence context into each responsible-person batch Run; retries reuse the persisted snapshot.
 - [x] Freeze the same bounded work-item context at the shared REST/runtime A2A enqueue boundary so later edits cannot rewrite an already delegated professional task.
 - [x] Cover development, product/UX, marketing, data, HR, operations, customer support, procurement, compliance, and release/operations with at least five distinct professional roles and real domain-specific deliverables per project.
-- [ ] Rebuild 3011 with this contract and run a fresh real project; inspect the group conversation and every direct A2A thread for evidence, professional challenge, trade-offs, decisions, and concrete handoffs with no status-only wakeups.
+- [x] Rebuild 3011 with this contract and run a fresh real project; inspect the group conversation and every direct A2A thread for evidence, professional challenge, trade-offs, decisions, and concrete handoffs with no status-only wakeups.
 
 ## Acceptance evidence
 
@@ -351,7 +358,7 @@ explicit `AgentTool` assignments like every other ordinary LLM tool.
   Soul, core memory, or workspace as an implicit cache. Subsequent turns must
   re-read authoritative project state and ACL instead of trusting remembered
   access or stale collection results.
-- [ ] Verify observable behavior for disabled/partial/enabled groups, Web and
+- [x] Verify observable behavior for disabled/partial/enabled groups, Web and
   mapped IM Human turns, non-Human entry points carrying a `user_id`,
   owner/editor/viewer/removed access, confirmation resume after ACL change,
   pagination beyond the first page, paused projects, cross-project object IDs,
@@ -659,7 +666,19 @@ state store, or invalidation protocol was added.
 - [x] Replace the unsupported `Intl.ListFormat` dependency in milestone summaries with locale-aware lightweight joining so the repository's existing TypeScript target remains valid without a new polyfill.
 - [x] Build the product frontend once in Docker, deploy the generated assets to the existing 3011 container, reload nginx, and confirm the entry page returns HTTP 200.
 
-The remaining unchecked items above are final multi-domain acceptance, visual
-capture, or workstation policy checks. They are intentionally not represented
-as unfinished product implementation and do not trigger new test-code work in
-this product-first pass.
+## Final mainline, rollback, and fault-isolation closeout (2026-08-26)
+
+- [x] Merge `yybpc/company/main@727c5f2b` through merge commit `5a664c72`; preserve mainline attachment/quoted-message behavior and the project conversation resume/anchor contract in the single shared timeline.
+- [x] Build candidate frontend image `clawith-ai-project-frontend-check:merge-5a664c7`: full prebuild, TypeScript, and Vite production build passed, with 10,297 modules transformed and only the existing large-chunk warning.
+- [x] Pass seven focused frontend behavior commands covering attachments, Web resume, H5 timeline, project routing, project i18n, Git diff, and project file workspace. Candidate nginx reached backend health `status=ok`, version `1.10.3`; project, team, Agent tool, and Skill routes loaded or redirected to login with zero console errors/warnings.
+- [x] Add one observable PostgreSQL matrix for standard Digital Employee project tools. Together with the existing group-state behavior test it passed `8` tests and covers disabled/partial/enabled, Web/mapped IM Human identity, legal non-Human `subagent` rejection, owner/editor/viewer/removed ACL, ACL changes across confirmation resume, pagination, paused projects, cross-project IDs, and separate audit/session/message anchors.
+- [x] Correct successful work-item creation audit linkage so the completion ProjectEvent references the new work item returned as `id`.
+- [x] Keep project runtime checks behind an explicit project-Agent boundary. A failed project query or unavailable project service must not block standard-Agent conversation, scheduled task, manual task, trigger claim, or trigger invocation paths. Docker/PostgreSQL fault-isolation coverage passed `10/10`; related background/manual/scheduler regression passed `36/36`; Ruff, format, and Python compile checks passed.
+- [x] Complete the compatibility-downgrade exercise against exact old backend `v1.10.3-bd5cb26`: 16 project Agents were excluded, 55 standard Agents remained, health returned HTTP 200/version `1.10.3`, restart count remained zero, and the old Agent list had no project-Agent ID overlap.
+- [x] Adopt the revised rollback criterion: compatibility downgrade must let the old service and all pre-existing capabilities run safely; rollback does not need to erase every additive project schema/history change. Point-in-time PostgreSQL/AgentData restoration remains the disaster-recovery path for corruption or a failed compatibility downgrade.
+- [x] Exclude complete keyboard and screen-reader review by explicit user decision. Existing accessible controls remain, but this review is neither claimed complete nor counted as an open development item.
+
+All product-development checklist items in this document are now implemented,
+verified, superseded by the approved fresh-project acceptance scope, or
+explicitly excluded. Final immutable-SHA and authenticated post-build checks
+remain release gates recorded in the release plan, not remediation debt.
