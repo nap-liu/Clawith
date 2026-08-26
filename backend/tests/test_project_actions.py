@@ -1851,6 +1851,108 @@ async def test_dispatch_does_not_regress_child_completed_project_run(
     assert persisted.output["subagent_session_id"] == str(child_id)
 
 
+async def test_project_dispatch_respects_project_parallel_task_limit(
+    project_api: ProjectApiEnv,
+):
+    from app.models.project import Project, ProjectMemberSnapshot, ProjectRun
+    from app.services import subagent_runtime
+    from app.services.project_service import freeze_run_members
+
+    env = project_api
+    project = await _create_project(env, name="Bounded project concurrency")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    stored_project.settings = {
+        **dict(stored_project.settings or {}),
+        "runtime": {"max_parallel_runs": 1},
+    }
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    leader_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project_id,
+                ProjectMemberSnapshot.agent_id == env.leader_id,
+            )
+        )
+    ).scalar_one()
+    anchor = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=uuid.UUID(group["access_agent_id"]),
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Run after capacity is available",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_run_request"},
+    )
+    active = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.worker_id,
+        initiated_by_user_id=env.owner_id,
+        status="running",
+        trigger_type="a2a",
+        started_at=datetime.now(UTC),
+    )
+    pending = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="queued",
+        trigger_type="manual",
+        input={
+            "dispatch": {
+                "group_session_id": group["id"],
+                "project_member_id": str(leader_member.id),
+                "turn_anchor_id": str(anchor.id),
+                "task": "Run after capacity is available",
+            }
+        },
+    )
+    env.db.add_all([anchor, active, pending])
+    await env.db.flush()
+    await freeze_run_members(env.db, stored_project, pending)
+    await env.db.commit()
+    active_id = active.id
+    pending_id = pending.id
+
+    dispatched = await subagent_runtime.dispatch_project_run(pending_id)
+    assert dispatched["status"] == "queued"
+    child_id = uuid.UUID(dispatched["subagent_run_id"])
+    env.db.expire_all()
+    still_pending = await env.db.get(ProjectRun, pending_id)
+    assert still_pending is not None and still_pending.status == "queued"
+    assert still_pending.started_at is None
+    assert still_pending.output["subagent_run_id"] == str(child_id)
+    assert await subagent_runtime._claim_subagent(child_id) is None
+
+    stored_active = await env.db.get(ProjectRun, active_id)
+    assert stored_active is not None
+    stored_active.status = "succeeded"
+    stored_active.finished_at = datetime.now(UTC)
+    await env.db.commit()
+    assert await subagent_runtime._claim_subagent(child_id) == child_id
+    claimed_input = await subagent_runtime._load_or_start_input(child_id)
+    assert claimed_input is not None
+    claimed_anchor, _recovering = claimed_input
+    env.db.expire_all()
+    started = await env.db.get(ProjectRun, pending_id)
+    assert started is not None and started.status == "running"
+    assert started.started_at is not None
+
+    await subagent_runtime._requeue_capacity_blocked_subagent(child_id, claimed_anchor.id)
+    env.db.expire_all()
+    requeued = await env.db.get(ProjectRun, pending_id)
+    assert requeued is not None and requeued.status == "queued"
+    assert requeued.started_at is None
+    input_row = await env.db.get(ChatMessage, claimed_anchor.id)
+    assert input_row is not None
+    assert input_row.message_meta["subagent_input_state"] == subagent_runtime.INPUT_PENDING
+
+
 async def test_active_child_inputs_durably_advance_only_their_exact_project_runs(
     project_api: ProjectApiEnv,
 ):

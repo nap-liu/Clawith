@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
 from loguru import logger
-from sqlalchemy import String, and_, cast, exists, or_, select
+from sqlalchemy import String, and_, cast, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
@@ -305,6 +305,23 @@ async def _requeue_capacity_blocked_subagent(
             meta["subagent_input_state"] = INPUT_PENDING
             meta["turn_status"] = "pending"
             anchor.message_meta = meta
+            raw_project_run_id = meta.get("project_run_id")
+            try:
+                project_run_id = uuid.UUID(str(raw_project_run_id))
+            except (TypeError, ValueError):
+                project_run_id = None
+            if project_run_id is not None and run.project_id is not None:
+                from app.models.project import ProjectRun
+
+                project_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
+                if (
+                    project_run is not None
+                    and project_run.project_id == run.project_id
+                    and project_run.finished_at is None
+                    and project_run.status not in {"succeeded", "failed", "cancelled"}
+                ):
+                    project_run.status = "queued"
+                    project_run.started_at = None
         run.status = RUN_QUEUED
         run.lease_owner = None
         run.lease_expires_at = None
@@ -1195,26 +1212,164 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
                 ),
             ),
         ]
-        if run_id is not None:
-            conditions.append(SubagentRun.id == run_id)
-        run = (
+        skipped_ids: set[uuid.UUID] = set()
+        while True:
+            candidate_conditions = list(conditions)
+            if run_id is not None:
+                candidate_conditions.append(SubagentRun.id == run_id)
+            elif skipped_ids:
+                candidate_conditions.append(SubagentRun.id.notin_(skipped_ids))
+            run = (
+                await db.execute(
+                    select(SubagentRun)
+                    .where(*candidate_conditions)
+                    .order_by(SubagentRun.id)
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if run is None:
+                return None
+            if await _project_accepts_new_subagent_anchor(db, run):
+                processing = (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.conversation_id == str(run.id),
+                            ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+                            ChatMessage.message_meta["subagent_input_state"].as_string()
+                            == INPUT_PROCESSING,
+                        )
+                        .order_by(ChatMessage.created_at, ChatMessage.id)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                pending = None
+                if processing is None:
+                    pending = (
+                        await db.execute(
+                            select(ChatMessage)
+                            .where(
+                                ChatMessage.conversation_id == str(run.id),
+                                ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+                                ChatMessage.message_meta["subagent_input_state"].as_string()
+                                == INPUT_PENDING,
+                            )
+                            .order_by(ChatMessage.created_at, ChatMessage.id)
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                capacity_input = processing or pending
+                capacity_available = processing is not None or capacity_input is None
+                if not capacity_available:
+                    allowed, _blocked = await _partition_project_inputs_by_capacity(
+                        db,
+                        run=run,
+                        input_rows=[capacity_input],
+                    )
+                    capacity_available = bool(allowed)
+                if capacity_available:
+                    run.status = RUN_RUNNING
+                    run.lease_owner = settings.INSTANCE_ID
+                    run.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
+                    await db.commit()
+                    return run.id
+            if run_id is not None:
+                return None
+            skipped_ids.add(run.id)
+
+
+def _input_project_run_id(row: ChatMessage) -> uuid.UUID | None:
+    raw_project_run_id = _message_meta(row).get("project_run_id")
+    try:
+        return uuid.UUID(str(raw_project_run_id))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _partition_project_inputs_by_capacity(
+    db,
+    *,
+    run: SubagentRun,
+    input_rows: list[ChatMessage],
+) -> tuple[list[ChatMessage], list[ChatMessage]]:
+    """Select project inputs that may atomically enter processing now."""
+    if run.project_id is None or not input_rows:
+        return list(input_rows), []
+
+    from app.models.project import Project, ProjectRun
+
+    project = await db.get(Project, run.project_id, with_for_update=True)
+    if project is None:
+        return [], list(input_rows)
+    project_run_ids = {
+        project_run_id
+        for row in input_rows
+        for project_run_id in [_input_project_run_id(row)]
+        if project_run_id is not None
+    }
+    if not project_run_ids:
+        return list(input_rows), []
+    project_runs = (
+        (
             await db.execute(
-                select(SubagentRun)
-                .where(*conditions)
-                .order_by(SubagentRun.id)
-                .with_for_update(skip_locked=True)
-                .limit(1)
+                select(ProjectRun)
+                .where(
+                    ProjectRun.id.in_(project_run_ids),
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.tenant_id == project.tenant_id,
+                )
+                .with_for_update()
             )
-        ).scalar_one_or_none()
-        if run is None:
-            return None
-        if not await _project_accepts_new_subagent_anchor(db, run):
-            return None
-        run.status = RUN_RUNNING
-        run.lease_owner = settings.INSTANCE_ID
-        run.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
-        await db.commit()
-        return run.id
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {project_run.id: project_run for project_run in project_runs}
+    stale_running_ids = {
+        project_run.id
+        for project_run in project_runs
+        if project_run.status == "running" and project_run.finished_at is None
+    }
+    for project_run_id in stale_running_ids:
+        project_run = by_id[project_run_id]
+        project_run.status = "queued"
+        project_run.started_at = None
+    running_tasks = int(
+        await db.scalar(
+            select(func.count(ProjectRun.id)).where(
+                ProjectRun.project_id == project.id,
+                ProjectRun.tenant_id == project.tenant_id,
+                ProjectRun.status == "running",
+                ProjectRun.finished_at.is_(None),
+                ProjectRun.trigger_type.in_(PROJECT_PARALLEL_TASK_TRIGGERS),
+                ProjectRun.id.notin_(stale_running_ids),
+            )
+        )
+        or 0
+    )
+    remaining = max(0, _project_parallel_run_limit(project) - running_tasks)
+    reserved_ids: set[uuid.UUID] = set()
+    allowed: list[ChatMessage] = []
+    blocked: list[ChatMessage] = []
+    for row in input_rows:
+        project_run_id = _input_project_run_id(row)
+        project_run = by_id.get(project_run_id) if project_run_id is not None else None
+        uses_slot = (
+            project_run is not None
+            and project_run.finished_at is None
+            and project_run.status not in {"succeeded", "failed", "cancelled"}
+            and project_run.trigger_type in PROJECT_PARALLEL_TASK_TRIGGERS
+        )
+        if not uses_slot or project_run.id in reserved_ids:
+            allowed.append(row)
+        elif remaining > 0:
+            reserved_ids.add(project_run.id)
+            remaining -= 1
+            allowed.append(row)
+        else:
+            blocked.append(row)
+    return allowed, blocked
 
 
 async def _mark_input_project_runs_running(
@@ -1314,11 +1469,7 @@ async def _load_or_start_input(
             run.lease_expires_at = None
             await db.commit()
             return None
-        raw_project_run_id = _message_meta(anchor).get("project_run_id")
-        try:
-            project_run_id = uuid.UUID(str(raw_project_run_id))
-        except (TypeError, ValueError):
-            project_run_id = None
+        project_run_id = _input_project_run_id(anchor)
         if not recovering and not await _project_accepts_new_subagent_anchor(
             db,
             run,
@@ -1331,6 +1482,18 @@ async def _load_or_start_input(
             run.lease_expires_at = None
             await db.commit()
             return None
+        if not recovering:
+            allowed, _blocked = await _partition_project_inputs_by_capacity(
+                db,
+                run=run,
+                input_rows=[anchor],
+            )
+            if not allowed:
+                run.status = RUN_QUEUED
+                run.lease_owner = None
+                run.lease_expires_at = None
+                await db.commit()
+                return None
         meta = _message_meta(anchor)
         meta.update(
             {
@@ -1406,8 +1569,13 @@ async def _drain_subagent_inbox(
             .scalars()
             .all()
         )
+        allowed, _blocked = await _partition_project_inputs_by_capacity(
+            db,
+            run=run,
+            input_rows=list(pending),
+        )
         injected: list[dict] = []
-        for row in pending:
+        for row in allowed:
             meta = _message_meta(row)
             meta.update(
                 {
@@ -1421,7 +1589,7 @@ async def _drain_subagent_inbox(
         await _mark_input_project_runs_running(
             db,
             run=run,
-            input_rows=list(pending),
+            input_rows=list(allowed),
         )
         run.lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)
         await db.commit()
@@ -3634,6 +3802,24 @@ PROJECT_DISPATCH_TRIGGERS = frozenset(
         "retry",
     }
 )
+PROJECT_PARALLEL_TASK_TRIGGERS = PROJECT_DISPATCH_TRIGGERS - {
+    "group_leader_message",
+    "leader_kickoff",
+}
+
+
+def _project_parallel_run_limit(project) -> int:
+    project_settings = project.settings if isinstance(project.settings, dict) else {}
+    runtime_settings = project_settings.get("runtime")
+    runtime_settings = runtime_settings if isinstance(runtime_settings, dict) else {}
+    raw_limit = runtime_settings.get("max_parallel_runs", 4)
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        limit = 4
+    return max(1, min(limit, 32))
+
+
 PROJECT_DISPATCH_BATCH_SIZE = 50
 ProjectDispatchCursor = tuple[datetime, uuid.UUID]
 
@@ -3894,6 +4080,23 @@ async def _project_run_has_child_input(
         return existing is not None
 
 
+async def _project_run_child_input_state(
+    db,
+    *,
+    child_id: uuid.UUID,
+    project_run_id: uuid.UUID,
+) -> str | None:
+    return await db.scalar(
+        select(ChatMessage.message_meta["subagent_input_state"].as_string())
+        .where(
+            ChatMessage.conversation_id == str(child_id),
+            ChatMessage.message_meta["project_run_id"].as_string() == str(project_run_id),
+        )
+        .order_by(ChatMessage.created_at, ChatMessage.id)
+        .limit(1)
+    )
+
+
 async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
     """Idempotently deliver one durable project dispatch outbox row.
 
@@ -3915,6 +4118,27 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         repaired = reconcile_project_run_terminal_state(project_run)
         output = dict(project_run.output or {})
         if output.get("subagent_run_id"):
+            try:
+                child_id = uuid.UUID(str(output["subagent_run_id"]))
+            except (TypeError, ValueError):
+                child_id = None
+            input_state = (
+                await _project_run_child_input_state(
+                    db,
+                    child_id=child_id,
+                    project_run_id=project_run.id,
+                )
+                if child_id is not None
+                else None
+            )
+            if (
+                project_run.finished_at is None
+                and project_run.status not in TERMINAL_PROJECT_RUN_STATUSES
+                and input_state == INPUT_PENDING
+            ):
+                project_run.status = "queued"
+                project_run.started_at = None
+                repaired = True
             if repaired:
                 await db.commit()
             return {**output, "status": project_run.status}
@@ -3997,14 +4221,6 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if project_run.status not in TERMINAL_PROJECT_RUN_STATUSES:
-            project_run.status = "running"
-            project_run.started_at = project_run.started_at or datetime.now(UTC)
-            project_run.output = {
-                **dict(project_run.output or {}),
-                "dispatch_claimed_at": dict(project_run.output or {}).get("dispatch_claimed_at")
-                or datetime.now(UTC).isoformat(),
-            }
         await db.commit()
 
     async with async_session() as db:
@@ -4085,11 +4301,20 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         # dispatch must enrich output without regressing that terminal fact.
         reconcile_project_run_terminal_state(project_run)
         if project_run.status not in TERMINAL_PROJECT_RUN_STATUSES:
-            project_run.status = "queued" if child_status == RUN_QUEUED else "running"
-            if project_run.status == "running" and project_run.started_at is None:
-                project_run.started_at = datetime.now(UTC)
+            input_state = await _project_run_child_input_state(
+                db,
+                child_id=child_id,
+                project_run_id=project_run.id,
+            )
+            project_run.status = "running" if input_state == INPUT_PROCESSING else "queued"
+            if project_run.status == "queued":
+                project_run.started_at = None
         project_run.output = {
-            **dict(project_run.output or {}),
+            **{
+                key: value
+                for key, value in dict(project_run.output or {}).items()
+                if key != "dispatch_claimed_at"
+            },
             "subagent_run_id": str(child_id),
             "subagent_session_id": str(child_id),
             **(
