@@ -32,6 +32,7 @@ from app.services.workload_capacity import WorkloadKind, get_workload_capacity
 
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
 STARTUP_RECOVERY_LEASE_RESOURCE = "startup-turn-recovery"
+RECOVERY_CONCURRENCY = 8
 
 
 @dataclass
@@ -475,6 +476,38 @@ async def _tail_has_pending_confirmation(db, anchor: ChatMessage, *, ctx_size: i
     return False
 
 
+async def _resume_one(
+    anchor: ChatMessage,
+    semaphore: asyncio.Semaphore,
+) -> RecoveryStats:
+    """Resume one independently cancellable anchor within the resource cap."""
+    result = RecoveryStats()
+    try:
+        async with semaphore:
+            # A recovered turn owns its cancellation lifecycle. Running it in
+            # a child task lets one stopped turn remain isolated while an
+            # actual shutdown still cancels the whole startup batch.
+            did_resume = await asyncio.create_task(resume_turn(anchor))
+    except asyncio.CancelledError:
+        recovery_task = asyncio.current_task()
+        if recovery_task is not None and recovery_task.cancelling():
+            raise
+        result.skipped = 1
+        logger.info(
+            "[turn_recovery] recovery cancelled for anchor={}",
+            anchor.id,
+        )
+    except Exception as exc:  # noqa: BLE001 - one failed turn must not cancel its batch
+        result.failed = 1
+        logger.exception(f"[turn_recovery] failed to resume anchor={anchor.id}: {exc}")
+    else:
+        if did_resume:
+            result.resumed = 1
+        else:
+            result.skipped = 1
+    return result
+
+
 async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
     """Resume startup-recoverable turn anchors once.
 
@@ -494,30 +527,28 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
             async with async_session() as db:
                 anchors = await _load_recoverable_anchors(db, limit=limit)
             stats.scanned = len(anchors)
-            for anchor in anchors:
-                try:
-                    # Each recovered anchor is an independently cancellable
-                    # logical turn. Keeping them on the startup scanner task
-                    # would make one stop request cancel the entire batch.
-                    did_resume = await asyncio.create_task(resume_turn(anchor))
-                except asyncio.CancelledError:
-                    scanner_task = asyncio.current_task()
-                    if scanner_task is not None and scanner_task.cancelling():
-                        raise
-                    stats.skipped += 1
-                    logger.info(
-                        "[turn_recovery] recovery cancelled for anchor={}; continuing batch",
-                        anchor.id,
-                    )
-                    continue
-                except Exception as exc:
-                    stats.failed += 1
-                    logger.exception(f"[turn_recovery] failed to resume anchor={anchor.id}: {exc}")
-                    continue
-                if did_resume:
-                    stats.resumed += 1
-                else:
-                    stats.skipped += 1
+            if anchors:
+                concurrency = min(len(anchors), RECOVERY_CONCURRENCY)
+                logger.info(
+                    "[turn_recovery] resuming anchors={} concurrency={}",
+                    len(anchors),
+                    concurrency,
+                )
+                semaphore = asyncio.Semaphore(concurrency)
+                tasks: list[asyncio.Task[RecoveryStats]] = []
+                async with asyncio.TaskGroup() as task_group:
+                    for anchor in anchors:
+                        tasks.append(
+                            task_group.create_task(
+                                _resume_one(anchor, semaphore),
+                                name=f"turn_recovery:{anchor.id}",
+                            )
+                        )
+                for task in tasks:
+                    result = task.result()
+                    stats.resumed += result.resumed
+                    stats.skipped += result.skipped
+                    stats.failed += result.failed
     except RedisLeaseBusyError:
         logger.info("[turn_recovery] another replica owns startup recovery")
     return stats
