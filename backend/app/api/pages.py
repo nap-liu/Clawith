@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import String, and_, func, literal, or_, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
@@ -70,9 +70,16 @@ class PageRequestResolution(BaseModel):
     status: str
 
 
+def _request_scheme(request: Request) -> str:
+    forwarded_scheme = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    if forwarded_scheme in {"http", "https"}:
+        return forwarded_scheme
+    request_scheme = request.url.scheme.lower()
+    return request_scheme if request_scheme in {"http", "https"} else "http"
+
+
 def _access_ui_redirect(page: PublishedPage, request: Request, denied: bool = False) -> RedirectResponse:
-    forwarded_scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
-    return_url = str(request.url.replace(scheme=forwarded_scheme))
+    return_url = str(request.url.replace(scheme=_request_scheme(request)))
     params = {
         "short_id": page.short_id,
         "return_to": return_url,
@@ -130,10 +137,9 @@ def _set_public_visitor_cookie(response: Response, value: str, request: Request)
         max_age=PUBLIC_VISITOR_COOKIE_MAX_AGE,
         httponly=True,
         samesite="lax",
-        secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
-        # The viewer context and iframe content live under /api/pages, so the
-        # opaque visitor cookie must be available outside /p/. The page-scoped
-        # HMAC remains the identifier persisted and displayed by the backend.
+        secure=_request_scheme(request) == "https",
+        # The management APIs and report route share this opaque visitor ID.
+        # Only the page-scoped HMAC is persisted by the backend.
         path="/",
     )
 
@@ -225,44 +231,52 @@ async def _record_view(
         await _record_anonymous_view(db, page.id, anonymous_visitor_key)
 
 
-async def _render_viewer_content(
+async def _render_page_content(
     db: AsyncSession,
     page: PublishedPage,
     user: User | None,
     request: Request,
-) -> HTMLResponse:
+) -> Response:
     storage = get_storage_backend()
     storage_key = _page_storage_key(page)
-    html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+    html_content = await storage.read_bytes(storage_key)
     anonymous_visitor_key = None
     new_visitor_cookie = None
     if user is None:
         anonymous_visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
     await _record_view(db, page, user, anonymous_visitor_key)
     await db.commit()
-    content_response = HTMLResponse(
-        html_content,
+    content_response = Response(
+        content=html_content,
         headers={
             "Cache-Control": "no-store",
-            # Access is enforced by the normalized page policy above. The raw
-            # response intentionally carries no framing policy so the official
-            # /p/<short_id> viewer can be embedded by external systems.
-            "X-Content-Type-Options": "nosniff",
+            "Content-Type": "text/html",
         },
     )
-    if new_visitor_cookie:
+    if user is not None:
+        content_response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
+        content_response.set_cookie(
+            PAGE_SESSION_COOKIE,
+            create_page_session(user.id),
+            max_age=PAGE_SESSION_HOURS * 3600,
+            httponly=True,
+            samesite="lax",
+            secure=_request_scheme(request) == "https",
+            path="/",
+        )
+    elif new_visitor_cookie:
         _set_public_visitor_cookie(content_response, new_visitor_cookie, request)
     return content_response
 
 
-@public_router.get("/p/{short_id}")
-async def render_page(short_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+async def _resolve_page_view(
+    short_id: str,
+    request: Request,
+    db: AsyncSession,
+) -> tuple[PublishedPage, User | None, int | None]:
     page = await db.scalar(select(PublishedPage).where(PublishedPage.short_id == short_id))
-    if not page:
-        return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
-
-    if not await _page_source_exists(page):
-        return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
+    if not page or not await _page_source_exists(page):
+        raise HTTPException(status_code=404, detail="Published page not found")
 
     user = (
         None
@@ -270,27 +284,36 @@ async def render_page(short_id: str, request: Request, db: AsyncSession = Depend
         else await page_user_from_session(db, request.cookies.get(PAGE_SESSION_COOKIE))
     )
     if page.access_mode != "public" and user is None:
-        return _access_ui_redirect(page, request)
+        return page, None, 401
     if not await can_view_page(db, page, user):
+        return page, user, 403
+    return page, user, None
+
+
+@public_router.get("/p/{short_id}")
+async def render_page(short_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    try:
+        page, user, access_error = await _resolve_page_view(short_id, request, db)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
+    if access_error == 401:
+        return _access_ui_redirect(page, request)
+    if access_error == 403:
         return _access_ui_redirect(page, request, denied=True)
 
-    # Keep the report's historical /p/<short_id> document URL inside the
-    # viewer iframe. The explicit marker preserves SDK short-ID detection and
-    # relative URL resolution without depending on Fetch Metadata headers,
-    # which are unavailable in older WebKit releases such as iOS 15.
+    # The platform viewer owns watermark rendering. The report itself is still
+    # returned byte-for-byte in an unrestricted, same-origin iframe: there is
+    # deliberately no sandbox, CSP, or route-owned browser capability policy.
     if request.query_params.get("__report_embed") == "1":
-        return await _render_viewer_content(db, page, user, request)
+        return await _render_page_content(db, page, user, request)
 
-    # Every access mode uses the platform-owned viewer. The report runs in a
-    # sandboxed iframe, so its DOM and CSP cannot remove or corrupt the parent
-    # watermark layer. Viewer failures remain independent from content loading.
     viewer_response = Response(headers={
         "X-Accel-Redirect": "/__published_page_viewer",
         "Cache-Control": "no-store",
     })
-    if page.access_mode != "public":
-        # Viewer API calls need the root-scoped cookie. Keep the token HttpOnly
-        # and renew it only after this route has already authorized the viewer.
+    if user is not None:
         viewer_response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
         viewer_response.set_cookie(
             PAGE_SESSION_COOKIE,
@@ -298,7 +321,7 @@ async def render_page(short_id: str, request: Request, db: AsyncSession = Depend
             max_age=PAGE_SESSION_HOURS * 3600,
             httponly=True,
             samesite="lax",
-            secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
+            secure=_request_scheme(request) == "https",
             path="/",
         )
     else:
@@ -329,7 +352,7 @@ async def create_render_session(
         max_age=PAGE_SESSION_HOURS * 3600,
         httponly=True,
         samesite="lax",
-        secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
+        secure=_request_scheme(request) == "https",
         path="/",
     )
     pending = bool(await db.scalar(select(PublishedPageAccess.id).where(
@@ -352,34 +375,21 @@ async def clear_render_session(response: Response):
     return {"ok": True}
 
 
-async def _viewer_page(
-    short_id: str,
-    request: Request,
-    db: AsyncSession,
-) -> tuple[PublishedPage, User | None]:
-    page = await db.scalar(select(PublishedPage).where(PublishedPage.short_id == short_id))
-    if not page:
-        raise HTTPException(404, "Published page not found")
-    if page.access_mode == "public":
-        return page, None
-    user = await page_user_from_session(db, request.cookies.get(PAGE_SESSION_COOKIE))
-    if user is None:
-        raise HTTPException(401, "Page session expired")
-    if not await can_view_page(db, page, user):
-        raise HTTPException(403, "无权访问此页面")
-    return page, user
-
-
 @router.get("/{short_id}/viewer-context")
-async def get_page_viewer_context(
+async def get_published_page_viewer_context(
     short_id: str,
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    page, user = await _viewer_page(short_id, request, db)
-    if not await _page_source_exists(page):
-        raise HTTPException(status_code=404, detail="Source file no longer exists")
+    """Return the identity context used by the unrestricted platform viewer."""
+    page, user, access_error = await _resolve_page_view(short_id, request, db)
+    if access_error == 401:
+        raise HTTPException(401, "Page session expired")
+    if access_error == 403:
+        raise HTTPException(403, "无权访问此页面")
+
+    response.headers["Cache-Control"] = "no-store"
     watermark_identity = None
     watermark_text = None
     if user is None:
@@ -387,8 +397,7 @@ async def get_page_viewer_context(
         try:
             watermark_text = _public_watermark_text(visitor_key, datetime.now(timezone.utc))
         except Exception:
-            # Watermark formatting is deliberately fail-open: the viewer still
-            # receives its context and renders the independent content iframe.
+            # Watermark formatting remains fail-open so the report can load.
             logger.exception("Failed to build public page watermark", extra={"page_id": str(page.id)})
         if new_visitor_cookie:
             _set_public_visitor_cookie(response, new_visitor_cookie, request)
@@ -404,24 +413,22 @@ async def get_page_viewer_context(
         "access_mode": page.access_mode,
         "watermark_identity": watermark_identity,
         "watermark_text": watermark_text,
-        # Published content must never replace the platform-owned viewer,
-        # regardless of whether an older report happens to reference the SDK.
-        "allow_top_navigation": False,
+        "allow_top_navigation": True,
     }
 
 
-@router.get("/{short_id}/content", response_class=HTMLResponse)
-async def get_page_viewer_content(
+@router.get("/{short_id}/content")
+async def get_published_page_content(
     short_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    # Compatibility alias for existing callers. Both raw entry points share
-    # authorization, response headers, and view accounting.
-    page, user = await _viewer_page(short_id, request, db)
-    if not await _page_source_exists(page):
-        raise HTTPException(status_code=404, detail="Source file no longer exists")
-    return await _render_viewer_content(db, page, user, request)
+    page, user, access_error = await _resolve_page_view(short_id, request, db)
+    if access_error == 401:
+        raise HTTPException(401, "Page session expired")
+    if access_error == 403:
+        raise HTTPException(403, "无权访问此页面")
+    return await _render_page_content(db, page, user, request)
 
 
 @router.post("/{short_id}/request-access")

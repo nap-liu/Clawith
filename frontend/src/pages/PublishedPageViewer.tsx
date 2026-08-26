@@ -15,8 +15,6 @@ type ViewerContext = {
     watermark_text: string | null;
 };
 
-const REPORT_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads';
-
 function retryThroughPublishedUrl(shortId: string) {
     window.location.replace(`/p/${encodeURIComponent(shortId)}${window.location.search}${window.location.hash}`);
 }
@@ -78,7 +76,7 @@ export default function PublishedPageViewer() {
     const iframeSrc = useMemo(() => {
         const params = new URLSearchParams(window.location.search);
         params.set('__report_embed', '1');
-        return `/p/${encodeURIComponent(shortId)}?${params.toString()}`;
+        return `/p/${encodeURIComponent(shortId)}?${params.toString()}${window.location.hash}`;
     }, [shortId]);
 
     useEffect(() => {
@@ -127,7 +125,7 @@ export default function PublishedPageViewer() {
         return (
             <main className="published-page-viewer-state" aria-live="polite">
                 <IconLoader2 className="published-page-viewer-spinner" size={26} aria-hidden="true" />
-                <p>正在安全加载页面…</p>
+                <p>正在加载页面…</p>
             </main>
         );
     }
@@ -138,7 +136,6 @@ export default function PublishedPageViewer() {
                 ref={frameRef}
                 className="published-page-viewer-frame"
                 title={context.title || '发布页面'}
-                sandbox={REPORT_SANDBOX}
                 src={iframeSrc}
             />
         </main>

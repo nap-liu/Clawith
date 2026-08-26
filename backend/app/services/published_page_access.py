@@ -64,6 +64,8 @@ async def can_view_page(db: AsyncSession, page: PublishedPage, user: User | None
         return False
     if page.access_mode == "authenticated":
         return True
+    if is_platform_admin_user(user) or user.role == "org_admin":
+        return True
     if user.id == page.user_id:
         return True
 
