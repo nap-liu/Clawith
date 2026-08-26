@@ -340,6 +340,34 @@ async def clear_render_session(response: Response):
     return {"ok": True}
 
 
+@router.get("/{short_id}/viewer-context")
+async def get_published_page_viewer_context(
+    short_id: str,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Keep the former viewer API compatible without restoring its restrictions."""
+    page, _user, access_error = await _resolve_page_view(short_id, request, db)
+    if access_error == 401:
+        raise HTTPException(401, "Page session expired")
+    if access_error == 403:
+        raise HTTPException(403, "无权访问此页面")
+
+    response.headers["Cache-Control"] = "no-store"
+    if page.access_mode == "public":
+        _visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+        if new_visitor_cookie:
+            _set_public_visitor_cookie(response, new_visitor_cookie, request)
+    return {
+        "title": page.title or page.source_path,
+        "access_mode": page.access_mode,
+        "watermark_identity": None,
+        "watermark_text": None,
+        "allow_top_navigation": True,
+    }
+
+
 @router.get("/{short_id}/content")
 async def get_published_page_content(
     short_id: str,

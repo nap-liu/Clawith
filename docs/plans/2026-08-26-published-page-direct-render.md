@@ -17,11 +17,11 @@
 
 ## Frozen workstreams
 
-1. [x] **One authoritative authorization-and-render path** — Reuse the current tenant-aware `can_view_page` policy for `/p/<short_id>` and `/api/pages/<short_id>/content`; re-check live user and access state on every request; remove all viewer-only branches and bypass-prone alternate behavior.
+1. [x] **One authoritative authorization-and-render path** — Reuse the current tenant-aware `can_view_page` policy for `/p/<short_id>`, `/api/pages/<short_id>/content`, and the legacy `/viewer-context` compatibility response; re-check live user and access state on every request; remove all viewer-only rendering branches and bypass-prone alternate behavior.
 
 2. [x] **Byte-preserving direct response** — Read report content with `read_bytes`; return those bytes unchanged with explicit `Content-Type: text/html` without a forced charset and `Cache-Control: no-store`; retain only required cookies plus ordinary protocol, trace, CORS-middleware, and gateway headers.
 
-3. [x] **Retire platform execution and embedding restrictions** — Remove the viewer iframe, sandbox, `X-Accel-Redirect`, `__report_embed`, viewer context, fetch-metadata assumptions, internal nginx viewer location, and route-owned CSP, XFO, COOP, COEP, CORP, Permissions-Policy, and `X-Content-Type-Options` behavior.
+3. [x] **Retire platform execution and embedding restrictions** — Remove the viewer iframe, sandbox, `X-Accel-Redirect`, `__report_embed` branching, viewer-context restrictions, fetch-metadata assumptions, internal nginx viewer location, and route-owned CSP, XFO, COOP, COEP, CORP, Permissions-Policy, and `X-Content-Type-Options` behavior. Keep the old context URL as an unrestricted authenticated compatibility response (`allow_top_navigation=true`, no platform watermark) so external callers do not break.
 
 4. [x] **Preserve access and audit lifecycle** — Keep the page session, HttpOnly cookie, access UI, request/approval workflow, tenant isolation, real-time revocation, public visitor cookie, named/anonymous aggregation, and exactly-once view accounting for each canonical content request.
 

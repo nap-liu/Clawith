@@ -171,6 +171,9 @@ async def test_next_request_rechecks_access_mode_approval_user_and_session_state
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         client.cookies.set(PAGE_SESSION_COOKIE, create_page_session(viewer_id), path="/")
         assert (await client.get(f"/p/{short_id}")).status_code == 200
+        context = await client.get(f"/api/pages/{short_id}/viewer-context")
+        assert context.status_code == 200
+        assert context.json()["allow_top_navigation"] is True
 
         async with async_session() as db:
             page = await db.get(PublishedPage, page_id)
@@ -182,6 +185,7 @@ async def test_next_request_rechecks_access_mode_approval_user_and_session_state
             access.status = "rejected"
             await db.commit()
         assert (await client.get(f"/api/pages/{short_id}/content")).status_code == 200
+        assert (await client.get(f"/api/pages/{short_id}/viewer-context")).status_code == 200
 
         async with async_session() as db:
             page = await db.get(PublishedPage, page_id)
@@ -191,6 +195,7 @@ async def test_next_request_rechecks_access_mode_approval_user_and_session_state
         assert denied_page.status_code == 302
         assert "denied=1" in denied_page.headers["location"]
         assert (await client.get(f"/api/pages/{short_id}/content")).status_code == 403
+        assert (await client.get(f"/api/pages/{short_id}/viewer-context")).status_code == 403
 
         async with async_session() as db:
             access = await db.scalar(select(PublishedPageAccess).where(
@@ -200,6 +205,7 @@ async def test_next_request_rechecks_access_mode_approval_user_and_session_state
             access.status = "approved"
             await db.commit()
         assert (await client.get(f"/p/{short_id}")).status_code == 200
+        assert (await client.get(f"/api/pages/{short_id}/viewer-context")).status_code == 200
 
         async with async_session() as db:
             viewer = await db.get(User, viewer_id)
@@ -209,6 +215,7 @@ async def test_next_request_rechecks_access_mode_approval_user_and_session_state
         assert inactive_page.status_code == 302
         assert "denied=1" not in inactive_page.headers["location"]
         assert (await client.get(f"/api/pages/{short_id}/content")).status_code == 401
+        assert (await client.get(f"/api/pages/{short_id}/viewer-context")).status_code == 401
 
     async with async_session() as db:
         viewer = await db.get(User, viewer_id)
@@ -229,6 +236,8 @@ async def test_next_request_rechecks_access_mode_approval_user_and_session_state
             invalid_client.cookies.set(PAGE_SESSION_COOKIE, invalid_session, path="/")
             response = await invalid_client.get(f"/api/pages/{short_id}/content")
             assert response.status_code == 401
+            context = await invalid_client.get(f"/api/pages/{short_id}/viewer-context")
+            assert context.status_code == 401
 
 
 async def test_forwarded_https_is_preserved_for_return_url_and_page_session_cookie():
@@ -333,7 +342,7 @@ async def test_public_and_authenticated_modes_keep_expected_access_boundaries():
         assert content.text == "<h1>secret</h1>"
 
 
-async def test_removed_viewer_context_does_not_affect_direct_public_content():
+async def test_legacy_viewer_context_is_unrestricted_and_does_not_count_a_view():
     short_id, page_id, _agent_id, _owner_id, _viewer_id = await _make_restricted_page()
     async with async_session() as db:
         page = await db.get(PublishedPage, page_id)
@@ -347,7 +356,18 @@ async def test_removed_viewer_context_does_not_affect_direct_public_content():
 
     assert response.status_code == 200
     assert response.text == "<h1>secret</h1>"
-    assert context.status_code == 404
+    assert context.status_code == 200
+    assert context.headers["cache-control"] == "no-store"
+    assert context.json() == {
+        "title": "Protected",
+        "access_mode": "public",
+        "watermark_identity": None,
+        "watermark_text": None,
+        "allow_top_navigation": True,
+    }
+    async with async_session() as db:
+        page = await db.get(PublishedPage, page_id)
+        assert page.view_count == 1
 
 
 async def test_report_owned_meta_csp_and_dom_are_returned_unchanged():
