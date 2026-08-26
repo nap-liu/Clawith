@@ -20,8 +20,9 @@
 当前候选：
 
 - 分支：`feature/ai-native-project-management`
-- 应用候选：`c94f8d52bf9437bec05a3289b57004942be71c0c`。
-- 最新主线：`yybpc/company/main@26bcd4b551dc12a2b1e90856be6a9867b6b402c1`，由合并提交 `c658ce8c` 纳入候选。
+- 完整差异审计应用基线：`e04de8dd7b9a1916a5567ac30b0cc95373d2bc0f`。
+- 最新主线：`yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e`，由合并提交 `e04de8dd` 纳入候选。
+- 最终收口在该基线上只恢复误退场的 Plaza、增加项目 Agent 的 Plaza 隔离、增加可逆 legacy 数据库边界及相应行为测试和文档；最终提交 SHA 在提交后记录。
 - `b0c2e14b` 完成里程碑自动关联；`b4c84ec7` 与 `c94f8d52` 完成项目原子并发门禁和普通 Subagent 隔离。
 - backend/frontend 版本均仍为 `1.10.3`。
 - `docker/aio-sandbox/**` 与 AIO Compose 没有变化，本次不构建、不切换 AIO。
@@ -40,24 +41,29 @@
 
 回滚标准已按最新产品决定调整：不要求回滚时抹除每张新增表、每个新增列或所有项目历史，只要求执行经过验证的兼容降级后，旧服务能够安全运行且原有能力不受影响。隔离演练已完成完整兼容降级序列，并用精确旧镜像 `v1.10.3-bd5cb26` 启动：
 
-- 16 个项目数字员工不再进入旧服务可见范围；55 个标准数字员工完整保留。
-- 健康检查 HTTP 200，版本 `1.10.3`，容器健康且无重启。
-- 旧版 Agent 列表 HTTP 200，与原项目 Agent ID 交集为 0。
-- 租户边界触发器在兼容降级后保留，旧服务启动迁移可继续执行。
+- 候选 helper 创建固定的专用非 owner 旧服务角色，对全部 Agent 外键表、`project_id` 表和 Plaza 多态作者表建立可逆 RLS 边界；不更新或删除业务行。
+- 精确旧镜像 `sha256:a8f783c27b05e79de40f88b9107ff98b896c6277051c80adeec396f09e33ddd6` 的 API/worker 分角色运行，健康检查 HTTP 200、版本 `1.10.3`、重启次数为 0。
+- 标准 Agent 六类接口保持 HTTP 200；已知项目 Agent 的详情、会话、任务、计划、触发器、工具、权限、活动、审批和网关十类接口全部 404；六类全局列表没有项目标记。
+- 旧 worker 不领取项目 Subagent Run、Schedule 或 Trigger；标准队列仍可领取。
+- `restore` 可重复执行，helper policy、RLS enable、专用角色和分类函数全部清除；项目 Agent、成员、会话、Run、事件和消息快照恢复前后 checksum 均为 `fa0afa5b04f4838c480a24d54d19dce9`，候选恢复后七个项目 API 全部 HTTP 200。
 
 普通应用回滚因此使用“兼容降级 + 旧 backend/frontend digest”，无需默认恢复整套数据。只有数据损坏、兼容降级失败或显式要求回到同一恢复点时，才启用 PostgreSQL、AgentData、Redis/对象存储的一致恢复路径。
 
 ### A-03 · 已关闭 · 候选验证门禁
 
-验证证据包括：此前候选完整后端套件 `2655 passed`；最新主线合并与并发收口后的 Docker 影响套件 `78 passed`；前端完整构建与浏览器关键路径；3011 backend 重启后健康 HTTP 200、restart count 0；严格 RC3 跨域验收；兼容降级和标准项目工具矩阵。`2655 passed` 属于此前候选全量证据，不表述为应用候选 `c94f8d52` 又执行了一次全量；`c94f8d52` 的新增与合并影响由 `78 passed` 覆盖。
+验证证据包括：以 Docker/PostgreSQL 分区执行的完整后端唯一用例 `2741 passed, 28 skipped`，没有产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；最新主线合并影响套件 `78 passed`；Plaza 恢复影响套件 `28 passed`；legacy RLS 持久行为测试 `1 passed`；前端完整 prebuild、TypeScript、Vite production build；3011 健康与严格 RC3 跨域验收。源码文本或正则形状测试不计入上述通过数。
 
-### A-04 · P2 · 发布面过大且没有项目功能开关
+### A-04 · 已关闭 · Plaza 非项目退场回归
+
+完整差异审计确认候选曾把 Plaza 作为全局能力退场，该变更不属于项目交付并会直接影响旧能力。最终收口已经恢复 `/plaza`、Onboarding、后端 router、标准 Agent seed/默认分配/LLM 目录/runtime、通知、活动和 Heartbeat；项目 Agent 继续从帖子、评论、点赞、提及、广播、历史和 Heartbeat 隔离。PostgreSQL/FastAPI/tool runtime 行为测试 `2 passed`，相关影响套件 `28 passed`，前端生产构建包含 Plaza chunk。
+
+### A-05 · P2 · 发布面过大且没有项目功能开关
 
 候选同时修改项目领域、会话、A2A、触发器、工具播种、Agent 可见性、文件工作区、后台运行、前端公共组件、部署文件和 CI。项目入口没有租户级发布开关，因此上线即面向全部生产用户，不能做租户灰度。
 
 处理原则：本轮不为此引入复杂灰度系统。阻断项修复后采用一次性维护窗口、关闭入口完成生产验收、通过后再开放。后续迭代再决定是否增加统一功能开关。
 
-### A-05 · P2 · 核心文件规模形成后续维护风险
+### A-06 · P2 · 核心文件规模形成后续维护风险
 
 - `ProjectWorkspacePage.tsx`：8,949 行。
 - `projectWorkspace.css`：4,942 行。
@@ -65,22 +71,22 @@
 
 当前不建议在发布前做大规模重构，以免扩大回归面；但发布后应冻结继续堆叠，按“页面区块、领域服务、共享组件”拆分，并保持 API 与用户行为不变。
 
-### A-06 · P1 运行前提 · 完整备份容量必须先确认
+### A-07 · P1 运行前提 · 完整备份容量必须先确认
 
 生产 AgentData 约 37 GB、数据库约 10 GB，当前数据盘剩余约 70 GB。本次变更同时写数据库与项目仓库，不能省略 AgentData 或数据库备份。正式窗口前必须完成压缩后体积测量或准备独立快照/外部备份目标，禁止在 cutover 时临时尝试并把主数据盘写满。
 
-A-06 是生产发布执行前提，不是未完成的研发任务。它只在获得发布授权并进入生产准备后执行；不影响本轮开发完成结论，但未满足时禁止停写与切换。
+A-07 是生产发布执行前提，不是未完成的研发任务。它只在获得发布授权并进入生产准备后执行；不影响本轮开发完成结论，但未满足时禁止停写与切换。
 
-### A-07 · 已关闭 · 项目能力故障不得影响原稳定能力
+### A-08 · 已关闭 · 项目能力故障不得影响原稳定能力
 
 项目运行判断已收敛到明确的项目 Agent 边界：标准 Agent 与普通 Subagent 使用独立非项目路径，不加载项目状态或项目容量。项目表、项目状态查询或项目服务故障时，标准 Agent 的普通会话、计划任务、手动任务、触发器领取与触发调用继续运行；只有对应项目入口局部失败。`max_parallel_runs` 对所有 ProjectRun 类型使用统一原子计数，饱和任务保持 queued，容量释放后才进入 running，不会占用或阻断普通 Subagent。Docker/PostgreSQL 故障隔离专项 `10 passed`、相关后台/手动/调度回归 `36 passed`，最新合并影响套件 `78 passed`。
 
 ## 三、最终候选冻结
 
-1. A-01 创建补偿、A-02 兼容降级、A-03 候选验证和 A-07 故障隔离已关闭。
-2. 最新主线 `26bcd4b5` 已由 `c658ce8c` 合入；应用候选冻结为 `c94f8d52`。
-3. 文档收口提交后记录最终不可变 `RELEASE_SHA`，并确认它相对 `c94f8d52` 只有文档变化；应用制品的代码门禁 SHA 为 `c94f8d52`。
-4. 生产准备不得把此前候选全量 `2655 passed` 误记为 `c94f8d52` 的全量结果；准确记录“此前候选全量 + 合并后影响套件 78 passed”。
+1. A-01 创建补偿、A-02 legacy RLS、A-03 候选验证、A-04 Plaza 恢复和 A-08 故障隔离已关闭。
+2. 最新主线 `d963d85c` 已由 `e04de8dd` 合入；应用代码候选冻结为 `828438e1`。
+3. 文档收口提交后记录最终不可变 `RELEASE_SHA`；应用制品的代码门禁 SHA 为 `828438e1`，其后的提交只允许文档变化。
+4. 准确记录“完整后端分区 2741 passed/28 skipped + 合并影响 78 passed + Plaza 影响 28 passed + legacy RLS 1 passed”，不把相互重叠的分区简单相加为唯一测试数。
 5. backend/frontend 的 `VERSION` 必须继续一致为 `1.10.3`。
 6. 发布标识按 `v1.10.3-<RELEASE_SHA 前 7 位>` 生成，不提升私有语义版本。
 7. Git tag 必须直接指向完整 `RELEASE_SHA`；合并、tag、push 和发布分别等待用户明确授权。
@@ -102,10 +108,10 @@ A-06 是生产发布执行前提，不是未完成的研发任务。它只在获
 - 从生产当前 `webhook_event_sequence` 升级到候选唯一 head `repair_tenant_boundary_triggers`。
 - 验证新增项目表、Agent 项目字段、会话/运行关联、执行用户字段、活动枚举和索引。
 - 记录迁移时间和锁等待；当前受影响核心表约为 Agents 125 行、ChatSession 23,345 行、SubagentRun 63 行，预计迁移较短，但以演练实测为准。
-- 此前候选完整 backend pytest 为 `2655 passed`；`c658ce8c` 主线合并和 `c94f8d52` 并发收口后的 Docker 影响套件为 `78 passed`。不得把两者合并表述为最终 SHA 再次全量通过。
+- 完整 backend 唯一用例采用适配其数据库前提的 Docker/PostgreSQL 分区执行：`2741 passed, 28 skipped`，无产品断言失败。主线合并影响套件 `78 passed`、Plaza 恢复影响套件 `28 passed`、legacy RLS 持久行为测试 `1 passed` 作为收口证据单列，不重复累加。
 - 验证 19 个用户项目工具写入数据库、默认关闭、没有给标准数字员工自动启用；运行时工具集合与数据库一致。
 - A-01 创建校验、服务链失败、成员/资产复制失败和最终提交失败均通过可观察行为验证；数据库、项目根目录、AgentDir 和 Git 操作记录无孤儿。
-- A-02 兼容降级演练在 `RELEASE_SHA` 对应迁移上复跑；精确旧镜像健康、标准 Agent 保留、项目 Agent 不泄漏。
+- A-02 使用应用候选 `828438e1` 的 helper 和精确旧镜像复跑：专用旧服务角色、48 张表边界、API/worker 分角色、深链 404、项目队列不领取、幂等 restore 和候选恢复全部通过。
 - 项目故障隔离矩阵通过：项目查询/服务不可用不阻断标准 Agent 会话、计划任务、手动任务、触发器领取和触发执行。
 - 标准 Agent 项目工具矩阵通过：组三态、Web/映射 IM Human、合法非 Human 拒绝、owner/editor/viewer/removed、确认恢复 ACL 重检、分页、暂停、跨项目 ID 和独立证据锚点。
 - 项目并发矩阵通过：所有 ProjectRun 类型统一进入 `max_parallel_runs` 原子门禁，饱和运行保持 queued；普通 Subagent 不参与项目计数并保持独立可执行。
@@ -113,7 +119,7 @@ A-06 是生产发布执行前提，不是未完成的研发任务。它只在获
 ### 4.3 前端与真实链路
 
 - 前端完整 prebuild、TypeScript 和 Vite production build 通过。
-- 前端候选证据：镜像 `clawith-ai-project-frontend-check:merge-5a664c7` 转换 10,297 个模块，只有既有大分块提示；附件、Web 恢复、H5 时间线、项目路由、项目 i18n、Git diff 和文件工作区七组命令通过。后续 `26bcd4b5` 合并与并发收口不修改前端产品代码，该证据继续适用于应用候选；生产制品仍按第五节从固定 SHA 构建。
+- 前端候选证据：应用候选完整 prebuild、TypeScript 和 Vite production build 通过，转换 10,297 个模块，只有既有大分块提示；附件、Web 恢复、H5 时间线、项目路由、Git diff 和文件工作区等可执行行为命令通过；Plaza 恢复后的最终构建生成 Plaza chunk。生产制品仍按第五节从固定 SHA 构建。
 - 使用最终 SHA 重建本地 Docker 栈，后端与前端健康。
 - 中文、英文、390/768/1280/1920 四档关键页面通过。
 - 负责人、编辑者、查看者权限矩阵通过。
@@ -139,7 +145,7 @@ A-06 是生产发布执行前提，不是未完成的研发任务。它只在获
 | 项目 | 值 |
 |---|---|
 | RELEASE_SHA | `RELEASE_SHA`（最终收口提交后回填完整 SHA） |
-| APPLICATION_SHA | `c94f8d52bf9437bec05a3289b57004942be71c0c` |
+| APPLICATION_SHA | `828438e1c4daa5b93ac9dfe0b6e5ab0c363682ab` |
 | RELEASE_ID | `v1.10.3-<sha7>` |
 | backend digest | 构建后回填 |
 | frontend digest | 构建后回填 |
@@ -238,7 +244,9 @@ A-06 是生产发布执行前提，不是未完成的研发任务。它只在获
 
 ### 回滚决策树
 
-1. **入口开放前且尚未产生候选写入**：停止候选 writer，执行已验证的兼容降级步骤，恢复旧 backend/frontend digest，健康后恢复入口。允许保留经演练确认对旧服务无影响的新增表、可空列和历史元数据。
+兼容降级固定步骤：停止全部候选 writer；用候选镜像和 owner DSN 执行 `PROJECT_LEGACY_ROLLBACK_PASSWORD=<secret-manager value> python -m app.scripts.project_legacy_rollback apply` 和 `status`；旧 API 与 worker 分别使用专用 `clawith_project_legacy` DSN 及 `PROCESS_ROLE=api` / `PROCESS_ROLE=worker` 启动。禁止旧镜像使用 owner DSN 或 `PROCESS_ROLE=all`。再次升级前停止旧进程，用候选镜像和 owner DSN 执行 `restore` 与 `status`，确认专用角色、policy、RLS enable 和分类函数均已清除，再恢复候选服务。
+
+1. **入口开放前且尚未产生候选写入**：停止候选 writer，执行上述兼容降级步骤，恢复旧 backend/frontend digest，健康后恢复入口。允许保留经演练确认对旧服务无影响的新增表、可空列和历史元数据。
 2. **已产生项目数据但数据库未损坏**：停止候选 writer，执行同一兼容降级，确认项目 Agent 不进入旧目录、55 个或发布前记录的标准 Agent 集合完整，再切换精确旧 digest。普通回滚不要求抹除所有项目 schema 或历史变化。
 3. **兼容降级失败、出现数据损坏或旧服务无法保持原能力**：停止全部 writer，按同一恢复点恢复 PostgreSQL、AgentData、Redis/对象存储，再恢复旧 backend/frontend digest。该灾备路径会丢弃恢复点之后的写入，必须由数据负责人批准。
 4. 不单独执行未经演练的 Alembic downgrade，也不只恢复数据库或只恢复 AgentData。应用回滚使用已经验证的完整兼容序列；灾备恢复必须保持所有权威数据源同点。
@@ -255,4 +263,4 @@ A-06 是生产发布执行前提，不是未完成的研发任务。它只在获
 - 真实生产渠道验收；
 - 回滚或数据恢复。
 
-A-01、A-02、A-03 和 A-07 已关闭，应用候选结论为 `GO for production preparation`。A-06 在生产准备阶段作为执行前提完成，不回退成研发任务。该 GO 不构成生产发布授权；只有 A-06 就绪并取得构建推送、停写、备份、迁移、切换和生产验收的逐项明确授权后，才允许执行对应操作。
+A-01、A-02、A-03、A-04 和 A-08 已关闭，应用候选结论为 `GO for production preparation`。A-07 在生产准备阶段作为执行前提完成，不回退成研发任务。该 GO 不构成生产发布授权；只有 A-07 就绪并取得构建推送、停写、备份、迁移、切换和生产验收的逐项明确授权后，才允许执行对应操作。

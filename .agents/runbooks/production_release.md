@@ -287,11 +287,48 @@ Rollback backend and frontend as one release set.  Do not leave mixed SHAs.
    python -m app.scripts.rollback_im_recall
    ```
 
+   Before starting a binary that predates project-scoped Agents, keep the
+   candidate project tables and history in place and apply the candidate
+   image's reversible database boundary:
+
+   ```bash
+   PROJECT_LEGACY_ROLLBACK_PASSWORD='<secret-manager value>' \
+     python -m app.scripts.project_legacy_rollback apply
+   python -m app.scripts.project_legacy_rollback status
+   ```
+
+   Construct a dedicated old-service DSN for the returned
+   `clawith_project_legacy` role from the same secret-manager value. Start the
+   previous API and worker as separate `PROCESS_ROLE=api` and
+   `PROCESS_ROLE=worker` services using only that DSN. An owner DSN and
+   `PROCESS_ROLE=all` are forbidden for this compatibility rollback: the owner
+   bypasses the row boundary, while `all` attempts to run migrations unknown to
+   the old binary. Verify standard Agent CRUD and task/schedule/trigger
+   processing, then prove a known project Agent ID and its sessions, tasks,
+   schedules, triggers, tools, permissions, activity, approvals, and gateway
+   messages all return not-found. Global inbox, notification, tool, Skill,
+   Plaza, and published-page lists must contain no project marker.
+
 3. Restore the saved Compose file or set both application images to their
    previous immutable digests.
 4. Start the previous backend, wait for health, then start frontend and other
    roles; confirm no candidate process remains.
 5. Repeat the platform and IM smoke subset and record the rollback result.
+
+To return from the project compatibility rollback to the candidate, first stop
+all legacy API/worker processes, then run the candidate image with the owner
+DSN:
+
+```bash
+python -m app.scripts.project_legacy_rollback restore
+python -m app.scripts.project_legacy_rollback status
+```
+
+`restore` is idempotent. Confirm the dedicated role, helper policies, and
+classifier are gone; every affected table has its recorded pre-apply RLS state;
+and project Agent, member, session, Run, event/history IDs and counts match the
+pre-rollback snapshot. Only then restart candidate API/worker roles with their
+normal DSN and verify those exact project records through candidate APIs.
 
 Default application rollback keeps current database/workspace data when the old
 binary is schema-compatible.  Do not automatically run Alembic downgrade.

@@ -14,6 +14,7 @@ substitute for that runbook.
 - Before production cutover: complete local Docker tests and any required browser validation, prepare/pull images, stop writers, take a fresh consistent rollback backup, migrate, start, and verify health.
 - A release plan must include explicit rollback anchors. Never commit credentials or current production secrets into release documentation.
 - Before rolling back to a binary that predates a newly seeded builtin tool, run the candidate image's idempotent rollback helper first. For IM recall this is `python -m app.scripts.rollback_im_recall`; only then start the older binary.
+- Before rolling back to a binary that predates project-scoped Agents, stop writers and run `python -m app.scripts.project_legacy_rollback apply` from the candidate image. The old API and worker must run as separate process roles through the helper's dedicated non-owner database role; never connect the old binary with the schema-owner DSN. Stop the old processes and run the candidate helper's idempotent `restore` before upgrading forward again.
 - The generic GitHub Release workflow currently increments semantic versions
   and does not build application images.  Do not run it unchanged for a private
   SHA-suffixed production release.

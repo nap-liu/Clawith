@@ -591,7 +591,7 @@
 ## 二十八、最终主线兼容与发布收口（2026-08-26）
 
 - [x] 合并 `yybpc/company/main@727c5f2b`，合并提交为 `5a664c72`；保留主线会话附件、引用消息和 H5 展示，同时保留项目会话续接、精确锚点与状态恢复。
-- [x] 合并最新 `yybpc/company/main@26bcd4b5`，合并提交为 `c658ce8c`；应用候选冻结为 `c94f8d52`。
+- [x] 合并 `yybpc/company/main@26bcd4b5`，合并提交为 `c658ce8c`；该门禁阶段应用候选为 `c94f8d52`。完整差异收口随后以 `yybpc/company/main@d963d85c` 为基线并冻结应用代码为 `828438e1`。
 - [x] 使用候选镜像 `clawith-ai-project-frontend-check:merge-5a664c7` 完成全量 prebuild、TypeScript、Vite production build，转换 10,297 个模块；仅出现既有大分块提示。
 - [x] 附件、Web 会话恢复、H5 时间线、项目路由、项目中英文、Git diff、项目文件工作区七组前端行为命令通过。
 - [x] 候选 nginx 对后端 `/api/health` 返回 `status=ok`、版本 `1.10.3`；项目、团队、标准数字员工工具/Skill 路由加载或登录跳转正常，控制台 0 错误、0 警告。
@@ -606,3 +606,18 @@
 - [x] RC3 严格跨域项目 `fb454fa3-ccb1-4f71-b587-a29ed200c3b6` 通过：4/4 工作项、32 次运行、5 个角色、200 个事件、2 个里程碑，失败、活跃、未恢复和缺失关联均为 0；Git `5f46a1483080e32236343a302e560a533352174f`，证据 checksum `1cfbbd26974d3b6a819ce7f317e312a26e7180796e6143ca33ee70411e40a090`。
 - [x] 完整键盘与读屏复核按用户明确范围排除，不属于开发尾项、发布阻断或完成率分母。
 - [x] 研发任务全部闭环，发布评估为 `GO for production preparation`。该结论只授权进入发布准备评审，不表示已经生产发布；构建推送、停写、备份、切换和生产验收仍需单独授权。
+
+## 二十九、完整分支差异与原能力稳定性收口（2026-08-26）
+
+- [x] 以 `yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e` 为基线完成完整差异审计；最终应用 SHA `828438e1c4daa5b93ac9dfe0b6e5ab0c363682ab` 相对主线为 302 个文件、104692 行新增、12866 行删除，178 个新增文件、124 个修改文件。
+- [x] 将项目领域本体与 18 个横切稳定性模块分开审计；Agent、Chat、WebSocket、Scheduler、Trigger、Subagent、LLM、Files、Tools、公共组件、全局页面、水印、发布页和部署均记录变更目的、旧能力风险和可观察证据。
+- [x] 发现并撤销与项目能力无关的 Plaza 全局退场；恢复 `/plaza`、Onboarding、后端 router、标准 Agent 工具 seed/目录/runtime、通知、活动和 Heartbeat。
+- [x] 保留项目 Agent 的 Plaza 隔离：默认无 Plaza 工具，发帖/评论/点赞拒绝，历史帖子/评论不进入 feed/detail/stats/tool browse，direct-ID 删除 404，mention/broadcast/heartbeat 不触达项目 Agent。
+- [x] Plaza 长期 PostgreSQL/FastAPI/tool runtime 行为测试 `2 passed`；相关通知和项目 Agent 影响套件 `28 passed`；最终前端完整 prebuild、TypeScript、Vite build 通过并生成 Plaza chunk。
+- [x] 旧服务回滚初验发现 Agent 列表隐藏不足：已知项目 Agent ID 的十类深链仍可访问，旧 worker 仍可领取项目 Subagent Run；该发现未被隐藏或降级为文档风险。
+- [x] 新增幂等 `project_legacy_rollback` helper：固定专用非 owner 角色，对 Agent 外键表、全部 `project_id` 表和 Plaza 多态作者表建立 48 表可逆 RLS 边界；不删除或更新任何业务行，首次遇到同名非托管角色 fail closed，`status` 只读。
+- [x] 精确旧镜像 API/worker 分角色验证：health 200、restart 0；标准六接口 200；项目详情、会话、任务、计划、触发器、工具、权限、活动、审批和网关十接口 404；六类全局列表无项目标记；项目 Subagent/Schedule/Trigger 未被消费。
+- [x] `restore` 和重复 restore 通过；helper policies、RLS enable、角色和函数归零；项目 Agent/member/session/Run/event/message 快照 checksum 前后均为 `fa0afa5b04f4838c480a24d54d19dce9`；候选恢复后七个项目 API 全部 200。
+- [x] 完整后端唯一行为用例按数据库前提分区执行为 `2741 passed, 28 skipped`，无产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；主线合并影响 `78 passed`；不把重叠分区相加为虚假的总数，不把源码正则/形状检查计为产品验证。
+- [x] Fresh PostgreSQL 历史迁移重复列通过 Git blob 与行为对比确认在最新主线同样存在，不属于本 feature diff；现有生产结构升级和兼容回滚通过。该问题作为独立主线 fresh-install 整改，不计为本迭代遗留。
+- [x] 详细审计见 `docs/plans/2026-08-26-ai-native-project-full-diff-stability-audit.md`；研发尾项为 0，结论为 `GO for production preparation`，不构成生产发布授权。

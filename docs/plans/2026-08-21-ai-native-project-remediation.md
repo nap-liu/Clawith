@@ -364,27 +364,28 @@ explicit `AgentTool` assignments like every other ordinary LLM tool.
   pagination beyond the first page, paused projects, cross-project object IDs,
   and complete audit/session/message anchors.
 
-## Global Plaza retirement (2026-08-24)
+## Plaza compatibility boundary (2026-08-26 superseding the 2026-08-24 retirement)
 
-Plaza is disabled as one platform invariant rather than a navigation-only
-change. Historical database rows remain readable for audit and rollback, but
-there is no user route, public API router, heartbeat instruction, LLM tool
-exposure, or direct runtime dispatch that can create, read, or comment on Plaza
-content.
+The full branch-to-main audit found that globally retiring Plaza was unrelated
+to the project capability and directly removed an established platform
+surface. That retirement is superseded. Plaza remains available to standard
+company-wide Agents and users; project isolation is enforced at the Agent and
+content boundary instead of by disabling the product.
 
-- [x] Redirect the retired frontend route to the supported discovery page and
-  remove onboarding, layout, access-scope, and heartbeat copy that advertises
-  Plaza.
-- [x] Stop registering the Plaza API router so direct HTTP calls are not a
-  supported product surface.
-- [x] Force all Plaza builtin tools globally disabled during seed/sync and
-  exclude them from every digital employee LLM tool roster, including existing
-  assignments restored from an old database.
-- [x] Reject direct Plaza tool dispatch at the shared runtime boundary so a
-  stale queued call or historical tool assignment cannot bypass the switch.
-- [x] Verify the disabled seed state, LLM roster, runtime rejection, retired
-  route, and HTTP 404 in the healthy port-3011 Docker environment while
-  reusing the existing local images and build cache.
+- [x] Restore both frontend `/plaza` routes, the onboarding destination, the
+  backend Plaza router, standard-Agent tool seed/default assignments, LLM tool
+  exposure, runtime dispatch, notifications, activity and heartbeat behavior.
+- [x] Preserve the original one-post/two-comment heartbeat limits and both
+  heartbeat templates for standard Agents.
+- [x] Keep project Agents out of Plaza defaults, runtime post/comment/like,
+  mentions, broadcasts and heartbeat scheduling.
+- [x] Hide historical project-Agent posts and comments from feed, detail,
+  statistics and tool browse; direct-ID comment/like/delete operations fail
+  closed without deleting the historical rows.
+- [x] Add observable PostgreSQL/API/tool-runtime coverage. The new Plaza
+  isolation tests passed `2/2`; the related notification and project-Agent
+  impact suite passed `28/28`; the full frontend production build emitted the
+  Plaza chunk and completed successfully.
 
 ## Workspace information-architecture consolidation (2026-08-24)
 
@@ -669,13 +670,13 @@ state store, or invalidation protocol was added.
 ## Final mainline, rollback, and fault-isolation closeout (2026-08-26)
 
 - [x] Merge `yybpc/company/main@727c5f2b` through merge commit `5a664c72`; preserve mainline attachment/quoted-message behavior and the project conversation resume/anchor contract in the single shared timeline.
-- [x] Merge latest `yybpc/company/main@26bcd4b5` through `c658ce8c`; application candidate is `c94f8d52`.
+- [x] Merge `yybpc/company/main@26bcd4b5` through `c658ce8c`; the application candidate at that gate was `c94f8d52`. The later full-diff closeout merged `yybpc/company/main@d963d85c` through `e04de8dd` and froze application code at `828438e1`.
 - [x] Build candidate frontend image `clawith-ai-project-frontend-check:merge-5a664c7`: full prebuild, TypeScript, and Vite production build passed, with 10,297 modules transformed and only the existing large-chunk warning.
 - [x] Pass seven focused frontend behavior commands covering attachments, Web resume, H5 timeline, project routing, project i18n, Git diff, and project file workspace. Candidate nginx reached backend health `status=ok`, version `1.10.3`; project, team, Agent tool, and Skill routes loaded or redirected to login with zero console errors/warnings.
 - [x] Add one observable PostgreSQL matrix for standard Digital Employee project tools. Together with the existing group-state behavior test it passed `8` tests and covers disabled/partial/enabled, Web/mapped IM Human identity, legal non-Human `subagent` rejection, owner/editor/viewer/removed ACL, ACL changes across confirmation resume, pagination, paused projects, cross-project IDs, and separate audit/session/message anchors.
 - [x] Correct successful work-item creation audit linkage so the completion ProjectEvent references the new work item returned as `id`.
 - [x] Keep project runtime checks behind an explicit project-Agent boundary. A failed project query or unavailable project service must not block standard-Agent conversation, scheduled task, manual task, trigger claim, or trigger invocation paths. Docker/PostgreSQL fault-isolation coverage passed `10/10`; related background/manual/scheduler regression passed `36/36`; Ruff, format, and Python compile checks passed.
-- [x] Complete the compatibility-downgrade exercise against exact old backend `v1.10.3-bd5cb26`: 16 project Agents were excluded, 55 standard Agents remained, health returned HTTP 200/version `1.10.3`, restart count remained zero, and the old Agent list had no project-Agent ID overlap.
+- [x] Complete the compatibility-downgrade exercise against exact old backend `v1.10.3-bd5cb26` and close the known-ID/worker boundary that an Agent-list-only check missed. The candidate helper creates a dedicated non-owner legacy role, applies reversible restrictive RLS to every Agent foreign-key and `project_id` boundary, and restores each table's exact prior RLS state without changing business rows. Exact old API/worker roles stayed healthy with restart count zero; standard Agent CRUD and task/schedule/trigger APIs remained available; known project Agent detail, session, task, schedule, trigger, tool, permission, activity, approval, and gateway APIs returned not-found; global inbox/notification/tool/Skill/Plaza/page lists had no project marker; and a queued project Subagent, schedule, and trigger remained unclaimed after worker ticks. Restore was idempotent and the project Agent/member/session/Run/event/message ID snapshot retained checksum `fa0afa5b04f4838c480a24d54d19dce9` before and after restore.
 - [x] Adopt the revised rollback criterion: compatibility downgrade must let the old service and all pre-existing capabilities run safely; rollback does not need to erase every additive project schema/history change. Point-in-time PostgreSQL/AgentData restoration remains the disaster-recovery path for corruption or a failed compatibility downgrade.
 - [x] Complete milestone trace links in `b0c2e14b`: selecting work items automatically links their same-project successful Runs, explicit identifiers remain bounded, and failure recovery remains idempotent while incorporating later successful Runs.
 - [x] Enforce `max_parallel_runs` as one atomic project gate across every ProjectRun type. Saturated work remains queued without a false running timestamp, capacity release permits the next atomic claim, and ordinary Subagents follow an isolated non-project claim path.
