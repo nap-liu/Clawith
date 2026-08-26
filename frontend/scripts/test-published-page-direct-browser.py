@@ -6,9 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -34,11 +32,19 @@ def wait_for_http() -> None:
 
 def assert_http_contract() -> None:
     with urlopen(REPORT_URL, timeout=5) as response:
-        body = response.read()
-        headers = {name.lower(): value for name, value in response.headers.items()}
-    assert b'<script type="module">' in body
-    assert headers["content-type"] == "text/html"
-    assert headers["cache-control"] == "no-store"
+        viewer_body = response.read()
+        viewer_headers = {name.lower(): value for name, value in response.headers.items()}
+    assert b'<div id="root">' in viewer_body
+    assert viewer_headers["content-type"].startswith("text/html")
+    assert "no-store" in viewer_headers["cache-control"]
+
+    separator = "&" if "?" in REPORT_URL else "?"
+    with urlopen(f"{REPORT_URL}{separator}__report_embed=1", timeout=5) as response:
+        report_body = response.read()
+        report_headers = {name.lower(): value for name, value in response.headers.items()}
+    assert b'<script type="module">' in report_body
+    assert report_headers["content-type"] == "text/html"
+    assert report_headers["cache-control"] == "no-store"
     for name in (
         "content-security-policy",
         "x-frame-options",
@@ -48,7 +54,7 @@ def assert_http_contract() -> None:
         "permissions-policy",
         "x-content-type-options",
     ):
-        assert name not in headers, (name, headers)
+        assert name not in report_headers, (name, report_headers)
 
 
 def chromium_result(url: str, *, test_popup: bool = False) -> dict:
@@ -155,10 +161,15 @@ def chromium_result(url: str, *, test_popup: bool = False) -> dict:
             raw_result = None
             while time.monotonic() < deadline:
                 raw_result = evaluate(
-                    "document.querySelector('#result') && document.querySelector('#result').textContent"
+                    "(() => { const frame = document.querySelector('.published-page-viewer-frame'); "
+                    "return frame && frame.contentDocument && frame.contentDocument.querySelector('#result') "
+                    "&& frame.contentDocument.querySelector('#result').textContent; })()"
                 )
                 if raw_result and raw_result != "waiting":
                     result = json.loads(str(raw_result))
+                    result["platformWatermark"] = bool(
+                        evaluate("!!document.querySelector('[data-platform-watermark]')")
+                    )
                     if test_popup:
                         result["popup"] = bool(
                             evaluate(
@@ -218,27 +229,9 @@ def chromium_result(url: str, *, test_popup: bool = False) -> dict:
         profile.cleanup()
 
 
-class EmbedHandler(BaseHTTPRequestHandler):
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
-
-    def do_GET(self) -> None:
-        body = f"""<!doctype html><meta charset=utf-8>
-<iframe src="{REPORT_URL}"></iframe><pre id=result>waiting</pre>
-<script>addEventListener('message', event => {{
-  if (event.data && event.data.type === 'published-direct-result') {{
-    document.querySelector('#result').textContent = JSON.stringify(event.data.result);
-  }}
-}});</script>""".encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-def assert_browser_result(result: dict, *, top_level: bool) -> None:
+def assert_browser_result(result: dict, *, top_level: bool, expected_hash: str) -> None:
     assert result.get("fatal") is None, result
+    assert result["initialHash"] == expected_hash
     assert result["topLevel"] is top_level
     assert result["origin"] == REPORT_URL.removesuffix("/p/browserdirect")
     assert result["localStorage"] == "available"
@@ -263,6 +256,7 @@ def assert_browser_result(result: dict, *, top_level: bool) -> None:
         assert result["downloaded"] is True
     assert result["health"] is True
     assert result["watermark"] is True
+    assert result["platformWatermark"] is True
     assert result["computedColor"] == "rgb(1, 2, 3)"
     assert result["errors"] == []
 
@@ -270,19 +264,13 @@ def assert_browser_result(result: dict, *, top_level: bool) -> None:
 def main() -> None:
     wait_for_http()
     assert_http_contract()
-    assert_browser_result(chromium_result(REPORT_URL, test_popup=True), top_level=True)
-
-    embed_server = ThreadingHTTPServer(("0.0.0.0", 0), EmbedHandler)
-    embed_thread = threading.Thread(target=embed_server.serve_forever, daemon=True)
-    embed_thread.start()
-    try:
-        embed_url = f"http://127.0.0.1:{embed_server.server_port}/embed"
-        assert_browser_result(chromium_result(embed_url), top_level=False)
-    finally:
-        embed_server.shutdown()
-        embed_server.server_close()
-        embed_thread.join(timeout=5)
-    print("published-page direct-render Chromium tests passed")
+    expected_hash = "#viewer-hash"
+    assert_browser_result(
+        chromium_result(f"{REPORT_URL}{expected_hash}", test_popup=True),
+        top_level=False,
+        expected_hash=expected_hash,
+    )
+    print("published-page unrestricted-viewer Chromium tests passed")
 
 
 if __name__ == "__main__":

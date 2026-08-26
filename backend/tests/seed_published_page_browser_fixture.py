@@ -68,6 +68,7 @@ REPORT_HTML = rb"""<!doctype html>
   const health = await fetch('/api/health').then(response => response.ok);
   await Clawith.watermark({text: 'Direct Browser Watermark'});
   const result = {
+    initialHash: initialUrl.hash,
     topLevel: window === top,
     origin: location.origin,
     localStorage: localStorage.getItem('published-direct-storage'),

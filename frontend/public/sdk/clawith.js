@@ -40,6 +40,13 @@
 
   function startOAuth() {
     var returnTo = location.href.split("#")[0].split("?")[0]; // 干净 URL（不含 query/fragment）
+    // Reports inside the platform viewer ask the parent to perform OAuth at
+    // the visible /p/<short_id> URL. The iframe itself remains unrestricted.
+    if (window.parent !== window && shortIdFromUrl()
+        && typeof window.parent.postMessage === "function") {
+      window.parent.postMessage({ type: "published-page:sdk-auth-start" }, "*");
+      return new Promise(function () { /* 顶层页面即将跳转，永不 resolve */ });
+    }
     location.assign(API_BASE + "/api/sdk/auth/start?return_to=" + encodeURIComponent(returnTo));
     return new Promise(function () { /* 页面即将卸载，永不 resolve */ });
   }

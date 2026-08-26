@@ -29,6 +29,7 @@ const H5AgentChat = lazy(() => import('./pages/h5/H5AgentChat'));
 const PublishedPages = lazy(() => import('./pages/PublishedPages'));
 const SkillMarket = lazy(() => import('./pages/SkillMarket'));
 const PublishedPageAccess = lazy(() => import('./pages/PublishedPageAccess'));
+const PublishedPageViewer = lazy(() => import('./pages/PublishedPageViewer'));
 const PublishedPageUnavailable = lazy(() => import('./pages/PublishedPageUnavailable'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -301,6 +302,7 @@ export default function App() {
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/published-page-access" element={<PublishedPageAccess />} />
                 <Route path="/published-page-unavailable" element={<PublishedPageUnavailable />} />
+                <Route path="/p/:shortId" element={<PublishedPageViewer />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/onboarding" element={<ProtectedRoute><Onboarding /></ProtectedRoute>} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>

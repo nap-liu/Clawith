@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import logging
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -48,6 +49,7 @@ MAX_ANONYMOUS_VISITORS_PER_PAGE = 10_000
 ANONYMOUS_VISITOR_OVERFLOW_KEY = "0" * 64
 MAX_BULK_PAGE_ACCESS_UPDATES = 100
 PUBLISHED_PAGE_UNAVAILABLE_PATH = "/published-page-unavailable"
+logger = logging.getLogger(__name__)
 
 
 class PageSessionRequest(BaseModel):
@@ -119,6 +121,12 @@ def _anonymous_visitor(request: Request, page_id: uuid.UUID) -> tuple[str, str |
         hashlib.sha256,
     ).hexdigest()
     return visitor_key, new_cookie
+
+
+def _public_watermark_text(visitor_key: str, accessed_at: datetime) -> str:
+    """Build the anonymous label rendered by the platform-owned viewer layer."""
+    accessed_at_text = accessed_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return f"匿名访客 {visitor_key[:12].upper()} · {accessed_at_text}"
 
 
 def _set_public_visitor_cookie(response: Response, value: str, request: Request) -> None:
@@ -293,7 +301,33 @@ async def render_page(short_id: str, request: Request, db: AsyncSession = Depend
         return _access_ui_redirect(page, request)
     if access_error == 403:
         return _access_ui_redirect(page, request, denied=True)
-    return await _render_page_content(db, page, user, request)
+
+    # The platform viewer owns watermark rendering. The report itself is still
+    # returned byte-for-byte in an unrestricted, same-origin iframe: there is
+    # deliberately no sandbox, CSP, or route-owned browser capability policy.
+    if request.query_params.get("__report_embed") == "1":
+        return await _render_page_content(db, page, user, request)
+
+    viewer_response = Response(headers={
+        "X-Accel-Redirect": "/__published_page_viewer",
+        "Cache-Control": "no-store",
+    })
+    if user is not None:
+        viewer_response.delete_cookie(PAGE_SESSION_COOKIE, path="/p/", samesite="lax")
+        viewer_response.set_cookie(
+            PAGE_SESSION_COOKIE,
+            create_page_session(user.id),
+            max_age=PAGE_SESSION_HOURS * 3600,
+            httponly=True,
+            samesite="lax",
+            secure=_request_scheme(request) == "https",
+            path="/",
+        )
+    else:
+        _visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+        if new_visitor_cookie:
+            _set_public_visitor_cookie(viewer_response, new_visitor_cookie, request)
+    return viewer_response
 
 
 @router.post("/session")
@@ -347,23 +381,37 @@ async def get_published_page_viewer_context(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Keep the former viewer API compatible without restoring its restrictions."""
-    page, _user, access_error = await _resolve_page_view(short_id, request, db)
+    """Return the identity context used by the unrestricted platform viewer."""
+    page, user, access_error = await _resolve_page_view(short_id, request, db)
     if access_error == 401:
         raise HTTPException(401, "Page session expired")
     if access_error == 403:
         raise HTTPException(403, "无权访问此页面")
 
     response.headers["Cache-Control"] = "no-store"
-    if page.access_mode == "public":
-        _visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+    watermark_identity = None
+    watermark_text = None
+    if user is None:
+        visitor_key, new_visitor_cookie = _anonymous_visitor(request, page.id)
+        try:
+            watermark_text = _public_watermark_text(visitor_key, datetime.now(timezone.utc))
+        except Exception:
+            # Watermark formatting remains fail-open so the report can load.
+            logger.exception("Failed to build public page watermark", extra={"page_id": str(page.id)})
         if new_visitor_cookie:
             _set_public_visitor_cookie(response, new_visitor_cookie, request)
+    else:
+        identity = await db.get(Identity, user.identity_id) if user.identity_id else None
+        watermark_identity = {
+            "display_name": user.display_name,
+            "username": identity.username if identity else None,
+            "primary_mobile": identity.phone if identity else None,
+        }
     return {
         "title": page.title or page.source_path,
         "access_mode": page.access_mode,
-        "watermark_identity": None,
-        "watermark_text": None,
+        "watermark_identity": watermark_identity,
+        "watermark_text": watermark_text,
         "allow_top_navigation": True,
     }
 

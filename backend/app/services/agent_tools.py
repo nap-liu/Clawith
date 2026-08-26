@@ -17979,7 +17979,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Published by: {publication_actor_label}\n"
         f"Published at: {publication_time.isoformat() if publication_time else 'not recorded'}\n\n"
         f"Access: {effective_access_mode}.\n"
-        "Platform watermark: not added automatically; report-authored SDK data-watermark remains available.\n"
+        f"Platform watermark: enabled automatically ({'anonymous visitor ID and access time' if effective_access_mode == 'public' else 'signed-in user identity'}).\n"
         "Automatic SSO: off by default; append ?auto_login=1 only when explicitly requested, "
         "and optionally append &sso=<provider_type>."
         f"{url_note}"

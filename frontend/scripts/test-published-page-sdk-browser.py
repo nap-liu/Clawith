@@ -52,6 +52,12 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
 <pre id=result>waiting</pre>
 <script>
 addEventListener('message', event => {{
+  if (event.source === document.querySelector('#report').contentWindow
+      && event.data && event.data.type === 'published-page:sdk-auth-start') {{
+    document.querySelector('#report').src = '/api/sdk/auth/start?return_to=' +
+      encodeURIComponent('/p/sdk-browser');
+    return;
+  }}
   if (event.data && event.data.type === 'sdk-browser-result') {{
     document.querySelector('#result').textContent = JSON.stringify(event.data.result);
     document.body.dataset.complete = '1';

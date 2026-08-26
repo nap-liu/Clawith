@@ -47,6 +47,15 @@ server {
         proxy_set_header X-Forwarded-Proto $effective_forwarded_proto;
     }
 
+    # After backend authorization, render the platform-owned watermark shell.
+    # The report iframe itself is same-origin and deliberately has no sandbox.
+    location = /__published_page_viewer {
+        internal;
+        try_files /index.html =404;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+    }
+
     # WeCom domain verification files
     # WeCom's ownership-check bot requests WW_verify_<token>.txt at the domain root.
     # This rule intercepts these requests before the SPA fallback and proxies them

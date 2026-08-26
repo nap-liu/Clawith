@@ -59,9 +59,11 @@ function createRuntime({
     fetchImpl = () => Promise.resolve(response({ ok: true })),
     scriptAttributes = {},
     embedded = false,
+    parentCanPost = true,
 } = {}) {
     const currentUrl = new URL(href);
     const assigned = [];
+    const posted = [];
     const replaced = [];
     const documentElement = new FakeElement('html');
     const currentScript = new FakeElement('script', scriptAttributes);
@@ -92,13 +94,25 @@ function createRuntime({
         MutationObserver: undefined,
     };
     runtime.window = runtime;
-    runtime.parent = embedded ? {} : runtime;
+    runtime.parent = embedded
+        ? (parentCanPost ? { postMessage: (message, target) => posted.push({ message, target }) } : {})
+        : runtime;
     vm.runInContext(scriptSource, vm.createContext(runtime), { filename: 'clawith.js' });
-    return { runtime, assigned, replaced, documentElement };
+    return { runtime, assigned, posted, replaced, documentElement };
 }
 
 {
-    const { runtime, assigned } = createRuntime({ embedded: true });
+    const { runtime, assigned, posted } = createRuntime({ embedded: true });
+    runtime.Clawith.ready();
+    assert.equal(assigned.length, 0);
+    assert.deepEqual(plain(posted), [{
+        message: { type: 'published-page:sdk-auth-start' },
+        target: '*',
+    }]);
+}
+
+{
+    const { runtime, assigned } = createRuntime({ embedded: true, parentCanPost: false });
     runtime.Clawith.ready();
     assert.equal(assigned.length, 1);
     assert.equal(

@@ -43,17 +43,23 @@ async def _make_page(html: str | bytes, short_id: str):
     (base / "r.html").write_bytes(content)
 
 
-async def test_top_level_page_returns_original_html_without_platform_restrictions():
+async def test_viewer_shell_and_embedded_report_keep_platform_boundary_without_runtime_restrictions():
     sid = f"x{uuid.uuid4().hex[:6]}"
     html = b'<meta charset="windows-1252"><h1>raw \x80 report</h1>'
     await _make_page(html, sid)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get(f"/p/{sid}")
-    assert resp.status_code == 200
-    assert resp.content == html
-    assert resp.headers["content-type"] == "text/html"
-    assert resp.headers["cache-control"] == "no-store"
+        viewer = await client.get(f"/p/{sid}")
+        report = await client.get(f"/p/{sid}?__report_embed=1")
+
+    assert viewer.status_code == 200
+    assert viewer.headers["x-accel-redirect"] == "/__published_page_viewer"
+    assert viewer.headers["cache-control"] == "no-store"
+
+    assert report.status_code == 200
+    assert report.content == html
+    assert report.headers["content-type"] == "text/html"
+    assert report.headers["cache-control"] == "no-store"
     for header in (
         "content-security-policy",
         "x-frame-options",
@@ -63,7 +69,7 @@ async def test_top_level_page_returns_original_html_without_platform_restriction
         "permissions-policy",
         "x-content-type-options",
     ):
-        assert header not in resp.headers
+        assert header not in report.headers
 
 
 @pytest.mark.parametrize(
