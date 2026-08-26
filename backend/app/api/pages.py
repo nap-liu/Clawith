@@ -244,11 +244,9 @@ async def _render_viewer_content(
         html_content,
         headers={
             "Cache-Control": "no-store",
-            # Resource origins stay unrestricted so published reports can use
-            # third-party scripts, styles, fonts, media, and API endpoints.
-            # The frontend iframe owns the execution sandbox; this header only
-            # prevents the document from being framed off-platform.
-            "Content-Security-Policy": "frame-ancestors 'self'",
+            # Access is enforced by the normalized page policy above. The raw
+            # response intentionally carries no framing policy so the official
+            # /p/<short_id> viewer can be embedded by external systems.
             "X-Content-Type-Options": "nosniff",
         },
     )
@@ -277,12 +275,10 @@ async def render_page(short_id: str, request: Request, db: AsyncSession = Depend
         return _access_ui_redirect(page, request, denied=True)
 
     # Keep the report's historical /p/<short_id> document URL inside the
-    # viewer iframe. This preserves SDK short-ID detection and relative URL
-    # resolution without allowing a top-level watermark bypass.
-    if (
-        request.query_params.get("__report_embed") == "1"
-        and request.headers.get("sec-fetch-dest", "").lower() == "iframe"
-    ):
+    # viewer iframe. The explicit marker preserves SDK short-ID detection and
+    # relative URL resolution without depending on Fetch Metadata headers,
+    # which are unavailable in older WebKit releases such as iOS 15.
+    if request.query_params.get("__report_embed") == "1":
         return await _render_viewer_content(db, page, user, request)
 
     # Every access mode uses the platform-owned viewer. The report runs in a
@@ -420,12 +416,8 @@ async def get_page_viewer_content(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    # The raw report is an implementation detail of the platform viewer. A
-    # top-level navigation would bypass its watermark, so only a browser-owned
-    # iframe request may receive the source document. Fetch Metadata headers
-    # cannot be forged by page JavaScript in supported browsers.
-    if request.headers.get("sec-fetch-dest", "").lower() != "iframe":
-        return RedirectResponse(f"/p/{short_id}", status_code=302)
+    # Compatibility alias for existing callers. Both raw entry points share
+    # authorization, response headers, and view accounting.
     page, user = await _viewer_page(short_id, request, db)
     if not await _page_source_exists(page):
         raise HTTPException(status_code=404, detail="Source file no longer exists")

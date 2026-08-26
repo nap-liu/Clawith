@@ -60,17 +60,23 @@ async def test_top_level_page_uses_platform_viewer_without_sdk():
         '<script src="/sdk/clawith.js"></script>',
     ],
 )
-async def test_embedded_report_csp_never_allows_top_navigation(html: str):
+async def test_embedded_report_allows_external_ancestors(html: str):
     sid = f"y{uuid.uuid4().hex[:6]}"
     await _make_page(html, sid)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get(
             f"/p/{sid}?__report_embed=1",
-            headers={"Sec-Fetch-Dest": "iframe"},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_1_1 like Mac OS X) "
+                    "AppleWebKit/605.1.15 Version/15.1 Mobile/15E148 Safari/604.1"
+                ),
+            },
         )
     assert resp.status_code == 200
     assert resp.text == html
-    csp = resp.headers["Content-Security-Policy"]
-    assert csp == "frame-ancestors 'self'"
-    assert "allow-top-navigation" not in csp
+    assert "Content-Security-Policy" not in resp.headers
+    assert "X-Frame-Options" not in resp.headers
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["Cache-Control"] == "no-store"

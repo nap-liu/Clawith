@@ -12,7 +12,7 @@ import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote_plus
 
 import httpx
@@ -30,6 +30,7 @@ from app.services.channel_dispatch import (
     run_channel_message,
 )
 from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
+from app.services.dingtalk_quoted_message import parse_dingtalk_quoted_message
 from app.services.dingtalk_token import dingtalk_token_manager
 from app.services.im_delivery import ProviderResponseUncertainError
 from app.services.storage import store_agent_upload
@@ -111,6 +112,22 @@ async def _store_dingtalk_upload(
     except Exception as exc:  # noqa: BLE001
         logger.error(f"[DingTalk] Failed to store inbound media {filename}: {exc}")
         return None
+
+
+async def _parse_dingtalk_quoted_message(
+    msg_data: dict[str, Any],
+    app_key: str,
+    app_secret: str,
+    agent_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    return await parse_dingtalk_quoted_message(
+        msg_data,
+        app_key,
+        app_secret,
+        agent_id,
+        download_media=_download_dingtalk_media,
+        store_upload=_store_dingtalk_upload,
+    )
 
 
 async def _process_media_message(
@@ -792,7 +809,9 @@ class DingTalkStreamManager:
                                 app_key, app_secret, message_id, conversation_id
                             )
 
-                            async def _work(_text=user_text, _ssid=sender_staff_id,
+                            async def _work(_text=user_text, _md=msg_data,
+                                            _is_cmd=is_cmd,
+                                            _ssid=sender_staff_id,
                                             _cid=conversation_id, _ctype=conversation_type,
                                             _nick=sender_nick,
                                             _mid=message_id, _sid=sender_id,
@@ -801,6 +820,14 @@ class DingTalkStreamManager:
 
                                 if await _check_message_dedup(_mid):
                                     return ""
+                                quoted_message = None
+                                if not _is_cmd:
+                                    quoted_message = await _parse_dingtalk_quoted_message(
+                                        _md,
+                                        app_key,
+                                        app_secret,
+                                        agent_id,
+                                    )
                                 await process_dingtalk_message(
                                     agent_id=agent_id,
                                     sender_staff_id=_ssid,
@@ -812,6 +839,7 @@ class DingTalkStreamManager:
                                     sender_id=_sid,
                                     conversation_title=_title,
                                     channel_reactions=_reactions,
+                                    quoted_message=quoted_message,
                                 )
                                 return ""
 
@@ -938,6 +966,13 @@ class DingTalkStreamManager:
                     logger.info("[DingTalk Stream] Empty content after media processing, skipping")
                     return
 
+                quoted_message = await _parse_dingtalk_quoted_message(
+                    msg_data,
+                    app_key,
+                    app_secret,
+                    agent_id,
+                )
+
                 await process_dingtalk_message(
                     agent_id=agent_id,
                     sender_staff_id=sender_staff_id,
@@ -950,6 +985,7 @@ class DingTalkStreamManager:
                     sender_id=sender_id,
                     conversation_title=conversation_title,
                     channel_reactions=channel_reactions,
+                    quoted_message=quoted_message,
                 )
 
         class ClawithCardCallbackHandler(dingtalk_stream.CallbackHandler):

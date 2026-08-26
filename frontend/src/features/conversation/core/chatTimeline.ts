@@ -1,6 +1,8 @@
-import type {
-  ChatMessageAttachment,
-  ChatPreviewImage,
+import {
+  normalizeChatQuotedMessage,
+  type ChatMessageAttachment,
+  type ChatPreviewImage,
+  type ChatQuotedMessage,
 } from "../../../utils/chatAttachments";
 import { createClientId } from "../../../utils/clientId";
 import {
@@ -19,6 +21,7 @@ export type ConversationMessage = {
   created_at?: string | null;
   display_content?: string;
   attachments?: ChatMessageAttachment[];
+  quoted_message?: ChatQuotedMessage;
   toolCallId?: string;
   toolName?: string;
   toolArgs?: any;
@@ -157,6 +160,7 @@ export function mapHistoryMessage(
     };
   }
 
+  const quotedMessage = normalizeChatQuotedMessage(raw.quoted_message);
   return {
     id: String(raw.id || makeId()),
     role: raw.role,
@@ -173,6 +177,7 @@ export function mapHistoryMessage(
     ...(Object.prototype.hasOwnProperty.call(raw, "attachments")
       ? { attachments: raw.attachments || [] }
       : {}),
+    ...(quotedMessage ? { quoted_message: quotedMessage } : {}),
   };
 }
 

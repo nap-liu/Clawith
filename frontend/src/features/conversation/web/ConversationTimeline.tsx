@@ -23,6 +23,8 @@ import { copyToClipboard } from "../../../utils/clipboard";
 import {
   buildPreviewImage,
   extractChatImageDataMarkers,
+  getChatQuotedMessageTypeLabel,
+  partitionChatQuotedContent,
   splitAttachmentFileNames,
   stripChatImageDataMarkers,
   type ChatMessageAttachment,
@@ -472,19 +474,33 @@ function MessageItem({
   runningLabel?: string;
 }) {
   const { t, i18n } = useTranslation();
-  const previews: ChatPreviewImage[] = msg.previewImages?.length
+  const quotedMessage = msg.quoted_message;
+  const allPreviews: ChatPreviewImage[] = msg.previewImages?.length
     ? msg.previewImages
     : msg.imageUrl
       ? [buildPreviewImage(msg.imageUrl, msg.fileName)]
       : [];
-  const inlinePreviews = previews.length
+  const inlinePreviews = allPreviews.length
     ? []
     : extractChatImageDataMarkers(msg.content || "");
   const content = stripChatImageDataMarkers(
     msg.display_content ?? msg.content ?? "",
   );
-  const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+  const allAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+  const {
+    attachments,
+    quotedAttachments,
+    previewImages: previews,
+    quotedPreviewImages: quotedPreviews,
+  } = partitionChatQuotedContent(
+    quotedMessage,
+    allAttachments,
+    allPreviews,
+  );
   const media = attachments.filter(
+    (item) => item.kind === "audio" || item.kind === "video",
+  );
+  const quotedMedia = quotedAttachments.filter(
     (item) => item.kind === "audio" || item.kind === "video",
   );
   const previewNames = new Set(
@@ -507,6 +523,14 @@ function MessageItem({
     : splitAttachmentFileNames(msg.fileName)
         .filter((name) => !previewNames.has(name))
         .map((name) => ({ name }));
+  const quotedFiles = quotedAttachments
+    .filter((item) => !["image", "audio", "video"].includes(item.kind))
+    .map((item) => ({
+      name: item.display_name,
+      path: item.path,
+      kind: item.kind,
+      mimeType: item.mime_type,
+    }));
   const sender = msg.sender_name || view.senderLabel;
   const avatar = view.avatarText || sender?.[0] || (view.isLeft ? "A" : "U");
   const showSender = !!sender && (view.forceSenderLabel || !!msg.sender_name);
@@ -557,6 +581,78 @@ function MessageItem({
             className={`chat-msg-bubble${view.isLeft ? "" : " chat-msg-bubble--user"}${msg._streaming && !msg.content && !msg.thinking ? " chat-msg-bubble--thinking" : ""}`}
           >
             {showSender && <div className="chat-msg-sender">{sender}</div>}
+            {quotedMessage && (
+              <div className="conversation-quoted-message">
+                <div className="conversation-quoted-message__header">
+                  <span>↪ {quotedMessage.sender_name || "引用消息"}</span>
+                  <span>
+                    {getChatQuotedMessageTypeLabel(quotedMessage.message_type)}
+                  </span>
+                </div>
+                {quotedPreviews.length > 0 && (
+                  <div className="conversation-image-list">
+                    {renderPreviews(quotedPreviews)}
+                  </div>
+                )}
+                {quotedMedia.length > 0 && (
+                  <div className="conversation-media-list">
+                    {quotedMedia.map((attachment, index) => (
+                      <ChatMediaCard
+                        key={`${attachment.path}-${index}`}
+                        agentId={agentId}
+                        messageId={msg.id}
+                        attachment={attachment}
+                        onDownload={() =>
+                          void onDownload?.(
+                            attachment.path,
+                            attachment.display_name,
+                          )
+                        }
+                        onUnavailable={() =>
+                          onUnavailable?.(attachment.path)
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
+                {quotedFiles.length > 0 && (
+                  <div className="conversation-file-list">
+                    {quotedFiles.map((file, index) => (
+                      <button
+                        key={`${file.path}-${index}`}
+                        className="chat-msg-file-chip"
+                        disabled={unavailable.has(file.path)}
+                        onClick={() => void onDownload?.(file.path, file.name)}
+                      >
+                        <ChatAttachmentIcon
+                          name={file.name}
+                          kind={file.kind}
+                          mimeType={file.mimeType}
+                          size={16}
+                        />
+                        <span>{file.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {quotedMessage.text ? (
+                  <MarkdownRenderer content={quotedMessage.text} />
+                ) : null}
+                {!quotedMessage.text &&
+                  quotedMessage.attachments.length === 0 && (
+                    <div className="conversation-quoted-message__unavailable">
+                      {quotedMessage.content_status === "failed"
+                        ? "引用内容获取失败"
+                        : "引用内容不可用"}
+                    </div>
+                  )}
+                {quotedMessage.content_status === "partial" && (
+                  <div className="conversation-quoted-message__unavailable">
+                    部分引用内容未能获取
+                  </div>
+                )}
+              </div>
+            )}
             {(previews.length > 0 || inlinePreviews.length > 0) && (
               <div className="conversation-image-list">
                 {renderPreviews(previews.length ? previews : inlinePreviews)}

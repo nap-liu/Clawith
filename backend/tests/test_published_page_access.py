@@ -132,14 +132,13 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         assert context.status_code == 200
         assert context.json()["watermark_identity"]["display_name"] == "Viewer"
         assert context.json()["allow_top_navigation"] is False
-        direct_content = await client.get(f"/api/pages/{short_id}/content", follow_redirects=False)
-        assert direct_content.status_code == 302
-        assert direct_content.headers["location"] == f"/p/{short_id}"
-        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+        content = await client.get(f"/api/pages/{short_id}/content")
         assert content.status_code == 200
         assert content.headers["content-type"].startswith("text/html")
         assert content.headers["cache-control"] == "no-store"
-        assert content.headers["content-security-policy"] == "frame-ancestors 'self'"
+        assert "content-security-policy" not in content.headers
+        assert "x-frame-options" not in content.headers
+        assert content.headers["x-content-type-options"] == "nosniff"
         assert "secret" in content.text
 
         cleared = await client.delete("/api/pages/session")
@@ -213,6 +212,14 @@ async def test_public_and_authenticated_modes_keep_expected_access_boundaries():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         unauthenticated = await client.get(f"/p/{short_id}", follow_redirects=False)
         assert unauthenticated.status_code == 302
+        unauthenticated_embed = await client.get(
+            f"/p/{short_id}?__report_embed=1",
+            follow_redirects=False,
+        )
+        assert unauthenticated_embed.status_code == 302
+        assert unauthenticated_embed.headers["location"].startswith("/published-page-access?")
+        unauthenticated_content = await client.get(f"/api/pages/{short_id}/content")
+        assert unauthenticated_content.status_code == 401
         bridge = await client.post(
             "/api/pages/session", json={"short_id": short_id}, headers={"Authorization": f"Bearer {token}"},
         )
@@ -269,24 +276,27 @@ async def test_public_report_dom_and_strict_csp_are_isolated_from_platform_water
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         viewer = await client.get(f"/p/{short_id}")
         context = await client.get(f"/api/pages/{short_id}/viewer-context")
-        top_level_embed = await client.get(
+        headerless_embed = await client.get(
             f"/p/{short_id}?__report_embed=1", follow_redirects=False,
         )
-        embedded = await client.get(
+        metadata_embed = await client.get(
             f"/p/{short_id}?__report_embed=1", headers=IFRAME_HEADERS,
         )
-        content = await client.get(f"/api/pages/{short_id}/content", headers=IFRAME_HEADERS)
+        content = await client.get(f"/api/pages/{short_id}/content")
 
     assert viewer.status_code == 200
     assert viewer.headers["x-accel-redirect"] == "/__published_page_viewer"
     assert context.status_code == 200
     assert context.json()["watermark_text"].startswith("匿名访客 ")
     assert context.json()["allow_top_navigation"] is False
-    assert top_level_embed.headers["x-accel-redirect"] == "/__published_page_viewer"
-    assert embedded.status_code == 200
-    assert "report remains intact" in embedded.text
-    assert "/sdk/clawith.js" in embedded.text
+    assert headerless_embed.status_code == 200
+    assert "report remains intact" in headerless_embed.text
+    assert metadata_embed.status_code == 200
+    assert "report remains intact" in metadata_embed.text
+    assert "/sdk/clawith.js" in metadata_embed.text
     assert content.status_code == 200
+    assert "content-security-policy" not in content.headers
+    assert "x-frame-options" not in content.headers
     assert "default-src 'none'" in content.text
     assert 'id="published-page-watermark-host"' in content.text
     assert "report remains intact" in content.text

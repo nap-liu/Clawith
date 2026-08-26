@@ -513,6 +513,12 @@ def build_llm_message_from_row(
             meta,
             source_channel,
         )
+        from app.services.quoted_message import render_quoted_message_for_llm
+
+        content = render_quoted_message_for_llm(
+            content,
+            meta.get("quoted_message"),
+        )
         legacy_image_markers = (
             extract_image_data_markers(message.content)
             if "attachments" not in (meta if isinstance(meta, dict) else {})

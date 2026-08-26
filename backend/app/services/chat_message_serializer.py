@@ -8,6 +8,7 @@ from app.services.chat_attachments import (
     normalize_attachment_metadata,
     normalize_chat_message_attachments,
 )
+from app.services.quoted_message import normalize_quoted_message
 
 
 def serialize_chat_message_for_client(
@@ -54,6 +55,10 @@ def serialize_chat_message_for_client(
         "attachments": attachments,
         "created_at": created_at.isoformat() if created_at else None,
     }
+    if role == "user" and isinstance(meta, dict):
+        quoted_message = normalize_quoted_message(meta.get("quoted_message"))
+        if quoted_message is not None:
+            entry["quoted_message"] = quoted_message
     thinking = getattr(message, "thinking", None)
     if thinking and recall_status != "recalled":
         entry["thinking"] = thinking

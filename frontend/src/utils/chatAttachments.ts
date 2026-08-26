@@ -16,6 +16,18 @@ export type ChatMessageAttachment = {
     size_bytes?: number;
 };
 
+export type ChatQuotedMessage = {
+    message_type: string;
+    provider_message_type?: string;
+    provider_message_id?: string;
+    sender_ref?: string;
+    sender_name?: string;
+    created_at_ms?: number;
+    content_status: 'available' | 'partial' | 'unavailable' | 'failed';
+    text: string;
+    attachments: ChatMessageAttachment[];
+};
+
 export type ChatAttachmentIconKind =
     | 'pdf'
     | 'word'
@@ -164,6 +176,60 @@ function normalizeApiAttachments(raw: unknown): ChatMessageAttachment[] {
         });
         return attachments;
     }, []);
+}
+
+export function normalizeChatQuotedMessage(raw: unknown): ChatQuotedMessage | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const value = raw as Record<string, unknown>;
+    const status = String(value.content_status || '').trim().toLowerCase();
+    const contentStatus: ChatQuotedMessage['content_status'] = ['available', 'partial', 'unavailable', 'failed'].includes(status)
+        ? status as ChatQuotedMessage['content_status']
+        : 'available';
+    const optionalString = (key: string) => {
+        const text = String(value[key] || '').trim();
+        return text || undefined;
+    };
+    return {
+        message_type: String(value.message_type || 'unknown').trim().toLowerCase() || 'unknown',
+        content_status: contentStatus,
+        text: String(value.text || ''),
+        attachments: normalizeApiAttachments(value.attachments),
+        ...(optionalString('provider_message_type') ? { provider_message_type: optionalString('provider_message_type') } : {}),
+        ...(optionalString('provider_message_id') ? { provider_message_id: optionalString('provider_message_id') } : {}),
+        ...(optionalString('sender_ref') ? { sender_ref: optionalString('sender_ref') } : {}),
+        ...(optionalString('sender_name') ? { sender_name: optionalString('sender_name') } : {}),
+        ...(typeof value.created_at_ms === 'number' && Number.isFinite(value.created_at_ms)
+            ? { created_at_ms: value.created_at_ms }
+            : {}),
+    };
+}
+
+export function getChatQuotedMessageTypeLabel(type?: string): string {
+    return ({
+        text: '文字',
+        image: '图片',
+        audio: '语音',
+        video: '视频',
+        file: '文件',
+        rich_text: '富文本',
+        card: '卡片',
+    } as Record<string, string>)[type || ''] || '消息';
+}
+
+export function partitionChatQuotedContent(
+    quotedMessage: ChatQuotedMessage | undefined,
+    attachments: ChatMessageAttachment[],
+    previewImages: ChatPreviewImage[],
+) {
+    const quotedPaths = new Set(
+        (quotedMessage?.attachments || []).map((attachment) => attachment.path),
+    );
+    return {
+        attachments: attachments.filter((attachment) => !quotedPaths.has(attachment.path)),
+        quotedAttachments: attachments.filter((attachment) => quotedPaths.has(attachment.path)),
+        previewImages: previewImages.filter((image) => !image.path || !quotedPaths.has(image.path)),
+        quotedPreviewImages: previewImages.filter((image) => !!image.path && quotedPaths.has(image.path)),
+    };
 }
 
 function parseLegacyAttachmentFields(content: string, sourceChannel?: string): { displayContent: string; attachments: ChatMessageAttachment[] } {
