@@ -14,18 +14,22 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
+from app.services.project_runtime_boundary import (
+    is_project_agent,
+    project_agent_runtime_allows,
+)
 from app.services.trigger_runtime import (
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
     requeue_trigger_executions,
 )
 from app.services.trigger_runtime.cron_schedule import format_cron_timing_context
+from app.services.webhook_inbox import format_webhook_inbox_context
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
     get_workload_capacity,
 )
-from app.services.webhook_inbox import format_webhook_inbox_context
 
 
 async def resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTrigger]) -> dict | None:
@@ -137,6 +141,24 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
         # may queue, so it intentionally happens after this session closes.
         async with async_session() as identity_db:
             identity_agent = await identity_db.get(Agent, agent_id)
+            if is_project_agent(identity_agent):
+                try:
+                    project_running = await project_agent_runtime_allows(
+                        identity_db,
+                        identity_agent,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                    logger.warning("Project trigger admission is unavailable: {}", exc)
+                    if execution_ids:
+                        await requeue_trigger_executions(execution_ids, str(exc)[:2000])
+                    return
+                if not project_running:
+                    if execution_ids:
+                        await requeue_trigger_executions(
+                            execution_ids,
+                            "Project runtime is paused",
+                        )
+                    return
             tenant_key = (
                 getattr(identity_agent, "company_id", None)
                 or getattr(identity_agent, "tenant_id", None)
@@ -155,6 +177,21 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                         "未找到数字员工或数字员工已过期",
                     )
                 return
+            if is_project_agent(agent):
+                try:
+                    project_running = await project_agent_runtime_allows(db, agent)
+                except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                    logger.warning("Project trigger recheck is unavailable: {}", exc)
+                    if execution_ids:
+                        await requeue_trigger_executions(execution_ids, str(exc)[:2000])
+                    return
+                if not project_running:
+                    if execution_ids:
+                        await requeue_trigger_executions(
+                            execution_ids,
+                            "Project runtime is paused",
+                        )
+                    return
             from app.core.okr_feature import is_retired_okr_agent
 
             if await is_retired_okr_agent(db, agent):

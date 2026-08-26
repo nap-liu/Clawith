@@ -6,7 +6,6 @@ Revises: project_webhook_heads
 
 from alembic import op
 
-
 revision = "repair_tenant_boundary_triggers"
 down_revision = "project_webhook_heads"
 branch_labels = None
@@ -87,7 +86,20 @@ def upgrade() -> None:
                 END IF;
                 RETURN NEW;
             END IF;
-            IF NEW.is_group IS TRUE OR NEW.source_channel = 'trigger' THEN
+            IF NEW.source_channel = 'subagent' THEN
+                IF NEW.is_group IS TRUE OR NEW.peer_agent_id IS NOT NULL THEN
+                    RAISE EXCEPTION 'invalid subagent chat session identity';
+                END IF;
+                IF NEW.user_id IS NULL THEN
+                    RETURN NEW;
+                END IF;
+                SELECT tenant_id INTO human_tenant FROM users WHERE id = NEW.user_id;
+                IF human_tenant IS NULL OR source_tenant IS DISTINCT FROM human_tenant THEN
+                    RAISE EXCEPTION 'cross-tenant subagent human edge';
+                END IF;
+                RETURN NEW;
+            END IF;
+            IF NEW.is_group IS TRUE OR NEW.source_channel IN ('trigger', 'project') THEN
                 IF NEW.user_id IS NOT NULL OR NEW.peer_agent_id IS NOT NULL THEN
                     RAISE EXCEPTION 'non-human chat session cannot carry a human or peer placeholder';
                 END IF;

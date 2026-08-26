@@ -14,14 +14,17 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from loguru import logger
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from app.core.logging_config import new_trace_id
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.project import Project
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
+from app.services.project_runtime_boundary import (
+    is_project_agent,
+    project_agent_runtime_allows,
+)
 from app.services.redis_lease_lock import RedisLeaseError
 from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
@@ -53,12 +56,12 @@ from app.services.trigger_runtime.evaluator import (
     should_skip_non_workday as should_skip_non_workday_runtime,
 )
 from app.services.trigger_runtime.executions import renew_trigger_execution_leases
+from app.services.webhook_inbox import format_webhook_inbox_context
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
     get_workload_capacity,
 )
-from app.services.webhook_inbox import format_webhook_inbox_context
 
 TICK_INTERVAL = 15  # seconds
 DEDUP_WINDOW = 30  # seconds — same agent won't be invoked twice within this window
@@ -1204,12 +1207,20 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             identity_agent = await identity_db.get(Agent, agent_id)
             if identity_agent is None:
                 raise RuntimeError("Agent is unavailable")
-            from app.services.project_service import project_runtime_allows_agent
-
-            if not await project_runtime_allows_agent(identity_db, identity_agent):
-                invocation_error = "Project runtime is paused"
-                invocation_retryable = True
-                return
+            if is_project_agent(identity_agent):
+                try:
+                    project_running = await project_agent_runtime_allows(
+                        identity_db,
+                        identity_agent,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                    invocation_error = f"Project runtime check failed: {exc}"
+                    invocation_retryable = True
+                    return
+                if not project_running:
+                    invocation_error = "Project runtime is paused"
+                    invocation_retryable = True
+                    return
             from app.services.execution_identity import resolve_execution_user_id
 
             execution_user_id = await resolve_execution_user_id(
@@ -1255,10 +1266,17 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             agent = result.scalar_one_or_none()
             if not agent or agent.is_expired:
                 raise RuntimeError("Agent is unavailable or expired")
-            if not await project_runtime_allows_agent(db, agent):
-                invocation_error = "Project runtime is paused"
-                invocation_retryable = True
-                return
+            if is_project_agent(agent):
+                try:
+                    project_running = await project_agent_runtime_allows(db, agent)
+                except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                    invocation_error = f"Project runtime recheck failed: {exc}"
+                    invocation_retryable = True
+                    return
+                if not project_running:
+                    invocation_error = "Project runtime is paused"
+                    invocation_retryable = True
+                    return
             from app.core.okr_feature import is_retired_okr_agent
 
             if await is_retired_okr_agent(db, agent):
@@ -1767,28 +1785,52 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 # ── Main Tick Loop ──────────────────────────────────────────────────
 
 
+async def _load_enabled_triggers_for_scope(*, project_agents: bool) -> list[AgentTrigger]:
+    """Load one Agent scope without coupling standard triggers to projects."""
+
+    async with async_session() as db:
+        statement = select(AgentTrigger).join(Agent, Agent.id == AgentTrigger.agent_id).where(
+            AgentTrigger.is_enabled.is_(True)
+        )
+        if project_agents:
+            from app.models.project import Project
+
+            statement = statement.join(Project, Project.id == Agent.project_id).where(
+                Agent.scope == "project",
+                Project.status == "running",
+            )
+        else:
+            statement = statement.where(Agent.scope != "project")
+
+        result = await db.execute(statement)
+        triggers = result.scalars().all()
+        # Expunge each object before session.close() is called.
+        # session.close() expires all objects still in the identity map;
+        # explicit expunge() detaches them WITHOUT expiry so their scalar
+        # attributes remain readable outside the session context.
+        for trigger in triggers:
+            db.expunge(trigger)
+    return list(triggers)
+
+
+async def _load_enabled_triggers() -> list[AgentTrigger]:
+    """Keep standard triggers available when project loading fails."""
+
+    standard = await _load_enabled_triggers_for_scope(project_agents=False)
+    try:
+        project = await _load_enabled_triggers_for_scope(project_agents=True)
+    except Exception as exc:  # noqa: BLE001 - isolate optional project runtime
+        logger.error("Project trigger loading failed; standard triggers remain available: {}", exc)
+        project = []
+    return [*standard, *project]
+
+
 async def _tick():
     """One daemon tick: evaluate all triggers, group by agent, invoke."""
     new_trace_id()
     now = datetime.now(timezone.utc)
 
-    async with async_session() as db:
-        result = await db.execute(
-            select(AgentTrigger)
-            .join(Agent, Agent.id == AgentTrigger.agent_id)
-            .outerjoin(Project, Project.id == Agent.project_id)
-            .where(
-                AgentTrigger.is_enabled.is_(True),
-                or_(Agent.scope != "project", Project.status == "running"),
-            )
-        )
-        all_triggers = result.scalars().all()
-        # Expunge each object before session.close() is called.
-        # session.close() expires all objects still in the identity map;
-        # explicit expunge() detaches them WITHOUT expiry so their scalar
-        # attributes remain readable outside the session context.
-        for _t in all_triggers:
-            db.expunge(_t)
+    all_triggers = await _load_enabled_triggers()
 
     if not all_triggers:
         return

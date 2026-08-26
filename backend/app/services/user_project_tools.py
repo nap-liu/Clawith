@@ -1453,10 +1453,10 @@ async def execute_user_project_tool(
         if project_id is not None and tool_name in USER_PROJECT_MUTATION_TOOL_NAMES:
             project = await db.get(Project, project_id)
             if project is not None and project.tenant_id == actor.tenant_id:
-                result_work_item_id = _optional_uuid(
-                    result.get("work_item_id") or arguments.get("work_item_id"),
-                    "work_item_id",
-                )
+                result_work_item_value = result.get("work_item_id") or arguments.get("work_item_id")
+                if tool_name == "user_project_work_item_create":
+                    result_work_item_value = result.get("id")
+                result_work_item_id = _optional_uuid(result_work_item_value, "work_item_id")
                 result_run_id = _optional_uuid(result.get("run_id"), "run_id")
                 add_event(
                     db,

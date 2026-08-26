@@ -14,9 +14,12 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.project import Project
 from app.models.task import Task, TaskLog
-from app.services.project_service import project_runtime_allows_agent
+from app.services.project_runtime_boundary import (
+    is_project_agent,
+    lock_and_check_project_agent_runtime,
+    project_agent_runtime_allows,
+)
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
@@ -88,15 +91,19 @@ async def _execute_task_impl(
             )
             return
 
-        if task_agent is not None and getattr(task_agent, "scope", "standard") == "project" and getattr(task_agent, "project_id", None) is not None:
-            await db.scalar(
-                select(Project.id)
-                .where(Project.id == task_agent.project_id)
-                .with_for_update()
-            )
-        if task_agent is not None and not await project_runtime_allows_agent(db, task_agent):
-            logger.info(f"[TaskExec] Task {task_id} deferred because its project is paused")
-            return
+        if task_agent is not None and is_project_agent(task_agent):
+            try:
+                project_running = await lock_and_check_project_agent_runtime(db, task_agent)
+            except Exception as exc:  # noqa: BLE001 - defer project-only failure
+                logger.warning(
+                    "[TaskExec] Task {} deferred because its project check failed: {}",
+                    task_id,
+                    exc,
+                )
+                return
+            if not project_running:
+                logger.info(f"[TaskExec] Task {task_id} deferred because its project is paused")
+                return
 
         if task_agent is not None:
             task = await db.scalar(select(Task).where(Task.id == task_id).with_for_update())
@@ -151,7 +158,7 @@ async def _execute_task_impl(
             return
         agent_name = agent.name
         agent_role_description = agent.role_description or ""
-        is_project_agent = getattr(agent, "scope", "standard") == "project"
+        project_scoped_agent = is_project_agent(agent)
         tenant_key = (
             getattr(agent, "company_id", None)
             or getattr(agent, "tenant_id", None)
@@ -165,12 +172,21 @@ async def _execute_task_impl(
         # database pool.
         async with get_workload_capacity().slot(WorkloadKind.BACKGROUND, tenant_key):
             project_paused = False
-            if is_project_agent:
+            if project_scoped_agent:
                 async with async_session() as db:
                     current_agent = await db.get(Agent, agent_id)
-                    project_paused = current_agent is not None and not await project_runtime_allows_agent(
-                        db, current_agent
-                    )
+                    try:
+                        project_paused = current_agent is not None and not await project_agent_runtime_allows(
+                            db,
+                            current_agent,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                        logger.warning(
+                            "[TaskExec] Task {} returned to pending because its project recheck failed: {}",
+                            task_id,
+                            exc,
+                        )
+                        project_paused = True
                 if current_agent is None:
                     await _log_error(task_id, "数字员工未找到")
                     if task_type == "supervision":

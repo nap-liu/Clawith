@@ -13,12 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import get_agent_access_level_for_user_id, is_agent_expired
 from app.models.agent import Agent
 from app.models.audit import AuditLog
-from app.models.project import Project
 from app.models.schedule import AgentSchedule
 from app.models.task import Task
 from app.models.trigger import AgentTrigger
 from app.services.execution_identity import align_background_execution_user
-from app.services.project_service import project_runtime_allows_agent
+from app.services.project_runtime_boundary import lock_and_check_project_agent_runtime
 from app.services.trigger_runtime.queue import enqueue_trigger_execution
 
 
@@ -102,16 +101,17 @@ async def run_background_resource(
     # Serialize manual admission with the owner pause switch. No resource
     # identity, audit row, durable trigger occurrence, or asyncio task is
     # created unless the authoritative project runtime accepts this work.
-    if agent.scope == "project" and agent.project_id is not None:
-        await db.scalar(
-            select(Project.id)
-            .where(Project.id == agent.project_id)
-            .with_for_update()
-        )
-    if not await project_runtime_allows_agent(db, agent):
-        raise BackgroundManualRunConflict(
-            "Project runtime is paused; resume the project before starting background work"
-        )
+    if getattr(agent, "scope", "standard") == "project":
+        try:
+            project_running = await lock_and_check_project_agent_runtime(db, agent)
+        except Exception as exc:
+            raise BackgroundManualRunConflict(
+                "Project runtime is unavailable; try again after the project recovers"
+            ) from exc
+        if not project_running:
+            raise BackgroundManualRunConflict(
+                "Project runtime is paused; resume the project before starting background work"
+            )
 
     item = await _resolve_resource(
         db,

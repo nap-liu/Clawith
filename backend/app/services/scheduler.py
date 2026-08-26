@@ -13,8 +13,12 @@ from enum import StrEnum
 
 from croniter import croniter
 from loguru import logger
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
+from app.services.project_runtime_boundary import (
+    is_project_agent,
+    project_agent_runtime_allows,
+)
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
@@ -89,15 +93,23 @@ async def _execute_schedule(
                 logger.info(f"Schedule {schedule_id}: agent {agent.name} has expired, skipping")
                 return ScheduleExecutionOutcome.SKIPPED
 
-            from app.services.project_service import project_runtime_allows_agent
-
-            if not await project_runtime_allows_agent(db, agent):
-                logger.info(f"Schedule {schedule_id}: project runtime is paused, deferring")
-                return ScheduleExecutionOutcome.RETRYABLE
+            project_scoped_agent = is_project_agent(agent)
+            if project_scoped_agent:
+                try:
+                    project_running = await project_agent_runtime_allows(db, agent)
+                except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                    logger.warning(
+                        "Schedule {}: project runtime check failed, deferring: {}",
+                        schedule_id,
+                        exc,
+                    )
+                    return ScheduleExecutionOutcome.RETRYABLE
+                if not project_running:
+                    logger.info(f"Schedule {schedule_id}: project runtime is paused, deferring")
+                    return ScheduleExecutionOutcome.RETRYABLE
 
             agent_name = agent.name
             role_description = agent.role_description or ""
-            is_project_agent = getattr(agent, "scope", "standard") == "project"
             tenant_key = (
                 getattr(agent, "company_id", None) or getattr(agent, "tenant_id", None) or execution_user_id or agent_id
             )
@@ -108,10 +120,22 @@ async def _execute_schedule(
         # Admission can queue for a bounded period, so it must happen only
         # after the agent read session has returned its connection.
         async with get_workload_capacity().slot(WorkloadKind.SCHEDULED, tenant_key):
-            if is_project_agent:
+            if project_scoped_agent:
                 async with async_session() as db:
                     current_agent = await db.get(Agent, agent_id)
-                    if current_agent is None or not await project_runtime_allows_agent(db, current_agent):
+                    try:
+                        project_running = current_agent is not None and await project_agent_runtime_allows(
+                            db,
+                            current_agent,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                        logger.warning(
+                            "Schedule {}: project runtime recheck failed, deferring: {}",
+                            schedule_id,
+                            exc,
+                        )
+                        return ScheduleExecutionOutcome.RETRYABLE
+                    if not project_running:
                         logger.info(f"Schedule {schedule_id}: project paused while waiting for capacity, deferring")
                         return ScheduleExecutionOutcome.RETRYABLE
             static_prompt, dynamic_prompt = await build_agent_context(
@@ -162,27 +186,41 @@ async def _execute_schedule(
         return ScheduleExecutionOutcome.FAILED
 
 
-async def _claim_due_schedules(now: datetime) -> tuple[_DueSchedule, ...]:
-    """Atomically claim due schedules and release the connection immediately."""
+async def _claim_due_schedules_for_scope(
+    now: datetime,
+    *,
+    project_agents: bool,
+) -> tuple[_DueSchedule, ...]:
+    """Claim one Agent scope without coupling standard work to projects."""
 
     from app.database import async_session
     from app.models.agent import Agent
-    from app.models.project import Project
     from app.models.schedule import AgentSchedule
 
     async with async_session() as db:
-        result = await db.execute(
+        statement = (
             select(AgentSchedule)
             .join(Agent, Agent.id == AgentSchedule.agent_id)
-            .outerjoin(Project, Project.id == Agent.project_id)
             .where(
                 AgentSchedule.is_enabled.is_(True),
                 AgentSchedule.next_run_at <= now,
-                or_(Agent.scope != "project", Project.status == "running"),
             )
-            .order_by(AgentSchedule.next_run_at, AgentSchedule.id)
-            .with_for_update(skip_locked=True)
         )
+        if project_agents:
+            from app.models.project import Project
+
+            statement = statement.join(Project, Project.id == Agent.project_id).where(
+                Agent.scope == "project",
+                Project.status == "running",
+            )
+        else:
+            statement = statement.where(Agent.scope != "project")
+
+        statement = statement.order_by(
+            AgentSchedule.next_run_at,
+            AgentSchedule.id,
+        ).with_for_update(skip_locked=True, of=AgentSchedule)
+        result = await db.execute(statement)
         due_schedules = result.scalars().all()
         claimed: list[_DueSchedule] = []
         for schedule in due_schedules:
@@ -210,6 +248,23 @@ async def _claim_due_schedules(now: datetime) -> tuple[_DueSchedule, ...]:
         await db.commit()
 
     return tuple(claimed)
+
+
+async def _claim_due_schedules(now: datetime) -> tuple[_DueSchedule, ...]:
+    """Claim standard work even when the optional project runtime is broken."""
+
+    standard = await _claim_due_schedules_for_scope(now, project_agents=False)
+    try:
+        project = await _claim_due_schedules_for_scope(now, project_agents=True)
+    except Exception as exc:  # noqa: BLE001 - isolate optional project runtime
+        logger.error("Project schedule claim failed; standard schedules remain available: {}", exc)
+        project = ()
+    return tuple(
+        sorted(
+            (*standard, *project),
+            key=lambda schedule: (schedule.occurrence_at, str(schedule.id)),
+        )
+    )
 
 
 async def _release_schedule_occurrence(schedule: _DueSchedule) -> bool:

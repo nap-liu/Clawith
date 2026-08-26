@@ -48,3 +48,14 @@ def pytest_sessionstart(session) -> None:
         "Set DATABASE_URL to an isolated database named test, test_*, or *_test "
         "(or use an in-memory/test-named SQLite database)."
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_storage_backend_between_tests():
+    """Keep one test's temporary storage configuration out of later tests."""
+
+    from app.services.storage_runtime import facade
+
+    facade._storage_backend = None
+    yield
+    facade._storage_backend = None

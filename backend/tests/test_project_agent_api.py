@@ -153,6 +153,16 @@ def project_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         return {"commit": "a" * 40, "message": message, "paths": paths}
 
     monkeypatch.setattr(project_agent_service, "commit_project_changes", fake_commit)
+
+    async def no_project_assets(*_args, **_kwargs):
+        return []
+
+    async def no_project_tool_policy(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(project_agent_service, "snapshot_source_agent_skills", no_project_assets)
+    monkeypatch.setattr(project_agent_service, "clone_source_agent_tool_dependencies", no_project_assets)
+    monkeypatch.setattr(project_agent_service, "initialize_project_agent_tool_policy", no_project_tool_policy)
     return repo
 
 
@@ -201,8 +211,10 @@ async def test_project_agent_blank_copy_update_and_read_are_project_owned(
         overwrite=False,
         default_soul="",
         default_memory="",
+        copy_source_memory=True,
+        copy_source_workspace=True,
     ):
-        del overwrite, default_soul, default_memory
+        del overwrite, default_soul, default_memory, copy_source_memory, copy_source_workspace
         layout = project_agent_service.project_agent_workspace(project_root, agent_id)
         layout.workspace.mkdir(parents=True)
         layout.soul.write_text(f"source:{source_agent_id}\n", encoding="utf-8")

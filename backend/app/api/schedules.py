@@ -18,7 +18,6 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
-from app.services.project_service import project_runtime_allows_agent
 from app.services.scheduler import compute_next_run
 from app.services.user_output import sanitize_user_visible_text
 
@@ -249,8 +248,18 @@ async def trigger_schedule(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if is_agent_expired(agent):
         raise HTTPException(status_code=403, detail="数字员工已过期，无法触发。")
-    if not await project_runtime_allows_agent(db, agent):
-        raise HTTPException(status_code=409, detail="项目已暂停；恢复项目后才能运行调度。")
+    if getattr(agent, "scope", "standard") == "project":
+        from app.services.project_runtime_boundary import project_agent_runtime_allows
+
+        try:
+            project_running = await project_agent_runtime_allows(db, agent)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="项目运行状态暂时不可用，请稍后重试。",
+            ) from exc
+        if not project_running:
+            raise HTTPException(status_code=409, detail="项目已暂停；恢复项目后才能运行调度。")
 
     result = await db.execute(
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
