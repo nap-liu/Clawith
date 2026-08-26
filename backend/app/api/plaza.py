@@ -7,12 +7,12 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update, func, desc, exists, and_
+from sqlalchemy import and_, desc, exists, func, select, update
 
 from app.api.auth import get_current_user
 from app.database import async_session
 from app.models.agent import Agent as AgentModel
-from app.models.plaza import PlazaPost, PlazaComment, PlazaLike
+from app.models.plaza import PlazaComment, PlazaLike, PlazaPost
 from app.models.user import User
 
 router = APIRouter(prefix="/api/plaza", tags=["plaza"])
@@ -23,9 +23,56 @@ def _hidden_agent_exists_for_author(author_id_column):
     return exists().where(
         and_(
             AgentModel.id == author_id_column,
-            (AgentModel.is_system == True) | (AgentModel.access_mode != "company"),
+            (AgentModel.scope != "standard")
+            | (AgentModel.is_system == True)
+            | (AgentModel.access_mode != "company"),
         )
     )
+
+
+def _visible_post_clause():
+    return ~(
+        (PlazaPost.author_type == "agent")
+        & _hidden_agent_exists_for_author(PlazaPost.author_id)
+    )
+
+
+def _visible_comment_clause():
+    return ~(
+        (PlazaComment.author_type == "agent")
+        & _hidden_agent_exists_for_author(PlazaComment.author_id)
+    )
+
+
+async def _visible_comment_count(db, post_id: uuid.UUID) -> int:
+    return int(
+        await db.scalar(
+            select(func.count(PlazaComment.id)).where(
+                PlazaComment.post_id == post_id,
+                _visible_comment_clause(),
+            )
+        )
+        or 0
+    )
+
+
+async def _require_public_agent_author(
+    db,
+    author_id: uuid.UUID,
+    tenant_id: uuid.UUID | str | None,
+    *,
+    action: str,
+) -> AgentModel:
+    agent = await db.scalar(select(AgentModel).where(AgentModel.id == author_id))
+    if (
+        not agent
+        or (tenant_id and str(agent.tenant_id) != str(tenant_id))
+        or agent.scope != "standard"
+        or agent.is_system
+        or (getattr(agent, "access_mode", None) or "company") != "company"
+    ):
+        raise HTTPException(403, f"Only company-wide agents can {action} on Plaza")
+    return agent
 
 
 # ── Schemas ─────────────────────────────────────────
@@ -155,7 +202,6 @@ async def list_posts(
     System agent posts are excluded from the feed — system agents (is_system=True)
     communicate through internal Chat and reports rather than Plaza.
     """
-    from app.models.agent import Agent as AgentModel
     # Enforce tenant from JWT; platform_admin can optionally specify a different tenant
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     if tenant_id and current_user.role == "platform_admin":
@@ -164,12 +210,7 @@ async def list_posts(
         q = select(PlazaPost).order_by(desc(PlazaPost.created_at))
         if effective_tenant_id:
             q = q.where(PlazaPost.tenant_id == effective_tenant_id)
-        q = q.where(
-            ~(
-                (PlazaPost.author_type == "agent")
-                & _hidden_agent_exists_for_author(PlazaPost.author_id)
-            )
-        )
+        q = q.where(_visible_post_clause())
         if since:
             try:
                 since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
@@ -180,7 +221,12 @@ async def list_posts(
         result = await db.execute(q)
         posts = result.scalars().all()
 
-        return [PostOut.model_validate(p) for p in posts]
+        response = []
+        for post in posts:
+            item = PostOut.model_validate(post)
+            item.comments_count = await _visible_comment_count(db, post.id)
+            response.append(item)
+        return response
 
 
 @router.get("/stats")
@@ -195,12 +241,10 @@ async def plaza_stats(
         effective_tenant_id = tenant_id
     async with async_session() as db:
         # Build base filters
-        private_or_system_post = (
-            (PlazaPost.author_type == "agent")
-            & _hidden_agent_exists_for_author(PlazaPost.author_id)
-        )
+        visible_post = _visible_post_clause()
+        visible_comment = _visible_comment_clause()
         post_filter = (PlazaPost.tenant_id == effective_tenant_id) if effective_tenant_id else True
-        post_filter = post_filter & ~private_or_system_post
+        post_filter = post_filter & visible_post
         # Total posts
         total_posts = (await db.execute(
             select(func.count(PlazaPost.id)).where(post_filter)
@@ -210,17 +254,21 @@ async def plaza_stats(
         if effective_tenant_id:
             comment_q = comment_q.join(PlazaPost, PlazaComment.post_id == PlazaPost.id).where(
                 PlazaPost.tenant_id == effective_tenant_id,
-                ~private_or_system_post,
+                visible_post,
+                visible_comment,
             )
         else:
-            comment_q = comment_q.join(PlazaPost, PlazaComment.post_id == PlazaPost.id).where(~private_or_system_post)
+            comment_q = comment_q.join(PlazaPost, PlazaComment.post_id == PlazaPost.id).where(
+                visible_post,
+                visible_comment,
+            )
         total_comments = (await db.execute(comment_q)).scalar() or 0
         # Today's posts
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         today_q = select(func.count(PlazaPost.id)).where(PlazaPost.created_at >= today_start)
         if effective_tenant_id:
             today_q = today_q.where(PlazaPost.tenant_id == effective_tenant_id)
-        today_q = today_q.where(~private_or_system_post)
+        today_q = today_q.where(visible_post)
         today_posts = (await db.execute(today_q)).scalar() or 0
         # Top 5 contributors by post count
         top_q = (
@@ -251,15 +299,9 @@ async def create_post(body: PostCreate, current_user: User = Depends(get_current
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
         if body.author_type == "agent":
-            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == body.author_id))
-            agent = agent_result.scalar_one_or_none()
-            if (
-                not agent
-                or (effective_tenant_id and str(agent.tenant_id) != effective_tenant_id)
-                or agent.is_system
-                or (getattr(agent, "access_mode", None) or "company") != "company"
-            ):
-                raise HTTPException(403, "Only company-wide agents can post to Plaza")
+            await _require_public_agent_author(
+                db, body.author_id, effective_tenant_id, action="post"
+            )
         post = PlazaPost(
             author_id=body.author_id,
             author_type=body.author_type,
@@ -285,39 +327,21 @@ async def get_post(post_id: uuid.UUID, current_user: User = Depends(get_current_
     """Get a single post with its comments. Enforces tenant isolation."""
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
-        q = select(PlazaPost).where(PlazaPost.id == post_id)
+        q = select(PlazaPost).where(PlazaPost.id == post_id, _visible_post_clause())
         if effective_tenant_id and current_user.role != "platform_admin":
             q = q.where(PlazaPost.tenant_id == effective_tenant_id)
         result = await db.execute(q)
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")
-        if post.author_type == "agent":
-            hidden_post = await db.execute(
-                select(_hidden_agent_exists_for_author(post.author_id))
-            )
-            if hidden_post.scalar():
-                raise HTTPException(404, "Post not found")
         cr = await db.execute(
-            select(PlazaComment).where(PlazaComment.post_id == post_id).order_by(PlazaComment.created_at)
+            select(PlazaComment)
+            .where(PlazaComment.post_id == post_id, _visible_comment_clause())
+            .order_by(PlazaComment.created_at)
         )
-        comments_raw = cr.scalars().all()
-        private_or_system_comment_ids = set()
-        agent_comment_ids = [c.author_id for c in comments_raw if c.author_type == "agent"]
-        if agent_comment_ids:
-            hidden_agents = await db.execute(
-                select(AgentModel.id).where(
-                    AgentModel.id.in_(agent_comment_ids),
-                    (AgentModel.is_system == True) | (AgentModel.access_mode != "company"),
-                )
-            )
-            private_or_system_comment_ids = {row[0] for row in hidden_agents.all()}
-        comments = [
-            CommentOut.model_validate(c)
-            for c in comments_raw
-            if not (c.author_type == "agent" and c.author_id in private_or_system_comment_ids)
-        ]
+        comments = [CommentOut.model_validate(c) for c in cr.scalars().all()]
         data = PostOut.model_validate(post).model_dump()
+        data["comments_count"] = len(comments)
         data["comments"] = comments
         return PostDetail(**data)
 
@@ -327,7 +351,9 @@ async def delete_post(post_id: uuid.UUID, current_user: User = Depends(get_curre
     """Delete a plaza post. Admins can delete any post; authors can delete their own. Enforces tenant isolation."""
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
-        result = await db.execute(select(PlazaPost).where(PlazaPost.id == post_id))
+        result = await db.execute(
+            select(PlazaPost).where(PlazaPost.id == post_id, _visible_post_clause())
+        )
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")
@@ -352,16 +378,12 @@ async def create_comment(post_id: uuid.UUID, body: CommentCreate, current_user: 
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
         if body.author_type == "agent":
-            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == body.author_id))
-            agent = agent_result.scalar_one_or_none()
-            if (
-                not agent
-                or (effective_tenant_id and str(agent.tenant_id) != effective_tenant_id)
-                or agent.is_system
-                or (getattr(agent, "access_mode", None) or "company") != "company"
-            ):
-                raise HTTPException(403, "Only company-wide agents can comment on Plaza")
-        result = await db.execute(select(PlazaPost).where(PlazaPost.id == post_id))
+            await _require_public_agent_author(
+                db, body.author_id, effective_tenant_id, action="comment"
+            )
+        result = await db.execute(
+            select(PlazaPost).where(PlazaPost.id == post_id, _visible_post_clause())
+        )
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")
@@ -431,7 +453,14 @@ async def create_comment(post_id: uuid.UUID, body: CommentCreate, current_user: 
             from app.services.notification_service import send_notification
             other_comments = await db.execute(
                 select(PlazaComment.author_id, PlazaComment.author_type)
-                .where(PlazaComment.post_id == post_id)
+                .join(AgentModel, AgentModel.id == PlazaComment.author_id)
+                .where(
+                    PlazaComment.post_id == post_id,
+                    PlazaComment.author_type == "agent",
+                    AgentModel.scope == "standard",
+                    AgentModel.is_system == False,
+                    AgentModel.access_mode == "company",
+                )
                 .distinct()
             )
             notified = {post.author_id, body.author_id}  # skip post author (done above) and commenter self
@@ -470,7 +499,13 @@ async def like_post(post_id: uuid.UUID, author_id: uuid.UUID, author_type: str =
     """Like a post (toggle). Requires authentication; enforces tenant isolation."""
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
-        result = await db.execute(select(PlazaPost).where(PlazaPost.id == post_id))
+        if author_type == "agent":
+            await _require_public_agent_author(
+                db, author_id, effective_tenant_id, action="like posts"
+            )
+        result = await db.execute(
+            select(PlazaPost).where(PlazaPost.id == post_id, _visible_post_clause())
+        )
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")

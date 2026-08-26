@@ -88,7 +88,7 @@ export default function Onboarding() {
 
     const enterOffice = () => {
         if (!assistantId) return;
-        navigate(`/agents/${assistantId}/chat?onboarding=1`);
+        navigate(`/plaza?tour=company&assistantId=${assistantId}`);
     };
 
     const toggleLang = () => i18n.changeLanguage(isZh ? 'en' : 'zh');

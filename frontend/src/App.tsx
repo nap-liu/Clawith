@@ -21,6 +21,7 @@ const CompanySetup = lazy(() => import("./pages/CompanySetup"));
 const Onboarding = lazy(() => import("./pages/Onboarding"));
 const Layout = lazy(() => import("./pages/Layout"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
+const Plaza = lazy(() => import("./pages/Plaza"));
 const Explore = lazy(() => import("./pages/Explore"));
 const AgentDetail = lazy(() => import("./pages/AgentDetail"));
 const AgentCreate = lazy(() => import("./pages/AgentCreate"));
@@ -399,7 +400,7 @@ export default function App() {
               <Route index element={<Navigate to="/explore" replace />} />
               <Route path="explore" element={<Explore />} />
               <Route path="dashboard" element={<Dashboard />} />
-              <Route path="plaza" element={<Navigate to="/explore" replace />} />
+              <Route path="plaza" element={<Plaza />} />
               <Route path="agents/new" element={<AgentCreate />} />
               <Route
                 path="agents/:id"
@@ -502,7 +503,7 @@ export default function App() {
             <Route index element={<Navigate to="/explore" replace />} />
             <Route path="explore" element={<Explore />} />
             <Route path="dashboard" element={<Dashboard />} />
-            <Route path="plaza" element={<Navigate to="/explore" replace />} />
+            <Route path="plaza" element={<Plaza />} />
             <Route path="agents/new" element={<AgentCreate />} />
             <Route path="agents/:id" element={<Navigate to="chat" replace />} />
             <Route path="agents/:id/chat" element={<AgentDetail />} />

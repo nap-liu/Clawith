@@ -6,11 +6,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import String, and_, cast, delete, or_, select
+from sqlalchemy import String, and_, cast, delete, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_feature_enabled
-from app.core.plaza_feature import PLAZA_TOOL_NAMES
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.mcp_server import MCPServer
@@ -95,25 +94,19 @@ def _reject_required_tool_disable(tool: Tool, enabled: bool | None) -> None:
 def _globally_visible_tool_clause():
     """Include required protocol tools even if legacy data marked them disabled."""
     enabled_clause = or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES))
-    feature_clauses = [enabled_clause, Tool.name.not_in(PLAZA_TOOL_NAMES)]
-    if not okr_feature_enabled():
-        feature_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
-    return and_(*feature_clauses)
+    if okr_feature_enabled():
+        return enabled_clause
+    return and_(enabled_clause, Tool.name.not_in(OKR_TOOL_NAMES))
 
 
 def _feature_visible_tool_clause():
-    feature_clauses = [Tool.name.not_in(PLAZA_TOOL_NAMES)]
-    if not okr_feature_enabled():
-        feature_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
-    return and_(*feature_clauses)
+    if okr_feature_enabled():
+        return true()
+    return Tool.name.not_in(OKR_TOOL_NAMES)
 
 
 def _require_feature_visible_tool(tool: Tool | None) -> Tool:
-    if (
-        tool is None
-        or tool.name in PLAZA_TOOL_NAMES
-        or is_retired_okr_tool(tool.name)
-    ):
+    if tool is None or is_retired_okr_tool(tool.name):
         raise HTTPException(status_code=404, detail="Tool not found")
     return tool
 

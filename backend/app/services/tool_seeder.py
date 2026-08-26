@@ -5,7 +5,6 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.core.okr_feature import OKR_TOOL_NAMES, okr_feature_enabled
-from app.core.plaza_feature import PLAZA_TOOL_NAMES
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
@@ -17,6 +16,14 @@ from app.services.tool_enablement import tool_is_required
 from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES, USER_PROJECT_TOOL_SEEDS
 
 _settings = get_settings()
+
+PLAZA_TOOL_NAMES = frozenset(
+    {
+        "plaza_get_new_posts",
+        "plaza_create_post",
+        "plaza_add_comment",
+    }
+)
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
     "run_subagent",
@@ -71,6 +78,9 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     # User project tools are manually enabled and must stay opt-in when an old
     # database is re-seeded.
     *USER_PROJECT_TOOL_NAMES,
+    # Restore the original standard-Agent defaults after the feature branch
+    # temporarily disabled Plaza globally.
+    *PLAZA_TOOL_NAMES,
 }
 
 # AgentBay is retained in the codebase for compatibility with historical data,
@@ -78,13 +88,11 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
 # invariant rather than relying on a one-off production database edit: a fresh
 # database or a restored old dump must seed/sync every AgentBay tool disabled.
 FORCE_DISABLED_BUILTIN_CATEGORIES = {"agentbay"}
-FORCE_DISABLED_BUILTIN_TOOL_NAMES = PLAZA_TOOL_NAMES
 
 
 def builtin_tool_forced_disabled(seed: dict) -> bool:
     return bool(
         seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES
-        or seed.get("name") in FORCE_DISABLED_BUILTIN_TOOL_NAMES
         or (not okr_feature_enabled() and seed.get("name") in OKR_TOOL_NAMES)
     )
 
@@ -5142,6 +5150,14 @@ async def seed_builtin_tools():
                     # A builtin that becomes default-on must receive explicit
                     # assignments for existing Agents too. Existing rows,
                     # including manual opt-outs, are preserved below.
+                    if seed_is_default:
+                        new_tool_ids.append(existing.id)
+                if t["name"] in PLAZA_TOOL_NAMES:
+                    if existing.enabled != seed_enabled:
+                        existing.enabled = seed_enabled
+                        updated_fields.append("enabled")
+                    # Recreate only missing default assignments for standard
+                    # Agents. Explicit per-Agent opt-outs remain unchanged.
                     if seed_is_default:
                         new_tool_ids.append(existing.id)
                 if (

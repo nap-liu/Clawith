@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.plaza_feature import PLAZA_NOTIFICATION_TYPES
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.notification import Notification
@@ -27,10 +26,8 @@ CATEGORY_TYPE_MAP: dict[str, list[str]] = {
 
 def _apply_category_filter(query, category: Optional[str]):
     """Apply category-based type filtering to a query."""
-    query = query.where(Notification.type.not_in(PLAZA_NOTIFICATION_TYPES))
     if category and category != "all" and category in CATEGORY_TYPE_MAP:
-        visible_types = set(CATEGORY_TYPE_MAP[category]) - PLAZA_NOTIFICATION_TYPES
-        query = query.where(Notification.type.in_(visible_types))
+        query = query.where(Notification.type.in_(CATEGORY_TYPE_MAP[category]))
     return query
 
 
