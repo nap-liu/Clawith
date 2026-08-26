@@ -1851,6 +1851,92 @@ async def test_dispatch_does_not_regress_child_completed_project_run(
     assert persisted.output["subagent_session_id"] == str(child_id)
 
 
+async def test_dispatch_does_not_regress_fast_waiting_project_run(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.project import Project, ProjectMemberSnapshot, ProjectRun
+    from app.services import subagent_runtime
+
+    env = project_api
+    project = await _create_project(env, name="Fast child waiting")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    leader_member = await env.db.scalar(
+        select(ProjectMemberSnapshot).where(
+            ProjectMemberSnapshot.project_id == project_id,
+            ProjectMemberSnapshot.agent_id == env.leader_id,
+        )
+    )
+    assert leader_member is not None
+    anchor = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=uuid.UUID(group["access_agent_id"]),
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Wait immediately",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_run_request"},
+    )
+    run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="queued",
+        trigger_type="manual",
+        input={
+            "dispatch": {
+                "group_session_id": group["id"],
+                "project_member_id": str(leader_member.id),
+                "turn_anchor_id": str(anchor.id),
+                "task": "Wait immediately",
+            }
+        },
+    )
+    env.db.add_all([anchor, run])
+    await env.db.commit()
+    project_run_id = run.id
+    child_id = uuid.uuid4()
+
+    async def wait_before_dispatch_commit(**_kwargs):
+        async with env.session_factory() as race_db:
+            raced = await race_db.get(ProjectRun, project_run_id)
+            assert raced is not None
+            raced.status = "waiting"
+            raced.started_at = datetime.now(UTC)
+            race_db.add(
+                ChatMessage(
+                    agent_id=env.leader_id,
+                    user_id=env.owner_id,
+                    sender_user_id=env.owner_id,
+                    role="user",
+                    content="Wait immediately",
+                    conversation_id=str(child_id),
+                    message_meta={
+                        "kind": subagent_runtime.SUBAGENT_INPUT,
+                        "subagent_input_state": subagent_runtime.INPUT_PROCESSING,
+                        "project_run_id": str(project_run_id),
+                    },
+                )
+            )
+            await race_db.commit()
+        return SimpleNamespace(id=child_id, status=subagent_runtime.RUN_WAITING), True
+
+    monkeypatch.setattr(subagent_runtime, "create_subagent", wait_before_dispatch_commit)
+    result = await subagent_runtime.dispatch_project_run(project_run_id)
+
+    assert result["status"] == "waiting"
+    env.db.expire_all()
+    persisted = await env.db.get(ProjectRun, project_run_id)
+    assert persisted is not None and persisted.status == "waiting"
+    assert persisted.started_at is not None
+
+
 async def test_project_dispatch_respects_project_parallel_task_limit(
     project_api: ProjectApiEnv,
 ):
@@ -1893,7 +1979,7 @@ async def test_project_dispatch_respects_project_parallel_task_limit(
         agent_id=env.worker_id,
         initiated_by_user_id=env.owner_id,
         status="running",
-        trigger_type="a2a",
+        trigger_type="leader_kickoff",
         started_at=datetime.now(UTC),
     )
     pending = ProjectRun(

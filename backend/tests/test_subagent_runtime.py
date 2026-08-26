@@ -790,6 +790,26 @@ async def test_create_uses_one_id_readable_model_and_idempotent_fork():
     assert rows[-1].message_meta["subagent_input_state"] == "pending"
 
 
+async def test_standard_subagent_claim_does_not_enter_project_query_path(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _created = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="standard-claim-project-isolation",
+        task="keep standard child work available",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+
+    def broken_project_exists(*_args, **_kwargs):
+        raise RuntimeError("projects relation unavailable")
+
+    monkeypatch.setattr(runtime, "exists", broken_project_exists)
+
+    assert await runtime._claim_subagent(run.id) == run.id
+
+
 async def test_round_boundary_drains_append_and_stop_wins():
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
