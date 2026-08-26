@@ -1349,15 +1349,12 @@ async def test_publish_tool_contract_is_self_contained_and_consistent():
         "use public only when the user explicitly wants",
         "search_page_viewers",
         "preserves its current permissions",
-        "render the stored HTML directly",
-        "without platform-added execution restrictions",
+        "Non-public pages receive the platform watermark automatically",
         "publication actor and exact publication time",
         "Page URL and Management URL",
     ):
         assert required_guidance in runtime_publish["description"]
         assert required_guidance in seeded_publish["description"]
-    assert "watermark automatically" not in runtime_publish["description"]
-    assert "watermark automatically" not in seeded_publish["description"]
     assert any(item["function"]["name"] == "list_page_access_requests" for item in AGENT_TOOLS)
     assert any(item["name"] == "list_page_access_requests" for item in BUILTIN_TOOLS)
     runtime_list = next(item["function"] for item in AGENT_TOOLS if item["function"]["name"] == "list_published_pages")
@@ -1404,9 +1401,7 @@ async def test_seeded_publish_page_guidance_reaches_actual_llm_tool_output():
     visible_tools = await get_agent_tools_for_llm(agent_id)
     publish_tool = next(tool for tool in visible_tools if tool["function"]["name"] == "publish_page")
     description = publish_tool["function"]["description"]
-    assert "render the stored HTML directly" in description
-    assert "without platform-added execution restrictions" in description
-    assert "watermark automatically" not in description
+    assert "Non-public pages receive the platform watermark automatically" in description
 
 
 async def test_agent_page_list_includes_management_links():

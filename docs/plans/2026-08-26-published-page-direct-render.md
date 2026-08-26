@@ -27,7 +27,7 @@
 
 5. [x] **Preserve the complete published-page SDK** — Remove the obsolete parent-viewer `postMessage` wait path and let the current browsing context initiate OAuth. Preserve short-ID detection, `ready`, `onReady`, OAuth start/callback/exchange, query cleanup, retry after failed exchange, `triggerHook`, and explicit `data-watermark`.
 
-6. [x] **Align Agent-visible publication contracts** — Remove the automatic-watermark promise from the runtime fallback definition, database seeder source of truth, and publication result text. Verify the seeded database row and actual `get_agent_tools_for_llm()` output in Docker.
+6. [x] **Preserve the existing Agent-visible tool description** — Keep the `publish_page` runtime fallback and database-seeded description byte-for-byte unchanged per product decision. Only the publication result reports the actual runtime behavior: the platform does not add a watermark automatically, while report-authored SDK `data-watermark` remains available. Verify the unchanged seeded row and actual `get_agent_tools_for_llm()` output in Docker.
 
 7. [x] **Preserve the external HTTPS scheme** — In the authoritative nginx template, retain a trusted inbound `X-Forwarded-Proto` and fall back to `$scheme` only when absent. In the backend, accept only `http` or `https` before using the value for access return URLs or Secure cookies.
 
@@ -52,7 +52,7 @@ The workstream count, direction, trust decision, SDK guarantee, and acceptance b
 | Protected external iframe | Not guaranteed in this iteration because third-party page-session cookies and real IdP framing policies are browser/provider boundaries. The canonical top-level `/p/<short_id>` remains the supported path. |
 | HTTPS | A trusted outer `https` proxy produces an `https://` return URL and Secure page-session cookie. Direct local HTTP remains functional. Invalid forwarded protocols are ignored. |
 | Counts and audit | Each canonical report response records one view. Named and anonymous aggregation plus management totals remain correct. |
-| Tool contract | Docker seeding and actual LLM tool output no longer claim an automatic platform watermark. |
+| Tool contract | Docker seeding and actual LLM tool output preserve the pre-iteration `publish_page` description unchanged. The publication result reports the actual no-platform-watermark behavior. |
 | Validation target | Backend, frontend, proxy, and browser evidence come from one source SHA in local Docker. Production is not used for development validation. |
 
 ## External embedding and SDK boundary
@@ -68,10 +68,8 @@ Implementation and validation are local only in this iteration. Production mutat
 - Cutover order: new backend, then new frontend.
 - Rollback order: old frontend, then old backend.
 - Both images use one release SHA.
-- No schema, business-data, or AgentData rollback is needed. The backend's
-  normal idempotent builtin-tool seeding may reconcile the `publish_page`
-  description, but it does not require a PostgreSQL or AgentData backup for
-  this release.
+- No schema, business-data, or AgentData rollback is needed. The candidate does
+  not change the seeded `publish_page` description or any other database seed.
 
 ## Local completion evidence
 
