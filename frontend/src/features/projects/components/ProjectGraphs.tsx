@@ -593,30 +593,47 @@ export function A2AMeshGraph({
       grouped.set(rank, [...(grouped.get(rank) || []), member]);
     });
     const positions = new Map<string, { x: number; y: number }>();
-    grouped.forEach((entries, rank) => {
-      const sortedEntries = [...entries].sort((left, right) => {
-        const degree = (entry: ProjectGraphRecord) => {
-          const id = valueText(entry, "agent_id", "id", "member_id");
-          return relationshipCounts.filter(
-            ({ source, target }) => source === id || target === id,
-          ).length;
-        };
-        return (
-          degree(right) - degree(left) ||
-          valueText(left, "name_snapshot", "agent_name", "name").localeCompare(
-            valueText(right, "name_snapshot", "agent_name", "name"),
-            "zh-CN",
-          )
-        );
+    let nextRowY = 0;
+    [...grouped.entries()]
+      .sort(([leftRank], [rightRank]) => leftRank - rightRank)
+      .forEach(([, entries]) => {
+        const sortedEntries = [...entries].sort((left, right) => {
+          const degree = (entry: ProjectGraphRecord) => {
+            const id = valueText(entry, "agent_id", "id", "member_id");
+            return relationshipCounts.filter(
+              ({ source, target }) => source === id || target === id,
+            ).length;
+          };
+          return (
+            degree(right) - degree(left) ||
+            valueText(
+              left,
+              "name_snapshot",
+              "agent_name",
+              "name",
+            ).localeCompare(
+              valueText(right, "name_snapshot", "agent_name", "name"),
+              "zh-CN",
+            )
+          );
+        });
+        const maxColumns = 4;
+        const rowCount = Math.ceil(sortedEntries.length / maxColumns);
+        sortedEntries.forEach((member, index) => {
+          const row = Math.floor(index / maxColumns);
+          const column = index % maxColumns;
+          const rowSize = Math.min(
+            maxColumns,
+            sortedEntries.length - row * maxColumns,
+          );
+          const firstX = -((rowSize - 1) * 286) / 2;
+          positions.set(valueText(member, "agent_id", "id", "member_id"), {
+            x: firstX + column * 286,
+            y: nextRowY + row * 170,
+          });
+        });
+        nextRowY += Math.max(1, rowCount) * 170;
       });
-      const firstX = -((sortedEntries.length - 1) * 286) / 2;
-      sortedEntries.forEach((member, index) =>
-        positions.set(valueText(member, "agent_id", "id", "member_id"), {
-          x: firstX + index * 286,
-          y: rank * 170,
-        }),
-      );
-    });
     return ordered.map<ProjectGraphNode>((member) => {
       const id = valueText(member, "agent_id", "id", "member_id");
       const isLeader = member.is_leader === true || id === leaderId;
@@ -737,7 +754,7 @@ export function A2AMeshGraph({
       variant="mesh"
       direction="vertical"
       fitViewPadding={0.12}
-      fitViewMinZoom={0.72}
+      fitViewMinZoom={0.35}
       fitViewMaxZoom={1.12}
       miniMap={ordered.length > 7}
       onSelect={({ id, record }) => onAgentSelect?.(id, record)}

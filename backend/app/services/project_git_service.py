@@ -1705,6 +1705,7 @@ def _commit(
     *,
     milestone: bool,
     operation_key: str | None = None,
+    force_add: bool = False,
     author_name: str | None,
     author_email: str | None,
 ) -> dict:
@@ -1723,7 +1724,13 @@ def _commit(
                     normalized_paths,
                     recovered=True,
                 )
-        add_args = ["add", "-A", "--", *(normalized_paths or ["."])]
+        add_args = [
+            "add",
+            "-A",
+            *(["-f"] if force_add else []),
+            "--",
+            *(normalized_paths or ["."]),
+        ]
         _git(repo, *add_args)
         diff_args = ["diff", "--cached", "--quiet"]
         if normalized_paths:
@@ -1774,6 +1781,7 @@ async def commit_project_changes(
     *,
     milestone: bool = False,
     operation_key: str | None = None,
+    force_add: bool = False,
     author_name: str | None = None,
     author_email: str | None = None,
 ) -> dict:
@@ -1784,6 +1792,7 @@ async def commit_project_changes(
         paths,
         milestone=milestone,
         operation_key=operation_key,
+        force_add=force_add,
         author_name=author_name,
         author_email=author_email,
     )

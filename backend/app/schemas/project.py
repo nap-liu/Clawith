@@ -113,6 +113,19 @@ class ProjectMemberToolUpdate(BaseModel):
     enabled: bool
 
 
+class ProjectSkillBackfillRequest(BaseModel):
+    action: Literal["dry_run", "apply", "rollback"] = "dry_run"
+    operation_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_operation(self):
+        if self.action == "rollback" and self.operation_id is None:
+            raise ValueError("operation_id is required for rollback")
+        if self.action != "rollback" and self.operation_id is not None:
+            raise ValueError("operation_id is only supported for rollback")
+        return self
+
+
 class ProjectMemberLifecycleRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 

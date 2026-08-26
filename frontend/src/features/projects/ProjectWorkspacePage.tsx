@@ -5259,7 +5259,7 @@ function MembersPanel({
                   <IconArrowRight size={14} />
                 </Button>
               ) : null}
-              {projectAgent && canManage ? (
+              {projectAgent && canManage && !departed ? (
                 <Button
                   variant="secondary"
                   onClick={openPromoteDialog}
@@ -5335,7 +5335,7 @@ function MembersPanel({
                       }}
                     >
                       <IconSettings size={15} />
-                      {canManage
+                      {canManage && !departed
                         ? t("projectAgents.actions.edit")
                         : t("projectAgents.actions.view")}
                     </Button>
@@ -5826,7 +5826,9 @@ function MembersPanel({
                         name: event.target.value,
                       }))
                     }
-                    disabled={agentDrawerMode === "edit" && !canManage}
+                    disabled={
+                      agentDrawerMode === "edit" && (!canManage || departed)
+                    }
                   />
                 </ProjectField>
                 <ProjectField
@@ -5843,7 +5845,9 @@ function MembersPanel({
                         roleDescription: event.target.value,
                       }))
                     }
-                    disabled={agentDrawerMode === "edit" && !canManage}
+                    disabled={
+                      agentDrawerMode === "edit" && (!canManage || departed)
+                    }
                   />
                 </ProjectField>
                 <ProjectField
@@ -5861,7 +5865,9 @@ function MembersPanel({
                         soul: event.target.value,
                       }))
                     }
-                    disabled={agentDrawerMode === "edit" && !canManage}
+                    disabled={
+                      agentDrawerMode === "edit" && (!canManage || departed)
+                    }
                   />
                 </ProjectField>
                 <ProjectField
@@ -5879,63 +5885,61 @@ function MembersPanel({
                         coreMemory: event.target.value,
                       }))
                     }
-                    disabled={agentDrawerMode === "edit" && !canManage}
+                    disabled={
+                      agentDrawerMode === "edit" && (!canManage || departed)
+                    }
                   />
                 </ProjectField>
               </div>
             )}
           </div>
-          <footer>
-            {agentDrawerMode === "edit" && canManage && projectAgent ? (
-              <Button
-                variant="primary"
-                onClick={saveProjectAgent}
-                disabled={
-                  agentDraft.name.trim().length < 2 ||
-                  busyAction === "save-project-agent"
-                }
-              >
-                <IconDeviceFloppy size={16} />
-                {t("projectAgents.actions.save")}
-              </Button>
-            ) : agentDrawerMode === "create" ? (
-              <>
-                <Button
-                  variant="secondary"
-                  onClick={() => setAgentDrawerMode(null)}
-                >
-                  {t("common.cancel")}
-                </Button>
+          {(agentDrawerMode === "create" ||
+            (agentDrawerMode === "edit" && canManage && !departed)) && (
+            <footer>
+              {agentDrawerMode === "edit" && projectAgent ? (
                 <Button
                   variant="primary"
-                  onClick={createOwnedAgent}
+                  onClick={saveProjectAgent}
                   disabled={
-                    busyAction === "create-project-agent" ||
-                    (createKind === "copy"
-                      ? !selectedCandidateId || agentsLoading
-                      : agentDraft.name.trim().length < 2)
+                    agentDraft.name.trim().length < 2 ||
+                    busyAction === "save-project-agent"
                   }
                 >
-                  {busyAction === "create-project-agent" ? (
-                    <IconLoader2
-                      className="project-workspace__spinner"
-                      size={16}
-                    />
-                  ) : (
-                    <IconPlus size={16} />
-                  )}
-                  {t("projectAgents.actions.create")}
+                  <IconDeviceFloppy size={16} />
+                  {t("projectAgents.actions.save")}
                 </Button>
-              </>
-            ) : (
-              <Button
-                variant="secondary"
-                onClick={() => setAgentDrawerMode(null)}
-              >
-                {t("common.close")}
-              </Button>
-            )}
-          </footer>
+              ) : agentDrawerMode === "create" ? (
+                <>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setAgentDrawerMode(null)}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                  <Button
+                    variant="primary"
+                    onClick={createOwnedAgent}
+                    disabled={
+                      busyAction === "create-project-agent" ||
+                      (createKind === "copy"
+                        ? !selectedCandidateId || agentsLoading
+                        : agentDraft.name.trim().length < 2)
+                    }
+                  >
+                    {busyAction === "create-project-agent" ? (
+                      <IconLoader2
+                        className="project-workspace__spinner"
+                        size={16}
+                      />
+                    ) : (
+                      <IconPlus size={16} />
+                    )}
+                    {t("projectAgents.actions.create")}
+                  </Button>
+                </>
+              ) : null}
+            </footer>
+          )}
         </div>
       </Drawer>
 
@@ -6511,7 +6515,15 @@ function CapabilitiesPanel({
                 />
               )}
             </>
-          ) : null}
+          ) : (
+            <EmptyState
+              icon={<IconTool size={22} />}
+              title={t("projectAgents.teamPage.capabilitiesEmptyTitle")}
+              description={t(
+                "projectAgents.teamPage.capabilitiesEmptyDescription",
+              )}
+            />
+          )}
         </>
       )}
     </>
@@ -6850,6 +6862,8 @@ function ProjectVisibilitySettings({
   const [permissionDenied, setPermissionDenied] = useState(
     project.access_role !== "owner",
   );
+  const sharedUserIdsVersion = (project.shared_with_user_ids || []).join("\u0000");
+  const sharedUserNamesVersion = (project.shared_with_names || []).join("\u0000");
 
   useEffect(() => {
     setVisibility(project.visibility);
@@ -6866,11 +6880,11 @@ function ProjectVisibilitySettings({
     setSaveError("");
   }, [
     canManageAccess,
-    project.shared_with_user_ids,
-    project.shared_with_names,
     project.execution_user_id,
     project.updated_at,
     project.visibility,
+    sharedUserIdsVersion,
+    sharedUserNamesVersion,
   ]);
 
   const readOnly = permissionDenied || !canManageAccess;
@@ -7122,7 +7136,7 @@ function PoliciesPanel({
   const { t } = useTranslation();
   const toast = useToast();
   const isOwner = project.access_role === "owner";
-  const canManageSettings = project.access_role !== "view";
+  const canManageSettings = isOwner;
   const governance = obj(policies?.policies);
   const [model, setModel] = useState("default");
   const [models, setModels] = useState<

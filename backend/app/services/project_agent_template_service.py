@@ -272,7 +272,11 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
                 "capability_name": binding.capability_name,
                 "source": binding.source,
                 "digital_employee_index": inherited_index,
-                "is_enabled": binding.is_enabled,
+                "is_enabled": binding.is_enabled
+                and (
+                    binding.source != "inherited"
+                    or (inherited_index is not None and member_rows[inherited_index][1].is_enabled)
+                ),
                 "scope": sanitize_template_scope(binding.scope or {}),
             }
         )
@@ -300,6 +304,8 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
 
     effective: dict[tuple[str, uuid.UUID, str], set[int]] = {}
     for index, (agent, member) in enumerate(member_rows):
+        if not member.is_enabled:
+            continue
         config = dict(member.config_snapshot or {})
         enabled_overrides = {str(name) for name in config.get("enabled_platform_tools", [])}
         disabled_overrides = {str(name) for name in config.get("disabled_platform_tools", [])}
@@ -423,11 +429,13 @@ async def instantiate_project_capabilities_from_template(
             if tool is None or tool.type == "mcp" or tool.tenant_id not in {None, project.tenant_id}:
                 raise ProjectTemplateSnapshotError("Project template tool is unavailable")
         inherited_agent_id = None
+        inherited_member_enabled = True
         if source == "inherited":
             index = item.get("digital_employee_index")
             if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(created_agents):
                 raise ProjectTemplateSnapshotError("Project template capability owner is invalid")
             inherited_agent_id = created_agents[index][0].id
+            inherited_member_enabled = created_agents[index][1].is_enabled
         elif item.get("digital_employee_index") is not None:
             raise ProjectTemplateSnapshotError("Shared project capability cannot have a digital employee owner")
         binding = await add_capability(
@@ -439,7 +447,7 @@ async def instantiate_project_capabilities_from_template(
                 capability_name=str(item.get("capability_name") or ""),
                 source=source,
                 inherited_from_agent_id=inherited_agent_id,
-                is_enabled=bool(item.get("is_enabled", True)),
+                is_enabled=bool(item.get("is_enabled", True)) and inherited_member_enabled,
                 scope=sanitize_template_scope(item.get("scope") or {}),
                 config={},
             ),
@@ -447,7 +455,8 @@ async def instantiate_project_capabilities_from_template(
         )
         from app.services.project_member_runtime import sync_project_capability_assignment
 
-        await sync_project_capability_assignment(db, project, binding)
+        if source == "shared" or inherited_member_enabled:
+            await sync_project_capability_assignment(db, project, binding)
 
 
 def _agent_from_template(

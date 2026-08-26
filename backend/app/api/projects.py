@@ -75,6 +75,7 @@ from app.schemas.project import (
     ProjectRunOut,
     ProjectRunUpdate,
     ProjectSettingsUpdate,
+    ProjectSkillBackfillRequest,
     ProjectTemplateCreate,
     ProjectTemplateFromProjectCreate,
     ProjectUpdate,
@@ -170,13 +171,16 @@ from app.services.project_service import (
     serialize_project_runs,
 )
 from app.services.project_skill_assets import (
+    apply_project_skill_backfill,
     bind_library_skill_to_project_agent,
     delete_project_skill_asset,
     export_project_skills_for_template,
     instantiate_project_skills_from_template,
+    plan_project_skill_backfill,
     project_skill_deletion_impact,
     project_skill_manifest,
     refresh_project_skill_asset,
+    rollback_project_skill_backfill,
     set_project_skill_enabled,
 )
 from app.services.project_template_snapshot import (
@@ -2194,6 +2198,99 @@ async def list_project_capabilities(
         .all()
     )
     return [await serialize_project_capability(db, project, binding) for binding in bindings]
+
+
+@router.post("/{project_id}/capabilities/skill-backfill")
+async def project_skill_backfill(
+    project_id: uuid.UUID,
+    data: ProjectSkillBackfillRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview, apply, or roll back the safe normalization of legacy Skill bindings."""
+
+    project = await require_owner(db, current_user, project_id)
+    if data.action == "dry_run":
+        summary, _plans = await plan_project_skill_backfill(db, project)
+        return {"action": "dry_run", "operation_id": None, **summary}
+    if data.action == "apply":
+        result, rollback_entries = await apply_project_skill_backfill(
+            db,
+            project,
+            actor_user_id=current_user.id,
+            actor_display_name=current_user.display_name,
+        )
+        if not rollback_entries:
+            return {"action": "apply", "operation_id": None, **result}
+        event = add_event(
+            db,
+            project,
+            "capability.skill_backfill.applied",
+            f"Normalized {len(rollback_entries)} legacy project Skill bindings",
+            actor_user_id=current_user.id,
+            metadata={
+                "applied_count": len(rollback_entries),
+                "rollback_entries": rollback_entries,
+            },
+        )
+        await db.flush()
+        return {"action": "apply", "operation_id": str(event.id), **result}
+
+    operation = (
+        await db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.id == data.operation_id,
+                ProjectEvent.project_id == project.id,
+                ProjectEvent.tenant_id == project.tenant_id,
+                ProjectEvent.event_type == "capability.skill_backfill.applied",
+            )
+        )
+    ).scalar_one_or_none()
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Project Skill backfill operation was not found")
+    rollback_events = list(
+        (
+            await db.execute(
+                select(ProjectEvent).where(
+                    ProjectEvent.project_id == project.id,
+                    ProjectEvent.tenant_id == project.tenant_id,
+                    ProjectEvent.event_type == "capability.skill_backfill.rolled_back",
+                )
+            )
+        ).scalars()
+    )
+    if any(
+        str(event.event_metadata.get("operation_id")) == str(operation.id)
+        for event in rollback_events
+        if isinstance(event.event_metadata, dict)
+    ):
+        raise HTTPException(status_code=409, detail="Project Skill backfill was already rolled back")
+    result = await rollback_project_skill_backfill(
+        db,
+        project,
+        dict(operation.event_metadata or {}).get("rollback_entries"),
+        actor_user_id=current_user.id,
+        actor_display_name=current_user.display_name,
+    )
+    rollback_event = add_event(
+        db,
+        project,
+        "capability.skill_backfill.rolled_back",
+        f"Rolled back {result['rolled_back_count']} project Skill bindings",
+        actor_user_id=current_user.id,
+        metadata={
+            "operation_id": str(operation.id),
+            "rolled_back_count": result["rolled_back_count"],
+            "binding_ids": result["binding_ids"],
+        },
+    )
+    await db.flush()
+    return {
+        "action": "rollback",
+        "operation_id": str(operation.id),
+        "rollback_event_id": str(rollback_event.id),
+        **result,
+    }
 
 
 @router.post("/{project_id}/capabilities", response_model=CapabilityOut, status_code=201)

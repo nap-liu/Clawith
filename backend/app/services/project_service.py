@@ -830,6 +830,16 @@ async def replace_access_grants(
 ) -> None:
     unique_ids = set(user_ids)
     unique_ids.discard(project.owner_user_id)
+    existing_roles = dict(
+        (
+            await db.execute(
+                select(ProjectAccessGrant.user_id, ProjectAccessGrant.role).where(
+                    ProjectAccessGrant.project_id == project.id,
+                    ProjectAccessGrant.tenant_id == project.tenant_id,
+                )
+            )
+        ).all()
+    )
     if unique_ids:
         valid_ids = set(
             (
@@ -844,14 +854,19 @@ async def replace_access_grants(
         )
         if valid_ids != unique_ids:
             raise HTTPException(status_code=422, detail="Every shared user must be active in the project tenant")
-    await db.execute(delete(ProjectAccessGrant).where(ProjectAccessGrant.project_id == project.id))
+    await db.execute(
+        delete(ProjectAccessGrant).where(
+            ProjectAccessGrant.project_id == project.id,
+            ProjectAccessGrant.tenant_id == project.tenant_id,
+        )
+    )
     for user_id in sorted(unique_ids, key=str):
         db.add(
             ProjectAccessGrant(
                 tenant_id=project.tenant_id,
                 project_id=project.id,
                 user_id=user_id,
-                role="view",
+                role=existing_roles.get(user_id, "view"),
                 created_by_user_id=actor_user_id,
             )
         )
@@ -1684,6 +1699,7 @@ async def project_summary(
         "next_action": project.settings.get("next_action"),
         "owner_name": owner_name,
         "access_role": access_role,
+        "shared_with_user_ids": [str(grant.user_id) for grant, _ in grants],
         "shared_with_names": [display_name for _, display_name in grants],
         "shared_with": [
             {"user_id": str(grant.user_id), "display_name": display_name, "role": grant.role}

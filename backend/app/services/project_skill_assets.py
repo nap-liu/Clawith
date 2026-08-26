@@ -6,10 +6,12 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import json
 import os
 import re
 import shutil
 import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from fastapi import HTTPException
@@ -57,6 +59,17 @@ _PACKAGE_KEYS = {
 }
 _PACKAGE_FILE_KEYS = {"path", "size", "sha256", "content_base64"}
 _FRONTMATTER_FIELD = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
+
+
+@dataclass(slots=True)
+class _SkillBackfillPlan:
+    binding: ProjectCapabilityBinding
+    previous_schema_version: int
+    previous_asset_id: str | None
+    metadata: dict
+    source_path: Path
+    target_path: Path
+    other_config_fingerprint: str
 
 
 async def bind_library_skill_to_project_agent(
@@ -192,6 +205,32 @@ async def snapshot_source_agent_skills(
 ) -> list[ProjectCapabilityBinding]:
     """Copy valid source-Agent Skills into one project Agent and bind them."""
 
+    source_agent = await db.get(Agent, source_agent_id)
+    project_agent = await db.get(Agent, project_agent_id)
+    member = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.agent_id == project_agent_id,
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if (
+        source_agent is None
+        or source_agent.tenant_id != project.tenant_id
+        or source_agent.scope != "standard"
+        or source_agent.is_deleted
+        or project_agent is None
+        or project_agent.tenant_id != project.tenant_id
+        or project_agent.scope != "project"
+        or project_agent.project_id != project.id
+        or project_agent.is_deleted
+        or member is None
+    ):
+        raise HTTPException(status_code=422, detail="Project Skill snapshot source or target is unavailable")
+
     source_prefix = normalize_storage_key(f"{source_agent_id}/skills")
     storage = get_storage_backend()
     if not await storage.is_dir(source_prefix):
@@ -263,6 +302,229 @@ async def snapshot_source_agent_skills(
         raise
     finally:
         await asyncio.to_thread(shutil.rmtree, staging, True)
+
+
+async def plan_project_skill_backfill(
+    db: AsyncSession,
+    project: Project,
+) -> tuple[dict, list[_SkillBackfillPlan]]:
+    """Inspect legacy Skill bindings without changing database or workspace state."""
+
+    bindings = await _skill_bindings(db, project)
+    root = project_repo_path(project.tenant_id, project.id)
+    ready: list[_SkillBackfillPlan] = []
+    items: list[dict] = []
+    asset_ids: dict[tuple, str] = {}
+    for binding in bindings:
+        raw_config = binding.config if isinstance(binding.config, dict) else {}
+        raw_metadata = raw_config.get(_ASSET_CONFIG_KEY)
+        if isinstance(raw_metadata, dict) and raw_metadata.get("schema_version") == 2:
+            try:
+                _binding_asset_metadata(binding)
+            except ProjectTemplateSnapshotError as exc:
+                items.append(_backfill_item(binding, "blocked", str(exc)))
+            else:
+                items.append(_backfill_item(binding, "current"))
+            continue
+        if raw_metadata is not None and not (
+            isinstance(raw_metadata, dict)
+            and raw_metadata.get("schema_version") == 1
+            and set(raw_metadata) == _ASSET_KEYS_V1
+        ):
+            items.append(_backfill_item(binding, "blocked", "Legacy Skill metadata is invalid"))
+            continue
+        try:
+            plan = await _prepare_skill_backfill_plan(
+                db,
+                project,
+                binding,
+                raw_metadata,
+                root,
+                asset_ids,
+            )
+        except (HTTPException, OSError, ProjectTemplateSnapshotError) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            items.append(_backfill_item(binding, "blocked", str(detail)))
+            continue
+        ready.append(plan)
+        items.append(
+            _backfill_item(
+                binding,
+                "ready",
+                previous_schema_version=plan.previous_schema_version,
+            )
+        )
+    summary = {
+        "project_id": str(project.id),
+        "ready_count": sum(item["status"] == "ready" for item in items),
+        "current_count": sum(item["status"] == "current" for item in items),
+        "blocked_count": sum(item["status"] == "blocked" for item in items),
+        "items": items,
+    }
+    return summary, ready
+
+
+async def apply_project_skill_backfill(
+    db: AsyncSession,
+    project: Project,
+    *,
+    actor_user_id: uuid.UUID,
+    actor_display_name: str,
+) -> tuple[dict, list[dict]]:
+    """Upgrade every safe legacy Skill binding as one compensating operation."""
+
+    summary, plans = await plan_project_skill_backfill(db, project)
+    if summary["blocked_count"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "project_skill_backfill_blocked", **summary},
+        )
+    moved: list[tuple[Path, Path]] = []
+    previous_configs = [(plan.binding, dict(plan.binding.config or {})) for plan in plans]
+    try:
+        for plan in plans:
+            if plan.source_path != plan.target_path:
+                plan.target_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(plan.source_path, plan.target_path)
+                moved.append((plan.source_path, plan.target_path))
+            plan.binding.config = {
+                **dict(plan.binding.config or {}),
+                _ASSET_CONFIG_KEY: dict(plan.metadata),
+            }
+        await db.flush()
+        if moved:
+            await commit_project_changes(
+                project,
+                f"Normalize {len(plans)} legacy project Skills",
+                _skill_backfill_git_paths(project, moved),
+                author_name=actor_display_name,
+                author_email=project_user_git_email(actor_user_id),
+            )
+    except Exception:
+        for source, target in reversed(moved):
+            if target.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, source)
+        for binding, config in previous_configs:
+            binding.config = config
+        raise
+    rollback_entries = [
+        {
+            "binding_id": str(plan.binding.id),
+            "previous_schema_version": plan.previous_schema_version,
+            "previous_asset_id": plan.previous_asset_id,
+            "applied_asset_id": plan.metadata["asset_id"],
+            "other_config_fingerprint": plan.other_config_fingerprint,
+        }
+        for plan in plans
+    ]
+    return {**summary, "applied_count": len(plans)}, rollback_entries
+
+
+async def rollback_project_skill_backfill(
+    db: AsyncSession,
+    project: Project,
+    entries: object,
+    *,
+    actor_user_id: uuid.UUID,
+    actor_display_name: str,
+) -> dict:
+    """Restore the exact legacy metadata shape when assets remain unchanged."""
+
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=409, detail="Project Skill backfill audit data is invalid")
+    bindings_by_id = {binding.id: binding for binding in await _skill_bindings(db, project)}
+    prepared: list[tuple[ProjectCapabilityBinding, dict, dict | None, Path, Path]] = []
+    root = project_repo_path(project.tenant_id, project.id)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=409, detail="Project Skill backfill audit data is invalid")
+        try:
+            binding_id = uuid.UUID(str(entry.get("binding_id")))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="Project Skill backfill audit data is invalid") from exc
+        binding = bindings_by_id.get(binding_id)
+        if binding is None:
+            raise HTTPException(status_code=409, detail="A backfilled Project Skill binding is unavailable")
+        metadata = _require_skill_asset(binding)
+        if metadata["asset_id"] != entry.get("applied_asset_id"):
+            raise HTTPException(status_code=409, detail="Project Skill changed after backfill")
+        if _other_config_fingerprint(binding.config) != entry.get("other_config_fingerprint"):
+            raise HTTPException(status_code=409, detail="Project Skill configuration changed after backfill")
+        source = _binding_asset_path(root, binding, metadata)
+        files = await asyncio.to_thread(_read_skill_root, source, metadata["path"])
+        if _skill_hash(files) != metadata["sha256"]:
+            raise HTTPException(status_code=409, detail="Project Skill files changed after backfill")
+        previous_schema = entry.get("previous_schema_version")
+        if previous_schema == 0:
+            previous_metadata = None
+            if binding.inherited_from_agent_id is None:
+                raise HTTPException(status_code=409, detail="Project Skill member is unavailable")
+            target = resolve_project_agent_path(
+                root,
+                binding.inherited_from_agent_id,
+                metadata["path"],
+            )
+        elif previous_schema == 1:
+            previous_metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key != "asset_id"
+            }
+            previous_metadata["schema_version"] = 1
+            old_asset_id = str(entry.get("previous_asset_id") or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", old_asset_id):
+                raise HTTPException(status_code=409, detail="Project Skill backfill audit data is invalid")
+            target = (
+                resolve_project_agent_path(root, binding.inherited_from_agent_id, metadata["path"])
+                if binding.is_enabled
+                else resolve_project_agent_path(
+                    root,
+                    binding.inherited_from_agent_id,
+                    f".disabled-skills/{old_asset_id}/{PurePosixPath(metadata['path']).name}",
+                )
+            )
+        else:
+            raise HTTPException(status_code=409, detail="Project Skill backfill audit data is invalid")
+        if target != source and target.exists():
+            raise HTTPException(status_code=409, detail="Project Skill rollback path is occupied")
+        prepared.append((binding, dict(binding.config or {}), previous_metadata, source, target))
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for binding, current_config, previous_metadata, source, target in prepared:
+            if source != target:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+                moved.append((source, target))
+            restored_config = dict(current_config)
+            if previous_metadata is None:
+                restored_config.pop(_ASSET_CONFIG_KEY, None)
+            else:
+                restored_config[_ASSET_CONFIG_KEY] = previous_metadata
+            binding.config = restored_config
+        await db.flush()
+        if moved:
+            await commit_project_changes(
+                project,
+                f"Roll back {len(prepared)} project Skill normalizations",
+                _skill_backfill_git_paths(project, moved),
+                author_name=actor_display_name,
+                author_email=project_user_git_email(actor_user_id),
+            )
+    except Exception:
+        for source, target in reversed(moved):
+            if target.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, source)
+        for binding, current_config, _previous_metadata, _source, _target in prepared:
+            binding.config = current_config
+        raise
+    return {
+        "project_id": str(project.id),
+        "rolled_back_count": len(prepared),
+        "binding_ids": [str(binding.id) for binding, *_rest in prepared],
+    }
 
 
 async def register_project_workspace_skill(
@@ -960,6 +1222,209 @@ def _asset_metadata(
         "file_count": len(files),
         "size_bytes": total_size,
     }
+
+
+def _backfill_item(
+    binding: ProjectCapabilityBinding,
+    status: str,
+    reason: str | None = None,
+    *,
+    previous_schema_version: int | None = None,
+) -> dict:
+    result = {
+        "binding_id": str(binding.id),
+        "member_agent_id": str(binding.inherited_from_agent_id) if binding.inherited_from_agent_id else None,
+        "name": binding.capability_name,
+        "status": status,
+    }
+    if reason:
+        result["reason"] = reason
+    if previous_schema_version is not None:
+        result["previous_schema_version"] = previous_schema_version
+        result["target_schema_version"] = 2
+    return result
+
+
+def _other_config_fingerprint(config: object) -> str:
+    value = dict(config) if isinstance(config, dict) else {}
+    value.pop(_ASSET_CONFIG_KEY, None)
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _skill_backfill_git_paths(project: Project, moved: list[tuple[Path, Path]]) -> list[str]:
+    root = project_repo_path(project.tenant_id, project.id)
+    paths = set()
+    for pair in moved:
+        for path in pair:
+            relative = path.relative_to(root)
+            if len(relative.parts) >= 3 and relative.parts[0] == ".agents":
+                paths.add(PurePosixPath(*relative.parts[:3]).as_posix())
+            else:
+                paths.add(relative.as_posix())
+    return sorted(paths)
+
+
+async def _prepare_skill_backfill_plan(
+    db: AsyncSession,
+    project: Project,
+    binding: ProjectCapabilityBinding,
+    raw_metadata: dict | None,
+    root: Path,
+    asset_ids: dict[tuple, str],
+) -> _SkillBackfillPlan:
+    if binding.inherited_from_agent_id is None:
+        raise HTTPException(status_code=409, detail="Legacy shared Skill has no project member")
+    member = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.agent_id == binding.inherited_from_agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    agent = await db.get(Agent, binding.inherited_from_agent_id)
+    if (
+        member is None
+        or agent is None
+        or agent.tenant_id != project.tenant_id
+        or agent.scope != "project"
+        or agent.project_id != project.id
+        or agent.is_deleted
+    ):
+        raise HTTPException(status_code=409, detail="Legacy Skill project member is unavailable")
+
+    if raw_metadata is not None:
+        normalized = _binding_asset_metadata(binding)
+        if normalized is None:
+            raise HTTPException(status_code=409, detail="Legacy Skill metadata is unavailable")
+        if normalized["source"] not in {"agent", "library", "template", "workspace"}:
+            raise HTTPException(status_code=409, detail="Legacy Skill source is invalid")
+        source_path = _binding_asset_path(root, binding, normalized)
+        files = await asyncio.to_thread(_read_skill_root, source_path, normalized["path"])
+        folder = PurePosixPath(normalized["path"]).name
+        _name, version = _skill_identity(folder, files, default_version=normalized["version"])
+        metadata = _asset_metadata(
+            files,
+            path=normalized["path"],
+            version=version,
+            source=normalized["source"],
+            source_agent_id=normalized.get("source_agent_id"),
+        )
+        if any(
+            metadata[key] != normalized[key]
+            for key in (
+                "version",
+                "sha256",
+                "path",
+                "source",
+                "source_agent_id",
+                "file_count",
+                "size_bytes",
+            )
+        ):
+            raise HTTPException(status_code=409, detail="Legacy Skill metadata does not match its files")
+        previous_schema_version = 1
+        previous_asset_id = str(raw_metadata["sha256"])
+    else:
+        folder, files, source, source_agent_id, default_version = await _discover_legacy_skill(
+            db,
+            project,
+            binding,
+            root,
+        )
+        relative_path = f"skills/{folder}"
+        source_path = resolve_project_agent_path(root, binding.inherited_from_agent_id, relative_path)
+        _name, version = _skill_identity(folder, files, default_version=default_version)
+        metadata = _asset_metadata(
+            files,
+            path=relative_path,
+            version=version,
+            source=source,
+            source_agent_id=source_agent_id,
+        )
+        previous_schema_version = 0
+        previous_asset_id = None
+
+    group_key = (
+        binding.capability_id,
+        metadata["source"],
+        metadata.get("source_agent_id"),
+        metadata["version"],
+        metadata["path"],
+        metadata["sha256"],
+    )
+    metadata["asset_id"] = asset_ids.setdefault(group_key, str(uuid.uuid4()))
+    target_path = (
+        resolve_project_agent_path(root, binding.inherited_from_agent_id, metadata["path"])
+        if binding.is_enabled
+        else resolve_project_agent_path(
+            root,
+            binding.inherited_from_agent_id,
+            _disabled_asset_path(metadata),
+        )
+    )
+    if target_path != source_path and target_path.exists():
+        raise HTTPException(status_code=409, detail="Project Skill backfill path is occupied")
+    return _SkillBackfillPlan(
+        binding=binding,
+        previous_schema_version=previous_schema_version,
+        previous_asset_id=previous_asset_id,
+        metadata=metadata,
+        source_path=source_path,
+        target_path=target_path,
+        other_config_fingerprint=_other_config_fingerprint(binding.config),
+    )
+
+
+async def _discover_legacy_skill(
+    db: AsyncSession,
+    project: Project,
+    binding: ProjectCapabilityBinding,
+    root: Path,
+) -> tuple[str, list[dict[str, str]], str, uuid.UUID | None, str]:
+    if binding.inherited_from_agent_id is None:
+        raise HTTPException(status_code=409, detail="Legacy Skill has no project member")
+    if binding.capability_id is not None:
+        skill = (
+            await db.execute(
+                select(Skill).where(
+                    Skill.id == binding.capability_id,
+                    (Skill.tenant_id == project.tenant_id) | Skill.tenant_id.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if skill is None:
+            raise HTTPException(status_code=409, detail="Legacy Skill source is unavailable")
+        folder = _validate_folder_name(skill.folder_name)
+        files = await asyncio.to_thread(
+            _read_local_skill,
+            root,
+            binding.inherited_from_agent_id,
+            f"skills/{folder}",
+        )
+        return folder, files, "library", skill.publisher_agent_id, str(skill.version or 1)
+
+    skills_root = resolve_project_agent_path(root, binding.inherited_from_agent_id, "skills")
+    if skills_root.is_symlink() or not skills_root.is_dir():
+        raise HTTPException(status_code=409, detail="Legacy Skill files are unavailable")
+    candidates: list[tuple[str, list[dict[str, str]]]] = []
+    for entry in sorted(skills_root.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            folder = _validate_folder_name(entry.name)
+            files = await asyncio.to_thread(_read_skill_root, entry, f"skills/{folder}")
+            name, _version = _skill_identity(folder, files)
+        except (HTTPException, OSError, ProjectTemplateSnapshotError):
+            continue
+        if name == binding.capability_name:
+            candidates.append((folder, files))
+    if len(candidates) != 1:
+        raise HTTPException(status_code=409, detail="Legacy Skill files cannot be identified safely")
+    folder, files = candidates[0]
+    return folder, files, "workspace", None, "1"
 
 
 def _binding_asset_metadata(binding: ProjectCapabilityBinding) -> dict | None:

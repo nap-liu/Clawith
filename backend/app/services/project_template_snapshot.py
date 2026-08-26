@@ -169,6 +169,7 @@ async def restore_project_template_files(
         project,
         "Restore final project assets from template",
         changed_paths,
+        force_add=True,
         author_name=author_name,
         author_email=author_email,
     )
