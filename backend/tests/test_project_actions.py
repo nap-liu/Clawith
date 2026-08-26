@@ -4298,6 +4298,8 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         "send_message_to_parent",
         "send_session_message",
     }
+    private_file_mutation_names = {"delete_file", "edit_file", "move_file", "write_file"}
+    ordinary_read_names = {"read_file"}
 
     async def normal_tools_with_collaboration_bypasses(_agent_id, *, assignment_snapshot=None):
         return [
@@ -4309,7 +4311,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
-            for name in collaboration_bypass_names
+            for name in collaboration_bypass_names | private_file_mutation_names | ordinary_read_names
         ]
 
     monkeypatch.setattr(
@@ -4380,6 +4382,10 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     assert "project_set_status" not in worker_names
     assert worker_names.isdisjoint(collaboration_bypass_names)
     assert leader_names.isdisjoint(collaboration_bypass_names)
+    assert worker_names.isdisjoint(private_file_mutation_names)
+    assert leader_names.isdisjoint(private_file_mutation_names)
+    assert ordinary_read_names <= worker_names
+    assert ordinary_read_names <= leader_names
     assert {
         "project_create_work_item",
         "project_update_plan",

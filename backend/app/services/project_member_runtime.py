@@ -17,7 +17,6 @@ from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberS
 from app.models.tool import AgentTool, Tool
 from app.services.tool_enablement import tool_is_required
 
-
 # Project copies start with the smallest useful local execution surface. These
 # are ordinary platform tools, not a second capability system: the copy still
 # uses AgentTool and the existing Agent tool panel, while every omitted tool is
@@ -25,19 +24,16 @@ from app.services.tool_enablement import tool_is_required
 PROJECT_AGENT_DEFAULT_TOOL_NAMES = frozenset(
     {
         "complete_focus_item",
-        "edit_file",
         "execute_code_aio",
         "find_files",
         "list_files",
         "list_focus_items",
-        "move_file",
         "read_document",
         "read_file",
         "read_image",
         "search_files",
         "send_media",
         "upsert_focus_item",
-        "write_file",
     }
 )
 

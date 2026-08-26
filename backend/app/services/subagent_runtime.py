@@ -1097,6 +1097,21 @@ async def prepare_subagent_tools(
                 for item in child_tools
                 if item.get("function", {}).get("name") not in project_collaboration_bypass_tools
             ]
+            # Project deliverables have one versioned workspace. Keep private
+            # Agent assets readable, but do not expose private file mutation
+            # tools during project execution: project_write_file is the sole
+            # write path and records the project version, Run and event.
+            private_file_mutation_tools = {
+                "delete_file",
+                "edit_file",
+                "move_file",
+                "write_file",
+            }
+            child_tools = [
+                item
+                for item in child_tools
+                if item.get("function", {}).get("name") not in private_file_mutation_tools
+            ]
             if project.status == "planning":
                 # Planning is a Human-controlled conversation with the project
                 # owner.  No inherited or project mutation surface is exposed

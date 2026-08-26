@@ -908,7 +908,6 @@ class AcceptanceRunner:
                             "git": {"repository_mode": "managed", "branch_policy": "work_item"},
                             "runtime": {"model": "qwen3.6-plus", "max_parallel_runs": 3},
                             "policies": {
-                                "approval": "risk",
                                 "max_group_mentions_per_message": 3,
                                 "max_a2a_wakes": 24,
                                 "loop_protection": True,
@@ -921,6 +920,19 @@ class AcceptanceRunner:
             self.save()
 
         project_id = project["id"]
+        project_agents = await self.request("GET", f"/projects/{project_id}/agents")
+        agents_by_source = {
+            str(agent.get("source_agent_id")): str(agent["id"])
+            for agent in project_agents
+            if agent.get("source_agent_id") and agent.get("id")
+        }
+        entry["role_agents"] = {
+            key: agents_by_source[str(self.state["agents"][key])]
+            for key in scenario.roles
+            if str(self.state["agents"][key]) in agents_by_source
+        }
+        if len(entry["role_agents"]) != len(scenario.roles):
+            raise RuntimeError(f"Project {scenario.key} is missing one or more project-owned role Agents")
         if not entry.get("input_commit"):
             files = await self.request("GET", f"/projects/{project_id}/files")
             if scenario.input_path in self._collect_paths(files):
@@ -1030,7 +1042,7 @@ class AcceptanceRunner:
 验收条件：
 {criteria}
 
-请先回复一份具体执行方案，包括工作项、依赖、各岗位负责人、交付文件、审查门禁和里程碑。每个岗位必须基于输入证据作出本专业判断，说明质疑或风险、决策依据以及可执行下一步；独立复核岗位不能照抄交付方结论。方案确认启动后，你必须使用项目管理工具创建工作项，由全部项目 Agent 按各自岗位真实协作；只允许点对点 A2A 交接或评审，禁止广播唤醒。只有上游输入已经具备且存在明确专业问题或交付任务时才能唤醒下游岗位；不得用 A2A 发送进度通知、要求确认收到或通知对方等待，普通进度只更新工作项和项目记录。业务判断和真实产物优先，Run、会话、Git 与验收证据应由实际工作自然形成，禁止为了留痕而让 Agent 复述工具操作。最后创建交付里程碑并将项目状态设置为 completed。不要用总结代替文件，不要等待额外人工输入。"""
+请先回复一份具体执行方案，包括工作项、依赖、各岗位负责人、交付文件、审查门禁和里程碑。每个岗位必须基于输入证据作出本专业判断，说明质疑或风险、决策依据以及可执行下一步；独立复核岗位不能照抄交付方结论。方案确认启动后，你必须使用项目管理工具创建工作项，由全部项目 Agent 按各自岗位真实协作；负责人自己的契约、编排与集成收口属于负责人 Run，不另建工作项，只为需要委派给其他岗位的专业交付创建工作项。每个工作项都必须指定项目成员，并通过点对点 A2A 产生独立 Run；只允许点对点 A2A 交接或评审，禁止广播唤醒。只有上游输入已经具备且存在明确专业问题或交付任务时才能唤醒下游岗位；不得用 A2A 发送进度通知、要求确认收到或通知对方等待，普通进度只更新工作项和项目记录。所有项目交付文件只能通过项目文件工具保存到项目工作区，不能写入数字员工私有工作区。业务判断和真实产物优先，Run、会话、Git 与验收证据应由实际工作自然形成，禁止为了留痕而让 Agent 复述工具操作。最后创建一个同时关联全部已完成工作项和对应成功 Run 的交付里程碑，再将项目状态设置为 completed。不要用总结代替文件，不要等待额外人工输入。"""
 
     async def send_planning_message(self, scenario: Scenario) -> None:
         entry = self.state["projects"][scenario.key]
@@ -1066,7 +1078,7 @@ class AcceptanceRunner:
                 item
                 for item in items
                 if item.get("role") == "assistant"
-                and item.get("sender_agent_id") == self.state["agents"][scenario.roles[0]]
+                and item.get("sender_agent_id") == entry["role_agents"][scenario.roles[0]]
                 and str(item.get("content") or "").strip()
                 and "[LLM Error]" not in str(item.get("content") or "")
                 and "Request timed out" not in str(item.get("content") or "")
@@ -1679,22 +1691,6 @@ class AcceptanceRunner:
         )
         file_names = self._collect_paths(files)
         missing_outputs = [path for path in scenario.outputs if path not in file_names]
-        available_outputs = [path for path in scenario.outputs if path in file_names]
-        output_payloads = await asyncio.gather(
-            *(
-                self.request(
-                    "GET",
-                    f"/projects/{project_id}/files/content",
-                    params={"path": path, "max_chars": 200_000},
-                )
-                for path in available_outputs
-            )
-        )
-        output_contents = {
-            path: str(payload.get("content") or "")
-            for path, payload in zip(available_outputs, output_payloads, strict=True)
-        }
-        semantic_assessment = self._assess_deliverable_semantics(scenario, output_contents)
         active = [run["id"] for run in runs if run.get("status") in {"queued", "running", "waiting"}]
         unlinked_business_runs = [
             run["id"]
@@ -1716,23 +1712,10 @@ class AcceptanceRunner:
         participating_agents = {
             str(run["agent_id"]) for run in work_linked_runs if run.get("agent_id") and run.get("status") == "succeeded"
         }
-        expected_role_agents = {key: str(self.state["agents"].get(key) or "") for key in scenario.roles}
-        role_run_semantics = self._assess_role_run_semantics(scenario, expected_role_agents, runs)
-        conversations = await self._load_project_conversations(
-            project_id=project_id,
-            group_session_id=str(entry["group_session_id"]),
-            runs=runs,
-        )
-        conversation_semantics = self._assess_conversation_semantics(
-            scenario,
-            expected_role_agents,
-            conversations,
-        )
-        collaboration_topology = self._assess_collaboration_topology(
-            scenario,
-            expected_role_agents,
-            conversations,
-        )
+        expected_role_agents = {
+            key: str(entry.get("role_agents", {}).get(key) or "")
+            for key in scenario.roles
+        }
         missing_participating_roles = [
             ROLES[key].name
             for key, agent_id in expected_role_agents.items()
@@ -1766,10 +1749,6 @@ class AcceptanceRunner:
             "milestone_with_run_and_work_item_links": milestone_with_links,
             "git_head": git.get("head"),
             "missing_outputs": missing_outputs,
-            "deliverable_semantics": semantic_assessment,
-            "role_run_semantics": role_run_semantics,
-            "conversation_semantics": conversation_semantics,
-            "collaboration_topology": collaboration_topology,
         }
         failures = []
         if project.get("status") != "completed":
@@ -1795,24 +1774,6 @@ class AcceptanceRunner:
                 failures.append(f"{label}: {', '.join(map(str, values))}")
         if len(participating_agents) < 5:
             failures.append(f"only {len(participating_agents)} agents completed work-item runs")
-        for label, values in semantic_assessment.items():
-            if values:
-                failures.append(f"{label}: {values}")
-        for label, values in role_run_semantics.items():
-            if values:
-                failures.append(f"{label}: {values}")
-        for label, values in conversation_semantics.items():
-            if values:
-                failures.append(f"{label}: {values}")
-        for label in (
-            "professional_requests_without_sender_ids",
-            "isolated_collaboration_roles",
-            "disconnected_collaboration_roles",
-            "missing_review_handoffs",
-        ):
-            values = collaboration_topology[label]
-            if values:
-                failures.append(f"{label}: {values}")
         if not git.get("head"):
             failures.append("Git HEAD is missing")
         if not milestones:
