@@ -1029,7 +1029,9 @@ class AcceptanceRunner:
             for item in contracts
         )
         criteria = "\n".join(f"- {item}" for item in scenario.criteria)
-        return f"""我们要执行真实的“{scenario.name}”项目。请你作为项目负责人先阅读 `{scenario.input_path}`，与我完成方案讨论。
+        return f"""我们要执行真实的“{scenario.name}”项目。输入已保存于 `{scenario.input_path}`，内容如下；请你作为项目负责人基于这些输入与我完成方案讨论，本轮不调用工具。
+
+{scenario.input_content}
 
 协作模式：{scenario.collaboration}
 

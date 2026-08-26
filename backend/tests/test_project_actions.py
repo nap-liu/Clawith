@@ -4688,6 +4688,10 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
             turn_anchor_id=anchor_id,
         )
     )
+    stored_run = await env.db.get(ProjectRun, uuid.UUID(run["id"]))
+    assert stored_run is not None
+    stored_run.status = "succeeded"
+    await env.db.commit()
     long_milestone_message = "里程碑完整说明：" + "六个Agent的交付证据、评审结论与回滚锚点均已核验。" * 40
     assert len(long_milestone_message) > 500
     milestone_result = json.loads(
@@ -4701,7 +4705,6 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
                 # work item's code/file change list.
                 "paths": ["deliverables/traced.md", "PROJECT.json"],
                 "related_work_item_ids": [item_id],
-                "related_run_ids": [run["id"]],
             },
             agent_id=env.leader_id,
             execution_user_id=env.owner_id,
@@ -4848,7 +4851,6 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
     recovery_arguments = {
         "message": "Recover this semantic milestone after DB failure",
         "related_work_item_ids": [item_id],
-        "related_run_ids": [run["id"]],
     }
     monkeypatch.setattr(project_runtime_tools, "async_session", FailSecondCommitSession)
     with pytest.raises(RuntimeError, match="injected metadata commit failure"):
@@ -4868,6 +4870,19 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
         text=True,
     ).splitlines()
     assert len(operation_commits_after_failure) == 2
+
+    late_success = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=uuid.UUID(project_id),
+        work_item_id=uuid.UUID(item_id),
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="succeeded",
+        trigger_type="retry",
+        output={"subagent_session_id": str(child_id)},
+    )
+    env.db.add(late_success)
+    await env.db.commit()
 
     monkeypatch.setattr(project_runtime_tools, "async_session", env.session_factory)
     recovered_result = json.loads(
@@ -4916,6 +4931,12 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
         ).event_type
         == "git.milestone.created"
     )
+    recovered_event = next(
+        event
+        for event in recovered_events
+        if event.event_metadata.get("milestone_message") == recovery_arguments["message"]
+    )
+    assert set(recovered_event.event_metadata["related_run_ids"]) == {run["id"], str(late_success.id)}
     assert not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain"], text=True).strip()
 
     completed = json.loads(

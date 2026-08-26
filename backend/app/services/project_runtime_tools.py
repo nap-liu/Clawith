@@ -331,7 +331,8 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
             "related_run_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Work progress identifiers associated with this checkpoint.",
+                "description": "Work progress identifiers associated with this checkpoint. When omitted, "
+                "successful progress for the selected work items is included.",
             },
         },
         ["message"],
@@ -930,25 +931,10 @@ async def execute_project_runtime_tool(
         related_work_item_ids = {
             _uuid(value, "related_work_item_id") for value in arguments.get("related_work_item_ids", [])
         }
-        related_run_ids = {_uuid(value, "related_run_id") for value in arguments.get("related_run_ids", [])}
-        operation_key = _milestone_operation_key(
-            project,
-            member,
-            project_run,
-            session_id,
-            message,
-            paths,
-            related_work_item_ids,
-            related_run_ids,
-        )
-        related_metadata = {
-            **trace_metadata,
-            "milestone_operation_key": operation_key,
-            "milestone_message": message,
-            "description": message,
-            "related_work_item_ids": [str(value) for value in sorted(related_work_item_ids, key=str)],
-            "related_run_ids": [str(value) for value in sorted(related_run_ids, key=str)],
+        requested_related_run_ids = {
+            _uuid(value, "related_run_id") for value in arguments.get("related_run_ids", [])
         }
+        related_run_ids = set(requested_related_run_ids)
         async with async_session() as db:
             if related_work_item_ids:
                 found_work_items = set(
@@ -963,6 +949,19 @@ async def execute_project_runtime_tool(
                 )
                 if found_work_items != related_work_item_ids:
                     raise ValueError("Every related work item must belong to the current project")
+                if not related_run_ids:
+                    related_run_ids = set(
+                        (
+                            await db.execute(
+                                select(ProjectRun.id).where(
+                                    ProjectRun.project_id == project.id,
+                                    ProjectRun.tenant_id == project.tenant_id,
+                                    ProjectRun.work_item_id.in_(related_work_item_ids),
+                                    ProjectRun.status == "succeeded",
+                                )
+                            )
+                        ).scalars()
+                    )
             if related_run_ids:
                 found_runs = set(
                     (
@@ -976,6 +975,24 @@ async def execute_project_runtime_tool(
                 )
                 if found_runs != related_run_ids:
                     raise ValueError("Every related run must belong to the current project")
+            operation_key = _milestone_operation_key(
+                project,
+                member,
+                project_run,
+                session_id,
+                message,
+                paths,
+                related_work_item_ids,
+                requested_related_run_ids,
+            )
+            related_metadata = {
+                **trace_metadata,
+                "milestone_operation_key": operation_key,
+                "milestone_message": message,
+                "description": message,
+                "related_work_item_ids": [str(value) for value in sorted(related_work_item_ids, key=str)],
+                "related_run_ids": [str(value) for value in sorted(related_run_ids, key=str)],
+            }
             operation_event = await _milestone_operation_event(db, project, operation_key)
             if operation_event is None:
                 operation_event = add_event(
