@@ -7,7 +7,6 @@ create/update return revert hints.
 from __future__ import annotations
 
 import uuid as _uuid
-from datetime import datetime, timezone
 
 from mcp.server.fastmcp import Context
 from sqlalchemy import select
@@ -126,6 +125,15 @@ async def set_agent_schedule_impl(
             old_instruction = sched.instruction
             old_enabled = sched.is_enabled
 
+            from app.services.execution_identity import align_background_execution_user
+
+            await align_background_execution_user(
+                db,
+                agent_id=ag.id,
+                resource_type="schedule",
+                resource_id=sched.id,
+                execution_user_id=pc.user.id,
+            )
             sched.name = name
             sched.cron_expr = cron_expr
             sched.instruction = instruction
@@ -245,22 +253,15 @@ async def run_agent_schedule_impl(
         if guidance:
             return guidance
 
-        # Fire in background — same mechanism as REST trigger_schedule
-        import asyncio
-        from app.services.scheduler import _execute_schedule
-        asyncio.create_task(
-            _execute_schedule(
-                sched.id,
-                sched.agent_id,
-                sched.instruction,
-                sched.execution_user_id,
-            )
-        )
+        from app.services.background_manual_run import run_background_resource
 
-        # Update tracking
-        sched.last_run_at = datetime.now(timezone.utc)
-        sched.run_count = (sched.run_count or 0) + 1
-        await db.commit()
+        await run_background_resource(
+            db,
+            actor_user_id=pc.user.id,
+            agent_id=ag.id,
+            resource_type="schedule",
+            resource=str(sched.id),
+        )
 
         return f"✅ 已触发「{ag.name}」的 schedule「{sched.name}」(id={sid}) 异步执行。"
 

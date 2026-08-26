@@ -31,6 +31,19 @@ def test_requested_builtin_default_flags_are_canonical():
     assert _seed("send_message_to_parent")["is_default"] is True
 
 
+def test_session_message_exposes_shared_dingtalk_card_template_config():
+    seed = _seed("send_session_message")
+    field = next(
+        item
+        for item in seed["config_schema"]["fields"]
+        if item["key"] == "card_template_id"
+    )
+
+    assert field["type"] == "string"
+    assert field.get("agent_only") is not True
+    assert _seed("send_group_session_message")["config_schema"] == {}
+
+
 def test_toolscall_is_agent_scoped_and_defaults_on():
     seed = _seed("execute_code_aio")
     assert seed["config"]["toolscall_enabled"] is True

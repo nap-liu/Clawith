@@ -1,4 +1,4 @@
-# Contributing to Clawith 🦞
+# Contributing to the Digital Employee Platform 🦞
 
 Thanks for your interest in contributing! Whether it's a bug fix, new feature, translation, or documentation improvement — every contribution matters.
 
@@ -32,7 +32,7 @@ Thanks for your interest in contributing! Whether it's a bug fix, new feature, t
 When reporting a bug, please include:
 - Steps to reproduce
 - Expected vs actual behavior
-- Clawith version and deployment method (Docker / Source)
+- Platform version and deployment method (Docker / Source)
 - Logs or screenshots if available
 
 **Priority guide:**
@@ -167,7 +167,7 @@ Para garantizar que todos los contribuidores puedan participar de manera efectiv
 
 ## Windows Development
 
-Clawith is primarily developed on Linux/macOS, but can run on Windows with a few adjustments.
+The platform is primarily developed on Linux/macOS, but can run on Windows with a few adjustments.
 
 ### Prerequisites
 

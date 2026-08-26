@@ -188,7 +188,7 @@ jobs:
               lines = lines[:100] + [f"- ... and {len(lines) - 100} more commits"]
           commit_summary = "\n".join(lines)
           
-          prompt = f"""You are writing Clawith release notes in markdown.
+          prompt = f"""You are writing digital employee platform release notes in markdown.
 
           Based on the provided commit history, analyze the changes between the previous version ({base_tag}) and the new target version ({target_tag}), and write comprehensive release notes in Markdown.
 

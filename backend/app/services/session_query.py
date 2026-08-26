@@ -18,9 +18,12 @@ Key invariants enforced structurally here:
   normalized ``session_agent_id`` (``min(a, b)``), so messages are *always*
   fetched by ``conversation_id`` — never ``ChatMessage.agent_id == self`` (that
   would return zero rows for the larger-UUID side of every A2A pair).
-- **non-human context**: when the current turn has no human in the loop
-  (source_channel ``agent``/``trigger``), the agent gets only its autonomous-side
-  sessions — it never inherits a creator's cross-user admin reach.
+- **execution identity**: session visibility follows the resolved execution user,
+  regardless of whether the current turn arrived from Web, IM, MCP, a trigger,
+  or another agent. ``source_channel`` describes routing, not authorization.
+- **creator fallback**: callers may resolve a missing execution user to the Agent
+  creator before entering the tool layer. If no valid user reaches this layer,
+  the autonomous minimum remains the fail-safe scope.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ from app.models.user import Identity, User
 HUMAN_CHANNELS = frozenset(
     {
         "web",
+        "mcp",
         "miniprogram",
         "wechat_miniprogram",
         "feishu",
@@ -262,27 +266,21 @@ async def resolve_human_viewer_access(db: AsyncSession, user_id, agent: Agent) -
 async def resolve_scope(db: AsyncSession, agent: Agent, ctx_session_id: str, user_id):
     """Return ``(scope_kind, session_where_predicate)``.
 
-    Discriminates by the *current* session's source_channel — the only reliable
-    "is a human in the loop?" signal at the tool layer (``user_id`` degrades to a
-    creator in A2A/trigger/cron paths and must not be trusted for escalation).
+    Authorization follows the canonical execution user. The channel is retained
+    only for routing and for the autonomous fail-safe predicate; it must never
+    narrow a valid user's current Agent permission.
     """
-    ctx = None
-    cu = _as_uuid(ctx_session_id)
-    if cu is not None:
-        ctx = (
-            await db.execute(select(ChatSession).where(ChatSession.id == cu))
-        ).scalar_one_or_none()
-    channel = ctx.source_channel if ctx else None
-
-    if channel in HUMAN_CHANNELS:
-        scope = await resolve_human_viewer_access(db, user_id, agent)
-        if scope == SCOPE_DENY:
-            return SCOPE_DENY, None
+    viewer_id = _as_uuid(user_id)
+    if viewer_id is not None:
+        scope = await resolve_human_viewer_access(db, viewer_id, agent)
         if scope == SCOPE_ALL:
             return SCOPE_ALL, _all_sessions_where(agent.id)
-        return SCOPE_OWN, _own_participated_where(agent.id, _as_uuid(user_id))
+        if scope == SCOPE_OWN:
+            return SCOPE_OWN, _own_participated_where(agent.id, viewer_id)
+        return SCOPE_DENY, None
 
-    # Non-human channel ('agent'/'trigger') or missing ctx -> autonomous minimum.
+    # No execution user reached the tool boundary. Keep the existing autonomous
+    # minimum rather than deriving authority from a session/channel attribute.
     return SCOPE_AUTONOMOUS, _autonomous_where(agent.id, ctx_session_id)
 
 

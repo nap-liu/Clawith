@@ -76,8 +76,8 @@ async def test_user_id_equals_agent_id_falls_back_to_creator():
     assert kwargs["headers"]["X-Owner"] == expected_email
 
 
-async def test_user_id_none_also_falls_back_to_creator():
-    """Direct trigger path with user_id=None — same fallback."""
+async def test_user_id_none_does_not_receive_creator_placeholders():
+    """A genuinely anonymous call cannot inherit creator credentials."""
     suffix = uuid.uuid4().hex[:6]
     async with async_session() as db:
         creator_identity = Identity(
@@ -119,6 +119,6 @@ async def test_user_id_none_also_falls_back_to_creator():
             f"mcp_none_{suffix}", {}, agent_id=agent_id, user_id=None,  # absent user
         )
 
-    assert result == "OK"
-    args, _ = mock_cls.call_args
-    assert args[0] == f"https://srv/owner-{suffix}@org.test"
+    assert "placeholder error" in result
+    fake_client.call_tool.assert_not_awaited()
+    mock_cls.assert_not_called()

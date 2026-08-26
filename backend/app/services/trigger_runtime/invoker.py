@@ -18,6 +18,7 @@ from app.services.trigger_runtime import (
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
 )
+from app.services.webhook_inbox import format_webhook_inbox_context
 
 
 async def resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTrigger]) -> dict | None:
@@ -190,11 +191,12 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                         "\n3. 工具调用成功后，再发送一句简短确认，明确你已收到并已记录。"
                         "\n4. 不要只回复确认而不调用工具，也不要把原始长对话原样存入日报。"
                     )
-                if t.type == "webhook" and cfg.get("_webhook_payload"):
-                    payload_str = cfg["_webhook_payload"]
-                    if len(payload_str) > 2000:
-                        payload_str = payload_str[:2000] + "... (truncated)"
-                    part += f"\nWebhook Payload:\n{payload_str}"
+                if t.type == "webhook":
+                    inbox_context = format_webhook_inbox_context(cfg, language="zh")
+                    if inbox_context:
+                        part += inbox_context
+                    elif cfg.get("_webhook_payload"):
+                        part += f"\nWebhook Payload:\n{cfg['_webhook_payload']}"
                 context_parts.append(part)
                 trigger_names.append(t.name)
 

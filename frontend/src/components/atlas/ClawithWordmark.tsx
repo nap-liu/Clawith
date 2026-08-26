@@ -1,11 +1,11 @@
 interface Props {
-    /** Rendered height in px (width scales to preserve aspect 9104:2400 ≈ 3.79:1) */
+    /** Rendered height in px. */
     height?: number;
     className?: string;
 }
 
 /**
- * Official Clawith wordmark — icon + "Clawith" text glyph paths.
+ * Legacy-compatible export that now renders the neutral platform icon only.
  * Uses fill="currentColor" so the surrounding CSS color controls the ink,
  * which makes theme switching (Paper Atlas ↔ Night Atlas) automatic.
  */
@@ -13,11 +13,11 @@ export default function ClawithWordmark({ height = 32, className }: Props) {
     return (
         <svg
             xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 9104 2400"
+            viewBox="0 0 2400 2400"
             height={height}
             fill="currentColor"
             className={className}
-            aria-label="Clawith"
+            aria-label="Digital Employee Platform"
         >
             <path d="M1209.68 101.151C1222.18 99.7115 1251.02 99.9775 1264.54 100.108C1380 101.218 1502.46 123.849 1611.08 161.851C1838.76 241.495 2058.12 409.079 2161.82 630.907C2197.14 707.753 2224.68 800.671 2198.74 884.277C2188.68 916.635 2152.46 934.015 2126.16 911.371C2095.08 884.609 2066.38 848.785 2036.52 818.573C1945.42 726.447 1844.96 666.909 1724.54 621.437C1650.28 596.154 1576.28 585.473 1498.2 592.019C1405.4 599.569 1309.6 642.447 1246.56 711.917C1191.6 772.473 1153.6 847.369 1061.62 853.681C974.088 859.689 894.504 810.833 829.994 756.331C752.648 690.985 690.758 601.601 683.328 498.195C676.904 414.227 704.812 331.243 760.67 268.219C867.33 146.494 1055.46 111.381 1209.68 101.151Z" />
             <path d="M2141.46 1478.6C2235.1 1469.08 2210.4 1628.3 2194.02 1679.7C2041.32 2158.48 1431.76 2386.6 972.339 2262.8C876.513 2236.98 791.411 2178.8 743.089 2091.04C640.785 1888.64 768.451 1689.38 952.281 1592.36C1031.51 1550.54 1119.64 1553.16 1184.44 1618.88C1212.96 1647.78 1236.36 1678.66 1267.04 1706.58C1305.94 1741.92 1351.8 1768.72 1401.68 1785.26C1643.24 1865.36 1939.9 1705.1 2091.94 1521.32C2106.32 1503.92 2118.34 1490.08 2138.88 1479.86L2141.46 1478.6Z" />

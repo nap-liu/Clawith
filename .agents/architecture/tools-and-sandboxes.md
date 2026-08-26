@@ -17,7 +17,7 @@ Do not hard-code one tool's name in unrelated tool descriptions, because disable
 
 ## CLI execution models
 
-Clawith supports two intentionally distinct command models:
+The platform supports two intentionally distinct command models:
 
 - Uploaded executable: a versioned artifact executed through the subprocess backend with a constrained environment.
 - AIO sandbox: shell/code execution in an isolated sandbox with language runtimes and its own workspace/network lifecycle.

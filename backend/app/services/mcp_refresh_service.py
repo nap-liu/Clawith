@@ -361,6 +361,7 @@ async def refresh_mcp_server_tools(
     *,
     agent_id: uuid.UUID | None = None,
     user_id: uuid.UUID | None = None,
+    session_id: str = "",
     assign_to_agent: bool = False,
 ) -> MCPToolRefreshResult:
     """Discover and persist one MCP server's current tool catalog.
@@ -399,7 +400,12 @@ async def refresh_mcp_server_tools(
     )
     config = compose_runtime_config(server, tenant_override, agent_override)
     context = (
-        await build_placeholder_context_for_call(db, agent_id, user_id)
+        await build_placeholder_context_for_call(
+            db,
+            agent_id,
+            user_id,
+            session_id=session_id,
+        )
         if agent_id is not None
         else _platform_context(server)
     )

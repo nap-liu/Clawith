@@ -1078,6 +1078,7 @@ async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery
         "app_secret": "ding-secret",
         "open_conversation_id": external_conv_id.removeprefix("dingtalk_group_"),
         "message": "卡片处理完成",
+        "raise_on_transport_error": True,
     }
     assert lock_keys == [
         channel_dispatch.channel_session_lock_key(
@@ -1168,7 +1169,11 @@ async def test_dingtalk_p2p_confirmation_followup_uses_unified_origin_delivery(m
 
     assert captured == {
         "args": (app_id, "ding-secret", [staff_id], "卡片处理完成"),
-        "kwargs": {"msg_type": "markdown", "robot_code": app_id},
+        "kwargs": {
+            "msg_type": "markdown",
+            "robot_code": app_id,
+            "raise_on_transport_error": True,
+        },
     }
 
 

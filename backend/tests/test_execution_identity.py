@@ -1,16 +1,18 @@
-"""Background work freezes its principal and only platform/org admins can reassign it."""
+"""Background work follows its last user mutation and freezes active-run snapshots."""
 
+import asyncio
 import uuid
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
+import app.models.chat_compaction  # noqa: F401 - registers ChatMessage FK target
 import app.models.participant  # noqa: F401 - registers ChatSession FK target
 from app.api.agents import get_agent_permission_members
-from app.api.schedules import ScheduleUpdate, update_schedule
+from app.api.schedules import ScheduleUpdate, trigger_schedule, update_schedule
 from app.api.tasks import update_task
-from app.api.triggers import list_agent_triggers
+from app.api.triggers import TriggerUpdate, list_agent_triggers, update_trigger
 from app.database import async_session, engine
 from app.models.agent import Agent, AgentPermission
 from app.models.schedule import AgentSchedule
@@ -53,19 +55,15 @@ async def _user(db, tenant_id, role, suffix):
     return user
 
 
-async def test_only_platform_admin_can_reassign_task_execution_user():
+async def test_task_mutation_aligns_execution_user_to_current_user():
     suffix = uuid.uuid4().hex[:10]
     async with async_session() as db:
         tenant = Tenant(name=f"Executor {suffix}", slug=f"executor-{suffix}")
-        foreign_tenant = Tenant(
-            name=f"Foreign {suffix}", slug=f"executor-foreign-{suffix}"
-        )
-        db.add_all([tenant, foreign_tenant])
+        db.add(tenant)
         await db.flush()
         admin = await _user(db, tenant.id, "platform_admin", f"admin_{suffix}")
         member = await _user(db, tenant.id, "member", f"member_{suffix}")
         candidate = await _user(db, tenant.id, "member", f"candidate_{suffix}")
-        foreign = await _user(db, foreign_tenant.id, "member", f"foreign_{suffix}")
         agent = Agent(
             tenant_id=tenant.id,
             creator_id=admin.id,
@@ -78,26 +76,32 @@ async def test_only_platform_admin_can_reassign_task_execution_user():
         task = Task(
             agent_id=agent.id,
             title="Frozen principal",
-            created_by=admin.id,
-            execution_user_id=admin.id,
+            created_by=candidate.id,
+            execution_user_id=None,
+            status="doing",
         )
         db.add(task)
+        await db.flush()
+        active_run = TaskLog(
+            task_id=task.id,
+            content="🤖 开始执行任务...",
+            execution_user_id=None,
+        )
+        db.add(active_run)
         await db.commit()
 
     async with async_session() as db:
         member = await db.get(User, member.id)
-        with pytest.raises(HTTPException) as denied:
-            await update_task(
-                agent.id,
-                task.id,
-                TaskUpdate(
-                    execution_user_id=candidate.id,
-                    expected_execution_user_id=admin.id,
-                ),
-                member,
-                db,
-            )
-        assert denied.value.status_code == 403
+        changed = await update_task(
+            agent.id,
+            task.id,
+            TaskUpdate(description="changed by member"),
+            member,
+            db,
+        )
+        assert changed.execution_user_id == member.id
+        assert (await db.get(TaskLog, active_run.id)).execution_user_id == candidate.id
+        await db.commit()
 
     async with async_session() as db:
         admin = await db.get(User, admin.id)
@@ -106,30 +110,15 @@ async def test_only_platform_admin_can_reassign_task_execution_user():
             task.id,
             TaskUpdate(
                 execution_user_id=candidate.id,
-                expected_execution_user_id=admin.id,
+                expected_execution_user_id=member.id,
             ),
             admin,
             db,
         )
         assert changed.execution_user_id == candidate.id
 
-    async with async_session() as db:
-        admin = await db.get(User, admin.id)
-        with pytest.raises(HTTPException) as cross_tenant:
-            await update_task(
-                agent.id,
-                task.id,
-                    TaskUpdate(
-                        execution_user_id=foreign.id,
-                        expected_execution_user_id=admin.id,
-                    ),
-                admin,
-                db,
-            )
-        assert cross_tenant.value.status_code == 422
 
-
-async def test_schedule_fields_remain_creator_only_while_org_admin_can_reassign():
+async def test_schedule_fields_remain_creator_only_and_identity_matches_actor():
     suffix = uuid.uuid4().hex[:10]
     async with async_session() as db:
         tenant = Tenant(name=f"Schedule {suffix}", slug=f"schedule-{suffix}")
@@ -185,6 +174,21 @@ async def test_schedule_fields_remain_creator_only_while_org_admin_can_reassign(
         assert denied.value.status_code == 403
 
     async with async_session() as db:
+        candidate = await db.get(User, candidate.id)
+        with pytest.raises(HTTPException) as identity_only_denied:
+            await update_schedule(
+                agent.id,
+                schedule.id,
+                ScheduleUpdate(
+                    execution_user_id=candidate.id,
+                    expected_execution_user_id=creator.id,
+                ),
+                candidate,
+                db,
+            )
+        assert identity_only_denied.value.status_code == 403
+
+    async with async_session() as db:
         org_admin = await db.get(User, org_admin.id)
         changed = await update_schedule(
             agent.id,
@@ -197,6 +201,183 @@ async def test_schedule_fields_remain_creator_only_while_org_admin_can_reassign(
             db,
         )
         assert changed.execution_user_id == candidate.id
+
+
+async def test_schedule_identity_only_requires_agent_manage_access():
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        tenant = Tenant(name=f"Private Schedule {suffix}", slug=f"private-schedule-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        creator = await _user(db, tenant.id, "member", f"private_creator_{suffix}")
+        org_admin = await _user(db, tenant.id, "org_admin", f"private_admin_{suffix}")
+        agent = Agent(
+            tenant_id=tenant.id,
+            creator_id=creator.id,
+            name=f"Private Schedule Agent {suffix}",
+            access_mode="private",
+            status="idle",
+        )
+        db.add(agent)
+        await db.flush()
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=org_admin.id,
+                access_level="use",
+            )
+        )
+        schedule = AgentSchedule(
+            agent_id=agent.id,
+            name="Private schedule",
+            instruction="original",
+            cron_expr="0 9 * * *",
+            created_by=creator.id,
+            execution_user_id=creator.id,
+        )
+        db.add(schedule)
+        await db.commit()
+
+    async with async_session() as db:
+        actor = await db.get(User, org_admin.id)
+        with pytest.raises(HTTPException) as denied:
+            await update_schedule(
+                agent.id,
+                schedule.id,
+                ScheduleUpdate(execution_user_id=org_admin.id),
+                actor,
+                db,
+            )
+        assert denied.value.status_code == 403
+
+
+async def test_regular_trigger_update_freezes_queued_legacy_identity():
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        tenant = Tenant(name=f"Trigger Update {suffix}", slug=f"trigger-update-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        creator = await _user(db, tenant.id, "member", f"trigger_creator_{suffix}")
+        org_admin = await _user(db, tenant.id, "org_admin", f"trigger_admin_{suffix}")
+        agent = Agent(
+            tenant_id=tenant.id,
+            creator_id=creator.id,
+            name=f"Trigger Update Agent {suffix}",
+            access_mode="company",
+            status="idle",
+        )
+        db.add(agent)
+        await db.flush()
+        trigger = AgentTrigger(
+            agent_id=agent.id,
+            created_by_user_id=creator.id,
+            execution_user_id=creator.id,
+            name=f"queued-{suffix}",
+            type="cron",
+            config={"expr": "0 9 * * *"},
+            reason="before",
+        )
+        db.add(trigger)
+        await db.flush()
+        execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=agent.id,
+            execution_user_id=None,
+            status="pending",
+            source="cron",
+            idempotency_key=f"queued-update-{suffix}",
+            payload={},
+            payload_text="",
+        )
+        db.add(execution)
+        await db.commit()
+
+    async with async_session() as db:
+        actor = await db.get(User, org_admin.id)
+        await db.refresh(actor, ["identity"])
+        await update_trigger(
+            agent.id,
+            trigger.id,
+            TriggerUpdate(reason="changed by admin"),
+            actor,
+        )
+
+    async with async_session() as db:
+        refreshed_trigger = await db.get(AgentTrigger, trigger.id)
+        refreshed_execution = await db.get(TriggerExecution, execution.id)
+        assert refreshed_trigger.execution_user_id == org_admin.id
+        assert refreshed_execution.execution_user_id == creator.id
+        same_identity_execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=agent.id,
+            execution_user_id=None,
+            status="pending",
+            source="cron",
+            idempotency_key=f"queued-same-identity-{suffix}",
+            payload={},
+            payload_text="",
+        )
+        db.add(same_identity_execution)
+        await db.commit()
+
+    async with async_session() as db:
+        actor = await db.get(User, org_admin.id)
+        await db.refresh(actor, ["identity"])
+        await update_trigger(
+            agent.id,
+            trigger.id,
+            TriggerUpdate(reason="changed again by same admin"),
+            actor,
+        )
+
+    async with async_session() as db:
+        assert (
+            await db.get(TriggerExecution, same_identity_execution.id)
+        ).execution_user_id == org_admin.id
+
+
+async def test_manual_schedule_run_aligns_execution_user_to_current_user(monkeypatch):
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        tenant = Tenant(name=f"Schedule Run {suffix}", slug=f"schedule-run-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        creator = await _user(db, tenant.id, "member", f"run_creator_{suffix}")
+        operator = await _user(db, tenant.id, "member", f"run_operator_{suffix}")
+        agent = Agent(
+            tenant_id=tenant.id,
+            creator_id=creator.id,
+            name=f"Schedule Run Agent {suffix}",
+            access_mode="company",
+            status="idle",
+        )
+        db.add(agent)
+        await db.flush()
+        schedule = AgentSchedule(
+            agent_id=agent.id,
+            name="Manual run",
+            instruction="run now",
+            cron_expr="0 9 * * *",
+            created_by=creator.id,
+            execution_user_id=creator.id,
+        )
+        db.add(schedule)
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _capture(*args):
+        captured["args"] = args
+
+    monkeypatch.setattr("app.services.scheduler._execute_schedule", _capture)
+    async with async_session() as db:
+        operator = await db.get(User, operator.id)
+        result = await trigger_schedule(agent.id, schedule.id, operator, db)
+        assert result["status"] == "triggered"
+        await asyncio.sleep(0)
+        assert captured["args"][3] == operator.id
+        assert (await db.get(AgentSchedule, schedule.id)).execution_user_id == operator.id
 
 
 async def test_execution_picker_only_lists_users_with_agent_access_without_org_profile():
@@ -289,7 +470,7 @@ async def test_agent_user_can_read_trigger_identity_labels_without_manage_access
     assert rows[0].config == {"expr": "0 9 * * *"}
 
 
-async def test_org_admin_agent_tool_reassigns_future_trigger_without_touching_queued_identity():
+async def test_org_admin_agent_tool_assigns_valid_target_without_touching_queued_identity():
     from app.services.execution_identity import handle_reassign_background_execution_user
 
     suffix = uuid.uuid4().hex[:10]
@@ -643,7 +824,6 @@ async def test_member_creator_and_unattended_context_cannot_use_reassignment_too
         await db.flush()
         creator = await _user(db, tenant.id, "member", f"creator_locked_{suffix}")
         admin = await _user(db, tenant.id, "org_admin", f"admin_locked_{suffix}")
-        candidate = await _user(db, tenant.id, "member", f"candidate_locked_{suffix}")
         agent = Agent(
             tenant_id=tenant.id,
             creator_id=creator.id,
@@ -708,20 +888,24 @@ async def test_member_creator_and_unattended_context_cannot_use_reassignment_too
         db.add_all([member_anchor, trigger_anchor, forged_human_anchor])
         await db.commit()
 
-    args = {
+    member_args = {
         "resource_type": "trigger",
         "resource_id": str(trigger.id),
-        "execution_user_id": str(candidate.id),
+        "execution_user_id": str(creator.id),
         "expected_execution_user_id": str(creator.id),
         "reason": "handover",
     }
     member_result = await handle_reassign_background_execution_user(
-        agent.id, creator.id, str(member_ctx.id), member_anchor.id, args
+        agent.id, creator.id, str(member_ctx.id), member_anchor.id, member_args
     )
     assert "Only platform administrators and organization administrators" in member_result
 
+    admin_args = {
+        **member_args,
+        "execution_user_id": str(admin.id),
+    }
     unattended_result = await handle_reassign_background_execution_user(
-        agent.id, admin.id, str(trigger_ctx.id), trigger_anchor.id, args
+        agent.id, admin.id, str(trigger_ctx.id), trigger_anchor.id, admin_args
     )
     assert "only run in a human interactive session" in unattended_result
 
@@ -730,6 +914,6 @@ async def test_member_creator_and_unattended_context_cannot_use_reassignment_too
         admin.id,
         str(forged_human_ctx.id),
         forged_human_anchor.id,
-        args,
+        admin_args,
     )
     assert "only run in a human interactive session" in forged_human_result

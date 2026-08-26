@@ -111,7 +111,10 @@ async def test_active_turn_tools_work_over_real_streamable_http_transport():
                 },
             },
         )
-        assert _jsonrpc_payload(initialized)["result"]["serverInfo"]["name"] == "Clawith"
+        assert (
+            _jsonrpc_payload(initialized)["result"]["serverInfo"]["name"]
+            == "Digital Employee Platform"
+        )
         session_id = initialized.headers["mcp-session-id"]
         session_headers = {**headers, "mcp-session-id": session_id}
 

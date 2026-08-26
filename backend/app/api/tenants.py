@@ -444,12 +444,12 @@ async def resolve_tenant_by_domain(
 ):
     """Resolve a tenant by its sso_domain or subdomain slug.
 
-    sso_domain is stored as a full URL (e.g. "https://acme.clawith.ai" or "http://1.2.3.4:3009").
+    sso_domain is stored as a full URL (for example, a tenant hostname or IP address).
     The incoming `domain` parameter is the host (without protocol).
 
     Lookup precedence:
     1. Exact match on tenant.sso_domain ending with the host (strips protocol)
-    2. Extract slug from "{slug}.clawith.ai" and match tenant.slug
+    2. Extract the slug from a recognized legacy platform hostname and match tenant.slug
     3. Match platform global domain -> return default tenant
     """
     tenant = None
@@ -463,7 +463,7 @@ async def resolve_tenant_by_domain(
 
     if sso_redirect_enabled:
         # 1. Match by stripping protocol from stored sso_domain
-        # sso_domain = "https://acme.clawith.ai" → compare against "acme.clawith.ai"
+        # Normalize the configured SSO URL to a bare hostname for comparison.
         for proto in ("https://", "http://"):
             result = await db.execute(
                 select(Tenant).where(Tenant.sso_domain == f"{proto}{domain}")
@@ -492,7 +492,7 @@ async def resolve_tenant_by_domain(
             tenant = result.scalar_one_or_none()
 
     # 2.5 Subdomain prefix match
-    # e.g. domain=acme.clawith.com, global hostname=clawith.com -> prefix acme
+    # For a tenant subdomain of the configured global hostname, use its prefix.
     if not tenant:
         from urllib.parse import urlparse as _urlparse
         setting_r2 = await db.execute(

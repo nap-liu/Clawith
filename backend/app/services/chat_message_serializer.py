@@ -39,7 +39,9 @@ def serialize_chat_message_for_client(
         delivery_status = meta.get("delivery_status") if isinstance(meta, dict) else None
         attachments = (
             normalize_attachment_metadata(meta.get("attachments"))
-            if isinstance(meta, dict) and delivery_status in {None, "sent"}
+            if isinstance(meta, dict)
+            and recall_status != "recalled"
+            and delivery_status in {None, "sent"}
             else []
         )
 

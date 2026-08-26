@@ -1183,6 +1183,32 @@ async def update_agent_trigger_impl(ctx, agent, trigger, is_enabled=None, config
         changes: list[str] = []
         revert_parts: list[str] = []
 
+        if all(
+            value is None
+            for value in (
+                is_enabled,
+                config,
+                reason,
+                max_fires,
+                cooldown_seconds,
+                expires_at,
+            )
+        ):
+            return (
+                f"（未提供任何更改字段：触发器「{row.name}」未变动。"
+                "请至少传一个要修改的字段，如 is_enabled、config 或 reason。）"
+            )
+
+        from app.services.execution_identity import align_background_execution_user
+
+        await align_background_execution_user(
+            db,
+            agent_id=ag.id,
+            resource_type="trigger",
+            resource_id=row.id,
+            execution_user_id=pc.user.id,
+        )
+
         if is_enabled is not None:
             old = row.is_enabled
             row.is_enabled = is_enabled
@@ -1220,12 +1246,6 @@ async def update_agent_trigger_impl(ctx, agent, trigger, is_enabled=None, config
             old_str = old_dt.isoformat() if old_dt else "None"
             changes.append(f"expires_at: {old_str} → {expires_at}")
             revert_parts.append(f"expires_at={old_str!r}")
-
-        if not changes:
-            return (
-                f"（未提供任何更改字段：触发器「{row.name}」未变动。"
-                "请至少传一个要修改的字段，如 is_enabled、config 或 reason。）"
-            )
 
         await db.commit()
 

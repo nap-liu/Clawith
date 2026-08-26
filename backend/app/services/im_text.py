@@ -18,6 +18,7 @@ _EMPHASIS_MARK_RE = re.compile(r"(?<!\w)([*_])(?=\S)(.+?)(?<=\S)\1(?!\w)")
 _WHITESPACE_RE = re.compile(r"\s+")
 _NON_TEXT_SUMMARY = "非文本消息"
 
+
 _HIDDEN_HTML_TAGS = {"head", "noscript", "script", "style", "template", "title"}
 
 
@@ -80,7 +81,10 @@ def _flatten_markdown_tables(text: str) -> str:
         while next_index < len(lines) and "|" in lines[next_index]:
             table_rows.add(next_index)
             next_index += 1
-    return "\n".join(line.replace("|", " ") if index in table_rows else line for index, line in enumerate(lines))
+    return "\n".join(
+        line.replace("|", " ") if index in table_rows else line
+        for index, line in enumerate(lines)
+    )
 
 
 def _matching_delimiter(text: str, start: int, opening: str, closing: str) -> int | None:

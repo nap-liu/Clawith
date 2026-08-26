@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import select, text
 
 from app.database import async_session, engine
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentPermission
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction  # noqa: F401 — register FK target table
 from app.models.chat_session import ChatSession
@@ -62,12 +62,19 @@ async def _seed_tenant() -> Tenant:
         return t
 
 
-async def _seed_user(role: str = "member", tenant_id=None, name: str = "U") -> User:
+async def _seed_user(
+    role: str = "member",
+    tenant_id=None,
+    name: str = "U",
+    *,
+    is_platform_admin: bool = False,
+) -> User:
     async with async_session() as db:
         ident = Identity(
             username=f"u_{uuid.uuid4().hex[:12]}",
             email=f"{uuid.uuid4().hex[:12]}@t.local",
             password_hash="x",
+            is_platform_admin=is_platform_admin,
         )
         db.add(ident)
         await db.flush()
@@ -229,6 +236,11 @@ async def test_human_viewer_access_maps_from_authoritative_helper():
     private_agent = await _seed_agent(creator.id, tenant_id=t1.id, access_mode="private")
     company_agent = await _seed_agent(creator.id, tenant_id=t1.id, access_mode="company")
     admin = await _seed_user(role="platform_admin", tenant_id=t1.id)
+    identity_admin = await _seed_user(
+        role="member",
+        tenant_id=t1.id,
+        is_platform_admin=True,
+    )
     org_admin = await _seed_user(role="org_admin", tenant_id=t1.id)
     member = await _seed_user(role="member", tenant_id=t1.id)
     cross = await _seed_user(role="platform_admin", tenant_id=(await _seed_tenant()).id)
@@ -237,6 +249,7 @@ async def test_human_viewer_access_maps_from_authoritative_helper():
         # creator + platform_admin manage everything (same tenant) -> ALL
         assert await resolve_human_viewer_access(db, creator.id, private_agent) == SCOPE_ALL
         assert await resolve_human_viewer_access(db, admin.id, private_agent) == SCOPE_ALL
+        assert await resolve_human_viewer_access(db, identity_admin.id, private_agent) == SCOPE_ALL
         # org_admin manages company agents (ALL) but has NO access to others' private (DENY) — HIGH-1
         assert await resolve_human_viewer_access(db, org_admin.id, company_agent) == SCOPE_ALL
         assert await resolve_human_viewer_access(db, org_admin.id, private_agent) == SCOPE_DENY
@@ -251,7 +264,7 @@ async def test_human_viewer_access_maps_from_authoritative_helper():
 # ── Task 2: scope resolution + per-scope predicates + message window ────────
 
 
-async def test_resolve_scope_discriminates_by_channel():
+async def test_resolve_scope_follows_execution_user_not_channel():
     t = await _seed_tenant()
     admin = await _seed_user(role="platform_admin", tenant_id=t.id)
     agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
@@ -262,11 +275,63 @@ async def test_resolve_scope_discriminates_by_channel():
 
     async with async_session() as db:
         assert (await resolve_scope(db, agent, str(web.id), admin.id))[0] == SCOPE_ALL
-        # non-human turns are autonomous EVEN THOUGH user_id is an admin creator
-        assert (await resolve_scope(db, agent, str(a2a.id), admin.id))[0] == SCOPE_AUTONOMOUS
-        assert (await resolve_scope(db, agent, str(trig.id), admin.id))[0] == SCOPE_AUTONOMOUS
-        # missing ctx -> autonomous minimum
-        assert (await resolve_scope(db, agent, str(uuid.uuid4()), admin.id))[0] == SCOPE_AUTONOMOUS
+        # Background/A2A turns use the same permissions as their resolved user.
+        assert (await resolve_scope(db, agent, str(a2a.id), admin.id))[0] == SCOPE_ALL
+        assert (await resolve_scope(db, agent, str(trig.id), admin.id))[0] == SCOPE_ALL
+        # Session routing metadata cannot narrow a valid execution identity.
+        assert (await resolve_scope(db, agent, str(uuid.uuid4()), admin.id))[0] == SCOPE_ALL
+        # Only a genuinely absent execution user falls back to autonomous scope.
+        assert (await resolve_scope(db, agent, str(a2a.id), None))[0] == SCOPE_AUTONOMOUS
+
+
+async def test_trigger_execution_user_with_agent_manage_access_sees_all_groups():
+    """Regression: a member who manages the Agent keeps full scope in a trigger turn."""
+    t = await _seed_tenant()
+    creator = await _seed_user(tenant_id=t.id, name="Creator")
+    manager = await _seed_user(tenant_id=t.id, name="宋柯")
+    agent = await _seed_agent(
+        creator.id,
+        tenant_id=t.id,
+        access_mode="custom",
+        name="123",
+    )
+    async with async_session() as db:
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=manager.id,
+                access_level="manage",
+            )
+        )
+        await db.commit()
+
+    shandong = await _seed_session(
+        agent.id,
+        None,
+        channel="dingtalk",
+        group=True,
+        title="山东群",
+        group_name="山东群",
+    )
+    northeast = await _seed_session(
+        agent.id,
+        None,
+        channel="dingtalk",
+        group=True,
+        title="东北群",
+        group_name="东北群",
+    )
+    trigger = await _seed_session(agent.id, None, channel="trigger")
+
+    out = await handle_list_sessions(
+        agent.id,
+        manager.id,
+        str(trigger.id),
+        {"is_group": True, "limit": 50},
+    )
+    assert str(shandong.id) in out
+    assert str(northeast.id) in out
 
 
 async def test_scope_predicates_select_right_sessions():
@@ -618,9 +683,8 @@ def test_session_cursor_rejects_naive_timestamps():
     assert sq.decode_session_cursor(raw) is None
 
 
-async def test_autonomous_context_excludes_human_archive_even_for_admin_creator():
-    """CRITICAL-2: an admin-created agent in a trigger turn must NOT inherit the
-    admin's cross-user reach into human conversations."""
+async def test_background_context_uses_resolved_admin_execution_user():
+    """A trigger using an admin execution user sees that Agent's full archive."""
     t = await _seed_tenant()
     admin = await _seed_user(role="platform_admin", tenant_id=t.id)
     enduser = await _seed_user(role="member", tenant_id=t.id)
@@ -628,10 +692,15 @@ async def test_autonomous_context_excludes_human_archive_even_for_admin_creator(
     human = await _seed_session(agent.id, enduser.id, channel="web")
     trig = await _seed_session(agent.id, admin.id, channel="trigger")
 
-    # ctx is the trigger session -> autonomous, regardless of admin user_id
+    # Trigger routing does not narrow the resolved execution user's permissions.
     out = await handle_list_sessions(agent.id, admin.id, str(trig.id), {"limit": 50})
     assert str(trig.id) in out
-    assert str(human.id) not in out  # human archive stays hidden in unattended turns
+    assert str(human.id) in out
+
+    # A genuinely absent execution user still receives the autonomous minimum.
+    autonomous = await handle_list_sessions(agent.id, None, str(trig.id), {"limit": 50})
+    assert str(trig.id) in autonomous
+    assert str(human.id) not in autonomous
 
 
 async def test_read_other_agents_session_denied_even_for_admin():
@@ -806,3 +875,39 @@ async def test_execute_tool_end_to_end_real_path():
         session_id=str(mine.id),
     )
     assert "remember the launch date" in read
+
+
+async def test_execute_tool_distinguishes_legacy_sentinel_from_anonymous():
+    """Agent-UUID sentinel uses creator fallback; genuine None stays autonomous."""
+    from app.services.agent_tools import execute_tool
+
+    t = await _seed_tenant()
+    creator = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(creator.id, tenant_id=t.id, access_mode="company")
+    group = await _seed_session(
+        agent.id,
+        None,
+        channel="dingtalk",
+        group=True,
+        title="Creator-visible group",
+        group_name="Creator-visible group",
+    )
+    trigger = await _seed_session(agent.id, None, channel="trigger")
+
+    creator_fallback = await execute_tool(
+        "list_sessions",
+        {"is_group": True, "limit": 50},
+        agent_id=agent.id,
+        user_id=agent.id,
+        session_id=str(trigger.id),
+    )
+    assert str(group.id) in creator_fallback
+
+    anonymous = await execute_tool(
+        "list_sessions",
+        {"is_group": True, "limit": 50},
+        agent_id=agent.id,
+        user_id=None,
+        session_id=str(trigger.id),
+    )
+    assert str(group.id) not in anonymous

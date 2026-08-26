@@ -18,7 +18,82 @@ from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.services.feishu_service import feishu_service
+from app.services.user_output import sanitize_user_visible_text
+
+
+def _safe_user_label(value: object, fallback: str) -> str:
+    return sanitize_user_visible_text(str(value or "")).strip() or fallback
+
+
+async def _prepare_creator_feishu_message(
+    *,
+    db: AsyncSession,
+    agent: Agent,
+    creator: User,
+    receive_id: str,
+    receive_id_type: str,
+    text_content: str,
+    artifact_role: str,
+) -> dict:
+    """Create a pending creator message in the caller's transaction."""
+    from app.services.channel_session import find_or_create_channel_session
+    from app.services.chat_history import persist_assistant_reply_row
+    from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+    text_content = sanitize_user_visible_text(text_content)
+    external_conv_id = f"feishu_p2p_{receive_id}"
+    session = await find_or_create_channel_session(
+        db=db,
+        agent_id=agent.id,
+        user_id=creator.id,
+        external_conv_id=external_conv_id,
+        source_channel="feishu",
+        first_message_title=text_content[:30],
+    )
+    message_id = await persist_assistant_reply_row(
+        db,
+        agent_id=agent.id,
+        user_id=creator.id,
+        conversation_id=str(session.id),
+        content=text_content,
+        message_meta=attach_delivery_to_meta(
+            {"artifact_role": artifact_role},
+            IMDeliveryResult.pending("feishu"),
+        ),
+    )
+    return {
+        "message_id": str(message_id),
+        "agent_id": str(agent.id),
+        "conversation_id": str(session.id),
+        "external_conv_id": external_conv_id,
+        "receive_id": receive_id,
+        "receive_id_type": receive_id_type,
+        "text": text_content,
+    }
+
+
+async def deliver_prepared_creator_notifications(items: list[dict]) -> None:
+    """Deliver creator messages only after their owning transaction commits."""
+    from app.services.im_delivery import deliver_persisted_message
+    from app.services.turn_runtime import TurnRuntime
+
+    for item in items:
+        result = await deliver_persisted_message(
+            message_id=item["message_id"],
+            agent_id=uuid.UUID(item["agent_id"]),
+            runtime=TurnRuntime(
+                session_found=True,
+                source_channel="feishu",
+                conversation_id=item["conversation_id"],
+                external_conv_id=item["external_conv_id"],
+                is_group=False,
+            ),
+            message=item["text"],
+            origin_actor_ref=item["receive_id"],
+            origin_actor_ref_type=item["receive_id_type"],
+        )
+        if not result.ok:
+            raise RuntimeError(result.error or "feishu_creator_delivery_failed")
 
 
 class AutonomyService:
@@ -70,11 +145,14 @@ class AutonomyService:
         elif level == "L2":
             # Auto-execute but notify creator
             logger.info(f"L2: Executing {action_type} for agent {agent.name} with notification")
-            await self._notify_creator(db, agent, action_type, details)
+            pending_notifications = await self._notify_creator(
+                db, agent, action_type, details
+            )
             return {
                 "allowed": True,
                 "level": "L2",
                 "message": "Executed and creator notified",
+                "_pending_im_notifications": pending_notifications,
             }
 
         elif level == "L3":
@@ -111,13 +189,16 @@ class AutonomyService:
             await db.flush()
 
             logger.info(f"L3: Approval required for {action_type} by agent {agent.name}")
-            await self._request_approval(db, agent, approval)
+            pending_notifications = await self._request_approval(
+                db, agent, approval
+            )
 
             return {
                 "allowed": False,
                 "level": "L3",
                 "approval_id": str(approval.id),
                 "message": "Approval requested from creator",
+                "_pending_im_notifications": pending_notifications,
             }
 
         return {"allowed": False, "level": "unknown", "message": "Unknown autonomy level"}
@@ -191,14 +272,18 @@ class AutonomyService:
         if agent:
             from app.services.notification_service import send_notification
             status_label = resolved_status
-            body_text = json.dumps(approval.details, ensure_ascii=False)[:200]
+            body_text = sanitize_user_visible_text(
+                json.dumps(approval.details, ensure_ascii=False)[:200]
+            )
             if execution_result:
-                body_text = f"Result: {execution_result}"
+                body_text = sanitize_user_visible_text(f"Result: {execution_result}")
+            safe_agent_name = _safe_user_label(agent.name, "Agent")
+            safe_action_type = _safe_user_label(approval.action_type, "action")
             await send_notification(
                 db,
                 user_id=agent.creator_id,
                 type="approval_resolved",
-                title=f"[{agent.name}] {approval.action_type} — {status_label}",
+                title=f"{safe_agent_name}: {safe_action_type} — {status_label}",
                 body=body_text,
                 link=f"/agents/{agent.id}#approvals",
                 ref_id=approval.id,
@@ -214,7 +299,7 @@ class AutonomyService:
                             db,
                             user_id=requester_id,
                             type="approval_resolved",
-                            title=f"[{agent.name}] {approval.action_type} — {status_label}",
+                            title=f"{safe_agent_name}: {safe_action_type} — {status_label}",
                             body=body_text,
                             link=f"/agents/{agent.id}#activityLog",
                             ref_id=approval.id,
@@ -270,25 +355,32 @@ class AutonomyService:
             return f"Execution failed: {e}"
 
     async def _notify_creator(self, db: AsyncSession, agent: Agent,
-                               action_type: str, details: dict) -> None:
+                               action_type: str, details: dict) -> list[dict]:
         """Send L2 notification to agent creator via Feishu + web."""
         # Web notification (always)
         from app.services.notification_service import send_notification
+        safe_agent_name = _safe_user_label(agent.name, "Agent")
+        safe_action_type = _safe_user_label(action_type, "action")
         await send_notification(
             db,
             user_id=agent.creator_id,
             type="autonomy_l2",
-            title=f"[{agent.name}] executed: {action_type}",
-            body=json.dumps(details, ensure_ascii=False)[:200],
+            title=f"{safe_agent_name}: executed {safe_action_type}",
+            body=sanitize_user_visible_text(json.dumps(details, ensure_ascii=False)[:200]),
             link=f"/agents/{agent.id}#activityLog",
         )
 
         # Try Feishu notification if channel is configured
         channel_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "feishu",
+                ChannelConfig.is_configured.is_(True),
+            )
         )
         channel = channel_result.scalars().first()
 
+        pending_notifications: list[dict] = []
         if channel and channel.app_id and channel.app_secret:
             creator_result = await db.execute(
                 select(User).where(User.id == agent.creator_id)
@@ -316,34 +408,48 @@ class AutonomyService:
                     if member and (member.external_id or member.open_id):
                         receive_id = member.external_id or member.open_id
                         id_type = "user_id" if member.external_id else "open_id"
-                        await feishu_service.send_message(
-                            channel.app_id, channel.app_secret,
-                            receive_id, "text",
-                            json.dumps({"text": f"[{agent.name}] executed: {action_type}"}),
+                        pending_notifications.append(await _prepare_creator_feishu_message(
+                            db=db,
+                            agent=agent,
+                            creator=creator,
+                            receive_id=receive_id,
                             receive_id_type=id_type,
-                        )
+                            text_content=f"{safe_agent_name}: executed {safe_action_type}",
+                            artifact_role="autonomy_notification",
+                        ))
+        return pending_notifications
 
     async def _request_approval(self, db: AsyncSession, agent: Agent,
-                                 approval: ApprovalRequest) -> None:
+                                 approval: ApprovalRequest) -> list[dict]:
         """Send L3 approval request to creator via Feishu card + web notification."""
         # Web notification (always)
         from app.services.notification_service import send_notification
+        safe_agent_name = _safe_user_label(agent.name, "Agent")
+        safe_action_type = _safe_user_label(approval.action_type, "action")
+        safe_details = sanitize_user_visible_text(
+            json.dumps(approval.details, ensure_ascii=False)
+        )
         await send_notification(
             db,
             user_id=agent.creator_id,
             type="approval_pending",
-            title=f"[{agent.name}] requests approval: {approval.action_type}",
-            body=json.dumps(approval.details, ensure_ascii=False)[:200],
+            title=f"{safe_agent_name}: requests approval for {safe_action_type}",
+            body=safe_details[:200],
             link=f"/agents/{agent.id}#approvals",
             ref_id=approval.id,
         )
 
         # Try Feishu notification
         channel_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "feishu",
+                ChannelConfig.is_configured.is_(True),
+            )
         )
         channel = channel_result.scalars().first()
 
+        pending_notifications: list[dict] = []
         if channel and channel.app_id and channel.app_secret:
             creator_result = await db.execute(
                 select(User).where(User.id == agent.creator_id)
@@ -370,13 +476,21 @@ class AutonomyService:
                     member = member_r.scalar_one_or_none()
                     if member and (member.external_id or member.open_id):
                         receive_id = member.external_id or member.open_id
-                        await feishu_service.send_approval_card(
-                            channel.app_id, channel.app_secret,
-                            receive_id,
-                            agent.name, approval.action_type,
-                            json.dumps(approval.details, ensure_ascii=False),
-                            str(approval.id),
-                        )
+                        pending_notifications.append(await _prepare_creator_feishu_message(
+                            db=db,
+                            agent=agent,
+                            creator=creator,
+                            receive_id=receive_id,
+                            receive_id_type=("user_id" if member.external_id else "open_id"),
+                            text_content=(
+                                f"🔴 {safe_agent_name}: 请求审批\n"
+                                f"操作: {safe_action_type}\n"
+                                f"详情: {safe_details}\n\n"
+                                "请在平台审批。"
+                            ),
+                            artifact_role="autonomy_approval",
+                        ))
+        return pending_notifications
 
 
 autonomy_service = AutonomyService()

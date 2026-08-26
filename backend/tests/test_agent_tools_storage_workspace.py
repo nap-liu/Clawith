@@ -741,3 +741,48 @@ async def test_memory_index_is_an_ordinary_deletable_workspace_file(monkeypatch,
 
     assert result.ok is True
     assert key not in storage.files
+
+
+@pytest.mark.asyncio
+async def test_agent_workspace_mutations_reject_system_webhook_inbox(tmp_path):
+    agent_id = uuid.uuid4()
+    base_dir = tmp_path / str(agent_id)
+    cases = (
+        ("write_file", {"path": "webhook/t/e/payload.json", "content": "changed"}),
+        ("edit_file", {"path": "webhook/t/e/payload.json", "old_string": "a", "new_string": "b"}),
+        ("delete_file", {"path": "webhook/t/e/payload.json"}),
+        (
+            "move_file",
+            {
+                "source_path": "webhook/t/e/payload.json",
+                "destination_path": "workspace/payload.json",
+            },
+        ),
+    )
+
+    for tool_name, arguments in cases:
+        result = await agent_tools._execute_workspace_mutation(
+            tool_name,
+            arguments,
+            agent_id=agent_id,
+            base_dir=base_dir,
+            session_id=None,
+        )
+        assert "read-only" in result
+
+
+@pytest.mark.asyncio
+async def test_agent_can_read_complete_webhook_inbox_payload(monkeypatch):
+    agent_id = uuid.uuid4()
+    rel_path = (
+        "webhook/1d5930c4-1d59-40c4-9bb4-b9532f2f6432/20260825/"
+        "1787625600123_00000000000000000042/payload.json"
+    )
+    payload = b'{"submission":"complete","score":100}\n'
+    storage = MemoryStorageBackend({f"{agent_id}/{rel_path}": payload})
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._storage_read_file(agent_id, rel_path)
+
+    assert rel_path in result
+    assert payload.decode().strip() in result

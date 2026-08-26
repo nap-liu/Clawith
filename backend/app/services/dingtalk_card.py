@@ -1,28 +1,39 @@
-"""DingTalk interactive-card delivery for confirmation cards.
+"""DingTalk interactive-card delivery.
 
-Sends a DingTalk 互动卡片 (standard interactive card) into the conversation that
-triggered a confirmation, and updates it after the user resolves. Mirrors the
-two-step create+deliver the `dingtalk_stream` SDK's CardReplier does, but derives
-the delivery target from the stored ChatSession instead of an incoming message
-(the confirmation is created deep in the LLM loop, far from the chat handler).
+Sends a DingTalk 互动卡片 (standard interactive card) into a durable ChatSession.
+Confirmation cards retain the established two-step create + deliver transport.
+Proactive group-message cards use DingTalk's atomic createAndDeliver transport:
+real-client validation showed that native group mentions are lost on the
+otherwise equivalent two-step route. Both derive the target from the stored
+ChatSession instead of an inbound message or its short-lived session webhook.
 
-callbackType is STREAM — button clicks come back over the existing DingTalk Stream
-connection (see dingtalk_stream.py), carrying outTrackId == the confirmation id.
+callbackType is STREAM. Confirmation-card button clicks return over the existing
+DingTalk Stream connection (see dingtalk_stream.py); proactive message cards contain
+no actions and use the same transport without introducing another callback path.
 """
 
+import html
 import json
 import logging
+import re
 
 import httpx
 
 from app.services.dingtalk_token import dingtalk_token_manager
+from app.services.im_delivery import ProviderResponseUncertainError
 
 logger = logging.getLogger(__name__)
 
 DINGTALK_OPENAPI = "https://api.dingtalk.com"
 _CREATE_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances"
 _DELIVER_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances/deliver"
+_CREATE_AND_DELIVER_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances/createAndDeliver"
 _UPDATE_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances"  # PUT
+
+_SUMMARY_LIMIT = 120
+_MARKDOWN_LINK_RE = re.compile(r"!?\[([^]]*)\]\([^)]+\)")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_MARKDOWN_MARKER_RE = re.compile(r"(?:^|\s)[#>*+-]+\s*|[`*_~]+")
 
 
 def _parse_target(external_conv_id: str, is_group: bool) -> tuple[str, str]:
@@ -36,8 +47,8 @@ def _parse_target(external_conv_id: str, is_group: bool) -> tuple[str, str]:
     if "__archived" in raw:
         raw = raw.split("__archived")[0]
     if is_group or raw.startswith("dingtalk_group_"):
-        return "IM_GROUP", raw[len("dingtalk_group_"):]
-    return "IM_ROBOT", raw[len("dingtalk_p2p_"):]
+        return "IM_GROUP", raw[len("dingtalk_group_") :]
+    return "IM_ROBOT", raw[len("dingtalk_p2p_") :]
 
 
 # risk level -> standard CSS named color for the card title (the template binds
@@ -107,6 +118,174 @@ async def send_confirmation_card(
 
     Best-effort: never raises (a delivery failure must not break confirmation creation).
     """
+    return await _create_and_deliver_card(
+        app_id=app_id,
+        app_secret=app_secret,
+        card_template_id=card_template_id,
+        out_track_id=out_track_id,
+        card_data=card_data,
+        external_conv_id=external_conv_id,
+        is_group=is_group,
+    )
+
+
+async def send_message_card(
+    *,
+    app_id: str,
+    app_secret: str,
+    card_template_id: str,
+    out_track_id: str,
+    content: str,
+    external_conv_id: str,
+    at_user_ids: dict[str, str],
+) -> str | None:
+    """Send one group Markdown card with matching visible and native mentions.
+
+    DingTalk accepts ``atUserIds`` independently from the card data, but the
+    mention label is not injected into a template's Markdown field for us.
+    Keep both representations aligned at the transport boundary: the card
+    renders the human-readable label while the delivery model carries the
+    provider IDs used for notification routing.
+    """
+    if not at_user_ids:
+        logger.warning("[DingTalkCard] message card requires at least one mention target")
+        return None
+    if "@ALL" in at_user_ids:
+        mention_text = "@所有人"
+    else:
+        mention_text = " ".join(f"@{name}" for name in at_user_ids.values() if name)
+    escaped_mention = html.escape(mention_text)
+    mention_markup = (
+        f"<font colorTokenV2=common_blue1_color>{escaped_mention}</font>"
+        if escaped_mention
+        else ""
+    )
+    body_content = (content or "").rstrip()
+    rendered_content = (
+        f"{body_content}\n\n{mention_markup}" if body_content and mention_markup else mention_markup
+    )
+    summary = _build_message_summary(content, mention_text)
+    return await _create_and_deliver_message_card(
+        app_id=app_id,
+        app_secret=app_secret,
+        card_template_id=card_template_id,
+        out_track_id=out_track_id,
+        card_data={"content": rendered_content},
+        external_conv_id=external_conv_id,
+        at_user_ids=at_user_ids,
+        summary=summary,
+    )
+
+
+def _build_message_summary(content: str, mention_text: str) -> str:
+    """Build a compact plain-text conversation preview for DingTalk clients."""
+    plain_content = _MARKDOWN_LINK_RE.sub(r"\1", content or "")
+    plain_content = _HTML_TAG_RE.sub("", plain_content)
+    plain_content = html.unescape(plain_content)
+    plain_content = _MARKDOWN_MARKER_RE.sub(" ", plain_content)
+    preview = " ".join(part for part in (plain_content, mention_text) if part)
+    preview = " ".join(preview.split())
+    if len(preview) <= _SUMMARY_LIMIT:
+        return preview
+    return f"{preview[: _SUMMARY_LIMIT - 1].rstrip()}…"
+
+
+async def _create_and_deliver_message_card(
+    *,
+    app_id: str,
+    app_secret: str,
+    card_template_id: str,
+    out_track_id: str,
+    card_data: dict,
+    external_conv_id: str,
+    at_user_ids: dict[str, str],
+    summary: str,
+) -> str | None:
+    """Atomically create and deliver one proactive group card with native mentions.
+
+    Keep this request deliberately minimal. In real DingTalk clients, adding
+    ``imGroupOpenSpaceModel.notification`` or splitting create and deliver into
+    separate calls produced a visible card but suppressed the native @ behavior.
+    ``userIdType`` must remain explicit because mention keys are DingTalk userIds.
+    """
+    try:
+        token = await dingtalk_token_manager.get_token(app_id, app_secret)
+        if not token:
+            logger.warning("[DingTalkCard] no access token for app %s — skip card send", app_id[:10])
+            return None
+        _, space_id = _parse_target(external_conv_id, True)
+        if not space_id:
+            logger.warning("[DingTalkCard] message-card target is empty")
+            return None
+
+        body = {
+            "cardTemplateId": card_template_id,
+            "outTrackId": out_track_id,
+            "cardData": {"cardParamMap": card_data},
+            "callbackType": "STREAM",
+            "openSpaceId": f"dtv1.card//IM_GROUP.{space_id}",
+            "imGroupOpenSpaceModel": {
+                "supportForward": False,
+                "lastMessageI18n": {
+                    "ZH_CN": summary,
+                    "EN_US": summary,
+                },
+            },
+            "imGroupOpenDeliverModel": {
+                "robotCode": app_id,
+                "atUserIds": dict(at_user_ids),
+            },
+            "userIdType": 1,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-acs-dingtalk-access-token": token,
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                _CREATE_AND_DELIVER_URL,
+                headers=headers,
+                json=body,
+            )
+        if response.status_code >= 300:
+            logger.warning(
+                "[DingTalkCard] createAndDeliver failed %s: %s",
+                response.status_code,
+                response.text[:300],
+            )
+            return None
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ProviderResponseUncertainError(
+                "DingTalk card delivery returned an unreadable response"
+            ) from exc
+        result = payload.get("result") if isinstance(payload, dict) else None
+        deliveries = result.get("deliverResults") if isinstance(result, dict) else None
+        if payload.get("success") is not True or not isinstance(deliveries, list):
+            logger.warning("[DingTalkCard] createAndDeliver returned no successful delivery")
+            return None
+        if not deliveries or any(item.get("success") is not True for item in deliveries):
+            logger.warning("[DingTalkCard] createAndDeliver group delivery was rejected")
+            return None
+        logger.info("[DingTalkCard] atomically sent mention card %s to IM_GROUP.%s", out_track_id, space_id)
+        return out_track_id
+    except Exception:
+        logger.exception("[DingTalkCard] atomic create-and-deliver failed")
+        raise
+
+
+async def _create_and_deliver_card(
+    *,
+    app_id: str,
+    app_secret: str,
+    card_template_id: str,
+    out_track_id: str,
+    card_data: dict,
+    external_conv_id: str,
+    is_group: bool,
+) -> str | None:
+    """Create and deliver one card without relying on an inbound webhook."""
     try:
         token = await dingtalk_token_manager.get_token(app_id, app_secret)
         if not token:
@@ -124,6 +303,9 @@ async def send_confirmation_card(
         }
 
         space_type, space_id = _parse_target(external_conv_id, is_group)
+        if not space_id:
+            logger.warning("[DingTalkCard] card target is empty")
+            return None
         deliver_body: dict = {
             "outTrackId": out_track_id,
             "userIdType": 1,
@@ -146,7 +328,7 @@ async def send_confirmation_card(
         logger.info("[DingTalkCard] sent card %s to %s.%s", out_track_id, space_type, space_id)
         return out_track_id
     except Exception:
-        logger.exception("[DingTalkCard] send_confirmation_card failed")
+        logger.exception("[DingTalkCard] create-and-deliver failed")
         return None
 
 

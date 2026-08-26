@@ -684,7 +684,7 @@ Always tell the user "I'm using web search instead of structured market data —
 
 ---
 
-## Asset Class Coverage (clawith roadmap)
+## Asset Class Coverage (platform roadmap)
 
 | Asset class | v1 (this skill) | v2 plan |
 |---|---|---|
@@ -728,7 +728,7 @@ Use when a trading agent needs:
 
 ## Implementation Note (v1)
 
-clawith does **not** ship a dedicated calendar MCP server in v1. Smithery doesn't yet have a robust earnings/macro calendar tool. So this skill is a **structured wrapper around `web-research`** with curated query templates and source preferences. v2 will add a dedicated MCP backed by a free API (likely finnhub or trading-economics).
+The platform does **not** ship a dedicated calendar MCP server in v1. Smithery doesn't yet have a robust earnings/macro calendar tool. So this skill is a **structured wrapper around `web-research`** with curated query templates and source preferences. v2 will add a dedicated MCP backed by a free API (likely finnhub or trading-economics).
 
 This means: every calendar query in v1 takes a web round-trip. Cache results in `memory/calendar_<month>.md` so the agent doesn't re-fetch the same Fed schedule three times in one week.
 
@@ -834,7 +834,7 @@ For a weekly briefing block:
 
 ## v2 Roadmap
 
-When clawith builds a dedicated finance-calendar MCP server, this skill will switch to direct API calls:
+When the platform adds a dedicated finance-calendar MCP server, this skill will switch to direct API calls:
 
 ```
 get_earnings_calendar(start="2026-04-28", end="2026-05-02")
@@ -889,15 +889,15 @@ If the user only requests static frontend pages without a database or backend AP
 - If Vercel tools are enabled but the `vercel_token` is missing or empty, guide the user:
   1. Visit https://vercel.com/signup to register (supports GitHub / Email sign up).
   2. Once logged in, go to https://vercel.com/account/tokens.
-  3. Click "Create" to generate a new token (suggested name: "clawith", Scope: "Full Account").
-  4. Copy the generated token, return to the Clawith tool settings page, and paste it into the "Vercel Access Token" configuration field for "Deploy to Vercel" or any other Vercel tools.
+  3. Click "Create" to generate a new token (suggested name: "platform", Scope: "Full Account").
+  4. Copy the generated token, return to the platform tool settings page, and paste it into the "Vercel Access Token" configuration field for "Deploy to Vercel" or any other Vercel tools.
 
 ### 0.3 Guide the User to Sign Up for Neon and Get an API Key
 - If the project requires a database (Postgres), guide the user:
   1. Visit https://neon.tech to register (recommending GitHub OAuth for instant registration).
   2. Once registered, go to the API Keys section in the console settings (https://console.neon.tech/app/settings/api-keys).
-  3. Click "Create new API Key", name it (e.g., "clawith"), and copy the generated key.
-  4. Return to the Clawith tool settings page, find the `Create Postgres Database` tool, and paste the key into the "Neon API Key" configuration field.
+  3. Click "Create new API Key", name it (e.g., "platform"), and copy the generated key.
+  4. Return to the platform tool settings page, find the `Create Postgres Database` tool, and paste the key into the "Neon API Key" configuration field.
 
 ---
 

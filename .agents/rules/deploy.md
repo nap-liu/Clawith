@@ -23,3 +23,5 @@
 - Production nginx behavior comes from the template baked into the frontend image; validate the rendered template in Docker.
 
 The concrete local test recipe is in `.agents/architecture/environments-and-operations.md`.
+The canonical production cutover, backup, validation, and rollback procedure is
+`.agents/runbooks/production_release.md`.

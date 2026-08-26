@@ -1,4 +1,4 @@
-"""Clawith MCP Server — outbound channel for external MCP clients.
+"""Platform MCP server — outbound channel for external MCP clients.
 
 Tools are registered in G5 (app/mcp_server/tools.py).
 """
@@ -7,9 +7,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP(
-    "Clawith",
+    "Digital Employee Platform",
     instructions=(
-        "Welcome to the Clawith MCP server. "
+        "Welcome to the Digital Employee Platform MCP server. "
         "Authenticate by passing your Personal Access Token as a Bearer token in the Authorization header. "
         "\n\n"
         "Read/chat operations:\n"

@@ -552,7 +552,7 @@ async def _process_wecom_text(
     provider_event_id: str | None = None,
 ):
     """Process an incoming WeCom text message and reply."""
-    from app.services.channel_commands import is_channel_command, handle_channel_command
+    from app.services.channel_commands import is_channel_command, prepare_channel_command_reply
     from app.services.channel_dispatch import (
         ChannelReactions,
         channel_session_lock_key,
@@ -570,19 +570,28 @@ async def _process_wecom_text(
     # archive the session and send a canned reply — no LLM, no lock needed.
     if is_channel_command(user_text):
         async with async_session() as _cmd_db:
-            cmd_result = await handle_channel_command(
+            cmd_result = await prepare_channel_command_reply(
                 db=_cmd_db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conv_id,
+                external_user_id=from_user,
                 source_channel="wecom",
+                provider_event_id=provider_event_id or kf_msg_id,
                 is_group=_is_group,
             )
             await _cmd_db.commit()
+        if not cmd_result["should_deliver"]:
+            return
         wecom_agent_id_cmd = (config.extra_config or {}).get("wecom_agent_id", "")
+        from app.services.im_delivery import (
+            IMDeliveryPart,
+            IMDeliveryResult,
+            register_delivery,
+        )
         try:
             access_token_cmd = await _get_wecom_token_cached(config.app_id, config.app_secret)
             async with httpx.AsyncClient(timeout=10) as _cl_cmd:
                 if access_token_cmd:
-                    await _cl_cmd.post(
+                    _cmd_response = await _cl_cmd.post(
                         f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token_cmd}",
                         json={
                             "touser": from_user,
@@ -591,7 +600,31 @@ async def _process_wecom_text(
                             "text": {"content": cmd_result["message"]},
                         },
                     )
+                    _cmd_response.raise_for_status()
+                    _cmd_data = _cmd_response.json()
+                    if _cmd_data.get("errcode") not in (0, "0"):
+                        raise RuntimeError(str(_cmd_data.get("errmsg") or _cmd_data.get("errcode")))
+                    _cmd_provider_id = str(_cmd_data.get("msgid") or "") or None
+                    await register_delivery(
+                        cmd_result["message_id"],
+                        IMDeliveryResult.sent(
+                            "wecom",
+                            IMDeliveryPart(
+                                transport="wecom_app",
+                                provider_message_id=_cmd_provider_id,
+                                conversation_ref=from_user,
+                                artifact_role="command_reply",
+                                recallable=bool(_cmd_provider_id),
+                            ),
+                        ),
+                    )
+                else:
+                    raise RuntimeError("access_token_unavailable")
         except Exception as _cmd_e:
+            await register_delivery(
+                cmd_result["message_id"],
+                IMDeliveryResult.from_exception("wecom", _cmd_e),
+            )
             logger.error(f"[WeCom] Failed to send command reply: {_cmd_e}")
         return
 
@@ -712,9 +745,16 @@ async def _process_wecom_text(
 
             # 调用 LLM
             _thinking_chunks: list[str] = []
-            _thinking_sender = BufferedIMThinkingSender(
+            _thinking_sender = BufferedIMThinkingSender.for_runtime(
                 enabled=resolve_im_thinking_enabled(agent_obj, sess),
-                send_text=_send_wecom_text,
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                conversation_id=session_conv_id,
+                turn_anchor_id=ingested.message.id,
+                delivery_kwargs={
+                    "origin_actor_ref": from_user,
+                    "allow_wecom_group_actor_fallback": True,
+                },
             )
 
             async def _collect_thinking(text: str):

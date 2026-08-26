@@ -1,4 +1,4 @@
-"""SDK OAuth identity endpoints — fetch user info via company OAuth2, without creating a clawith User."""
+"""SDK OAuth identity endpoints — fetch user info without creating a platform User."""
 
 import base64
 import hashlib

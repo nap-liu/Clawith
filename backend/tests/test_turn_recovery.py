@@ -1034,7 +1034,16 @@ async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeyp
 
     captured: dict = {}
 
-    async def fake_send(app_id, app_secret, user_ids, message, msg_type="text", robot_code=None):
+    async def fake_send(
+        app_id,
+        app_secret,
+        user_ids,
+        message,
+        msg_type="text",
+        robot_code=None,
+        *,
+        raise_on_transport_error=False,
+    ):
         captured.update(
             {
                 "app_id": app_id,
@@ -1043,6 +1052,7 @@ async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeyp
                 "message": message,
                 "msg_type": msg_type,
                 "robot_code": robot_code,
+                "raise_on_transport_error": raise_on_transport_error,
             }
         )
         return {"errcode": 0}
@@ -1066,6 +1076,7 @@ async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeyp
         "message": "恢复完成",
         "msg_type": "markdown",
         "robot_code": app_id,
+        "raise_on_transport_error": True,
     }
 
 
@@ -1722,6 +1733,7 @@ async def test_dingtalk_natural_entry_creates_and_completes_recoverable_turn(mon
     """The real DingTalk entry path must create the same recoverable turn anchor."""
     from app.api.dingtalk import process_dingtalk_message
     from app.models.chat_session import ChatSession
+    from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
 
     agent_id, user_id = await _make_agent_with_model(context_window_size=4)
     sender_staff_id = f"staff_{uuid.uuid4().hex[:8]}"
@@ -1751,31 +1763,24 @@ async def test_dingtalk_natural_entry_creates_and_completes_recoverable_turn(mon
         assert kwargs["turn_anchor_id"] is not None
         return "natural dingtalk reply"
 
-    posts = []
+    deliveries = []
 
-    class FakeResponse:
-        status_code = 200
-        text = "{}"
-
-        def json(self):
-            return {"ok": True}
-
-    class FakeAsyncClient:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def post(self, url, **kwargs):
-            posts.append((url, kwargs))
-            return FakeResponse()
+    async def fake_deliver_message_with_receipt(*, agent_id, runtime, message, **_kwargs):
+        deliveries.append((agent_id, runtime, message))
+        return IMDeliveryResult.sent(
+            "dingtalk",
+            IMDeliveryPart(
+                transport="dingtalk_openapi_oto",
+                provider_message_id="process-query-key",
+                conversation_ref=runtime.external_conv_id,
+            ),
+        )
 
     monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
-    monkeypatch.setattr("httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(
+        "app.services.turn_runtime.deliver_message_with_receipt",
+        fake_deliver_message_with_receipt,
+    )
 
     await process_dingtalk_message(
         agent_id=agent_id,
@@ -1783,7 +1788,6 @@ async def test_dingtalk_natural_entry_creates_and_completes_recoverable_turn(mon
         user_text="natural dingtalk user message",
         conversation_id="open-conv-1",
         conversation_type="1",
-        session_webhook="https://example.invalid/dingtalk-webhook",
         sender_nick="DingTalk Tester",
         message_id=f"msg-{uuid.uuid4().hex}",
     )
@@ -1818,7 +1822,12 @@ async def test_dingtalk_natural_entry_creates_and_completes_recoverable_turn(mon
 
     assert user_msg.content == "natural dingtalk user message"
     assert assistant_msg.content == "natural dingtalk reply"
-    assert any(payload["json"]["msgtype"] == "markdown" for _url, payload in posts)
+    assert len(deliveries) == 1
+    delivered_agent_id, runtime, delivered_message = deliveries[0]
+    assert delivered_agent_id == agent_id
+    assert runtime.external_conv_id == f"dingtalk_p2p_{sender_staff_id}"
+    assert runtime.is_group is False
+    assert delivered_message == "natural dingtalk reply"
 
 
 async def test_dingtalk_cancelled_turn_preserves_recovery_anchor(monkeypatch):
@@ -1863,7 +1872,6 @@ async def test_dingtalk_cancelled_turn_preserves_recovery_anchor(monkeypatch):
             user_text="recover me after shutdown",
             conversation_id="open-conv-cancel",
             conversation_type="1",
-            session_webhook="https://example.invalid/dingtalk-webhook",
             sender_nick="DingTalk Tester",
             message_id=f"msg-{uuid.uuid4().hex}",
         )
