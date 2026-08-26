@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -11,9 +14,11 @@ from app.main import app
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
 from app.models.tenant import Tenant
+from app.models.tool import AgentTool, Tool
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import User, Identity
+from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
 from app.services.trigger_daemon import (
     _finalize_invocation_executions,
     _link_invocation_executions,
@@ -23,6 +28,9 @@ from app.services.trigger_daemon import (
 )
 from app.services.trigger_runtime.dispatch import enqueue_due_trigger
 from app.models.audit import AuditLog
+from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.tool_seeder import BUILTIN_TOOLS, seed_builtin_tools
+from app.services.webhook_inbox import format_webhook_inbox_context
 
 pytestmark = pytest.mark.asyncio
 
@@ -147,6 +155,21 @@ async def _post(token, body):
         return await c.post(f"/api/webhooks/t/{token}", json=body)
 
 
+async def _post_raw(token, body: bytes):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        return await c.post(
+            f"/api/webhooks/t/{token}",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+
+async def _read_event_payload(agent_id, event_ref):
+    key = normalize_storage_key(f"{agent_id}/{event_ref['path']}")
+    return await get_storage_backend().read_bytes(key)
+
+
 async def _trigger_cfg(agent_id):
     async with async_session() as db:
         t = (await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == agent_id))).scalar_one()
@@ -159,10 +182,15 @@ async def _trigger_cfg(agent_id):
 async def test_legacy_overwrites():
     aid, token = await _make_agent_with_hook("legacy")
     await _post(token, {"n": 1})
+    first = (await _trigger_cfg(aid))["_webhook_event"]
     await _post(token, {"n": 2})
     cfg = await _trigger_cfg(aid)
     assert cfg.get("_webhook_pending") is True
-    assert '"n": 2' in cfg["_webhook_payload"]
+    second = cfg["_webhook_event"]
+    assert second["event_id"] > first["event_id"]
+    assert json.loads(await _read_event_payload(aid, first)) == {"n": 1}
+    assert json.loads(await _read_event_payload(aid, second)) == {"n": 2}
+    assert cfg["_webhook_payload"] is None
     assert "_webhook_queue" not in cfg
 
 
@@ -172,7 +200,72 @@ async def test_queue_accumulates():
         assert (await _post(token, {"n": i})).status_code == 200
     cfg = await _trigger_cfg(aid)
     assert len(cfg["_webhook_queue"]) == 3
+    event_ids = [item["event_id"] for item in cfg["_webhook_queue"]]
+    assert event_ids == sorted(event_ids)
+    assert len(set(event_ids)) == 3
+    for expected, event_ref in enumerate(cfg["_webhook_queue"]):
+        assert json.loads(await _read_event_payload(aid, event_ref)) == {"n": expected}
     assert "_webhook_pending" not in cfg
+
+
+async def test_queue_preserves_payload_beyond_legacy_text_limits():
+    aid, token = await _make_agent_with_hook("queue")
+    body = json.dumps(
+        {"prefix": "start", "content": "中" * 12_000, "tail": "END-OF-PAYLOAD"},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    response = await _post_raw(token, body)
+
+    assert response.status_code == 200
+    event_ref = (await _trigger_cfg(aid))["_webhook_queue"][0]
+    assert event_ref["size"] == len(body)
+    assert len(str(event_ref["received_at_ms"])) == 13
+    assert f"{event_ref['received_at_ms']}_{event_ref['event_id']:020d}" in event_ref["path"]
+    assert await _read_event_payload(aid, event_ref) == body
+
+
+async def test_streamed_webhook_preserves_hmac_verification():
+    aid, token = await _make_agent_with_hook("queue")
+    secret = "test-signing-secret"
+    async with async_session() as db:
+        trigger = (
+            await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        ).scalar_one()
+        trigger.config = {**trigger.config, "secret": secret}
+        await db.commit()
+
+    body = b'{"event":"signed","tail":"complete"}'
+    valid_signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        invalid = await client.post(
+            f"/api/webhooks/t/{token}",
+            content=body,
+            headers={"content-type": "application/json", "x-hub-signature-256": "sha256=bad"},
+        )
+        valid = await client.post(
+            f"/api/webhooks/t/{token}",
+            content=body,
+            headers={"content-type": "application/json", "x-hub-signature-256": valid_signature},
+        )
+
+    assert invalid.status_code == 200
+    assert valid.status_code == 200
+    queue = (await _trigger_cfg(aid))["_webhook_queue"]
+    assert len(queue) == 1
+    assert await _read_event_payload(aid, queue[0]) == body
+
+
+async def test_streamed_webhook_rejects_oversize_body_without_partial_event(monkeypatch):
+    aid, token = await _make_agent_with_hook("queue")
+    monkeypatch.setattr(webhooks_api, "MAX_PAYLOAD_SIZE", 10)
+
+    response = await _post_raw(token, b'{"long":true}')
+
+    assert response.status_code == 413
+    assert (await _trigger_cfg(aid)).get("_webhook_queue") in (None, [])
 
 
 async def test_queue_backpressure_when_full():
@@ -278,6 +371,7 @@ async def test_merge_due_claim_is_atomic_and_enqueues_one_execution():
         assert stored.config["_webhook_active"] is True
         assert stored.config["_webhook_batch_size"] == 1
         assert len(executions) == 1
+        assert executions[0].payload["_webhook_batch"] == ["a"]
 
 
 async def test_stale_webhook_lock_with_unfinished_execution_does_not_duplicate():
@@ -350,6 +444,8 @@ async def test_ingress_and_claim_share_one_row_lock_without_losing_active_state(
         assert stored.config["_webhook_batch_size"] in {1, 2}
         assert len(stored.config["_webhook_queue"]) == 2
         assert len(executions) == 1
+        batch_size = stored.config["_webhook_batch_size"]
+        assert executions[0].payload["_webhook_batch"] == stored.config["_webhook_queue"][:batch_size]
 
 
 async def test_ingress_and_advance_preserve_late_payload_and_finalize_atomically():
@@ -393,7 +489,8 @@ async def test_ingress_and_advance_preserve_late_payload_and_finalize_atomically
         stored = await db.get(AgentTrigger, trigger_id)
         execution = await db.get(TriggerExecution, execution_id)
         assert len(stored.config["_webhook_queue"]) == 1
-        assert '"n": 2' in stored.config["_webhook_queue"][0]
+        remaining = stored.config["_webhook_queue"][0]
+        assert json.loads(await _read_event_payload(agent_id, remaining)) == {"n": 2}
         assert stored.config["_webhook_active"] is False
         assert execution.status == "completed"
 
@@ -630,6 +727,39 @@ async def test_merge_wake_context_format():
     # The header the wake-context builder wraps it with:
     header = f"Webhook Payload (merged, {len(['p1', 'p2'])} entries):\n{merged}"
     assert "(merged, 2 entries)" in header
+
+
+async def test_webhook_inbox_context_contains_references_not_payload_bytes():
+    refs = [
+        {
+            "kind": "webhook_inbox_event_v1",
+            "event_id": 21,
+            "received_at_ms": 1787635812345,
+            "event_key": "1787635812345_00000000000000000021",
+            "path": "webhook/t/20260825/21/payload.json",
+            "size": 18001,
+            "sha256": "a" * 64,
+            "content_type": "application/json",
+        },
+        {
+            "kind": "webhook_inbox_event_v1",
+            "event_id": 22,
+            "received_at_ms": 1787635812346,
+            "event_key": "1787635812346_00000000000000000022",
+            "path": "webhook/t/20260825/22/payload.json",
+            "size": 19002,
+            "sha256": "b" * 64,
+            "content_type": "application/json",
+        },
+    ]
+
+    context = format_webhook_inbox_context({"_webhook_batch": refs})
+
+    assert "Event ID: 21" in context
+    assert "Event ID: 22" in context
+    assert refs[0]["path"] in context
+    assert refs[1]["path"] in context
+    assert "read_file" in context
 
 
 async def _make_persisted_webhook_trigger(mode, queue, *, batch_size=None):
@@ -913,12 +1043,10 @@ async def test_set_trigger_description_mentions_webhook_mode():
 
 async def test_webhook_mode_description_has_scenario_guidance():
     """B: webhook_mode description tells the agent WHEN to use each mode, not just what they do."""
-    from app.services.agent_tools import AGENT_TOOLS
-
     st = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
     desc = st["function"]["parameters"]["properties"]["webhook_mode"]["description"]
-    assert "FIFO" in desc and "individually" in desc  # queue scenario
-    assert "summarize" in desc or "together" in desc  # merge scenario
+    assert "FIFO" in desc and "once per event" in desc
+    assert "batch captured when execution starts" in desc
 
 
 # --- C: update_trigger can switch an existing hook's mode without clobbering token/queue ---
@@ -938,12 +1066,65 @@ async def _make_webhook_agent(cfg):
 
 
 async def test_update_trigger_schema_contains_webhook_mode():
-    from app.services.agent_tools import AGENT_TOOLS
-
     ut = next(t for t in AGENT_TOOLS if t["function"]["name"] == "update_trigger")
     props = ut["function"]["parameters"]["properties"]
     assert "webhook_mode" in props
     assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
+
+
+async def test_webhook_guidance_reaches_seeded_llm_runtime():
+    aid = await _make_webhook_agent({"token": "runtime-guidance", "webhook_mode": "queue"})
+    await seed_builtin_tools()
+
+    expected_names = {"set_trigger", "update_trigger"}
+    async with async_session() as db:
+        tool_rows = (
+            await db.execute(select(Tool).where(Tool.name.in_(expected_names)))
+        ).scalars().all()
+        assert {tool.name for tool in tool_rows} == expected_names
+        assignments = {
+            assignment.tool_id: assignment
+            for assignment in (
+                await db.execute(select(AgentTool).where(AgentTool.agent_id == aid))
+            ).scalars().all()
+        }
+        for tool in tool_rows:
+            assignment = assignments.get(tool.id)
+            if assignment is None:
+                db.add(AgentTool(agent_id=aid, tool_id=tool.id, enabled=True))
+            else:
+                assignment.enabled = True
+        await db.commit()
+
+    runtime_by_name = {
+        tool["function"]["name"]: tool["function"]
+        for tool in await get_agent_tools_for_llm(aid)
+        if tool["function"]["name"] in expected_names
+    }
+    seeded_by_name = {
+        tool["name"]: tool for tool in BUILTIN_TOOLS if tool["name"] in expected_names
+    }
+    fallback_by_name = {
+        tool["function"]["name"]: tool["function"]
+        for tool in AGENT_TOOLS
+        if tool["function"]["name"] in expected_names
+    }
+
+    assert set(runtime_by_name) == expected_names
+    for name in expected_names:
+        assert runtime_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
+        assert fallback_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
+
+    set_mode_description = runtime_by_name["set_trigger"]["parameters"]["properties"][
+        "webhook_mode"
+    ]["description"]
+    update_properties = runtime_by_name["update_trigger"]["parameters"]["properties"]
+    assert "stored byte-for-byte" in set_mode_description
+    assert "read the referenced file" in set_mode_description
+    assert "does not convert or drain in-flight work" in update_properties["webhook_mode"][
+        "description"
+    ]
+    assert "partial patch" in update_properties["config"]["description"]
 
 
 async def test_update_trigger_switches_mode_preserving_token_and_queue():
@@ -957,6 +1138,34 @@ async def test_update_trigger_switches_mode_preserving_token_and_queue():
         assert t.config["webhook_mode"] == "queue"
         assert t.config["token"] == "tok123"               # token preserved
         assert t.config["_webhook_queue"] == ["x", "y"]    # queued payloads preserved
+
+
+async def test_update_trigger_partial_config_preserves_webhook_identity_and_mode():
+    from app.services.agent_tools import _handle_update_trigger
+
+    aid = await _make_webhook_agent(
+        {
+            "token": "tok123",
+            "secret": "old",
+            "webhook_mode": "queue",
+            "_webhook_queue": [{"event_id": 7}],
+        }
+    )
+
+    result = await _handle_update_trigger(
+        aid,
+        {"name": "h", "config": {"secret": "new"}},
+    )
+
+    assert "✅" in result
+    async with async_session() as db:
+        trigger = (
+            await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == aid))
+        ).scalar_one()
+        assert trigger.config["token"] == "tok123"
+        assert trigger.config["secret"] == "new"
+        assert trigger.config["webhook_mode"] == "queue"
+        assert trigger.config["_webhook_queue"] == [{"event_id": 7}]
 
 
 async def test_update_trigger_to_legacy_drops_mode_key():

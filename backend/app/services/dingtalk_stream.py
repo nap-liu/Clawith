@@ -31,6 +31,7 @@ from app.services.channel_dispatch import (
 )
 from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_token import dingtalk_token_manager
+from app.services.im_delivery import ProviderResponseUncertainError
 from app.services.storage import store_agent_upload
 
 DINGTALK_VOICE_MAX_BYTES = 2 * 1024 * 1024
@@ -426,7 +427,12 @@ async def _send_dingtalk_media_message(
                     },
                 )
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise ProviderResponseUncertainError(
+                    "DingTalk media send returned an unreadable response"
+                ) from exc
             # Check for error
             if resp.status_code >= 400 or data.get("errcode"):
                 logger.error(f"[DingTalk] Send media failed: {data}")
@@ -755,10 +761,6 @@ class DingTalkStreamManager:
                     conversation_id = incoming.conversation_id or ""
                     conversation_type = incoming.conversation_type or "1"
                     conversation_title = (incoming.conversation_title or "").strip()
-                    session_webhook = incoming.session_webhook or ""
-                    session_webhook_expires_at_ms = msg_data.get(
-                        "sessionWebhookExpiredTime"
-                    )
 
                     logger.info(
                         f"[DingTalk Stream] Received {msgtype} message from {sender_staff_id}"
@@ -792,8 +794,7 @@ class DingTalkStreamManager:
 
                             async def _work(_text=user_text, _ssid=sender_staff_id,
                                             _cid=conversation_id, _ctype=conversation_type,
-                                            _wh=session_webhook, _nick=sender_nick,
-                                            _wh_exp=session_webhook_expires_at_ms,
+                                            _nick=sender_nick,
                                             _mid=message_id, _sid=sender_id,
                                             _title=conversation_title, _reactions=reactions):
                                 from app.api.dingtalk import _check_message_dedup
@@ -806,8 +807,6 @@ class DingTalkStreamManager:
                                     user_text=_text,
                                     conversation_id=_cid,
                                     conversation_type=_ctype,
-                                    session_webhook=_wh,
-                                    session_webhook_expires_at_ms=_wh_exp,
                                     sender_nick=_nick,
                                     message_id=_mid,
                                     sender_id=_sid,
@@ -841,8 +840,7 @@ class DingTalkStreamManager:
 
                             async def _work_media(_md=msg_data, _ak=app_key, _as=app_secret,
                                                   _ssid=sender_staff_id, _cid=conversation_id,
-                                                  _ctype=conversation_type, _wh=session_webhook,
-                                                  _wh_exp=session_webhook_expires_at_ms,
+                                                  _ctype=conversation_type,
                                                   _nick=sender_nick, _mid=message_id,
                                                   _sid=sender_id, _title=conversation_title,
                                                   _reactions=reactions):
@@ -858,8 +856,6 @@ class DingTalkStreamManager:
                                     sender_staff_id=_ssid,
                                     conversation_id=_cid,
                                     conversation_type=_ctype,
-                                    session_webhook=_wh,
-                                    session_webhook_expires_at_ms=_wh_exp,
                                     sender_nick=_nick,
                                     message_id=_mid,
                                     sender_id=_sid,
@@ -883,7 +879,7 @@ class DingTalkStreamManager:
 
                     return dingtalk_stream.AckMessage.STATUS_OK, "ok"
                 except Exception as e:
-                    # Network exception text may include a signed sessionWebhook.
+                    # Keep channel credentials and provider payload details out of logs.
                     logger.error(
                         f"[DingTalk Stream] Error in message handler: {type(e).__name__}"
                     )
@@ -900,8 +896,6 @@ class DingTalkStreamManager:
                 sender_staff_id: str,
                 conversation_id: str,
                 conversation_type: str,
-                session_webhook: str,
-                session_webhook_expires_at_ms: int | str | None = None,
                 sender_nick: str = "",
                 message_id: str = "",
                 sender_id: str = "",
@@ -950,8 +944,6 @@ class DingTalkStreamManager:
                     user_text=user_text,
                     conversation_id=conversation_id,
                     conversation_type=conversation_type,
-                    session_webhook=session_webhook,
-                    session_webhook_expires_at_ms=session_webhook_expires_at_ms,
                     saved_file_paths=saved_file_paths,
                     sender_nick=sender_nick,
                     message_id=message_id,

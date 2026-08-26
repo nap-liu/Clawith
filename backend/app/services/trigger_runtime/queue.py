@@ -61,7 +61,7 @@ async def enqueue_trigger_execution(
         status="pending",
         idempotency_key=idempotency_key[:255],
         payload=payload_obj if isinstance(payload_obj, dict) else {},
-        payload_text=payload_text[:8000],
+        payload_text=payload_text,
         scheduled_at=canonical_scheduled_at,
     )
     try:

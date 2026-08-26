@@ -58,6 +58,7 @@ from app.services.workload_capacity import (
     WorkloadOverloadedError,
     get_workload_capacity,
 )
+from app.services.webhook_inbox import format_webhook_inbox_context
 
 TICK_INTERVAL = 15  # seconds
 DEDUP_WINDOW = 30  # seconds — same agent won't be invoked twice within this window
@@ -1327,39 +1328,35 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                     )
                 # Include webhook payload (by mode)
                 if t.type == "webhook":
-                    wmode = cfg.get("webhook_mode", "legacy")
-                    if wmode == "legacy":
-                        payload_str = cfg.get("_webhook_payload")
-                        if payload_str:
-                            if len(payload_str) > 2000:
-                                payload_str = payload_str[:2000] + "... (truncated)"
-                            part += f"\nWebhook Payload:\n{payload_str}"
-                    elif wmode == "queue":
-                        q = cfg.get("_webhook_queue") or []
-                        if q:
-                            payload_str = q[0]
-                            if len(payload_str) > 2000:
-                                payload_str = payload_str[:2000] + "... (truncated)"
-                            part += f"\nWebhook Payload:\n{payload_str}"
-                    elif wmode == "merge":
-                        # B1 fix: render the SAME batch the finally will delete —
-                        # read fresh queue + recorded batch_size, not the T0 tick
-                        # snapshot. FIFO guarantees queue[:batch_size] is stable
-                        # between this build and _advance_webhook_trigger, so the
-                        # rendered set == the deleted set (late arrivals only append
-                        # to the tail → never silently dropped).
-                        async with async_session() as _wdb:
-                            _wres = await _wdb.execute(select(AgentTrigger).where(AgentTrigger.id == t.id))
-                            _wtrig = _wres.scalar_one_or_none()
-                        _fresh_cfg = (_wtrig.config if _wtrig else cfg) or {}
-                        _q = _fresh_cfg.get("_webhook_queue") or []
-                        _bs = _fresh_cfg.get("_webhook_batch_size", len(_q))
-                        _batch = _q[:_bs]
-                        if _batch:
-                            merged = _merge_webhook_payloads(_batch)
-                            if len(merged) > 2000:
-                                merged = merged[:2000] + "... (truncated)"
-                            part += f"\nWebhook Payload (merged, {len(_batch)} entries):\n{merged}"
+                    inbox_context = format_webhook_inbox_context(cfg)
+                    if inbox_context:
+                        part += inbox_context
+                    else:
+                        wmode = cfg.get("webhook_mode", "legacy")
+                        if wmode == "legacy":
+                            payload_str = cfg.get("_webhook_payload")
+                            if payload_str:
+                                part += f"\nWebhook Payload:\n{payload_str}"
+                        elif wmode == "queue":
+                            q = cfg.get("_webhook_queue") or []
+                            if q and isinstance(q[0], str):
+                                part += f"\nWebhook Payload:\n{q[0]}"
+                        elif wmode == "merge":
+                            # Render the same legacy inline batch that completion
+                            # will remove. New inbox events are execution-owned
+                            # references handled above and need no fresh read.
+                            async with async_session() as _wdb:
+                                _wres = await _wdb.execute(
+                                    select(AgentTrigger).where(AgentTrigger.id == t.id)
+                                )
+                                _wtrig = _wres.scalar_one_or_none()
+                            _fresh_cfg = (_wtrig.config if _wtrig else cfg) or {}
+                            _q = _fresh_cfg.get("_webhook_queue") or []
+                            _bs = _fresh_cfg.get("_webhook_batch_size", len(_q))
+                            _batch = [item for item in _q[:_bs] if isinstance(item, str)]
+                            if _batch:
+                                merged = _merge_webhook_payloads(_batch)
+                                part += f"\nWebhook Payload (merged, {len(_batch)} entries):\n{merged}"
                 context_parts.append(part)
                 trigger_names.append(t.name)
 

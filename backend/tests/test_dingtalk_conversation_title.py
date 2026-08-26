@@ -45,7 +45,6 @@ async def test_dingtalk_stream_extracts_conversation_title(monkeypatch):
     msg.conversation_id = "cid_yyy"
     msg.conversation_type = "2"
     msg.conversation_title = "Real Group Name"
-    msg.session_webhook = "http://x"
     msg.sender_nick = "Alice"
 
     # The stream handler reads `incoming.conversation_title`. Verify the
@@ -55,7 +54,6 @@ async def test_dingtalk_stream_extracts_conversation_title(monkeypatch):
         "conversationId": "cid_yyy",
         "conversationType": "2",
         "conversationTitle": "Real Group Name",
-        "sessionWebhook": "http://x",
         "senderNick": "Alice",
         "msgtype": "text",
         "text": {"content": "hi"},

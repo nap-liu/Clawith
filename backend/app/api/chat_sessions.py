@@ -1185,7 +1185,7 @@ async def get_session_messages(
         db=db,
         response=response,
     )
-    if not paginated:
+    if paginated is not True:
         return rows
     return {
         "items": rows,

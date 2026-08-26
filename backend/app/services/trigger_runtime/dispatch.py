@@ -132,12 +132,31 @@ async def enqueue_due_trigger(
                 locked_cfg["_webhook_batch_size"] = len(queue)
             fresh.config = locked_cfg
 
+            batch = queue if webhook_mode == "merge" else queue[:1]
+            execution_payload = {
+                **runtime_execution_payload(fresh),
+                "_webhook_batch": batch,
+            }
+            event_ids = [
+                str(item.get("event_id"))
+                for item in batch
+                if isinstance(item, dict) and item.get("event_id") is not None
+            ]
+            if event_ids and len(event_ids) == len(batch):
+                batch_key = (
+                    event_ids[0]
+                    if len(event_ids) == 1
+                    else f"{event_ids[0]}-{event_ids[-1]}-{len(event_ids)}"
+                )
+            else:
+                batch_key = active_since
+
             _execution, created = await enqueue_trigger_execution(
                 db,
                 trigger=fresh,
                 source="webhook",
-                idempotency_key=f"webhook:{fresh.id}:{active_since}",
-                payload_obj=runtime_execution_payload(fresh),
+                idempotency_key=f"webhook:{fresh.id}:{batch_key}",
+                payload_obj=execution_payload,
                 commit=False,
             )
             if created:
@@ -147,6 +166,13 @@ async def enqueue_due_trigger(
             return
 
         payload_obj = runtime_execution_payload(trigger)
+        payload_text = ""
+        if trigger.type == "webhook":
+            webhook_event = cfg.get("_webhook_event")
+            if isinstance(webhook_event, dict):
+                payload_obj = {**payload_obj, "_webhook_batch": [webhook_event]}
+            else:
+                payload_text = str(cfg.get("_webhook_payload") or "")
         execution_scheduled_at = None
         if trigger.type == "cron":
             if scheduled_for is None:
@@ -173,6 +199,7 @@ async def enqueue_due_trigger(
                 scheduled_for=scheduled_for,
             ),
             payload_obj=payload_obj,
+            payload_text=payload_text,
             scheduled_at=execution_scheduled_at,
         )
 

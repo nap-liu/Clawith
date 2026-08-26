@@ -1,6 +1,7 @@
 import json
 import uuid
 
+import httpx
 import pytest
 
 from app.api import dingtalk as dingtalk_api
@@ -25,6 +26,11 @@ class _Response:
         return self._payload
 
 
+class _UnreadableResponse(_Response):
+    def json(self):
+        raise ValueError("invalid provider JSON")
+
+
 class _Client:
     def __init__(self, response, calls):
         self._response = response
@@ -41,79 +47,53 @@ class _Client:
         return self._response
 
 
+class _TimeoutClient:
+    def __init__(self, calls):
+        self._calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def post(self, url, **kwargs):
+        self._calls.append((url, kwargs))
+        raise httpx.ReadTimeout("provider response timed out")
+
+
 @pytest.mark.asyncio
-async def test_command_webhook_business_error_never_finalizes_sent(monkeypatch):
-    calls = []
-    finalized = []
-    response = _Response({"errcode": 40035, "errmsg": "invalid webhook"})
-    monkeypatch.setattr(
-        dingtalk_api.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(response, calls),
-    )
+async def test_command_reply_uses_persisted_delivery_and_exact_session_lock_key(monkeypatch):
+    deliveries = []
 
-    async def register(_message_id, result):
-        finalized.append(result)
-        return True
+    async def deliver(**kwargs):
+        deliveries.append(kwargs)
+        return IMDeliveryResult.failed("dingtalk", "provider_rejected")
 
-    monkeypatch.setattr(im_delivery, "register_delivery", register)
+    monkeypatch.setattr(im_delivery, "deliver_persisted_message", deliver)
 
+    message_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    conversation_id = str(uuid.uuid4())
     result = await dingtalk_api._deliver_dingtalk_command_reply(
-        message_id=uuid.uuid4(),
-        session_webhook="https://example.invalid/session-webhook",
-        conversation_ref="conversation-1",
+        message_id=message_id,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        external_conv_id="dingtalk_group_conversation-1",
+        is_group=True,
         message="command reply",
     )
 
-    assert len(calls) == 1
+    assert len(deliveries) == 1
+    assert deliveries[0]["message_id"] == message_id
+    assert deliveries[0]["agent_id"] == agent_id
+    runtime = deliveries[0]["runtime"]
+    assert runtime.source_channel == "dingtalk"
+    assert runtime.conversation_id == conversation_id
+    assert runtime.external_conv_id == "dingtalk_group_conversation-1"
+    assert runtime.is_group is True
+    assert deliveries[0]["message"] == "command reply"
     assert result.status == "failed"
-    assert finalized == [result]
-    assert all(item.status != "sent" for item in finalized)
-
-
-@pytest.mark.asyncio
-async def test_session_webhook_business_error_never_records_file_part(monkeypatch):
-    calls = []
-    recorded = []
-    response = _Response({"errcode": 310000, "errmsg": "invalid session"})
-    monkeypatch.setattr(
-        dingtalk_api.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(response, calls),
-    )
-
-    async def record(part):
-        recorded.append(part)
-
-    monkeypatch.setattr(agent_tools, "record_channel_file_part", record)
-    part = IMDeliveryPart(
-        transport="dingtalk_session_webhook",
-        conversation_ref="conversation-1",
-        artifact_role="file_fallback",
-        recallable=False,
-    )
-
-    with pytest.raises(RuntimeError, match="dingtalk_session_webhook_error"):
-        await dingtalk_api._deliver_dingtalk_session_webhook_part(
-            session_webhook="https://example.invalid/session-webhook",
-            payload={"msgtype": "text", "text": {"content": "fallback"}},
-            part=part,
-        )
-
-    assert len(calls) == 1
-    assert recorded == []
-
-
-def test_legacy_markdown_title_is_sanitized():
-    forbidden = "cla" + "with"
-    payload = dingtalk_api._dingtalk_markdown_payload(
-        f"[Agent] {forbidden.upper()} Helper",
-        "safe reply",
-    )
-
-    assert forbidden not in payload["markdown"]["title"].lower()
-    assert payload["markdown"]["title"] == "safe reply"
-    assert payload["markdown"]["text"] == "safe reply"
 
 
 @pytest.mark.asyncio
@@ -167,6 +147,111 @@ async def test_dingtalk_markdown_transports_use_plain_text_summary_and_keep_rece
             "title": "发布结果 服务已更新",
             "text": "## 发布结果\n\n**服务已更新**",
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_group", [False, True])
+async def test_dingtalk_proactive_transport_timeout_propagates_without_retry(
+    monkeypatch,
+    is_group,
+):
+    calls = []
+
+    async def get_token(_key, _secret):
+        return "token"
+
+    async def get_access_token(_key, _secret):
+        return {"access_token": "token", "expires_in": 7200}
+
+    monkeypatch.setattr(dingtalk_service, "get_dingtalk_access_token", get_access_token)
+    monkeypatch.setattr(
+        "app.services.dingtalk_token.dingtalk_token_manager.get_token",
+        get_token,
+    )
+    monkeypatch.setattr(
+        dingtalk_service.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _TimeoutClient(calls),
+    )
+    monkeypatch.setattr(
+        turn_runtime.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _TimeoutClient(calls),
+    )
+
+    with pytest.raises(httpx.ReadTimeout):
+        await turn_runtime.send_dingtalk_proactive_markdown(
+            app_id="app",
+            app_secret="secret",
+            target_id="conversation" if is_group else "staff",
+            is_group=is_group,
+            message="timeout test",
+        )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_group", [False, True])
+async def test_dingtalk_proactive_unreadable_response_is_uncertain_without_retry(
+    monkeypatch,
+    is_group,
+):
+    calls = []
+
+    async def get_token(_key, _secret):
+        return "token"
+
+    async def get_access_token(_key, _secret):
+        return {"access_token": "token", "expires_in": 7200}
+
+    client_factory = lambda **_kwargs: _Client(_UnreadableResponse({}), calls)
+    monkeypatch.setattr(dingtalk_service, "get_dingtalk_access_token", get_access_token)
+    monkeypatch.setattr(dingtalk_stream.dingtalk_token_manager, "get_token", get_token)
+    monkeypatch.setattr(dingtalk_service.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(turn_runtime.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(im_delivery.ProviderResponseUncertainError) as caught:
+        await turn_runtime.send_dingtalk_proactive_markdown(
+            app_id="app",
+            app_secret="secret",
+            target_id="conversation" if is_group else "staff",
+            is_group=is_group,
+            message="parse test",
+        )
+
+    assert IMDeliveryResult.from_exception("dingtalk", caught.value).status == "unknown"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_media_unreadable_response_is_uncertain_without_retry(monkeypatch):
+    calls = []
+
+    async def get_token(_key, _secret):
+        return "token"
+
+    monkeypatch.setattr(dingtalk_stream.dingtalk_token_manager, "get_token", get_token)
+    monkeypatch.setattr(
+        dingtalk_stream.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(_UnreadableResponse({}), calls),
+    )
+
+    with pytest.raises(im_delivery.ProviderResponseUncertainError) as caught:
+        await dingtalk_stream._send_dingtalk_media_message(
+            "app",
+            "secret",
+            "conversation",
+            "media-id",
+            "file",
+            "2",
+            filename="report.pdf",
+            raise_on_transport_error=True,
+        )
+
+    assert IMDeliveryResult.from_exception("dingtalk", caught.value).status == "unknown"
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -276,6 +361,9 @@ async def test_provider_success_receipt_failure_is_unknown_without_fallback_io(
         finalized.append(result)
         return True
 
+    async def no_exact_session_route(_agent_id, _session_id):
+        return False
+
     async def sender(_path, _message):
         parts = []
 
@@ -307,6 +395,11 @@ async def test_provider_success_receipt_failure_is_unknown_without_fallback_io(
     monkeypatch.setattr(agent_tools, "_claim_channel_file_receipt", claim)
     monkeypatch.setattr(agent_tools, "append_delivery_part", append)
     monkeypatch.setattr(agent_tools, "register_delivery", register)
+    monkeypatch.setattr(
+        agent_tools,
+        "_supports_exact_file_session_route",
+        no_exact_session_route,
+    )
     monkeypatch.setattr(dingtalk_stream.dingtalk_token_manager, "get_token", get_token)
     monkeypatch.setattr(
         dingtalk_stream.httpx,

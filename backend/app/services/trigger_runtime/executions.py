@@ -260,7 +260,12 @@ def apply_base_trigger_fired_state(
     if trigger.type == "webhook":
         cfg = trigger.config or {}
         if cfg.get("webhook_mode", "legacy") == "legacy":
-            trigger.config = {**cfg, "_webhook_pending": False, "_webhook_payload": None}
+            trigger.config = {
+                **cfg,
+                "_webhook_pending": False,
+                "_webhook_event": None,
+                "_webhook_payload": None,
+            }
 
 
 async def mark_base_triggers_fired(trigger_ids: list[uuid.UUID], now: datetime) -> None:

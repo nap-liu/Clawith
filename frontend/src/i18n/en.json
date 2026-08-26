@@ -2601,6 +2601,11 @@
         "cardTemplateIdPlaceholder": "DingTalk interactive-card template ID; the template must include title/summary/action_preview/risk/status/buttons variables",
         "cardTemplateIdHelp": "Create and publish a template in the DingTalk Card Platform first; you can download the standard template to import (fields aligned):",
         "downloadTemplate": "Download standard template"
+      },
+      "sessionMessage": {
+        "cardTemplateId": "DingTalk group-mention card template ID",
+        "cardTemplateIdPlaceholder": "DingTalk interactive-card template ID; the template must contain a dynamic Markdown field named content",
+        "cardTemplateIdHelp": "Used by the application robot for proactive native group mentions without a temporary reply credential."
       }
     },
     "toolCategories": {

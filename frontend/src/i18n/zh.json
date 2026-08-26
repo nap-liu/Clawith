@@ -2614,6 +2614,11 @@
         "cardTemplateIdPlaceholder": "钉钉互动卡片模板 ID;模板须含 title/summary/action_preview/risk/status/buttons 变量",
         "cardTemplateIdHelp": "需先在钉钉卡片平台创建并发布模板;可下载标准模板导入(字段已对齐):",
         "downloadTemplate": "下载标准模板"
+      },
+      "sessionMessage": {
+        "cardTemplateId": "钉钉群 @ 消息卡片模板 ID",
+        "cardTemplateIdPlaceholder": "钉钉互动卡片模板 ID;模板须包含 content 动态 Markdown 字段",
+        "cardTemplateIdHelp": "用于机器人主动发送带原生 @ 的群消息，不依赖临时回复凭证。"
       }
     },
     "toolCategories": {

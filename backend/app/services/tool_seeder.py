@@ -1004,7 +1004,7 @@ BUILTIN_TOOLS = [
                 "webhook_mode": {
                     "type": "string",
                     "enum": ["legacy", "queue", "merge"],
-                    "description": "Webhook processing mode (type=webhook only). Pick by scenario: legacy (default) = keep only the newest payload (overwrite earlier ones) — for low-frequency events where only the latest matters (e.g. a status ping). queue = handle each trigger one-by-one in FIFO order, serial, zero loss — for when EVERY event must be processed individually and in order (e.g. each reader's feedback, each ticket, each order). merge = accumulate all pending triggers and process them together in one session — for when you want to review/summarize multiple events at once (e.g. batch several alerts into one analysis).",
+                    "description": "Webhook processing mode (type=webhook only). Every authenticated submission accepted by the endpoint is stored byte-for-byte in this agent's webhook/ inbox; the wake context provides its event ID, millisecond timestamp, file path, size, and SHA-256, and you should read the referenced file before processing it. legacy (default) wakes from only the newest event while older inbox files remain discoverable. queue wakes once per event in FIFO order. merge wakes once for the batch captured when execution starts. Choose the mode when creating the trigger; if changing it later, briefly pause upstream submissions and do not switch during an active webhook run.",
                 },
             },
             "required": ["name", "type", "config", "reason"],
@@ -1023,12 +1023,12 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Name of the trigger to update"},
-                "config": {"type": "object", "description": "New config (replaces existing config)"},
+                "config": {"type": "object", "description": "New config. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged."},
                 "reason": {"type": "string", "description": "New reason text"},
                 "webhook_mode": {
                     "type": "string",
                     "enum": ["legacy", "queue", "merge"],
-                    "description": "For type=webhook only: switch the processing mode of an EXISTING webhook trigger (legacy/queue/merge — see set_trigger.webhook_mode for what each means). Preserves the existing webhook URL/token and any already-queued payloads.",
+                    "description": "For an existing webhook trigger only. Briefly pause upstream submissions and switch only when no webhook run is active and no event is pending or queued. The change is immediate and affects subsequent scheduling; it does not convert or drain in-flight work. The existing URL token, secret, and stored webhook inbox files remain unchanged. legacy uses the newest event, queue processes FIFO, and merge processes the batch captured when execution starts.",
                 },
             },
             "required": ["name"],
@@ -1070,7 +1070,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_channel_file",
         "display_name": "Send File",
-        "description": "Send a workspace file to a person or back to the current conversation. Omit user_id only when replying to the current IM/web conversation; that preserves the exact current-session route. Explicit delivery to another person currently supports Feishu and Slack only; provide canonical user_id and choose one of those routes.",
+        "description": "Send a workspace file through an existing conversation or to a person. Omit all targets only for the current conversation. Use exact session_id for another existing person/group Session, or canonical user_id (and channel when needed) for direct person delivery. Never provide both session_id and user_id.",
         "category": "communication",
         "icon": "📎",
         "is_default": True,
@@ -1078,7 +1078,8 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Workspace-relative path to the file, e.g. workspace/report.md"},
-                "user_id": {"type": "string", "description": "Canonical platform user_id. Omit only to reply to the current conversation."},
+                "user_id": {"type": "string", "description": "Canonical platform user_id for direct person delivery. Mutually exclusive with session_id."},
+                "session_id": {"type": "string", "description": "Exact existing Session UUID for person or group delivery. Mutually exclusive with user_id."},
                 "channel": {"type": "string", "enum": ["feishu", "slack"], "description": "Executable explicit file route chosen by the Agent."},
                 "message": {"type": "string", "description": "Optional message to accompany the file"},
             },
@@ -1206,7 +1207,27 @@ BUILTIN_TOOLS = [
             "additionalProperties": False,
         },
         "config": {},
-        "config_schema": {},
+        # The canonical Session-message capability owns the DingTalk mention-card
+        # card template. The compatibility group-only wrapper reads this same
+        # config through the shared delivery runtime, so administrators configure
+        # one value only. As with request_confirmation, standard tool-config
+        # resolution provides agent override -> tenant default -> tool default.
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "card_template_id",
+                    "label": "agent.tools.sessionMessage.cardTemplateId",
+                    "type": "string",
+                    "placeholder": "agent.tools.sessionMessage.cardTemplateIdPlaceholder",
+                    "help_text": "agent.tools.sessionMessage.cardTemplateIdHelp",
+                    "description": (
+                        "用于钉钉群原生 @ 投递的互动卡片模板 ID。模板必须包含唯一的 "
+                        "content 动态 Markdown 字段。可配置企业默认值并按数字员工覆盖；"
+                        "不配置时，带 @ 的钉钉群消息明确失败且不会降级为普通消息。"
+                    ),
+                },
+            ]
+        },
     },
     {
         "name": "send_group_session_message",
