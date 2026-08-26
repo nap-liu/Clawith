@@ -212,6 +212,25 @@ async def _project_accepts_new_subagent_anchor(
     if run.project_id is None:
         return True
 
+    # A process restart can leave an already-authorized project turn in the
+    # durable ``processing`` state while its worker lease is returned to the
+    # queue.  That turn crossed the project-state boundary before the restart;
+    # let the worker reclaim it so one stale row cannot sit at the head of the
+    # queue and block every newer project turn.
+    processing_anchor_id = await db.scalar(
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.conversation_id == str(run.id),
+            ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+            ChatMessage.message_meta["subagent_input_state"].as_string()
+            == INPUT_PROCESSING,
+        )
+        .order_by(ChatMessage.created_at, ChatMessage.id)
+        .limit(1)
+    )
+    if processing_anchor_id is not None:
+        return True
+
     from app.models.project import Project, ProjectRun
 
     project = await db.get(Project, run.project_id, with_for_update=True)

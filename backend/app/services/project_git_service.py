@@ -1068,6 +1068,8 @@ async def _ensure_project_member_directories(db: AsyncSession, project_id: uuid.
             source_agent_id=source_agent_id,
             default_soul=default_soul,
             default_memory=default_memory,
+            copy_source_memory=False,
+            copy_source_workspace=False,
         )
         changed_paths.update(missing[member.agent_id])
         changed_paths.update(f".agents/{member.agent_id}/{path}" for path in copy_result.copied)

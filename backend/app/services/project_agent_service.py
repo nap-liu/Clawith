@@ -178,6 +178,12 @@ async def create_project_agent(
             source_agent_id=source.id if source else None,
             default_soul=default_soul,
             default_memory=default_memory,
+            # A project copy keeps the source employee's professional identity,
+            # but starts with project-owned memory and an empty workspace. Runtime
+            # history and delivery files belong to the source employee's global
+            # scope and must never cross into a newly created project.
+            copy_source_memory=False,
+            copy_source_workspace=False,
         )
         skill_bindings = (
             await snapshot_source_agent_skills(

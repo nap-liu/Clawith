@@ -20,6 +20,7 @@ import {
 } from "@tabler/icons-react";
 
 import SessionViewerDrawer, {
+  type SessionViewerGroupConfig,
   type SessionViewerTarget,
 } from "../../components/SessionViewerDrawer";
 import { projectsApi } from "../../services/projects";
@@ -53,10 +54,20 @@ export default function ProjectPlanningPage() {
     queryFn: () => projectsApi.listMembers(projectId),
     enabled: Boolean(projectId),
   });
-  const leaderSessionQuery = useQuery({
-    queryKey: ["project", projectId, "leader-session"],
-    queryFn: () => projectsApi.getLeaderSession(projectId),
+  const groupSessionQuery = useQuery({
+    queryKey: ["project", projectId, "group-session"],
+    queryFn: () => projectsApi.getGroupSession(projectId),
     enabled: Boolean(projectId),
+  });
+  const groupSessionId = text(
+    groupSessionQuery.data || {},
+    "id",
+    "group_session_id",
+  );
+  const planningMessagesQuery = useQuery({
+    queryKey: ["project", projectId, "group-session", groupSessionId, "messages"],
+    queryFn: () => projectsApi.listGroupMessages(projectId, groupSessionId),
+    enabled: Boolean(projectId && groupSessionId),
   });
   const confirmMutation = useMutation({
     mutationFn: () => projectsApi.confirmKickoff(projectId),
@@ -71,19 +82,44 @@ export default function ProjectPlanningPage() {
     text(leader || {}, "name_snapshot", "agent_name", "name") ||
     t("projectTerminology.projectOwner");
   const project = projectQuery.data;
-  const session = leaderSessionQuery.data;
+  const session = groupSessionQuery.data;
+  const groupMembers = useMemo(
+    () =>
+      members
+        .map((member) => ({
+          agentId: text(member, "agent_id"),
+          name:
+            text(member, "name_snapshot", "agent_name", "name") ||
+            t("projectTerminology.dynamicCopy.digitalEmployee"),
+          isLeader: member.is_leader === true,
+          isEnabled: member.is_enabled !== false,
+        }))
+        .filter((member) => member.agentId),
+    [members, t],
+  );
+  const groupConfig = useMemo<SessionViewerGroupConfig>(
+    () => ({
+      members: groupMembers,
+      maxMentions: 0,
+      loadMessages: (sessionId, options) =>
+        projectsApi.listGroupMessages(projectId, sessionId, options),
+      sendMessage: (sessionId, payload) =>
+        projectsApi.sendGroupMessage(projectId, sessionId, payload),
+    }),
+    [groupMembers, projectId],
+  );
   const sessionTarget = useMemo<SessionViewerTarget | null>(
     () =>
       session
         ? {
-            sessionId: session.id,
-            agentId: session.agent_id,
+            sessionId: text(session, "id", "group_session_id"),
+            agentId: text(session, "access_agent_id", "agent_id"),
             title:
-              session.title ||
+              text(session, "title", "group_name") ||
               t("projectTerminology.planning.sessionTitle", {
                 name: leaderName,
               }),
-            mode: "project_planning",
+            mode: "group",
             status: "planning",
           }
         : null,
@@ -92,11 +128,22 @@ export default function ProjectPlanningPage() {
   const loading =
     projectQuery.isPending ||
     membersQuery.isPending ||
-    leaderSessionQuery.isPending;
+    groupSessionQuery.isPending ||
+    planningMessagesQuery.isPending;
   const failed =
-    projectQuery.isError || membersQuery.isError || leaderSessionQuery.isError;
-  const discussionCount = Number(session?.discussion_count || 0);
-  const canConfirm = discussionCount >= 2;
+    projectQuery.isError ||
+    membersQuery.isError ||
+    groupSessionQuery.isError ||
+    planningMessagesQuery.isError;
+  const discussionMessages = planningMessagesQuery.data?.items || [];
+  const discussionRoles = new Set(
+    discussionMessages.map((message) => text(message, "role")),
+  );
+  const discussionCount = discussionMessages.filter((message) =>
+    ["user", "assistant"].includes(text(message, "role")),
+  ).length;
+  const canConfirm =
+    discussionRoles.has("user") && discussionRoles.has("assistant");
 
   if (loading) {
     return (
@@ -110,7 +157,10 @@ export default function ProjectPlanningPage() {
 
   if (failed || !project || !sessionTarget) {
     const error =
-      projectQuery.error || membersQuery.error || leaderSessionQuery.error;
+      projectQuery.error ||
+      membersQuery.error ||
+      groupSessionQuery.error ||
+      planningMessagesQuery.error;
     return (
       <main className="pm-planning-page pm-planning-state" role="alert">
         <IconAlertTriangle size={26} />
@@ -125,7 +175,8 @@ export default function ProjectPlanningPage() {
           onClick={() => {
             void projectQuery.refetch();
             void membersQuery.refetch();
-            void leaderSessionQuery.refetch();
+            void groupSessionQuery.refetch();
+            void planningMessagesQuery.refetch();
           }}
         >
           <IconRefresh size={16} />
@@ -300,13 +351,14 @@ export default function ProjectPlanningPage() {
       </div>
 
       <SessionViewerDrawer
-        agentId={session?.agent_id || ""}
+        agentId={text(session || {}, "access_agent_id", "agent_id")}
         agentName={leaderName}
         target={drawerOpen ? sessionTarget : null}
         interactive
+        groupConfig={groupConfig}
         onClose={() => {
           setDrawerOpen(false);
-          void leaderSessionQuery.refetch();
+          void planningMessagesQuery.refetch();
         }}
       />
     </main>

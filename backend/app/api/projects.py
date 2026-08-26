@@ -144,6 +144,7 @@ from app.services.project_group_timeline import (
     build_project_group_timeline,
     serialize_project_group_message,
 )
+from app.services.project_member_runtime import PROJECT_AGENT_DEFAULT_TOOL_NAMES
 from app.services.project_service import (
     accessible_projects_clause,
     add_capability,
@@ -732,6 +733,7 @@ async def get_project_bootstrap_options(
             "source": "inherited",
             "owner_agent_id": str(assignment.agent_id),
             "enabled": assignment.enabled,
+            "enabled_by_default": tool.name in PROJECT_AGENT_DEFAULT_TOOL_NAMES,
         }
         for assignment, tool in inherited_tools
     )

@@ -220,6 +220,8 @@ async def create_project_agent_workspace(
     overwrite: bool = False,
     default_soul: str = DEFAULT_PROJECT_SOUL,
     default_memory: str = DEFAULT_PROJECT_MEMORY,
+    copy_source_memory: bool = True,
+    copy_source_workspace: bool = True,
 ) -> ProjectAgentWorkspaceCopyResult:
     """Create a project snapshot, optionally seeded from a standard AgentDir."""
 
@@ -234,6 +236,8 @@ async def create_project_agent_workspace(
         overwrite,
         default_soul,
         default_memory,
+        copy_source_memory,
+        copy_source_workspace,
     )
 
 
@@ -291,6 +295,8 @@ def _create_local_snapshot(
     overwrite: bool,
     default_soul: str,
     default_memory: str,
+    copy_source_memory: bool,
+    copy_source_workspace: bool,
 ) -> ProjectAgentWorkspaceCopyResult:
     layout.root.mkdir(parents=True, exist_ok=True)
     _reject_symlink_path(layout.root, layout.root)
@@ -311,20 +317,25 @@ def _create_local_snapshot(
             copied,
             skipped_existing,
         )
-        source_memory = source_dir / "memory" / "memory.md"
-        if not source_memory.is_file():
-            source_memory = source_dir / "memory.md"
-        _copy_if_allowed(
-            source_memory,
-            layout.memory,
-            layout.root,
-            "memory.md",
-            overwrite,
-            copied,
-            skipped_existing,
-        )
+        if copy_source_memory:
+            source_memory = source_dir / "memory" / "memory.md"
+            if not source_memory.is_file():
+                source_memory = source_dir / "memory.md"
+            _copy_if_allowed(
+                source_memory,
+                layout.memory,
+                layout.root,
+                "memory.md",
+                overwrite,
+                copied,
+                skipped_existing,
+            )
         source_workspace = source_dir / "workspace"
-        if source_workspace.is_dir() and not source_workspace.is_symlink():
+        if (
+            copy_source_workspace
+            and source_workspace.is_dir()
+            and not source_workspace.is_symlink()
+        ):
             for source, relative_path in _iter_allowed_files(source_workspace, skipped_sensitive):
                 project_relative = f"workspace/{relative_path.as_posix()}"
                 _copy_if_allowed(

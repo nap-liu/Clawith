@@ -30,7 +30,12 @@ from app.models.skill import Skill
 from app.models.subagent_run import SubagentRun
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
-from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
+from app.schemas.project import (
+    ProjectAgentCreate,
+    ProjectCapabilityCreate,
+    ProjectCreate,
+    ProjectMemberCreate,
+)
 
 PROJECT_EVENT_SUMMARY_MAX_LENGTH = 500
 PROJECT_RUNTIME_STATUS_RUNNING = "running"
@@ -894,6 +899,28 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     )
     db.add(project)
     await db.flush()
+
+    from app.services.project_git_service import (
+        initialize_project_repo,
+        project_user_git_email,
+        reconcile_project_repository_operations,
+    )
+
+    git_config = dict((project.settings or {}).get("git") or {})
+    git_mode = git_config.get("mode") or git_config.get("repository_mode", "managed")
+    if git_mode != "managed":
+        raise HTTPException(status_code=501, detail="External Git repositories require a connector")
+    git_state = await initialize_project_repo(
+        project,
+        author_name=user.display_name,
+        author_email=project_user_git_email(user.id),
+    )
+    project.settings = {
+        **(project.settings or {}),
+        "git": {**git_config, "mode": git_mode, **git_state},
+    }
+    await reconcile_project_repository_operations(project.id, db=db)
+
     members = list(data.members)
     if members:
         leader_count = sum(member.is_leader for member in members)
@@ -901,10 +928,43 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
             raise HTTPException(status_code=422, detail="A project can have only one leader")
         if leader_count == 0:
             members[0].is_leader = True
-    for member in members:
-        await add_member(db, project, member, actor_user_id=user.id)
 
-    capabilities = list(data.capabilities)
+    # A newly created project owns independent digital employees. The selected
+    # standard employees are sources for a one-time copy, never live members of
+    # the project. This keeps professional identity, tools and Skill files inside
+    # the project repository while source memory and workspace history stay in
+    # global scope.
+    from app.services.project_agent_service import create_project_agent
+
+    project_agent_ids: list[uuid.UUID] = []
+    source_to_project_agent: dict[uuid.UUID, uuid.UUID] = {}
+    for member in members:
+        project_agent, _project_member = await create_project_agent(
+            db,
+            project,
+            user,
+            ProjectAgentCreate(
+                source_agent_id=member.agent_id,
+                is_leader=member.is_leader,
+            ),
+        )
+        project_agent_ids.append(project_agent.id)
+        source_to_project_agent[member.agent_id] = project_agent.id
+
+    capabilities: list[ProjectCapabilityCreate] = []
+    for capability in data.capabilities:
+        inherited_from_agent_id = capability.inherited_from_agent_id
+        if capability.source == "inherited" and inherited_from_agent_id is not None:
+            inherited_from_agent_id = source_to_project_agent.get(
+                inherited_from_agent_id,
+                inherited_from_agent_id,
+            )
+        capabilities.append(
+            capability.model_copy(
+                update={"inherited_from_agent_id": inherited_from_agent_id},
+            )
+        )
+
     explicit_capability_ids = {capability.capability_id for capability in capabilities}
     for capability_id in data.shared_capability_ids:
         if capability_id in explicit_capability_ids:
@@ -940,10 +1000,93 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
                 source="shared",
             )
         )
-    for capability in capabilities:
-        binding = await add_capability(db, project, capability, actor_user_id=user.id)
-        from app.services.project_member_runtime import sync_project_capability_assignment
 
+    # The capability picker starts from the normalized project starter set and
+    # may add further Tool/MCP dependencies explicitly. Apply only those chosen
+    # identifiers to the copied project employee; source Agent assignments and
+    # configuration are never reused.
+    for member in members:
+        project_agent_id = source_to_project_agent[member.agent_id]
+        for capability_id in member.enabled_inherited_capability_ids:
+            tool = (
+                await db.execute(
+                    select(Tool).where(
+                        Tool.id == capability_id,
+                        Tool.enabled.is_(True),
+                        or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
+                    )
+                )
+            ).scalar_one_or_none()
+            if tool is None:
+                continue
+            normalized_type = "mcp" if tool.type == "mcp" else "tool"
+            normalized_id = tool.mcp_server_id if normalized_type == "mcp" else tool.id
+            if normalized_id is None:
+                continue
+            capabilities.append(
+                ProjectCapabilityCreate(
+                    capability_type=normalized_type,
+                    capability_id=normalized_id,
+                    capability_name=tool.mcp_server_name or tool.display_name or tool.name,
+                    source="inherited",
+                    inherited_from_agent_id=project_agent_id,
+                )
+            )
+
+    from app.services.project_member_runtime import sync_project_capability_assignment
+    from app.services.project_skill_assets import bind_library_skill_to_project_agent
+
+    for capability in capabilities:
+        if capability.capability_type == "skill":
+            targets = (
+                project_agent_ids
+                if capability.source == "shared"
+                else [capability.inherited_from_agent_id]
+            )
+            for target_agent_id in dict.fromkeys(targets):
+                if target_agent_id is None:
+                    continue
+                existing_skill = (
+                    await db.execute(
+                        select(ProjectCapabilityBinding.id).where(
+                            ProjectCapabilityBinding.project_id == project.id,
+                            ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                            ProjectCapabilityBinding.capability_type == "skill",
+                            ProjectCapabilityBinding.capability_id == capability.capability_id,
+                            ProjectCapabilityBinding.inherited_from_agent_id == target_agent_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing_skill is not None:
+                    continue
+                await bind_library_skill_to_project_agent(
+                    db,
+                    project,
+                    skill_id=capability.capability_id,
+                    project_agent_id=target_agent_id,
+                    is_enabled=capability.is_enabled,
+                    scope=capability.scope,
+                    actor_user_id=user.id,
+                    actor_display_name=user.display_name,
+                )
+            continue
+
+        existing_capability = (
+            await db.execute(
+                select(ProjectCapabilityBinding.id).where(
+                    ProjectCapabilityBinding.project_id == project.id,
+                    ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                    ProjectCapabilityBinding.capability_type == capability.capability_type,
+                    ProjectCapabilityBinding.capability_id == capability.capability_id,
+                    ProjectCapabilityBinding.source == capability.source,
+                    ProjectCapabilityBinding.inherited_from_agent_id
+                    == capability.inherited_from_agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_capability is not None:
+            continue
+        binding = await add_capability(db, project, capability, actor_user_id=user.id)
         await sync_project_capability_assignment(db, project, binding)
 
     if data.visibility == "shared" and not data.shared_with_user_ids:
@@ -954,26 +1097,6 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     if members:
         await ensure_project_group_session(db, project)
         await ensure_project_leader_session(db, project)
-    from app.services.project_git_service import (
-        initialize_project_repo,
-        project_user_git_email,
-        reconcile_project_repository_operations,
-    )
-
-    git_config = dict((project.settings or {}).get("git") or {})
-    git_mode = git_config.get("mode") or git_config.get("repository_mode", "managed")
-    if git_mode != "managed":
-        raise HTTPException(status_code=501, detail="External Git repositories require a connector")
-    git_state = await initialize_project_repo(
-        project,
-        author_name=user.display_name,
-        author_email=project_user_git_email(user.id),
-    )
-    project.settings = {
-        **(project.settings or {}),
-        "git": {**git_config, "mode": git_mode, **git_state},
-    }
-    await reconcile_project_repository_operations(project.id, db=db)
     add_event(db, project, "project.created", f"Created project {project.name}", actor_user_id=user.id)
     if project.status == "initializing":
         project.status = "planning"
