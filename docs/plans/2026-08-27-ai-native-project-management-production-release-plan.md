@@ -7,6 +7,25 @@
 
 本次备份范围按用户在 2026-08-27 的明确授权做例外收敛：**不备份 AgentData，不做全库备份，只对迁移和启动 seed 直接影响的既有表执行在线逻辑热备份**。该授权覆盖本发布的默认完整备份要求，但不改变候选迁移必须在短维护窗口排空 writer 后执行的约束。
 
+## 零、Claude 全局项目记忆对齐
+
+本计划已逐项核对 Claude 全局项目记忆中的生产分支、Compose 拓扑、镜像规则、备份约定、Docker 验证和发布授权要求，并按“当前用户指令 > 仓库发布规则 > 历史项目记忆”的优先级处理过期或冲突信息：
+
+| 记忆约束 | 本次执行口径 |
+|---|---|
+| 生产只认 `company/main` | 只获取和比较 `yybpc/company/main`；禁止使用旧的 `yybpc/main`、upstream 或其他远端分支推断生产状态 |
+| 私有版本不自行升级 | 当前 backend/frontend 上游版本事实为 `1.10.3`，发布标识固定为 `v1.10.3-<RELEASE_SHA7>`；历史记忆中的 `1.9.3` 已过期 |
+| Tag 必须绑定构建 SHA | backend、frontend、Git annotated tag、Compose 引用和发布记录必须绑定同一个不可变 `RELEASE_SHA`，不得从可变分支头打 Tag |
+| 所有应用镜像同批构建 | backend 与 frontend 必须从同一干净上下文、同一 SHA 一起构建和推送；AIO 没有源码/基础镜像变化，按仓库最新规则保持现有独立 digest |
+| 生产制品必须为 amd64 | Apple Silicon 仅使用 `docker buildx build --platform linux/amd64 --push`；普通本地 Compose 镜像不得推生产仓库 |
+| 本地验证先于生产 | 当前候选已完成 Docker/PostgreSQL、production build、3011 公共 API 和真实项目验证；生产只做授权后的低风险 smoke，不承担开发测试 |
+| 不做渐进式新旧混跑 | 在单一维护窗口排空 writer，一次切换 backend/frontend 完整制品组合；旧、新 backend 不重叠运行 |
+| 历史完整备份默认 | 被本次用户明确授权覆盖：不备份 AgentData、不做全库/Redis/对象存储备份，只在线热备 11 张受影响既有表并完成隔离恢复演练 |
+| 历史 builtin tool 全量 fan-out | 不适用于本次项目 Agent：按当前产品决定，项目工具默认关闭、由用户逐 Agent 开启，且设置只在当前项目生效，不得修改标准 Agent 或全局工具状态 |
+| 先出计划再执行 | 本文不授权 merge、push、Tag、构建推送、生产只读核对、热备、停写、迁移、切换、真实渠道 smoke 或回滚；每个阶段继续使用独立授权点 |
+
+Claude 记忆中的生产主机、绝对目录和凭证属于运行时运维清单。依照仓库规则，本文不复制凭证或可变生产事实；授权发布会话必须从实际 Compose、运行容器和批准的运维清单重新解析，不允许直接相信历史记忆值。
+
 ## 一、发布目标与不可变边界
 
 ### 1.1 权威代码
@@ -16,7 +35,7 @@
 | 权威主线 | `yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e` |
 | 候选分支 | `feature/ai-native-project-management` |
 | 已验证应用代码 SHA | `d8d6263d8fc96832b15fb9e27f196ee025425a00` |
-| 当前计划基线 HEAD | `51730a783aa9b43d69400fbad57df8f8fc878070` |
+| 当前已提交候选 HEAD（本计划更新前） | `a6d8701372b7131763c05008997f9762787de975` |
 | backend/frontend 版本 | `1.10.3` / `1.10.3` |
 | 当前候选 Alembic head | `repair_tenant_boundary_triggers` |
 | AIO 变更 | 0；不构建、不推送、不切换 |
