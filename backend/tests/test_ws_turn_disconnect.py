@@ -179,3 +179,83 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
         "content": "completed reply",
     }
     handler._safe_send.assert_awaited_once_with({"type": "done", "role": "assistant", "content": "completed reply"})
+
+
+async def test_websocket_turn_wires_parent_subagent_drain_into_round_hook(monkeypatch):
+    """A live Web turn must expose the shared parent-event drain to the caller."""
+
+    class _Result:
+        @staticmethod
+        def scalar_one_or_none():
+            return SimpleNamespace()
+
+    class _Db:
+        @staticmethod
+        async def execute(_statement):
+            return _Result()
+
+    class _DbContext:
+        async def __aenter__(self):
+            return _Db()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    session_id = str(uuid.uuid4())
+    anchor_id = uuid.uuid4()
+
+    async def quiet_receive():
+        await asyncio.sleep(10)
+        return {}
+
+    handler = WebSocketChatHandler(
+        websocket=SimpleNamespace(receive_json=quiet_receive),
+        agent_id=agent_id,
+        token="test",
+        session_id=session_id,
+    )
+    handler.user_id = user_id
+    handler.conv_id = session_id
+    handler.agent_name = "Parent"
+    handler.conversation = []
+    handler._update_activity_and_quota = AsyncMock()
+
+    drain_calls: list[dict] = []
+
+    async def fake_drain(**kwargs):
+        drain_calls.append(kwargs)
+        return [{"role": "user", "content": "late child result"}]
+
+    captured_round_input: list[dict] = []
+
+    async def fake_llm(**kwargs):
+        captured_round_input.extend(await kwargs["before_round"](0))
+        return "merged web reply"
+
+    async def no_onboarding(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.api.websocket.async_session", lambda: _DbContext())
+    monkeypatch.setattr("app.api.websocket.resolve_onboarding_prompt", no_onboarding)
+    monkeypatch.setattr("app.api.websocket.call_llm_with_failover", fake_llm)
+    monkeypatch.setattr("app.services.subagent_runtime.drain_parent_subagent_events", fake_drain)
+
+    result = await handler._run_llm_and_stream(
+        SimpleNamespace(model="test-model"),
+        False,
+        turn_anchor_id=anchor_id,
+    )
+
+    assert result[0] == "merged web reply"
+    assert result[3] == "completed"
+    assert captured_round_input == [{"role": "user", "content": "late child result"}]
+    assert drain_calls == [
+        {
+            "parent_session_id": session_id,
+            "active_turn_anchor_id": anchor_id,
+            "execution_agent_id": agent_id,
+            "execution_user_id": user_id,
+        }
+    ]

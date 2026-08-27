@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.api.tools import AgentToolUpdate, get_agent_tools_with_config, update_agent_tools
 from app.api.websocket import _has_active_subagent_event_turn
@@ -124,7 +124,7 @@ async def _make_context(*, parent_channel: str = "web", project: bool = False):
         parent = ChatSession(
             agent_id=agent.id,
             project_id=project_row.id if project_row is not None else None,
-            user_id=user.id if parent_channel == "web" else None,
+            user_id=user.id if parent_channel in {"web", "dingtalk"} else None,
             title="Parent",
             source_channel=parent_channel,
             is_primary=False,
@@ -1569,6 +1569,486 @@ async def test_async_parent_event_is_deduplicated_and_keeps_execution_agent(monk
     assert dispatch_kwargs
     assert all(kwargs["workload_kind"] is WorkloadKind.PROJECT for kwargs in dispatch_kwargs)
     assert all(kwargs["tenant_id"] != f"web:{parent_id}" for kwargs in dispatch_kwargs)
+
+
+async def test_idle_parent_batches_multiple_subagent_events_into_one_resume(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-batched-parent-wake",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    for index in range(3):
+        await runtime.send_subagent_message_to_parent(
+            agent_id=agent_id,
+            execution_user_id=user_id,
+            origin_tool_call_id=f"batched-child-message-{index}",
+            subagent_session_id=str(run.id),
+            message=f"result {index}",
+        )
+    async with async_session() as db:
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="assistant",
+                content="parent idle",
+                conversation_id=str(parent_id),
+                message_meta={"attachments": []},
+            )
+        )
+        await db.commit()
+        events = (
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.conversation_id == str(run.id),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == runtime.SUBAGENT_PARENT_MESSAGE,
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    resumed = []
+
+    async def fake_resume(batch_anchor):
+        resumed.append(batch_anchor.id)
+        async with async_session() as db:
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content="one merged parent response",
+                    conversation_id=str(parent_id),
+                    message_meta={
+                        "turn_anchor_id": str(batch_anchor.id),
+                        "turn_status": "completed",
+                        "attachments": [],
+                    },
+                )
+            )
+            await db.commit()
+        return True
+
+    async def fake_run_channel_message(_lock_key, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr("app.services.turn_recovery.resume_turn", fake_resume)
+    monkeypatch.setattr(
+        "app.services.channel_dispatch.run_channel_message",
+        fake_run_channel_message,
+    )
+    batches, special_events = await runtime._pending_parent_event_groups(
+        [event.id for event in events]
+    )
+    assert special_events == []
+    assert batches == [[event.id for event in events]]
+    assert await runtime._dispatch_parent_event_batch(batches[0])
+    assert len(resumed) == 1
+
+    async with async_session() as db:
+        projections = (
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.external_event_key.in_(
+                            [f"subagent-parent:{event.id}" for event in events]
+                        )
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(projections) == 3
+    assert projections[0].id == resumed[0]
+    assert projections[0].message_meta["subagent_event_batch"] is True
+    assert all(
+        row.message_meta["subagent_turn_anchor_id"] == str(resumed[0])
+        for row in projections[1:]
+    )
+    pending = await runtime._pending_parent_events(debounce_seconds=0)
+    assert not {event.id for event in events}.intersection(pending)
+
+
+async def test_concurrent_parent_dispatchers_resume_one_batch_once(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-concurrent-parent-wake",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    for index in range(3):
+        await runtime.send_subagent_message_to_parent(
+            agent_id=agent_id,
+            execution_user_id=user_id,
+            origin_tool_call_id=f"concurrent-child-message-{index}",
+            subagent_session_id=str(run.id),
+            message=f"concurrent result {index}",
+        )
+    async with async_session() as db:
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="assistant",
+                content="parent idle",
+                conversation_id=str(parent_id),
+                message_meta={"attachments": []},
+            )
+        )
+        await db.commit()
+        event_ids = list(
+            (
+                await db.execute(
+                    select(ChatMessage.id)
+                    .where(
+                        ChatMessage.conversation_id == str(run.id),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == runtime.SUBAGENT_PARENT_MESSAGE,
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            ).scalars()
+        )
+
+    resumed: list[uuid.UUID] = []
+
+    async def fake_resume(batch_anchor):
+        resumed.append(batch_anchor.id)
+        await asyncio.sleep(0.1)
+        async with async_session() as db:
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content="one concurrent parent response",
+                    conversation_id=str(parent_id),
+                    message_meta={
+                        "turn_anchor_id": str(batch_anchor.id),
+                        "turn_status": "completed",
+                        "attachments": [],
+                    },
+                )
+            )
+            await db.commit()
+        return True
+
+    monkeypatch.setattr("app.services.turn_recovery.resume_turn", fake_resume)
+    await asyncio.gather(
+        runtime._dispatch_parent_event_batch(event_ids),
+        runtime._dispatch_parent_event_batch(event_ids),
+    )
+
+    async with async_session() as db:
+        projection_count = await db.scalar(
+            select(func.count(ChatMessage.id)).where(
+                ChatMessage.external_event_key.in_(
+                    [f"subagent-parent:{event_id}" for event_id in event_ids]
+                )
+            )
+        )
+    assert len(resumed) == 1
+    assert projection_count == 3
+
+
+async def test_compat_single_event_dispatch_resolves_materialized_batch_root_once(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-compat-parent-wake",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    for index in range(3):
+        await runtime.send_subagent_message_to_parent(
+            agent_id=agent_id,
+            execution_user_id=user_id,
+            origin_tool_call_id=f"compat-child-message-{index}",
+            subagent_session_id=str(run.id),
+            message=f"compat result {index}",
+        )
+    async with async_session() as db:
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="assistant",
+                content="parent idle",
+                conversation_id=str(parent_id),
+                message_meta={"attachments": []},
+            )
+        )
+        await db.commit()
+        event_ids = list(
+            (
+                await db.execute(
+                    select(ChatMessage.id)
+                    .where(
+                        ChatMessage.conversation_id == str(run.id),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == runtime.SUBAGENT_PARENT_MESSAGE,
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            ).scalars()
+        )
+
+    root, _injected, status = await runtime._materialize_parent_event_batch(
+        parent_session_id=parent_id,
+        execution_agent_id=agent_id,
+        execution_user_id=user_id,
+        candidate_ids=event_ids,
+    )
+    assert status == "materialized"
+    resumed: list[uuid.UUID] = []
+
+    async def fake_resume(batch_root):
+        resumed.append(batch_root.id)
+        async with async_session() as db:
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content="compat completed",
+                    conversation_id=str(parent_id),
+                    message_meta={
+                        "turn_anchor_id": str(batch_root.id),
+                        "turn_status": "completed",
+                        "attachments": [],
+                    },
+                )
+            )
+            await db.commit()
+        return True
+
+    async def fake_run_channel_message(_lock_key, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr("app.services.turn_recovery.resume_turn", fake_resume)
+    monkeypatch.setattr(
+        "app.services.channel_dispatch.run_channel_message",
+        fake_run_channel_message,
+    )
+    assert await runtime._dispatch_parent_event(event_ids[1])
+    assert await runtime._dispatch_parent_event(event_ids[2])
+    assert resumed == [root.id]
+    pending = await runtime._pending_parent_events(debounce_seconds=0)
+    assert not set(event_ids).intersection(pending)
+
+
+async def test_active_parent_turn_drains_subagent_events_once_and_tool_tail_recovery_keeps_root():
+    from app.services.turn_recovery import _find_turn_anchor_for_latest
+
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-active-parent-wake",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    for index in range(2):
+        await runtime.send_subagent_message_to_parent(
+            agent_id=agent_id,
+            execution_user_id=user_id,
+            origin_tool_call_id=f"active-child-message-{index}",
+            subagent_session_id=str(run.id),
+            message=f"late result {index}",
+        )
+
+    first = await runtime.drain_parent_subagent_events(
+        parent_session_id=str(parent_id),
+        active_turn_anchor_id=anchor_id,
+        execution_agent_id=agent_id,
+        execution_user_id=user_id,
+    )
+    second = await runtime.drain_parent_subagent_events(
+        parent_session_id=str(parent_id),
+        active_turn_anchor_id=anchor_id,
+        execution_agent_id=agent_id,
+        execution_user_id=user_id,
+    )
+    assert len(first) == 2
+    assert "late result 0" in first[0]["content"]
+    assert "late result 1" in first[1]["content"]
+    assert second == []
+
+    async with async_session() as db:
+        projections = (
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.conversation_id == str(parent_id),
+                        ChatMessage.message_meta["subagent_turn_anchor_id"].as_string()
+                        == str(anchor_id),
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        tool_tail = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            role="tool_call",
+            content=json.dumps(
+                {
+                    "name": "read_file",
+                    "call_id": "active-parent-tool-tail",
+                    "args": {"path": "evidence.txt"},
+                    "status": "done",
+                    "result": "durable evidence",
+                }
+            ),
+            conversation_id=str(parent_id),
+            message_meta={
+                "turn_anchor_id": str(anchor_id),
+                "attachments": [],
+            },
+            created_at=projections[-1].created_at + timedelta(microseconds=1),
+        )
+        db.add(tool_tail)
+        await db.commit()
+        recovered_from_projection = await _find_turn_anchor_for_latest(db, projections[-1])
+        recovered_from_tool_tail = await _find_turn_anchor_for_latest(db, tool_tail)
+    assert len(projections) == 2
+    assert recovered_from_projection.id == anchor_id
+    assert recovered_from_tool_tail.id == anchor_id
+
+
+async def test_channel_llm_composes_parent_event_drain_with_existing_round_hook(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context(parent_channel="dingtalk")
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-channel-parent-hook",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    await runtime.send_subagent_message_to_parent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        origin_tool_call_id="channel-parent-hook-result",
+        subagent_session_id=str(run.id),
+        message="channel late result",
+    )
+    captured: list[dict] = []
+
+    async def upstream(_round_i: int) -> list[dict]:
+        return [{"role": "user", "content": "existing round input"}]
+
+    async def fake_provider_dispatch(**kwargs):
+        captured.extend(await kwargs["before_round"](0))
+        return "merged channel answer"
+
+    monkeypatch.setattr(
+        "app.services.llm.call_llm_with_failover",
+        fake_provider_dispatch,
+    )
+    async with async_session() as db:
+        parent = await db.get(ChatSession, parent_id)
+        reply = await channel_llm._call_agent_llm(
+            db,
+            agent_id,
+            "parent request",
+            session_id=str(parent_id),
+            user_id=user_id,
+            prepared_tools=[],
+            include_soul=False,
+            include_memory=False,
+            broadcast_web=False,
+            runtime_session=parent,
+            turn_anchor_id=anchor_id,
+            before_round=upstream,
+        )
+    assert reply == "merged channel answer"
+    assert captured[0] == {"role": "user", "content": "existing round input"}
+    assert "channel late result" in captured[1]["content"]
+
+
+async def test_project_parent_event_stays_on_special_materialization_path(monkeypatch):
+    agent_id, user_id, parent_id, anchor_id = await _make_context(
+        parent_channel="project",
+        project=True,
+    )
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-project-special-parent-wake",
+        task="project child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    await runtime.send_subagent_message_to_parent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        origin_tool_call_id="project-special-result",
+        subagent_session_id=str(run.id),
+        message="project result",
+    )
+    async with async_session() as db:
+        event = await db.scalar(
+            select(ChatMessage)
+            .where(
+                ChatMessage.conversation_id == str(run.id),
+                ChatMessage.message_meta["kind"].as_string()
+                == runtime.SUBAGENT_PARENT_MESSAGE,
+            )
+            .limit(1)
+        )
+
+    batches, special_events = await runtime._pending_parent_event_groups([event.id])
+    assert batches == []
+    assert special_events == [event.id]
+
+    async def fail_batch(_message_ids):
+        raise AssertionError("project parent event must not enter ordinary batching")
+
+    monkeypatch.setattr(runtime, "_dispatch_parent_event_batch", fail_batch)
+    assert await runtime._dispatch_parent_event(event.id)
+    async with async_session() as db:
+        projected = await db.scalar(
+            select(ChatMessage).where(
+                ChatMessage.external_event_key == f"project-subagent:{event.id}"
+            )
+        )
+        ordinary = await db.scalar(
+            select(ChatMessage.id).where(
+                ChatMessage.external_event_key == f"subagent-parent:{event.id}"
+            )
+        )
+    assert projected.role == "assistant"
+    assert projected.message_meta["kind"] == "project_subagent_reply"
+    assert ordinary is None
 
 
 async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(monkeypatch):

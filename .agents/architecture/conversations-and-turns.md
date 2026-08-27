@@ -6,6 +6,17 @@ Web, IM, A2A, trigger, task, webhook, and MCP-facing message paths should delega
 
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
+### Asynchronous Subagent events on parent turns
+
+Ordinary Web, IM, trigger, and non-project A2A parent Sessions use one durable Subagent-event drain rather than one wake turn per child event. A child `ChatMessage` with `subagent_wake=true` remains the notification source, and its parent projection is idempotent through `external_event_key=subagent-parent:<child_message_id>`.
+
+- If the parent is idle, the dispatcher groups a bounded set of events by parent Session and execution identity. The first projection is the root anchor, later projections carry `subagent_turn_anchor_id`, and the batch calls `resume_turn()` once.
+- If a parent turn is running, the shared `before_round` drain binds new projections to that active anchor so the next model iteration sees them without enqueuing another turn.
+- A terminal assistant row for the root anchor completes every projection bound to that root. Startup recovery resolves a latest injected projection back to the root anchor.
+- Project Group/A2A and Leader batching retain their dedicated collaboration semantics.
+
+Do not add a second inbox table, a completion-cohort state machine, or channel-specific copies for this behavior. Preserve per-event audit rows, unique projection keys, bounded batch size, execution-identity validation, and the shared LLM turn loop.
+
 ## Sessions and identities
 
 - P2P: the counterpart is stable for the session, so identity is session-scoped.
