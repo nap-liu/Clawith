@@ -38,6 +38,7 @@ from app.services.project_service import (
 WORK_ITEM_STATUSES = frozenset({"backlog", "todo", "in_progress", "review", "blocked", "done"})
 WORK_ITEM_PRIORITIES = frozenset({"low", "medium", "high", "urgent"})
 PROJECT_RUNTIME_SWITCH_STATUSES = frozenset({"running", "paused"})
+PROJECT_RUNTIME_RESUMABLE_STATUSES = frozenset({"running", "paused", "waiting"})
 
 
 def _git_head(project: Project, commit: str) -> None:
@@ -260,7 +261,7 @@ async def update_project_runtime_status(
     if status not in PROJECT_RUNTIME_SWITCH_STATUSES:
         raise ValueError("Project status must be running or paused")
     await db.refresh(project, with_for_update=True)
-    if project.status not in PROJECT_RUNTIME_SWITCH_STATUSES:
+    if project.status not in PROJECT_RUNTIME_RESUMABLE_STATUSES:
         raise ValueError("The project runtime switch is unavailable in the current project state")
     previous = project.status
     if status == previous:

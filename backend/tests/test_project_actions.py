@@ -3378,6 +3378,36 @@ async def test_planning_leader_session_never_gets_project_runtime_tools(
         )
 
 
+async def test_owner_can_resume_waiting_project(project_api: ProjectApiEnv):
+    from app.models.project import Project, ProjectEvent
+
+    env = project_api
+    project = await _create_project(env, name="Waiting project can resume")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "waiting"
+    await env.db.commit()
+
+    resumed = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"status": "running"},
+    )
+
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["status"] == "running"
+    event = await env.db.scalar(
+        select(ProjectEvent)
+        .where(
+            ProjectEvent.project_id == project_id,
+            ProjectEvent.event_type == "project.resumed",
+        )
+        .order_by(ProjectEvent.created_at.desc())
+    )
+    assert event is not None
+    assert event.event_metadata["previous_status"] == "waiting"
+
+
 async def test_kickoff_requires_leader_discussion_then_freezes_and_starts(project_api: ProjectApiEnv):
     from app.models.project import Project, ProjectRun, ProjectRunMemberSnapshot
     from app.models.subagent_run import SubagentRun

@@ -1580,27 +1580,27 @@ export default function ProjectWorkspacePage() {
             )}
           </p>
         </div>
-        {isOwner && ["running", "paused"].includes(data.project.status) && (
+        {isOwner && ["running", "paused", "waiting"].includes(data.project.status) && (
           <Button
-            variant={data.project.status === "paused" ? "primary" : "secondary"}
+            variant={data.project.status === "running" ? "secondary" : "primary"}
             disabled={busyAction === "project-runtime"}
             onClick={() =>
               setRuntimeDialog(
-                data.project.status === "paused" ? "resume" : "pause",
+                data.project.status === "running" ? "pause" : "resume",
               )
             }
           >
             {busyAction === "project-runtime" ? (
               <IconLoader2 className="project-workspace__spinner" size={16} />
-            ) : data.project.status === "paused" ? (
-              <IconPlayerPlay size={16} />
-            ) : (
+            ) : data.project.status === "running" ? (
               <IconPlayerPause size={16} />
+            ) : (
+              <IconPlayerPlay size={16} />
             )}
             {t(
-              data.project.status === "paused"
-                ? "projectRuntime.resumeAction"
-                : "projectRuntime.pauseAction",
+              data.project.status === "running"
+                ? "projectRuntime.pauseAction"
+                : "projectRuntime.resumeAction",
             )}
           </Button>
         )}
