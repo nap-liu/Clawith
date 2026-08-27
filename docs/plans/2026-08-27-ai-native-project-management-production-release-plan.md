@@ -16,7 +16,7 @@
 | 权威主线 | `yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e` |
 | 候选分支 | `feature/ai-native-project-management` |
 | 已验证应用代码 SHA | `d8d6263d8fc96832b15fb9e27f196ee025425a00` |
-| 当前计划基线 HEAD | `d4fabcc0ccf789e8ef92f1c4b5b43a348b1ef992` |
+| 当前计划基线 HEAD | `51730a783aa9b43d69400fbad57df8f8fc878070` |
 | backend/frontend 版本 | `1.10.3` / `1.10.3` |
 | 当前候选 Alembic head | `repair_tenant_boundary_triggers` |
 | AIO 变更 | 0；不构建、不推送、不切换 |
@@ -53,7 +53,7 @@ v1.10.3-<RELEASE_SHA 前 7 位>
 | 门禁 | 结果 |
 |---|---|
 | 主线关系 | `yybpc/company/main@d963d85c` 是当前候选祖先 |
-| 完整后端分区 | Docker/PostgreSQL：`2741 passed, 28 skipped`，无产品断言失败 |
+| 完整后端分区 | 2026-08-27 最终 Docker/PostgreSQL 主套件 `2676 passed, 28 skipped`；需独立 schema 前提的项目 API/工具矩阵 `65 passed`、legacy 回滚 `1 passed`，均无产品断言失败 |
 | 项目协作 | `515 passed` |
 | 市场与项目设置 | `41 passed` |
 | 最新主线影响套件 | `78 passed` |
@@ -61,9 +61,13 @@ v1.10.3-<RELEASE_SHA 前 7 位>
 | legacy 回滚行为 | PostgreSQL 长期行为 `1 passed`；精确旧镜像 API/worker 演练通过 |
 | 前端 | 完整 prebuild、TypeScript、Vite production build 通过，10,297 modules transformed |
 | 严格真实项目 RC3 | 4/4 工作项、32 Runs、5 个角色、200 个事件、2 个里程碑；失败、活跃、未恢复、未关联均为 0 |
-| 当前压力验证 | 当前最终代码 5×700，共 3,500 次；错误 0；125/125 溢出正确拒绝；DB pool 峰值 30/30；结束 active=0、waiting=0；健康前后 200 |
+| 当前压力验证 | 2026-08-27 最终复跑 5×700，共 3,500 次；错误 0；125/125 溢出正确拒绝；P50/P95/P99 为 399.67/692.55/772.39 ms；DB pool 峰值 30/30；结束 active=0、waiting=0；恢复 0.01 ms；健康前后 200 |
 | Plaza 授权退场 | 3011 `/api/plaza/posts` 为 404；三项工具均 `enabled=false / is_default=false`；runtime switch 为 false |
-| 本地候选 | 3011 健康 200，backend/frontend 运行且 restart count 为 0 |
+| 公开页面兼容 | 修正验证容器的统一存储根后，公开/受保护页面、水印、会话和发布工具行为 `36 passed` |
+| 真实项目复核 | 3011 通过公共 API 重新严格核验 RC3：4/4 工作项、32 Runs、5 个角色、200 事件、2 里程碑，失败/活跃/未恢复/未关联均为 0 |
+| 生产结构迁移演练 | 从本地 1.10.3 数据库只读副本的 `webhook_event_sequence` 升级至 `repair_tenant_boundary_triggers` 成功；既有受影响表迁移前后行数一致 |
+| 热备恢复演练 | 11 张 allowlist 表在线逻辑备份、`pg_restore --list`、结构校验和与隔离恢复行数比对全部通过；archive SHA-256 `2ebf8f7c31abef8755a8268c0f9ce8a5565b5af8d183ae7cedebad32dba5c727` |
+| 本地候选 | 3011 返回健康 200 / 版本 1.10.3；backend 关键源码 checksum 与当前工作树一致，frontend `dist/index.html` checksum 与运行容器一致；应用代码冻结后仅文档变化 |
 
 压力验证使用真实 Docker、PostgreSQL、正式 admission/session/数据库边界代码，供应商等待为受控模拟；它证明当前单实例容量与恢复机制，不构成真实供应商或多实例 fleet 容量承诺。
 

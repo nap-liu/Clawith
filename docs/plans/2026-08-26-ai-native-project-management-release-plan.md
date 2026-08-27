@@ -1,8 +1,10 @@
 # AI 原生项目管理发布前中立审计与发布计划
 
-日期：2026-08-26  
+日期：2026-08-26
 状态：**GO for production preparation（研发与候选验证已闭环；尚未生产发布）**
 权威集成分支：`yybpc/company/main`
+
+发布执行细节以 [2026-08-27 生产发布计划](./2026-08-27-ai-native-project-management-production-release-plan.md) 为准。用户已明确收敛备份范围：本次不备份 AgentData、不做全库备份，只对迁移和启动 seed 直接影响的既有表执行低负载在线逻辑热备份；本文中更早的完整备份假设由该最新授权替代。
 
 ## 一、审计口径
 
@@ -47,11 +49,11 @@
 - 旧 worker 不领取项目 Subagent Run、Schedule 或 Trigger；标准队列仍可领取。
 - `restore` 可重复执行，helper policy、RLS enable、专用角色和分类函数全部清除；项目 Agent、成员、会话、Run、事件和消息快照恢复前后 checksum 均为 `fa0afa5b04f4838c480a24d54d19dce9`，候选恢复后七个项目 API 全部 HTTP 200。
 
-普通应用回滚因此使用“兼容降级 + 旧 backend/frontend digest”，无需默认恢复整套数据。只有数据损坏、兼容降级失败或显式要求回到同一恢复点时，才启用 PostgreSQL、AgentData、Redis/对象存储的一致恢复路径。
+普通应用回滚因此使用“兼容降级 + 旧 backend/frontend digest”，无需默认恢复整套数据。若发生数据损坏或兼容降级失败，本次发布只能依据已授权的受影响表热备份制定选择性修复；不得把本轮未生成的 AgentData、Redis、对象存储或全库备份写成可用回滚材料。
 
 ### A-03 · 已关闭 · 候选验证门禁
 
-验证证据包括：以 Docker/PostgreSQL 分区执行的完整后端唯一用例 `2741 passed, 28 skipped`，没有产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；最新主线合并影响套件 `78 passed`；legacy RLS 持久行为测试 `1 passed`；前端完整 prebuild、TypeScript、Vite production build；授权 Plaza 退场的 3011 API/数据库行为；3011 健康与严格 RC3 跨域验收。源码文本或正则形状测试不计入上述通过数。
+验证证据包括：2026-08-27 最终 Docker/PostgreSQL 主套件 `2676 passed, 28 skipped`，需独立 schema 前提的项目 API/工具矩阵 `65 passed`、legacy RLS 持久行为 `1 passed`，均没有产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；最新主线合并影响套件 `78 passed`；前端完整 prebuild、TypeScript、Vite production build；授权 Plaza 退场的 3011 API/数据库行为；3011 健康与严格 RC3 跨域验收。源码文本或正则形状测试不计入上述通过数。
 
 ### A-04 · 已关闭 · Plaza 授权范围纠偏
 
@@ -71,11 +73,11 @@ Plaza 全局退场是用户已授权的独立产品决策，不是项目能力�
 
 当前不建议在发布前做大规模重构，以免扩大回归面；但发布后应冻结继续堆叠，按“页面区块、领域服务、共享组件”拆分，并保持 API 与用户行为不变。
 
-### A-07 · P1 运行前提 · 完整备份容量必须先确认
+### A-07 · 已关闭 · 精简热备份边界已确认
 
-生产 AgentData 约 37 GB、数据库约 10 GB，当前数据盘剩余约 70 GB。本次变更同时写数据库与项目仓库，不能省略 AgentData 或数据库备份。正式窗口前必须完成压缩后体积测量或准备独立快照/外部备份目标，禁止在 cutover 时临时尝试并把主数据盘写满。
+本次发布不生成 AgentData 备份或全库 dump。热备份 allowlist 固定为 `alembic_version`、`agents`、`skills`、`skill_files`、`tools`、`agent_tools`、`chat_sessions`、`subagent_runs`、`agent_relationships`、`agent_agent_relationships`、`agent_activity_logs`；采用单连接一致性 snapshot、短锁等待、低优先级和在线监控，不停止生产写入。
 
-A-07 是生产发布执行前提，不是未完成的研发任务。它只在获得发布授权并进入生产准备后执行；不影响本轮开发完成结论，但未满足时禁止停写与切换。
+隔离 Docker 已完成一次 allowlist 热备份与恢复演练：归档可列出、结构校验和可核对、11 张表恢复行数与来源一致。正式发布仍需在 AUTH-3 后记录生产 snapshot LSN、性能基线、归档 checksum 与恢复清单；未获得授权或监控门禁异常时禁止进入迁移切换。
 
 ### A-08 · 已关闭 · 项目能力故障不得影响原稳定能力
 
@@ -86,7 +88,7 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 1. A-01 创建补偿、A-02 legacy RLS、A-03 候选验证、A-04 Plaza 授权范围纠偏和 A-08 故障隔离已关闭。
 2. 最新主线 `d963d85c` 已由 `e04de8dd` 合入；Plaza 授权纠偏后的应用代码候选冻结为 `d8d6263d`。
 3. 文档收口提交后记录最终不可变 `RELEASE_SHA`；应用制品的代码门禁 SHA 为 `d8d6263d`，其后的提交只允许文档变化。
-4. 准确记录“完整后端分区 2741 passed/28 skipped + 合并影响 78 passed + legacy RLS 1 passed + Plaza 退场 API/数据库行为”，不把相互重叠的分区简单相加为唯一测试数。
+4. 准确记录“最终主套件 2676 passed/28 skipped + 独立项目 API/工具矩阵 65 passed + legacy RLS 1 passed + 合并影响 78 passed + Plaza 退场 API/数据库行为”，不把相互重叠的分区简单相加为唯一测试数。
 5. backend/frontend 的 `VERSION` 必须继续一致为 `1.10.3`。
 6. 发布标识按 `v1.10.3-<RELEASE_SHA 前 7 位>` 生成，不提升私有语义版本。
 7. Git tag 必须直接指向完整 `RELEASE_SHA`；合并、tag、push 和发布分别等待用户明确授权。
@@ -108,7 +110,7 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 - 从生产当前 `webhook_event_sequence` 升级到候选唯一 head `repair_tenant_boundary_triggers`。
 - 验证新增项目表、Agent 项目字段、会话/运行关联、执行用户字段、活动枚举和索引。
 - 记录迁移时间和锁等待；当前受影响核心表约为 Agents 125 行、ChatSession 23,345 行、SubagentRun 63 行，预计迁移较短，但以演练实测为准。
-- 完整 backend 唯一用例采用适配其数据库前提的 Docker/PostgreSQL 分区执行：`2741 passed, 28 skipped`，无产品断言失败。主线合并影响套件 `78 passed`、legacy RLS 持久行为测试 `1 passed` 和 Plaza 退场 API/数据库行为作为收口证据单列，不重复累加。
+- 最终 backend 主套件在迁移后的真实 1.10.3 结构副本上执行为 `2676 passed, 28 skipped`；会重建 schema 的项目 API/工具矩阵独立执行 `65 passed`，legacy RLS 持久行为独立执行 `1 passed`，均无产品断言失败。主线合并影响套件 `78 passed` 和 Plaza 退场 API/数据库行为作为收口证据单列，不重复累加。
 - 验证 19 个用户项目工具写入数据库、默认关闭、没有给标准数字员工自动启用；运行时工具集合与数据库一致。
 - A-01 创建校验、服务链失败、成员/资产复制失败和最终提交失败均通过可观察行为验证；数据库、项目根目录、AgentDir 和 Git 操作记录无孤儿。
 - A-02 使用应用候选中的 helper 和精确旧镜像复跑：专用旧服务角色、48 张表边界、API/worker 分角色、深链 404、项目队列不领取、幂等 restore 和候选恢复全部通过；`d8d6263d` 未修改该 helper 或对应测试。
@@ -160,8 +162,8 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 2. 生成候选 Compose，检查只有 backend/frontend digest 和本轮必要配置变化。
 3. 在隔离容器中用生产环境变量渲染 frontend nginx 模板，验证 `/api`、`/ws`、`/mcp`、上传和对象存储代理；`API_UPSTREAM` 必须非空。
 4. 生产只拉取候选 digest，不在生产构建源码。
-5. 检查数据盘和备份目标；完成 37 GB AgentData 的备份方法与耗时演练。
-6. 创建带时间戳的备份目录占位，但权威备份只能在停写后生成。
+5. 检查受影响表热备份目标和资源余量；本次不创建 AgentData 或全库备份。
+6. 创建带时间戳的证据目录；在线热备份只能在 AUTH-3 后按 allowlist 和监控中止门禁执行。
 7. 准备回滚脚本，写入当前生产两个应用 digest；不删除卷、不执行 `docker compose down`。
 8. 记录负责人：发布负责人/数据负责人/回滚负责人由刘喜确认；操作人与验证人由授权发布会话确定。
 9. 确认维护窗口、预计停写时长、通知渠道和用户通知文本。
@@ -174,22 +176,11 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 2. 确认 AIO 没有仍在写 AgentData 的后台作业；必要时仅停止 AIO，切换后仍用原镜像恢复。
 3. 停止 frontend 和全部应用 writer，包括 backend、worker、connector、trigger 和 schedule 角色。
 4. 确认旧 backend 进程数为 0。禁止新旧 backend 重叠。
-5. PostgreSQL、Redis 和存储保持运行以完成一致备份。
+5. PostgreSQL、Redis 和存储保持运行；切换前确认已授权的在线受影响表热备份证据完整。
 
-### 7.2 权威备份
+### 7.2 已授权的受影响表热备份
 
-停写后立即生成：
-
-- PostgreSQL custom-format dump；
-- Redis RDB；
-- AgentData 完整归档或一致存储快照；
-- 对象存储快照/清单（若生产对象存储为权威来源）；
-- 生效 Compose、候选渲染 Compose、必要的环境配置快照；
-- 旧/新 backend/frontend tag 与 digest、AIO digest；
-- 迁移前 revision、备份时间、遗漏项和恢复命令；
-- SHA-256 清单和可执行回滚脚本。
-
-必须用 `pg_restore --list` 验证数据库备份，检查所有校验和及归档可读性。数据库、Redis、AgentData 或对象存储的任何省略都需要本次发布的单独授权。
+热备份在停写前在线完成，不关闭入口；仅包含 A-07 的 11 张既有表，不包含 AgentData、Redis、对象存储或全库 dump。必须记录 snapshot LSN、开始/结束时间、表清单、行数与 SHA-256，并以 `pg_restore --list` 和隔离恢复演练验证归档。热备期间出现锁等待、连接池、延迟、5xx、CPU、IO 或复制延迟异常时立即中止，本次发布保持 NO-GO。
 
 ### 7.3 切换顺序
 
@@ -248,8 +239,8 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 
 1. **入口开放前且尚未产生候选写入**：停止候选 writer，执行上述兼容降级步骤，恢复旧 backend/frontend digest，健康后恢复入口。允许保留经演练确认对旧服务无影响的新增表、可空列和历史元数据。
 2. **已产生项目数据但数据库未损坏**：停止候选 writer，执行同一兼容降级，确认项目 Agent 不进入旧目录、55 个或发布前记录的标准 Agent 集合完整，再切换精确旧 digest。普通回滚不要求抹除所有项目 schema 或历史变化。
-3. **兼容降级失败、出现数据损坏或旧服务无法保持原能力**：停止全部 writer，按同一恢复点恢复 PostgreSQL、AgentData、Redis/对象存储，再恢复旧 backend/frontend digest。该灾备路径会丢弃恢复点之后的写入，必须由数据负责人批准。
-4. 不单独执行未经演练的 Alembic downgrade，也不只恢复数据库或只恢复 AgentData。应用回滚使用已经验证的完整兼容序列；灾备恢复必须保持所有权威数据源同点。
+3. **兼容降级失败、出现数据损坏或旧服务无法保持原能力**：停止全部 writer；由 Data Owner 单独授权后，先在隔离数据库恢复受影响表热备份并制定逐表/逐行修复方案。禁止把整份表 dump 直接覆盖生产，也不得假设存在本轮未生成的全库或 AgentData 恢复点。
+4. 不单独执行未经演练的 Alembic downgrade。默认回滚只使用已验证的兼容序列与旧应用 digest，保留项目 schema 和历史数据。
 
 ## 十、授权检查点
 
@@ -263,4 +254,4 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 - 真实生产渠道验收；
 - 回滚或数据恢复。
 
-A-01、A-02、A-03、A-04 和 A-08 已关闭，应用候选结论为 `GO for production preparation`。A-07 在生产准备阶段作为执行前提完成，不回退成研发任务。该 GO 不构成生产发布授权；只有 A-07 就绪并取得构建推送、停写、备份、迁移、切换和生产验收的逐项明确授权后，才允许执行对应操作。
+A-01、A-02、A-03、A-04、A-07 和 A-08 已关闭，应用候选结论为 `GO for production preparation`。该 GO 不构成生产发布授权；只有最终制品、生产动态值、AUTH-3 在线热备份证据及迁移、切换和生产验收的逐项明确授权齐备后，才允许执行对应操作。
