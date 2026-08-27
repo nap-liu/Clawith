@@ -774,6 +774,7 @@ class DingTalkStreamManager:
                     if not sender_staff_id and sender_id:
                         sender_staff_id = sender_id  # fallback
                     sender_nick = incoming.sender_nick or ""
+                    chatbot_user_id = incoming.chatbot_user_id or ""
                     message_id = incoming.message_id or ""
                     conversation_id = incoming.conversation_id or ""
                     conversation_type = incoming.conversation_type or "1"
@@ -815,6 +816,7 @@ class DingTalkStreamManager:
                                             _cid=conversation_id, _ctype=conversation_type,
                                             _nick=sender_nick,
                                             _mid=message_id, _sid=sender_id,
+                                            _bot_uid=chatbot_user_id,
                                             _title=conversation_title, _reactions=reactions):
                                 from app.api.dingtalk import _check_message_dedup
 
@@ -837,6 +839,7 @@ class DingTalkStreamManager:
                                     sender_nick=_nick,
                                     message_id=_mid,
                                     sender_id=_sid,
+                                    chatbot_user_id=_bot_uid,
                                     conversation_title=_title,
                                     channel_reactions=_reactions,
                                     quoted_message=quoted_message,
@@ -870,7 +873,8 @@ class DingTalkStreamManager:
                                                   _ssid=sender_staff_id, _cid=conversation_id,
                                                   _ctype=conversation_type,
                                                   _nick=sender_nick, _mid=message_id,
-                                                  _sid=sender_id, _title=conversation_title,
+                                                  _sid=sender_id, _bot_uid=chatbot_user_id,
+                                                  _title=conversation_title,
                                                   _reactions=reactions):
                                 from app.api.dingtalk import _check_message_dedup
 
@@ -887,6 +891,7 @@ class DingTalkStreamManager:
                                     sender_nick=_nick,
                                     message_id=_mid,
                                     sender_id=_sid,
+                                    chatbot_user_id=_bot_uid,
                                     conversation_title=_title,
                                     channel_reactions=_reactions,
                                 )
@@ -927,6 +932,7 @@ class DingTalkStreamManager:
                 sender_nick: str = "",
                 message_id: str = "",
                 sender_id: str = "",
+                chatbot_user_id: str = "",
                 conversation_title: str = "",
                 channel_reactions: ChannelReactions | None = None,
             ):
@@ -983,6 +989,7 @@ class DingTalkStreamManager:
                     sender_nick=sender_nick,
                     message_id=message_id,
                     sender_id=sender_id,
+                    chatbot_user_id=chatbot_user_id,
                     conversation_title=conversation_title,
                     channel_reactions=channel_reactions,
                     quoted_message=quoted_message,

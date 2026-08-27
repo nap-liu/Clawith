@@ -53,6 +53,8 @@ from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.chat_attachments import attachment_from_workspace_path
+from app.services.dingtalk_quoted_message import has_trusted_dingtalk_sender_alias
+from app.services.quoted_message import resolve_quoted_message_sender
 
 router = APIRouter(tags=["dingtalk"])
 
@@ -418,6 +420,7 @@ async def process_dingtalk_message(
     sender_nick: str = "",
     message_id: str = "",
     sender_id: str = "",
+    chatbot_user_id: str = "",
     conversation_title: str = "",
     channel_reactions=None,
     quoted_message: dict | None = None,
@@ -439,6 +442,8 @@ async def process_dingtalk_message(
 
     async with async_session() as db:
         sender_staff_id = (sender_staff_id or "").strip()
+        sender_id = (sender_id or "").strip()
+        chatbot_user_id = (chatbot_user_id or "").strip()
 
         # Load agent
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
@@ -760,6 +765,40 @@ async def process_dingtalk_message(
                     logger.info("[DingTalk] Backfilled enterprise org member identity fields")
 
         platform_user_id = platform_user.id
+
+        # Learn the opaque DingTalk senderId only from a callback that also
+        # carried a real corporate staff id.  The Stream adapter falls back to
+        # senderId when senderStaffId is absent, so equal values are not trusted
+        # identity evidence.
+        trusted_sender_alias = has_trusted_dingtalk_sender_alias(
+            sender_staff_id,
+            sender_id,
+        )
+        if _dingtalk_provider is None and (trusted_sender_alias or quoted_message):
+            _dingtalk_provider = await _get_tenant_dingtalk_provider(
+                db,
+                agent_obj.tenant_id,
+            )
+
+        if trusted_sender_alias and _dingtalk_provider is not None:
+            await channel_user_service.remember_provider_user_alias(
+                db,
+                provider=_dingtalk_provider,
+                channel_type="dingtalk",
+                id_type="sender_id",
+                subject=sender_id,
+                user=platform_user,
+            )
+
+        quoted_message = await resolve_quoted_message_sender(
+            db,
+            quoted_message,
+            provider=_dingtalk_provider,
+            channel_type="dingtalk",
+            provider_sender_id_type="sender_id",
+            agent=agent_obj,
+            agent_provider_ref=chatbot_user_id,
+        )
 
         # Check for channel commands (/new, /reset)
         from app.services.channel_commands import (

@@ -10,6 +10,7 @@ import pytest
 from app.services import dingtalk_stream
 from app.services.chat_history import build_llm_message_from_row
 from app.services.chat_message_serializer import serialize_chat_message_for_client
+from app.services.dingtalk_quoted_message import has_trusted_dingtalk_sender_alias
 from app.services.quoted_message import (
     normalize_quoted_message,
     render_quoted_message_for_llm,
@@ -18,7 +19,14 @@ from app.services.quoted_message import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_text_quote_is_normalized_with_sender_and_provider_identity():
+async def test_sender_alias_requires_distinct_staff_and_opaque_ids():
+    assert has_trusted_dingtalk_sender_alias("staff-1", "opaque-1") is True
+    assert has_trusted_dingtalk_sender_alias("opaque-1", "opaque-1") is False
+    assert has_trusted_dingtalk_sender_alias("", "opaque-1") is False
+    assert has_trusted_dingtalk_sender_alias("staff-1", "") is False
+
+
+async def test_real_text_quote_shape_keeps_opaque_sender_for_platform_resolution():
     quote = await dingtalk_stream._parse_dingtalk_quoted_message(
         {
             "msgtype": "text",
@@ -29,7 +37,6 @@ async def test_text_quote_is_normalized_with_sender_and_provider_identity():
                     "msgType": "text",
                     "msgId": "quoted-message-id",
                     "senderId": "quoted-sender-id",
-                    "senderNick": "张三",
                     "createdAt": 1785405000000,
                     "content": {"text": "被引用的原文"},
                 },
@@ -47,7 +54,6 @@ async def test_text_quote_is_normalized_with_sender_and_provider_identity():
         "attachments": [],
         "provider_message_id": "quoted-message-id",
         "sender_ref": "quoted-sender-id",
-        "sender_name": "张三",
         "provider_message_type": "text",
         "created_at_ms": 1785405000000,
     }

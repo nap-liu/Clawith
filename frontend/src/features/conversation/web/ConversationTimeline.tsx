@@ -261,7 +261,7 @@ function MessageItem({ agentId, msg, view, unavailable, onDownload, onUnavailabl
                         {showSender && <div className="chat-msg-sender">{sender}</div>}
                         {quotedMessage && <div className="conversation-quoted-message">
                             <div className="conversation-quoted-message__header">
-                                <span>↪ {quotedMessage.sender_name || '引用消息'}</span>
+                                <span>↪ {quotedMessage.sender_name || '发送人未知'}</span>
                                 <span>{getChatQuotedMessageTypeLabel(quotedMessage.message_type)}</span>
                             </div>
                             {quotedPreviews.length > 0 && <div className="conversation-image-list">{renderPreviews(quotedPreviews)}</div>}

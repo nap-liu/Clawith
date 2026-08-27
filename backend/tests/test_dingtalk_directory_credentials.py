@@ -19,7 +19,8 @@ from app.models.agent import Agent
 from app.models.channel_config import ChannelConfig
 from app.models.identity import IdentityProvider
 from app.models.llm import LLMModel
-from app.models.org import OrgMember
+from app.models.org import ChannelUserBinding, OrgMember
+from app.models.participant import Participant  # noqa: F401 - register FK metadata
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 
@@ -290,6 +291,7 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
     await process_dingtalk_message(
         agent_id=agent_id,
         sender_staff_id=sender_staff_id,
+        sender_id=f"opaque-{suffix}",
         user_text="please enrich my identity",
         conversation_id=f"conversation-{suffix}",
         conversation_type="1",
@@ -299,6 +301,7 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
     await process_dingtalk_message(
         agent_id=agent_id,
         sender_staff_id=sender_staff_id,
+        sender_id=f"opaque-{suffix}",
         user_text="refresh my bound identity",
         conversation_id=f"conversation-{suffix}",
         conversation_type="1",
@@ -326,6 +329,17 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
                 )
             )
         ).scalar_one()
+        provider_alias = (
+            await db.execute(
+                select(ChannelUserBinding).where(
+                    ChannelUserBinding.provider_id == provider_id,
+                    ChannelUserBinding.installation_scope == f"provider:{provider_id}",
+                    ChannelUserBinding.channel_type == "dingtalk",
+                    ChannelUserBinding.id_type == "sender_id",
+                    ChannelUserBinding.subject == f"opaque-{suffix}",
+                )
+            )
+        ).scalar_one()
 
     if email_already_claimed:
         assert identity is None
@@ -346,3 +360,4 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
     assert member.phone == mobile
     assert member.email == real_email
     assert member.unionid == f"union-{suffix}"
+    assert provider_alias.user_id == member.user_id
