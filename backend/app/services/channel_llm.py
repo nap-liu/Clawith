@@ -381,6 +381,39 @@ async def _call_agent_llm(
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id
 
+    # Ordinary parent Sessions share the same durable Subagent-event inbox as
+    # Web Chat. A child Session keeps its existing, child-specific before_round
+    # hook; project Sessions retain their dedicated group/A2A batching policy.
+    if runtime_session is None and session_id:
+        from app.models.chat_session import ChatSession
+
+        try:
+            runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
+        except (TypeError, ValueError):
+            runtime_session = None
+    try:
+        parent_event_execution_user_id = (
+            uuid.UUID(str(effective_user_id)) if effective_user_id is not None else None
+        )
+    except (TypeError, ValueError):
+        parent_event_execution_user_id = None
+    if (
+        turn_anchor_id is not None
+        and runtime_session is not None
+        and runtime_session.source_channel != "subagent"
+        and runtime_session.project_id is None
+        and parent_event_execution_user_id is not None
+    ):
+        from app.services.subagent_runtime import build_parent_subagent_before_round
+
+        before_round = build_parent_subagent_before_round(
+            parent_session_id=session_id,
+            active_turn_anchor_id=turn_anchor_id,
+            execution_agent_id=agent_id,
+            execution_user_id=parent_event_execution_user_id,
+            upstream=before_round,
+        )
+
     # Centralized tool-call persistence: wrap the channel callback so EVERY IM
     # channel stores completed tool calls with one canonical schema (shared
     # persist_tool_call) — making them visible in the web UI and replayable in

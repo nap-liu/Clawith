@@ -49,6 +49,16 @@ _CARD_TEXT_KEYS = {
 }
 
 
+def has_trusted_dingtalk_sender_alias(
+    sender_staff_id: str,
+    sender_id: str,
+) -> bool:
+    """Return whether one callback carried two distinct sender identifiers."""
+    staff_ref = str(sender_staff_id or "").strip()
+    opaque_ref = str(sender_id or "").strip()
+    return bool(staff_ref and opaque_ref and staff_ref != opaque_ref)
+
+
 def _content_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -339,19 +349,25 @@ async def parse_dingtalk_quoted_message(
         created_at_ms = int(created_at) if created_at is not None else None
     except (TypeError, ValueError):
         created_at_ms = None
+    provider_sender_ref = str(
+        replied_msg.get("senderId") or replied_msg.get("senderStaffId") or ""
+    ).strip()
     normalized = normalize_quoted_message(
         {
             "message_type": message_type,
             "provider_message_type": raw_type,
             "provider_message_id": replied_msg.get("msgId"),
-            "sender_ref": replied_msg.get("senderStaffId") or replied_msg.get("senderId"),
-            "sender_name": replied_msg.get("senderNick"),
             "created_at_ms": created_at_ms,
             "content_status": content_status,
             "text": quoted_text,
             "attachments": attachments,
         }
     )
+    if normalized is not None and provider_sender_ref:
+        # Adapter-private, request-local resolution input.  The shared
+        # normalizer deliberately drops it before persistence, API output, or
+        # LLM rendering.
+        normalized["_provider_sender_ref"] = provider_sender_ref
     logger.info(
         "[DingTalk] Parsed quoted message type={} status={} attachments={}/{}",
         raw_type or "unknown",

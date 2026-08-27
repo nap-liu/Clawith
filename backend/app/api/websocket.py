@@ -1880,6 +1880,19 @@ class WebSocketChatHandler:
                     except Exception:
                         pass
 
+                parent_events_before_round = None
+                if turn_anchor_id is not None:
+                    from app.services.subagent_runtime import (
+                        build_parent_subagent_before_round,
+                    )
+
+                    parent_events_before_round = build_parent_subagent_before_round(
+                        parent_session_id=self.conv_id,
+                        active_turn_anchor_id=turn_anchor_id,
+                        execution_agent_id=self.agent_id,
+                        execution_user_id=self.user_id,
+                    )
+
                 return await call_llm_with_failover(
                     primary_model=effective_llm_model,
                     fallback_model=self.fallback_llm_model,
@@ -1900,6 +1913,7 @@ class WebSocketChatHandler:
                     turn_anchor_id=turn_anchor_id,
                     turn_type="web",
                     context_recovery=context_recovery,
+                    before_round=parent_events_before_round,
                 )
 
             llm_task = asyncio.create_task(_call_with_failover())

@@ -73,6 +73,35 @@ const {
 }
 
 {
+    const providerRef = 'legacy-provider-sender-id';
+    const unknownSender = normalizeChatQuotedMessage({
+        message_type: 'text',
+        content_status: 'available',
+        text: '引用正文',
+        attachments: [],
+        sender_ref: providerRef,
+        sender_name: 'untrusted provider nickname',
+    });
+    assert.equal(unknownSender.sender_status, 'unknown');
+    assert.equal(Object.hasOwn(unknownSender, 'sender_ref'), false);
+    assert.equal(Object.hasOwn(unknownSender, 'sender_name'), false);
+
+    const senderUserId = '9275f720-016d-4ea1-a1bf-366cbd62f57b';
+    const resolvedSender = normalizeChatQuotedMessage({
+        message_type: 'text',
+        content_status: 'available',
+        text: '引用正文',
+        attachments: [],
+        sender_status: 'resolved',
+        sender_user_id: senderUserId,
+        sender_name: 'Canonical Sender',
+    });
+    assert.equal(resolvedSender.sender_status, 'resolved');
+    assert.equal(resolvedSender.sender_user_id, senderUserId);
+    assert.equal(resolvedSender.sender_name, 'Canonical Sender');
+}
+
+{
     const cases = [
         ['contract.PDF', undefined, undefined, 'pdf'],
         ['proposal.docx', undefined, undefined, 'word'],

@@ -443,20 +443,42 @@ async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
 
 
 async def _find_turn_anchor_for_latest(db, latest_row: ChatMessage) -> ChatMessage | None:
-    if latest_row.role == "user":
-        return latest_row
-    result = await db.execute(
-        select(ChatMessage)
-        .where(
-            ChatMessage.agent_id == latest_row.agent_id,
-            ChatMessage.conversation_id == latest_row.conversation_id,
-            ChatMessage.role == "user",
-            ChatMessage.compacted_into.is_(None),
-        )
-        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
+    candidate = latest_row
+    if latest_row.role != "user":
+        candidate = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.agent_id == latest_row.agent_id,
+                    ChatMessage.conversation_id == latest_row.conversation_id,
+                    ChatMessage.role == "user",
+                    ChatMessage.compacted_into.is_(None),
+                )
+                .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if candidate is None:
+        return None
+
+    meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
+    injected_root_id = meta.get("subagent_turn_anchor_id")
+    if not injected_root_id:
+        return candidate
+    try:
+        root_id = uuid.UUID(str(injected_root_id))
+    except (TypeError, ValueError):
+        return None
+    root = await db.get(ChatMessage, root_id)
+    if (
+        root is None
+        or root.role != "user"
+        or root.agent_id != candidate.agent_id
+        or root.conversation_id != candidate.conversation_id
+        or root.user_id != candidate.user_id
+    ):
+        return None
+    return root
 
 
 async def _tail_has_pending_confirmation(db, anchor: ChatMessage, *, ctx_size: int) -> bool:

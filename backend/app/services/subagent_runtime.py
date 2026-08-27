@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 
@@ -52,6 +53,9 @@ LEASE_SECONDS = 60
 WORKER_CONCURRENCY = 4
 PROJECT_LEADER_BATCH_MAX_REPLIES = 12
 PROJECT_LEADER_BATCH_MAX_BYTES = 24 * 1024
+PARENT_EVENT_BATCH_MAX_MESSAGES = 20
+PARENT_EVENT_BATCH_MAX_BYTES = 24 * 1024
+PARENT_EVENT_BATCH_DEBOUNCE_SECONDS = 0.5
 
 settings = get_settings()
 _running_tasks: dict[uuid.UUID, asyncio.Task] = {}
@@ -2460,7 +2464,354 @@ async def _subagent_worker_loop() -> None:
         active.add(task)
 
 
-async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
+def _parent_event_external_key(child_message_id: uuid.UUID) -> str:
+    return f"subagent-parent:{child_message_id}"
+
+
+def _parent_event_content(event: ChatMessage, child: ChatSession) -> str:
+    label = {
+        SUBAGENT_PARENT_MESSAGE: "message",
+        SUBAGENT_COMPLETION: "completed",
+        SUBAGENT_FAILURE: "failed",
+    }.get(_message_meta(event).get("kind"), "event")
+    return (
+        f'<subagent-event subagent_id="{child.id}" type="{label}">\n'
+        f"{event.content}\n"
+        "</subagent-event>"
+    )
+
+
+async def _parent_event_candidates(
+    db,
+    *,
+    parent_session_id: uuid.UUID,
+    execution_agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    candidate_ids: list[uuid.UUID] | None = None,
+) -> list[tuple[ChatMessage, SubagentRun, ChatSession]]:
+    child_session = aliased(ChatSession)
+    parent_projection = aliased(ChatMessage)
+    parent_final = aliased(ChatMessage)
+    completed_projection_exists = exists(
+        select(parent_final.id)
+        .select_from(parent_projection)
+        .join(
+            parent_final,
+            parent_final.conversation_id == parent_projection.conversation_id,
+        )
+        .where(
+            parent_projection.external_event_key
+            == ("subagent-parent:" + cast(ChatMessage.id, String)),
+            parent_final.role == "assistant",
+            parent_final.message_meta["turn_anchor_id"].as_string()
+            == func.coalesce(
+                parent_projection.message_meta["subagent_turn_anchor_id"].as_string(),
+                cast(parent_projection.id, String),
+            ),
+        )
+    )
+    stmt = (
+        select(ChatMessage, SubagentRun, child_session)
+        .join(
+            SubagentRun,
+            cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
+        )
+        .join(child_session, child_session.id == SubagentRun.id)
+        .where(
+            SubagentRun.parent_session_id == parent_session_id,
+            SubagentRun.execution_user_id == execution_user_id,
+            child_session.agent_id == execution_agent_id,
+            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+            ChatMessage.message_meta["kind"]
+            .as_string()
+            .in_([SUBAGENT_PARENT_MESSAGE, SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
+            ~completed_projection_exists,
+        )
+        .order_by(ChatMessage.created_at, ChatMessage.id)
+        .limit(PARENT_EVENT_BATCH_MAX_MESSAGES * 4)
+    )
+    if candidate_ids is not None:
+        if not candidate_ids:
+            return []
+        stmt = stmt.where(ChatMessage.id.in_(candidate_ids))
+    return [tuple(row) for row in (await db.execute(stmt)).all()]
+
+
+async def _parent_event_projections(
+    db,
+    event_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, ChatMessage]:
+    if not event_ids:
+        return {}
+    key_to_event_id = {
+        _parent_event_external_key(event_id): event_id for event_id in event_ids
+    }
+    rows = (
+        (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.external_event_key.in_(list(key_to_event_id))
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        key_to_event_id[row.external_event_key]: row
+        for row in rows
+        if row.external_event_key in key_to_event_id
+    }
+
+
+async def _parent_turn_has_terminal_reply(
+    db,
+    *,
+    parent_session_id: uuid.UUID,
+    anchor_id: uuid.UUID,
+) -> bool:
+    return bool(
+        await db.scalar(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.conversation_id == str(parent_session_id),
+                ChatMessage.role == "assistant",
+                ChatMessage.message_meta["turn_anchor_id"].as_string()
+                == str(anchor_id),
+            )
+            .limit(1)
+        )
+    )
+
+
+async def _materialize_parent_event_batch(
+    *,
+    parent_session_id: uuid.UUID,
+    execution_agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    active_turn_anchor_id: uuid.UUID | None = None,
+    candidate_ids: list[uuid.UUID] | None = None,
+) -> tuple[ChatMessage | None, list[dict], str]:
+    """Project a bounded event batch onto one ordinary parent logical turn."""
+    from app.services.execution_identity import ExecutionIdentityError
+
+    async with async_session() as db:
+        parent = await db.get(ChatSession, parent_session_id, with_for_update=True)
+        if parent is None:
+            return None, [], "gone"
+        if parent.project_id is not None:
+            return None, [], "special"
+
+        candidates = await _parent_event_candidates(
+            db,
+            parent_session_id=parent.id,
+            execution_agent_id=execution_agent_id,
+            execution_user_id=execution_user_id,
+            candidate_ids=candidate_ids,
+        )
+        if not candidates:
+            return None, [], "empty"
+
+        event_ids = [event.id for event, _run, _child in candidates]
+        projections = await _parent_event_projections(db, event_ids)
+        projected_root_ids: list[uuid.UUID] = []
+        for projection in projections.values():
+            raw_root_id = _message_meta(projection).get("subagent_turn_anchor_id")
+            try:
+                projected_root_ids.append(
+                    uuid.UUID(str(raw_root_id)) if raw_root_id else projection.id
+                )
+            except (TypeError, ValueError):
+                continue
+
+        root: ChatMessage | None = None
+        if active_turn_anchor_id is not None:
+            root = await db.get(ChatMessage, active_turn_anchor_id, with_for_update=True)
+            if (
+                root is None
+                or root.conversation_id != str(parent.id)
+                or root.user_id != execution_user_id
+            ):
+                return None, [], "busy"
+            root_meta = _message_meta(root)
+            if root_meta.get("turn_status") in {"cancelled", "failed"}:
+                return None, [], "busy"
+            raw_root_execution_agent_id = root_meta.get("execution_agent_id")
+            if raw_root_execution_agent_id:
+                try:
+                    if uuid.UUID(str(raw_root_execution_agent_id)) != execution_agent_id:
+                        return None, [], "busy"
+                except (TypeError, ValueError):
+                    return None, [], "busy"
+            elif root.agent_id != execution_agent_id:
+                return None, [], "busy"
+            if any(root_id != root.id for root_id in projected_root_ids):
+                return None, [], "busy"
+        elif projected_root_ids:
+            root_id = projected_root_ids[0]
+            root = await db.get(ChatMessage, root_id, with_for_update=True)
+            if root is None or root.conversation_id != str(parent.id):
+                return None, [], "busy"
+            # Only synthetic Subagent roots are resumed by the idle daemon.
+            # A projection already attached to a human/channel turn is owned by
+            # that turn and its ordinary crash-recovery path.
+            if _message_meta(root).get("kind") != SUBAGENT_PARENT_EVENT:
+                return None, [], "busy"
+        else:
+            latest = (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.conversation_id == str(parent.id))
+                    .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if latest is not None and latest.role != "assistant":
+                return None, [], "busy"
+
+        if root is not None and await _parent_turn_has_terminal_reply(
+            db,
+            parent_session_id=parent.id,
+            anchor_id=root.id,
+        ):
+            return root, [], "completed"
+
+        valid: list[tuple[ChatMessage, SubagentRun, ChatSession, str]] = []
+        invalid: list[tuple[ChatMessage, SubagentRun, ChatSession, str]] = []
+        total_bytes = 0
+        for event, run, child in candidates:
+            if event.id in projections:
+                continue
+            try:
+                await _validate_execution_identity(db, run, child)
+            except (ExecutionIdentityError, RuntimeError) as exc:
+                logger.warning(
+                    "[subagent] parent event identity invalid event=%s: %s",
+                    event.id,
+                    type(exc).__name__,
+                )
+                invalid.append((event, run, child, _parent_event_content(event, child)))
+                continue
+            content = _parent_event_content(event, child)
+            event_bytes = len(content.encode("utf-8")) + 256
+            if valid and (
+                len(valid) >= PARENT_EVENT_BATCH_MAX_MESSAGES
+                or total_bytes + event_bytes > PARENT_EVENT_BATCH_MAX_BYTES
+            ):
+                break
+            valid.append((event, run, child, content))
+            total_bytes += min(event_bytes, PARENT_EVENT_BATCH_MAX_BYTES)
+
+        materialized_status = "materialized"
+        if not valid:
+            if active_turn_anchor_id is not None or projections or not invalid:
+                return root, [], "identity_invalid" if not projections else "claimed"
+            # Keep the pre-existing observable failure contract: an idle event
+            # with a revoked execution identity gets one auditable parent turn
+            # and a terminal failure reply, but it is never sent to the model.
+            valid = [invalid[0]]
+            materialized_status = "identity_invalid"
+
+        now = datetime.now(UTC)
+        injected: list[dict] = []
+        for index, (event, run, child, content) in enumerate(valid):
+            projection_id = uuid.uuid4()
+            is_new_root = root is None and index == 0
+            if is_new_root:
+                root_id = projection_id
+            else:
+                root_id = root.id if root is not None else projection_id
+            event_meta = _message_meta(event)
+            projection_meta = {
+                "kind": SUBAGENT_PARENT_EVENT,
+                "execution_agent_id": str(child.agent_id),
+                "subagent_id": str(child.id),
+                "child_message_id": str(event.id),
+                "attachments": list(event_meta.get("attachments") or []),
+                **(
+                    {"turn_status": "running", "subagent_event_batch": True}
+                    if is_new_root
+                    else {"subagent_turn_anchor_id": str(root_id)}
+                ),
+            }
+            projection = ChatMessage(
+                id=projection_id,
+                agent_id=parent.agent_id,
+                user_id=run.execution_user_id,
+                sender_agent_id=child.agent_id,
+                role="user",
+                content=content,
+                conversation_id=str(parent.id),
+                external_event_key=_parent_event_external_key(event.id),
+                message_meta=projection_meta,
+                created_at=now + timedelta(microseconds=index),
+            )
+            db.add(projection)
+            if is_new_root:
+                root = projection
+            injected.append({"role": "user", "content": content})
+
+        parent.last_message_at = now + timedelta(microseconds=len(valid) - 1)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            return None, [], "busy"
+        return root, injected, materialized_status
+
+
+async def drain_parent_subagent_events(
+    *,
+    parent_session_id: str,
+    active_turn_anchor_id: uuid.UUID,
+    execution_agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+) -> list[dict]:
+    """Inject newly completed child events at one parent LLM round boundary."""
+    try:
+        parent_id = uuid.UUID(str(parent_session_id))
+    except (TypeError, ValueError):
+        return []
+    _root, injected, _status = await _materialize_parent_event_batch(
+        parent_session_id=parent_id,
+        execution_agent_id=execution_agent_id,
+        execution_user_id=execution_user_id,
+        active_turn_anchor_id=active_turn_anchor_id,
+    )
+    return injected
+
+
+def build_parent_subagent_before_round(
+    *,
+    parent_session_id: str,
+    active_turn_anchor_id: uuid.UUID,
+    execution_agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    upstream: Callable[[int], Awaitable[list[dict]]] | None = None,
+) -> Callable[[int], Awaitable[list[dict]]]:
+    """Compose one shared parent-event round hook for Web and channel turns."""
+
+    async def _before_round(round_i: int) -> list[dict]:
+        injected = list(await upstream(round_i)) if upstream is not None else []
+        injected.extend(
+            await drain_parent_subagent_events(
+                parent_session_id=parent_session_id,
+                active_turn_anchor_id=active_turn_anchor_id,
+                execution_agent_id=execution_agent_id,
+                execution_user_id=execution_user_id,
+            )
+        )
+        return injected
+
+    return _before_round
+
+
+async def _pending_parent_events(
+    limit: int = 50,
+    *,
+    debounce_seconds: float = PARENT_EVENT_BATCH_DEBOUNCE_SECONDS,
+) -> list[uuid.UUID]:
+    cutoff = datetime.now(UTC) - timedelta(seconds=max(0.0, debounce_seconds))
     async with async_session() as db:
         parent_anchor = aliased(ChatMessage)
         parent_final = aliased(ChatMessage)
@@ -2476,7 +2827,11 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
             .where(
                 parent_anchor.external_event_key == ("subagent-parent:" + cast(ChatMessage.id, String)),
                 parent_final.role == "assistant",
-                parent_final.message_meta["turn_anchor_id"].as_string() == cast(parent_anchor.id, String),
+                parent_final.message_meta["turn_anchor_id"].as_string()
+                == func.coalesce(
+                    parent_anchor.message_meta["subagent_turn_anchor_id"].as_string(),
+                    cast(parent_anchor.id, String),
+                ),
             )
         )
         project_materialized_exists = exists(
@@ -2503,6 +2858,7 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
                                 SUBAGENT_FAILURE,
                             ]
                         ),
+                        ChatMessage.created_at <= cutoff,
                         ~completed_exists,
                         ~project_materialized_exists,
                     )
@@ -2836,14 +3192,6 @@ async def _materialize_project_a2a_turn(
 
 
 async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
-    from app.services.channel_dispatch import (
-        ChannelReactions,
-        chat_session_lock_key,
-        run_channel_message,
-    )
-    from app.services.execution_identity import ExecutionIdentityError
-    from app.services.turn_recovery import resume_turn
-
     async with async_session() as db:
         event = await db.get(ChatMessage, child_message_id)
         if event is None:
@@ -2857,7 +3205,6 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         parent = await db.get(ChatSession, run.parent_session_id) if run else None
         if run is None or child is None or parent is None:
             return True
-        lock_key = chat_session_lock_key(parent)
 
     if parent.source_channel == "agent" and parent.project_id is not None and child.project_id == parent.project_id:
         return await _materialize_project_a2a_turn(
@@ -2922,146 +3269,165 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
             except IntegrityError:
                 await db.rollback()
             return True
+    return await _dispatch_parent_event_batch([child_message_id])
 
-    external_key = f"subagent-parent:{child_message_id}"
+
+async def _pending_parent_event_groups(
+    message_ids: list[uuid.UUID],
+) -> tuple[list[list[uuid.UUID]], list[uuid.UUID]]:
+    """Split ordinary parent batches from project-specific single events."""
+    if not message_ids:
+        return [], []
+    child_session = aliased(ChatSession)
+    parent_session = aliased(ChatSession)
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(
+                    ChatMessage.id,
+                    SubagentRun.parent_session_id,
+                    SubagentRun.execution_user_id,
+                    child_session.agent_id,
+                    parent_session.project_id,
+                )
+                .join(
+                    SubagentRun,
+                    cast(ChatMessage.conversation_id, String)
+                    == cast(SubagentRun.id, String),
+                )
+                .join(child_session, child_session.id == SubagentRun.id)
+                .join(parent_session, parent_session.id == SubagentRun.parent_session_id)
+                .where(ChatMessage.id.in_(message_ids))
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
+        ).all()
+    batches: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], list[uuid.UUID]] = {}
+    special: list[uuid.UUID] = []
+    for message_id, parent_id, execution_user_id, execution_agent_id, project_id in rows:
+        if project_id is not None:
+            special.append(message_id)
+            continue
+        key = (parent_id, execution_user_id, execution_agent_id)
+        batches.setdefault(key, []).append(message_id)
+    return list(batches.values()), special
+
+
+async def _persist_parent_batch_identity_failure(
+    *,
+    anchor: ChatMessage,
+    parent: ChatSession,
+    run: SubagentRun,
+    child: ChatSession,
+    exc: BaseException,
+) -> None:
+    from app.services.chat_history import persist_assistant_reply_row
+
+    async with async_session() as db:
+        stored_anchor = await db.get(ChatMessage, anchor.id, with_for_update=True)
+        if stored_anchor is None:
+            return
+        completed = await db.scalar(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.conversation_id == str(parent.id),
+                ChatMessage.role == "assistant",
+                ChatMessage.message_meta["turn_anchor_id"].as_string()
+                == str(stored_anchor.id),
+            )
+            .limit(1)
+        )
+        if completed is not None:
+            return
+        meta = _message_meta(stored_anchor)
+        meta["turn_status"] = "failed"
+        stored_anchor.message_meta = meta
+        await persist_assistant_reply_row(
+            db,
+            agent_id=child.agent_id,
+            user_id=run.execution_user_id,
+            conversation_id=str(parent.id),
+            content=(
+                "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
+                f"Agent 访问权限。({type(exc).__name__})"
+            ),
+            message_meta={
+                "kind": "subagent_event_failure",
+                "attachments": [],
+            },
+            turn_anchor_id=stored_anchor.id,
+        )
+        stored_parent = await db.get(ChatSession, parent.id)
+        if stored_parent is not None:
+            stored_parent.last_message_at = datetime.now(UTC)
+        await db.commit()
+
+
+async def _dispatch_parent_event_batch(message_ids: list[uuid.UUID]) -> bool:
+    """Materialize one bounded ordinary-parent batch and resume it once."""
+    if not message_ids:
+        return False
+    from app.services.channel_dispatch import (
+        ChannelReactions,
+        chat_session_lock_key,
+        run_channel_message,
+    )
+    from app.services.execution_identity import ExecutionIdentityError
+    from app.services.turn_recovery import resume_turn
+
+    async with async_session() as db:
+        first_event = await db.get(ChatMessage, message_ids[0])
+        if first_event is None:
+            return True
+        try:
+            child_id = uuid.UUID(str(first_event.conversation_id))
+        except (TypeError, ValueError):
+            return True
+        run = await db.get(SubagentRun, child_id)
+        child = await db.get(ChatSession, child_id)
+        parent = await db.get(ChatSession, run.parent_session_id) if run else None
+        if run is None or child is None or parent is None:
+            return True
+        if parent.project_id is not None:
+            return False
+        lock_key = chat_session_lock_key(parent)
 
     async def _work() -> str:
-        anchor: ChatMessage | None = None
-        async with async_session() as db:
-            locked_parent = await db.get(
-                ChatSession,
-                parent.id,
-                with_for_update=True,
-            )
-            if locked_parent is None:
-                return "gone"
-            anchor = (
-                await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == external_key))
-            ).scalar_one_or_none()
-            latest = (
-                await db.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.conversation_id == str(parent.id))
-                    .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if anchor is None:
-                if latest is not None and latest.role != "assistant":
-                    return "busy"
-                event_meta = _message_meta(event)
-                event_kind = event_meta.get("kind")
-                label = {
-                    SUBAGENT_PARENT_MESSAGE: "message",
-                    SUBAGENT_COMPLETION: "completed",
-                    SUBAGENT_FAILURE: "failed",
-                }.get(event_kind, "event")
-                anchor = ChatMessage(
-                    agent_id=parent.agent_id,
-                    user_id=run.execution_user_id,
-                    sender_agent_id=child.agent_id,
-                    role="user",
-                    content=(
-                        f'<subagent-event subagent_id="{child.id}" type="{label}">\n{event.content}\n</subagent-event>'
-                    ),
-                    conversation_id=str(parent.id),
-                    external_event_key=external_key,
-                    message_meta={
-                        "kind": SUBAGENT_PARENT_EVENT,
-                        "execution_agent_id": str(child.agent_id),
-                        "subagent_id": str(child.id),
-                        "child_message_id": str(child_message_id),
-                        "attachments": [],
-                        "turn_status": "running",
-                    },
-                )
-                db.add(anchor)
-                locked_parent.last_message_at = datetime.now(UTC)
-                try:
-                    await db.commit()
-                except IntegrityError:
-                    await db.rollback()
-                    anchor = (
-                        await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == external_key))
-                    ).scalar_one()
-            else:
-                completed = (
-                    await db.execute(
-                        select(ChatMessage.id)
-                        .where(
-                            ChatMessage.conversation_id == str(parent.id),
-                            ChatMessage.role == "assistant",
-                            ChatMessage.message_meta["turn_anchor_id"].as_string() == str(anchor.id),
-                        )
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if completed is not None:
-                    return "already_processed"
-                if latest is not None and latest.id != anchor.id and latest.role != "assistant":
-                    return "busy"
+        anchor, _injected, status = await _materialize_parent_event_batch(
+            parent_session_id=parent.id,
+            execution_agent_id=child.agent_id,
+            execution_user_id=run.execution_user_id,
+            candidate_ids=message_ids,
+        )
+        if status in {"gone", "empty", "completed"}:
+            return "processed"
+        if status == "identity_invalid" and anchor is None:
+            return "identity_invalid"
+        if anchor is None:
+            return "busy"
+
+        root_meta = _message_meta(anchor)
+        try:
+            root_child_id = uuid.UUID(str(root_meta.get("subagent_id")))
+        except (TypeError, ValueError):
+            return "busy"
         async with async_session() as check_db:
-            fresh_latest = (
-                await check_db.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.conversation_id == str(parent.id))
-                    .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if fresh_latest is not None and fresh_latest.id != anchor.id and fresh_latest.role != "assistant":
-                return "busy"
-            live_run = await check_db.get(SubagentRun, child.id)
-            live_child = await check_db.get(ChatSession, child.id)
+            live_run = await check_db.get(SubagentRun, root_child_id)
+            live_child = await check_db.get(ChatSession, root_child_id)
             try:
                 if live_run is None or live_child is None:
                     raise RuntimeError("Subagent lifecycle no longer exists")
                 await _validate_execution_identity(check_db, live_run, live_child)
             except (ExecutionIdentityError, RuntimeError) as exc:
-                from app.services.chat_history import persist_assistant_reply_row
-
-                async with async_session() as failed_db:
-                    stored_anchor = await failed_db.get(
-                        ChatMessage,
-                        anchor.id,
-                        with_for_update=True,
-                    )
-                    if stored_anchor is None:
-                        return "gone"
-                    completed = (
-                        await failed_db.execute(
-                            select(ChatMessage.id)
-                            .where(
-                                ChatMessage.conversation_id == str(parent.id),
-                                ChatMessage.role == "assistant",
-                                ChatMessage.message_meta["turn_anchor_id"].as_string() == str(stored_anchor.id),
-                            )
-                            .limit(1)
-                        )
-                    ).scalar_one_or_none()
-                    if completed is None:
-                        meta = _message_meta(stored_anchor)
-                        meta["turn_status"] = "failed"
-                        stored_anchor.message_meta = meta
-                        await persist_assistant_reply_row(
-                            failed_db,
-                            agent_id=child.agent_id,
-                            user_id=run.execution_user_id,
-                            conversation_id=str(parent.id),
-                            content=(
-                                "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
-                                f"Agent 访问权限。({type(exc).__name__})"
-                            ),
-                            message_meta={
-                                "kind": "subagent_event_failure",
-                                "attachments": [],
-                            },
-                            turn_anchor_id=stored_anchor.id,
-                        )
-                        failed_parent = await failed_db.get(ChatSession, parent.id)
-                        if failed_parent is not None:
-                            failed_parent.last_message_at = datetime.now(UTC)
-                        await failed_db.commit()
+                if live_run is None or live_child is None:
+                    live_run = run
+                    live_child = child
+                await _persist_parent_batch_identity_failure(
+                    anchor=anchor,
+                    parent=parent,
+                    run=live_run,
+                    child=live_child,
+                    exc=exc,
+                )
                 return "processed"
         resumed = await resume_turn(anchor)
         return "processed" if resumed else "busy"
@@ -4679,7 +5045,24 @@ async def _subagent_parent_dispatch_loop() -> None:
             await asyncio.sleep(1)
             continue
         made_progress = False
-        for message_id in pending:
+        try:
+            parent_batches, special_events = await _pending_parent_event_groups(pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - daemon must survive transient DB faults
+            logger.exception(f"[subagent] parent event grouping failed: {exc}")
+            await asyncio.sleep(1)
+            continue
+        for message_ids in parent_batches:
+            try:
+                made_progress = await _dispatch_parent_event_batch(message_ids) or made_progress
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate each durable event
+                logger.exception(
+                    f"[subagent] parent event batch dispatch failed messages={message_ids}: {exc}"
+                )
+        for message_id in special_events:
             try:
                 made_progress = await _dispatch_parent_event(message_id) or made_progress
             except asyncio.CancelledError:
