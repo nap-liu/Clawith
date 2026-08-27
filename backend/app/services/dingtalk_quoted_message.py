@@ -349,19 +349,25 @@ async def parse_dingtalk_quoted_message(
         created_at_ms = int(created_at) if created_at is not None else None
     except (TypeError, ValueError):
         created_at_ms = None
+    provider_sender_ref = str(
+        replied_msg.get("senderId") or replied_msg.get("senderStaffId") or ""
+    ).strip()
     normalized = normalize_quoted_message(
         {
             "message_type": message_type,
             "provider_message_type": raw_type,
             "provider_message_id": replied_msg.get("msgId"),
-            "sender_ref": replied_msg.get("senderId") or replied_msg.get("senderStaffId"),
-            "sender_name": replied_msg.get("senderNick"),
             "created_at_ms": created_at_ms,
             "content_status": content_status,
             "text": quoted_text,
             "attachments": attachments,
         }
     )
+    if normalized is not None and provider_sender_ref:
+        # Adapter-private, request-local resolution input.  The shared
+        # normalizer deliberately drops it before persistence, API output, or
+        # LLM rendering.
+        normalized["_provider_sender_ref"] = provider_sender_ref
     logger.info(
         "[DingTalk] Parsed quoted message type={} status={} attachments={}/{}",
         raw_type or "unknown",

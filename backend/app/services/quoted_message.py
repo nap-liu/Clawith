@@ -14,7 +14,6 @@ from app.services.channel_user_service import channel_user_service
 from app.services.chat_attachments import normalize_attachment_metadata
 
 QUOTED_MESSAGE_STATUSES = {"available", "partial", "unavailable", "failed"}
-QUOTED_SENDER_STATUSES = {"resolved", "unknown"}
 MAX_QUOTED_TEXT_LENGTH = 20_000
 MAX_QUOTED_LABEL_LENGTH = 255
 MAX_QUOTED_ID_LENGTH = 1024
@@ -50,7 +49,6 @@ def normalize_quoted_message(raw: Any) -> dict[str, Any] | None:
 
     optional_strings = {
         "provider_message_id": MAX_QUOTED_ID_LENGTH,
-        "sender_ref": MAX_QUOTED_ID_LENGTH,
         "sender_name": MAX_QUOTED_LABEL_LENGTH,
     }
     for key, limit in optional_strings.items():
@@ -69,7 +67,7 @@ def normalize_quoted_message(raw: Any) -> dict[str, Any] | None:
             result["sender_user_id"] = sender_user_id
         else:
             result["sender_agent_id"] = sender_agent_id
-    elif sender_status in QUOTED_SENDER_STATUSES:
+    else:
         result["sender_status"] = "unknown"
         result.pop("sender_name", None)
 
@@ -106,11 +104,17 @@ async def resolve_quoted_message_sender(
     or an explicit unknown actor.  Raw provider identifiers are never used as
     actor identities in LLM context.
     """
+    sender_ref = ""
+    if isinstance(raw_quote, dict):
+        sender_ref = _string(
+            raw_quote.get("_provider_sender_ref") or raw_quote.get("sender_ref"),
+            limit=MAX_QUOTED_ID_LENGTH,
+        )
+
     quote = normalize_quoted_message(raw_quote)
     if quote is None:
         return None
 
-    sender_ref = str(quote.get("sender_ref") or "").strip()
     quote.pop("sender_name", None)
     quote.pop("sender_user_id", None)
     quote.pop("sender_agent_id", None)

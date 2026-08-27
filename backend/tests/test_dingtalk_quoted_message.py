@@ -26,7 +26,7 @@ async def test_sender_alias_requires_distinct_staff_and_opaque_ids():
     assert has_trusted_dingtalk_sender_alias("staff-1", "") is False
 
 
-async def test_real_text_quote_shape_keeps_opaque_sender_for_platform_resolution():
+async def test_real_text_quote_shape_keeps_opaque_sender_only_for_request_resolution():
     quote = await dingtalk_stream._parse_dingtalk_quoted_message(
         {
             "msgtype": "text",
@@ -53,10 +53,24 @@ async def test_real_text_quote_shape_keeps_opaque_sender_for_platform_resolution
         "text": "被引用的原文",
         "attachments": [],
         "provider_message_id": "quoted-message-id",
-        "sender_ref": "quoted-sender-id",
+        "sender_status": "unknown",
+        "_provider_sender_ref": "quoted-sender-id",
         "provider_message_type": "text",
         "created_at_ms": 1785405000000,
     }
+
+    serialized = serialize_chat_message_for_client(
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            role="user",
+            content="current message",
+            message_meta={"quoted_message": quote},
+            thinking=None,
+            created_at=datetime(2026, 8, 27, tzinfo=UTC),
+        )
+    )
+    assert "sender_ref" not in serialized["quoted_message"]
+    assert "_provider_sender_ref" not in serialized["quoted_message"]
 
 
 @pytest.mark.parametrize(
@@ -321,6 +335,40 @@ async def test_quote_metadata_is_visible_to_llm_history_and_clients():
     assert llm_message["attachments"] == [attachment]
     assert client_message["display_content"] == "请分析这条消息"
     assert client_message["quoted_message"] == quote
+
+
+async def test_legacy_raw_quote_identity_is_scrubbed_from_client_and_llm():
+    provider_ref = "legacy-provider-sender-id"
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="user",
+        content="current message",
+        message_meta={
+            "quoted_message": {
+                "message_type": "text",
+                "content_status": "available",
+                "text": "quoted body",
+                "attachments": [],
+                "sender_ref": provider_ref,
+                "sender_name": "untrusted provider nickname",
+            }
+        },
+        thinking=None,
+        created_at=datetime(2026, 8, 27, tzinfo=UTC),
+        sender_user_id=None,
+        user_id=None,
+    )
+
+    client_message = serialize_chat_message_for_client(row)
+    quoted_message = client_message["quoted_message"]
+    assert quoted_message["sender_status"] == "unknown"
+    assert "sender_ref" not in quoted_message
+    assert "sender_name" not in quoted_message
+
+    llm_message = build_llm_message_from_row(row)
+    assert llm_message is not None
+    assert provider_ref not in str(llm_message["content"])
+    assert "untrusted provider nickname" not in str(llm_message["content"])
 
 
 async def test_rendered_current_message_is_not_lost_when_quote_is_unavailable():

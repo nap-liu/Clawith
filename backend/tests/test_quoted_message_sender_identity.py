@@ -115,6 +115,8 @@ async def test_provider_alias_resolves_to_same_platform_user_across_agents(
     assert resolved["sender_user_id"] == str(canonical_user.id)
     assert resolved["sender_name"] == "Canonical Sender"
     assert "sender_agent_id" not in resolved
+    assert "sender_ref" not in resolved
+    assert "_provider_sender_ref" not in resolved
 
     llm_content = render_quoted_message_for_llm("current body", resolved)
     context = json.loads(llm_content.splitlines()[1])
@@ -292,3 +294,5 @@ async def test_provider_self_reference_resolves_to_platform_agent():
     assert resolved["sender_agent_id"] == str(agent.id)
     assert resolved["sender_name"] == "Canonical Agent"
     assert "sender_user_id" not in resolved
+    assert "sender_ref" not in resolved
+    assert "_provider_sender_ref" not in resolved

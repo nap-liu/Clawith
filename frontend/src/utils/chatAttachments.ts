@@ -20,7 +20,9 @@ export type ChatQuotedMessage = {
     message_type: string;
     provider_message_type?: string;
     provider_message_id?: string;
-    sender_ref?: string;
+    sender_status?: 'resolved' | 'unknown';
+    sender_user_id?: string;
+    sender_agent_id?: string;
     sender_name?: string;
     created_at_ms?: number;
     content_status: 'available' | 'partial' | 'unavailable' | 'failed';
@@ -189,6 +191,9 @@ export function normalizeChatQuotedMessage(raw: unknown): ChatQuotedMessage | un
         const text = String(value[key] || '').trim();
         return text || undefined;
     };
+    const senderUserId = optionalString('sender_user_id');
+    const senderAgentId = optionalString('sender_agent_id');
+    const senderResolved = value.sender_status === 'resolved' && Boolean(senderUserId) !== Boolean(senderAgentId);
     return {
         message_type: String(value.message_type || 'unknown').trim().toLowerCase() || 'unknown',
         content_status: contentStatus,
@@ -196,8 +201,10 @@ export function normalizeChatQuotedMessage(raw: unknown): ChatQuotedMessage | un
         attachments: normalizeApiAttachments(value.attachments),
         ...(optionalString('provider_message_type') ? { provider_message_type: optionalString('provider_message_type') } : {}),
         ...(optionalString('provider_message_id') ? { provider_message_id: optionalString('provider_message_id') } : {}),
-        ...(optionalString('sender_ref') ? { sender_ref: optionalString('sender_ref') } : {}),
-        ...(optionalString('sender_name') ? { sender_name: optionalString('sender_name') } : {}),
+        sender_status: senderResolved ? 'resolved' : 'unknown',
+        ...(senderResolved && senderUserId ? { sender_user_id: senderUserId } : {}),
+        ...(senderResolved && senderAgentId ? { sender_agent_id: senderAgentId } : {}),
+        ...(senderResolved && optionalString('sender_name') ? { sender_name: optionalString('sender_name') } : {}),
         ...(typeof value.created_at_ms === 'number' && Number.isFinite(value.created_at_ms)
             ? { created_at_ms: value.created_at_ms }
             : {}),
