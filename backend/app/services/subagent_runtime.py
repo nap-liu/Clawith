@@ -56,10 +56,48 @@ PROJECT_LEADER_BATCH_MAX_BYTES = 24 * 1024
 PARENT_EVENT_BATCH_MAX_MESSAGES = 20
 PARENT_EVENT_BATCH_MAX_BYTES = 24 * 1024
 PARENT_EVENT_BATCH_DEBOUNCE_SECONDS = 0.5
+DISPATCH_RECOVERY_INTERVAL_SECONDS = 60.0
+LEGACY_PARENT_RECOVERY_INTERVAL_SECONDS = 300.0
+DISPATCH_RETRY_INTERVAL_SECONDS = 5.0
+
+SUBAGENT_DISPATCH_PENDING = "pending"
+SUBAGENT_DISPATCH_DELIVERED = "delivered"
+SUBAGENT_DISPATCH_DISCARDED = "discarded"
 
 settings = get_settings()
 _running_tasks: dict[uuid.UUID, asyncio.Task] = {}
 _running_tasks_guard = asyncio.Lock()
+_dispatch_wakeup = asyncio.Event()
+_project_dispatch_wakeup = asyncio.Event()
+
+
+def _signal_dispatch_work() -> None:
+    """Wake the local durable dispatcher after a producer commit."""
+
+    _dispatch_wakeup.set()
+
+
+def _signal_project_dispatch_work() -> None:
+    """Wake project-only dispatch without coupling it to ordinary parents."""
+
+    _project_dispatch_wakeup.set()
+
+
+async def _finish_parent_event_dispatch(
+    message_id: uuid.UUID,
+    state: str,
+) -> None:
+    """Move an ordinary wake event out of the active queue idempotently."""
+
+    async with async_session() as db:
+        event = await db.get(ChatMessage, message_id, with_for_update=True)
+        if event is None:
+            return
+        event.message_meta = {
+            **_message_meta(event),
+            "subagent_dispatch_state": state,
+        }
+        await db.commit()
 
 
 class SubagentError(ValueError):
@@ -902,6 +940,8 @@ async def send_subagent_message_to_parent(
     if not call_id:
         raise SubagentError("缺少当前工具调用标识，无法可靠发送消息。")
     event_key = f"subagent-child-message:{child_id}:{call_id}"
+    should_wake_dispatcher = False
+    should_wake_project_dispatcher = False
 
     async with async_session() as db:
         run = await db.get(SubagentRun, child_id, with_for_update=True)
@@ -921,6 +961,8 @@ async def send_subagent_message_to_parent(
         ).scalar_one_or_none()
         if existing is not None:
             return
+        should_wake_dispatcher = run.mode == "async"
+        should_wake_project_dispatcher = should_wake_dispatcher and run.project_id is not None
         now = datetime.now(UTC)
         db.add(
             ChatMessage(
@@ -933,7 +975,12 @@ async def send_subagent_message_to_parent(
                 external_event_key=event_key,
                 message_meta={
                     "kind": SUBAGENT_PARENT_MESSAGE,
-                    "subagent_wake": run.mode == "async",
+                    "subagent_wake": should_wake_dispatcher,
+                    **(
+                        {"subagent_dispatch_state": SUBAGENT_DISPATCH_PENDING}
+                        if should_wake_dispatcher
+                        else {}
+                    ),
                     "attachments": [],
                 },
                 created_at=now,
@@ -941,6 +988,10 @@ async def send_subagent_message_to_parent(
         )
         child.last_message_at = now
         await db.commit()
+    if should_wake_project_dispatcher:
+        _signal_project_dispatch_work()
+    elif should_wake_dispatcher:
+        _signal_dispatch_work()
 
 
 async def stop_subagent(
@@ -1952,6 +2003,11 @@ async def _finish_subagent_turn(
             message_meta={
                 "kind": kind,
                 "subagent_wake": terminal and run.mode == "async",
+                **(
+                    {"subagent_dispatch_state": SUBAGENT_DISPATCH_PENDING}
+                    if terminal and run.mode == "async"
+                    else {}
+                ),
                 "attachments": [],
                 "project_run_ids": [str(value) for value in sorted(project_run_ids, key=str)],
                 **({"reply_quality": reply_quality} if reply_quality else {}),
@@ -1971,6 +2027,11 @@ async def _finish_subagent_turn(
         else:
             run.lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)
         await db.commit()
+        if terminal and run.mode == "async":
+            if run.project_id is not None:
+                _signal_project_dispatch_work()
+            else:
+                _signal_dispatch_work()
         return terminal
 
 
@@ -2510,6 +2571,25 @@ async def _parent_event_candidates(
             ),
         )
     )
+    dispatch_state = ChatMessage.message_meta["subagent_dispatch_state"].as_string()
+    wake_predicate = or_(
+        dispatch_state == SUBAGENT_DISPATCH_PENDING,
+        and_(
+            dispatch_state.is_(None),
+            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+        ),
+    )
+    candidate_conditions = [
+        SubagentRun.parent_session_id == parent_session_id,
+        SubagentRun.execution_user_id == execution_user_id,
+        child_session.agent_id == execution_agent_id,
+        wake_predicate,
+        ChatMessage.message_meta["kind"]
+        .as_string()
+        .in_([SUBAGENT_PARENT_MESSAGE, SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
+    ]
+    if candidate_ids is None:
+        candidate_conditions.append(~completed_projection_exists)
     stmt = (
         select(ChatMessage, SubagentRun, child_session)
         .join(
@@ -2517,16 +2597,7 @@ async def _parent_event_candidates(
             cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
         )
         .join(child_session, child_session.id == SubagentRun.id)
-        .where(
-            SubagentRun.parent_session_id == parent_session_id,
-            SubagentRun.execution_user_id == execution_user_id,
-            child_session.agent_id == execution_agent_id,
-            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
-            ChatMessage.message_meta["kind"]
-            .as_string()
-            .in_([SUBAGENT_PARENT_MESSAGE, SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
-            ~completed_projection_exists,
-        )
+        .where(*candidate_conditions)
         .order_by(ChatMessage.created_at, ChatMessage.id)
         .limit(PARENT_EVENT_BATCH_MAX_MESSAGES * 4)
     )
@@ -2591,6 +2662,7 @@ async def _materialize_parent_event_batch(
     execution_user_id: uuid.UUID,
     active_turn_anchor_id: uuid.UUID | None = None,
     candidate_ids: list[uuid.UUID] | None = None,
+    projected_event_ids: list[uuid.UUID] | None = None,
 ) -> tuple[ChatMessage | None, list[dict], str]:
     """Project a bounded event batch onto one ordinary parent logical turn."""
     from app.services.execution_identity import ExecutionIdentityError
@@ -2668,6 +2740,12 @@ async def _materialize_parent_event_batch(
             ).scalar_one_or_none()
             if latest is not None and latest.role != "assistant":
                 return None, [], "busy"
+
+        if root is not None and projected_event_ids is not None:
+            for event_id, projection in projections.items():
+                raw_root_id = _message_meta(projection).get("subagent_turn_anchor_id")
+                if str(raw_root_id or projection.id) == str(root.id):
+                    projected_event_ids.append(event_id)
 
         if root is not None and await _parent_turn_has_terminal_reply(
             db,
@@ -2747,6 +2825,8 @@ async def _materialize_parent_event_batch(
                 created_at=now + timedelta(microseconds=index),
             )
             db.add(projection)
+            if projected_event_ids is not None:
+                projected_event_ids.append(event.id)
             if is_new_root:
                 root = projection
             injected.append({"role": "user", "content": content})
@@ -2758,6 +2838,60 @@ async def _materialize_parent_event_batch(
             await db.rollback()
             return None, [], "busy"
         return root, injected, materialized_status
+
+
+async def _finish_parent_events_for_root(
+    root_id: uuid.UUID,
+    candidate_ids: list[uuid.UUID],
+) -> None:
+    """Close only source events durably projected onto one accepted turn."""
+
+    if not candidate_ids:
+        return
+    keys = {
+        _parent_event_external_key(message_id): message_id
+        for message_id in candidate_ids
+    }
+    async with async_session() as db:
+        projections = (
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.external_event_key.in_(list(keys)),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        source_ids: list[uuid.UUID] = []
+        for projection in projections:
+            raw_root_id = _message_meta(projection).get("subagent_turn_anchor_id")
+            if str(raw_root_id or projection.id) != str(root_id):
+                continue
+            try:
+                source_ids.append(keys[str(projection.external_event_key)])
+            except KeyError:
+                pass
+        if not source_ids:
+            return
+        events = (
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.id.in_(source_ids))
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for event in events:
+            event.message_meta = {
+                **_message_meta(event),
+                "subagent_dispatch_state": SUBAGENT_DISPATCH_DELIVERED,
+            }
+        await db.commit()
 
 
 async def drain_parent_subagent_events(
@@ -2772,12 +2906,16 @@ async def drain_parent_subagent_events(
         parent_id = uuid.UUID(str(parent_session_id))
     except (TypeError, ValueError):
         return []
-    _root, injected, _status = await _materialize_parent_event_batch(
+    projected_event_ids: list[uuid.UUID] = []
+    root, injected, _status = await _materialize_parent_event_batch(
         parent_session_id=parent_id,
         execution_agent_id=execution_agent_id,
         execution_user_id=execution_user_id,
         active_turn_anchor_id=active_turn_anchor_id,
+        projected_event_ids=projected_event_ids,
     )
+    if root is not None and injected:
+        await _finish_parent_events_for_root(root.id, projected_event_ids)
     return injected
 
 
@@ -2810,12 +2948,17 @@ async def _pending_parent_events(
     limit: int = 50,
     *,
     debounce_seconds: float = PARENT_EVENT_BATCH_DEBOUNCE_SECONDS,
+    include_legacy: bool = True,
+    project_scope: bool | None = None,
+    legacy_count_out: list[int] | None = None,
+    legacy_ids_out: set[uuid.UUID] | None = None,
 ) -> list[uuid.UUID]:
     cutoff = datetime.now(UTC) - timedelta(seconds=max(0.0, debounce_seconds))
     async with async_session() as db:
         parent_anchor = aliased(ChatMessage)
         parent_final = aliased(ChatMessage)
         project_materialized = aliased(ChatMessage)
+        project_group_reply = aliased(ChatMessage)
         parent_session = aliased(ChatSession)
         completed_exists = exists(
             select(parent_final.id)
@@ -2839,16 +2982,29 @@ async def _pending_parent_events(
                 project_materialized.external_event_key == ("project-subagent:" + cast(ChatMessage.id, String))
             )
         )
-        rows = (
+        project_group_reply_exists = exists(
+            select(project_group_reply.id).where(
+                project_group_reply.external_event_key
+                == ("project-a2a-group-reply:" + cast(ChatMessage.id, String))
+            )
+        )
+        dispatch_state = ChatMessage.message_meta["subagent_dispatch_state"].as_string()
+        active_query = select(ChatMessage.id)
+        if project_scope is not None:
+            active_query = active_query.join(
+                SubagentRun,
+                cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
+            ).where(
+                SubagentRun.project_id.is_not(None)
+                if project_scope
+                else SubagentRun.project_id.is_(None)
+            )
+        active_rows = (
             (
                 await db.execute(
-                    select(ChatMessage.id)
-                    .join(
-                        SubagentRun,
-                        cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
-                    )
+                    active_query
                     .where(
-                        ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+                        dispatch_state == SUBAGENT_DISPATCH_PENDING,
                         ChatMessage.message_meta["kind"]
                         .as_string()
                         .in_(
@@ -2859,8 +3015,6 @@ async def _pending_parent_events(
                             ]
                         ),
                         ChatMessage.created_at <= cutoff,
-                        ~completed_exists,
-                        ~project_materialized_exists,
                     )
                     .order_by(ChatMessage.created_at, ChatMessage.id)
                     .limit(limit)
@@ -2869,58 +3023,89 @@ async def _pending_parent_events(
             .scalars()
             .all()
         )
-        # A crash can happen after the exact A2A timeline is committed (the
-        # `project-subagent:*` key exists) but before its project-group handoff
-        # is written.  That half-delivered row is no longer in the ordinary
-        # parent queue, so reconcile it explicitly and idempotently.
-        a2a_candidates = (
-            (
-                await db.execute(
-                    select(ChatMessage.id)
-                    .join(
-                        SubagentRun,
-                        cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
-                    )
-                    .join(parent_session, parent_session.id == SubagentRun.parent_session_id)
-                    .where(
-                        ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
-                        ChatMessage.message_meta["kind"].as_string().in_([SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
-                        parent_session.source_channel == "agent",
-                        parent_session.project_id.is_not(None),
-                    )
-                    .order_by(ChatMessage.created_at, ChatMessage.id)
-                    .limit(limit)
-                )
+        legacy_rows: list[uuid.UUID] = []
+        if include_legacy:
+            legacy_scope = (
+                SubagentRun.project_id.is_not(None)
+                if project_scope is True
+                else SubagentRun.project_id.is_(None)
+                if project_scope is False
+                else True
             )
-            .scalars()
-            .all()
-        )
-        a2a_handoffs: list[uuid.UUID] = []
-        if a2a_candidates:
-            expected_keys = {
-                key
-                for message_id in a2a_candidates
-                for key in (
-                    f"project-subagent:{message_id}",
-                    f"project-a2a-group-reply:{message_id}",
-                )
-            }
-            stored_keys = set(
+            legacy_rows = (
                 (
                     await db.execute(
-                        select(ChatMessage.external_event_key).where(ChatMessage.external_event_key.in_(expected_keys))
+                        select(ChatMessage.id)
+                        .join(
+                            SubagentRun,
+                            cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
+                        )
+                        .where(
+                            dispatch_state.is_(None),
+                            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+                            ChatMessage.message_meta["kind"]
+                            .as_string()
+                            .in_(
+                                [
+                                    SUBAGENT_PARENT_MESSAGE,
+                                    SUBAGENT_COMPLETION,
+                                    SUBAGENT_FAILURE,
+                                ]
+                            ),
+                            ChatMessage.created_at <= cutoff,
+                            ~completed_exists,
+                            ~project_materialized_exists,
+                            legacy_scope,
+                        )
+                        .order_by(ChatMessage.created_at, ChatMessage.id)
+                        .limit(limit)
                     )
                 )
                 .scalars()
                 .all()
             )
-            a2a_handoffs = [
-                message_id
-                for message_id in a2a_candidates
-                if f"project-subagent:{message_id}" in stored_keys
-                and f"project-a2a-group-reply:{message_id}" not in stored_keys
-            ]
-        return list(dict.fromkeys([*rows, *a2a_handoffs]))[:limit]
+        # A crash can happen after the exact A2A timeline is committed (the
+        # `project-subagent:*` key exists) but before its project-group handoff
+        # is written.  That half-delivered row is no longer in the ordinary
+        # parent queue, so reconcile it explicitly and idempotently.
+        a2a_handoffs: list[uuid.UUID] = []
+        remaining = max(0, limit - len(legacy_rows))
+        if include_legacy and project_scope is not False and remaining:
+            a2a_handoffs = (
+                (
+                    await db.execute(
+                        select(ChatMessage.id)
+                        .join(
+                            SubagentRun,
+                            cast(ChatMessage.conversation_id, String) == cast(SubagentRun.id, String),
+                        )
+                        .join(parent_session, parent_session.id == SubagentRun.parent_session_id)
+                        .where(
+                            dispatch_state.is_(None),
+                            ChatMessage.message_meta["subagent_wake"].as_boolean().is_(True),
+                            ChatMessage.message_meta["kind"]
+                            .as_string()
+                            .in_([SUBAGENT_COMPLETION, SUBAGENT_FAILURE]),
+                            parent_session.source_channel == "agent",
+                            parent_session.project_id.is_not(None),
+                            project_materialized_exists,
+                            ~project_group_reply_exists,
+                        )
+                        .order_by(ChatMessage.created_at, ChatMessage.id)
+                        .limit(remaining)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        legacy_ids = list(dict.fromkeys([*legacy_rows, *a2a_handoffs]))
+        if legacy_count_out is not None:
+            legacy_count_out.append(len(legacy_ids))
+        if legacy_ids_out is not None:
+            legacy_ids_out.update(legacy_ids)
+        # Active and compatibility queues each keep their own bounded budget;
+        # a permanently busy row in either queue cannot starve the other.
+        return list(dict.fromkeys([*legacy_ids, *active_rows]))
 
 
 async def _a2a_completion_leader_policy(
@@ -2976,9 +3161,15 @@ async def _materialize_project_a2a_turn(
         except (TypeError, ValueError):
             continue
     if not project_run_ids:
+        await _finish_parent_event_dispatch(event.id, SUBAGENT_DISPATCH_DISCARDED)
         return True
 
     async with async_session() as db:
+        stored_event = await db.get(ChatMessage, event.id, with_for_update=True)
+        if stored_event is None:
+            return True
+        event = stored_event
+        event_meta = _message_meta(event)
         project_runs = (
             (
                 await db.execute(
@@ -2993,6 +3184,11 @@ async def _materialize_project_a2a_turn(
             .all()
         )
         if not project_runs:
+            event.message_meta = {
+                **event_meta,
+                "subagent_dispatch_state": SUBAGENT_DISPATCH_DISCARDED,
+            }
+            await db.commit()
             return True
         project_run = project_runs[0]
         anchor = (
@@ -3007,6 +3203,11 @@ async def _materialize_project_a2a_turn(
             )
         ).scalar_one_or_none()
         if anchor is None:
+            event.message_meta = {
+                **event_meta,
+                "subagent_dispatch_state": SUBAGENT_DISPATCH_DISCARDED,
+            }
+            await db.commit()
             return True
 
         trace_rows = (
@@ -3119,6 +3320,7 @@ async def _materialize_project_a2a_turn(
                 .limit(1)
             )
         ).scalar_one_or_none()
+        wake_leader = False
         if group is not None:
             from app.models.project import ProjectMemberSnapshot
 
@@ -3150,6 +3352,7 @@ async def _materialize_project_a2a_turn(
                     if should_wake_leader
                     else "observed_peer_completion"
                 )
+                wake_leader = leader_batch_state == "pending"
                 db.add(
                     ChatMessage(
                         agent_id=group.agent_id,
@@ -3184,10 +3387,17 @@ async def _materialize_project_a2a_turn(
                     )
                 )
                 group.last_message_at = event.created_at or datetime.now(UTC)
+        event.message_meta = {
+            **event_meta,
+            "subagent_dispatch_state": SUBAGENT_DISPATCH_DELIVERED,
+        }
         try:
             await db.commit()
         except IntegrityError:
             await db.rollback()
+            return False
+        if wake_leader:
+            _signal_project_dispatch_work()
         return True
 
 
@@ -3199,11 +3409,15 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         try:
             child_id = uuid.UUID(str(event.conversation_id))
         except (TypeError, ValueError):
+            await db.rollback()
+            await _finish_parent_event_dispatch(child_message_id, SUBAGENT_DISPATCH_DISCARDED)
             return True
         run = await db.get(SubagentRun, child_id)
         child = await db.get(ChatSession, child_id)
         parent = await db.get(ChatSession, run.parent_session_id) if run else None
         if run is None or child is None or parent is None:
+            await db.rollback()
+            await _finish_parent_event_dispatch(child_message_id, SUBAGENT_DISPATCH_DISCARDED)
             return True
 
     if parent.source_channel == "agent" and parent.project_id is not None and child.project_id == parent.project_id:
@@ -3222,10 +3436,18 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         async with async_session() as db:
             from app.models.project import ProjectMemberSnapshot
 
+            stored_event = await db.get(ChatMessage, child_message_id, with_for_update=True)
+            if stored_event is None:
+                return True
             existing = (
                 await db.execute(select(ChatMessage.id).where(ChatMessage.external_event_key == external_key))
             ).scalar_one_or_none()
             if existing is not None:
+                stored_event.message_meta = {
+                    **_message_meta(stored_event),
+                    "subagent_dispatch_state": SUBAGENT_DISPATCH_DELIVERED,
+                }
+                await db.commit()
                 return True
             leader_agent_id = (
                 await db.execute(
@@ -3261,6 +3483,10 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                 },
             )
             db.add(materialized)
+            stored_event.message_meta = {
+                **_message_meta(stored_event),
+                "subagent_dispatch_state": SUBAGENT_DISPATCH_DELIVERED,
+            }
             stored_parent = await db.get(ChatSession, parent.id)
             if stored_parent is not None:
                 stored_parent.last_message_at = datetime.now(UTC)
@@ -3268,6 +3494,9 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                 await db.commit()
             except IntegrityError:
                 await db.rollback()
+                return False
+            if not is_leader_reply:
+                _signal_project_dispatch_work()
             return True
     return await _dispatch_parent_event_batch([child_message_id])
 
@@ -3303,12 +3532,15 @@ async def _pending_parent_event_groups(
         ).all()
     batches: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], list[uuid.UUID]] = {}
     special: list[uuid.UUID] = []
+    grouped_ids: set[uuid.UUID] = set()
     for message_id, parent_id, execution_user_id, execution_agent_id, project_id in rows:
+        grouped_ids.add(message_id)
         if project_id is not None:
             special.append(message_id)
             continue
         key = (parent_id, execution_user_id, execution_agent_id)
         batches.setdefault(key, []).append(message_id)
+    special.extend(message_id for message_id in message_ids if message_id not in grouped_ids)
     return list(batches.values()), special
 
 
@@ -3392,13 +3624,17 @@ async def _dispatch_parent_event_batch(message_ids: list[uuid.UUID]) -> bool:
         lock_key = chat_session_lock_key(parent)
 
     async def _work() -> str:
+        projected_event_ids: list[uuid.UUID] = []
         anchor, _injected, status = await _materialize_parent_event_batch(
             parent_session_id=parent.id,
             execution_agent_id=child.agent_id,
             execution_user_id=run.execution_user_id,
             candidate_ids=message_ids,
+            projected_event_ids=projected_event_ids,
         )
         if status in {"gone", "empty", "completed"}:
+            if anchor is not None and status == "completed":
+                await _finish_parent_events_for_root(anchor.id, projected_event_ids)
             return "processed"
         if status == "identity_invalid" and anchor is None:
             return "identity_invalid"
@@ -3428,8 +3664,11 @@ async def _dispatch_parent_event_batch(message_ids: list[uuid.UUID]) -> bool:
                     child=live_child,
                     exc=exc,
                 )
+                await _finish_parent_events_for_root(anchor.id, projected_event_ids)
                 return "processed"
         resumed = await resume_turn(anchor)
+        if resumed:
+            await _finish_parent_events_for_root(anchor.id, projected_event_ids)
         return "processed" if resumed else "busy"
 
     result = await run_channel_message(
@@ -5034,57 +5273,175 @@ async def _recover_project_dispatch_outbox_once() -> bool:
         await asyncio.sleep(0)
 
 
-async def _subagent_parent_dispatch_loop() -> None:
+async def _dispatch_event_loop(*, project_scope: bool) -> None:
+    startup_pass = True
+    legacy_backlog = True
+    loop = asyncio.get_running_loop()
+    wake_event = _project_dispatch_wakeup if project_scope else _dispatch_wakeup
+    signal_work = (
+        _signal_project_dispatch_work if project_scope else _signal_dispatch_work
+    )
+    next_recovery_at = loop.time()
+    next_legacy_recovery_at = loop.time()
     while True:
+        legacy_pass = legacy_backlog or loop.time() >= next_legacy_recovery_at
+        recovery_pass = startup_pass
+        if startup_pass:
+            startup_pass = False
+            wake_event.clear()
+            await asyncio.sleep(PARENT_EVENT_BATCH_DEBOUNCE_SECONDS)
+        else:
+            signaled = False
+            try:
+                await asyncio.wait_for(
+                    wake_event.wait(),
+                    timeout=max(
+                        0.0,
+                        min(next_recovery_at, next_legacy_recovery_at) - loop.time(),
+                    ),
+                )
+                signaled = True
+            except TimeoutError:
+                pass
+            wake_event.clear()
+            recovery_pass = loop.time() >= next_recovery_at
+            legacy_pass = legacy_backlog or loop.time() >= next_legacy_recovery_at
+            if signaled:
+                # One shared window coalesces ordinary parent events and
+                # Project Leader replies before either queue is read.
+                await asyncio.sleep(PARENT_EVENT_BATCH_DEBOUNCE_SECONDS)
         try:
-            pending = await _pending_parent_events()
+            legacy_counts: list[int] = []
+            legacy_ids: set[uuid.UUID] = set()
+            pending = await _pending_parent_events(
+                debounce_seconds=0,
+                include_legacy=legacy_pass,
+                project_scope=project_scope,
+                legacy_count_out=legacy_counts,
+                legacy_ids_out=legacy_ids,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - daemon must survive transient DB faults
             logger.exception(f"[subagent] parent event scan failed: {exc}")
+            wake_event.set()
             await asyncio.sleep(1)
             continue
         made_progress = False
+        legacy_retry_needed = False
         try:
             parent_batches, special_events = await _pending_parent_event_groups(pending)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - daemon must survive transient DB faults
             logger.exception(f"[subagent] parent event grouping failed: {exc}")
+            wake_event.set()
             await asyncio.sleep(1)
             continue
         for message_ids in parent_batches:
             try:
-                made_progress = await _dispatch_parent_event_batch(message_ids) or made_progress
+                processed = await _dispatch_parent_event_batch(message_ids)
+                made_progress = processed or made_progress
+                if not processed:
+                    legacy_retry_needed = legacy_retry_needed or bool(
+                        legacy_ids.intersection(message_ids)
+                    )
+                    loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate each durable event
                 logger.exception(
                     f"[subagent] parent event batch dispatch failed messages={message_ids}: {exc}"
                 )
+                legacy_retry_needed = legacy_retry_needed or bool(
+                    legacy_ids.intersection(message_ids)
+                )
+                loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
         for message_id in special_events:
             try:
-                made_progress = await _dispatch_parent_event(message_id) or made_progress
+                processed = await _dispatch_parent_event(message_id)
+                made_progress = processed or made_progress
+                if not processed:
+                    legacy_retry_needed = (
+                        legacy_retry_needed or message_id in legacy_ids
+                    )
+                    loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate each durable event
                 logger.exception(f"[subagent] parent event dispatch failed message={message_id}: {exc}")
-        try:
-            leader_groups = await _pending_project_leader_groups()
+                legacy_retry_needed = legacy_retry_needed or message_id in legacy_ids
+                loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
+        leader_groups: list[uuid.UUID] = []
+        if project_scope:
+            try:
+                leader_groups = await _pending_project_leader_groups(
+                    debounce_seconds=0
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - daemon survives scan faults
+                logger.exception(
+                    f"[subagent] project Leader queue scan failed: {exc}"
+                )
+                loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
             for group_id in leader_groups:
-                made_progress = await _dispatch_project_leader_batch(group_id) or made_progress
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - durable claimed batches retry on the next scan
-            logger.exception(f"[subagent] project Leader batch dispatch failed: {exc}")
-        try:
-            made_progress = await _recover_project_dispatch_outbox_once() or made_progress
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - daemon must survive transient scan faults
-            logger.exception(f"[subagent] project dispatch scan failed: {exc}")
-        if not made_progress:
-            await asyncio.sleep(0.5)
+                try:
+                    made_progress = (
+                        await _dispatch_project_leader_batch(
+                            group_id,
+                            debounce_seconds=0,
+                        )
+                        or made_progress
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate each project
+                    logger.exception(
+                        "[subagent] project Leader batch dispatch failed "
+                        f"group={group_id}: {exc}"
+                    )
+                    loop.call_later(DISPATCH_RETRY_INTERVAL_SECONDS, signal_work)
+        if made_progress and (len(pending) >= 50 or len(leader_groups) >= 20):
+            wake_event.set()
+        if legacy_pass:
+            legacy_backlog = bool(legacy_counts and legacy_counts[0] >= 50)
+            if legacy_retry_needed:
+                next_legacy_recovery_at = loop.time() + DISPATCH_RETRY_INTERVAL_SECONDS
+            elif legacy_backlog and made_progress:
+                wake_event.set()
+                next_legacy_recovery_at = loop.time()
+            elif legacy_backlog:
+                next_legacy_recovery_at = (
+                    loop.time() + DISPATCH_RECOVERY_INTERVAL_SECONDS
+                )
+            else:
+                next_legacy_recovery_at = (
+                    loop.time() + LEGACY_PARENT_RECOVERY_INTERVAL_SECONDS
+                )
+        if recovery_pass and project_scope:
+            try:
+                await _recover_project_dispatch_outbox_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - daemon must survive transient scan faults
+                logger.exception(f"[subagent] project dispatch recovery failed: {exc}")
+            finally:
+                next_recovery_at = loop.time() + DISPATCH_RECOVERY_INTERVAL_SECONDS
+        elif recovery_pass:
+            next_recovery_at = loop.time() + DISPATCH_RECOVERY_INTERVAL_SECONDS
+
+
+async def _subagent_parent_dispatch_loop() -> None:
+    """Dispatch ordinary Subagent parent events independently of projects."""
+
+    await _dispatch_event_loop(project_scope=False)
+
+
+async def _project_dispatch_loop() -> None:
+    """Dispatch project replies and outbox work behind a fault boundary."""
+
+    await _dispatch_event_loop(project_scope=True)
 
 
 async def start_subagent_daemon() -> None:
@@ -5092,4 +5449,5 @@ async def start_subagent_daemon() -> None:
     await asyncio.gather(
         _subagent_worker_loop(),
         _subagent_parent_dispatch_loop(),
+        _project_dispatch_loop(),
     )
