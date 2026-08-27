@@ -103,6 +103,7 @@ import ProjectFileWorkspace from "./components/ProjectFileWorkspace";
 import ProjectEventContent, {
   ProjectEventLabel,
 } from "./components/ProjectEventContent";
+import ProjectAgentCapabilityPanel from "./components/ProjectAgentCapabilityPanel";
 import {
   closestProjectTraceValue as closestTraceValue,
   inferProjectSessionIntent as inferredSessionIntent,
@@ -1580,27 +1581,27 @@ export default function ProjectWorkspacePage() {
             )}
           </p>
         </div>
-        {isOwner && ["running", "paused"].includes(data.project.status) && (
+        {isOwner && ["running", "paused", "waiting"].includes(data.project.status) && (
           <Button
-            variant={data.project.status === "paused" ? "primary" : "secondary"}
+            variant={data.project.status === "running" ? "secondary" : "primary"}
             disabled={busyAction === "project-runtime"}
             onClick={() =>
               setRuntimeDialog(
-                data.project.status === "paused" ? "resume" : "pause",
+                data.project.status === "running" ? "pause" : "resume",
               )
             }
           >
             {busyAction === "project-runtime" ? (
               <IconLoader2 className="project-workspace__spinner" size={16} />
-            ) : data.project.status === "paused" ? (
-              <IconPlayerPlay size={16} />
-            ) : (
+            ) : data.project.status === "running" ? (
               <IconPlayerPause size={16} />
+            ) : (
+              <IconPlayerPlay size={16} />
             )}
             {t(
-              data.project.status === "paused"
-                ? "projectRuntime.resumeAction"
-                : "projectRuntime.pauseAction",
+              data.project.status === "running"
+                ? "projectRuntime.pauseAction"
+                : "projectRuntime.resumeAction",
             )}
           </Button>
         )}
@@ -5408,58 +5409,53 @@ function MembersPanel({
                   </div>
                 </div>
               )}
-              <nav
-                className="project-workspace__member-capability-rail"
-                aria-label={t("projectAgents.capabilityPackage.title")}
-              >
-                {(
-                  [
-                    {
-                      value: "config",
-                      icon: <IconSettings size={16} />,
+              <ProjectAgentCapabilityPanel
+                value={capabilitySection}
+                onChange={setCapabilitySection}
+                ariaLabel={t("projectAgents.capabilityPackage.title")}
+                tabs={[
+                  {
+                    value: "config",
+                    icon: <IconSettings size={16} />,
+                    label: t(
+                      "projectAgents.capabilityPackage.sections.config",
+                    ),
+                    count: t("projectAgents.capabilityPackage.count", {
                       count: configCount,
-                    },
-                    {
-                      value: "tools",
-                      icon: <IconTool size={16} />,
+                    }),
+                  },
+                  {
+                    value: "tools",
+                    icon: <IconTool size={16} />,
+                    label: t(
+                      "projectAgents.capabilityPackage.sections.tools",
+                    ),
+                    count: t("projectAgents.capabilityPackage.count", {
                       count: effectiveProjectToolCount + platformTools.length,
-                    },
-                    {
-                      value: "mcp",
-                      icon: <IconCodeDots size={16} />,
+                    }),
+                  },
+                  {
+                    value: "mcp",
+                    icon: <IconCodeDots size={16} />,
+                    label: t(
+                      "projectAgents.capabilityPackage.sections.mcp",
+                    ),
+                    count: t("projectAgents.capabilityPackage.count", {
                       count: memberMcps.length,
-                    },
-                    {
-                      value: "skill",
-                      icon: <IconBolt size={16} />,
+                    }),
+                  },
+                  {
+                    value: "skill",
+                    icon: <IconBolt size={16} />,
+                    label: t(
+                      "projectAgents.capabilityPackage.sections.skill",
+                    ),
+                    count: t("projectAgents.capabilityPackage.count", {
                       count: memberSkills.length,
-                    },
-                  ] as const
-                ).map((section) => (
-                  <button
-                    key={section.value}
-                    type="button"
-                    className={
-                      capabilitySection === section.value ? "is-active" : ""
-                    }
-                    aria-pressed={capabilitySection === section.value}
-                    onClick={() => setCapabilitySection(section.value)}
-                  >
-                    {section.icon}
-                    <strong>
-                      {t(
-                        `projectAgents.capabilityPackage.sections.${section.value}`,
-                      )}
-                    </strong>
-                    <small>
-                      {t("projectAgents.capabilityPackage.count", {
-                        count: section.count,
-                      })}
-                    </small>
-                  </button>
-                ))}
-              </nav>
-              <div className="project-workspace__member-capability-body">
+                    }),
+                  },
+                ] as const}
+              >
                 {capabilitySection === "config" ? (
                   <>
                     <div className="project-workspace__snapshot-form">
@@ -5585,7 +5581,7 @@ function MembersPanel({
                     canManage={Boolean(projectAgent) && canManage && !departed}
                   />
                 )}
-              </div>
+              </ProjectAgentCapabilityPanel>
             </section>
           )}
         </>

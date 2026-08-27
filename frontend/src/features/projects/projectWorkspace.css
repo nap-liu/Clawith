@@ -2426,67 +2426,6 @@
   border-style: dashed;
   background: var(--bg-tertiary);
 }
-.project-workspace__member-capability-rail {
-  margin: 16px -16px;
-  border-top: 1px solid var(--border-subtle);
-  border-bottom: 1px solid var(--border-subtle);
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  background: var(--bg-secondary);
-}
-.project-workspace__member-capability-rail > button {
-  min-width: 0;
-  min-height: 52px;
-  padding: 8px 12px;
-  border: 0;
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  color: var(--text-secondary);
-  background: transparent;
-  cursor: pointer;
-}
-.project-workspace__member-capability-rail > button + button {
-  border-left: 1px solid var(--border-subtle);
-}
-.project-workspace__member-capability-rail > button:hover {
-  background: var(--bg-hover);
-}
-.project-workspace__member-capability-rail > button:focus-visible {
-  position: relative;
-  z-index: 1;
-  outline: 2px solid var(--accent-primary);
-  outline-offset: -2px;
-}
-.project-workspace__member-capability-rail > button.is-active {
-  color: var(--accent-primary);
-  background: var(--accent-subtle);
-  box-shadow: inset 0 -2px 0 var(--accent-primary);
-}
-.project-workspace__member-capability-rail strong,
-.project-workspace__member-capability-rail small {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.project-workspace__member-capability-rail strong {
-  font-size: var(--text-sm);
-  text-align: left;
-}
-.project-workspace__member-capability-rail small {
-  color: var(--text-tertiary);
-  font-size: var(--text-xs);
-}
-.project-workspace__member-capability-body {
-  min-width: 0;
-}
-.project-workspace__member-capability-body > footer {
-  margin-top: 16px;
-  display: flex;
-  justify-content: flex-end;
-}
 .project-workspace__member-capability-group +
   .project-workspace__member-capability-group {
   margin-top: 20px;
@@ -4594,19 +4533,6 @@
   .project-workspace__member-editor > header {
     align-items: stretch;
     flex-direction: column;
-  }
-  .project-workspace__member-capability-rail {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .project-workspace__member-capability-rail > button {
-    min-height: 48px;
-    padding-inline: 10px;
-  }
-  .project-workspace__member-capability-rail > button:nth-child(3) {
-    border-left: 0;
-  }
-  .project-workspace__member-capability-rail > button:nth-child(n + 3) {
-    border-top: 1px solid var(--border-subtle);
   }
   .project-workspace__project-tools.is-compact
     .project-workspace__project-tool-grid

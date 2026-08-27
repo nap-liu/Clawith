@@ -33,8 +33,11 @@
 .tool-catalog-panel__groups {
   min-width: 0;
   display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 10px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .tool-catalog-panel__group {

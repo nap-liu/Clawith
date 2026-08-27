@@ -1458,11 +1458,12 @@ async def patch_project(
     )
     runtime_event_type = None
     target_status = updates.get("status")
+    runtime_previous_status = project.status if runtime_change else None
     if runtime_change:
-        if project.status not in {"running", "paused"} or target_status not in {"running", "paused"}:
+        if project.status not in {"running", "paused", "waiting"} or target_status not in {"running", "paused"}:
             raise HTTPException(
                 status_code=409,
-                detail="The project runtime switch only supports running and paused projects",
+                detail="The project runtime switch is unavailable in the current project state",
             )
         if target_status != project.status:
             runtime_event_type = "project.paused" if target_status == "paused" else "project.resumed"
@@ -1536,7 +1537,7 @@ async def patch_project(
             runtime_event_type,
             "Paused all new project work" if target_status == "paused" else "Resumed project work",
             actor_user_id=current_user.id,
-            metadata={"previous_status": "running" if target_status == "paused" else "paused"},
+            metadata={"previous_status": runtime_previous_status},
         )
     if set(updates) - {"status"} or acl_change:
         add_event(db, project, "project.updated", "Project settings updated", actor_user_id=current_user.id)
