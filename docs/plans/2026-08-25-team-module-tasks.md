@@ -591,7 +591,7 @@
 ## 二十八、最终主线兼容与发布收口（2026-08-26）
 
 - [x] 合并 `yybpc/company/main@727c5f2b`，合并提交为 `5a664c72`；保留主线会话附件、引用消息和 H5 展示，同时保留项目会话续接、精确锚点与状态恢复。
-- [x] 合并 `yybpc/company/main@26bcd4b5`，合并提交为 `c658ce8c`；该门禁阶段应用候选为 `c94f8d52`。完整差异收口随后以 `yybpc/company/main@d963d85c` 为基线并冻结应用代码为 `828438e1`。
+- [x] 合并 `yybpc/company/main@26bcd4b5`，合并提交为 `c658ce8c`；该门禁阶段应用候选为 `c94f8d52`。完整差异收口随后以 `yybpc/company/main@d963d85c` 为基线；Plaza 授权纠偏后的应用代码冻结为 `d8d6263d`。
 - [x] 使用候选镜像 `clawith-ai-project-frontend-check:merge-5a664c7` 完成全量 prebuild、TypeScript、Vite production build，转换 10,297 个模块；仅出现既有大分块提示。
 - [x] 附件、Web 会话恢复、H5 时间线、项目路由、项目中英文、Git diff、项目文件工作区七组前端行为命令通过。
 - [x] 候选 nginx 对后端 `/api/health` 返回 `status=ok`、版本 `1.10.3`；项目、团队、标准数字员工工具/Skill 路由加载或登录跳转正常，控制台 0 错误、0 警告。
@@ -609,11 +609,11 @@
 
 ## 二十九、完整分支差异与原能力稳定性收口（2026-08-26）
 
-- [x] 以 `yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e` 为基线完成完整差异审计；最终应用 SHA `828438e1c4daa5b93ac9dfe0b6e5ab0c363682ab` 相对主线为 302 个文件、104692 行新增、12866 行删除，178 个新增文件、124 个修改文件。
+- [x] 以 `yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e` 为基线完成完整差异审计；Plaza 授权范围纠偏后的应用代码 SHA 为 `d8d6263d8fc96832b15fb9e27f196ee025425a00`。
 - [x] 将项目领域本体与 18 个横切稳定性模块分开审计；Agent、Chat、WebSocket、Scheduler、Trigger、Subagent、LLM、Files、Tools、公共组件、全局页面、水印、发布页和部署均记录变更目的、旧能力风险和可观察证据。
-- [x] 发现并撤销与项目能力无关的 Plaza 全局退场；恢复 `/plaza`、Onboarding、后端 router、标准 Agent 工具 seed/目录/runtime、通知、活动和 Heartbeat。
-- [x] 保留项目 Agent 的 Plaza 隔离：默认无 Plaza 工具，发帖/评论/点赞拒绝，历史帖子/评论不进入 feed/detail/stats/tool browse，direct-ID 删除 404，mention/broadcast/heartbeat 不触达项目 Agent。
-- [x] Plaza 长期 PostgreSQL/FastAPI/tool runtime 行为测试 `2 passed`；相关通知和项目 Agent 影响套件 `28 passed`；最终前端完整 prebuild、TypeScript、Vite build 通过并生成 Plaza chunk。
+- [x] 确认 Plaza 全局退场是用户已授权的独立产品决策；完整差异审计不得把该决策误判为项目回归，也不得擅自恢复。
+- [x] 恢复统一退场状态：旧前端路由跳转到发现页，Onboarding 不进入 Plaza，后端 Plaza API 为 404，三项 Plaza 工具在数据库均为 `enabled=false / is_default=false`，LLM 目录和 runtime 继续统一拒绝。
+- [x] 修正后 Docker 前端完整 prebuild、TypeScript、Vite production build 通过，共转换 10,297 个模块；后端关键 Ruff/编译检查通过，3011 健康 200。
 - [x] 旧服务回滚初验发现 Agent 列表隐藏不足：已知项目 Agent ID 的十类深链仍可访问，旧 worker 仍可领取项目 Subagent Run；该发现未被隐藏或降级为文档风险。
 - [x] 新增幂等 `project_legacy_rollback` helper：固定专用非 owner 角色，对 Agent 外键表、全部 `project_id` 表和 Plaza 多态作者表建立 48 表可逆 RLS 边界；不删除或更新任何业务行，首次遇到同名非托管角色 fail closed，`status` 只读。
 - [x] 精确旧镜像 API/worker 分角色验证：health 200、restart 0；标准六接口 200；项目详情、会话、任务、计划、触发器、工具、权限、活动、审批和网关十接口 404；六类全局列表无项目标记；项目 Subagent/Schedule/Trigger 未被消费。

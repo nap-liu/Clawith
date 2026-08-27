@@ -364,28 +364,26 @@ explicit `AgentTool` assignments like every other ordinary LLM tool.
   pagination beyond the first page, paused projects, cross-project object IDs,
   and complete audit/session/message anchors.
 
-## Plaza compatibility boundary (2026-08-26 superseding the 2026-08-24 retirement)
+## Global Plaza retirement (authorized 2026-08-24, reconfirmed 2026-08-27)
 
-The full branch-to-main audit found that globally retiring Plaza was unrelated
-to the project capability and directly removed an established platform
-surface. That retirement is superseded. Plaza remains available to standard
-company-wide Agents and users; project isolation is enforced at the Agent and
-content boundary instead of by disabling the product.
+Plaza is disabled as one authorized platform invariant rather than a
+navigation-only change. Historical database rows remain available for audit
+and rollback, but there is no user route, public API router, heartbeat
+instruction, LLM tool exposure, or direct runtime dispatch that can create,
+read, or comment on Plaza content.
 
-- [x] Restore both frontend `/plaza` routes, the onboarding destination, the
-  backend Plaza router, standard-Agent tool seed/default assignments, LLM tool
-  exposure, runtime dispatch, notifications, activity and heartbeat behavior.
-- [x] Preserve the original one-post/two-comment heartbeat limits and both
-  heartbeat templates for standard Agents.
-- [x] Keep project Agents out of Plaza defaults, runtime post/comment/like,
-  mentions, broadcasts and heartbeat scheduling.
-- [x] Hide historical project-Agent posts and comments from feed, detail,
-  statistics and tool browse; direct-ID comment/like/delete operations fail
-  closed without deleting the historical rows.
-- [x] Add observable PostgreSQL/API/tool-runtime coverage. The new Plaza
-  isolation tests passed `2/2`; the related notification and project-Agent
-  impact suite passed `28/28`; the full frontend production build emitted the
-  Plaza chunk and completed successfully.
+- [x] Redirect the retired frontend route to the supported discovery page and
+  remove onboarding, layout, access-scope, and heartbeat copy that advertises
+  Plaza.
+- [x] Stop registering the Plaza API router so direct HTTP calls are not a
+  supported product surface.
+- [x] Force all Plaza builtin tools globally disabled during seed/sync and
+  exclude them from every digital employee LLM tool roster, including existing
+  assignments restored from an old database.
+- [x] Reject direct Plaza tool dispatch at the shared runtime boundary so a
+  stale queued call or historical tool assignment cannot bypass the switch.
+- [x] Preserve this authorized decision during the full branch-to-main audit;
+  do not reinterpret an explicit product removal as an unintended regression.
 
 ## Workspace information-architecture consolidation (2026-08-24)
 
@@ -670,7 +668,7 @@ state store, or invalidation protocol was added.
 ## Final mainline, rollback, and fault-isolation closeout (2026-08-26)
 
 - [x] Merge `yybpc/company/main@727c5f2b` through merge commit `5a664c72`; preserve mainline attachment/quoted-message behavior and the project conversation resume/anchor contract in the single shared timeline.
-- [x] Merge `yybpc/company/main@26bcd4b5` through `c658ce8c`; the application candidate at that gate was `c94f8d52`. The later full-diff closeout merged `yybpc/company/main@d963d85c` through `e04de8dd` and froze application code at `828438e1`.
+- [x] Merge `yybpc/company/main@26bcd4b5` through `c658ce8c`; the application candidate at that gate was `c94f8d52`. The later full-diff closeout merged `yybpc/company/main@d963d85c` through `e04de8dd`; the Plaza authorization correction froze application code at `d8d6263d`.
 - [x] Build candidate frontend image `clawith-ai-project-frontend-check:merge-5a664c7`: full prebuild, TypeScript, and Vite production build passed, with 10,297 modules transformed and only the existing large-chunk warning.
 - [x] Pass seven focused frontend behavior commands covering attachments, Web resume, H5 timeline, project routing, project i18n, Git diff, and project file workspace. Candidate nginx reached backend health `status=ok`, version `1.10.3`; project, team, Agent tool, and Skill routes loaded or redirected to login with zero console errors/warnings.
 - [x] Add one observable PostgreSQL matrix for standard Digital Employee project tools. Together with the existing group-state behavior test it passed `8` tests and covers disabled/partial/enabled, Web/mapped IM Human identity, legal non-Human `subagent` rejection, owner/editor/viewer/removed ACL, ACL changes across confirmation resume, pagination, paused projects, cross-project IDs, and separate audit/session/message anchors.

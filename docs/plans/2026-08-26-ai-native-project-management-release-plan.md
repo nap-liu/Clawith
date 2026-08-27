@@ -22,7 +22,7 @@
 - 分支：`feature/ai-native-project-management`
 - 完整差异审计应用基线：`e04de8dd7b9a1916a5567ac30b0cc95373d2bc0f`。
 - 最新主线：`yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e`，由合并提交 `e04de8dd` 纳入候选。
-- 最终收口在该基线上只恢复误退场的 Plaza、增加项目 Agent 的 Plaza 隔离、增加可逆 legacy 数据库边界及相应行为测试和文档；最终提交 SHA 在提交后记录。
+- 最终收口在该基线上增加可逆 legacy 数据库边界及相应行为测试；Plaza 全局退场是用户已授权的独立产品决策，审计纠偏提交 `d8d6263d` 已撤销错误恢复并保持统一退场。
 - `b0c2e14b` 完成里程碑自动关联；`b4c84ec7` 与 `c94f8d52` 完成项目原子并发门禁和普通 Subagent 隔离。
 - backend/frontend 版本均仍为 `1.10.3`。
 - `docker/aio-sandbox/**` 与 AIO Compose 没有变化，本次不构建、不切换 AIO。
@@ -51,11 +51,11 @@
 
 ### A-03 · 已关闭 · 候选验证门禁
 
-验证证据包括：以 Docker/PostgreSQL 分区执行的完整后端唯一用例 `2741 passed, 28 skipped`，没有产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；最新主线合并影响套件 `78 passed`；Plaza 恢复影响套件 `28 passed`；legacy RLS 持久行为测试 `1 passed`；前端完整 prebuild、TypeScript、Vite production build；3011 健康与严格 RC3 跨域验收。源码文本或正则形状测试不计入上述通过数。
+验证证据包括：以 Docker/PostgreSQL 分区执行的完整后端唯一用例 `2741 passed, 28 skipped`，没有产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；最新主线合并影响套件 `78 passed`；legacy RLS 持久行为测试 `1 passed`；前端完整 prebuild、TypeScript、Vite production build；授权 Plaza 退场的 3011 API/数据库行为；3011 健康与严格 RC3 跨域验收。源码文本或正则形状测试不计入上述通过数。
 
-### A-04 · 已关闭 · Plaza 非项目退场回归
+### A-04 · 已关闭 · Plaza 授权范围纠偏
 
-完整差异审计确认候选曾把 Plaza 作为全局能力退场，该变更不属于项目交付并会直接影响旧能力。最终收口已经恢复 `/plaza`、Onboarding、后端 router、标准 Agent seed/默认分配/LLM 目录/runtime、通知、活动和 Heartbeat；项目 Agent 继续从帖子、评论、点赞、提及、广播、历史和 Heartbeat 隔离。PostgreSQL/FastAPI/tool runtime 行为测试 `2 passed`，相关影响套件 `28 passed`，前端生产构建包含 Plaza chunk。
+Plaza 全局退场是用户已授权的独立产品决策，不是项目能力造成的意外回归。审计一度错误恢复该能力，现已由 `d8d6263d` 撤销：旧前端路由继续跳转发现页，Onboarding 继续进入 Agent 会话，后端不注册 Plaza router，相关工具在 seed、LLM 目录和 runtime 中统一关闭，通知、活动与 Heartbeat 不再暴露 Plaza。3011 `/api/plaza/posts` 返回 404，三项工具均为 `enabled=false / is_default=false`，修正后的前端 production build 通过且不生成 Plaza 页面 chunk。
 
 ### A-05 · P2 · 发布面过大且没有项目功能开关
 
@@ -83,10 +83,10 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 
 ## 三、最终候选冻结
 
-1. A-01 创建补偿、A-02 legacy RLS、A-03 候选验证、A-04 Plaza 恢复和 A-08 故障隔离已关闭。
-2. 最新主线 `d963d85c` 已由 `e04de8dd` 合入；应用代码候选冻结为 `828438e1`。
-3. 文档收口提交后记录最终不可变 `RELEASE_SHA`；应用制品的代码门禁 SHA 为 `828438e1`，其后的提交只允许文档变化。
-4. 准确记录“完整后端分区 2741 passed/28 skipped + 合并影响 78 passed + Plaza 影响 28 passed + legacy RLS 1 passed”，不把相互重叠的分区简单相加为唯一测试数。
+1. A-01 创建补偿、A-02 legacy RLS、A-03 候选验证、A-04 Plaza 授权范围纠偏和 A-08 故障隔离已关闭。
+2. 最新主线 `d963d85c` 已由 `e04de8dd` 合入；Plaza 授权纠偏后的应用代码候选冻结为 `d8d6263d`。
+3. 文档收口提交后记录最终不可变 `RELEASE_SHA`；应用制品的代码门禁 SHA 为 `d8d6263d`，其后的提交只允许文档变化。
+4. 准确记录“完整后端分区 2741 passed/28 skipped + 合并影响 78 passed + legacy RLS 1 passed + Plaza 退场 API/数据库行为”，不把相互重叠的分区简单相加为唯一测试数。
 5. backend/frontend 的 `VERSION` 必须继续一致为 `1.10.3`。
 6. 发布标识按 `v1.10.3-<RELEASE_SHA 前 7 位>` 生成，不提升私有语义版本。
 7. Git tag 必须直接指向完整 `RELEASE_SHA`；合并、tag、push 和发布分别等待用户明确授权。
@@ -108,10 +108,10 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 - 从生产当前 `webhook_event_sequence` 升级到候选唯一 head `repair_tenant_boundary_triggers`。
 - 验证新增项目表、Agent 项目字段、会话/运行关联、执行用户字段、活动枚举和索引。
 - 记录迁移时间和锁等待；当前受影响核心表约为 Agents 125 行、ChatSession 23,345 行、SubagentRun 63 行，预计迁移较短，但以演练实测为准。
-- 完整 backend 唯一用例采用适配其数据库前提的 Docker/PostgreSQL 分区执行：`2741 passed, 28 skipped`，无产品断言失败。主线合并影响套件 `78 passed`、Plaza 恢复影响套件 `28 passed`、legacy RLS 持久行为测试 `1 passed` 作为收口证据单列，不重复累加。
+- 完整 backend 唯一用例采用适配其数据库前提的 Docker/PostgreSQL 分区执行：`2741 passed, 28 skipped`，无产品断言失败。主线合并影响套件 `78 passed`、legacy RLS 持久行为测试 `1 passed` 和 Plaza 退场 API/数据库行为作为收口证据单列，不重复累加。
 - 验证 19 个用户项目工具写入数据库、默认关闭、没有给标准数字员工自动启用；运行时工具集合与数据库一致。
 - A-01 创建校验、服务链失败、成员/资产复制失败和最终提交失败均通过可观察行为验证；数据库、项目根目录、AgentDir 和 Git 操作记录无孤儿。
-- A-02 使用应用候选 `828438e1` 的 helper 和精确旧镜像复跑：专用旧服务角色、48 张表边界、API/worker 分角色、深链 404、项目队列不领取、幂等 restore 和候选恢复全部通过。
+- A-02 使用应用候选中的 helper 和精确旧镜像复跑：专用旧服务角色、48 张表边界、API/worker 分角色、深链 404、项目队列不领取、幂等 restore 和候选恢复全部通过；`d8d6263d` 未修改该 helper 或对应测试。
 - 项目故障隔离矩阵通过：项目查询/服务不可用不阻断标准 Agent 会话、计划任务、手动任务、触发器领取和触发执行。
 - 标准 Agent 项目工具矩阵通过：组三态、Web/映射 IM Human、合法非 Human 拒绝、owner/editor/viewer/removed、确认恢复 ACL 重检、分页、暂停、跨项目 ID 和独立证据锚点。
 - 项目并发矩阵通过：所有 ProjectRun 类型统一进入 `max_parallel_runs` 原子门禁，饱和运行保持 queued；普通 Subagent 不参与项目计数并保持独立可执行。
@@ -119,7 +119,7 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 ### 4.3 前端与真实链路
 
 - 前端完整 prebuild、TypeScript 和 Vite production build 通过。
-- 前端候选证据：应用候选完整 prebuild、TypeScript 和 Vite production build 通过，转换 10,297 个模块，只有既有大分块提示；附件、Web 恢复、H5 时间线、项目路由、Git diff 和文件工作区等可执行行为命令通过；Plaza 恢复后的最终构建生成 Plaza chunk。生产制品仍按第五节从固定 SHA 构建。
+- 前端候选证据：Plaza 授权纠偏后的完整 prebuild、TypeScript 和 Vite production build 通过，转换 10,297 个模块，只有既有大分块提示；附件、Web 恢复、H5 时间线、项目路由、Git diff 和文件工作区等可执行行为命令通过；最终构建不再生成 Plaza 页面 chunk。生产制品仍按第五节从固定 SHA 构建。
 - 使用最终 SHA 重建本地 Docker 栈，后端与前端健康。
 - 中文、英文、390/768/1280/1920 四档关键页面通过。
 - 负责人、编辑者、查看者权限矩阵通过。
@@ -145,7 +145,7 @@ A-07 是生产发布执行前提，不是未完成的研发任务。它只在获
 | 项目 | 值 |
 |---|---|
 | RELEASE_SHA | `RELEASE_SHA`（最终收口提交后回填完整 SHA） |
-| APPLICATION_SHA | `828438e1c4daa5b93ac9dfe0b6e5ab0c363682ab` |
+| APPLICATION_SHA | `d8d6263d8fc96832b15fb9e27f196ee025425a00` |
 | RELEASE_ID | `v1.10.3-<sha7>` |
 | backend digest | 构建后回填 |
 | frontend digest | 构建后回填 |

@@ -12,17 +12,17 @@
 |---|---|
 | 主线基线 | `yybpc/company/main@d963d85cbc4852feaa070a13915023f231ab8b4e` |
 | 初始完整审计 SHA | `e04de8dd7b9a1916a5567ac30b0cc95373d2bc0f` |
-| 最终应用 SHA | `828438e1c4daa5b93ac9dfe0b6e5ab0c363682ab` |
-| 最终比较范围 | `d963d85...828438e1` |
-| 最终变更规模 | 302 files changed，104692 insertions，12866 deletions；178 added，124 modified |
+| Plaza 授权纠偏后的应用 SHA | `d8d6263d8fc96832b15fb9e27f196ee025425a00` |
+| 应用比较范围 | `d963d85...d8d6263d` |
+| 该 SHA 变更规模 | 308 files changed，104380 insertions，12870 deletions；179 added，129 modified |
 | 审计原则 | 以 API、数据库、事件、Docker 运行、浏览器行为和真实项目证据为准；源码文本匹配不作为稳定性通过证据 |
 
-初始审计发现两个阻断问题，均已在最终应用 SHA 关闭：
+初始审计发现一个真实阻断问题，并发生一次审计范围误判：
 
-1. `e04de8dd` 把 Plaza 作为全局能力退场，超出了项目能力交付范围。`828438e1` 已恢复原入口、API、工具、通知、活动和 Heartbeat，并只对项目 Agent 建立隔离。
-2. 兼容降级后的老服务可通过已知项目 Agent ID 触达项目记录，旧 worker 也可领取项目 Subagent Run。`828438e1` 已增加专用旧服务数据库身份和可逆 RLS 边界，并由精确旧镜像闭环验证。
+1. Plaza 全局退场是用户已授权的独立产品决策，不是项目能力回归。审计一度错误恢复该能力；`d8d6263d` 已撤销错误恢复并保留统一退场状态。
+2. 兼容降级后的老服务可通过已知项目 Agent ID 触达项目记录，旧 worker 也可领取项目 Subagent Run。候选已增加专用旧服务数据库身份和可逆 RLS 边界，并由精确旧镜像闭环验证。
 
-最终结论支持进入生产准备：项目主体、项目故障隔离、标准 Agent 资产隔离、Plaza 原能力、旧服务兼容回滚和真实项目交付链路均已有可观察证据。该结论不授权生产构建推送、停写、迁移或切换。
+最终结论支持进入生产准备：项目主体、项目故障隔离、标准 Agent 资产隔离、授权产品退场、旧服务兼容回滚和真实项目交付链路均已有可观察证据。该结论不授权生产构建推送、停写、迁移或切换。
 
 ## 二、差异分层
 
@@ -44,7 +44,7 @@
 
 | 证据分区 | 结果 | 覆盖内容 | 判断 |
 |---|---:|---|---|
-| 后端完整分区 | `2741 passed, 28 skipped` | 在完整审计基线执行后端 Docker/PostgreSQL 行为分区；跳过项按测试环境能力记录，不计为通过 | 已通过；最终收口新增的 Plaza 与 legacy RLS 代码另由对应行为套件覆盖 |
+| 后端完整分区 | `2741 passed, 28 skipped` | 在完整审计基线执行后端 Docker/PostgreSQL 行为分区；跳过项按测试环境能力记录，不计为通过 | 已通过；最终收口新增的 legacy RLS 代码另由对应行为套件覆盖 |
 | 项目协作分区 | `515 passed` | 项目创建、成员、规划、群聊、A2A、任务、运行、里程碑、文件、Git、模板、权限与回滚相关行为 | 已通过 |
 | 市场与设置分区 | `41 passed` | Skill Market 8、项目/设置 9、运行时开关 6、Agent/模板生命周期 15、MCP 生命周期 3 | 已通过 |
 | 前端 production build | 通过 | Docker production prebuild、TypeScript、Vite；10,297 modules transformed，仅保留既有大分块告警 | 已通过；构建证据不替代登录态交互验收 |
@@ -68,7 +68,7 @@
 | 9 | Backend：LLM、上下文与压缩 | 新增租户模型配置克隆；模型选择支持精确快照；Caller 增加 provider slot、总时长、TTFT、不活跃超时；压缩与历史保留精确锚点 | 全部普通 Agent 的模型选择、首 token、重试、长上下文压缩和错误呈现 | 模型配置 3、provider timeout/throttle、context guard 11、history compaction、channel error 12、turn recovery 测试 | **高**。真实供应商延迟和错误分布无法由隔离测试穷尽；上线需观察 TTFT、超时、重试和压缩指标 |
 | 10 | Backend：Scheduler、Trigger、Task、Heartbeat | claim 提交后派发、容量与过载重试、远程调用前释放 session、暂停项目门禁；模板和术语同步 | 普通 Agent 定时任务、Trigger、后台 Run 与 Heartbeat | Scheduler/工具并发与过载行为、后台 session 边界、项目故障隔离和 Trigger runtime 行为套件 | **中至高**。多副本时钟、重排延迟和 lease 续期需生产指标；Heartbeat 模板语义需保持兼容 |
 | 11 | Backend：A2A、活动、通知 | 新增 A2A 文件投递及发送/接收活动类型；PostgreSQL enum 前向兼容；普通活动过滤项目会话；租户广播排除项目 Agent | 标准 A2A 新会话、文件投递、活动反序列化和广播范围 | A2A 新会话 5、活动 enum 兼容 3、项目文件投递行为测试 | **中**。滚动部署时 enum 与迁移顺序仍需守门；项目 Agent 不进入旧广播是隔离要求 |
-| 12 | Backend/Frontend：Plaza | 初始审计发现全局退场；最终 SHA 恢复前端路由、Onboarding、后端 router、标准 Agent seed/目录/runtime、通知、活动和 Heartbeat，只隔离项目 Agent | 原 Plaza 入口、API、工具、通知、活动和 Heartbeat | 新增 PostgreSQL/FastAPI/tool runtime 行为测试 `2 passed`；相关影响套件 `28 passed`；前端完整构建生成 Plaza chunk | **已关闭**。标准能力恢复；项目 Agent 的 post/comment/like/mention/broadcast/history/heartbeat 全部 fail closed |
+| 12 | Backend/Frontend：Plaza | 按用户授权全局退场：旧路由跳转发现页，Onboarding 改走 Agent 会话，不注册后端 router，工具 seed/目录/runtime、通知、活动和 Heartbeat 统一关闭 | 该项是明确产品范围变化，不作为项目能力对旧功能的意外回归处理 | 3011 后端 `/api/plaza/posts` 返回 404；三项工具均为 `enabled=false / is_default=false`；Docker frontend 完整 build 通过且无 Plaza chunk | **已关闭**。授权退场保持一致；审计不得擅自恢复 |
 | 13 | Frontend：公共 Shell 与组件 | `App` auth-loading 路由策略调整；Layout 增加项目入口、窄屏折叠；Dialog、Popover、MultiSelect、Pagination、SplitPane、成员选择器共享化 | 登录初始化、全局导航、响应式侧栏和所有复用弹窗/下拉/分页页面 | Docker production build 通过；nginx 路由 smoke 无 console error/warning | **中至高**。构建和未登录 smoke 不能替代登录态交互；需抽样 auth bootstrap、窄屏导航、弹窗和下拉定位 |
 | 14 | Frontend：对话与公共会话抽屉 | Timeline 支持锚点、分析组消息 ID 和运行态占位；SessionViewerDrawer 扩展为完整时间线、输入、附件、WebSocket、分页和群聊 mention | 旧 Web/H5 对话、恢复、附件、引用与群聊 mention | chat attachments、Web resume、H5 timeline、rich mention 可执行行为脚本；后端 WebSocket/session 行为套件 | **高**。缺登录态组件级浏览器验证会话抽屉重连、输入、附件、锚点和分页组合 |
 | 15 | Frontend：标准 Agent 工具/Skill UI 与 i18n | `ToolCatalogPanel` 复用到 Agent/项目；ToolsManager 增加 scope/canConfigure；Skill、工具名、分类和 MCP 分组归一；中英文词条与 fallback 更新 | 普通 Agent 工具搜索/启停、MCP/Skill 页面、语言切换和缺失翻译 | Agent tools/skills 路由 smoke 无 console error；后端工具生命周期/开关行为通过；production build 通过 | **中**。无真实前端操作自动化覆盖普通 Agent 工具开关、MCP 分组、Skill 导入和语言切换；源码 i18n 扫描不计行为证据 |
@@ -76,21 +76,21 @@
 | 17 | Frontend：水印与公开页 | PlatformWatermark 在 `/p/*` 路由抑制，发布页使用自身 SDK 水印 | 普通页面平台水印、公开发布页重复或缺失水印 | Platform watermark、Published Page SDK 可执行脚本和后端发布页 watermark 行为测试 | **低至中**。最终候选仍应对登录页、普通登录态页面和公开页各做一次视觉确认 |
 | 18 | Deploy、CI 与迁移 | Dockerfile、Compose、Drone 增加镜像源参数、前端产物权限、容量环境项和镜像策略；部署编排同步 | 既有服务构建、启动、静态文件读取和环境默认值 | 真实 Docker production build 成功；候选 nginx 到 backend health 正常；3011 backend 重启后 HTTP 200、restart count 0 | **中**。镜像源覆盖和旧 Drone 流程需发布演练；fresh DB 问题继承自主线，仍是部署前置风险 |
 
-## 五、两个必须关闭的稳定性发现
+## 五、授权范围确认与稳定性阻断修复
 
-### 5.1 Plaza 全局退场已恢复
+### 5.1 Plaza 全局退场保持不变
 
-审计 SHA 中的 Plaza 改动不是项目领域实现所必需的适配，而是对既有平台产品的全局移除。它同时改变前端入口、路由、后端 API 注册、工具 seed/运行时、通知和活动过滤，因此不能以“新项目能力”授权覆盖。
+Plaza 全局退场不是项目实现的附带行为，而是用户已经明确授权的独立产品决策。完整差异审计应识别该授权边界，验证其实现是否统一，不得仅因它影响公共路径就擅自撤销。
 
-关闭证据：
+纠偏结果：
 
-1. 恢复 Plaza 原入口、路由和后端 API 注册。
-2. 恢复 Plaza 工具的既有 seed、启停和运行语义。
-3. 恢复 Plaza 通知与活动可见性，不把项目 Agent 混入旧广播范围。
-4. PostgreSQL/FastAPI/tool runtime 行为测试覆盖 Plaza 列表、详情、统计、发帖、评论、点赞、删除、工具可见性和调用边界；前端完整构建确认路由 chunk。
-5. 项目 Agent 的隔离由 scope/权限实现，不通过关闭 Plaza 达成。
+1. `/plaza` 继续统一跳转到 `/explore`，Onboarding 继续进入 Agent 会话。
+2. 后端不注册 Plaza router，直接 API 返回 404。
+3. 三项 Plaza builtin tool 在 seed 后均保持 `enabled=false / is_default=false`，并从 LLM 工具目录移除；历史分配不能绕过 runtime 拒绝。
+4. Plaza 通知、活动和 Heartbeat 文案继续从当前产品面移除；历史数据不因退场被删除。
+5. 删除错误恢复阶段新增的 Plaza 隔离测试，不把已撤销实现的通过数计入候选证据。
 
-以上标准全部满足。最终会话的应用内浏览器连接不可用，因此没有把未执行的最终浏览器点击伪写为通过；此前 3011 登录态浏览器证据与最终生产构建、API 行为共同作为候选证据，正式发布窗口仍按发布计划执行 UI smoke。
+以上标准已满足。修正提交为 `d8d6263d`。
 
 ### 5.2 Legacy 深链与 RLS 隔离已修复
 
@@ -119,8 +119,8 @@ Fresh PostgreSQL 从零执行 Alembic 时出现重复列问题。Git blob/hash �
 
 ## 七、发布判断
 
-当前证据覆盖项目主体、完整后端分区、项目协作、市场与设置、production build、严格 RC3、项目故障隔离、Plaza 恢复和精确旧服务回滚。相对 `e04de8dd` 的应用收口只包含 Plaza 兼容恢复、项目 Agent Plaza 隔离、legacy 可逆数据库边界和对应行为测试。
+当前证据覆盖项目主体、完整后端分区、项目协作、市场与设置、production build、严格 RC3、项目故障隔离、授权的 Plaza 全局退场和精确旧服务回滚。相对 `e04de8dd` 的有效应用收口只保留 legacy 可逆数据库边界、对应行为测试以及对错误 Plaza 恢复的撤销。
 
-最终应用代码已加载到本地隔离栈：3011 的前端运行镜像与最新构建镜像同为 `sha256:d9e8d594b980705ecf956a280db7cf5e923ee00c00434c9b383ffb1b5153bc10`，后端直接挂载最终 worktree；`/api/health`、`/sdk/clawith.js`、`/plaza` 分别返回 200，未登录 `/api/plaza/posts` 返回 401，前后端均运行且重启计数为 0。
+修正后的后端已加载到本地隔离栈：3011 `/api/health` 返回 200，`/api/plaza/posts` 返回 404，三项 Plaza 工具均为关闭且非默认；后端运行健康、重启计数为 0。修正后的 frontend 完整 prebuild、TypeScript 和 Vite production build 通过，共转换 10,297 个模块。
 
 结论：**GO for production preparation**。研发尾项为 0；完整键盘与读屏按用户要求排除。Fresh DB 历史迁移问题和生产备份容量属于独立主线/生产准备前提，不是本分支新增回归。生产备份、制品、迁移、切换、真实渠道和发布窗口 UI smoke 仍需单独授权。

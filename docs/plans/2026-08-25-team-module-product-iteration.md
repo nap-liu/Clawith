@@ -522,7 +522,7 @@
 - 消息历史旧调用仅在显式传入分页开关时返回分页结构，保持旧调用方的列表响应合同。
 - 最新合并在 Docker 隔离 PostgreSQL 中完成 154 条 webhook、钉钉消息、群会话、工作区边界和默认工具策略行为验证，结果为 `154 passed`；容器内后端编译通过。空库全历史迁移仍停在既有 `system_prompt_block` 重复列问题，不影响本轮模型建表后的行为回归结论。
 - 2026-08-26 最终收口继续合并 `yybpc/company/main@727c5f2b`，合并提交为 `5a664c72`。会话时间线冲突按“保留主线附件/引用消息展示，同时保留项目会话续接、锚点和状态恢复”归一解决，没有维护第二套会话渲染器。
-- 随后合并 `yybpc/company/main@26bcd4b5`，合并提交为 `c658ce8c`；该门禁阶段应用候选为 `c94f8d52`。合并后的 Docker 影响套件 `78 passed`。3011 backend 重启后健康检查返回 HTTP 200，restart count 为 0，原稳定能力与项目能力共同运行。完整差异收口随后以 `yybpc/company/main@d963d85c` 为基线并冻结应用代码为 `828438e1`。
+- 随后合并 `yybpc/company/main@26bcd4b5`，合并提交为 `c658ce8c`；该门禁阶段应用候选为 `c94f8d52`。合并后的 Docker 影响套件 `78 passed`。3011 backend 重启后健康检查返回 HTTP 200，restart count 为 0，原稳定能力与项目能力共同运行。完整差异收口随后以 `yybpc/company/main@d963d85c` 为基线；Plaza 授权纠偏后的应用代码冻结为 `d8d6263d`。
 - 合并后的前端候选镜像 `clawith-ai-project-frontend-check:merge-5a664c7` 完成全量 prebuild、TypeScript 与 Vite production build；共转换 10,297 个模块，仅保留既有大于 500 kB 分块提示。附件、Web 会话恢复、H5 时间线、项目路由、项目 i18n、Git diff、项目工作区七组行为命令全部通过。候选 nginx 对 `/api/health` 返回 `status=ok`、版本 `1.10.3`，项目、团队、标准数字员工工具/Skill 路由加载或登录跳转正常，控制台错误和警告均为 0。构建后的最终登录态复验仍属于发布 SHA 门禁，不反向计为产品开发缺口。
 - 标准数字员工项目管理工具完成 PostgreSQL 行为矩阵：工具组 disabled/partial/enabled，Web 与映射 IM Human，会话中携带 `user_id` 的合法非 Human `subagent` 拒绝，owner/editor/viewer/removed，确认恢复后的 ACL 重检，分页、暂停项目、跨项目对象 ID，以及 ProjectEvent、AgentActivityLog、ChatSession、Human 消息和 tool-call 锚点；与既有组三态用例合计 `8 passed`。
 - 项目运行故障边界归一为“先识别 `scope=project`，标准数字员工直接走原稳定路径”。项目状态查询、项目表或项目运行服务故障不得阻断标准数字员工的普通会话、计划任务、手动任务、触发器领取与触发执行；项目入口自身失败必须局部失败，不得扩散到原平台能力。Docker/PostgreSQL 故障隔离专项 `10 passed`，相关后台运行、手动运行和调度工具回归 `36 passed`，Ruff、格式和 Python 编译检查通过。
@@ -535,10 +535,10 @@
 
 ## 二十四、完整差异审计后的产品边界归一
 
-最终候选以 `yybpc/company/main@d963d85` 为基线，应用代码 SHA 为 `828438e1`。完整差异审计不只检查项目页面，也逐项检查所有被项目能力穿过的原平台能力。
+最终候选以 `yybpc/company/main@d963d85` 为基线，Plaza 授权纠偏后的应用代码 SHA 为 `d8d6263d`。完整差异审计不只检查项目页面，也逐项检查所有被项目能力穿过的原平台能力。
 
-审计发现候选曾把 Plaza 作为全局能力退场。该设计与项目交付无关，并直接改变原产品，因此已撤销：标准数字员工和用户继续使用原 Plaza 入口、API、工具、通知、活动与 Heartbeat；项目数字员工则通过统一的项目作用域边界从 Plaza 默认能力、内容、提及、广播和 Heartbeat 中隔离。产品原则明确为“保留原能力，只隔离项目资产”，不再用关闭整个平台能力来解决项目边界。
+完整差异审计确认 Plaza 全局退场是用户已授权的独立产品决策，不属于误删或项目能力回归。该决策继续保持统一：前端旧路由跳转到受支持的发现页，Onboarding 不再进入 Plaza，后端不注册 Plaza API，相关工具在 seed、LLM 目录和 runtime 中统一禁用，通知、活动和 Heartbeat 不再暴露该能力。审计不得擅自恢复已明确退场的产品面。
 
 回滚产品目标继续是不破坏原服务，而不是删除全部新数据库结构。候选提供一个可逆兼容模式：旧 API 和 worker 使用专用非 owner 数据库身份，只能看见和操作标准数字员工及非项目数据；项目 Agent、项目会话、任务、计划、触发器、Subagent Run 和项目历史保留但不可见、不可领取。再次升级时恢复原数据库访问状态，项目历史原样可用。该模式不改变业务行，不要求旧服务理解项目模型，也不允许旧服务继续使用会绕过边界的 owner 数据库身份。
 
-产品验收结果：Plaza 恢复、项目 Agent Plaza 隔离、旧服务深链隔离、旧 worker 队列隔离、标准 Agent 读写和再次升级恢复全部通过。完整横切审计及证据见 `docs/plans/2026-08-26-ai-native-project-full-diff-stability-audit.md`。
+产品验收结果：授权的 Plaza 全局退场保持不变；旧服务深链隔离、旧 worker 队列隔离、标准 Agent 读写和再次升级恢复全部通过。完整横切审计及证据见 `docs/plans/2026-08-26-ai-native-project-full-diff-stability-audit.md`。
