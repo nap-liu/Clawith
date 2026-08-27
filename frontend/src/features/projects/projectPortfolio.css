@@ -1572,16 +1572,19 @@
 .pm-agent-avatar {
   width: 34px;
   height: 34px;
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
   border-radius: 9px;
   background: var(--bg-active);
   color: var(--text-secondary);
   object-fit: cover;
   font-size: 11px;
+  line-height: 1;
+  text-align: center;
 }
-.pm-agent-select > span {
+.pm-agent-select__copy {
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -1673,7 +1676,7 @@
   border-color: var(--info-card-accent);
   background: var(--info-subtle);
 }
-.pm-selected-agent-list > .btn > span:last-child {
+.pm-selected-agent-copy {
   min-width: 0;
   display: grid;
   gap: 3px;
@@ -1697,6 +1700,16 @@
   justify-content: space-between;
   gap: 12px;
   padding-top: 2px;
+}
+.pm-capability-catalog {
+  height: clamp(360px, 52vh, 560px);
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.pm-capability-catalog > .tool-catalog-panel__groups {
+  min-height: 0;
+  max-height: none;
+  overscroll-behavior: contain;
 }
 .pm-capability-tabs {
   height: 38px;

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 
@@ -27,7 +27,12 @@ from app.models.chat_session import ChatSession
 from app.models.org import OrgDepartment, OrgMember
 from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
-from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
+from app.schemas.schemas import (
+    AgentCreate,
+    AgentExplorePageOut,
+    AgentOut,
+    AgentUpdate,
+)
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.org_directory import (
     canonical_org_member_id_subquery,
@@ -173,10 +178,21 @@ async def _build_unread_count_by_agent(
     the current platform user and ignore agent-to-agent / trigger-only threads.
     """
 
-    if not agents:
+    return await _build_unread_count_by_agent_ids(
+        db,
+        [agent.id for agent in agents],
+        current_user,
+    )
+
+
+async def _build_unread_count_by_agent_ids(
+    db: AsyncSession,
+    agent_ids: list[uuid.UUID],
+    current_user: User,
+) -> dict[str, int]:
+    if not agent_ids:
         return {}
 
-    agent_ids = [agent.id for agent in agents]
     result = await db.execute(
         select(ChatSession.agent_id, func.count(ChatMessage.id))
         .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
@@ -322,6 +338,131 @@ async def list_agents(
         model.onboarded_for_me = a.id in onboarded
         out.append(model)
     return out
+
+
+@router.get("/explore", response_model=AgentExplorePageOut)
+async def explore_agents(
+    tenant_id: uuid.UUID | None = None,
+    search: str | None = Query(default=None, max_length=120),
+    agent_status: str | None = Query(default=None, alias="status"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=24, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the lightweight, paginated Agent directory used by Explore."""
+    if tenant_id and tenant_id != current_user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Can only list agents in your own company",
+        )
+    if agent_status not in (None, "running", "idle", "stopped", "creating", "error"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid agent status",
+        )
+
+    visible = build_visible_agents_query(
+        current_user,
+        tenant_id=current_user.tenant_id,
+    ).with_only_columns(
+        Agent.id,
+        Agent.name,
+        Agent.avatar_url,
+        Agent.role_description,
+        Agent.bio,
+        Agent.status,
+        Agent.creator_id,
+        Agent.agent_type,
+        Agent.openclaw_last_seen,
+        Agent.created_at,
+        Agent.last_active_at,
+    ).subquery("explore_visible_agents")
+
+    counts_result = await db.execute(
+        select(
+            func.count(visible.c.id),
+            func.coalesce(func.sum(case((visible.c.status == "running", 1), else_=0)), 0),
+            func.coalesce(func.sum(case((visible.c.status == "idle", 1), else_=0)), 0),
+            func.coalesce(func.sum(case((visible.c.status == "stopped", 1), else_=0)), 0),
+        ).select_from(visible)
+    )
+    all_count, running_count, idle_count, stopped_count = counts_result.one()
+
+    filters = []
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        filters.append(
+            or_(
+                visible.c.name.ilike(pattern),
+                visible.c.role_description.ilike(pattern),
+                visible.c.bio.ilike(pattern),
+            )
+        )
+    if agent_status:
+        filters.append(visible.c.status == agent_status)
+
+    filtered = select(visible).where(*filters).subquery("explore_filtered_agents")
+    total_result = await db.execute(select(func.count()).select_from(filtered))
+    total = int(total_result.scalar_one() or 0)
+
+    creator = aliased(User)
+    creator_identity = aliased(Identity)
+    status_order = case(
+        (filtered.c.status == "running", 0),
+        (filtered.c.status == "idle", 1),
+        (filtered.c.status == "creating", 2),
+        (filtered.c.status == "stopped", 3),
+        (filtered.c.status == "error", 4),
+        else_=5,
+    )
+    rows_result = await db.execute(
+        select(
+            filtered.c.id,
+            filtered.c.name,
+            filtered.c.avatar_url,
+            filtered.c.role_description,
+            filtered.c.bio,
+            filtered.c.status,
+            filtered.c.creator_id,
+            creator.display_name.label("creator_display_name"),
+            creator_identity.username.label("creator_username"),
+            filtered.c.agent_type,
+            filtered.c.openclaw_last_seen,
+            filtered.c.created_at,
+            filtered.c.last_active_at,
+        )
+        .select_from(filtered)
+        .outerjoin(creator, creator.id == filtered.c.creator_id)
+        .outerjoin(creator_identity, creator_identity.id == creator.identity_id)
+        .order_by(status_order.asc(), filtered.c.last_active_at.desc().nullslast(), filtered.c.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    rows = [dict(row) for row in rows_result.mappings().all()]
+    unread_by_agent = await _build_unread_count_by_agent_ids(
+        db,
+        [row["id"] for row in rows],
+        current_user,
+    )
+    for row in rows:
+        row["unread_count"] = unread_by_agent.get(str(row["id"]), 0)
+
+    return {
+        "items": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": page * page_size < total,
+        "counts": {
+            "all": int(all_count or 0),
+            "running": int(running_count or 0),
+            "idle": int(idle_count or 0),
+            "stopped": int(stopped_count or 0),
+        },
+    }
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)

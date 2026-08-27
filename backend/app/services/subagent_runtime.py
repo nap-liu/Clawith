@@ -2118,6 +2118,25 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     session_project_id=child.project_id,
                     session_config=dict(child.im_config or {}),
                 )
+                web_broadcast_targets: list[tuple[uuid.UUID | str, str, dict]] = []
+                if child.project_id is not None:
+                    parent_session = await db.get(ChatSession, run.parent_session_id)
+                    if parent_session is not None and parent_session.source_channel == "project":
+                        child_config = dict(child.im_config or {})
+                        web_broadcast_targets.append(
+                            (
+                                parent_session.agent_id,
+                                str(parent_session.id),
+                                {
+                                    "message_id": f"project-stream:{run_id}:{anchor_id}",
+                                    "sender_agent_id": str(child_agent_id),
+                                    "sender_name": str(
+                                        child_config.get("project_member_name_snapshot")
+                                        or agent.name
+                                    ),
+                                },
+                            )
+                        )
 
             tools = await prepare_subagent_tools(
                 child_agent_id,
@@ -2174,6 +2193,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     # standard thinking/chunk/tool/done packets while this
                     # durable worker remains the sole model caller.
                     broadcast_web=True,
+                    web_broadcast_targets=web_broadcast_targets,
                     runtime_session=child,
                     runtime_workspace=runtime_workspace,
                     max_tool_rounds_override=max_tool_rounds_override,

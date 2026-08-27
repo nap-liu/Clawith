@@ -16,6 +16,7 @@ export type ToolCatalogPanelGroup<T> = {
 };
 
 type ToolCatalogPanelProps<T> = {
+  className?: string;
   items: T[];
   allItems?: T[];
   getKey: (item: T) => string;
@@ -42,6 +43,7 @@ type ToolCatalogPanelProps<T> = {
 };
 
 export default function ToolCatalogPanel<T>({
+  className = "",
   items,
   allItems = items,
   getKey,
@@ -110,7 +112,7 @@ export default function ToolCatalogPanel<T>({
   };
 
   return (
-    <div className="tool-catalog-panel" aria-label={ariaLabel}>
+    <div className={`tool-catalog-panel${className ? ` ${className}` : ""}`} aria-label={ariaLabel}>
       <div className="tool-catalog-panel__toolbar">
         <SearchInput
           value={searchValue}

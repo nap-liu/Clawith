@@ -1100,11 +1100,16 @@ export default function Layout() {
     }
   }, [currentTenant]);
 
-  const { data: agents = [] } = useQuery({
-    queryKey: ["agents", currentTenant],
-    queryFn: () => agentApi.list(currentTenant || undefined),
+  const { data: agentDirectory } = useQuery({
+    queryKey: ["agents", "directory", currentTenant],
+    queryFn: () =>
+      agentApi.explore({
+        tenantId: currentTenant || undefined,
+        pageSize: 500,
+      }),
     refetchInterval: 30000,
   });
+  const agents = agentDirectory?.items || [];
 
   const openAgentDrawer = useCallback(() => {
     if (!sidebarCollapsed) return;

@@ -741,7 +741,7 @@ function TeamStep({
                     >
                       <i>{selected && <IconCheck size={13} />}</i>
                       <AgentAvatar agent={agent} />
-                      <span>
+                      <span className="pm-agent-select__copy">
                         <strong>{agent.name}</strong>
                         <small>
                           {projectUserFacingCopy(agent.role_description, t)}
@@ -900,7 +900,7 @@ function CapabilitiesStep({
                 role="listitem"
               >
                 <AgentAvatar agent={agent} />
-                <span>
+                <span className="pm-selected-agent-copy">
                   <strong>{agent.name}</strong>
                   <small>{projectUserFacingCopy(agent.role_description, t)}</small>
                 </span>
@@ -936,6 +936,7 @@ function CapabilitiesStep({
           </ProjectCountBadge>
         </div>
         <ToolCatalogPanel
+          className="pm-capability-catalog"
           items={capabilityTab === "tools" ? toolCapabilities : skillCapabilities}
           getKey={(capability) => capability.id}
           getPresentation={getPresentation}
@@ -976,7 +977,6 @@ function CapabilitiesStep({
                 : t("projectCreate.capabilities.projectShared")}
             </span>
           )}
-          maxHeight={520}
         />
       </section>
     </div>

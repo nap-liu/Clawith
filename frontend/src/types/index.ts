@@ -61,6 +61,33 @@ export interface Agent {
     last_active_at?: string;
 }
 
+export type ExploreAgent = Pick<
+    Agent,
+    | 'id'
+    | 'name'
+    | 'avatar_url'
+    | 'role_description'
+    | 'bio'
+    | 'status'
+    | 'creator_id'
+    | 'creator_display_name'
+    | 'creator_username'
+    | 'agent_type'
+    | 'openclaw_last_seen'
+    | 'unread_count'
+    | 'created_at'
+    | 'last_active_at'
+>;
+
+export interface ExploreAgentPage {
+    items: ExploreAgent[];
+    total: number;
+    page: number;
+    page_size: number;
+    has_more: boolean;
+    counts: Record<'all' | 'running' | 'idle' | 'stopped', number>;
+}
+
 export interface Task {
     id: string;
     agent_id: string;

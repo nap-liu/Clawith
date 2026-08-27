@@ -31,6 +31,7 @@ import {
   buildConversationEntries,
   getConversationScrollAnchor,
   mapHistoryMessage,
+  mergeHistoryMessages,
   toolCallMessageFromEvent,
   upsertToolCallMessage,
   type ConversationMessage,
@@ -437,7 +438,9 @@ export default function SessionViewerDrawer({
           ? deriveGroupTurnState(Array.isArray(rows) ? rows : [])
           : null;
         setSession(detail);
-        setMessages(normalized);
+        setMessages((previous) =>
+          background ? mergeHistoryMessages(previous, normalized) : normalized,
+        );
         if (groupConfig) {
           setGroupTurn(nextGroupTurn);
           if (!groupSendInFlightRef.current)
@@ -499,7 +502,6 @@ export default function SessionViewerDrawer({
     if (
       !interactive ||
       targetReadOnly ||
-      groupConfig ||
       !sessionId ||
       !accessAgentId
     )
@@ -556,6 +558,8 @@ export default function SessionViewerDrawer({
               type: payload.type,
               content: String(payload.content || ""),
               messageId,
+              sender_name: payload.sender_name,
+              sender_agent_id: payload.sender_agent_id,
             }),
           );
           return;
@@ -638,6 +642,8 @@ export default function SessionViewerDrawer({
             applyAssistantDoneMessage(previous, {
               content: String(payload.content || ""),
               messageId,
+              sender_name: payload.sender_name,
+              sender_agent_id: payload.sender_agent_id,
             }),
           );
           setSending(false);

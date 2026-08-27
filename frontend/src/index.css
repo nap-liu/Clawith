@@ -9483,6 +9483,12 @@ select:focus {
   line-height: 1.55;
 }
 
+.session-viewer-drawer__composer-row > .ui-rich-mention-composer {
+  min-height: 34px;
+  padding: 6px 2px;
+  box-sizing: border-box;
+}
+
 .session-viewer-drawer__composer-row textarea::placeholder {
   color: var(--text-tertiary);
 }

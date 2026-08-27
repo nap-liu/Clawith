@@ -131,6 +131,7 @@ async def _call_agent_llm(
     before_round=None,
     before_tool_execution=None,
     broadcast_web: bool = True,
+    web_broadcast_targets: list[tuple[uuid.UUID | str, str, dict]] | None = None,
     include_soul: bool = True,
     include_memory: bool = True,
     release_db_before_dispatch: bool = False,
@@ -396,8 +397,15 @@ async def _call_agent_llm(
     # as the WebSocket chat path). Lazy import avoids a services->api import
     # cycle; best-effort so IM delivery is never affected by a web-side hiccup.
     async def _web_broadcast(payload: dict):
-        if broadcast_web:
-            await _broadcast_to_web_session(history_agent_id, session_id, payload)
+        if not broadcast_web:
+            return
+        await _broadcast_to_web_session(history_agent_id, session_id, payload)
+        for target_agent_id, target_session_id, target_context in web_broadcast_targets or []:
+            await _broadcast_to_web_session(
+                target_agent_id,
+                target_session_id,
+                {**payload, **target_context},
+            )
 
     from app.services.user_output import (
         UserOutputStreamSanitizer,

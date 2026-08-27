@@ -89,6 +89,8 @@ export type AssistantStreamMessage = {
   content?: string;
   now?: string;
   messageId?: string;
+  sender_name?: string;
+  sender_agent_id?: string;
 };
 
 const CONFIRMATION_TOOL = "request_confirmation";
@@ -222,7 +224,13 @@ function findStreamingAssistantIndexAfterLastTool(
 
 export function applyAssistantDoneMessage<T extends Record<string, any>>(
   messages: T[],
-  event: { content?: string; now?: string; messageId?: string },
+  event: {
+    content?: string;
+    now?: string;
+    messageId?: string;
+    sender_name?: string;
+    sender_agent_id?: string;
+  },
   makeId: () => string = defaultMakeId,
 ): T[] {
   let identifiedIdx = event.messageId
@@ -313,6 +321,9 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
       : {}),
     created_at: identifiedMessage?.created_at || streamed[0]?.created_at || now,
     timestamp: identifiedMessage?.timestamp || streamed[0]?.timestamp || now,
+    sender_name: event.sender_name || identifiedMessage?.sender_name || streamed[0]?.sender_name,
+    sender_agent_id:
+      event.sender_agent_id || identifiedMessage?.sender_agent_id || streamed[0]?.sender_agent_id,
     streaming: false,
     _streaming: false,
     _canonicalDone: true,
@@ -379,6 +390,8 @@ export function applyAssistantStreamMessage(
       next[idx] = {
         ...next[idx],
         thinking: (next[idx].thinking || "") + content,
+        sender_name: event.sender_name || next[idx].sender_name,
+        sender_agent_id: event.sender_agent_id || next[idx].sender_agent_id,
         streaming: true,
         _streaming: true,
       };
@@ -391,6 +404,8 @@ export function applyAssistantStreamMessage(
         role: "assistant",
         content: "",
         thinking: content,
+        sender_name: event.sender_name,
+        sender_agent_id: event.sender_agent_id,
         streaming: true,
         _streaming: true,
       },
@@ -403,6 +418,8 @@ export function applyAssistantStreamMessage(
       next[idx] = {
         ...next[idx],
         content: next[idx].content + content,
+        sender_name: event.sender_name || next[idx].sender_name,
+        sender_agent_id: event.sender_agent_id || next[idx].sender_agent_id,
         streaming: true,
         _streaming: true,
       };
@@ -414,6 +431,8 @@ export function applyAssistantStreamMessage(
         id: event.messageId || makeId(),
         role: "assistant",
         content,
+        sender_name: event.sender_name,
+        sender_agent_id: event.sender_agent_id,
         streaming: true,
         _streaming: true,
       },

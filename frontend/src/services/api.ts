@@ -1,6 +1,6 @@
 /** API service layer */
 
-import type { Agent, TokenResponse, User, Task, ChatMessage } from "../types";
+import type { Agent, ExploreAgentPage, TokenResponse, User, Task, ChatMessage } from "../types";
 
 const API_BASE = "/api";
 
@@ -506,6 +506,22 @@ export const adminApi = {
 export const agentApi = {
   list: (tenantId?: string) =>
     request<Agent[]>(`/agents/${tenantId ? `?tenant_id=${tenantId}` : ""}`),
+
+  explore: (params: {
+    tenantId?: string;
+    search?: string;
+    status?: string;
+    page?: number;
+    pageSize?: number;
+  } = {}) => {
+    const query = new URLSearchParams();
+    if (params.tenantId) query.set("tenant_id", params.tenantId);
+    if (params.search) query.set("search", params.search);
+    if (params.status) query.set("status", params.status);
+    query.set("page", String(params.page || 1));
+    query.set("page_size", String(params.pageSize || 24));
+    return request<ExploreAgentPage>(`/agents/explore?${query.toString()}`);
+  },
 
   get: (id: string) => request<Agent>(`/agents/${id}`),
 
