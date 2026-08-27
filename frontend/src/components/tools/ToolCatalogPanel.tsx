@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { ReactNode } from "react";
-import { IconChevronDown, IconTools } from "@tabler/icons-react";
+import { IconCheck, IconChevronDown, IconTools } from "@tabler/icons-react";
 
 import SearchInput from "../ui/SearchInput";
 import type { LocalizedToolPresentation } from "../../utils/toolPresentation";
@@ -29,6 +29,8 @@ type ToolCatalogPanelProps<T> = {
   onExpandedGroupsChange: (groups: Set<string>) => void;
   selectedKey?: string;
   onSelect?: (key: string) => void;
+  selectedKeys?: ReadonlySet<string>;
+  onToggle?: (key: string) => void;
   renderGroupIcon?: (group: ToolCatalogPanelGroup<T>) => ReactNode;
   renderGroupSummary?: (group: ToolCatalogPanelGroup<T>) => ReactNode;
   renderGroupActions?: (group: ToolCatalogPanelGroup<T>) => ReactNode;
@@ -53,6 +55,8 @@ export default function ToolCatalogPanel<T>({
   onExpandedGroupsChange,
   selectedKey,
   onSelect,
+  selectedKeys,
+  onToggle,
   renderGroupIcon,
   renderGroupSummary,
   renderGroupActions,
@@ -63,6 +67,8 @@ export default function ToolCatalogPanel<T>({
   maxHeight,
 }: ToolCatalogPanelProps<T>) {
   const normalizedSearch = searchValue.trim().toLocaleLowerCase();
+  const multiple = selectedKeys !== undefined;
+  const selectable = Boolean(onSelect || onToggle);
   const groups = useMemo(() => {
     const groupedAll = new Map<string, T[]>();
     allItems.forEach((item) => {
@@ -154,14 +160,27 @@ export default function ToolCatalogPanel<T>({
               </div>
               {expanded ? (
                 customBody ?? (
-                  <div className="tool-catalog-panel__items" role={onSelect ? "listbox" : "list"}>
+                  <div
+                    className="tool-catalog-panel__items"
+                    role={selectable ? "listbox" : "list"}
+                    aria-multiselectable={multiple || undefined}
+                  >
                     {group.items.map((item) => {
                       const key = getKey(item);
                       const presentation = getPresentation(item);
-                      const selected = key === selectedKey;
+                      const selected = multiple
+                        ? selectedKeys?.has(key) ?? false
+                        : key === selectedKey;
                       const copy = (
                         <>
-                          {onSelect ? <span className="tool-catalog-panel__selection" aria-hidden="true" /> : null}
+                          {selectable ? (
+                            <span
+                              className={`tool-catalog-panel__selection${multiple ? " is-multiple" : ""}`}
+                              aria-hidden="true"
+                            >
+                              {multiple && selected ? <IconCheck size={10} /> : null}
+                            </span>
+                          ) : null}
                           <span className="tool-catalog-panel__item-copy">
                             <span>
                               <strong>{presentation.name}</strong>
@@ -175,14 +194,14 @@ export default function ToolCatalogPanel<T>({
                         <div
                           key={key}
                           className={`tool-catalog-panel__item${selected ? " is-selected" : ""}`}
-                          role={onSelect ? "option" : "listitem"}
-                          aria-selected={onSelect ? selected : undefined}
+                          role={selectable ? "option" : "listitem"}
+                          aria-selected={selectable ? selected : undefined}
                         >
-                          {onSelect ? (
+                          {selectable ? (
                             <button
                               type="button"
                               className="tool-catalog-panel__item-select"
-                              onClick={() => onSelect(key)}
+                              onClick={() => onToggle ? onToggle(key) : onSelect?.(key)}
                             >
                               {copy}
                             </button>

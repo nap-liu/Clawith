@@ -280,12 +280,24 @@
 }
 .pm-view-toggle button {
   width: 31px;
+  height: 31px;
   display: grid;
   place-items: center;
   border: 0;
   border-radius: 5px;
   background: transparent;
   color: var(--text-tertiary);
+}
+.pm-view-toggle.project-segmented-control > .btn {
+  width: 31px;
+  min-width: 31px;
+  padding: 0;
+}
+.pm-view-toggle.project-segmented-control > .btn > span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
 }
 .pm-view-toggle button.is-active {
   background: var(--accent-subtle);
@@ -1118,7 +1130,7 @@
   position: absolute;
   top: 35px;
   bottom: -6px;
-  left: 15px;
+  left: 22px;
   width: 1px;
   background: var(--border-subtle);
 }
@@ -1517,6 +1529,12 @@
   gap: 9px;
   margin-top: 13px;
 }
+.pm-agent-search {
+  margin-top: 13px;
+}
+.pm-agent-search .ui-search-input__control {
+  min-height: 40px;
+}
 .pm-agent-grid article {
   overflow: hidden;
   border: 1px solid var(--border-subtle);
@@ -1631,6 +1649,57 @@
 }
 .pm-create-minimal-name {
   margin-bottom: 14px;
+}
+.pm-capability-picker {
+  display: grid;
+  gap: 14px;
+}
+.pm-selected-agent-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+.pm-selected-agent-list > .btn {
+  min-width: 0;
+  min-height: 54px;
+  height: auto;
+  justify-content: flex-start;
+  padding: 9px 11px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  text-align: left;
+}
+.pm-selected-agent-list > .btn.is-active {
+  border-color: var(--info-card-accent);
+  background: var(--info-subtle);
+}
+.pm-selected-agent-list > .btn > span:last-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.pm-selected-agent-list strong,
+.pm-selected-agent-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pm-selected-agent-list strong {
+  font-size: 11px;
+}
+.pm-selected-agent-list small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+.pm-capability-picker__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 2px;
+}
+.pm-capability-tabs {
+  height: 38px;
 }
 .pm-planning-intro {
   display: flex;

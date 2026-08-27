@@ -248,6 +248,19 @@
   border-radius: 50%;
 }
 
+.tool-catalog-panel__selection.is-multiple {
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tool-catalog-panel__item.is-selected .tool-catalog-panel__selection.is-multiple {
+  border: 1px solid var(--accent-primary);
+  color: var(--text-inverse);
+  background: var(--accent-primary);
+}
+
 .tool-catalog-panel__item.is-selected .tool-catalog-panel__selection {
   border: 4px solid var(--accent-primary);
 }

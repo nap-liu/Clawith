@@ -680,6 +680,7 @@ async def get_project_bootstrap_options(
         .all()
     )
     agent_ids = [agent.id for agent in agents]
+    agent_names = {agent.id: agent.name for agent in agents}
     inherited_tools = []
     if agent_ids:
         inherited_tools = (
@@ -730,8 +731,11 @@ async def get_project_bootstrap_options(
             "type": "mcp" if tool.type == "mcp" else "tool",
             "name": tool.display_name or tool.name,
             "description": tool.description,
+            "category": tool.category,
+            "mcp_server_name": tool.mcp_server_name,
             "source": "inherited",
             "owner_agent_id": str(assignment.agent_id),
+            "owner_agent_name": agent_names.get(assignment.agent_id),
             "enabled": assignment.enabled,
             "enabled_by_default": tool.name in PROJECT_AGENT_DEFAULT_TOOL_NAMES,
         }
@@ -743,6 +747,7 @@ async def get_project_bootstrap_options(
                 "id": str(agent.id),
                 "name": agent.name,
                 "role_description": agent.role_description,
+                "avatar_url": agent.avatar_url,
                 "status": agent.status,
                 "agent_type": agent.agent_type,
             }

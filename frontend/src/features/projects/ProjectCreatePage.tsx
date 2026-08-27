@@ -20,6 +20,8 @@ import {
 
 import { projectsApi } from "../../services/projects";
 import { useDialog } from "../../components/Dialog/DialogProvider";
+import ToolCatalogPanel from "../../components/tools/ToolCatalogPanel";
+import { getLocalizedToolPresentation } from "../../utils/toolPresentation";
 import type {
   ProjectAgentOption,
   ProjectCapabilityCreateOverride,
@@ -34,8 +36,9 @@ import {
   ProjectCountBadge,
   ProjectEmptyState,
   ProjectField,
+  ProjectSegmentedControl,
+  SearchInput,
   TextInput,
-  ToggleSwitch,
 } from "./components/ProjectUI";
 import { projectUserFacingCopy } from "./projectUserFacingCopy";
 import "./projectPortfolio.css";
@@ -76,66 +79,21 @@ function toggleItem(items: string[], id: string) {
 }
 
 function AgentAvatar({ agent }: { agent: ProjectAgentOption }) {
-  return agent.avatar_url ? (
-    <img className="pm-agent-avatar" src={agent.avatar_url} alt="" />
+  const [failed, setFailed] = useState(false);
+  const token = typeof window === "undefined" ? "" : localStorage.getItem("token") || "";
+  const avatarUrl = agent.avatar_url?.startsWith("/api") && token
+    ? `${agent.avatar_url}${agent.avatar_url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`
+    : agent.avatar_url;
+  useEffect(() => setFailed(false), [avatarUrl]);
+  return avatarUrl && !failed ? (
+    <img
+      className="pm-agent-avatar"
+      src={avatarUrl}
+      alt=""
+      onError={() => setFailed(true)}
+    />
   ) : (
     <span className="pm-agent-avatar">{agent.name.slice(0, 1)}</span>
-  );
-}
-
-function CapabilityRow({
-  capability,
-  selected,
-  onToggle,
-}: {
-  capability: ProjectCapabilityOption;
-  selected: boolean;
-  onToggle: (checked: boolean) => void;
-}) {
-  const { t } = useTranslation();
-  const kindLabel =
-    capability.kind === "skill"
-      ? "Skill"
-      : capability.kind === "mcp"
-        ? "MCP"
-        : t("projectCreate.capabilityKind.tool");
-  const capabilityName = projectUserFacingCopy(capability.name, t);
-  return (
-    <div className={`pm-capability-row ${selected ? "is-selected" : ""}`}>
-      <span className={`pm-capability-kind pm-kind-${capability.kind}`}>
-        {capability.kind === "skill" ? (
-          <IconBolt size={15} />
-        ) : (
-          <IconCode size={15} />
-        )}
-      </span>
-      <span>
-        <strong>{capabilityName}</strong>
-        <small>
-          {capability.description ||
-            `${kindLabel} · ${capability.version || t("projectCreate.capabilities.currentVersion")}`}
-        </small>
-      </span>
-      {capability.risk_level && (
-        <em className={`pm-risk pm-risk-${capability.risk_level}`}>
-          {capability.risk_level === "high"
-            ? t("projectCreate.capabilities.riskHigh")
-            : capability.risk_level === "medium"
-              ? t("projectCreate.capabilities.riskMedium")
-              : t("projectCreate.capabilities.riskLow")}
-        </em>
-      )}
-      <ToggleSwitch
-        checked={selected}
-        onChange={onToggle}
-        ariaLabel={t(
-          selected
-            ? "projectCreate.capabilities.disableAria"
-            : "projectCreate.capabilities.enableAria",
-          { name: capabilityName },
-        )}
-      />
-    </div>
   );
 }
 
@@ -485,6 +443,7 @@ export default function ProjectCreatePage() {
           )}
           {step === 2 && (
             <CapabilitiesStep
+              agents={selectedAgents}
               projectCapabilities={projectCapabilities}
               inheritedCapabilities={inheritedCapabilities}
               template={template}
@@ -610,7 +569,19 @@ function TeamStep({
   patch: PatchDraft;
 }) {
   const { t } = useTranslation();
+  const [agentQuery, setAgentQuery] = useState("");
   const restoresSnapshot = Boolean(template?.snapshot_backed);
+  const visibleAgents = useMemo(() => {
+    const query = agentQuery.trim().toLocaleLowerCase();
+    if (!query) return agents;
+    return agents.filter((agent) =>
+      [agent.name, agent.role_description]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase()
+        .includes(query),
+    );
+  }, [agentQuery, agents]);
   return (
     <div className="pm-step-section">
       <StepTitle
@@ -711,9 +682,17 @@ function TeamStep({
               {t("projectCreate.team.a2a")}
             </span>
           </div>
+          <SearchInput
+            className="pm-agent-search"
+            value={agentQuery}
+            onChange={(event) => setAgentQuery(event.target.value)}
+            placeholder={t("projectCreate.team.searchPlaceholder")}
+            aria-label={t("projectCreate.team.searchAria")}
+          />
           {agents.length ? (
-            <div className="pm-agent-grid">
-              {agents.map((agent) => {
+            visibleAgents.length ? (
+              <div className="pm-agent-grid">
+              {visibleAgents.map((agent) => {
                 const selected = draft.memberIds.includes(agent.id);
                 const isLeader = draft.leaderId === agent.id;
                 const toggleAgent = () => {
@@ -792,7 +771,13 @@ function TeamStep({
                   </article>
                 );
               })}
-            </div>
+              </div>
+            ) : (
+              <ProjectEmptyState
+                title={t("projectCreate.team.noSearchResults")}
+                description={t("projectCreate.team.noSearchResultsHint")}
+              />
+            )
           ) : (
             <ProjectEmptyState
               title={t("projectCreate.team.emptyTitle")}
@@ -806,12 +791,14 @@ function TeamStep({
 }
 
 function CapabilitiesStep({
+  agents,
   projectCapabilities,
   inheritedCapabilities,
   template,
   draft,
   patch,
 }: {
+  agents: ProjectAgentOption[];
   projectCapabilities: ProjectCapabilityOption[];
   inheritedCapabilities: ProjectCapabilityOption[];
   template?: ProjectTemplate;
@@ -819,6 +806,60 @@ function CapabilitiesStep({
   patch: PatchDraft;
 }) {
   const { t } = useTranslation();
+  const [activeAgentId, setActiveAgentId] = useState(
+    () => draft.leaderId || agents[0]?.id || "",
+  );
+  const [capabilityTab, setCapabilityTab] = useState<"tools" | "skills">("tools");
+  const [toolSearch, setToolSearch] = useState("");
+  const [skillSearch, setSkillSearch] = useState("");
+  const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(
+    () => new Set(["general"]),
+  );
+  const [expandedSkillGroups, setExpandedSkillGroups] = useState<Set<string>>(
+    () => new Set(["general"]),
+  );
+  useEffect(() => {
+    if (!agents.some((agent) => agent.id === activeAgentId)) {
+      setActiveAgentId(draft.leaderId || agents[0]?.id || "");
+    }
+  }, [activeAgentId, agents, draft.leaderId]);
+  const allCapabilities = [...projectCapabilities, ...inheritedCapabilities];
+  const visibleCapabilities = allCapabilities.filter(
+    (capability) =>
+      capability.source === "project" ||
+      capability.owner_agent_id === activeAgentId,
+  );
+  const toolCapabilities = visibleCapabilities.filter(
+    (capability) => capability.kind !== "skill",
+  );
+  const skillCapabilities = visibleCapabilities.filter(
+    (capability) => capability.kind === "skill",
+  );
+  const selectedCapabilityIds = useMemo(
+    () =>
+      new Set([
+        ...draft.sharedCapabilityIds,
+        ...draft.inheritedCapabilityIds,
+      ]),
+    [draft.inheritedCapabilityIds, draft.sharedCapabilityIds],
+  );
+  const toggleCapability = (capabilityId: string) => {
+    const capability = allCapabilities.find((item) => item.id === capabilityId);
+    if (!capability) return;
+    const key = capability.source === "agent"
+      ? "inheritedCapabilityIds"
+      : "sharedCapabilityIds";
+    patch(key, toggleItem(draft[key], capabilityId));
+  };
+  const getPresentation = (capability: ProjectCapabilityOption) =>
+    getLocalizedToolPresentation(t, {
+      key: capability.internal_name,
+      name: projectUserFacingCopy(capability.name, t),
+      description: capability.description,
+      category: capability.category,
+      type: capability.kind,
+      mcp_server_name: capability.mcp_server_name,
+    });
   if (template?.snapshot_backed) {
     return (
       <div className="pm-step-section">
@@ -844,73 +885,99 @@ function CapabilitiesStep({
         title={t("projectCreate.capabilities.title")}
         description={t("projectCreate.capabilities.description")}
       />
-      <section className="pm-capability-group">
-        <header>
-          <div>
-            <strong>{t("projectCreate.capabilities.shared")}</strong>
-            <small>{t("projectCreate.capabilities.sharedHint")}</small>
-          </div>
+      <section className="pm-capability-picker">
+        <div className="pm-selected-agent-list" role="list">
+          {agents.map((agent) => {
+            const active = agent.id === activeAgentId;
+            return (
+              <Button
+                key={agent.id}
+                type="button"
+                variant="ghost"
+                className={active ? "is-active" : ""}
+                onClick={() => setActiveAgentId(agent.id)}
+                aria-pressed={active}
+                role="listitem"
+              >
+                <AgentAvatar agent={agent} />
+                <span>
+                  <strong>{agent.name}</strong>
+                  <small>{projectUserFacingCopy(agent.role_description, t)}</small>
+                </span>
+              </Button>
+            );
+          })}
+        </div>
+        <div className="pm-capability-picker__header">
+          <ProjectSegmentedControl
+            className="pm-capability-tabs"
+            value={capabilityTab}
+            onChange={setCapabilityTab}
+            ariaLabel={t("projectCreate.capabilities.tabsAria")}
+            options={[
+              {
+                value: "tools",
+                icon: <IconCode size={15} />,
+                label: t("projectCreate.capabilities.toolsTab"),
+                count: toolCapabilities.length,
+              },
+              {
+                value: "skills",
+                icon: <IconBolt size={15} />,
+                label: t("projectCreate.capabilities.skillsTab"),
+                count: skillCapabilities.length,
+              },
+            ]}
+          />
           <ProjectCountBadge>
             {t("projectCreate.capabilities.count", {
-              count: draft.sharedCapabilityIds.length,
+              count: selectedCapabilityIds.size,
             })}
           </ProjectCountBadge>
-        </header>
-        {projectCapabilities.length ? (
-          <div>
-            {projectCapabilities.map((capability) => (
-              <CapabilityRow
-                key={capability.id}
-                capability={capability}
-                selected={draft.sharedCapabilityIds.includes(capability.id)}
-                onToggle={() =>
-                  patch(
-                    "sharedCapabilityIds",
-                    toggleItem(draft.sharedCapabilityIds, capability.id),
-                  )
-                }
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="pm-inline-empty">
-            <p>{t("projectCreate.capabilities.noShared")}</p>
-          </div>
-        )}
-      </section>
-      <section className="pm-capability-group">
-        <header>
-          <div>
-            <strong>{t("projectCreate.capabilities.employee")}</strong>
-            <small>{t("projectCreate.capabilities.employeeHint")}</small>
-          </div>
-          <ProjectCountBadge>
-            {t("projectCreate.capabilities.count", {
-              count: draft.inheritedCapabilityIds.length,
-            })}
-          </ProjectCountBadge>
-        </header>
-        {inheritedCapabilities.length ? (
-          <div>
-            {inheritedCapabilities.map((capability) => (
-              <CapabilityRow
-                key={capability.id}
-                capability={capability}
-                selected={draft.inheritedCapabilityIds.includes(capability.id)}
-                onToggle={() =>
-                  patch(
-                    "inheritedCapabilityIds",
-                    toggleItem(draft.inheritedCapabilityIds, capability.id),
-                  )
-                }
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="pm-inline-empty">
-            <p>{t("projectCreate.capabilities.noEmployee")}</p>
-          </div>
-        )}
+        </div>
+        <ToolCatalogPanel
+          items={capabilityTab === "tools" ? toolCapabilities : skillCapabilities}
+          getKey={(capability) => capability.id}
+          getPresentation={getPresentation}
+          searchValue={capabilityTab === "tools" ? toolSearch : skillSearch}
+          onSearchChange={capabilityTab === "tools" ? setToolSearch : setSkillSearch}
+          searchPlaceholder={t(
+            capabilityTab === "tools"
+              ? "projectCreate.capabilities.searchTools"
+              : "projectCreate.capabilities.searchSkills",
+          )}
+          emptyLabel={t(
+            capabilityTab === "tools"
+              ? "projectCreate.capabilities.noTools"
+              : "projectCreate.capabilities.noSkills",
+          )}
+          ariaLabel={t(
+            capabilityTab === "tools"
+              ? "projectCreate.capabilities.toolsAria"
+              : "projectCreate.capabilities.skillsAria",
+          )}
+          expandedGroups={
+            capabilityTab === "tools" ? expandedToolGroups : expandedSkillGroups
+          }
+          onExpandedGroupsChange={
+            capabilityTab === "tools" ? setExpandedToolGroups : setExpandedSkillGroups
+          }
+          selectedKeys={selectedCapabilityIds}
+          onToggle={toggleCapability}
+          renderGroupIcon={() =>
+            capabilityTab === "tools" ? <IconCode size={15} /> : <IconBolt size={15} />
+          }
+          renderItemBadges={(capability) => (
+            <span className="tool-catalog-panel__badge">
+              {capability.source === "agent"
+                ? t("projectCreate.capabilities.fromEmployee", {
+                    name: capability.owner_agent_name || t("projectCreate.capabilities.employeeShort"),
+                  })
+                : t("projectCreate.capabilities.projectShared")}
+            </span>
+          )}
+          maxHeight={520}
+        />
       </section>
     </div>
   );

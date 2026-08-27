@@ -137,6 +137,40 @@ async def test_create_without_source_seeds_required_project_assets(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_create_from_local_agentdir_does_not_rewrite_source_runtime_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_agent_id = uuid.uuid4()
+    project_agent_id = uuid.uuid4()
+    storage_root = tmp_path / "agent-data"
+    source = storage_root / str(source_agent_id)
+    source.mkdir(parents=True)
+    (source / "soul.md").write_text("# Source identity\n", encoding="utf-8")
+    readonly_cache = source / "go" / "pkg" / "mod" / "dependency.md"
+    readonly_cache.parent.mkdir(parents=True)
+    readonly_cache.write_text("runtime cache", encoding="utf-8")
+    readonly_cache.chmod(0o444)
+    storage = LocalStorageBackend(str(storage_root))
+    monkeypatch.setattr(agent_manager_module, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(agent_manager_module.settings, "STORAGE_LOCAL_ROOT", str(storage_root))
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    result = await create_project_agent_workspace(
+        project_root,
+        project_agent_id,
+        source_agent_id=source_agent_id,
+        copy_source_memory=False,
+        copy_source_workspace=False,
+    )
+
+    assert result.workspace.soul.read_text(encoding="utf-8") == "# Source identity\n"
+    assert readonly_cache.read_text(encoding="utf-8") == "runtime cache"
+    assert not (result.workspace.root / "go").exists()
+
+
+@pytest.mark.asyncio
 async def test_project_identity_defaults_are_role_specific_and_do_not_replace_source_assets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

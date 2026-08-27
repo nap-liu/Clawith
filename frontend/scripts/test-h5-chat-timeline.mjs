@@ -554,6 +554,25 @@ const {
 }
 
 {
+    const entries = buildH5ConversationEntries([
+        { id: 'u1', role: 'user', content: '连续运行多个工具' },
+        { id: 'thinking-1', role: 'assistant', content: '', thinking: '第一轮思考', streaming: true, _streaming: true },
+        { id: 'tool-1', role: 'tool_call', toolName: 'search_contacts', toolCallId: 'tool-1', toolStatus: 'done' },
+        { id: 'thinking-2', role: 'assistant', content: '', thinking: '第二轮思考', streaming: true, _streaming: true },
+        { id: 'tool-2', role: 'tool_call', toolName: 'read_file', toolCallId: 'tool-2', toolStatus: 'done' },
+        { id: 'thinking-3', role: 'assistant', content: '', thinking: '当前思考', streaming: true, _streaming: true },
+    ]);
+
+    assert.equal(
+        entries.filter((entry) => entry.type === 'message' && entry.msg._streaming && !entry.msg.content).length,
+        1,
+        'one logical turn must render only one live thinking row',
+    );
+    const analysis = entries.find((entry) => entry.type === 'analysis_group');
+    assert.equal(analysis.items.filter((item) => item.type === 'tool').length, 2);
+}
+
+{
     const messageId = 'initial-assistant:session-1';
     let messages = applyAssistantStreamMessage([], {
         type: 'done',

@@ -18,7 +18,7 @@ from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.services.agent_memory import CORE_MEMORY_TEMPLATE, MEMORY_INDEX_TEMPLATE
 from app.services.llm import get_model_api_key
-from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.storage import LocalStorageBackend, get_storage_backend, normalize_storage_key
 
 settings = get_settings()
 
@@ -78,6 +78,15 @@ class AgentManager:
         storage = get_storage_backend()
         agent_prefix = self._agent_storage_prefix(agent_id)
         agent_dir.mkdir(parents=True, exist_ok=True)
+
+        # Local storage already is the mounted AgentDir. Replaying its files
+        # into the same path is unnecessary and can overwrite read-only runtime
+        # caches. Only remote storage needs materialization.
+        if isinstance(storage, LocalStorageBackend):
+            storage_dir = await storage.local_path_for(agent_prefix)
+            if storage_dir is not None and storage_dir.resolve() == agent_dir.resolve():
+                return agent_dir
+
         if not await storage.exists(agent_prefix) and not await storage.is_dir(agent_prefix):
             return agent_dir
         for entry in await storage.list_dir(agent_prefix):

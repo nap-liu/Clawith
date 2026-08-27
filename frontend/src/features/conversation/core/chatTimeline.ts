@@ -838,6 +838,19 @@ export function buildConversationEntries(
   messages: ConversationMessage[],
 ): ConversationEntry[] {
   messages = normalizeChatTimelineMessages(messages);
+  let latestEmptyStreamingAssistantIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message.role === "assistant" &&
+      Boolean(message.streaming || message._streaming) &&
+      !message.content?.trim() &&
+      !(Array.isArray(message.attachments) && message.attachments.length > 0)
+    ) {
+      latestEmptyStreamingAssistantIndex = index;
+      break;
+    }
+  }
 
   const grouped: ConversationEntry[] = [];
   let currentGroup: ConversationAnalysisItem[] | null = null;
@@ -903,6 +916,17 @@ export function buildConversationEntries(
         }
         pushThinking(currentGroup, msg.thinking);
         currentGroupMessageIds.push(msg.id);
+      }
+      // A multi-tool turn can create one temporary empty assistant row after
+      // each tool boundary. Keep only the latest row as the live loading
+      // indicator; prior rows remain represented by the unified analysis group.
+      if (
+        !contentText &&
+        !hasAttachments &&
+        isStreamingPlaceholder &&
+        i !== latestEmptyStreamingAssistantIndex
+      ) {
+        continue;
       }
       // Keep the canonical empty streaming row. ConversationTimeline
       // renders it with the same thinking/loading bubble used by normal

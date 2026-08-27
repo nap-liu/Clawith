@@ -6,6 +6,7 @@ import pytest
 from app.api import files
 from app.services.agent_manager import AgentManager
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion
+from app.services.storage_runtime.local import LocalStorageBackend
 
 
 class PrefixOnlyStorage(StorageBackend):
@@ -168,3 +169,22 @@ async def test_agent_manager_materializes_s3_prefix_directory(monkeypatch, tmp_p
 
     assert (agent_dir / "soul.md").read_text(encoding="utf-8") == "# Soul\n"
     assert (agent_dir / "memory" / "memory.md").read_text(encoding="utf-8") == "# Memory\n"
+
+
+@pytest.mark.asyncio
+async def test_agent_manager_reuses_local_agent_directory_without_rewriting(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    agent_dir = tmp_path / str(agent_id)
+    readonly_file = agent_dir / "go" / "pkg" / "mod" / "dependency.md"
+    readonly_file.parent.mkdir(parents=True)
+    readonly_file.write_text("existing", encoding="utf-8")
+    readonly_file.chmod(0o444)
+    storage = LocalStorageBackend(str(tmp_path))
+    monkeypatch.setattr("app.services.agent_manager.get_storage_backend", lambda: storage)
+    monkeypatch.setattr("app.services.agent_manager.settings.STORAGE_LOCAL_ROOT", str(tmp_path))
+
+    manager = AgentManager()
+    materialized = await manager._materialize_agent_dir(agent_id)
+
+    assert materialized == agent_dir
+    assert readonly_file.read_text(encoding="utf-8") == "existing"
