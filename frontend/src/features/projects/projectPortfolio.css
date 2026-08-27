@@ -1694,12 +1694,11 @@
   color: var(--text-tertiary);
   font-size: 9px;
 }
-.pm-capability-picker__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding-top: 2px;
+.pm-capability-panel .project-workspace__member-capability-rail {
+  margin: 0 0 14px;
+}
+.pm-capability-panel__body {
+  min-height: 0;
 }
 .pm-capability-catalog {
   height: clamp(360px, 52vh, 560px);
@@ -1710,9 +1709,6 @@
   min-height: 0;
   max-height: none;
   overscroll-behavior: contain;
-}
-.pm-capability-tabs {
-  height: 38px;
 }
 .pm-planning-intro {
   display: flex;

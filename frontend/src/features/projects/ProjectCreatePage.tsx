@@ -9,7 +9,7 @@ import {
   IconArrowRight,
   IconBolt,
   IconCheck,
-  IconCode,
+  IconTool,
   IconCrown,
   IconLock,
   IconMessageCircle,
@@ -33,13 +33,12 @@ import type {
 } from "./types";
 import {
   Button,
-  ProjectCountBadge,
   ProjectEmptyState,
   ProjectField,
-  ProjectSegmentedControl,
   SearchInput,
   TextInput,
 } from "./components/ProjectUI";
+import ProjectAgentCapabilityPanel from "./components/ProjectAgentCapabilityPanel";
 import { projectUserFacingCopy } from "./projectUserFacingCopy";
 import "./projectPortfolio.css";
 
@@ -908,76 +907,89 @@ function CapabilitiesStep({
             );
           })}
         </div>
-        <div className="pm-capability-picker__header">
-          <ProjectSegmentedControl
-            className="pm-capability-tabs"
-            value={capabilityTab}
-            onChange={setCapabilityTab}
-            ariaLabel={t("projectCreate.capabilities.tabsAria")}
-            options={[
-              {
-                value: "tools",
-                icon: <IconCode size={15} />,
-                label: t("projectCreate.capabilities.toolsTab"),
+        <ProjectAgentCapabilityPanel
+          className="pm-capability-panel"
+          bodyClassName="pm-capability-panel__body"
+          value={capabilityTab}
+          onChange={setCapabilityTab}
+          ariaLabel={t("projectCreate.capabilities.tabsAria")}
+          tabs={[
+            {
+              value: "tools",
+              icon: <IconTool size={16} />,
+              label: t("projectCreate.capabilities.toolsTab"),
+              count: t("projectAgents.capabilityPackage.count", {
                 count: toolCapabilities.length,
-              },
-              {
-                value: "skills",
-                icon: <IconBolt size={15} />,
-                label: t("projectCreate.capabilities.skillsTab"),
+              }),
+            },
+            {
+              value: "skills",
+              icon: <IconBolt size={16} />,
+              label: t("projectCreate.capabilities.skillsTab"),
+              count: t("projectAgents.capabilityPackage.count", {
                 count: skillCapabilities.length,
-              },
-            ]}
+              }),
+            },
+          ] as const}
+        >
+          <ToolCatalogPanel
+            className="pm-capability-catalog"
+            items={
+              capabilityTab === "tools" ? toolCapabilities : skillCapabilities
+            }
+            getKey={(capability) => capability.id}
+            getPresentation={getPresentation}
+            searchValue={capabilityTab === "tools" ? toolSearch : skillSearch}
+            onSearchChange={
+              capabilityTab === "tools" ? setToolSearch : setSkillSearch
+            }
+            searchPlaceholder={t(
+              capabilityTab === "tools"
+                ? "projectCreate.capabilities.searchTools"
+                : "projectCreate.capabilities.searchSkills",
+            )}
+            emptyLabel={t(
+              capabilityTab === "tools"
+                ? "projectCreate.capabilities.noTools"
+                : "projectCreate.capabilities.noSkills",
+            )}
+            ariaLabel={t(
+              capabilityTab === "tools"
+                ? "projectCreate.capabilities.toolsAria"
+                : "projectCreate.capabilities.skillsAria",
+            )}
+            expandedGroups={
+              capabilityTab === "tools"
+                ? expandedToolGroups
+                : expandedSkillGroups
+            }
+            onExpandedGroupsChange={
+              capabilityTab === "tools"
+                ? setExpandedToolGroups
+                : setExpandedSkillGroups
+            }
+            selectedKeys={selectedCapabilityIds}
+            onToggle={toggleCapability}
+            renderGroupIcon={() =>
+              capabilityTab === "tools" ? (
+                <IconTool size={15} />
+              ) : (
+                <IconBolt size={15} />
+              )
+            }
+            renderItemBadges={(capability) => (
+              <span className="tool-catalog-panel__badge">
+                {capability.source === "agent"
+                  ? t("projectCreate.capabilities.fromEmployee", {
+                      name:
+                        capability.owner_agent_name ||
+                        t("projectCreate.capabilities.employeeShort"),
+                    })
+                  : t("projectCreate.capabilities.projectShared")}
+              </span>
+            )}
           />
-          <ProjectCountBadge>
-            {t("projectCreate.capabilities.count", {
-              count: selectedCapabilityIds.size,
-            })}
-          </ProjectCountBadge>
-        </div>
-        <ToolCatalogPanel
-          className="pm-capability-catalog"
-          items={capabilityTab === "tools" ? toolCapabilities : skillCapabilities}
-          getKey={(capability) => capability.id}
-          getPresentation={getPresentation}
-          searchValue={capabilityTab === "tools" ? toolSearch : skillSearch}
-          onSearchChange={capabilityTab === "tools" ? setToolSearch : setSkillSearch}
-          searchPlaceholder={t(
-            capabilityTab === "tools"
-              ? "projectCreate.capabilities.searchTools"
-              : "projectCreate.capabilities.searchSkills",
-          )}
-          emptyLabel={t(
-            capabilityTab === "tools"
-              ? "projectCreate.capabilities.noTools"
-              : "projectCreate.capabilities.noSkills",
-          )}
-          ariaLabel={t(
-            capabilityTab === "tools"
-              ? "projectCreate.capabilities.toolsAria"
-              : "projectCreate.capabilities.skillsAria",
-          )}
-          expandedGroups={
-            capabilityTab === "tools" ? expandedToolGroups : expandedSkillGroups
-          }
-          onExpandedGroupsChange={
-            capabilityTab === "tools" ? setExpandedToolGroups : setExpandedSkillGroups
-          }
-          selectedKeys={selectedCapabilityIds}
-          onToggle={toggleCapability}
-          renderGroupIcon={() =>
-            capabilityTab === "tools" ? <IconCode size={15} /> : <IconBolt size={15} />
-          }
-          renderItemBadges={(capability) => (
-            <span className="tool-catalog-panel__badge">
-              {capability.source === "agent"
-                ? t("projectCreate.capabilities.fromEmployee", {
-                    name: capability.owner_agent_name || t("projectCreate.capabilities.employeeShort"),
-                  })
-                : t("projectCreate.capabilities.projectShared")}
-            </span>
-          )}
-        />
+        </ProjectAgentCapabilityPanel>
       </section>
     </div>
   );
