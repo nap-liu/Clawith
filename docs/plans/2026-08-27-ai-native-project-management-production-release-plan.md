@@ -144,7 +144,7 @@ v1.10.3-<RELEASE_SHA 前 7 位>
 ### 5.1 冻结
 
 ```bash
-git fetch yybpc main
+git fetch yybpc company/main
 git rev-parse yybpc/company/main
 git rev-parse HEAD
 git merge-base --is-ancestor yybpc/company/main HEAD
