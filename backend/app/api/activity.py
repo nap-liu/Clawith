@@ -13,6 +13,7 @@ from app.core.permissions import (
     is_agent_creator,
     require_current_agent_tenant,
 )
+from app.core.plaza_feature import PLAZA_ACTIVITY_TYPES
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.activity_log import AgentActivityLog
@@ -40,7 +41,10 @@ async def get_agent_activity(
     logs = (
         await db.execute(
             select(AgentActivityLog)
-            .where(AgentActivityLog.agent_id == agent_id)
+            .where(
+                AgentActivityLog.agent_id == agent_id,
+                AgentActivityLog.action_type.not_in(PLAZA_ACTIVITY_TYPES),
+            )
             .order_by(AgentActivityLog.created_at.desc())
             .limit(limit)
         )

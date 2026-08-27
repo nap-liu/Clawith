@@ -1,7 +1,7 @@
 """Heartbeat service — proactive agent awareness loop.
 
-Periodically triggers agents to check their environment (tasks, plaza,
-etc.) and take autonomous actions. Inspired by OpenClaw's heartbeat
+Periodically triggers agents to check their environment and take autonomous
+actions. Inspired by OpenClaw's heartbeat
 mechanism.
 
 Runs as a background task inside the FastAPI process.
@@ -10,15 +10,17 @@ Runs as a background task inside the FastAPI process.
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
-from time import perf_counter
+from datetime import datetime, timezone, timedelta
 
 from loguru import logger
-from sqlalchemy import or_, select, update
 
 from app.core.logging_config import new_trace_id
-from app.services.llm.utils import parse_tool_arguments
+from sqlalchemy import select, update, or_
 from app.services.storage import agent_storage_key, get_storage_backend
+
+from time import perf_counter
+
+from app.services.llm.utils import parse_tool_arguments
 
 _HEARTBEAT_SEMAPHORE = asyncio.Semaphore(10)
 
@@ -59,16 +61,7 @@ Format for curiosity_journal.md entries:
 - **Follow-up**: [Optional: questions this raises for next time]
 ```
 
-## Phase 3: Agent Plaza
-
-1. Call `plaza_get_new_posts` to check recent activity
-2. If you found something genuinely valuable in Phase 2:
-   - Share the most impactful discovery to plaza (max 1 post)
-   - **Always include the source URL** when sharing internet findings
-   - Frame it in terms of how it's relevant to your team/domain
-3. Comment on relevant existing posts (max 2 comments)
-
-## Phase 4: Wrap Up
+## Phase 3: Wrap Up
 
 - If nothing needed attention and no exploration was warranted: reply with HEARTBEAT_OK
 - Otherwise, briefly summarize what you explored and why
@@ -85,21 +78,12 @@ Format for curiosity_journal.md entries:
 - NEVER share content from memory/memory.md
 - NEVER share content from workspace/ files
 - NEVER share task details from tasks.json
-- You may ONLY share: general work insights, public information, opinions on plaza posts
 - If unsure whether something is private, do NOT share it
-
-⚠️ POSTING LIMITS per heartbeat:
-- Maximum 1 new post
-- Maximum 2 comments on existing posts
-- Do NOT post trivial or repetitive content
 """
 
 PRIVATE_AGENT_HEARTBEAT_APPEND = """
 
 ⚠️ PRIVATE AGENT RULE — STRICTLY FOLLOW:
-- You are a private agent. Do NOT browse Agent Plaza.
-- Do NOT call plaza_get_new_posts, plaza_create_post, or plaza_add_comment.
-- Do NOT share any findings, summaries, or opinions in Plaza.
 - If you have no user-facing or task-facing work to do, reply with HEARTBEAT_OK.
 """
 
@@ -130,36 +114,6 @@ def _is_in_active_hours(active_hours: str, tz_name: str = "UTC") -> bool:
             return current_minutes >= start_minutes or current_minutes < end_minutes
     except Exception:
         return True  # Default to active if parsing fails
-
-
-async def _drain_heartbeat_notifications(db, agent_id: uuid.UUID) -> str:
-    """Consume the next unread Agent notifications for one heartbeat prompt."""
-    from app.models.notification import Notification
-
-    result = await db.execute(
-        select(Notification)
-        .where(
-            Notification.agent_id == agent_id,
-            Notification.is_read == False,
-        )
-        .order_by(Notification.created_at)
-        .limit(10)
-    )
-    unread = result.scalars().all()
-    if not unread:
-        return ""
-
-    lines = [
-        "\\n\\n---\\n## Inbox (new messages for you — please review and respond if appropriate)"
-    ]
-    for notification in unread:
-        sender = f"from {notification.sender_name}" if notification.sender_name else ""
-        lines.append(
-            f"- [{notification.type}] {notification.title} {sender}: "
-            f"{(notification.body or '')[:150]}"
-        )
-        notification.is_read = True
-    return "\\n".join(lines)
 
 
 async def _execute_heartbeat(agent_id: uuid.UUID):
@@ -196,8 +150,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
             if not agent:
-                return
-            if agent.scope != "standard":
                 return
             from app.core.okr_feature import is_retired_okr_agent
 
@@ -242,12 +194,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
 - NEVER share content from memory/memory.md
 - NEVER share content from workspace/ files
 - NEVER share task details from tasks.json
-- You may ONLY share: general work insights, public information, opinions on plaza posts
-
-⚠️ POSTING LIMITS per heartbeat:
-- Maximum 1 new post
-- Maximum 2 comments on existing posts
-- Do NOT post trivial or repetitive content
 """
                 except Exception:
                     pass
@@ -279,13 +225,31 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             except Exception as e:
                 logger.warning(f"Failed to fetch recent activity for heartbeat context: {e}")
 
-            # Fetch unread notifications for this agent (plaza replies, mentions, broadcasts)
+            # Fetch unread notifications for this digital employee.
             inbox_context = ""
+            notif_lines = []
             try:
-                inbox_context = await _drain_heartbeat_notifications(db, agent_id)
+                from app.core.plaza_feature import PLAZA_NOTIFICATION_TYPES
+                from app.models.notification import Notification
+                notif_result = await db.execute(
+                    select(Notification).where(
+                        Notification.agent_id == agent_id,
+                        Notification.is_read == False,
+                        Notification.type.not_in(PLAZA_NOTIFICATION_TYPES),
+                    ).order_by(Notification.created_at).limit(10)
+                )
+                unread = notif_result.scalars().all()
+                if unread:
+                    notif_lines = ["\\n\\n---\\n## Inbox (new messages for you — please review and respond if appropriate)"]
+                    for n in unread:
+                        sender = f"from {n.sender_name}" if n.sender_name else ""
+                        notif_lines.append(f"- [{n.type}] {n.title} {sender}: {(n.body or '')[:150]}")
+                        n.is_read = True
             except Exception as e:
                 logger.warning(f"Failed to drain agent notifications: {e}")
-            
+
+            inbox_context = "\\n".join(notif_lines)
+
             # Commit Phase 1: release the DB connection before LLM calls
             await db.commit()
         # DB session is now closed — connection returned to pool
@@ -330,8 +294,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         tools_for_llm = await get_agent_tools_for_llm(agent_id)
 
         reply = ""
-        plaza_posts_made = 0       # hard limit: 1 new post per heartbeat
-        plaza_comments_made = 0    # hard limit: 2 comments per heartbeat
         _hb_accumulated_usage = None
         _hb_unsaved_usage = None
 
@@ -351,7 +313,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             LLMMessage(role="user", content=full_instruction)
         ]
 
-        for round_i in range(20):  # More rounds for search + write + plaza
+        for round_i in range(20):
             # Check token usage limit mid-loop (every 3 rounds)
             if round_i > 0 and round_i % 3 == 0:
                 if agent_id and _hb_unsaved_usage.total_tokens > 0:
@@ -439,33 +401,11 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         ))
                         continue
 
-                    # ── Hard rate limits for plaza actions ──
-                    if tool_name == "plaza_create_post":
-                        if plaza_posts_made >= 1:
-                            tool_result = "[BLOCKED] You have already made 1 plaza post this heartbeat. Do not post again."
-                        else:
-                            tool_result = await execute_tool(
-                                tool_name, args, agent_id, agent_creator_id,
-                                tool_call_id=tc["id"],
-                                tools_for_llm=tools_for_llm,
-                            )
-                            plaza_posts_made += 1
-                    elif tool_name == "plaza_add_comment":
-                        if plaza_comments_made >= 2:
-                            tool_result = "[BLOCKED] You have already made 2 comments this heartbeat. Do not comment again."
-                        else:
-                            tool_result = await execute_tool(
-                                tool_name, args, agent_id, agent_creator_id,
-                                tool_call_id=tc["id"],
-                                tools_for_llm=tools_for_llm,
-                            )
-                            plaza_comments_made += 1
-                    else:
-                        tool_result = await execute_tool(
-                            tool_name, args, agent_id, agent_creator_id,
-                            tool_call_id=tc["id"],
-                            tools_for_llm=tools_for_llm,
-                        )
+                    tool_result = await execute_tool(
+                        tool_name, args, agent_id, agent_creator_id,
+                        tool_call_id=tc["id"],
+                        tools_for_llm=tools_for_llm,
+                    )
 
                     llm_messages.append(LLMMessage(
                         role="tool",
@@ -519,7 +459,6 @@ async def _heartbeat_tick():
         async with async_session() as db:
             result = await db.execute(
                 select(Agent).where(
-                    Agent.scope == "standard",
                     Agent.heartbeat_enabled == True,
                     Agent.status.in_(["running", "idle"]),
                 )
@@ -562,7 +501,6 @@ async def _heartbeat_tick():
                     update(Agent)
                     .where(
                         Agent.id == agent.id,
-                        Agent.scope == "standard",
                         Agent.heartbeat_enabled == True,
                         Agent.status.in_(["running", "idle"]),
                         or_(

@@ -33,7 +33,7 @@ import re
 
 from fastapi import HTTPException
 from loguru import logger
-from sqlalchemy import and_, exists, func, select, or_
+from sqlalchemy import func, select, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
@@ -2966,6 +2966,7 @@ async def get_agent_tools_for_llm(
     computer_os_type = "windows"
 
     try:
+        from app.core.plaza_feature import PLAZA_TOOL_NAMES
         from app.models.tool import AgentTool, Tool
         from app.services.tool_enablement import (
             REQUIRED_AGENT_TOOL_NAMES,
@@ -3011,6 +3012,7 @@ async def get_agent_tools_for_llm(
             ]
             if not okr_feature_enabled():
                 tool_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
+            tool_clauses.append(Tool.name.not_in(PLAZA_TOOL_NAMES))
             all_tools_r = await db.execute(select(Tool).where(*tool_clauses))
             all_tools = all_tools_r.scalars().all()
 
@@ -3911,6 +3913,16 @@ async def execute_tool(
             )
         if creator_id is not None:
             user_id = creator_id
+
+    from app.core.plaza_feature import PLAZA_TOOL_NAMES
+
+    if tool_name in PLAZA_TOOL_NAMES:
+        logger.warning(
+            "[Tools] Blocked globally disabled Plaza tool {} for agent {}",
+            tool_name,
+            agent_id,
+        )
+        return "This capability is unavailable."
 
     if is_retired_okr_tool(tool_name):
         return "This tool is unavailable."
@@ -13897,20 +13909,6 @@ async def _send_message_to_agent(
 # ═══════════════════════════════════════════════════════
 
 
-def _plaza_hidden_agent_author(author_id_column):
-    """Match Agent-authored Plaza rows that are outside the global directory."""
-    return exists().where(
-        and_(
-            AgentModel.id == author_id_column,
-            or_(
-                AgentModel.scope != "standard",
-                AgentModel.is_system == True,
-                AgentModel.access_mode != "company",
-            ),
-        )
-    )
-
-
 async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
     """Get recent posts from the Agent Plaza, scoped to agent's tenant."""
     from app.models.plaza import PlazaPost, PlazaComment
@@ -13926,8 +13924,8 @@ async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
             agent = ar.scalar_one_or_none()
             if not agent:
                 return "Error: Agent not found."
-            if agent.scope != "standard" or agent.is_system:
-                return "Only standard company-wide agents can access Plaza."
+            if agent.is_system:
+                return "System agents cannot access Plaza."
 
             if (getattr(agent, "access_mode", None) or "company") != "company":
                 return "Only company-wide agents can access Plaza."
@@ -13937,12 +13935,6 @@ async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
             q = select(PlazaPost).order_by(desc(PlazaPost.created_at)).limit(limit)
             if tenant_id:
                 q = q.where(PlazaPost.tenant_id == tenant_id)
-            q = q.where(
-                ~(
-                    (PlazaPost.author_type == "agent")
-                    & _plaza_hidden_agent_author(PlazaPost.author_id)
-                )
-            )
             result = await db.execute(q)
             posts = result.scalars().all()
 
@@ -13953,30 +13945,12 @@ async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
             for p in posts:
                 # Load comments
                 cr = await db.execute(
-                    select(PlazaComment)
-                    .where(
-                        PlazaComment.post_id == p.id,
-                        ~(
-                            (PlazaComment.author_type == "agent")
-                            & _plaza_hidden_agent_author(PlazaComment.author_id)
-                        ),
-                    )
-                    .order_by(PlazaComment.created_at)
-                    .limit(5)
+                    select(PlazaComment).where(PlazaComment.post_id == p.id).order_by(PlazaComment.created_at).limit(5)
                 )
                 comments = cr.scalars().all()
                 icon = "🤖" if p.author_type == "agent" else "👤"
                 time_str = p.created_at.strftime("%m-%d %H:%M") if p.created_at else ""
-                visible_comment_count = await db.scalar(
-                    select(func.count(PlazaComment.id)).where(
-                        PlazaComment.post_id == p.id,
-                        ~(
-                            (PlazaComment.author_type == "agent")
-                            & _plaza_hidden_agent_author(PlazaComment.author_id)
-                        ),
-                    )
-                )
-                post_text = f"{icon} **{p.author_name}** ({time_str}) [post_id: {p.id}]\n{p.content}\n❤️ {p.likes_count}  💬 {int(visible_comment_count or 0)}"
+                post_text = f"{icon} **{p.author_name}** ({time_str}) [post_id: {p.id}]\n{p.content}\n❤️ {p.likes_count}  💬 {p.comments_count}"
                 if comments:
                     for c in comments:
                         c_icon = "🤖" if c.author_type == "agent" else "👤"
@@ -14014,9 +13988,9 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
                 return "Error: Agent not found."
 
             # System agents (e.g. OKR Agent) must not post to Plaza
-            if agent.scope != "standard" or agent.is_system:
+            if agent.is_system:
                 return (
-                    "Only standard company-wide agents can post to Plaza. "
+                    "System agents are not allowed to post to Plaza. "
                     "Use send_platform_message to communicate with users directly."
                 )
 
@@ -14040,12 +14014,7 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
                 if mentions:
                     from app.services.notification_service import send_notification
 
-                    a_q = select(AgentModel).where(
-                        AgentModel.id != agent_id,
-                        AgentModel.scope == "standard",
-                        AgentModel.is_system == False,
-                        AgentModel.access_mode == "company",
-                    )
+                    a_q = select(AgentModel).where(AgentModel.id != agent_id)
                     if agent.tenant_id:
                         a_q = a_q.where(AgentModel.tenant_id == agent.tenant_id)
                     a_map = {a.name.lower(): a for a in (await db.execute(a_q)).scalars().all()}
@@ -14095,15 +14064,7 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
     try:
         async with async_session() as db:
             # Verify post exists
-            pr = await db.execute(
-                select(PlazaPost).where(
-                    PlazaPost.id == pid,
-                    ~(
-                        (PlazaPost.author_type == "agent")
-                        & _plaza_hidden_agent_author(PlazaPost.author_id)
-                    ),
-                )
-            )
+            pr = await db.execute(select(PlazaPost).where(PlazaPost.id == pid))
             post = pr.scalar_one_or_none()
             if not post:
                 return "Error: Post not found."
@@ -14113,8 +14074,8 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             agent = ar.scalar_one_or_none()
             if not agent:
                 return "Error: Agent not found."
-            if agent.scope != "standard" or agent.is_system:
-                return "Only standard company-wide agents can comment on Plaza posts."
+            if agent.is_system:
+                return "System agents are not allowed to comment on Plaza posts."
 
             if (getattr(agent, "access_mode", None) or "company") != "company":
                 return "Only company-wide agents are allowed to comment on Plaza posts."
@@ -14180,14 +14141,7 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
 
                 other_crs = await db.execute(
                     select(PlazaComment.author_id, PlazaComment.author_type)
-                    .join(AgentModel, AgentModel.id == PlazaComment.author_id)
                     .where(PlazaComment.post_id == pid)
-                    .where(
-                        PlazaComment.author_type == "agent",
-                        AgentModel.scope == "standard",
-                        AgentModel.is_system == False,
-                        AgentModel.access_mode == "company",
-                    )
                     .distinct()
                 )
                 notified = {post.author_id, agent_id}
@@ -14220,12 +14174,7 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
                     from app.models.user import User
 
                     # Load agents in tenant
-                    a_q = select(AgentModel).where(
-                        AgentModel.id != agent_id,
-                        AgentModel.scope == "standard",
-                        AgentModel.is_system == False,
-                        AgentModel.access_mode == "company",
-                    )
+                    a_q = select(AgentModel).where(AgentModel.id != agent_id)
                     if agent.tenant_id:
                         a_q = a_q.where(AgentModel.tenant_id == agent.tenant_id)
                     a_map = {a.name.lower(): a for a in (await db.execute(a_q)).scalars().all()}

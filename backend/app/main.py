@@ -462,7 +462,6 @@ from app.api.tenants import router as tenants_router
 from app.api.schedules import router as schedules_router
 from app.api.tools import router as tools_router
 from app.api.cli_tools import router as cli_tools_router
-from app.api.plaza import router as plaza_router
 from app.api.skills import router as skills_router
 from app.api.skill_market import agent_market_router, market_router as skill_market_router
 from app.api.users import router as users_router
@@ -548,7 +547,6 @@ app.include_router(triggers_router)
 app.include_router(focus_router, prefix=settings.API_PREFIX)
 app.include_router(scenes_router, prefix=settings.API_PREFIX)
 app.include_router(chat_sessions_router)
-app.include_router(plaza_router)
 app.include_router(notification_router, prefix=settings.API_PREFIX)
 app.include_router(webhooks_router)  # Public endpoint, no API prefix
 app.include_router(ws_router)
