@@ -31,6 +31,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 async def _isolate_messages_and_engine():
+    await engine.dispose()
     async with async_session() as db:
         await db.execute(delete(ChatMessage))
         await db.commit()

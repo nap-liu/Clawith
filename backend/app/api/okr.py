@@ -647,7 +647,10 @@ async def sync_okr_relationships(user=Depends(get_current_user)):
         # Locate the OKR Agent from settings
         settings = await _get_or_create_settings(db, user.tenant_id)
         if not settings.okr_agent_id:
-            raise HTTPException(404, "OKR Agent not found for this tenant. Enable OKR in Company Settings first.")
+            raise HTTPException(
+                404,
+                "当前租户未找到 OKR 数字员工，请先在企业设置中启用 OKR。",
+            )
         okr_agent_id = settings.okr_agent_id
 
         await _sync_okr_agent_relationships(db, user.tenant_id, okr_agent_id)
@@ -1619,14 +1622,14 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
         if not settings.okr_agent_id:
             raise HTTPException(
                 404,
-                "OKR Agent not found. Please ensure OKR is enabled and the agent has been seeded.",
+                "未找到 OKR 数字员工，请确认已启用 OKR 并完成初始化。",
             )
         okr_agent_result = await db.execute(select(Agent).where(Agent.id == settings.okr_agent_id))
         okr_agent = okr_agent_result.scalar_one_or_none()
         if not okr_agent:
             raise HTTPException(
                 404,
-                "OKR Agent not found. Please ensure OKR is enabled and the agent has been seeded.",
+                "未找到 OKR 数字员工，请确认已启用 OKR 并完成初始化。",
             )
 
         covered_users = set((await db.execute(

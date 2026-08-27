@@ -727,6 +727,17 @@ async def _reenter_loop(
         session = await db.get(ChatSession, uuid.UUID(str(conversation_id)))
         if session is not None and session.agent_id != agent_id:
             raise RuntimeError("Confirmation session changed owner")
+        if session is not None and session.source_channel == "subagent":
+            # Project group members, direct A2A targets, work-item Runs and
+            # restored member generations all execute as durable SubagentRuns.
+            # Resume through that worker so restart recovery, project lifecycle
+            # and parent delivery remain on the canonical path.
+            from app.services.subagent_runtime import (
+                resume_subagent_after_confirmation,
+            )
+
+            await resume_subagent_after_confirmation(session.id)
+            return
         # Legacy confirmation rows can outlive a deleted/missing ChatSession.
         # Preserve their UUID lock identity; durable sessions use the same
         # canonical external-session key as ordinary channel messages.

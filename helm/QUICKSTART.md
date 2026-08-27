@@ -45,7 +45,7 @@ vi helm/clawith/values.yaml
 ```yaml
 # 1. 配置镜像仓库地址
 global:
-  imageRegistry: docker.io/yourusername  # 修改为你的镜像仓库地址
+  imageRegistry: registry.cn-hangzhou.aliyuncs.com/your-namespace  # 修改为你的国内镜像仓库地址
 
 # 2. 配置镜像标签
 backend:
@@ -65,7 +65,7 @@ backend:
 
 postgresql:
   image:
-    registry: docker.io/bitnami  # 修改为你的镜像仓库
+    registry: docker.m.daocloud.io  # 国内镜像加速地址
   auth:
     password: "clawith123456"  # 强烈建议修改为强密码！
   primary:
@@ -76,7 +76,7 @@ postgresql:
 
 redis:
   image:
-    registry: docker.io  # 修改为你的镜像仓库
+    registry: docker.m.daocloud.io  # 国内镜像加速地址
   persistence:
     existingClaim: ""  # 如果使用现有 PVC，填入 PVC 名称
     storageClass: ""  # 如果新建，则修改为你的 StorageClass 名称

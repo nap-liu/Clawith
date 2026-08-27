@@ -1,8 +1,10 @@
 """Tests for MCP schedule tools (list/set/delete/run, creator-gated)."""
+
 from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +24,7 @@ async def _isolate():
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _ctx(token):
     h = {"authorization": f"Bearer {token}"} if token else {}
@@ -101,12 +104,11 @@ async def _seed_schedule(agent, user, name="daily", cron_expr="0 9 * * *", instr
 
 async def _reload_schedule(schedule_id) -> AgentSchedule | None:
     async with async_session() as db:
-        return (
-            await db.execute(select(AgentSchedule).where(AgentSchedule.id == schedule_id))
-        ).scalar_one_or_none()
+        return (await db.execute(select(AgentSchedule).where(AgentSchedule.id == schedule_id))).scalar_one_or_none()
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
+
 
 async def test_set_schedule_creates():
     """Creator can create a schedule; DB row is persisted with next_run_at set."""
@@ -128,9 +130,7 @@ async def test_set_schedule_creates():
 
     # Verify DB row
     async with async_session() as db:
-        result = await db.execute(
-            select(AgentSchedule).where(AgentSchedule.agent_id == agent.id)
-        )
+        result = await db.execute(select(AgentSchedule).where(AgentSchedule.agent_id == agent.id))
         rows = result.scalars().all()
     assert len(rows) == 1, f"Expected 1 schedule row, got {len(rows)}"
     row = rows[0]
@@ -187,9 +187,7 @@ async def test_set_schedule_invalid_cron():
 
     # No row created
     async with async_session() as db:
-        result = await db.execute(
-            select(AgentSchedule).where(AgentSchedule.agent_id == agent.id)
-        )
+        result = await db.execute(select(AgentSchedule).where(AgentSchedule.agent_id == agent.id))
         rows = result.scalars().all()
     assert len(rows) == 0, "No schedule row should be created on invalid cron"
 
@@ -271,9 +269,7 @@ async def test_run_schedule_requires_confirm():
         confirm=False,
     )
     # Must show confirmation guidance without executing
-    assert "confirm=True" in out or "confirm=true" in out.lower(), (
-        f"Expected confirm guidance, got: {out}"
-    )
+    assert "confirm=True" in out or "confirm=true" in out.lower(), f"Expected confirm guidance, got: {out}"
     assert "✅" not in out
 
     # run_count should be unchanged
@@ -295,7 +291,10 @@ async def test_run_schedule_aligns_execution_user_to_pat_actor(monkeypatch):
     captured: dict[str, object] = {}
 
     async def _capture(*args):
+        from app.services.scheduler import ScheduleExecutionOutcome
+
         captured["args"] = args
+        return ScheduleExecutionOutcome.SUCCEEDED
 
     monkeypatch.setattr("app.services.scheduler._execute_schedule", _capture)
     out = await run_agent_schedule_impl(
@@ -346,3 +345,77 @@ async def test_run_schedule_does_not_spawn_when_commit_fails(monkeypatch):
 
     await asyncio.sleep(0)
     assert spawned is False
+
+
+async def test_concurrent_scheduler_ticks_claim_due_schedule_once():
+    """Concurrent scheduler workers must not dispatch the same occurrence twice."""
+
+    from app.services.scheduler import _claim_due_schedules
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    schedule = await _seed_schedule(agent, user, cron_expr="*/5 * * * *")
+    now = datetime.now(UTC)
+
+    async with async_session() as db:
+        row = await db.get(AgentSchedule, schedule.id)
+        assert row is not None
+        row.next_run_at = now - timedelta(minutes=1)
+        await db.commit()
+
+    first, second = await asyncio.gather(
+        _claim_due_schedules(now),
+        _claim_due_schedules(now),
+    )
+
+    claimed_ids = [item.id for batch in (first, second) for item in batch]
+    assert claimed_ids.count(schedule.id) == 1
+
+    refreshed = await _reload_schedule(schedule.id)
+    assert refreshed is not None
+    assert refreshed.run_count == 1
+    assert refreshed.last_run_at == now
+    assert refreshed.next_run_at is not None
+    assert refreshed.next_run_at > now
+
+
+async def test_scheduler_capacity_overload_restores_claimed_occurrence(monkeypatch):
+    """A claimed cron occurrence returns to the due queue after overload."""
+
+    from app.services.scheduler import (
+        ScheduleExecutionOutcome,
+        _claim_due_schedules,
+        _execute_claimed_schedule,
+    )
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    schedule = await _seed_schedule(agent, user, cron_expr="*/5 * * * *")
+    now = datetime.now(UTC)
+    occurrence_at = now - timedelta(minutes=1)
+
+    async with async_session() as db:
+        row = await db.get(AgentSchedule, schedule.id)
+        assert row is not None
+        row.last_run_at = None
+        row.next_run_at = occurrence_at
+        row.run_count = 0
+        await db.commit()
+
+    claimed = await _claim_due_schedules(now)
+    assert len(claimed) == 1
+    assert claimed[0].id == schedule.id
+
+    async def _deferred(*_args):
+        return ScheduleExecutionOutcome.RETRYABLE
+
+    monkeypatch.setattr("app.services.scheduler._execute_schedule", _deferred)
+    await _execute_claimed_schedule(claimed[0])
+
+    refreshed = await _reload_schedule(schedule.id)
+    assert refreshed is not None
+    assert refreshed.run_count == 0
+    assert refreshed.last_run_at is None
+    assert refreshed.next_run_at == occurrence_at

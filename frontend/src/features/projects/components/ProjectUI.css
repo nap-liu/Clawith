@@ -1,0 +1,299 @@
+.project-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.project-field__label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.project-field > .project-select {
+  width: 100%;
+}
+
+.project-field__label em {
+  color: var(--error);
+  font-style: normal;
+}
+
+.project-field__error {
+  color: var(--error) !important;
+}
+
+.project-field.is-invalid .form-input,
+.project-field.is-invalid .select-dropdown__trigger {
+  border-color: var(--error);
+}
+
+.project-textarea {
+  width: 100%;
+  min-height: 82px;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 11px;
+  line-height: 1.6;
+}
+
+.project-select .select-dropdown__trigger {
+  width: 100%;
+  height: 38px;
+  border-color: var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.project-dialog {
+  width: min(680px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  margin: auto;
+  padding: 0;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  outline: 0;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-lg);
+}
+
+.project-empty-state__icon {
+  flex: none;
+}
+
+.project-empty-state {
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-8);
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-xl);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.project-empty-state > strong {
+  color: var(--text-secondary);
+  font-size: var(--text-base);
+}
+
+.project-empty-state > p {
+  max-width: 480px;
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+}
+
+.project-empty-state.pm-state-error > strong {
+  color: var(--error);
+}
+
+.project-segmented-control {
+  height: var(--control-height-md);
+  min-height: var(--control-height-md);
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+}
+
+.project-radio-group {
+  display: grid;
+}
+
+.project-radio-option {
+  cursor: pointer;
+}
+
+.project-radio-option:focus-within {
+  outline: 2px solid var(--info-subtle);
+  outline-offset: -2px;
+}
+
+.project-radio-option:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.project-segmented-control > .btn {
+  min-width: 31px;
+  height: 100%;
+  min-height: 0;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  color: var(--text-tertiary);
+}
+
+.project-segmented-control > .btn.is-active {
+  background: var(--accent-subtle);
+  color: var(--text-primary);
+}
+
+.project-icon-button.btn {
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: var(--text-tertiary);
+}
+
+.project-icon-button.btn:hover:not(:disabled) {
+  background: var(--accent-subtle);
+  color: var(--text-primary);
+}
+
+.project-progress {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.project-progress__track {
+  height: 4px;
+  flex: 1;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--border-default);
+}
+
+.project-progress__track > span {
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    var(--info-card-accent),
+    var(--info-card-accent-end)
+  );
+}
+
+.project-progress > strong {
+  font: 600 10px var(--font-mono);
+}
+
+.project-status-badge,
+.project-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border-radius: 999px;
+  font-size: 9px;
+}
+
+.project-status-badge {
+  gap: 5px;
+  color: var(--text-tertiary);
+}
+
+.project-status-badge > i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.project-status-badge.is-info {
+  color: var(--info-card-accent);
+}
+.project-status-badge.is-success {
+  color: var(--success);
+}
+.project-status-badge.is-warning {
+  color: var(--warning);
+}
+.project-status-badge.is-error {
+  color: var(--error);
+}
+
+.project-count-badge {
+  min-width: 19px;
+  padding: 1px 5px;
+  background: var(--info-subtle);
+  color: var(--info-card-accent-end);
+  font: 600 10px var(--font-mono);
+}
+
+.project-panel,
+.project-card {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+  background: var(--bg-secondary);
+}
+
+.project-card:focus-visible {
+  border-color: var(--accent-primary);
+  outline: 2px solid var(--accent-subtle);
+  outline-offset: 2px;
+}
+
+.project-data-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+}
+
+.project-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.project-data-table th,
+.project-data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: left;
+}
+
+.project-data-table th {
+  background: var(--bg-tertiary);
+  color: var(--text-tertiary);
+  font-weight: 550;
+}
+
+.project-data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.project-data-table tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+@media (max-width: 620px) {
+  .project-dialog {
+    width: calc(100vw - 28px);
+    max-height: calc(100vh - 28px);
+  }
+
+  .project-segmented-control .project-count-badge {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .project-progress__track > span {
+    transition: none;
+  }
+}

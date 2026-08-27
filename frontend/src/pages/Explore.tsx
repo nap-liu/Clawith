@@ -1,10 +1,11 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { agentApi } from '../services/api';
-import type { Agent } from '../types';
+import type { ExploreAgent } from '../types';
 import { Globe, Zap, Coffee, PauseCircle } from 'lucide-react';
+import Pagination from '../components/Pagination';
 
 /* ────── Avatar Gradient Palette ────── */
 
@@ -71,7 +72,7 @@ const CATEGORIES = [
     { key: 'running', icon: <Zap size={14} />, labelZh: '运行中', labelEn: 'Running' },
     { key: 'idle', icon: <Coffee size={14} />, labelZh: '空闲', labelEn: 'Idle' },
     { key: 'stopped', icon: <PauseCircle size={14} />, labelZh: '已停止', labelEn: 'Stopped' },
-];
+] as const;
 
 const TAG_LABELS_ZH: Record<string, string> = {
     NATIVE: '原生智能体',
@@ -92,13 +93,6 @@ function getTagColor(tag: string) {
 }
 
 /* ────── Helpers ────── */
-
-const fetchJson = async <T,>(url: string): Promise<T> => {
-    const token = localStorage.getItem('token');
-    const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-    if (!res.ok) throw new Error('Failed to fetch');
-    return res.json();
-};
 
 function timeAgo(dateStr: string | undefined, isChinese: boolean): string {
     if (!dateStr) return '-';
@@ -144,6 +138,10 @@ const styles = `
         border-color: var(--border-strong);
         box-shadow: var(--shadow-md);
         transform: translateY(-2px);
+    }
+    .explore-pagination {
+        max-width: 1440px;
+        margin: 8px auto 40px;
     }
     .explore-search {
         width: 100%;
@@ -224,7 +222,7 @@ const styles = `
 /* ────── Bot Card Component ────── */
 
 function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
-    agent: Agent;
+    agent: ExploreAgent;
     creatorName: string;
     isChinese: boolean;
     onCardClick: () => void;
@@ -370,68 +368,34 @@ export default function Explore() {
     const navigate = useNavigate();
     const isChinese = i18n.language?.startsWith('zh');
     const [search, setSearch] = useState('');
-    const [category, setCategory] = useState('all');
+    const [debouncedSearch, setDebouncedSearch] = useState('');
+    const [category, setCategory] = useState<(typeof CATEGORIES)[number]['key']>('all');
+    const [page, setPage] = useState(1);
     const tenantId = localStorage.getItem('current_tenant_id') || '';
+    const pageSize = 24;
 
-    // Fetch agents
-    const { data: agents = [], isLoading } = useQuery({
-        queryKey: ['agents', tenantId],
-        queryFn: () => agentApi.list(tenantId || undefined),
-        refetchInterval: 15000,
-    });
+    useEffect(() => {
+        const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250);
+        return () => window.clearTimeout(timer);
+    }, [search]);
 
-    // Fetch users for creator names
-    const { data: users = [] } = useQuery<any[]>({
-        queryKey: ['users-for-explore', tenantId],
-        queryFn: () => fetchJson(`/api/org/users${tenantId ? `?tenant_id=${tenantId}` : ''}`),
+    useEffect(() => setPage(1), [category, debouncedSearch]);
+
+    const { data, isLoading, isFetching } = useQuery({
+        queryKey: ['agents', 'explore', tenantId, category, debouncedSearch, page],
+        queryFn: () => agentApi.explore({
+            tenantId: tenantId || undefined,
+            search: debouncedSearch || undefined,
+            status: category === 'all' ? undefined : category,
+            page,
+            pageSize,
+        }),
+        placeholderData: previous => previous,
+        staleTime: 30000,
         refetchInterval: 60000,
     });
-
-    const userMap = useMemo(() => {
-        const map = new Map<string, string>();
-        users.forEach((u: any) => map.set(u.id, u.display_name || u.username));
-        return map;
-    }, [users]);
-
-    // Filter agents
-    const filtered = useMemo(() => {
-        let result = [...agents];
-
-        // Category filter
-        if (category !== 'all') {
-            result = result.filter(a => a.status === category);
-        }
-
-        // Search filter
-        if (search.trim()) {
-            const q = search.trim().toLowerCase();
-            result = result.filter(a =>
-                a.name.toLowerCase().includes(q) ||
-                (a.role_description || '').toLowerCase().includes(q) ||
-                (a.bio || '').toLowerCase().includes(q)
-            );
-        }
-
-        // Sort: running first, then by last_active_at descending
-        result.sort((a, b) => {
-            const statusOrder: Record<string, number> = { running: 0, idle: 1, creating: 2, stopped: 3, error: 4 };
-            const sa = statusOrder[a.status] ?? 5;
-            const sb = statusOrder[b.status] ?? 5;
-            if (sa !== sb) return sa - sb;
-            const ta = a.last_active_at ? new Date(a.last_active_at).getTime() : 0;
-            const tb = b.last_active_at ? new Date(b.last_active_at).getTime() : 0;
-            return tb - ta;
-        });
-
-        return result;
-    }, [agents, category, search]);
-
-    // Category counts
-    const counts = useMemo(() => {
-        const c: Record<string, number> = { all: agents.length, running: 0, idle: 0, stopped: 0 };
-        agents.forEach(a => { if (c[a.status] !== undefined) c[a.status]++; });
-        return c;
-    }, [agents]);
+    const agents = data?.items || [];
+    const counts = data?.counts || { all: 0, running: 0, idle: 0, stopped: 0 };
 
     return (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
@@ -527,7 +491,7 @@ export default function Explore() {
                     {isChinese ? '加载中...' : 'Loading...'}
                     <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
                 </div>
-            ) : filtered.length === 0 ? (
+            ) : agents.length === 0 ? (
                 <div style={{
                     textAlign: 'center', padding: '80px 20px',
                     color: 'var(--text-tertiary)',
@@ -556,11 +520,11 @@ export default function Explore() {
                 </div>
             ) : (
                 <div className="explore-grid">
-                    {filtered.map(agent => (
+                    {agents.map(agent => (
                         <BotCard
                             key={agent.id}
                             agent={agent}
-                            creatorName={userMap.get(agent.creator_id) || (isChinese ? '未知' : 'Unknown')}
+                            creatorName={agent.creator_display_name || (isChinese ? '未知' : 'Unknown')}
                             isChinese={!!isChinese}
                             onCardClick={() => navigate(`/agents/${agent.id}`)}
                             onChatClick={(e) => {
@@ -570,6 +534,22 @@ export default function Explore() {
                         />
                     ))}
                 </div>
+            )}
+            {data && data.total > pageSize && (
+                <Pagination
+                    className="explore-pagination"
+                    page={page}
+                    pageSize={pageSize}
+                    total={data.total}
+                    onPageChange={setPage}
+                    showJump={false}
+                    ariaLabel={isChinese ? '智能体分页' : 'Agent pages'}
+                />
+            )}
+            {isFetching && !isLoading && (
+                <span aria-live="polite" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden' }}>
+                    {isChinese ? '正在更新列表' : 'Updating list'}
+                </span>
             )}
         </div>
     );

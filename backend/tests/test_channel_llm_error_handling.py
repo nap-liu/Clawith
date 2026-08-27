@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import app.services.channel_llm as channel_llm
+from app.services import channel_llm
 
 pytestmark = pytest.mark.asyncio
 
@@ -41,7 +41,7 @@ class _Result:
 
 
 def _make_db(agent, model, fallback_model=None):
-    """Minimal AsyncSession double: returns agent then model on .execute()."""
+    """Minimal AsyncSession double for the normal channel runtime-model path."""
     results = [_Result(agent), _Result(model)]
     if fallback_model is not None:
         results.append(_Result(fallback_model))
@@ -52,7 +52,13 @@ def _make_db(agent, model, fallback_model=None):
         state["n"] += 1
         return results[i] if i < len(results) else _Result(None)
 
-    return SimpleNamespace(execute=_execute)
+    async def _get(*_args, **_kwargs):
+        # No persisted ChatSession override in the common fixture. Tests that
+        # exercise a concrete message/session replace this with their own
+        # AsyncMock below, matching AsyncSession.get's current production path.
+        return None
+
+    return SimpleNamespace(execute=_execute, get=_get)
 
 
 def _make_model(*, model_name="test-model", request_timeout=None):
@@ -257,7 +263,7 @@ async def test_current_channel_attachment_keeps_live_text_and_uses_structured_pa
     anchor_id = uuid.uuid4()
     session_id = str(uuid.uuid4())
     db = _make_db(agent, model)
-    db.get = AsyncMock(return_value=SimpleNamespace(
+    anchor = SimpleNamespace(
         agent_id=agent.id,
         conversation_id=session_id,
         message_meta={
@@ -269,7 +275,12 @@ async def test_current_channel_attachment_keeps_live_text_and_uses_structured_pa
                 "kind": "image",
             }],
         },
-    ))
+    )
+    db.get = AsyncMock(
+        side_effect=lambda model_cls, _object_id: (
+            anchor if model_cls.__name__ == "ChatMessage" else None
+        )
+    )
     captured = {}
 
     async def fake_llm(*_args, **kwargs):
@@ -420,10 +431,10 @@ async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):
 
     import app.api.websocket as ws_mod
 
-    sent: list[tuple[str, str]] = []
+    sent: list[tuple[str, str, dict]] = []
 
     async def _fake_send_to_session(agent_id, session_id, payload):
-        sent.append((session_id, payload.get("type")))
+        sent.append((session_id, payload.get("type"), payload))
 
     monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake_send_to_session)
     # Keep this a pure wiring test — no real DB writes / compaction.
@@ -447,15 +458,34 @@ async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):
     monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_llm, raising=False)
 
     reply = await channel_llm._call_agent_llm(
-        _make_db(agent, model), agent.id, "看销售", session_id="sess-123", user_id=agent.id
+        _make_db(agent, model),
+        agent.id,
+        "看销售",
+        session_id="sess-123",
+        user_id=agent.id,
+        web_broadcast_targets=[
+            (
+                "project-leader",
+                "project-group",
+                {
+                    "message_id": "project-stream-1",
+                    "sender_agent_id": str(agent.id),
+                    "sender_name": agent.name,
+                },
+            )
+        ],
     )
 
     assert reply == "昨天销售额 5050"
-    types = [t for _sid, t in sent]
-    sids = {sid for sid, _t in sent}
-    assert sids == {"sess-123"}, "every broadcast must target the turn's session"
+    original = [payload for session_id, _type, payload in sent if session_id == "sess-123"]
+    mirrored = [payload for session_id, _type, payload in sent if session_id == "project-group"]
+    types = [payload["type"] for payload in original]
+    assert len(original) == len(mirrored)
+    assert all(payload["message_id"] == "project-stream-1" for payload in mirrored)
+    assert all(payload["sender_name"] == agent.name for payload in mirrored)
     for expected in ("thinking", "chunk", "tool_call", "done"):
         assert expected in types, f"web viewer must receive the {expected!r} event of an IM turn"
+        assert expected in [payload["type"] for payload in mirrored]
 
 
 async def test_broadcast_channel_user_message_emits_event(monkeypatch):

@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.core.okr_feature import OKR_TOOL_NAMES, okr_feature_enabled
+from app.core.plaza_feature import PLAZA_TOOL_NAMES
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
@@ -13,6 +14,7 @@ from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
 from app.services.tool_config import meaningful_config, tenant_tool_config_key
 from app.services.tool_enablement import tool_is_required
+from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES, USER_PROJECT_TOOL_SEEDS
 
 _settings = get_settings()
 
@@ -66,6 +68,9 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "agentbay_computer_close_window",
     "agentbay_computer_dismiss_dialog",
     "agentbay_file_transfer",
+    # User project tools are manually enabled and must stay opt-in when an old
+    # database is re-seeded.
+    *USER_PROJECT_TOOL_NAMES,
 }
 
 # AgentBay is retained in the codebase for compatibility with historical data,
@@ -73,11 +78,13 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
 # invariant rather than relying on a one-off production database edit: a fresh
 # database or a restored old dump must seed/sync every AgentBay tool disabled.
 FORCE_DISABLED_BUILTIN_CATEGORIES = {"agentbay"}
+FORCE_DISABLED_BUILTIN_TOOL_NAMES = PLAZA_TOOL_NAMES
 
 
 def builtin_tool_forced_disabled(seed: dict) -> bool:
     return bool(
         seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES
+        or seed.get("name") in FORCE_DISABLED_BUILTIN_TOOL_NAMES
         or (not okr_feature_enabled() and seed.get("name") in OKR_TOOL_NAMES)
     )
 
@@ -2905,8 +2912,8 @@ BUILTIN_TOOLS = [
     },
     {
         # generate_okr_report — OKR Agent calls this to produce the structured report.
-        # The tool writes the report to WorkReport table and returns the markdown content
-        # so the Agent can choose to post it to Plaza or send it to specific channels.
+        # The tool writes the report to WorkReport and returns the markdown content
+        # so the digital employee can deliver it through an appropriate channel.
         "name": "generate_okr_report",
         "display_name": "Generate OKR Report",
         "description": (
@@ -2914,7 +2921,7 @@ BUILTIN_TOOLS = [
             "period. The report summarizes all Objectives and Key Results, highlights items "
             "at risk or behind, and shows overall team health metrics. The report is saved "
             "to the database and to your workspace/reports/ folder. Returns the full report "
-            "markdown so you can post it to Plaza or share with the team."
+            "markdown so you can share it with the team through an appropriate channel."
         ),
         "category": "okr",
         "icon": "📋",
@@ -5038,6 +5045,7 @@ BUILTIN_TOOLS = [
     *OKR_BUILTIN_TOOLS,
     *DEPLOY_BUILTIN_TOOLS,
     *BROWSER_BUILTIN_TOOLS,
+    *USER_PROJECT_TOOL_SEEDS,
 ]
 
 
@@ -5178,13 +5186,14 @@ async def seed_builtin_tools():
                 if updated_fields:
                     logger.info(f"[ToolSeeder] Updated {', '.join(updated_fields)}: {t['name']}")
 
-        # Auto-assign new default tools and self-heal required protocol tools
-        # for every existing Agent. Required bindings cannot remain missing or
-        # disabled after startup, even if legacy control-plane data says so.
+        # Auto-assign new default tools to standard Agents only. Project Agents
+        # have an explicit project-local allowlist and must not inherit future
+        # platform defaults during startup. Required protocol tools still
+        # self-heal for every Agent regardless of scope.
         assignment_tool_ids = set(new_tool_ids) | required_tool_ids
         if assignment_tool_ids:
-            agents_result = await db.execute(select(Agent.id))
-            agent_ids = [row[0] for row in agents_result.fetchall()]
+            agents_result = await db.execute(select(Agent.id, Agent.scope))
+            agent_rows = agents_result.fetchall()
             assignments_result = await db.execute(
                 select(AgentTool).where(AgentTool.tool_id.in_(assignment_tool_ids))
             )
@@ -5192,16 +5201,22 @@ async def seed_builtin_tools():
                 (assignment.agent_id, assignment.tool_id): assignment
                 for assignment in assignments_result.scalars().all()
             }
-            for agent_id in agent_ids:
-                for tool_id in assignment_tool_ids:
+            ensured_count = 0
+            for agent_id, agent_scope in agent_rows:
+                applicable_tool_ids = set(required_tool_ids)
+                if agent_scope == "standard":
+                    applicable_tool_ids.update(new_tool_ids)
+                for tool_id in applicable_tool_ids:
                     assignment = assignments_by_pair.get((agent_id, tool_id))
                     if assignment is None:
                         db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=True))
+                        ensured_count += 1
                     elif tool_id in required_tool_ids and not assignment.enabled:
                         assignment.enabled = True
+                        ensured_count += 1
             logger.info(
-                f"[ToolSeeder] Ensured {len(assignment_tool_ids)} new/required "
-                f"tools for {len(agent_ids)} agents"
+                f"[ToolSeeder] Ensured {ensured_count} new/required assignments "
+                f"across {len(agent_rows)} agents"
             )
 
         OBSOLETE_TOOLS = ["bing_search", "manage_tasks"]

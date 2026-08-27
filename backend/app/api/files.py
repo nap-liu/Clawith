@@ -22,9 +22,16 @@ from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.audit import ChatMessage
+from app.models.agent import Agent
 from app.models.user import User
 from app.models.workspace import WorkspaceFileRevision
 from app.services.focus_service import is_focus_file_path
+from app.services.agent_runtime_workspace import (
+    bind_agent_runtime_workspace,
+    current_agent_runtime_workspace,
+    project_agent_runtime_workspace,
+    standard_agent_runtime_workspace,
+)
 from app.services.workspace_collaboration import (
     acquire_edit_lock,
     content_hash,
@@ -162,14 +169,172 @@ TEXT_PREVIEW_FILENAMES = {
 
 
 def _agent_base_dir(agent_id: uuid.UUID) -> Path:
-    local_root = settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR
-    return Path(local_root) / str(agent_id)
+    return current_agent_runtime_workspace(agent_id).local_root
 
 
 def _agent_storage_key(agent_id: uuid.UUID, rel_path: str = "") -> str:
-    prefix = str(agent_id)
-    rel = normalize_storage_key(rel_path)
-    return f"{prefix}/{rel}" if rel else prefix
+    return current_agent_runtime_workspace(agent_id).storage_key(rel_path)
+
+
+async def _bind_file_workspace(
+    agent_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Route control-plane file APIs to the same workspace used at runtime."""
+
+    agent, _access = await check_agent_access(db, current_user, agent_id)
+    workspace = _runtime_workspace(agent)
+    with bind_agent_runtime_workspace(workspace):
+        yield agent
+
+
+async def _resolve_workspace_agent(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID,
+    candidate: object,
+) -> Agent:
+    """Keep endpoint functions callable outside FastAPI dependency injection."""
+
+    if getattr(candidate, "id", None) == agent_id:
+        return candidate  # type: ignore[return-value]
+    agent, _access = await check_agent_access(db, current_user, agent_id)
+    return agent
+
+
+def _runtime_workspace(agent: Agent):
+    if getattr(agent, "scope", "standard") != "project":
+        return standard_agent_runtime_workspace(agent.id)
+    if agent.project_id is None or agent.tenant_id is None:
+        raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
+    return project_agent_runtime_workspace(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        project_id=agent.project_id,
+    )
+
+
+async def _record_project_skill_change(
+    db: AsyncSession,
+    agent: Agent,
+    current_user: User,
+    path: str,
+) -> None:
+    normalized = normalize_storage_key(path)
+    parts = Path(normalized).parts
+    if getattr(agent, "scope", "standard") != "project" or len(parts) < 2 or parts[0] != "skills":
+        return
+    from app.models.project import Project
+    from app.services.project_git_service import commit_project_changes, project_user_git_email
+    from app.services.project_skill_assets import register_project_workspace_skill
+
+    project = await db.get(Project, agent.project_id)
+    if project is None or project.tenant_id != agent.tenant_id:
+        raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
+    skill_root = _agent_base_dir(agent.id) / "skills" / parts[1]
+    if (skill_root / "SKILL.md").is_file():
+        await register_project_workspace_skill(
+            db,
+            project,
+            project_agent_id=agent.id,
+            folder_name=parts[1],
+            actor_user_id=current_user.id,
+            actor_display_name=current_user.display_name,
+        )
+        return
+    await commit_project_changes(
+        project,
+        f"Update project Skill files: {parts[1]}",
+        [f".agents/{agent.id}/skills/{parts[1]}"],
+        author_name=current_user.display_name,
+        author_email=project_user_git_email(current_user.id),
+    )
+
+
+async def _delete_bound_project_skill(
+    db: AsyncSession,
+    agent: Agent,
+    current_user: User,
+    path: str,
+) -> dict | None:
+    """Route a project Skill root deletion through its binding lifecycle."""
+
+    normalized = normalize_storage_key(path)
+    parts = Path(normalized).parts
+    is_skill_root = len(parts) == 2 and parts[0] == "skills"
+    is_skill_manifest = len(parts) == 3 and parts[0] == "skills" and parts[2] == "SKILL.md"
+    if getattr(agent, "scope", "standard") != "project" or not (is_skill_root or is_skill_manifest):
+        return None
+
+    from app.models.project import Project, ProjectCapabilityBinding
+    from app.services.project_service import add_event
+    from app.services.project_skill_assets import (
+        delete_project_skill_asset,
+        project_skill_deletion_impact,
+    )
+
+    project = await db.get(Project, agent.project_id)
+    if (
+        project is None
+        or project.tenant_id != agent.tenant_id
+        or project.owner_user_id != current_user.id
+    ):
+        raise HTTPException(status_code=404, detail="Project not found")
+    bindings = list(
+        (
+            await db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == project.id,
+                    ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                    ProjectCapabilityBinding.capability_type == "skill",
+                    ProjectCapabilityBinding.inherited_from_agent_id == agent.id,
+                )
+            )
+        ).scalars()
+    )
+    expected_path = f"skills/{parts[1]}"
+    binding = next(
+        (
+            item
+            for item in bindings
+            if isinstance(item.config, dict)
+            and isinstance(item.config.get("skill_asset"), dict)
+            and item.config["skill_asset"].get("path") == expected_path
+        ),
+        None,
+    )
+    if binding is None:
+        return None
+
+    impact = await project_skill_deletion_impact(db, project, binding)
+    deleted = await delete_project_skill_asset(
+        db,
+        project,
+        binding,
+        actor_user_id=current_user.id,
+        actor_display_name=current_user.display_name,
+    )
+    add_event(
+        db,
+        project,
+        "capability.deleted",
+        f"Deleted project Skill {deleted['skill_name']}",
+        actor_user_id=current_user.id,
+        metadata={
+            "asset_id": deleted["asset_id"],
+            "affected_member_count": impact["affected_member_count"],
+            "source": "agent_files",
+        },
+    )
+    await db.flush()
+    return {
+        "status": "ok",
+        "path": expected_path,
+        "project_skill_deleted": True,
+        "affected_member_count": impact["affected_member_count"],
+        "affected_members": impact["affected_members"],
+    }
 
 
 def _safe_path(agent_id: uuid.UUID, rel_path: str) -> Path:
@@ -200,14 +365,21 @@ def _is_enterprise_visible_path(rel_path: str) -> bool:
     return normalized == "enterprise_info" or normalized.startswith("enterprise_info/")
 
 
-def _visible_storage_key(agent_id: uuid.UUID, rel_path: str, tenant_id: uuid.UUID | None) -> tuple[str, bool]:
+def _visible_storage_key(
+    agent_id: uuid.UUID,
+    rel_path: str,
+    tenant_id: uuid.UUID | None,
+    *,
+    workspace=None,
+) -> tuple[str, bool]:
     normalized = (rel_path or "").strip().strip("/")
     if _is_enterprise_visible_path(normalized):
         if not tenant_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No tenant associated")
         sub_path = normalized[len("enterprise_info"):].lstrip("/")
         return _enterprise_storage_key(str(tenant_id), sub_path), True
-    return _agent_storage_key(agent_id, normalized), False
+    key = workspace.storage_key(normalized) if workspace is not None else _agent_storage_key(agent_id, normalized)
+    return key, False
 
 
 async def _require_agent_file_delete_access(
@@ -231,11 +403,12 @@ async def list_files(
     path: str = "",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """List files and directories in an agent's file system."""
     # Adopt upstream's storage-backend listing; keep our is_creator so the
     # CREATOR_ONLY_FILES filter (below) still hides secrets.md from non-creators.
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     storage = get_storage_backend()
     storage_key, is_enterprise = _visible_storage_key(agent_id, path, current_user.tenant_id)
@@ -276,7 +449,7 @@ async def list_files(
             rel = str(Path(entry.key).relative_to(f"enterprise_info_{current_user.tenant_id}"))
             rel_path = f"enterprise_info/{rel}" if rel != "." else "enterprise_info"
         else:
-            rel_path = str(Path(entry.key).relative_to(str(agent_id)))
+            rel_path = str(Path(entry.key).relative_to(current_agent_runtime_workspace(agent_id).storage_prefix))
         items.append(FileInfo(
             name=entry.name,
             path=rel_path,
@@ -295,9 +468,10 @@ async def read_file(
     path: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Read the content of a file."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
@@ -438,6 +612,7 @@ async def preview_file(
     path: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Return a browser-friendly preview payload for Workspace files."""
     await check_agent_access(db, current_user, agent_id)
@@ -1010,7 +1185,12 @@ async def download_file(
     if filename in CREATOR_ONLY_FILES and not is_creator:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, path, user.tenant_id)
+    key, _ = _visible_storage_key(
+        agent_id,
+        path,
+        user.tenant_id,
+        workspace=_runtime_workspace(agent),
+    )
     if not await storage.exists(key) or not await storage.is_file(key):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     presigned = await storage.presign_download_url(key, filename=Path(path).name, inline=inline)
@@ -1042,9 +1222,10 @@ async def write_file(
     data: FileWrite,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Write content to a file (create or overwrite)."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
@@ -1085,6 +1266,7 @@ async def write_file(
     )
     if not result.ok:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
+    await _record_project_skill_change(db, agent, current_user, result.path)
     await db.commit()
     return {"status": "ok", "path": result.path, "revision_id": result.revision_id}
 
@@ -1095,6 +1277,7 @@ async def lock_file(
     data: FileLockBody,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Acquire or refresh a short-lived human editing lock for a file."""
     await check_agent_access(db, current_user, agent_id)
@@ -1117,6 +1300,7 @@ async def unlock_file(
     path: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Release the current user's edit lock for a file."""
     await check_agent_access(db, current_user, agent_id)
@@ -1131,6 +1315,7 @@ async def get_file_revisions(
     path: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """List version history for the currently opened Workspace file."""
     await check_agent_access(db, current_user, agent_id)
@@ -1162,6 +1347,7 @@ async def restore_file_revision(
     data: RestoreRevisionBody,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Restore a file to a previous revision's after-content."""
     await check_agent_access(db, current_user, agent_id)
@@ -1191,6 +1377,7 @@ async def restore_file_revision(
     )
     if not restored.ok:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=restored.message)
+    await _record_project_skill_change(db, _workspace_agent, current_user, revision.path)
     await db.commit()
     return {"status": "ok", "path": revision.path, "revision_id": restored.revision_id}
 
@@ -1202,12 +1389,13 @@ async def delete_file(
     expected_version_token: str | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Delete a file."""
     # Upstream: only managers/admins may delete workspace files. Ours: creator-only
     # files (e.g. secrets.md) are protected even from non-creator managers. Apply both.
     await _require_agent_file_delete_access(db, current_user, agent_id)
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
@@ -1222,6 +1410,10 @@ async def delete_file(
         raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
     if path.strip("/") == "enterprise_info":
         raise HTTPException(status_code=400, detail="Cannot delete enterprise_info root")
+    project_skill_result = await _delete_bound_project_skill(db, agent, current_user, path)
+    if project_skill_result is not None:
+        await db.commit()
+        return project_skill_result
     result = await delete_workspace_file(
         db,
         agent_id=agent_id,
@@ -1236,6 +1428,7 @@ async def delete_file(
         if "not found" in result.message.lower():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result.message)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
+    await _record_project_skill_change(db, agent, current_user, path)
     await db.commit()
     return {"status": "ok", "path": path}
 
@@ -1250,15 +1443,17 @@ async def import_skill_to_agent(
     body: ImportSkillBody,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Import a global skill into this agent's skills/ workspace folder.
 
     Copies all files from the global skill registry into
     <agent_workspace>/skills/<folder_name>/.
     """
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
+    _agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
-        raise HTTPException(status_code=403, detail="Agent manage access required")
+        raise HTTPException(status_code=403, detail="需要数字员工管理权限")
 
     from sqlalchemy import or_
     from sqlalchemy.orm import selectinload
@@ -1277,6 +1472,33 @@ async def import_skill_to_agent(
     skill = result.scalar_one_or_none()
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
+
+    if agent.scope == "project":
+        from app.models.project import Project
+        from app.services.project_skill_assets import bind_library_skill_to_project_agent
+
+        project = await db.get(Project, agent.project_id)
+        if project is None or project.tenant_id != agent.tenant_id:
+            raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
+        binding = await bind_library_skill_to_project_agent(
+            db,
+            project,
+            skill_id=skill.id,
+            project_agent_id=agent.id,
+            is_enabled=True,
+            scope={},
+            actor_user_id=current_user.id,
+            actor_display_name=current_user.display_name,
+        )
+        await db.commit()
+        return {
+            "status": "ok",
+            "skill_name": skill.name,
+            "folder_name": skill.folder_name,
+            "files_written": len(skill.files),
+            "files": [file.path for file in skill.files],
+            "project_skill_binding_id": str(binding.id),
+        }
 
     # Market-managed Skills use one installation path so validation, visibility,
     # conflict handling, version tracking, and unique Agent counts cannot drift.
@@ -1325,6 +1547,7 @@ async def upload_file_to_workspace(
     path: str = "workspace/knowledge_base",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Upload a binary file to agent workspace."""
     await check_agent_access(db, current_user, agent_id)
@@ -1539,6 +1762,7 @@ async def agent_import_from_clawhub(
     body: ClawhubImportBody,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Import a skill from ClawHub directly into this agent's skills/ workspace."""
     await check_agent_access(db, current_user, agent_id)
@@ -1579,6 +1803,14 @@ async def agent_import_from_clawhub(
         file_path.write_text(f["content"], encoding="utf-8")
         written.append(f["path"])
 
+    await _record_project_skill_change(
+        db,
+        workspace_agent,
+        current_user,
+        f"skills/{folder_name}/SKILL.md",
+    )
+    await db.commit()
+
     return {
         "status": "ok",
         "skill_name": skill_info.get("displayName", slug),
@@ -1594,6 +1826,7 @@ async def agent_import_from_url(
     body: UrlImportBody,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
     """Import a skill from a GitHub URL directly into this agent's skills/ workspace."""
     await check_agent_access(db, current_user, agent_id)
@@ -1627,6 +1860,14 @@ async def agent_import_from_url(
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(f["content"], encoding="utf-8")
         written.append(f["path"])
+
+    await _record_project_skill_change(
+        db,
+        workspace_agent,
+        current_user,
+        f"skills/{folder_name}/SKILL.md",
+    )
+    await db.commit()
 
     return {
         "status": "ok",

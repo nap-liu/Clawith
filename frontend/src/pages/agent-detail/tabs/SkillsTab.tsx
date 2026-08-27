@@ -1,5 +1,5 @@
-import type { Dispatch, ReactNode, SetStateAction } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { IconDownload, IconFolder, IconTools } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 
@@ -9,66 +9,33 @@ import FileBrowser from '../../../components/FileBrowser';
 import { useToast } from '../../../components/Toast/ToastProvider';
 import { fileApi, skillApi } from '../../../services/api';
 
-type SafeDisplayIcon = (icon?: string | null, fallback?: ReactNode) => ReactNode;
-
 interface Props {
     agentId: string;
     canManage: boolean;
-    safeDisplayIcon: SafeDisplayIcon;
-    showAgentClawhub: boolean;
-    setShowAgentClawhub: Dispatch<SetStateAction<boolean>>;
-    agentClawhubQuery: string;
-    setAgentClawhubQuery: Dispatch<SetStateAction<string>>;
-    agentClawhubResults: any[];
-    setAgentClawhubResults: Dispatch<SetStateAction<any[]>>;
-    agentClawhubSearching: boolean;
-    setAgentClawhubSearching: Dispatch<SetStateAction<boolean>>;
-    agentClawhubInstalling: string | null;
-    setAgentClawhubInstalling: Dispatch<SetStateAction<string | null>>;
-    showAgentUrlImport: boolean;
-    setShowAgentUrlImport: Dispatch<SetStateAction<boolean>>;
-    agentUrlInput: string;
-    setAgentUrlInput: Dispatch<SetStateAction<string>>;
-    agentUrlImporting: boolean;
-    setAgentUrlImporting: Dispatch<SetStateAction<boolean>>;
-    showImportSkillModal: boolean;
-    setShowImportSkillModal: Dispatch<SetStateAction<boolean>>;
-    globalSkillsForImport: any[] | undefined;
-    importingSkillId: string | null;
-    setImportingSkillId: Dispatch<SetStateAction<string | null>>;
 }
 
-export default function SkillsTab(props: Props) {
-    const {
-        agentId,
-        canManage,
-        safeDisplayIcon,
-        showAgentClawhub,
-        setShowAgentClawhub,
-        agentClawhubQuery,
-        setAgentClawhubQuery,
-        agentClawhubResults,
-        setAgentClawhubResults,
-        agentClawhubSearching,
-        setAgentClawhubSearching,
-        agentClawhubInstalling,
-        setAgentClawhubInstalling,
-        showAgentUrlImport,
-        setShowAgentUrlImport,
-        agentUrlInput,
-        setAgentUrlInput,
-        agentUrlImporting,
-        setAgentUrlImporting,
-        showImportSkillModal,
-        setShowImportSkillModal,
-        globalSkillsForImport,
-        importingSkillId,
-        setImportingSkillId,
-    } = props;
-    const { t } = useTranslation();
+export default function SkillsTab({ agentId, canManage }: Props) {
+    const { t, i18n } = useTranslation();
     const dialog = useDialog();
     const toast = useToast();
     const queryClient = useQueryClient();
+    const [showAgentClawhub, setShowAgentClawhub] = useState(false);
+    const [agentClawhubQuery, setAgentClawhubQuery] = useState('');
+    const [agentClawhubResults, setAgentClawhubResults] = useState<any[]>([]);
+    const [agentClawhubSearching, setAgentClawhubSearching] = useState(false);
+    const [agentClawhubInstalling, setAgentClawhubInstalling] = useState<string | null>(null);
+    const [showAgentUrlImport, setShowAgentUrlImport] = useState(false);
+    const [agentUrlInput, setAgentUrlInput] = useState('');
+    const [agentUrlImporting, setAgentUrlImporting] = useState(false);
+    const [showImportSkillModal, setShowImportSkillModal] = useState(false);
+    const [importingSkillId, setImportingSkillId] = useState<string | null>(null);
+    const { data: globalSkillsForImport } = useQuery({
+        queryKey: ['global-skills-for-import'],
+        queryFn: () => skillApi.list(),
+        enabled: showImportSkillModal,
+    });
+    const safeDisplayIcon = (icon?: string | null, fallback = <IconTools size={20} stroke={1.8} />) =>
+        icon && !/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(icon) ? icon : fallback;
     const adapter: FileBrowserApi = {
         list: (path) => fileApi.list(agentId, path),
         read: (path) => fileApi.read(agentId, path),
@@ -102,27 +69,23 @@ export default function SkillsTab(props: Props) {
                             style={{ fontSize: '13px' }}
                             onClick={() => { setShowAgentUrlImport(true); setAgentUrlInput(''); }}
                         >
-                            Import from URL
+                            {t('agent.skills.importFromUrl')}
                         </button>
                         <button
                             className="btn btn-secondary"
                             style={{ fontSize: '13px' }}
                             onClick={() => { setShowAgentClawhub(true); setAgentClawhubQuery(''); setAgentClawhubResults([]); }}
                         >
-                            Browse ClawHub
+                            {t('agent.skills.browseClawhub')}
                         </button>
                         <button
                             className="btn btn-primary"
                             style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}
                             onClick={() => setShowImportSkillModal(true)}
                         >
-                            Import from Presets
+                            {t('agent.skills.importPreset')}
                         </button>
                     </div>}
-                </div>
-                <div style={{ marginTop: '8px', padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                    <strong>Skill Format:</strong><br />
-                    • <code>skills/my-skill/SKILL.md</code> — {t('agent.skills.folderFormat', 'Each skill is a folder with a SKILL.md file and optional auxiliary files (scripts/, examples/)')}
                 </div>
             </div>
 
@@ -132,16 +95,22 @@ export default function SkillsTab(props: Props) {
                 <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setShowAgentClawhub(false)}>
                     <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '600px', width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                            <h3>Browse ClawHub</h3>
-                            <button onClick={() => setShowAgentClawhub(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>x</button>
+                            <h3>{t('agent.skills.browseClawhub')}</h3>
+                            <button
+                                aria-label={t('agent.skills.close')}
+                                title={t('agent.skills.close')}
+                                onClick={() => setShowAgentClawhub(false)}
+                                style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}
+                            >×</button>
                         </div>
                         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 12px' }}>
-                            Search and install skills from ClawHub directly into this agent&apos;s workspace.
+                            {t('agent.skills.browseClawhubDescription')}
                         </p>
                         <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
                             <input
                                 className="input"
-                                placeholder="Search skills..."
+                                placeholder={t('agent.skills.searchSkills')}
+                                aria-label={t('agent.skills.searchSkills')}
                                 value={agentClawhubQuery}
                                 onChange={(e) => setAgentClawhubQuery(e.target.value)}
                                 onKeyDown={(e) => {
@@ -155,12 +124,12 @@ export default function SkillsTab(props: Props) {
                                 disabled={!agentClawhubQuery.trim() || agentClawhubSearching}
                                 onClick={searchClawHub}
                             >
-                                {agentClawhubSearching ? 'Searching...' : 'Search'}
+                                {agentClawhubSearching ? t('agent.skills.searching') : t('agent.skills.search')}
                             </button>
                         </div>
                         <div style={{ flex: 1, overflowY: 'auto' }}>
                             {agentClawhubResults.length === 0 && !agentClawhubSearching && (
-                                <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)', fontSize: '13px' }}>Search ClawHub to find skills</div>
+                                <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)', fontSize: '13px' }}>{t('agent.skills.searchClawhubHint')}</div>
                             )}
                             {agentClawhubResults.map((result: any) => (
                                 <div key={result.slug} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px', borderRadius: '8px', marginBottom: '6px', border: '1px solid var(--border-subtle)', background: 'var(--bg-secondary)' }}>
@@ -170,7 +139,7 @@ export default function SkillsTab(props: Props) {
                                             {result.version && <span style={{ fontSize: '10px', color: 'var(--accent-text)', background: 'var(--accent-subtle)', padding: '1px 5px', borderRadius: '4px' }}>v{result.version}</span>}
                                         </div>
                                         <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{result.summary?.substring(0, 100)}{result.summary?.length > 100 ? '...' : ''}</div>
-                                        {result.updatedAt && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px', opacity: 0.7 }}>Updated {new Date(result.updatedAt).toLocaleDateString()}</div>}
+                                        {result.updatedAt && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px', opacity: 0.7 }}>{t('agent.skills.updated', { date: new Date(result.updatedAt).toLocaleDateString(i18n.language) })}</div>}
                                     </div>
                                     <button
                                         className="btn btn-secondary"
@@ -190,7 +159,7 @@ export default function SkillsTab(props: Props) {
                                             }
                                         }}
                                     >
-                                        {agentClawhubInstalling === result.slug ? 'Installing...' : 'Install'}
+                                        {agentClawhubInstalling === result.slug ? t('agent.skills.installing') : t('agent.skills.install')}
                                     </button>
                                 </div>
                             ))}
@@ -203,21 +172,27 @@ export default function SkillsTab(props: Props) {
                 <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setShowAgentUrlImport(false)}>
                     <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '500px', width: '90%', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                            <h3>Import from GitHub URL</h3>
-                            <button onClick={() => setShowAgentUrlImport(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>x</button>
+                            <h3>{t('agent.skills.importFromGithub')}</h3>
+                            <button
+                                aria-label={t('agent.skills.close')}
+                                title={t('agent.skills.close')}
+                                onClick={() => setShowAgentUrlImport(false)}
+                                style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}
+                            >×</button>
                         </div>
                         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 12px' }}>
-                            Paste a GitHub URL pointing to a skill directory (must contain SKILL.md).
+                            {t('agent.skills.githubUrlDesc')}
                         </p>
                         <input
                             className="input"
-                            placeholder="https://github.com/owner/repo/tree/main/path/to/skill"
+                            placeholder={t('agent.skills.githubUrlPlaceholder')}
+                            aria-label={t('agent.skills.githubUrlPlaceholder')}
                             value={agentUrlInput}
                             onChange={(e) => setAgentUrlInput(e.target.value)}
                             style={{ width: '100%', fontSize: '13px', marginBottom: '12px', boxSizing: 'border-box' }}
                         />
                         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-                            <button className="btn btn-secondary" onClick={() => setShowAgentUrlImport(false)}>Cancel</button>
+                            <button className="btn btn-secondary" onClick={() => setShowAgentUrlImport(false)}>{t('agent.skills.cancel')}</button>
                             <button
                                 className="btn btn-primary"
                                 disabled={!agentUrlInput.trim() || agentUrlImporting}
@@ -236,7 +211,7 @@ export default function SkillsTab(props: Props) {
                                     }
                                 }}
                             >
-                                {agentUrlImporting ? 'Importing...' : 'Import'}
+                                {agentUrlImporting ? t('agent.skills.importing') : t('agent.skills.importBtn')}
                             </button>
                         </div>
                     </div>
@@ -248,16 +223,21 @@ export default function SkillsTab(props: Props) {
                     <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '600px', width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                             <h3>{t('agent.skills.importPreset', 'Import from Presets')}</h3>
-                            <button onClick={() => setShowImportSkillModal(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>✕</button>
+                            <button
+                                aria-label={t('agent.skills.close')}
+                                title={t('agent.skills.close')}
+                                onClick={() => setShowImportSkillModal(false)}
+                                style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}
+                            >×</button>
                         </div>
                         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 16px' }}>
                             {t('agent.skills.importDesc', 'Select a preset skill to import into this agent. All skill files will be copied to the agent\'s skills folder.')}
                         </p>
                         <div style={{ flex: 1, overflowY: 'auto' }}>
                             {!globalSkillsForImport ? (
-                                <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)' }}>Loading...</div>
+                                <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)' }}>{t('agent.skills.loading')}</div>
                             ) : globalSkillsForImport.length === 0 ? (
-                                <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)' }}>No preset skills available</div>
+                                <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)' }}>{t('agent.skills.noPresetSkills')}</div>
                             ) : (
                                 globalSkillsForImport.map((skill: any) => (
                                     <div
@@ -282,7 +262,7 @@ export default function SkillsTab(props: Props) {
                                                 </div>
                                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
                                                     <IconFolder size={12} stroke={1.8} /> {skill.folder_name}
-                                                    {skill.is_default && <span style={{ marginLeft: '8px', color: 'var(--accent-primary)', fontWeight: 600 }}>✓ Default</span>}
+                                                    {skill.is_default && <span style={{ marginLeft: '8px', color: 'var(--accent-primary)', fontWeight: 600 }}>✓ {t('agent.skills.default')}</span>}
                                                 </div>
                                             </div>
                                         </div>
@@ -305,7 +285,7 @@ export default function SkillsTab(props: Props) {
                                                 }
                                             }}
                                         >
-                                            {importingSkillId === skill.id ? 'Importing...' : <><IconDownload size={13} stroke={1.8} /> Import</>}
+                                            {importingSkillId === skill.id ? t('agent.skills.importing') : <><IconDownload size={13} stroke={1.8} /> {t('agent.skills.importBtn')}</>}
                                         </button>
                                     </div>
                                 ))

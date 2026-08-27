@@ -1,40 +1,47 @@
 """Enterprise management API routes: LLM pool, enterprise info, approvals, audit logs."""
 
-import uuid
 import logging
+import uuid
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.security import get_current_admin, get_current_user, require_role, encrypt_data
+from app.core.domain import resolve_base_url
+from app.core.security import encrypt_data, get_current_admin, get_current_user, require_role
 from app.database import async_session, get_db
-from app.models.org import OrgDepartment, OrgMember
-from app.models.identity import IdentityProvider
-from app.models.user import User
-from app.services.org_sync_adapter import derive_member_department_paths
-from app.services.org_directory import canonical_org_member_id_subquery
 from app.models.agent import Agent
+from app.models.audit import ApprovalRequest, AuditLog, EnterpriseInfo
+from app.models.identity import IdentityProvider
 from app.models.llm import LLMModel
-from app.models.audit import AuditLog, ApprovalRequest, EnterpriseInfo
-from app.schemas.oauth2 import OAuth2ProviderCreate, OAuth2ProviderUpdate, OAuth2Config
-from app.schemas.oauth2 import OAuth2ProviderCreate, OAuth2ProviderUpdate, OAuth2Config
+from app.models.org import OrgDepartment, OrgMember
+from app.models.user import User
+from app.schemas.oauth2 import OAuth2Config, OAuth2ProviderCreate, OAuth2ProviderUpdate
 from app.schemas.schemas import (
-    ApprovalAction, ApprovalRequestOut, AuditLogOut, EnterpriseInfoOut,
-    EnterpriseInfoUpdate, LLMModelCreate, LLMModelOut, LLMModelUpdate,
-    IdentityProviderOut, UserInviteRequest
+    ApprovalAction,
+    ApprovalRequestOut,
+    AuditLogOut,
+    EnterpriseInfoOut,
+    EnterpriseInfoUpdate,
+    IdentityProviderOut,
+    LLMModelClone,
+    LLMModelCreate,
+    LLMModelOut,
+    LLMModelUpdate,
+    UserInviteRequest,
 )
 from app.services.autonomy_service import autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service
-from app.services.llm import get_provider_manifest, get_model_api_key, create_llm_client, LLMMessage
+from app.services.llm import LLMMessage, create_llm_client, get_model_api_key, get_provider_manifest
+from app.services.org_directory import canonical_org_member_id_subquery
+from app.services.org_sync_adapter import derive_member_department_paths
 from app.services.platform_service import platform_service
-from app.core.domain import resolve_base_url
 from app.services.sso_service import sso_service
 
 router = APIRouter(prefix="/enterprise", tags=["enterprise"])
@@ -198,6 +205,41 @@ async def add_llm_model(
             tenant.default_model_id = model.id
 
     return LLMModelOut.model_validate(model)
+
+
+@router.post("/llm-models/{source_model_id}/clone", response_model=LLMModelOut)
+async def clone_llm_model(
+    source_model_id: uuid.UUID,
+    data: LLMModelClone,
+    current_user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Idempotently clone a tenant model while retaining its stored secret."""
+    from app.services.llm_model_config import (
+        LLMModelConfigError,
+        clone_tenant_llm_model,
+    )
+
+    source = await db.get(LLMModel, source_model_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source model not found")
+    if not _is_platform_admin_user(current_user):
+        if current_user.tenant_id is None or source.tenant_id != current_user.tenant_id:
+            raise HTTPException(status_code=403, detail="Cannot clone another tenant's model")
+    if source.tenant_id is None:
+        raise HTTPException(status_code=400, detail="Source model is not tenant-scoped")
+
+    try:
+        cloned, _ = await clone_tenant_llm_model(
+            db,
+            source_model_id=source_model_id,
+            tenant_id=source.tenant_id,
+            model_key=data.model,
+            label=data.label,
+        )
+    except LLMModelConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return LLMModelOut.model_validate(cloned)
 
 
 @router.post("/llm-models/{model_id}/set-default", status_code=status.HTTP_204_NO_CONTENT)
@@ -637,9 +679,9 @@ async def get_email_templates_endpoint(
 ):
     """Get email templates (current values + available variables per scenario)."""
     from app.services.system_email_service import (
-        get_email_templates,
-        EMAIL_TEMPLATE_VARIABLES,
         DEFAULT_EMAIL_TEMPLATES,
+        EMAIL_TEMPLATE_VARIABLES,
+        get_email_templates,
     )
 
     templates = await get_email_templates(db=db)
@@ -1494,6 +1536,7 @@ async def wecom_org_sync_verify(
       - verify_aes_key: the EncodingAESKey provided by WeCom (43 chars, base64url)
     """
     from fastapi.responses import Response as _Response
+
     from app.api.wecom import _decrypt_msg, _verify_signature
 
     result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
@@ -1553,6 +1596,7 @@ async def wecom_callback_verify_universal(
     the user can add their API server IPs to allow App-level user/get calls.
     """
     from fastapi.responses import Response as _Response
+
     from app.api.wecom import _decrypt_msg, _verify_signature
 
     if not token:
@@ -1658,9 +1702,10 @@ async def invite_users(
         
     import random
     import string
-    from app.services.system_email_service import send_company_invitation_email
-    from app.services.platform_service import platform_service
+
     from app.models.tenant import Tenant
+    from app.services.platform_service import platform_service
+    from app.services.system_email_service import send_company_invitation_email
     
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
     tenant = tenant_result.scalar_one_or_none()
@@ -1767,6 +1812,7 @@ async def export_invitation_codes_csv(
     _require_tenant_admin(current_user)
     import csv
     import io
+
     from fastapi.responses import StreamingResponse
 
     result = await db.execute(

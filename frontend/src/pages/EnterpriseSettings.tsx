@@ -18,6 +18,7 @@ import SpeechRecognitionTab from './enterprise-settings/tabs/SpeechRecognitionTa
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
 import { A2AAsyncToggle, CompanyLogoEditor, CompanyNameEditor, CompanyTimezoneEditor } from './enterprise-settings/components/CompanyInfoEditors';
 import { mcpServersApi } from '../services/mcpServers';
+import { getLocalizedToolPresentation } from '../utils/toolPresentation';
 import {
     IconBrowser,
     IconBulb,
@@ -267,38 +268,6 @@ export default function EnterpriseSettings() {
         return next;
     };
 
-    // Labels for tool categories (mirrors AgentDetail getCategoryLabels)
-    const categoryLabels: Record<string, string> = {
-        file: t('agent.toolCategories.file'),
-        task: t('agent.toolCategories.task'),
-        communication: t('agent.toolCategories.communication'),
-        search: t('agent.toolCategories.search'),
-        aware: t('agent.toolCategories.aware', 'Aware & Triggers'),
-        social: t('agent.toolCategories.social', 'Social'),
-        code: t('agent.toolCategories.code', 'Code & Execution'),
-        discovery: t('agent.toolCategories.discovery', 'Discovery'),
-        email: t('agent.toolCategories.email', 'Email'),
-        feishu: t('agent.toolCategories.feishu', 'Feishu / Lark'),
-        custom: t('agent.toolCategories.custom'),
-        general: t('agent.toolCategories.general'),
-        agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
-        browser: t('agent.toolCategories.browser', 'Browser'),
-    };
-    const categoryDescriptions: Record<string, string> = {
-        agentbay: 'Browser and cloud computer automation',
-        browser: 'Isolated in-sandbox browser: read pages and run multi-step RPA',
-        file: 'Read, write, convert, and manage workspace files',
-        communication: 'Messages and cross-channel collaboration',
-        search: 'Web and knowledge search tools',
-        code: 'Code execution and development utilities',
-        aware: 'Triggers, reminders, and awareness workflows',
-        email: 'Email reading and sending tools',
-        feishu: 'Feishu / Lark messaging and collaboration',
-        social: 'Social publishing and community workflows',
-        discovery: 'Tool and capability discovery',
-        custom: 'Company-added or MCP tools',
-        general: 'General purpose tools',
-    };
     const renderCategoryIcon = (category: string, size = 15) => {
         const style = { color: 'var(--text-tertiary)' };
         switch (category) {
@@ -319,27 +288,14 @@ export default function EnterpriseSettings() {
             default: return <IconTools size={size} stroke={1.8} style={style} />;
         }
     };
-    const mcpToolGroupKey = (tool: any) => {
-        const serverName = String(tool.mcp_server_name || '').trim();
-        return tool.type === 'mcp' && serverName
-            ? `mcp:${serverName.toLowerCase()}`
-            : (tool.category || 'general');
-    };
     const getToolGroupMeta = (groupKey: string, toolsInGroup: any[]) => {
         const first = toolsInGroup.find((tool: any) => tool.type === 'mcp' && tool.mcp_server_name) || toolsInGroup[0];
-        if (groupKey.startsWith('mcp:') && first?.mcp_server_name) {
-            return {
-                label: first.mcp_server_name,
-                description: t('agent.tools.mcpGroupDescription', 'Tools from {{name}}', { name: first.mcp_server_name }),
-                iconCategory: 'custom',
-                configCategory: first.category || 'custom',
-            };
-        }
+        const presentation = getLocalizedToolPresentation(t, first || {});
         return {
-            label: categoryLabels[groupKey] || groupKey,
-            description: categoryDescriptions[groupKey] || 'Tools in this category',
-            iconCategory: groupKey,
-            configCategory: groupKey,
+            label: presentation.groupLabel,
+            description: presentation.groupDescription,
+            iconCategory: groupKey.startsWith('mcp:') ? 'custom' : presentation.categoryKey,
+            configCategory: presentation.categoryKey,
         };
     };
     const switchTrack = (enabled: boolean, mixed = false) => ({
@@ -841,7 +797,7 @@ export default function EnterpriseSettings() {
                                 ) : (
                                     (() => {
                                         const grouped = agentInstalledTools.reduce((acc: Record<string, any[]>, row: any) => {
-                                            const groupKey = mcpToolGroupKey(row);
+                                            const groupKey = getLocalizedToolPresentation(t, row).groupKey;
                                             (acc[groupKey] = acc[groupKey] || []).push(row);
                                             return acc;
                                         }, {});
@@ -885,13 +841,15 @@ export default function EnterpriseSettings() {
                                                                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                                                             <span style={{ fontSize: '13px', fontWeight: 650, color: 'var(--text-primary)' }}>{meta.label}</span>
                                                                             <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                                                                {groupRows.length} {groupRows.length === 1 ? 'tool' : 'tools'}
+                                                                                {t('agent.tools.toolCount', { count: groupRows.length })}
                                                                             </span>
                                                                         </div>
                                                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{meta.description}</div>
                                                                     </div>
                                                                 </div>
-                                                                {expanded && groupRows.map((row: any, idx: number) => (
+                                                                {expanded && groupRows.map((row: any, idx: number) => {
+                                                                    const presentation = getLocalizedToolPresentation(t, row);
+                                                                    return (
                                                                     <div key={row.agent_tool_id} style={{
                                                                         display: 'grid',
                                                                         gridTemplateColumns: 'minmax(0, 1fr) auto',
@@ -903,17 +861,17 @@ export default function EnterpriseSettings() {
                                                                     }}>
                                                                         <div style={{ minWidth: 0 }}>
                                                                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flexWrap: 'wrap' }}>
-                                                                                <span style={{ fontWeight: 500, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.tool_display_name}</span>
+                                                                                <span style={{ fontWeight: 500, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{presentation.name}</span>
                                                                                 {row.type === 'mcp' && <span style={{ fontSize: '10px', background: 'var(--bg-tertiary)', color: 'var(--text-secondary)', borderRadius: '4px', padding: '1px 5px' }}>MCP</span>}
                                                                                 {row.configured && <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>{t('enterprise.tools.configured', 'Configured')}</span>}
                                                                             </div>
                                                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                                                {row.installed_by_agent_name || 'Unknown Agent'}
+                                                                                {row.installed_by_agent_name || t('enterprise.tools.unknownDigitalEmployee')}
                                                                                 {row.installed_at && <span> · {new Date(row.installed_at).toLocaleString()}</span>}
                                                                             </div>
                                                                         </div>
                                                                         <button className="btn btn-ghost" style={{ color: 'var(--error)', fontSize: '12px' }} onClick={async () => {
-                                                                            const ok = await dialog.confirm(t('enterprise.tools.removeFromAgent', { name: row.tool_display_name }), { title: '移除工具', danger: true, confirmLabel: '移除' });
+                                                                            const ok = await dialog.confirm(t('enterprise.tools.removeFromAgent', { name: presentation.name }), { title: t('agent.tools.removeTool'), danger: true, confirmLabel: t('common.confirmActions.removeLabel') });
                                                                             if (!ok) return;
                                                                             try {
                                                                                 await fetchJson(`/tools/agent-tool/${row.agent_tool_id}`, { method: 'DELETE' });
@@ -923,7 +881,8 @@ export default function EnterpriseSettings() {
                                                                             loadAgentInstalledTools();
                                                                         }}>{t('enterprise.tools.delete')}</button>
                                                                     </div>
-                                                                ))}
+                                                                    );
+                                                                })}
                                                             </div>
                                                         );
                                                     })}
@@ -1187,16 +1146,7 @@ export default function EnterpriseSettings() {
                                 const normalizedSearch = toolSearch.trim().toLowerCase();
                                 const matchesSearch = (tool: any) => {
                                     if (!normalizedSearch) return true;
-                                    const category = tool.category || 'general';
-                                    const haystack = [
-                                        tool.name,
-                                        tool.display_name,
-                                        tool.description,
-                                        tool.mcp_server_name,
-                                        category,
-                                        categoryLabels[category],
-                                    ].filter(Boolean).join(' ').toLowerCase();
-                                    return haystack.includes(normalizedSearch);
+                                    return getLocalizedToolPresentation(t, tool).searchText.includes(normalizedSearch);
                                 };
                                 const matchesStatus = (tool: any) => {
                                     if (toolStatusFilter === 'enabled') return !!tool.enabled;
@@ -1207,7 +1157,7 @@ export default function EnterpriseSettings() {
                                 };
                                 const filteredTools = allTools.filter(tool => matchesSearch(tool) && matchesStatus(tool));
                                 const groupTools = (toolList: any[]) => toolList.reduce((acc: Record<string, any[]>, tool: any) => {
-                                    const cat = mcpToolGroupKey(tool);
+                                    const cat = getLocalizedToolPresentation(t, tool).groupKey;
                                     (acc[cat] = acc[cat] || []).push(tool);
                                     return acc;
                                 }, {} as Record<string, any[]>);
@@ -1237,6 +1187,7 @@ export default function EnterpriseSettings() {
                                 };
 
                                 const renderToolRow = (tool: any, category: string, idx: number, total: number) => {
+                                    const presentation = getLocalizedToolPresentation(t, tool);
                                     const hasCategoryConfig = !!GLOBAL_CATEGORY_CONFIG_SCHEMAS[category];
                                     // Count only company-configurable fields — a tool whose fields are all
                                     // agent_only (e.g. request_confirmation's card template) has nothing to
@@ -1257,15 +1208,15 @@ export default function EnterpriseSettings() {
                                         }}>
                                             <div style={{ minWidth: 0 }}>
                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0, flexWrap: 'wrap' }}>
-                                                    <span style={{ fontWeight: 500, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{tool.display_name}</span>
+                                                    <span style={{ fontWeight: 500, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{presentation.name}</span>
                                                     <span style={{ fontSize: '10px', background: tool.type === 'mcp' ? 'var(--primary)' : 'var(--bg-tertiary)', color: tool.type === 'mcp' ? '#fff' : 'var(--text-secondary)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>
-                                                        {tool.type === 'mcp' ? 'MCP' : 'Built-in'}
+                                                        {tool.type === 'mcp' ? 'MCP' : t('enterprise.tools.builtIn')}
                                                     </span>
-                                                    {tool.is_default && <span style={{ fontSize: '10px', background: 'rgba(0,200,100,0.15)', color: 'var(--success)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>Default</span>}
+                                                    {tool.is_default && <span style={{ fontSize: '10px', background: 'rgba(0,200,100,0.15)', color: 'var(--success)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>{t('enterprise.tools.default')}</span>}
                                                     {isConfigured && <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>{t('enterprise.tools.configured', 'Configured')}</span>}
                                                 </div>
                                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                    {tool.description}
+                                                    {presentation.description}
                                                     {tool.mcp_server_name && <span> · {tool.mcp_server_name}</span>}
                                                 </div>
                                             </div>
@@ -1278,7 +1229,7 @@ export default function EnterpriseSettings() {
                                                             server_name: tool.mcp_server_name,
                                                         })}
                                                     >
-                                                        Edit Server
+                                                        {t('enterprise.tools.editMcpServer')}
                                                     </button>
                                                 )}
                                                 {hasOwnConfig && (
@@ -1305,7 +1256,7 @@ export default function EnterpriseSettings() {
                                                 )}
                                                 {tool.type !== 'builtin' && (
                                                     <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: '11px' }} onClick={async () => {
-                                                        const ok = await dialog.confirm(t('common.dialog.deleteToolConfirm', { name: tool.display_name }), { title: t('common.dialog.deleteTool'), danger: true, confirmLabel: t('common.confirmActions.deleteLabel') });
+                                                        const ok = await dialog.confirm(t('common.dialog.deleteToolConfirm', { name: presentation.name }), { title: t('common.dialog.deleteTool'), danger: true, confirmLabel: t('common.confirmActions.deleteLabel') });
                                                         if (!ok) return;
                                                         await fetchJson(`/tools/${tool.id}`, { method: 'DELETE' });
                                                         loadAllTools();
@@ -1359,7 +1310,7 @@ export default function EnterpriseSettings() {
                                                     {filter === 'all' ? t('common.all', 'All')
                                                         : filter === 'enabled' ? t('common.enabled', 'Enabled')
                                                             : filter === 'disabled' ? t('common.disabled', 'Disabled')
-                                                                : filter === 'default' ? 'Default'
+                                                                : filter === 'default' ? t('enterprise.tools.default')
                                                                     : t('agent.tools.configured', 'Configured')}
                                                 </button>
                                             ))}
@@ -1407,11 +1358,11 @@ export default function EnterpriseSettings() {
                                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                                                     <span style={{ fontSize: '13px', fontWeight: 650, color: 'var(--text-primary)' }}>{label}</span>
                                                                     <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                                                        {allCatTools.length} tools · {enabledCount} enabled
-                                                                        {defaultCount > 0 ? ` · ${defaultCount} default` : ''}
-                                                                        {visibleCount !== allCatTools.length ? ` · ${visibleCount} shown` : ''}
+                                                                        {t('agent.tools.groupSummary', { total: allCatTools.length, enabled: enabledCount })}
+                                                                        {defaultCount > 0 ? ` · ${t('enterprise.tools.defaultCount', { count: defaultCount })}` : ''}
+                                                                        {visibleCount !== allCatTools.length ? ` · ${t('agent.tools.groupShown', { count: visibleCount })}` : ''}
                                                                     </span>
-                                                                    {configuredCount > 0 && <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>{configuredCount} configured</span>}
+                                                                    {configuredCount > 0 && <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>{t('agent.tools.groupConfigured', { count: configuredCount })}</span>}
                                                                 </div>
                                                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta.description}</div>
                                                             </div>
@@ -1423,11 +1374,11 @@ export default function EnterpriseSettings() {
                                                                     setEditingConfig({});
                                                                     const firstToolWithConfig = (allCatTools as any[]).find((tl: any) => tl.category === meta.configCategory && hasMeaningfulConfig(tl.config));
                                                                     if (firstToolWithConfig?.config) setEditingConfig({ ...firstToolWithConfig.config });
-                                                                }} style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '4px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }} title={`Configure ${label}`}>
+                                                                }} style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '4px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }} title={t('agent.tools.configureCategory', { category: label })}>
                                                                     {t('enterprise.tools.configure', 'Configure')}
                                                                 </button>
                                                             )}
-                                                            {controllableTools.length > 0 && <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={`Enable/Disable all ${label} tools`}>
+                                                            {controllableTools.length > 0 && <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={t('agent.tools.enableDisableAll', { category: label })}>
                                                                 <input type="checkbox" checked={allEnabled} onChange={(e) => void bulkToggle(allCatTools, e.target.checked)} style={{ opacity: 0, width: 0, height: 0 }} />
                                                                 <span style={switchTrack(allEnabled, mixed)}>
                                                                     <span style={switchKnob(allEnabled)} />
@@ -1464,6 +1415,7 @@ export default function EnterpriseSettings() {
                             {editingToolId && (() => {
                                 const tool = allTools.find(t => t.id === editingToolId);
                                 if (!tool) return null;
+                                const presentation = getLocalizedToolPresentation(t, tool);
                                 const visibleFields = (tool.config_schema.fields || []).filter((field: any) => {
                                     // agent_only fields are configured per-agent (e.g. a DingTalk card
                                     // template bound to each agent's own app) — never at company level.
@@ -1533,8 +1485,8 @@ export default function EnterpriseSettings() {
                                         <div onClick={e => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', width: '480px', maxWidth: '95vw', maxHeight: '80vh', overflow: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.4)' }}>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                                                 <div>
-                                                    <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}><IconSettings size={20} stroke={1.8} /> {tool.display_name}</h3>
-                                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>Global configuration used by all agents</div>
+                                                    <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}><IconSettings size={20} stroke={1.8} /> {presentation.name}</h3>
+                                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{t('enterprise.tools.globalConfigDescription')}</div>
                                                 </div>
                                                 <button onClick={() => setEditingToolId(null)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)' }}>✕</button>
                                             </div>
@@ -1548,7 +1500,7 @@ export default function EnterpriseSettings() {
                                                             onClick={() => setShowAdvancedToolConfig(v => !v)}
                                                             style={{ padding: 0, minWidth: 'auto', fontSize: '12px', color: 'var(--text-secondary)' }}
                                                         >
-                                                            {showAdvancedToolConfig ? 'Hide advanced settings' : 'Advanced settings'}
+                                                            {showAdvancedToolConfig ? t('enterprise.tools.hideAdvancedSettings') : t('enterprise.tools.advancedSettings')}
                                                         </button>
                                                         {showAdvancedToolConfig && (
                                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '12px' }}>
@@ -1590,7 +1542,7 @@ export default function EnterpriseSettings() {
                                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                                             <div>
                                                 <h3 style={{ margin: 0 }}>{GLOBAL_CATEGORY_CONFIG_SCHEMAS[configCategory].title}</h3>
-                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>Global configuration shared by all tools in this category</div>
+                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{t('enterprise.tools.globalCategoryConfigDescription')}</div>
                                             </div>
                                             <button onClick={() => setConfigCategory(null)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)' }}>x</button>
                                         </div>

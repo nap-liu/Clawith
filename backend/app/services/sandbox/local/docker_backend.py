@@ -1,11 +1,12 @@
 """Local docker-based sandbox backend."""
 
+import os
 import time
-from pathlib import Path
+
+from loguru import logger
 
 from app.services.sandbox.base import BaseSandboxBackend, ExecutionResult, SandboxCapabilities
 from app.services.sandbox.config import SandboxConfig
-from loguru import logger
 
 # Lazy import docker to make it optional
 _docker = None
@@ -17,21 +18,48 @@ def _get_docker():
     if _docker is None:
         try:
             import docker
+
             _docker = docker
         except ImportError:
-            raise ImportError(
-                "docker package is required for docker backend. "
-                "Install it with: pip install docker"
-            )
+            raise ImportError("docker package is required for docker backend. Install it with: pip install docker")
     return _docker
 
 
-# Language to docker image mapping
-_DOCKER_IMAGES = {
+_DOCKER_IMAGE_NAMES = {
     "python": "python:3.11-slim",
     "bash": "bash:5.2",
     "node": "node:18-slim",
 }
+
+_DOMESTIC_REGISTRY_PATTERNS = (
+    "docker.m.daocloud.io",
+    "enterprise-public-cn-beijing.cr.volces.com",
+    "registry.cn-",
+    "ccr.ccs.tencentyun.com",
+    "swr.cn-",
+)
+
+
+def _is_domestic_registry(registry: str) -> bool:
+    hostname = registry.split("/", 1)[0].lower()
+    return hostname in _DOMESTIC_REGISTRY_PATTERNS[:2] or any(
+        hostname.startswith(prefix) for prefix in _DOMESTIC_REGISTRY_PATTERNS[2:]
+    )
+
+
+def _docker_images() -> dict[str, str]:
+    """Resolve sandbox images through the configured domestic registry."""
+    registry = os.getenv("CLAWITH_IMAGE_MIRROR", "docker.m.daocloud.io").strip().rstrip("/")
+    if not _is_domestic_registry(registry):
+        raise RuntimeError("CLAWITH_IMAGE_MIRROR must reference an approved domestic registry")
+    return {language: f"{registry}/library/{image}" for language, image in _DOCKER_IMAGE_NAMES.items()}
+
+
+def _docker_daemon_uses_proxy(client) -> bool:
+    """Return whether image pulls would traverse a daemon HTTP/HTTPS proxy."""
+    info = client.info()
+    return bool(info.get("HttpProxy") or info.get("HttpsProxy"))
+
 
 # Docker run command mapping
 _DOCKER_COMMANDS = {
@@ -80,29 +108,25 @@ class DockerBackend(BaseSandboxBackend):
             return False
 
     async def execute(
-        self,
-        code: str,
-        language: str,
-        timeout: int = 30,
-        work_dir: str | None = None,
-        **kwargs
+        self, code: str, language: str, timeout: int = 30, work_dir: str | None = None, **kwargs
     ) -> ExecutionResult:
         """Execute code inside a docker container."""
         start_time = time.time()
 
         # Validate language
-        if language not in _DOCKER_IMAGES:
+        images = _docker_images()
+        if language not in images:
             return ExecutionResult(
                 success=False,
                 stdout="",
                 stderr="",
                 exit_code=1,
                 duration_ms=int((time.time() - start_time) * 1000),
-                error=f"Unsupported language: {language}. Use: {', '.join(_DOCKER_IMAGES.keys())}"
+                error=f"Unsupported language: {language}. Use: {', '.join(images)}",
             )
 
         # Get image and command
-        image = _DOCKER_IMAGES[language]
+        image = images[language]
 
         # Prepare environment
         env = {
@@ -124,7 +148,7 @@ class DockerBackend(BaseSandboxBackend):
                 stderr="",
                 exit_code=1,
                 duration_ms=int((time.time() - start_time) * 1000),
-                error=f"Unsupported language: {language}"
+                error=f"Unsupported language: {language}",
             )
 
         # Resource limits
@@ -139,7 +163,18 @@ class DockerBackend(BaseSandboxBackend):
             try:
                 self.client.images.get(image)
             except Exception:
-                # Image not found, pull it
+                if _docker_daemon_uses_proxy(self.client):
+                    return ExecutionResult(
+                        success=False,
+                        stdout="",
+                        stderr="",
+                        exit_code=1,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        error=(
+                            "Docker daemon proxy is enabled; image pulls are disabled. "
+                            "Disable the daemon HTTP/HTTPS proxy and retry."
+                        ),
+                    )
                 self.client.images.pull(image)
 
             # Run container
@@ -173,13 +208,13 @@ class DockerBackend(BaseSandboxBackend):
                 stderr=stderr,
                 exit_code=exit_code,
                 duration_ms=duration_ms,
-                error=None if exit_code == 0 else f"Exit code: {exit_code}"
+                error=None if exit_code == 0 else f"Exit code: {exit_code}",
             )
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e)
-            logger.exception(f"[Docker] Execution error")
+            logger.exception("[Docker] Execution error")
 
             # Handle timeout specifically
             if "timeout" in error_msg.lower():
@@ -189,7 +224,7 @@ class DockerBackend(BaseSandboxBackend):
                     stderr="",
                     exit_code=124,
                     duration_ms=duration_ms,
-                    error=f"Code execution timed out after {timeout}s"
+                    error=f"Code execution timed out after {timeout}s",
                 )
 
             return ExecutionResult(
@@ -198,5 +233,5 @@ class DockerBackend(BaseSandboxBackend):
                 stderr="",
                 exit_code=1,
                 duration_ms=duration_ms,
-                error=f"Docker execution error: {error_msg[:200]}"
+                error=f"Docker execution error: {error_msg[:200]}",
             )

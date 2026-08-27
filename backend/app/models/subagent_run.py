@@ -31,6 +31,15 @@ class SubagentRun(Base):
         nullable=False,
         index=True,
     )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    project_member_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("project_member_snapshots.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     execution_user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id"),

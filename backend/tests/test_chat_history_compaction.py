@@ -26,6 +26,7 @@ from app.database import async_session, engine
 from app.services.chat_history import (
     _SyntheticSummaryMessage,
     load_history_for_llm,
+    load_history_prefix_before_anchor,
     load_messages_for_session,
     load_recoverable_messages_for_turn,
 )
@@ -329,6 +330,55 @@ async def test_flagged_rows_are_skipped_summary_injected():
         assert 'epoch="1"' in rows[0].content
         assert "the older two messages were here" in rows[0].content
         assert [r.id for r in rows[1:]] == [inserted[2].id, inserted[3].id]
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_exact_anchor_prefix_keeps_summary_and_excludes_later_inputs():
+    summary = (
+        "## Summary of earlier conversation\n\n"
+        "### Decisions\n- preserve the durable project context\n"
+    )
+    conv_id, agent_id, inserted, _ = await _setup(
+        [
+            ("user", "compacted question", 600),
+            ("assistant", "compacted answer", 500),
+            ("user", "exact turn anchor", 200),
+            ("user", "later queued input", 100),
+        ],
+        marker_spec={
+            "epoch": 1,
+            "summary": summary,
+            "from_idx": 0,
+            "to_idx": 1,
+            "flag_indices": [0, 1],
+            "passed": True,
+        },
+    )
+    try:
+        async with async_session() as db:
+            prefix = await load_history_prefix_before_anchor(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                turn_anchor_id=inserted[2].id,
+                ctx_size=100,
+            )
+            compacted_anchor = await load_history_prefix_before_anchor(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                turn_anchor_id=inserted[0].id,
+                ctx_size=100,
+            )
+
+        assert prefix is not None
+        assert [message["role"] for message in prefix] == ["user"]
+        assert "<conversation-summary" in prefix[0]["content"]
+        assert "preserve the durable project context" in prefix[0]["content"]
+        assert "exact turn anchor" not in prefix[0]["content"]
+        assert "later queued input" not in prefix[0]["content"]
+        assert compacted_anchor is None
     finally:
         await _cleanup(conv_id)
 

@@ -12,9 +12,9 @@ route; provider identifiers never enter the public contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,7 +35,6 @@ from app.models.org import (
 )
 from app.models.user import User
 from app.services.channel_user_service import channel_user_service
-
 
 MESSAGE_OUTBOUND_CHANNELS = frozenset(
     {"feishu", "dingtalk", "wecom", "slack", "teams", "wechat"}
@@ -93,7 +92,7 @@ def parse_canonical_id(value: object, field_name: str) -> uuid.UUID:
 class ResolvedAgentRecipient:
     source_agent: Agent
     target_agent: Agent
-    relationship: AgentAgentRelationship
+    relationship: AgentAgentRelationship | None
 
 
 @dataclass(frozen=True)
@@ -139,8 +138,16 @@ async def resolve_agent_recipient(
     db: AsyncSession,
     source_agent_id: uuid.UUID,
     target_agent_id: object,
+    *,
+    project_id: uuid.UUID | None = None,
 ) -> ResolvedAgentRecipient:
-    """Resolve one exact, same-tenant, active A2A relationship by Agent.id."""
+    """Resolve one exact, same-tenant A2A recipient.
+
+    The ordinary path requires an active global relationship. A project-scoped
+    call may instead use two enabled member snapshots in the same project;
+    this grants no authority outside that project and never mutates either
+    source Agent's global relationship graph.
+    """
 
     target_id = parse_canonical_id(target_agent_id, "agent_id")
     source = await _load_source_agent(db, source_agent_id)
@@ -166,6 +173,42 @@ async def resolve_agent_recipient(
             "recipient_not_found",
             "agent_id does not identify exactly one active digital employee in this tenant",
         )
+    if project_id is not None:
+        from app.models.project import Project, ProjectMemberSnapshot
+
+        project = (
+            await db.execute(
+                select(Project).where(
+                    Project.id == project_id,
+                    Project.tenant_id == source.tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if project is None:
+            raise RecipientResolutionError(
+                "project_not_found",
+                "Project-scoped Agent delivery has no matching project",
+            )
+        member_ids = set(
+            (
+                await db.execute(
+                    select(ProjectMemberSnapshot.agent_id).where(
+                        ProjectMemberSnapshot.project_id == project.id,
+                        ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                        ProjectMemberSnapshot.agent_id.in_([source.id, target.id]),
+                        ProjectMemberSnapshot.is_enabled.is_(True),
+                    )
+                )
+            ).scalars()
+        )
+        if member_ids != {source.id, target.id}:
+            raise RecipientResolutionError(
+                "project_member_inactive",
+                "Project-scoped Agent delivery requires two active project members",
+            )
+        # Project membership is both the grant and the boundary. A global
+        # relationship must never let a departed member bypass this scope.
+        return ResolvedAgentRecipient(source, target, None)
     relationship_result = await db.execute(
         select(AgentAgentRelationship).where(
             AgentAgentRelationship.agent_id == source.id,

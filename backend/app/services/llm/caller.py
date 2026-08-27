@@ -17,39 +17,45 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import get_settings
 from app.database import async_session
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
 # import: agent_tools → llm/__init__ → caller → agent_tools
 
+
 async def get_agent_tools_for_llm(*args, **kwargs):
     from app.services.agent_tools import get_agent_tools_for_llm as _impl
+
     return await _impl(*args, **kwargs)
+
 
 async def execute_tool(*args, **kwargs):
     from app.services.agent_tools import execute_tool as _impl
+
     return await _impl(*args, **kwargs)
+
+
+from app.services.active_turns import ensure_active_turn
 from app.services.token_tracker import (
     TokenUsage,
-    record_token_usage,
-    extract_token_usage,
     estimate_token_usage_from_chars,
+    extract_token_usage,
+    record_token_usage,
 )
-from app.services.active_turns import ensure_active_turn
 
 from .client import LLMClientCloseGuard, LLMError
-from .failover import classify_error, FailoverErrorType
+from .confirmation_tool import find_request_confirmation_call
+from .failover import FailoverErrorType, classify_error
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import enforce_message_budget, finalize_tool_output
-from .confirmation_tool import find_request_confirmation_call
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -101,9 +107,21 @@ def _join_visible_response_segments(*segments: str | None) -> str:
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 PROVIDER_THROTTLE_RETRY_DELAYS = (1.0, 2.0)
-PROVIDER_THROTTLE_USER_MESSAGE = (
-    "⚠️ 模型服务当前繁忙或被限流，已自动重试仍未成功，请稍后再试。"
-)
+PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS = (2.0,)
+# DashScope compatible endpoints can silently queue requests when several
+# project Agents wake at once.  Bound provider I/O separately from the
+# Subagent worker pool so waiting for a slot does not consume the model's
+# request timeout.  Operators with a higher provider quota can raise this
+# without changing the durable project queue semantics.
+PROVIDER_MAX_IN_FLIGHT_ENV = "CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT"
+PROVIDER_MAX_IN_FLIGHT_DEFAULT = 2
+# A request that is making meaningful streaming progress gets a sliding
+# inactivity lease, but never an unbounded lifetime.  This is deliberately
+# distinct from increasing ``request_timeout``: a silent request still fails
+# at the configured timeout, while active reasoning/tool JSON is allowed to
+# finish within a bounded absolute budget.
+PROVIDER_PROGRESS_HARD_TIMEOUT_MULTIPLIER = 3.0
+PROVIDER_THROTTLE_USER_MESSAGE = "⚠️ 模型服务当前繁忙或被限流，已自动重试仍未成功，请稍后再试。"
 
 # Claude Code's exact prompt text for the resume nudge. Keep verbatim so we
 # inherit its tuned tone — short, no recap, no apology.
@@ -177,35 +195,80 @@ async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
 
 
+async def _sleep_before_timeout_retry(delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+
+
+_provider_slots: dict[tuple[int, str, str, int, int], asyncio.Semaphore] = {}
+
+
+def _provider_slot(model) -> asyncio.Semaphore:
+    """Return one event-loop-local slot pool for a provider endpoint."""
+    try:
+        limit = int(os.environ.get(PROVIDER_MAX_IN_FLIGHT_ENV, PROVIDER_MAX_IN_FLIGHT_DEFAULT))
+    except ValueError:
+        limit = PROVIDER_MAX_IN_FLIGHT_DEFAULT
+    limit = max(1, limit)
+    loop_id = id(asyncio.get_running_loop())
+    key = (
+        loop_id,
+        str(getattr(model, "provider", "") or "").lower(),
+        str(getattr(model, "base_url", "") or ""),
+        # Separate provider accounts without retaining or logging credential
+        # material in the slot key. Cloned models sharing one stored credential
+        # intentionally share capacity.
+        hash(str(getattr(model, "api_key_encrypted", "") or "")),
+        limit,
+    )
+    return _provider_slots.setdefault(key, asyncio.Semaphore(limit))
+
+
 async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
-    attempts = 1 + len(PROVIDER_THROTTLE_RETRY_DELAYS)
+    request_timeout = _get_model_timeout(model)
+    throttle_attempt_idx = 0
+    timeout_attempt_idx = 0
+    provider_slot = _provider_slot(model)
 
-    # Per-round latency observability: wall time + time-to-first-token (first
-    # content/thinking/tool-args delta from the provider). Callbacks are wrapped
-    # to timestamp the first delta; None callbacks get a marker-only no-op
-    # (safe — clients simply invoke whatever callback is present).
-    _first_token_at: list[float] = []
-
-    def _wrap_first_token(cb):
-        async def _marked(*a, **k):
-            if not _first_token_at:
-                _first_token_at.append(perf_counter())
-            if cb is not None:
-                return await cb(*a, **k)
-        return _marked
-
-    for _cb_key in ("on_chunk", "on_thinking"):
-        stream_kwargs[_cb_key] = _wrap_first_token(stream_kwargs.get(_cb_key))
-    if stream_kwargs.get("on_tool_delta") is not None:
-        stream_kwargs["on_tool_delta"] = _wrap_first_token(stream_kwargs["on_tool_delta"])
-
-    for attempt_idx in range(attempts):
-        _first_token_at.clear()
+    while True:
+        first_progress_at: list[float] = []
         _t0 = perf_counter()
+        dispatch_started_at = _t0
+        attempt_kwargs = dict(stream_kwargs)
         try:
-            response = await client.stream(**stream_kwargs)
+            # Queue outside the timeout budget.  Provider saturation should
+            # delay dispatch, not turn a healthy queued request into a false
+            # model timeout.
+            async with provider_slot:
+                dispatch_started_at = perf_counter()
+                hard_deadline = dispatch_started_at + request_timeout * PROVIDER_PROGRESS_HARD_TIMEOUT_MULTIPLIER
+                async with asyncio.timeout(request_timeout) as progress_timeout:
+
+                    def _wrap_progress(
+                        cb,
+                        *,
+                        progress_marks=first_progress_at,
+                        absolute_deadline=hard_deadline,
+                        timeout_scope=progress_timeout,
+                    ):
+                        async def _marked(*args, **kwargs):
+                            now = perf_counter()
+                            if not progress_marks:
+                                progress_marks.append(now)
+                            timeout_scope.reschedule(min(absolute_deadline, now + request_timeout))
+                            if cb is not None:
+                                return await cb(*args, **kwargs)
+
+                        return _marked
+
+                    # Only meaningful model deltas renew the inactivity lease;
+                    # transport heartbeat lines never reach these callbacks.
+                    for callback_key in ("on_chunk", "on_thinking"):
+                        attempt_kwargs[callback_key] = _wrap_progress(attempt_kwargs.get(callback_key))
+                    if attempt_kwargs.get("on_tool_delta") is not None:
+                        attempt_kwargs["on_tool_delta"] = _wrap_progress(attempt_kwargs["on_tool_delta"])
+                    response = await client.stream(**attempt_kwargs)
             _elapsed = perf_counter() - _t0
-            _ttft = f"{_first_token_at[0] - _t0:.2f}s" if _first_token_at else "n/a"
+            _ttft = f"{first_progress_at[0] - dispatch_started_at:.2f}s" if first_progress_at else "n/a"
             _usage = getattr(response, "usage", None)
             _out_tokens = _usage.get("completion_tokens") if isinstance(_usage, dict) else None
             _rate = f" ({_out_tokens / _elapsed:.0f} tok/s)" if _out_tokens and _elapsed > 0 else ""
@@ -214,17 +277,104 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
                 f"llm_call={_elapsed:.2f}s ttft={_ttft} output_tokens={_out_tokens}{_rate}"
             )
             return response
+        except TimeoutError as e:
+            phase = "stream" if first_progress_at else "ttft"
+            # A TTFT timeout has emitted no content, thinking, tool arguments,
+            # or side effects for this provider round. One bounded retry is
+            # therefore safe even when earlier tool rounds exist in history.
+            if phase == "ttft" and timeout_attempt_idx < len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS):
+                delay = PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS[timeout_attempt_idx]
+                timeout_attempt_idx += 1
+                logger.warning(
+                    f"[LLM] Provider TTFT timeout; retrying after {delay:.1f}s "
+                    f"(attempt {timeout_attempt_idx + 1}/"
+                    f"{len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS) + 1}, "
+                    f"round {round_i}, provider={getattr(model, 'provider', '?')} "
+                    f"model={getattr(model, 'model', '?')})"
+                )
+                await _sleep_before_timeout_retry(delay)
+                continue
+            logger.error(
+                f"[LLM Timing] timeout phase={phase} round={round_i} "
+                f"elapsed={perf_counter() - _t0:.2f}s "
+                f"provider={getattr(model, 'provider', '?')} "
+                f"model={getattr(model, 'model', '?')}"
+            )
+            raise LLMError(f"Request timed out after {request_timeout:g}s") from e
         except LLMError as e:
             if not _is_provider_throttle_error(e):
                 raise
-            if attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
+            if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
                 raise ProviderThrottleExhausted(str(e)) from e
 
-            delay = PROVIDER_THROTTLE_RETRY_DELAYS[attempt_idx]
+            delay = PROVIDER_THROTTLE_RETRY_DELAYS[throttle_attempt_idx]
+            throttle_attempt_idx += 1
             logger.warning(
                 f"[LLM] Provider throttle; retrying after {delay:.1f}s "
-                f"(attempt {attempt_idx + 2}/{attempts}, round {round_i}, "
+                f"(attempt {throttle_attempt_idx + 1}/"
+                f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
                 f"provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')}): {e}"
+            )
+            await _sleep_before_throttle_retry(delay)
+
+
+async def _complete_with_throttle_retry(client, *, model, round_i: int, **complete_kwargs):
+    """Run a non-streaming provider request through the shared capacity gate.
+
+    Background, scheduled, and project turns use ``complete`` while Web Chat
+    uses ``stream``. Both paths must share the same provider-account limit;
+    otherwise a project burst can bypass admission and starve interactive
+    conversations. Waiting for a provider slot is intentionally outside the
+    request timeout and does not hold a database transaction.
+    """
+
+    request_timeout = _get_model_timeout(model)
+    throttle_attempt_idx = 0
+    timeout_attempt_idx = 0
+    provider_slot = _provider_slot(model)
+
+    while True:
+        queued_at = perf_counter()
+        dispatch_started_at = queued_at
+        try:
+            async with provider_slot:
+                dispatch_started_at = perf_counter()
+                async with asyncio.timeout(request_timeout):
+                    response = await client.complete(**complete_kwargs)
+            elapsed = perf_counter() - dispatch_started_at
+            logger.info(
+                f"[LLM Timing] round={round_i} model={getattr(model, 'model', '?')} "
+                f"queue={dispatch_started_at - queued_at:.2f}s llm_call={elapsed:.2f}s (complete)"
+            )
+            return response
+        except TimeoutError as exc:
+            if timeout_attempt_idx < len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS):
+                delay = PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS[timeout_attempt_idx]
+                timeout_attempt_idx += 1
+                logger.warning(
+                    f"[LLM] Provider complete timeout; retrying after {delay:.1f}s "
+                    f"(attempt {timeout_attempt_idx + 1}/"
+                    f"{len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS) + 1}, "
+                    f"round {round_i}, provider={getattr(model, 'provider', '?')} "
+                    f"model={getattr(model, 'model', '?')})"
+                )
+                await _sleep_before_timeout_retry(delay)
+                continue
+            raise LLMError(f"Request timed out after {request_timeout:g}s") from exc
+        except LLMError as exc:
+            if not _is_provider_throttle_error(exc):
+                raise
+            if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
+                raise ProviderThrottleExhausted(str(exc)) from exc
+
+            delay = PROVIDER_THROTTLE_RETRY_DELAYS[throttle_attempt_idx]
+            throttle_attempt_idx += 1
+            logger.warning(
+                f"[LLM] Provider complete throttled; retrying after {delay:.1f}s "
+                f"(attempt {throttle_attempt_idx + 1}/"
+                f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
+                f"provider={getattr(model, 'provider', '?')} "
+                f"model={getattr(model, 'model', '?')}): {exc}"
             )
             await _sleep_before_throttle_retry(delay)
 
@@ -265,9 +415,7 @@ REPEAT_TOOL_CALL_BREAK_MESSAGE = (
 # overhead that is not represented by the message bodies themselves.
 QWEN_INPUT_CHAR_HARD_LIMIT = 900_000
 DISPATCH_INPUT_SAFETY_RATIO = 0.95
-PROVIDER_CONTEXT_BLOCKED_MESSAGE = (
-    "上下文过长，请新开会话。"
-)
+PROVIDER_CONTEXT_BLOCKED_MESSAGE = "上下文过长，请新开会话。"
 
 
 @dataclass(frozen=True)
@@ -331,11 +479,7 @@ def _dispatch_context_size(messages: list, tools: list[dict] | None) -> tuple[in
     chars = len(combined)
     # CJK is commonly close to one token per character.  ASCII-heavy JSON and
     # prose are conservatively estimated at three characters per token.
-    cjk = sum(
-        1
-        for ch in combined
-        if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff"
-    )
+    cjk = sum(1 for ch in combined if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff")
     estimated_tokens = cjk + (chars - cjk + 2) // 3
     return chars, estimated_tokens
 
@@ -359,10 +503,7 @@ def measure_dispatch(
         int(physical_input_capacity * DISPATCH_INPUT_SAFETY_RATIO),
     )
     token_overflow = context_window > 0 and estimated_tokens >= safe_input_limit
-    char_overflow = (
-        str(getattr(model, "provider", "")).lower() == "qwen"
-        and chars >= QWEN_INPUT_CHAR_HARD_LIMIT
-    )
+    char_overflow = str(getattr(model, "provider", "")).lower() == "qwen" and chars >= QWEN_INPUT_CHAR_HARD_LIMIT
     return DispatchBudget(
         chars=chars,
         estimated_tokens=estimated_tokens,
@@ -407,6 +548,7 @@ async def _guard_provider_dispatch(
     )
     logger.error(f"[context_guard] blocked provider dispatch session={session_id} {reason}")
     return PROVIDER_CONTEXT_BLOCKED_MESSAGE
+
 
 def _tool_call_signature(tc: dict) -> tuple[str, str]:
     """Stable ``(name, canonical-args)`` identity for a tool call.
@@ -566,18 +708,27 @@ def _observable_tool_result(tool_name: str, result: str) -> str:
         try:
             payload = json.loads(result)
             if not isinstance(payload, dict):
-                return "{\"type\": \"media_delivery_result\", \"status\": \"unparseable\"}"
+                return '{"type": "media_delivery_result", "status": "unparseable"}'
             safe_keys = (
-                "type", "version", "status", "code", "media_kind",
-                "source_mode", "channel", "http_status", "actual_kind",
-                "size", "mime_type", "caption_sent",
+                "type",
+                "version",
+                "status",
+                "code",
+                "media_kind",
+                "source_mode",
+                "channel",
+                "http_status",
+                "actual_kind",
+                "size",
+                "mime_type",
+                "caption_sent",
             )
             summary = {key: payload[key] for key in safe_keys if key in payload}
             summary["has_url"] = bool(payload.get("url"))
             summary["has_path"] = bool(payload.get("path") or payload.get("managed_path"))
             return json.dumps(summary, ensure_ascii=False, default=str)
         except Exception:
-            return "{\"type\": \"media_delivery_result\", \"status\": \"unparseable\"}"
+            return '{"type": "media_delivery_result", "status": "unparseable"}'
     if tool_name not in _SENSITIVE_RESULT_TOOLS:
         return result
     try:
@@ -593,9 +744,7 @@ def _observable_tool_result(tool_name: str, result: str) -> str:
         return result
 
 
-def _send_media_result_is_durable_in_current_session(
-    tool_name: str, result: str, session_id: str
-) -> bool:
+def _send_media_result_is_durable_in_current_session(tool_name: str, result: str, session_id: str) -> bool:
     """True when send_media already updated the current Session's tool row."""
     if tool_name != "send_media":
         return False
@@ -605,11 +754,18 @@ def _send_media_result_is_durable_in_current_session(
         return False
     return bool(
         isinstance(payload, dict)
-        and payload.get("type") in {
-            "platform_media_delivery", "media_delivery_result",
+        and payload.get("type")
+        in {
+            "platform_media_delivery",
+            "media_delivery_result",
         }
-        and payload.get("status") in {
-            "sent", "already_sent", "failed", "unsupported", "unknown",
+        and payload.get("status")
+        in {
+            "sent",
+            "already_sent",
+            "failed",
+            "unsupported",
+            "unknown",
         }
         and str(payload.get("session_id") or "") == str(session_id or "")
         and str(payload.get("message_id") or "")
@@ -692,8 +848,8 @@ async def _get_user_name(user_id) -> str | None:
     if not user_id:
         return None
     try:
-        from app.models.user import User as _UserModel
         from app.models.agent import Agent as _AgentModel
+        from app.models.user import User as _UserModel
 
         async with async_session() as _udb:
             _ur = await _udb.execute(select(_UserModel).where(_UserModel.id == user_id))
@@ -712,8 +868,8 @@ async def _get_user_name(user_id) -> str | None:
 
 def _convert_messages_for_vision(api_messages: list, supports_vision: bool) -> list:
     """Convert image markers to vision format if supported, or strip them."""
-    import re as _re_v
     import copy
+    import re as _re_v
 
     # Deep copy to avoid modifying the original list in place
     new_messages = copy.deepcopy(api_messages)
@@ -1108,8 +1264,10 @@ async def _process_tool_call(
     if supports_vision and agent_id:
         try:
             from app.services.vision_inject import try_inject_screenshot_vision
-            settings = get_settings()
-            ws_path = Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR) / str(agent_id)
+
+            from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+
+            ws_path = current_agent_runtime_workspace(agent_id).local_root
             vision_content = try_inject_screenshot_vision(tool_name, str(result), ws_path)
             if vision_content:
                 tool_content = vision_content
@@ -1128,9 +1286,7 @@ async def _process_tool_call(
         "result": llm_view,
         "reasoning_content": full_reasoning_content,
     }
-    if _send_media_result_is_durable_in_current_session(
-        tool_name, str(llm_view), session_id
-    ):
+    if _send_media_result_is_durable_in_current_session(tool_name, str(llm_view), session_id):
         done_evt["_durable_persisted"] = True
     elif await _persist_tool_call_events_strict(
         [done_evt],
@@ -1202,9 +1358,7 @@ async def call_llm(
         from app.models.agent import Agent as AgentModel
 
         async with async_session() as identity_db:
-            creator_id = await identity_db.scalar(
-                select(AgentModel.creator_id).where(AgentModel.id == agent_uuid)
-            )
+            creator_id = await identity_db.scalar(select(AgentModel.creator_id).where(AgentModel.id == agent_uuid))
         if creator_id is not None:
             user_id = creator_id
 
@@ -1230,12 +1384,13 @@ async def call_llm(
     _max_tool_rounds, _token_limit_msg = await _get_agent_config(agent_id)
     if _token_limit_msg:
         return _token_limit_msg
-    if max_tool_rounds_override and max_tool_rounds_override < _max_tool_rounds:
-        _max_tool_rounds = max_tool_rounds_override
+    if max_tool_rounds_override is not None:
+        _max_tool_rounds = max(1, min(200, int(max_tool_rounds_override)))
 
     # Auto-assign fallback tool call logger if none provided but conversation context exists
     if on_tool_call is None and session_id:
         from app.services.chat_history import persist_tool_call
+
         async def _default_on_tool_call(data: dict):
             if data.get("status") in {"running", "done"} and agent_id:
                 await persist_tool_call(
@@ -1246,6 +1401,7 @@ async def call_llm(
                     evt=data,
                     turn_anchor_id=turn_anchor_id,
                 )
+
         on_tool_call = _default_on_tool_call
 
     # Direct callers build their own turn snapshot.  The failover wrapper passes
@@ -1280,6 +1436,7 @@ async def call_llm(
         tools_for_llm = []
     else:
         from app.services.agent_tools import AGENT_TOOLS
+
         tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
     if tools_for_llm:
         tools_for_llm = sorted(
@@ -1344,10 +1501,7 @@ async def call_llm(
         ratio = _cache_hit_ratio(raw_usage)
         if ratio is not None and isinstance(raw_usage, dict):
             prompt_tokens = raw_usage.get("prompt_tokens")
-            line = (
-                f"[LLM] Round {round_number} cache-hit-ratio={ratio} "
-                f"prompt={prompt_tokens}"
-            )
+            line = f"[LLM] Round {round_number} cache-hit-ratio={ratio} prompt={prompt_tokens}"
             if ratio < float(os.environ.get("CLAWITH_CACHE_HIT_WARN_RATIO", "0.7")):
                 logger.warning(line + " (LOW — prefix cache may be missing the tool-loop tail)")
             else:
@@ -1450,8 +1604,23 @@ async def call_llm(
             tools=tools_for_llm if tools_for_llm else None,
             max_output_tokens=max_tokens,
         )
+        # All persisted conversation surfaces (Web Chat, project group leader
+        # children, project A2A children, and ordinary IM sessions) share the
+        # same first-dispatch compaction boundary.  Previously recovery only
+        # ran after the prompt no longer fit, even though the canonical
+        # compactor exposes a conservative pre-flight threshold specifically
+        # to avoid reaching that cliff.  Keep recovery single-shot and anchored
+        # to a durable fresh turn, but invoke it when either the hard guard or
+        # the standard pre-flight policy says the session should compact.
+        from app.services.llm.compactor import should_compact
+
+        preflight_compaction_required, _, _ = should_compact(
+            model=model,
+            last_prompt_tokens=None,
+            pre_flight_estimate=dispatch_budget.estimated_tokens,
+        )
         if (
-            not dispatch_budget.fits
+            (not dispatch_budget.fits or preflight_compaction_required)
             and round_i == 0
             and turn_anchor_id is not None
             and context_recovery is not None
@@ -1595,7 +1764,9 @@ async def call_llm(
             _log_turn_timing("throttle_exhausted", round_i + 1)
             return PROVIDER_THROTTLE_USER_MESSAGE
         except LLMError as e:
-            logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
+            logger.error(
+                f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}"
+            )
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client_guard.close()
@@ -1624,11 +1795,7 @@ async def call_llm(
             # allowed round, claiming here would mark the message processing and
             # then fall out of the loop without ever showing it to the model.
             has_next_round = round_i + 1 < _max_tool_rounds
-            late_injected = (
-                await before_round(round_i + 1)
-                if before_round is not None and has_next_round
-                else []
-            )
+            late_injected = await before_round(round_i + 1) if before_round is not None and has_next_round else []
             if late_injected:
                 from app.services.image_context import prepare_messages_for_model
 
@@ -1659,10 +1826,7 @@ async def call_llm(
                 await record_token_usage(agent_id, _unsaved_usage)
             await client_guard.close()
             _log_turn_timing("reply", round_i + 1)
-            return (
-                _join_visible_response_segments(*visible_response_segments)
-                or "[LLM returned empty content]"
-            )
+            return _join_visible_response_segments(*visible_response_segments) or "[LLM returned empty content]"
 
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i + 1}: {len(response.tool_calls)} tool call(s)")
@@ -1680,6 +1844,7 @@ async def call_llm(
             _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
             if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
                 from app.services import confirmation_service  # lazy import — avoid circular
+
                 await confirmation_service.suspend_for_confirmation(
                     agent_id=agent_id,
                     conversation_id=session_id,
@@ -1710,17 +1875,21 @@ async def call_llm(
                 # A role="tool" reply must be preceded by the assistant message
                 # carrying its tool_calls, or strict providers reject the
                 # orphaned tool message next round.
-                api_messages.append(LLMMessage(
-                    role="assistant",
-                    content=response.content or None,
-                    tool_calls=sanitized_tool_calls,
-                    reasoning_content=response.reasoning_content,
-                ))
-                api_messages.append(LLMMessage(
-                    role="tool",
-                    content=f"❌ {_conf_reason}",
-                    tool_call_id=conf_call.call_id,
-                ))
+                api_messages.append(
+                    LLMMessage(
+                        role="assistant",
+                        content=response.content or None,
+                        tool_calls=sanitized_tool_calls,
+                        reasoning_content=response.reasoning_content,
+                    )
+                )
+                api_messages.append(
+                    LLMMessage(
+                        role="tool",
+                        content=f"❌ {_conf_reason}",
+                        tool_call_id=conf_call.call_id,
+                    )
+                )
                 continue
 
         # Repeated tool-call guard. If the model has now emitted the identical
@@ -1741,10 +1910,7 @@ async def call_llm(
                 await record_token_usage(agent_id, _unsaved_usage)
             await client_guard.close()
             _log_turn_timing("repeat_guard", round_i + 1)
-            return (
-                _join_visible_response_segments(*visible_response_segments)
-                or REPEAT_TOOL_CALL_BREAK_MESSAGE
-            )
+            return _join_visible_response_segments(*visible_response_segments) or REPEAT_TOOL_CALL_BREAK_MESSAGE
 
         # A durable background owner may have been cancelled while the provider
         # request was in flight.  Revalidate immediately before persisting tool
@@ -1908,6 +2074,7 @@ async def call_llm_with_failover(
     before_tool_execution=None,
     include_soul: bool = True,
     include_memory: bool = True,
+    max_tool_rounds_override: int | None = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -1937,10 +2104,7 @@ async def call_llm_with_failover(
         try:
             recovered = await context_recovery(model, budget)
         except Exception as exc:
-            logger.error(
-                "[context_guard] safe context recovery failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            logger.error(f"[context_guard] safe context recovery failed: {type(exc).__name__}: {exc}")
             return None
         if recovered is not None:
             turn_messages = list(recovered) + list(injected_turn_messages)
@@ -2037,6 +2201,7 @@ async def call_llm_with_failover(
         context_recovery=_recover_once,
         before_round=_wrapped_before_round,
         before_tool_execution=before_tool_execution,
+        max_tool_rounds_override=max_tool_rounds_override,
     )
 
     # Check if we need to failover
@@ -2128,12 +2293,10 @@ async def call_llm_with_failover(
         context_recovery=None,
         before_round=_wrapped_before_round,
         before_tool_execution=before_tool_execution,
+        max_tool_rounds_override=max_tool_rounds_override,
     )
 
-    if (
-        primary_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE
-        and fallback_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE
-    ):
+    if primary_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE and fallback_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE:
         return PROVIDER_CONTEXT_BLOCKED_MESSAGE
 
     # Combine error messages if fallback also failed
@@ -2159,9 +2322,9 @@ async def call_agent_llm(
     on_thinking=None,
 ) -> str:
     """Call the agent's LLM with automatic failover support."""
+    from app.core.permissions import is_agent_expired
     from app.models.agent import Agent
     from app.models.llm import LLMModel
-    from app.core.permissions import is_agent_expired
 
     # Load agent
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -2174,7 +2337,7 @@ async def call_agent_llm(
         return "⚠️ 数字员工未找到"
 
     if is_agent_expired(agent):
-        return "This Agent has expired and is off duty. Please contact your admin to extend its service."
+        return "数字员工已过期并停止服务，请联系管理员延长有效期。"
 
     # Load primary model
     primary_model: LLMModel | None = None
@@ -2243,11 +2406,11 @@ async def call_agent_llm_with_tools(
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
-        return "⚠️ Agent not found"
+        return "⚠️ 未找到数字员工"
     from app.core.okr_feature import is_retired_okr_agent
 
     if await is_retired_okr_agent(db, agent):
-        return "⚠️ Agent not found"
+        return "⚠️ 未找到数字员工"
 
     if execution_user_id is None:
         # Rolling-upgrade compatibility for legacy background call sites.
@@ -2289,10 +2452,7 @@ async def call_agent_llm_with_tools(
         return f"⚠️ {agent.name} has no LLM model configured"
 
     if _same_model_record(primary_model, fallback_model):
-        logger.info(
-            "[call_agent_llm_with_tools] Primary and fallback reference the same model id; "
-            "skipping fallback"
-        )
+        logger.info("[call_agent_llm_with_tools] Primary and fallback reference the same model id; skipping fallback")
         fallback_model = None
 
     # Build messages
@@ -2303,6 +2463,12 @@ async def call_agent_llm_with_tools(
 
     tools_for_llm = await get_agent_tools_for_llm(agent_id)
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
+
+    # Everything needed by the provider/tool loop is now an immutable snapshot.
+    # End the read transaction before waiting for provider capacity or remote
+    # model I/O so hundreds of queued turns do not pin one database connection
+    # each. ``expire_on_commit=False`` keeps the loaded agent/model values usable.
+    await db.commit()
 
     async def _try_model(model: LLMModel) -> tuple[str, bool, bool]:
         """Try to complete with a model. Returns (response, success, tool_executed)."""
@@ -2334,7 +2500,9 @@ async def call_agent_llm_with_tools(
                         _unsaved_usage = TokenUsage()
                         _, _token_limit_msg = await _get_agent_config(agent_id)
                         if _token_limit_msg:
-                            logger.warning(f"[call_agent_llm_with_tools] Token limit exceeded mid-loop: {_token_limit_msg}")
+                            logger.warning(
+                                f"[call_agent_llm_with_tools] Token limit exceeded mid-loop: {_token_limit_msg}"
+                            )
                             await client_guard.close()
                             return _token_limit_msg, False, tool_executed
 
@@ -2352,16 +2520,14 @@ async def call_agent_llm_with_tools(
                     return context_stop, False, tool_executed
 
                 try:
-                    _round_t0 = perf_counter()
-                    response = await client.complete(
+                    response = await _complete_with_throttle_retry(
+                        client,
+                        model=model,
+                        round_i=round_i + 1,
                         messages=api_messages,
                         tools=tools_for_llm if tools_for_llm else None,
                         temperature=model.temperature,
                         max_tokens=max_tokens,
-                    )
-                    logger.info(
-                        f"[LLM Timing] round={round_i + 1} model={getattr(model, 'model', '?')} "
-                        f"llm_call={perf_counter() - _round_t0:.2f}s (complete) agent={agent_id}"
                     )
                 except Exception as e:
                     logger.error(f"[call_agent_llm_with_tools] Agent {agent_id}: LLM call error: {e}")
@@ -2384,8 +2550,7 @@ async def call_agent_llm_with_tools(
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client_guard.close()
                     return (
-                        _join_visible_response_segments(*visible_response_segments)
-                        or "[Empty response]",
+                        _join_visible_response_segments(*visible_response_segments) or "[Empty response]",
                         True,
                         tool_executed,
                     )
@@ -2406,6 +2571,7 @@ async def call_agent_llm_with_tools(
                     _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
                     if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
                         from app.services import confirmation_service  # lazy import — avoid circular
+
                         await confirmation_service.suspend_for_confirmation(
                             agent_id=agent_id,
                             conversation_id=session_id,
@@ -2436,17 +2602,21 @@ async def call_agent_llm_with_tools(
                         # A role="tool" reply must be preceded by the assistant
                         # message carrying its tool_calls, or strict providers
                         # reject the orphaned tool message.
-                        api_messages.append(LLMMessage(
-                            role="assistant",
-                            content=response.content or None,
-                            tool_calls=sanitized_tool_calls,
-                            reasoning_content=response.reasoning_content,
-                        ))
-                        api_messages.append(LLMMessage(
-                            role="tool",
-                            content=f"❌ {_conf_reason}",
-                            tool_call_id=conf_call.call_id,
-                        ))
+                        api_messages.append(
+                            LLMMessage(
+                                role="assistant",
+                                content=response.content or None,
+                                tool_calls=sanitized_tool_calls,
+                                reasoning_content=response.reasoning_content,
+                            )
+                        )
+                        api_messages.append(
+                            LLMMessage(
+                                role="tool",
+                                content=f"❌ {_conf_reason}",
+                                tool_call_id=conf_call.call_id,
+                            )
+                        )
                         continue
 
                 # Repeated tool-call guard (twin of the streaming call_llm loop).
@@ -2465,8 +2635,7 @@ async def call_agent_llm_with_tools(
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client_guard.close()
                     return (
-                        _join_visible_response_segments(*visible_response_segments)
-                        or REPEAT_TOOL_CALL_BREAK_MESSAGE,
+                        _join_visible_response_segments(*visible_response_segments) or REPEAT_TOOL_CALL_BREAK_MESSAGE,
                         True,
                         tool_executed,
                     )
@@ -2559,10 +2728,7 @@ async def call_agent_llm_with_tools(
     if success2:
         return reply2
 
-    if (
-        reply == PROVIDER_CONTEXT_BLOCKED_MESSAGE
-        and reply2 == PROVIDER_CONTEXT_BLOCKED_MESSAGE
-    ):
+    if reply == PROVIDER_CONTEXT_BLOCKED_MESSAGE and reply2 == PROVIDER_CONTEXT_BLOCKED_MESSAGE:
         return PROVIDER_CONTEXT_BLOCKED_MESSAGE
 
     return f"⚠️ Both models failed | Primary: {reply[:80]} | Fallback: {reply2[:80]}"

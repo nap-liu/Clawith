@@ -1,0 +1,107 @@
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  column-gap: var(--spacing-3);
+  row-gap: var(--spacing-2);
+  min-height: 58px;
+  padding: var(--spacing-3) var(--spacing-4);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.pagination__total {
+  margin-right: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.pagination__pages,
+.pagination__jump {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-1);
+}
+
+.pagination__jump {
+  flex: 0 0 auto;
+  margin-inline-start: var(--spacing-2);
+  white-space: nowrap;
+}
+
+.pagination__button.btn {
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+}
+
+.pagination__button.btn.is-active {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  background: var(--accent-subtle);
+  font-weight: 600;
+}
+
+.pagination__gap {
+  width: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+
+.pagination__page-size {
+  min-width: 104px;
+}
+
+.pagination__page-size .select-dropdown__trigger {
+  height: 34px;
+  border-color: var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  font-size: var(--font-size-sm);
+}
+
+.pagination__jump input {
+  width: 52px;
+  height: 34px;
+  padding: 0 var(--spacing-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  text-align: center;
+}
+
+.pagination__jump input:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.pagination--compact {
+  min-height: 46px;
+  padding: var(--spacing-2) var(--spacing-3);
+  column-gap: var(--spacing-1);
+  row-gap: var(--spacing-1);
+}
+
+.pagination--compact .pagination__button.btn {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+}
+
+@media (max-width: 720px) {
+  .pagination {
+    justify-content: center;
+  }
+
+  .pagination__total {
+    width: 100%;
+    margin-right: 0;
+    text-align: center;
+  }
+}

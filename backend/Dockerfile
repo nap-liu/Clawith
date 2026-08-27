@@ -1,6 +1,7 @@
 # ─── Backend Dockerfile (Optimized) ─────────────────────
 # Multi-stage: deps → production
-FROM python:3.12-slim AS deps
+ARG CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io
+FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim AS deps
 
 WORKDIR /app
 # APT mirror is a build arg — the default (aliyun) occasionally stalls on
@@ -27,7 +28,7 @@ RUN if [ -n "$CLAWITH_PIP_INDEX_URL" ] && [ -n "$CLAWITH_PIP_TRUSTED_HOST" ]; th
     fi
 
 # ─── Production ─────────────────────────────────────────
-FROM python:3.12-slim AS production
+FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim AS production
 
 WORKDIR /app
 ARG CLAWITH_APT_MIRROR=mirrors.aliyun.com
@@ -39,6 +40,18 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     apt-get update && \
     apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu bubblewrap libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info pango1.0-tools fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk chromium && \
     fc-cache -fv && \
+    rm -rf /var/lib/apt/lists/*
+
+# Project workspaces use native Git for immutable commit history, safe restore
+# commits, and project-local branches. Keep this in its own layer so changing
+# the Git dependency does not invalidate the large Chromium/runtime layer.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s/deb.debian.org/${CLAWITH_APT_MIRROR}/g" /etc/apt/sources.list.d/debian.sources; \
+    else \
+        sed -i "s/deb.debian.org/${CLAWITH_APT_MIRROR}/g" /etc/apt/sources.list; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from deps stage

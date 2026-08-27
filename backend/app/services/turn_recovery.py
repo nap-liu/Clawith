@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 
 from app.database import async_session
 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE, Agent
@@ -26,10 +26,12 @@ from app.services.chat_history import (
 )
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
+from app.services.redis_lease_lock import RedisLeaseBusyError, RedisLeaseLock
 from app.services.turn_runtime import deliver_recovered_reply_to_origin, load_turn_runtime
+from app.services.workload_capacity import WorkloadKind, get_workload_capacity
 
-RECOVERY_ADVISORY_LOCK_KEY = 2026070801
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
+STARTUP_RECOVERY_LEASE_RESOURCE = "startup-turn-recovery"
 RECOVERY_CONCURRENCY = 8
 
 
@@ -66,10 +68,7 @@ async def _validated_execution_agent_id(
         return candidate
     meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
     if meta.get("kind") != "subagent_event":
-        logger.warning(
-            f"[turn_recovery] ignored execution_agent_id on non-subagent "
-            f"anchor={anchor.id}"
-        )
+        logger.warning(f"[turn_recovery] ignored execution_agent_id on non-subagent anchor={anchor.id}")
         return anchor.agent_id
 
     try:
@@ -99,16 +98,11 @@ async def _validated_execution_agent_id(
         or run.execution_user_id != anchor.user_id
         or storage_agent.tenant_id != execution_agent.tenant_id
         or not (
-            parent.agent_id == candidate
-            or (
-                parent.source_channel == "agent"
-                and parent.peer_agent_id == candidate
-            )
+            parent.agent_id == candidate or (parent.source_channel == "agent" and parent.peer_agent_id == candidate)
         )
     ):
         logger.error(
-            f"[turn_recovery] rejected invalid subagent execution edge "
-            f"anchor={anchor.id} candidate={candidate}"
+            f"[turn_recovery] rejected invalid subagent execution edge anchor={anchor.id} candidate={candidate}"
         )
         return None
     return candidate
@@ -188,6 +182,7 @@ async def _complete_unfinished_tool_calls(
     ctx_size: int,
     expected_origin: _RecoveryOrigin,
     execution_agent_id: uuid.UUID | None = None,
+    release_db_before_execution: bool = False,
 ) -> int:
     execution_agent_id = execution_agent_id or anchor.agent_id
     rows = await load_recoverable_messages_for_turn(
@@ -198,6 +193,11 @@ async def _complete_unfinished_tool_calls(
         ctx_size=ctx_size,
     )
     unfinished = _unfinished_tool_call_rows(rows, turn_anchor_id=anchor.id)
+    if release_db_before_execution:
+        # Tool execution can wait on subprocesses and remote services. The
+        # rows above are immutable inputs, so the recovery session must not
+        # retain a pooled connection while those tools run.
+        await db.close()
     completed = 0
     for _row, payload, key in unfinished:
         if not await _recovery_origin_matches(anchor, expected_origin):
@@ -269,11 +269,7 @@ async def _load_recovery_origin(
         session_id = uuid.UUID(str(anchor.conversation_id))
     except (TypeError, ValueError):
         session_id = None
-    session = (
-        await db.get(ChatSession, session_id, with_for_update=for_update)
-        if session_id
-        else None
-    )
+    session = await db.get(ChatSession, session_id, with_for_update=for_update) if session_id else None
     fresh_anchor = await db.get(
         ChatMessage,
         anchor.id,
@@ -348,9 +344,14 @@ async def _deliver_recovered_reply(
 ) -> bool:
     """Validate the turn generation and deliver while its rows stay locked."""
     async with async_session() as db:
-        current_origin = await _load_recovery_origin(db, anchor, for_update=True)
+        current_origin = await _load_recovery_origin(
+            db,
+            anchor,
+            for_update=True,
+        )
         if current_origin != expected_origin:
             return False
+
         delivery_kwargs = {
             "agent_id": execution_agent_id,
             "conversation_id": anchor.conversation_id,
@@ -470,11 +471,7 @@ async def _tail_has_pending_confirmation(db, anchor: ChatMessage, *, ctx_size: i
         if getattr(row, "role", None) != "tool_call":
             continue
         payload = _tool_payload(row)
-        if (
-            payload
-            and payload.get("name") == REQUEST_CONFIRMATION_TOOL_NAME
-            and payload.get("status") == "pending"
-        ):
+        if payload and payload.get("name") == REQUEST_CONFIRMATION_TOOL_NAME and payload.get("status") == "pending":
             return True
     return False
 
@@ -487,8 +484,14 @@ async def _resume_one(
     result = RecoveryStats()
     try:
         async with semaphore:
-            did_resume = await resume_turn(anchor)
+            # A recovered turn owns its cancellation lifecycle. Running it in
+            # a child task lets one stopped turn remain isolated while an
+            # actual shutdown still cancels the whole startup batch.
+            did_resume = await asyncio.create_task(resume_turn(anchor))
     except asyncio.CancelledError:
+        recovery_task = asyncio.current_task()
+        if recovery_task is not None and recovery_task.cancelling():
+            raise
         result.skipped = 1
         logger.info(
             "[turn_recovery] recovery cancelled for anchor={}",
@@ -508,16 +511,21 @@ async def _resume_one(
 async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
     """Resume startup-recoverable turn anchors once.
 
-    All app instances may pass through this gate. The advisory lock makes
-    non-winning instances wait until the winner finishes recovery, preventing
-    duplicate recovery work across replicas. Callers may run this synchronously
-    or as a detached startup background task.
+    All app instances may pass through this gate. A renewable Redis lease keeps
+    one replica responsible for a recovery batch without reserving a PostgreSQL
+    connection while model turns execute. Callers may run this synchronously or
+    as a detached startup background task.
     """
     stats = RecoveryStats()
-    async with async_session() as db:
-        await db.execute(text("SELECT pg_advisory_lock(:key)"), {"key": RECOVERY_ADVISORY_LOCK_KEY})
-        try:
-            anchors = await _load_recoverable_anchors(db, limit=limit)
+    try:
+        async with RedisLeaseLock(
+            STARTUP_RECOVERY_LEASE_RESOURCE,
+            namespace="turn-recovery",
+        ):
+            # Scanning is a short read transaction. Close it before admission,
+            # model execution, tool execution, or inter-turn waits.
+            async with async_session() as db:
+                anchors = await _load_recoverable_anchors(db, limit=limit)
             stats.scanned = len(anchors)
             if anchors:
                 concurrency = min(len(anchors), RECOVERY_CONCURRENCY)
@@ -541,8 +549,8 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
                     stats.resumed += result.resumed
                     stats.skipped += result.skipped
                     stats.failed += result.failed
-        finally:
-            await db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": RECOVERY_ADVISORY_LOCK_KEY})
+    except RedisLeaseBusyError:
+        logger.info("[turn_recovery] another replica owns startup recovery")
     return stats
 
 
@@ -553,91 +561,103 @@ async def resume_turn(anchor: ChatMessage) -> bool:
     if expected_origin is None:
         return False
 
+    # Resolve admission identity in a short transaction. Capacity waiting must
+    # never reserve a database connection.
     async with async_session() as db:
         execution_agent_id = await _validated_execution_agent_id(db, anchor)
         if execution_agent_id is None:
             return False
-        agent = (
-            await db.execute(select(Agent).where(Agent.id == execution_agent_id))
-        ).scalar_one_or_none()
+        agent = (await db.execute(select(Agent).where(Agent.id == execution_agent_id))).scalar_one_or_none()
         if agent is None or getattr(agent, "agent_type", None) == "openclaw":
             return False
-        ctx_size = (agent.context_window_size if agent else None) or DEFAULT_CONTEXT_WINDOW_SIZE
-        if await _tail_has_pending_confirmation(db, anchor, ctx_size=ctx_size):
-            return False
-        await _complete_unfinished_tool_calls(
-            db,
-            anchor,
-            ctx_size=ctx_size,
-            expected_origin=expected_origin,
-            execution_agent_id=execution_agent_id,
-        )
+        tenant_id = agent.tenant_id
+        ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
+
+    async with get_workload_capacity().slot(WorkloadKind.BACKGROUND, tenant_id):
         if not await _recovery_origin_matches(anchor, expected_origin):
             return False
-        history = await load_recoverable_history_for_turn(
-            db,
-            agent_id=anchor.agent_id,
-            conversation_id=anchor.conversation_id,
-            turn_anchor_id=anchor.id,
-            ctx_size=ctx_size,
-        )
-        if not history:
-            return False
-        last_role = history[-1].get("role")
-        if last_role == "assistant":
-            # Defensive guard for direct callers and races after anchor selection:
-            # a persisted assistant means this turn is already complete.
-            return False
 
-        reply = await _call_agent_llm(
-            db,
-            execution_agent_id,
-            "",
-            session_id=anchor.conversation_id,
-            user_id=anchor.user_id,
-            history=history,
-            recovery_hint=None,
-            continue_turn=True,
-            recovery_mode=True,
-            turn_anchor_id=anchor.id,
-            storage_agent_id=anchor.agent_id,
-            turn_type="recovery",
-        )
-
-    if reply and reply.strip():
-        if not await _recovery_origin_matches(anchor, expected_origin):
-            return False
-        from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
-
-        runtime = await load_turn_runtime(
-            agent_id=anchor.agent_id,
-            conversation_id=anchor.conversation_id,
-        )
         async with async_session() as db:
-            assistant_message_id = await persist_assistant_reply_row(
+            if await _tail_has_pending_confirmation(db, anchor, ctx_size=ctx_size):
+                return False
+            await _complete_unfinished_tool_calls(
+                db,
+                anchor,
+                ctx_size=ctx_size,
+                expected_origin=expected_origin,
+                execution_agent_id=execution_agent_id,
+                release_db_before_execution=True,
+            )
+
+        if not await _recovery_origin_matches(anchor, expected_origin):
+            return False
+
+        async with async_session() as db:
+            history = await load_recoverable_history_for_turn(
                 db,
                 agent_id=anchor.agent_id,
-                user_id=anchor.user_id,
                 conversation_id=anchor.conversation_id,
-                content=reply,
-                message_meta=attach_delivery_to_meta(
-                    {},
-                    IMDeliveryResult.pending(runtime.source_channel),
-                ),
                 turn_anchor_id=anchor.id,
-                sender_agent_id=execution_agent_id,
+                ctx_size=ctx_size,
             )
-            await db.commit()
-        delivered = await _deliver_recovered_reply(
-            anchor,
-            expected_origin=expected_origin,
-            reply=reply,
-            execution_agent_id=execution_agent_id,
-            message_id=assistant_message_id,
-        )
-        if not delivered:
-            logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
-            return False
-        return True
+            if not history:
+                return False
+            last_role = history[-1].get("role")
+            if last_role == "assistant":
+                # Defensive guard for direct callers and races after anchor selection:
+                # a persisted assistant means this turn is already complete.
+                return False
 
-    return False
+            reply = await _call_agent_llm(
+                db,
+                execution_agent_id,
+                "",
+                session_id=anchor.conversation_id,
+                user_id=anchor.user_id,
+                history=history,
+                recovery_hint=None,
+                continue_turn=True,
+                recovery_mode=True,
+                turn_anchor_id=anchor.id,
+                storage_agent_id=anchor.agent_id,
+                turn_type="recovery",
+                release_db_before_dispatch=True,
+            )
+
+        if reply and reply.strip():
+            if not await _recovery_origin_matches(anchor, expected_origin):
+                return False
+            from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+            runtime = await load_turn_runtime(
+                agent_id=anchor.agent_id,
+                conversation_id=anchor.conversation_id,
+            )
+            async with async_session() as db:
+                assistant_message_id = await persist_assistant_reply_row(
+                    db,
+                    agent_id=anchor.agent_id,
+                    user_id=anchor.user_id,
+                    conversation_id=anchor.conversation_id,
+                    content=reply,
+                    message_meta=attach_delivery_to_meta(
+                        {},
+                        IMDeliveryResult.pending(runtime.source_channel),
+                    ),
+                    turn_anchor_id=anchor.id,
+                    sender_agent_id=execution_agent_id,
+                )
+                await db.commit()
+            delivered = await _deliver_recovered_reply(
+                anchor,
+                expected_origin=expected_origin,
+                reply=reply,
+                execution_agent_id=execution_agent_id,
+                message_id=assistant_message_id,
+            )
+            if not delivered:
+                logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
+                return False
+            return True
+
+        return False

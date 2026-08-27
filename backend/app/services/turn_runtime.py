@@ -28,6 +28,7 @@ from app.services.im_delivery import (
 )
 
 DeliveryPartObserver = Callable[[IMDeliveryPart], Awaitable[None]]
+HISTORY_ONLY_CHANNELS = frozenset({"agent", "trigger", "subagent", "project"})
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,15 @@ async def deliver_reply_to_origin(
                 runtime.external_conv_id,
             )
             return False
+        if message_id is None and runtime.source_channel in HISTORY_ONLY_CHANNELS:
+            return await deliver_message_to_runtime(
+                agent_id=agent_id,
+                runtime=runtime,
+                message=reply,
+                require_transport=require_transport,
+                origin_actor_ref=origin_actor_ref,
+                origin_actor_ref_type=origin_actor_ref_type,
+            )
         if message_id is None:
             from app.models.audit import ChatMessage
 
@@ -321,7 +331,11 @@ async def deliver_message_with_receipt(
         delivered = await _deliver_wechat(agent_id, runtime, message, on_part=on_part)
     elif channel == "discord":
         delivered = await _deliver_discord(agent_id, runtime, message)
-    elif channel in {"agent", "trigger"}:
+    elif channel in HISTORY_ONLY_CHANNELS:
+        # Durable child Sessions have no external transport adapter. Their DB
+        # history is the authoritative delivery surface (and the normal parent
+        # event dispatcher consumes terminal child rows). Treat the persisted
+        # reply exactly like Web/Agent history instead of retrying forever.
         return await _deliver_web(agent_id, runtime, message)
 
     if delivered is not None:

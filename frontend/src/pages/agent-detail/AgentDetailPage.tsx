@@ -16,7 +16,7 @@ import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
 import { getChatToolRenderType } from '../../components/ChatToolCallRenderer';
@@ -32,7 +32,7 @@ import {
     shouldScheduleResumeReconnect,
     type ResumeEventGate,
 } from '../../features/conversation/core/resumeRecovery';
-import { buildConversationEntries, getConversationScrollAnchor } from '../../features/conversation/core/chatTimeline';
+import { buildConversationEntries, getConversationScrollAnchor, isA2AMessageLeft } from '../../features/conversation/core/chatTimeline';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import {
     createConversationHistoryPageParams,
@@ -101,7 +101,6 @@ import {
     IconRobot,
     IconSend,
     IconSettings,
-    IconTools,
     IconUser,
     IconWorld,
     IconBolt,
@@ -147,7 +146,6 @@ const mergeSessionsById = (first: any[], second: any[]) => {
         return true;
     });
 };
-const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
 const trimLeadingPictograph = (value: string) => value.replace(/^\p{Extended_Pictographic}\s*/u, '');
 const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
     const clean = trimLeadingPictograph(value || 'Trigger execution').trim();
@@ -155,9 +153,6 @@ const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
     if (legacyMatch) return isZh ? `内心独白：${legacyMatch[1]}` : `Reflection: ${legacyMatch[1]}`;
     return clean;
 };
-const safeDisplayIcon = (icon?: string | null, fallback: React.ReactNode = <IconTools size={18} stroke={1.8} />) =>
-    icon && !EMOJI_RE.test(icon) ? icon : fallback;
-
 // React Router unmounts this page while an agent turn can keep running on the
 // server. Keep only the affected runtime keys long enough for the next mount to
 // close the durable-history gap; ordinary completed sessions never enter here.
@@ -535,19 +530,19 @@ function AccessPermissionsPanel({
             value: 'company',
             icon: <IconBuilding size={14} stroke={1.8} />,
             label: t('agent.settings.perm.companyWide', 'Company-wide'),
-            desc: isChinese ? '所有平台用户和所有 Agent 都可以访问；可参与 Plaza。' : 'All platform users and all agents can access it; Plaza is enabled.',
+            desc: isChinese ? '所有平台用户和数字员工都可以访问。' : 'All platform users and digital employees can access it.',
         },
         {
             value: 'private',
             icon: <IconUser size={14} stroke={1.8} />,
             label: t('agent.settings.perm.onlyMe', 'Only Me'),
-            desc: isChinese ? '只有创建者可以使用和管理；不可参与 Plaza。' : 'Only the creator can use and manage it; Plaza is disabled.',
+            desc: isChinese ? '只有创建者可以使用和管理。' : 'Only the creator can use and manage it.',
         },
         {
             value: 'custom',
             icon: <IconLock size={14} stroke={1.8} />,
             label: isChinese ? '指定访问' : 'Custom',
-            desc: isChinese ? '指定可访问的部门或成员；不可参与 Plaza。Agent 关系请在“关系”里配置。' : 'Choose departments or members; Plaza is disabled. Agent relationships are configured in Relationships.',
+            desc: isChinese ? '指定可访问的部门或成员；数字员工关系请在“关系”里配置。' : 'Choose departments or members. Digital employee relationships are configured in Relationships.',
         },
     ] as const;
 
@@ -793,7 +788,7 @@ function AccessPermissionsPanel({
 
             {localScope !== 'company' && (
                 <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                    {isChinese ? '非全公司可见的 Agent 不会出现在 Plaza，也不能在 Plaza 发布或评论。' : 'Agents that are not company-wide cannot view, post, or comment in Plaza.'}
+                    {isChinese ? '访问范围仅影响谁可以查看和使用该数字员工。' : 'Access scope controls who can view and use this digital employee.'}
                 </div>
             )}
 
@@ -4393,24 +4388,6 @@ export default function AgentDetailPage() {
     const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
     const [logFilter, setLogFilter] = useState<string>('user'); // 'user' | 'backend' | 'heartbeat' | 'schedule' | 'messages'
 
-    // Import skill from presets
-    const [showImportSkillModal, setShowImportSkillModal] = useState(false);
-    const [importingSkillId, setImportingSkillId] = useState<string | null>(null);
-    const { data: globalSkillsForImport } = useQuery({
-        queryKey: ['global-skills-for-import'],
-        queryFn: () => skillApi.list(),
-        enabled: showImportSkillModal,
-    });
-    // Agent-level import from ClawHub / URL
-    const [showAgentClawhub, setShowAgentClawhub] = useState(false);
-    const [agentClawhubQuery, setAgentClawhubQuery] = useState('');
-    const [agentClawhubResults, setAgentClawhubResults] = useState<any[]>([]);
-    const [agentClawhubSearching, setAgentClawhubSearching] = useState(false);
-    const [agentClawhubInstalling, setAgentClawhubInstalling] = useState<string | null>(null);
-    const [showAgentUrlImport, setShowAgentUrlImport] = useState(false);
-    const [agentUrlInput, setAgentUrlInput] = useState('');
-    const [agentUrlImporting, setAgentUrlImporting] = useState(false);
-
     const { data: backgroundTasks = [] } = useQuery({
         queryKey: ['tasks', id],
         queryFn: () => taskApi.list(id!),
@@ -6217,32 +6194,7 @@ export default function AgentDetailPage() {
                 {/* ── Skills Tab ── */}
                 {
                     activeTab === 'skills' && id && (
-                        <SkillsTab
-                            agentId={id}
-                            canManage={canManage}
-                            safeDisplayIcon={safeDisplayIcon}
-                            showAgentClawhub={showAgentClawhub}
-                            setShowAgentClawhub={setShowAgentClawhub}
-                            agentClawhubQuery={agentClawhubQuery}
-                            setAgentClawhubQuery={setAgentClawhubQuery}
-                            agentClawhubResults={agentClawhubResults}
-                            setAgentClawhubResults={setAgentClawhubResults}
-                            agentClawhubSearching={agentClawhubSearching}
-                            setAgentClawhubSearching={setAgentClawhubSearching}
-                            agentClawhubInstalling={agentClawhubInstalling}
-                            setAgentClawhubInstalling={setAgentClawhubInstalling}
-                            showAgentUrlImport={showAgentUrlImport}
-                            setShowAgentUrlImport={setShowAgentUrlImport}
-                            agentUrlInput={agentUrlInput}
-                            setAgentUrlInput={setAgentUrlInput}
-                            agentUrlImporting={agentUrlImporting}
-                            setAgentUrlImporting={setAgentUrlImporting}
-                            showImportSkillModal={showImportSkillModal}
-                            setShowImportSkillModal={setShowImportSkillModal}
-                            globalSkillsForImport={globalSkillsForImport}
-                            importingSkillId={importingSkillId}
-                            setImportingSkillId={setImportingSkillId}
-                        />
+                        <SkillsTab agentId={id} canManage={canManage} />
                     )
                 }
 
@@ -6596,13 +6548,15 @@ export default function AgentDetailPage() {
                                                     onOpenSubagentSession={openSubagentSession}
                                                     onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
                                                     viewOf={(m: any) => {
-                                                    // Determine if this message is from "this agent" (left) or peer (right).
+                                                    // Canonical actor IDs, not LLM roles, determine A2A ownership.
+                                                    // All Agent actors are left and human actors are right.
+                                                    // Actorless legacy rows fail closed to the left.
                                                     // Group chat: assistant always left; user msgs are RIGHT only when sent
                                                     // by the logged-in viewer themself, otherwise LEFT (so each distinct
                                                     // human speaker gets their own avatar/name label).
                                                     let isLeft: boolean;
-                                                    if (isA2A && thisAgentId && m.sender_agent_id) {
-                                                        isLeft = String(m.sender_agent_id) !== thisAgentId;
+                                                    if (isA2A) {
+                                                        isLeft = isA2AMessageLeft(m);
                                                     } else if (isGroupChat) {
                                                         if (m.role === 'assistant') {
                                                             isLeft = true;
@@ -6954,7 +6908,7 @@ export default function AgentDetailPage() {
                     activeTab === 'activityLog' && (() => {
                         // Category definitions
                         const userActionTypes = ['chat_reply', 'tool_call', 'task_created', 'task_updated', 'file_written', 'error'];
-                        const heartbeatTypes = ['heartbeat', 'plaza_post'];
+                        const heartbeatTypes = ['heartbeat'];
                         const scheduleTypes = ['schedule_run'];
                         const messageTypes = ['feishu_msg_sent', 'agent_msg_sent', 'web_msg_sent'];
 
@@ -7030,7 +6984,6 @@ export default function AgentDetailPage() {
                                                 error: <IconAlertTriangle size={16} stroke={1.8} />,
                                                 schedule_run: <IconClock size={16} stroke={1.8} />,
                                                 heartbeat: <IconHeartbeat size={16} stroke={1.8} />,
-                                                plaza_post: <IconBuilding size={16} stroke={1.8} />,
                                             };
                                             const time = log.created_at ? new Date(log.created_at).toLocaleString('zh-CN', {
                                                 month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',

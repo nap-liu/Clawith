@@ -93,6 +93,7 @@ const {
     buildConversationEntries: buildH5ConversationEntries,
     getConversationScrollAnchor: getH5ScrollAnchor,
     hasPendingConfirmation,
+    isA2AMessageLeft,
     isConfirmationToolCall,
     latestHistoryWindowOverlaps,
     mapHistoryMessage,
@@ -110,6 +111,42 @@ const {
     prepareMessagesForActiveTurnResume,
     shouldScheduleResumeReconnect,
 } = resumeRecoveryModule.exports;
+
+{
+    const entries = buildH5ConversationEntries([{
+        id: 'streaming-placeholder',
+        role: 'assistant',
+        content: '',
+        _streaming: true,
+    }]);
+    assert.equal(entries.length, 1, 'an empty streaming assistant row must remain visible');
+    assert.equal(entries[0].type, 'message');
+    assert.equal(entries[0].msg._streaming, true);
+}
+
+{
+    const currentAgentId = 'agent-engineer';
+    assert.equal(
+        isA2AMessageLeft({ sender_agent_id: 'agent-architect' }),
+        true,
+        'the peer Agent must render on the left regardless of its stored LLM role',
+    );
+    assert.equal(
+        isA2AMessageLeft({ sender_agent_id: currentAgentId }),
+        true,
+        'the Agent whose page is open must also render on the left',
+    );
+    assert.equal(
+        isA2AMessageLeft({ sender_user_id: 'human-owner' }),
+        false,
+        'a human-authored A2A timeline message must render on the right',
+    );
+    assert.equal(
+        isA2AMessageLeft({}),
+        true,
+        'legacy actorless A2A rows must not guess ownership from role',
+    );
+}
 
 {
     const messages = [
@@ -514,6 +551,25 @@ const {
     assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['message', 'analysis_group', 'message']));
     assert.equal(entries[2].msg.role, 'assistant');
     assert.equal(entries[2].msg.content, '已完成！');
+}
+
+{
+    const entries = buildH5ConversationEntries([
+        { id: 'u1', role: 'user', content: '连续运行多个工具' },
+        { id: 'thinking-1', role: 'assistant', content: '', thinking: '第一轮思考', streaming: true, _streaming: true },
+        { id: 'tool-1', role: 'tool_call', toolName: 'search_contacts', toolCallId: 'tool-1', toolStatus: 'done' },
+        { id: 'thinking-2', role: 'assistant', content: '', thinking: '第二轮思考', streaming: true, _streaming: true },
+        { id: 'tool-2', role: 'tool_call', toolName: 'read_file', toolCallId: 'tool-2', toolStatus: 'done' },
+        { id: 'thinking-3', role: 'assistant', content: '', thinking: '当前思考', streaming: true, _streaming: true },
+    ]);
+
+    assert.equal(
+        entries.filter((entry) => entry.type === 'message' && entry.msg._streaming && !entry.msg.content).length,
+        1,
+        'one logical turn must render only one live thinking row',
+    );
+    const analysis = entries.find((entry) => entry.type === 'analysis_group');
+    assert.equal(analysis.items.filter((item) => item.type === 'tool').length, 2);
 }
 
 {

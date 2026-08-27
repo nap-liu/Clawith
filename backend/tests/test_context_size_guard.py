@@ -98,8 +98,10 @@ async def test_first_dispatch_can_recover_once_before_provider(monkeypatch):
     monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "key")
     monkeypatch.setattr("app.services.llm.caller.get_max_tokens", lambda *_args, **_kwargs: 100)
 
+    model = _model(provider="custom", context_window=1_000)
+    model.max_output_tokens = 100
     result = await call_llm(
-        _model(provider="custom", context_window=1_000),
+        model,
         [{"role": "user", "content": "数" * 900}],
         "agent",
         "",
@@ -112,6 +114,49 @@ async def test_first_dispatch_can_recover_once_before_provider(monkeypatch):
     assert result == "ok"
     assert recovery.await_count == 1
     assert len(calls) == 1
+
+
+async def test_first_dispatch_preflight_compacts_before_hard_overflow(monkeypatch):
+    """Every anchored session surface uses the standard pre-flight boundary.
+
+    The initial prompt still fits the provider window, but it has crossed the
+    compactor's conservative input-capacity threshold.  Recovery must therefore
+    run before the first provider request, not wait for a later hard overflow.
+    Project group and project A2A durable children use this exact caller path.
+    """
+
+    calls = []
+
+    class _Client:
+        async def stream(self, *, messages, **_kwargs):
+            calls.append(messages)
+            return LLMResponse(content="ok", usage={"prompt_tokens": 10})
+
+        async def close(self):
+            return None
+
+    recovery = AsyncMock(return_value=[{"role": "user", "content": "compacted"}])
+    monkeypatch.setattr("app.services.llm.caller._get_agent_config", AsyncMock(return_value=(3, None)))
+    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: _Client())
+    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "key")
+    monkeypatch.setattr("app.services.llm.caller.get_max_tokens", lambda *_args, **_kwargs: 100)
+
+    model = _model(provider="custom", context_window=1_000)
+    model.max_output_tokens = 100
+    result = await call_llm(
+        model,
+        [{"role": "user", "content": "数" * 880}],
+        "agent",
+        "",
+        prepared_turn_context=("system", "dynamic"),
+        prepared_tools=[],
+        context_recovery=recovery,
+        turn_anchor_id=uuid.uuid4(),
+    )
+
+    assert result == "ok"
+    recovery.assert_awaited_once()
+    assert calls[0][-1].content.endswith("compacted")
 
 
 async def test_failed_recovery_never_dispatches_normal_generation(monkeypatch):
@@ -227,7 +272,7 @@ async def test_later_tool_round_overflow_stops_without_recovery_or_replay(monkey
 
     async def append_large_tool_result(**kwargs):
         kwargs["api_messages"].append(
-            LLMMessage(role="tool", tool_call_id="call-1", content="数" * 900)
+            LLMMessage(role="tool", tool_call_id="call-1", content="数" * 1_300)
         )
         return ""
 
@@ -242,8 +287,10 @@ async def test_later_tool_round_overflow_stops_without_recovery_or_replay(monkey
         AsyncMock(return_value=False),
     )
 
+    model = _model(provider="custom", context_window=1_500)
+    model.max_output_tokens = 100
     result = await call_llm(
-        _model(provider="custom", context_window=1_000),
+        model,
         [{"role": "user", "content": "small"}],
         "agent",
         "",

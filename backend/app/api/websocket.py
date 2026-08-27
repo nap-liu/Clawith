@@ -31,12 +31,12 @@ from app.models.chat_session import ChatSession
 from app.models.subagent_run import SubagentRun
 from app.models.task import Task
 from app.models.user import User
-from app.services.activity_logger import log_activity
 from app.services.active_turns import (
     active_turn_boundary,
     ensure_active_turn,
     set_active_turn_cancel_task,
 )
+from app.services.activity_logger import log_activity
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_history import persist_initial_assistant_message_if_pristine
@@ -68,6 +68,11 @@ from app.services.quota_guard import (
 )
 from app.services.realtime import realtime_router
 from app.services.task_executor import execute_task
+from app.services.workload_capacity import (
+    WorkloadKind,
+    WorkloadOverloadedError,
+    get_workload_capacity,
+)
 from app.utils.sanitize import sanitize_tool_args
 
 router = APIRouter(tags=["websocket"])
@@ -103,8 +108,7 @@ async def _has_active_subagent_event_turn(
         select(final.id).where(
             final.conversation_id == anchor.conversation_id,
             final.role == "assistant",
-            final.message_meta["turn_anchor_id"].as_string()
-            == cast(anchor.id, String),
+            final.message_meta["turn_anchor_id"].as_string() == cast(anchor.id, String),
         )
     )
     active = (
@@ -327,6 +331,7 @@ class WebSocketChatHandler:
 
         # State fields initialized during setup
         self.user_id: uuid.UUID | None = None
+        self.tenant_id: uuid.UUID | None = None
         self.agent_name: str = ""
         self.agent_type: str = ""
         self.role_description: str = ""
@@ -340,6 +345,7 @@ class WebSocketChatHandler:
         # allowed to see (admins / agent creator). They subscribe to live
         # broadcasts but may never drive a turn — enforced in ``message_loop``.
         self.read_only: bool = False
+        self.project_session_access: str | None = None
         self.history_messages: list[ChatMessage] = []
         self.conversation: list[dict] = []
         self.current_user_text: str = ""
@@ -408,13 +414,30 @@ class WebSocketChatHandler:
                     return False
 
                 logger.info(f"[WS] Checking agent access for {self.agent_id}")
-                agent, _ = await check_agent_access(db, user, self.agent_id)
+                project_session = None
+                if self.session_id_param:
+                    try:
+                        project_session = await db.get(ChatSession, uuid.UUID(self.session_id_param))
+                    except (TypeError, ValueError):
+                        project_session = None
+                if project_session is not None and project_session.agent_id == self.agent_id:
+                    from app.services.project_service import project_session_access_mode
+
+                    self.project_session_access = await project_session_access_mode(db, user, project_session)
+                if self.project_session_access is not None:
+                    agent = await db.get(Agent, self.agent_id)
+                    if agent is None or agent.is_deleted or agent.tenant_id != user.tenant_id:
+                        await self.websocket.send_json({"type": "error", "content": "Session not found"})
+                        await self.websocket.close(code=4003)
+                        return False
+                else:
+                    agent, _ = await check_agent_access(db, user, self.agent_id)
                 require_current_agent_tenant(user, agent)
                 if is_agent_expired(agent):
                     await self.websocket.send_json(
                         {
                             "type": "error",
-                            "content": "This Agent has expired and is off duty. Please contact your admin to extend its service.",
+                            "content": "数字员工已过期并停止服务，请联系管理员延长有效期。",
                         }
                     )
                     await self.websocket.close(code=4003)
@@ -426,6 +449,7 @@ class WebSocketChatHandler:
                 self.welcome_message = agent.welcome_message or ""
                 self.ctx_size = agent.context_window_size or 100
                 self.user_display_name = (user.display_name or "").strip() or "there"
+                self.tenant_id = user.tenant_id
                 await self._load_scene_manifest(db)
                 logger.info(
                     f"[WS] Agent: {self.agent_name}, type: {self.agent_type}, model_id: {agent.primary_model_id}, ctx: {self.ctx_size}"
@@ -456,9 +480,7 @@ class WebSocketChatHandler:
                 # A published scene welcome is already the authored first reply.
                 # Prefer it over the generated onboarding greeting so opening the
                 # scene does not spend tokens or create an extra model turn.
-                self.onboarding_required = self._resolve_onboarding_required(
-                    onboarding_eligibility.required
-                )
+                self.onboarding_required = self._resolve_onboarding_required(onboarding_eligibility.required)
                 # setup owns the complete initialization transaction. Helpers
                 # may flush/query but must never commit or roll it back.
                 await db.commit()
@@ -552,24 +574,31 @@ class WebSocketChatHandler:
                 if not _existing:
                     conv_id = None
                 else:
+                    # Session-level read-only state is authoritative.  Project
+                    # planning sessions use this flag after the project group
+                    # chat becomes the sole writable planning transport.
+                    if bool(dict(_existing.im_config or {}).get("read_only")):
+                        self.read_only = True
                     is_subagent_owner = False
                     if _existing.source_channel == "subagent":
                         # Subagent sessions are runtime-owned but may be opened
-                        # directly as a standard read-only execution record.
-                        self.read_only = True
+                        # directly. Project owner/editors may continue an active
+                        # member's durable work session; historical/departed
+                        # sessions remain visible but read-only.
+                        if self.project_session_access is not None:
+                            self.read_only = self.read_only or self.project_session_access != "edit"
+                        else:
+                            self.read_only = True
                         run = await db.get(SubagentRun, _existing.id)
                         is_subagent_owner = bool(
-                            run is not None and run.execution_user_id == user_id
+                            self.project_session_access is not None
+                            or (run is not None and run.execution_user_id == user_id)
                         )
                     if hasattr(agent, "tenant_id"):
                         try:
-                            await require_tenant_safe_chat_session(
-                                db, _existing, agent.tenant_id
-                            )
+                            await require_tenant_safe_chat_session(db, _existing, agent.tenant_id)
                         except HTTPException:
-                            await self.websocket.send_json(
-                                {"type": "error", "content": "Session not found"}
-                            )
+                            await self.websocket.send_json({"type": "error", "content": "Session not found"})
                             await self.websocket.close(code=4003)
                             return None
                     self.source_channel = _existing.source_channel or self.source_channel
@@ -600,6 +629,148 @@ class WebSocketChatHandler:
             conv_id = str(_latest.id)
             logger.info(f"[WS] Selected primary session {conv_id}")
         return conv_id
+
+    async def _project_session_still_writable(self) -> bool:
+        """Revalidate membership and Human ACL for every project work-session Turn."""
+
+        if getattr(self, "project_session_access", None) is None or not self.conv_id or self.user_id is None:
+            return not self.read_only
+        async with async_session() as db:
+            session = await db.get(ChatSession, uuid.UUID(self.conv_id))
+            user = await db.get(User, self.user_id)
+            if session is None or user is None:
+                return False
+            from app.services.project_service import project_session_access_mode
+
+            return await project_session_access_mode(db, user, session) == "edit"
+
+    async def _enqueue_project_subagent_message(
+        self,
+        *,
+        content: str,
+        display_content: str,
+        file_name: str,
+        client_message_id: str | None,
+        attachments: list[dict] | None,
+    ) -> bool:
+        """Route an editable project child Session through its durable inbox.
+
+        A project member Session is a ``SubagentRun`` execution surface, not a
+        second independent Web-chat runtime.  Driving it through the generic WS
+        caller would let one browser turn race the durable worker and bypass its
+        lease, membership snapshot and inbox batching.  Return ``True`` whenever
+        this is a project child Session (including a rejected enqueue), so the
+        caller must never fall through to the generic model path.
+        """
+
+        if self.source_channel != "subagent" or self.project_session_access is None:
+            return False
+        if not self.conv_id or self.user_id is None:
+            await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+            return True
+
+        try:
+            child_id = uuid.UUID(self.conv_id)
+        except (TypeError, ValueError):
+            await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+            return True
+
+        from app.models.project import ProjectRun
+        from app.services.subagent_runtime import SubagentError, append_subagent_message
+
+        async with async_session() as db:
+            child = await db.get(ChatSession, child_id)
+            run = await db.get(SubagentRun, child_id)
+            if (
+                child is None
+                or run is None
+                or child.source_channel != "subagent"
+                or child.project_id is None
+                or run.project_id != child.project_id
+                or child.agent_id != self.agent_id
+            ):
+                await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+                return True
+
+            # Preserve an exact active ProjectRun association when this child is
+            # currently executing one.  Never infer a historical association by
+            # title/time/session history: only the durable output contract counts.
+            active_project_runs = (
+                (
+                    await db.execute(
+                        select(ProjectRun)
+                        .where(
+                            ProjectRun.project_id == child.project_id,
+                            ProjectRun.agent_id == child.agent_id,
+                            ProjectRun.status.in_(["queued", "running", "waiting"]),
+                        )
+                        .order_by(ProjectRun.created_at.desc(), ProjectRun.id.desc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            project_run_id = next(
+                (
+                    row.id
+                    for row in active_project_runs
+                    if str(dict(row.output or {}).get("subagent_session_id") or "") == str(child_id)
+                ),
+                None,
+            )
+            parent_session_id = str(run.parent_session_id)
+            execution_user_id = run.execution_user_id
+
+        raw_client_id = str(client_message_id or "").strip()
+        durable_message_key = (
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"clawith:project-subagent-web:{child_id}:{raw_client_id}",
+            )
+            if raw_client_id
+            else uuid.uuid4()
+        )
+        origin_tool_call_id = f"project-web:{durable_message_key}"
+        event_key = f"subagent-parent-input:{child_id}:{origin_tool_call_id}"
+        try:
+            await append_subagent_message(
+                agent_id=self.agent_id,
+                parent_session_id=parent_session_id,
+                subagent_id=str(child_id),
+                message=content,
+                execution_user_id=execution_user_id,
+                origin_tool_call_id=origin_tool_call_id,
+                project_run_id=project_run_id,
+                input_metadata={
+                    "project_web_input": True,
+                    "web_sender_user_id": str(self.user_id),
+                    "client_message_id": raw_client_id or None,
+                    "display_content": display_content or None,
+                    "file_name": file_name or None,
+                    "attachments": list(attachments or []),
+                },
+            )
+        except SubagentError as exc:
+            # Membership/confirmation may have changed after the per-turn ACL
+            # check.  Keep the historical session visible, but never fall back
+            # to a direct model call.
+            await self._safe_send({"type": "error", "content": str(exc)})
+            return True
+
+        if raw_client_id:
+            async with async_session() as db:
+                persisted_id = (
+                    await db.execute(select(ChatMessage.id).where(ChatMessage.external_event_key == event_key))
+                ).scalar_one_or_none()
+            if persisted_id is not None:
+                await self._safe_send(
+                    {
+                        "type": "user_message_committed",
+                        "client_message_id": raw_client_id,
+                        "message_id": str(persisted_id),
+                    }
+                )
+        return True
 
     async def _load_scene_manifest(self, db: AsyncSession | None = None) -> None:
         """Load the current scene revision without binding it to the session."""
@@ -653,10 +824,7 @@ class WebSocketChatHandler:
         if self.history_messages or not self._has_configured_scene_welcome():
             return
         if not await claim_fixed_welcome_slot(db, self.agent_id, user_id):
-            logger.info(
-                "[WS] Fixed scene welcome skipped because onboarding already "
-                "published visible output"
-            )
+            logger.info("[WS] Fixed scene welcome skipped because onboarding already published visible output")
             return
         self.pending_initial_assistant = {
             "content": str(self.scene_manifest["welcome_message"]),
@@ -722,9 +890,7 @@ class WebSocketChatHandler:
         """Core message processing loop."""
         # Send welcome message on new session (no history)
         initial_content = (
-            str(self.pending_initial_assistant["content"])
-            if self.pending_initial_assistant
-            else self.welcome_message
+            str(self.pending_initial_assistant["content"]) if self.pending_initial_assistant else self.welcome_message
         )
         if initial_content and not self.history_messages and not self.onboarding_required:
             await self.websocket.send_json(
@@ -754,14 +920,18 @@ class WebSocketChatHandler:
             if not content and not is_onboarding_trigger:
                 continue
 
+            if (
+                getattr(self, "project_session_access", None) is not None
+                and not await self._project_session_still_writable()
+            ):
+                self.read_only = True
+
             # Read-only monitor: this viewer is watching a session they do not
             # own (admin/creator with view rights). They receive live broadcasts
             # but must never drive a turn or post as the session owner. The UI
             # also disables the composer, but THIS is the authoritative guard.
             if self.read_only:
-                await self.websocket.send_json(
-                    {"type": "error", "content": "只读监看会话,无法在此发送消息。"}
-                )
+                await self.websocket.send_json({"type": "error", "content": "只读监看会话,无法在此发送消息。"})
                 continue
 
             validated_attachments = None
@@ -774,10 +944,20 @@ class WebSocketChatHandler:
                         raw_attachments,
                     )
                 except (TypeError, ValueError) as exc:
-                    await self.websocket.send_json(
-                        {"type": "error", "content": f"附件无效：{exc}"}
-                    )
+                    await self.websocket.send_json({"type": "error", "content": f"附件无效：{exc}"})
                     continue
+
+            if await self._enqueue_project_subagent_message(
+                content=content,
+                display_content=display_content,
+                file_name=file_name,
+                client_message_id=data.get("message_id") or data.get("client_message_id"),
+                attachments=validated_attachments,
+            ):
+                # The durable worker owns persistence, compaction, tools and the
+                # model call.  Its standard Web broadcasts complete this exact
+                # Session's streaming bubble for every subscribed drawer.
+                continue
 
             # Scene changes apply to the next turn. The session itself remains
             # unchanged; the exact scene revision used is recorded on messages.
@@ -826,11 +1006,7 @@ class WebSocketChatHandler:
                     file_name,
                     is_onboarding_trigger,
                     client_message_id=client_message_id,
-                    model_id=(
-                        str(effective_llm_model.id)
-                        if effective_llm_model is not None
-                        else None
-                    ),
+                    model_id=(str(effective_llm_model.id) if effective_llm_model is not None else None),
                     attachments=validated_attachments,
                 )
             except SessionTurnBusyError:
@@ -856,8 +1032,7 @@ class WebSocketChatHandler:
                     {
                         "type": "confirmation_required",
                         "content": "请先完成待确认操作。",
-                        "message_id": data.get("message_id")
-                        or data.get("client_message_id"),
+                        "message_id": data.get("message_id") or data.get("client_message_id"),
                         "name": "request_confirmation",
                         "call_id": str(pending_confirmation.row_id),
                         "args": pending_confirmation.args,
@@ -883,9 +1058,7 @@ class WebSocketChatHandler:
                         include_thinking=True,
                     )
                 if refreshed_prefix is None:
-                    raise RuntimeError(
-                        "confirmation ignore committed but history prefix could not be rebuilt"
-                    )
+                    raise RuntimeError("confirmation ignore committed but history prefix could not be rebuilt")
                 self.conversation = refreshed_prefix
 
             if persisted_initial_assistant is not None:
@@ -952,7 +1125,22 @@ class WebSocketChatHandler:
                     task_match=task_match,
                 )
             )
-            disposition = await turn_task
+            try:
+                disposition = await turn_task
+            except WorkloadOverloadedError:
+                await self._safe_send(
+                    {
+                        "type": "error",
+                        "code": "turn_capacity_busy",
+                        "retryable": True,
+                        "content": (
+                            "当前请求较多，请稍后重试。"
+                            if self.lang.lower().startswith("zh")
+                            else "The service is busy. Please try again shortly."
+                        ),
+                    }
+                )
+                continue
             if disposition == "disconnect":
                 break
             if disposition == "continue":
@@ -969,13 +1157,16 @@ class WebSocketChatHandler:
     ) -> str:
         """Run one web turn in its own cancellable task through persistence."""
 
-        async with active_turn_boundary():
+        capacity = get_workload_capacity()
+        async with (
+            capacity.slot(
+                WorkloadKind.INTERACTIVE,
+                self.tenant_id or self.user_id or self.conv_id,
+            ),
+            active_turn_boundary(),
+        ):
             current_user_content = next(
-                (
-                    str(item.get("content") or "")
-                    for item in reversed(self.conversation)
-                    if item.get("role") == "user"
-                ),
+                (str(item.get("content") or "") for item in reversed(self.conversation) if item.get("role") == "user"),
                 "",
             )
             await ensure_active_turn(
@@ -1021,21 +1212,13 @@ class WebSocketChatHandler:
                             onboarding_claim.claimed_at,
                         )
 
-                if (
-                    is_onboarding_trigger
-                    and not produced_output
-                    and turn_outcome in {"failed", "aborted"}
-                ):
+                if is_onboarding_trigger and not produced_output and turn_outcome in {"failed", "aborted"}:
                     if self.conversation and self.conversation[-1].get("role") == "user":
                         self.conversation.pop()
                     await self._safe_send(
                         {
                             "type": "onboarding_skipped",
-                            "reason": (
-                                "generation_aborted"
-                                if turn_outcome == "aborted"
-                                else "generation_failed"
-                            ),
+                            "reason": ("generation_aborted" if turn_outcome == "aborted" else "generation_failed"),
                             "agent_id": str(self.agent_id),
                         }
                     )
@@ -1043,9 +1226,7 @@ class WebSocketChatHandler:
 
                 # request_confirmation persisted a suspended turn itself.
                 if assistant_response == "":
-                    await self._safe_send(
-                        {"type": "done", "role": "assistant", "content": ""}
-                    )
+                    await self._safe_send({"type": "done", "role": "assistant", "content": ""})
                     if self.client_disconnected:
                         await manager.disconnect(str(self.agent_id), self.websocket)
                         return "disconnect"
@@ -1057,22 +1238,14 @@ class WebSocketChatHandler:
                         assistant_response,
                     )
 
-                self.conversation.append(
-                    {"role": "assistant", "content": assistant_response}
-                )
+                self.conversation.append({"role": "assistant", "content": assistant_response})
                 await self._save_assistant_reply(
                     assistant_response,
                     thinking_content,
                     message_id=terminal_message_id,
                     turn_anchor_id=turn_anchor_id,
-                    turn_status=(
-                        "cancelled" if turn_outcome == "aborted" else "completed"
-                    ),
-                    complete_onboarding=(
-                        is_onboarding_trigger
-                        and produced_output
-                        and self.source_channel != "web"
-                    ),
+                    turn_status=("cancelled" if turn_outcome == "aborted" else "completed"),
+                    complete_onboarding=(is_onboarding_trigger and produced_output and self.source_channel != "web"),
                 )
                 await self._safe_send(
                     {
@@ -1084,8 +1257,7 @@ class WebSocketChatHandler:
 
                 if self.client_disconnected:
                     logger.info(
-                        "[WS] Detached turn complete after disconnect; closing handler "
-                        f"for {self.user_id or 'unknown'}"
+                        f"[WS] Detached turn complete after disconnect; closing handler for {self.user_id or 'unknown'}"
                     )
                     await manager.disconnect(str(self.agent_id), self.websocket)
                     return "disconnect"
@@ -1109,21 +1281,11 @@ class WebSocketChatHandler:
                 except Exception:
                     logger.exception("[WS] Failed to persist externally cancelled turn")
                 if saved_cancelled:
-                    if (
-                        self.conversation
-                        and self.conversation[-1].get("role") == "assistant"
-                    ):
+                    if self.conversation and self.conversation[-1].get("role") == "assistant":
                         self.conversation.pop()
-                    self.conversation.append(
-                        {"role": "assistant", "content": stopped}
-                    )
-                    await self._safe_send(
-                        {"type": "done", "role": "assistant", "content": stopped}
-                    )
-                elif (
-                    self.conversation
-                    and self.conversation[-1].get("role") == "assistant"
-                ):
+                    self.conversation.append({"role": "assistant", "content": stopped})
+                    await self._safe_send({"type": "done", "role": "assistant", "content": stopped})
+                elif self.conversation and self.conversation[-1].get("role") == "assistant":
                     # The completed row won the commit race. Its streaming
                     # chunks may already be visible, but cancellation skipped
                     # the normal terminal event, so close the frontend state.
@@ -1202,10 +1364,7 @@ class WebSocketChatHandler:
         self.llm_model = resolved.primary_model
         self.fallback_llm_model = resolved.fallback_model
         if resolved.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}:
-            logger.warning(
-                f"[WS] model override {override_model_id!r} rejected "
-                f"({resolved.override_status})"
-            )
+            logger.warning(f"[WS] model override {override_model_id!r} rejected ({resolved.override_status})")
         return resolved.primary_model
 
     async def _check_quotas(self) -> bool:
@@ -1259,17 +1418,13 @@ class WebSocketChatHandler:
 
             async with async_session() as db:
                 _sess_r = await db.execute(
-                    select(ChatSession)
-                    .where(ChatSession.id == uuid.UUID(self.conv_id))
-                    .with_for_update()
+                    select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)).with_for_update()
                 )
                 _sess = _sess_r.scalar_one_or_none()
                 if _sess is None:
                     raise RuntimeError("chat session no longer exists")
                 if await _has_active_subagent_event_turn(db, self.conv_id):
-                    raise SessionTurnBusyError(
-                        "Subagent parent wake currently owns this session turn"
-                    )
+                    raise SessionTurnBusyError("Subagent parent wake currently owns this session turn")
                 initial_assistant = None
                 first_user_created_at = None
                 if self.pending_initial_assistant is not None:
@@ -1279,17 +1434,11 @@ class WebSocketChatHandler:
                         agent_id=self.agent_id,
                         user_id=self.user_id,
                         content=str(self.pending_initial_assistant["content"]),
-                        message_meta=dict(
-                            self.pending_initial_assistant.get("message_meta") or {}
-                        ),
+                        message_meta=dict(self.pending_initial_assistant.get("message_meta") or {}),
                     )
                     if initial_assistant is not None:
-                        initial_created_at = (
-                            initial_assistant.created_at or datetime.now(tz.utc)
-                        )
-                        first_user_created_at = initial_created_at + timedelta(
-                            microseconds=1
-                        )
+                        initial_created_at = initial_assistant.created_at or datetime.now(tz.utc)
+                        first_user_created_at = initial_created_at + timedelta(microseconds=1)
                 ingested = await ingest_incoming_chat_message(
                     db,
                     session=_sess,
@@ -1406,16 +1555,10 @@ class WebSocketChatHandler:
 
             # Accumulate partial content for abort handling
             # Set inside _call_with_failover when an onboarding prompt was injected
-            onboarding_claimed_at = (
-                onboarding_claim.claimed_at if onboarding_claim else None
-            )
-            needs_onboarding_mark = bool(
-                is_onboarding_trigger and onboarding_claimed_at is not None
-            )
+            onboarding_claimed_at = onboarding_claim.claimed_at if onboarding_claim else None
+            needs_onboarding_mark = bool(is_onboarding_trigger and onboarding_claimed_at is not None)
             onboarding_target_phase = "completed"
-            onboarding_expected_phase: str | None = (
-                PHASE_PENDING if needs_onboarding_mark else None
-            )
+            onboarding_expected_phase: str | None = PHASE_PENDING if needs_onboarding_mark else None
             onboarding_mark_done = False
             onboarding_visible_output_started = False
             onboarding_lease_refreshed_at = 0.0
@@ -1436,17 +1579,12 @@ class WebSocketChatHandler:
                             expected_onboarded_at=onboarding_claimed_at,
                         )
                     if not advanced:
-                        logger.info(
-                            "[WS] Onboarding phase changed before this turn "
-                            "could publish its first output"
-                        )
+                        logger.info("[WS] Onboarding phase changed before this turn could publish its first output")
                         return False
                     onboarding_mark_done = True
                     onboarding_lease_refreshed_at = perf_counter()
                     if onboarding_target_phase == PHASE_GREETED:
-                        onboarding_lease_task = asyncio.create_task(
-                            maintain_onboarding_lease()
-                        )
+                        onboarding_lease_task = asyncio.create_task(maintain_onboarding_lease())
                     # Tell the frontend to refresh its cached agent record
                     await self._safe_send(
                         {
@@ -1467,11 +1605,7 @@ class WebSocketChatHandler:
                 if (
                     not onboarding_mark_done
                     or onboarding_target_phase != PHASE_GREETED
-                    or (
-                        not force
-                        and perf_counter() - onboarding_lease_refreshed_at
-                        < ONBOARDING_LEASE_REFRESH_SECONDS
-                    )
+                    or (not force and perf_counter() - onboarding_lease_refreshed_at < ONBOARDING_LEASE_REFRESH_SECONDS)
                 ):
                     return True
                 try:
@@ -1484,18 +1618,13 @@ class WebSocketChatHandler:
                             expected_phase=PHASE_GREETED,
                         )
                     if not refreshed:
-                        logger.info(
-                            "[WS] Onboarding greeting lease changed before "
-                            "assistant persistence"
-                        )
+                        logger.info("[WS] Onboarding greeting lease changed before assistant persistence")
                         onboarding_lease_lost = True
                         return False
                     onboarding_lease_refreshed_at = perf_counter()
                     return True
                 except Exception as _lease_err:
-                    logger.warning(
-                        f"[WS] Onboarding greeting lease refresh failed: {_lease_err}"
-                    )
+                    logger.warning(f"[WS] Onboarding greeting lease refresh failed: {_lease_err}")
                     onboarding_lease_lost = True
                     return False
 
@@ -1619,15 +1748,11 @@ class WebSocketChatHandler:
                             onboarding_claimed_at,
                         )
                     if not claim_is_current:
-                        raise RuntimeError(
-                            "Onboarding claim lost before model invocation"
-                        )
+                        raise RuntimeError("Onboarding claim lost before model invocation")
 
                 async def _on_failover(reason: str):
                     if not await reserve_visible_output():
-                        raise RuntimeError(
-                            "Onboarding claim lost before failover output"
-                        )
+                        raise RuntimeError("Onboarding claim lost before failover output")
                     await self._safe_send({"type": "info", "content": f"Primary model error, {reason}"})
 
                 # History loading is turn-aware, so do not re-apply a row/message
@@ -1642,9 +1767,7 @@ class WebSocketChatHandler:
                 skip_tools_for_greeting = False
                 try:
                     async with async_session() as _ob_db:
-                        _agent_result = await _ob_db.execute(
-                            select(Agent).where(Agent.id == self.agent_id)
-                        )
+                        _agent_result = await _ob_db.execute(select(Agent).where(Agent.id == self.agent_id))
                         _agent = _agent_result.scalar_one_or_none()
                         if _agent is None:
                             raise RuntimeError("Agent no longer exists")
@@ -1669,13 +1792,9 @@ class WebSocketChatHandler:
                 except Exception as _onb_err:
                     logger.warning(f"[WS] Onboarding prompt resolve failed (non-fatal): {_onb_err}")
                     if is_onboarding_trigger:
-                        raise RuntimeError(
-                            "Onboarding prompt could not be resolved"
-                        ) from _onb_err
+                        raise RuntimeError("Onboarding prompt could not be resolved") from _onb_err
                 if is_onboarding_trigger and _onb is None:
-                    raise RuntimeError(
-                        "Onboarding claim changed before prompt resolution"
-                    )
+                    raise RuntimeError("Onboarding claim changed before prompt resolution")
 
                 context_recovery = None
                 if turn_anchor_id is not None and persisted_view:
@@ -1716,9 +1835,7 @@ class WebSocketChatHandler:
                                 include_thinking=True,
                             )
                         if prefix is None:
-                            logger.warning(
-                                f"[WS] context recovery lost latest-anchor race session={self.conv_id}"
-                            )
+                            logger.warning(f"[WS] context recovery lost latest-anchor race session={self.conv_id}")
                             return None
                         # Keep only the persisted projection on the long-lived WS
                         # state. Onboarding/dynamic overlays remain turn-local.
@@ -1734,9 +1851,7 @@ class WebSocketChatHandler:
                     """Stream execute_code output chunks to the frontend live panel in real-time."""
                     nonlocal live_code_chars_sent, live_code_truncated_sent
                     if not await reserve_visible_output():
-                        raise RuntimeError(
-                            "Onboarding claim lost before code output"
-                        )
+                        raise RuntimeError("Onboarding claim lost before code output")
                     try:
                         remaining = MAX_LIVE_CODE_STREAM_CHARS - live_code_chars_sent
                         if remaining <= 0:
@@ -1841,9 +1956,7 @@ class WebSocketChatHandler:
                 return "", thinking_content, queued_messages, "aborted", False
 
             produced_output = (
-                bool(partial_chunks)
-                or (not aborted and bool(assistant_response))
-                or onboarding_visible_output_started
+                bool(partial_chunks) or (not aborted and bool(assistant_response)) or onboarding_visible_output_started
             )
             return assistant_response, thinking_content, queued_messages, _turn_outcome, produced_output
 
@@ -1855,9 +1968,7 @@ class WebSocketChatHandler:
             await stop_onboarding_lease()
             if is_onboarding_trigger and onboarding_lease_lost:
                 return "", thinking_content, [], "aborted", False
-            if is_onboarding_trigger and (
-                partial_chunks or onboarding_visible_output_started
-            ):
+            if is_onboarding_trigger and (partial_chunks or onboarding_visible_output_started):
                 partial_response = "".join(partial_chunks).strip()
                 if not partial_response:
                     partial_response = "*[Welcome generation interrupted]*"
@@ -1865,8 +1976,7 @@ class WebSocketChatHandler:
                     (
                         partial_response
                         if partial_response.endswith("*[Welcome generation interrupted]*")
-                        else partial_response
-                        + "\n\n*[Welcome generation interrupted]*"
+                        else partial_response + "\n\n*[Welcome generation interrupted]*"
                     ),
                     thinking_content,
                     [],
@@ -2044,8 +2154,7 @@ class WebSocketChatHandler:
                         ChatMessage.agent_id == self.agent_id,
                         ChatMessage.conversation_id == self.conv_id,
                         ChatMessage.role == "assistant",
-                        ChatMessage.message_meta["turn_anchor_id"].as_string()
-                        == str(turn_anchor_id),
+                        ChatMessage.message_meta["turn_anchor_id"].as_string() == str(turn_anchor_id),
                     )
                     .limit(1)
                 )
@@ -2081,9 +2190,7 @@ class WebSocketChatHandler:
                     .values(phase=PHASE_COMPLETED)
                 )
                 if not completed.rowcount:
-                    raise RuntimeError(
-                        "Onboarding state changed before assistant persistence"
-                    )
+                    raise RuntimeError("Onboarding state changed before assistant persistence")
             await maybe_mark_session_read_for_active_viewer(
                 db,
                 agent_id=self.agent_id,

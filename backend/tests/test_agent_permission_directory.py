@@ -179,6 +179,7 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
         id=user_id,
         tenant_id=tenant_id,
         display_name="刘喜",
+        title="平台注册职务",
         role="member",
         is_active=True,
     )
@@ -213,6 +214,7 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
         provider_id=directory_provider.id,
         user_id=user_id,
         name="刘喜",
+        nickname="阿喜",
         name_translit_full="liuxi",
         name_translit_initial="lx",
         department_id=team.id,
@@ -260,10 +262,10 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
             "id": str(user_id),
             "member_id": str(directory_member.id),
                 "name": "刘喜",
-                "nickname": None,
+                "nickname": "阿喜",
             "department_id": str(team.id),
             "department_path": team.path,
-            "title": "前端开发",
+            "title": "平台注册职务",
             "avatar_url": None,
             "email": None,
         }
@@ -278,6 +280,78 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
         db=directory_session,
     )
     assert [item["id"] for item in search_response["items"]] == [str(user_id)]
+
+
+@pytest.mark.asyncio
+async def test_permission_members_include_active_tenant_users_without_org_profiles(
+    directory_session,
+    monkeypatch,
+):
+    tenant_id = uuid.uuid4()
+    manager = User(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        display_name="Manager",
+        role="member",
+        is_active=True,
+    )
+    identity = Identity(
+        id=uuid.uuid4(),
+        username="registered-user",
+        email="registered@example.test",
+        password_hash="test-only",
+    )
+    registered_user = User(
+        id=uuid.uuid4(),
+        identity_id=identity.id,
+        tenant_id=tenant_id,
+        display_name="Registered User",
+        title="Product",
+        role="member",
+        is_active=True,
+    )
+    inactive_user = User(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        display_name="Inactive User",
+        role="member",
+        is_active=False,
+    )
+    directory_session.add_all(
+        [
+            Tenant(id=tenant_id, name="Acme", slug=f"acme-{uuid.uuid4().hex[:8]}"),
+            identity,
+            manager,
+            registered_user,
+            inactive_user,
+        ]
+    )
+    await directory_session.flush()
+    await _allow_manage(monkeypatch, tenant_id)
+
+    response = await agents_api.get_agent_permission_members(
+        agent_id=uuid.uuid4(),
+        search="registered@example.test",
+        page=1,
+        page_size=50,
+        current_user=manager,
+        db=directory_session,
+    )
+
+    assert response["total"] == 1
+    assert response["items"] == [
+        {
+            "id": str(registered_user.id),
+            "member_id": None,
+            "name": "Registered User",
+            "nickname": None,
+            "department_id": None,
+            "department_path": "",
+            "title": "Product",
+            "avatar_url": None,
+            "email": "registered@example.test",
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -152,7 +152,24 @@ async def _load_accessible_session(
     session_id: uuid.UUID,
 ) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
     """Resolve one session and the web picker scope that can display it."""
-    agent, agent_access = await check_agent_access(db, current_user, agent_id)
+    get_row = getattr(db, "get", None)
+    candidate = await get_row(ChatSession, session_id) if callable(get_row) else None
+    project_access: str | None = None
+    if candidate is not None and candidate.agent_id == agent_id:
+        from app.services.project_service import project_session_access_mode
+
+        project_access = await project_session_access_mode(db, current_user, candidate)
+    if project_access is not None:
+        agent = await get_row(Agent, agent_id)
+        if (
+            agent is None
+            or agent.is_deleted
+            or agent.tenant_id != current_user.tenant_id
+        ):
+            raise HTTPException(status_code=404, detail="Session not found")
+        agent_access = "manage" if project_access == "edit" else "read"
+    else:
+        agent, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     parent_session = aliased(ChatSession)
     result = await db.execute(
@@ -217,12 +234,12 @@ async def _load_accessible_session(
         is_group_member = member_result.scalar_one_or_none() is not None
 
     is_trigger_manager = agent_access == "manage" and source_channel == "trigger"
-    if not (is_owner or is_privileged or is_group_member or is_trigger_manager):
+    if not (is_owner or is_privileged or is_group_member or is_trigger_manager or project_access is not None):
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     view_scope: Literal["mine", "all"] = (
         "mine"
-        if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member)
+        if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member or project_access is not None)
         else "all"
     )
     return agent, session, view_scope
@@ -321,7 +338,7 @@ async def list_sessions(
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = agent_result.scalar_one_or_none()
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise HTTPException(status_code=404, detail="未找到数字员工")
     await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     source_channel = (source_channel or "").strip() or None
@@ -356,6 +373,10 @@ async def list_sessions(
                 | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
             )
             & (ChatSession.source_channel != "subagent")
+            # Project conversations have their own project-scoped navigation
+            # and APIs.  Never leak planning, group, or direct project A2A
+            # threads into the ordinary Web Agent session picker.
+            & ChatSession.project_id.is_(None)
         )
         has_messages = (
             select(ChatMessage.id)
@@ -429,7 +450,7 @@ async def list_sessions(
                     ChatSession.id.in_(session_uuid_ids),
                     ChatSession.user_id == current_user.id,
                     ChatSession.source_channel.notin_(["agent", "trigger"]),
-                    ChatSession.is_group == False,
+                    ChatSession.is_group.is_(False),
                     ChatMessage.role.in_(["assistant", "system", "tool_call"]),
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,
@@ -539,15 +560,16 @@ async def list_sessions(
             select(ChatSession)
             .where(
                 ChatSession.agent_id == agent_id,
+                ChatSession.project_id.is_(None),
                 ChatSession.source_channel.notin_(["agent", "trigger", "subagent"]),
                 or_(ChatSession.is_primary.is_(True), has_agent_messages),
                 or_(
                     and_(
-                        ChatSession.is_group == False,
+                        ChatSession.is_group.is_(False),
                         ChatSession.user_id == current_user.id,
                     ),
                     and_(
-                        ChatSession.is_group == True,
+                        ChatSession.is_group.is_(True),
                         group_membership,
                     ),
                 ),
@@ -633,7 +655,7 @@ async def list_sessions(
                 .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
                 .where(
                     ChatSession.id.in_(session_uuid_ids),
-                    ChatSession.is_group == False,  # group last_read_at is shared; per-user unread undefined
+                    ChatSession.is_group.is_(False),  # group last_read_at is shared; per-user unread undefined
                     ChatMessage.role.in_(["assistant", "system", "tool_call"]),
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,
@@ -1145,12 +1167,16 @@ async def get_session_messages(
     session_id: uuid.UUID,
     limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
     before: str = Query(None, description="Cursor: ISO timestamp, optionally followed by |message UUID"),
+    paginated: bool = Query(
+        False,
+        description="Return cursor metadata in the response body.",
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     response: Response = None,
 ):
     """Legacy row-count pagination. Kept unchanged for existing clients."""
-    return await _get_session_messages_page(
+    rows = await _get_session_messages_page(
         agent_id=agent_id,
         session_id=session_id,
         limit=limit,
@@ -1160,6 +1186,13 @@ async def get_session_messages(
         db=db,
         response=response,
     )
+    if paginated is not True:
+        return rows
+    return {
+        "items": rows,
+        "has_more": response.headers.get("X-Message-Has-More") == "true",
+        "next_cursor": response.headers.get("X-Message-Next-Cursor") or None,
+    }
 
 
 @router.get("/{agent_id}/sessions/{session_id}/message-turns")

@@ -1,13 +1,13 @@
 """Application configuration."""
 
-from datetime import datetime, timezone
-from functools import lru_cache
 import os
-from pathlib import Path
 import socket
 import uuid
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 from app.services.sandbox.config import SandboxConfig, SandboxType
@@ -66,9 +66,12 @@ def _default_allow_unsafe_bwrap_fallback() -> bool:
 
 def _read_version() -> str:
     """Read version from local VERSION file, fallback to root."""
-    for candidate in [Path(__file__).resolve().parent.parent / "VERSION",
-                      Path(__file__).resolve().parent.parent.parent / "VERSION",
-                      Path("/app/VERSION"), Path("/VERSION")]:
+    for candidate in [
+        Path(__file__).resolve().parent.parent / "VERSION",
+        Path(__file__).resolve().parent.parent.parent / "VERSION",
+        Path("/app/VERSION"),
+        Path("/VERSION"),
+    ]:
         try:
             return candidate.read_text(encoding="utf-8").strip()
         except OSError:
@@ -89,6 +92,23 @@ class Settings(BaseSettings):
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://clawith:clawith@localhost:5432/clawith"
+    DATABASE_POOL_SIZE: int = Field(default=20, ge=1)
+    DATABASE_MAX_OVERFLOW: int = Field(default=10, ge=0)
+    DATABASE_POOL_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0)
+    DATABASE_POOL_RECYCLE_SECONDS: int = Field(default=1800, ge=0)
+    DATABASE_POOL_PRE_PING: bool = True
+    DATABASE_POOL_USE_LIFO: bool = True
+
+    # Process-local workload admission. These values are per application
+    # instance; deployments must divide their desired fleet capacity across
+    # replicas instead of treating these limits as a distributed quota.
+    WORKLOAD_GLOBAL_LIMIT: int = Field(default=700, ge=1)
+    WORKLOAD_TENANT_LIMIT: int = Field(default=700, ge=1)
+    WORKLOAD_INTERACTIVE_LIMIT: int = Field(default=500, ge=0)
+    WORKLOAD_PROJECT_LIMIT: int = Field(default=100, ge=0)
+    WORKLOAD_SCHEDULED_LIMIT: int = Field(default=50, ge=0)
+    WORKLOAD_BACKGROUND_LIMIT: int = Field(default=50, ge=0)
+    WORKLOAD_ACQUIRE_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0)
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -161,7 +181,6 @@ class Settings(BaseSettings):
     # Exa AI (Search API)
     EXA_API_KEY: str = ""
 
-
     # Feature flags
     MCP_USE_LEGACY_COLLECTOR: bool = False
     # Retired product surface. Keep the implementation and historical data
@@ -188,17 +207,11 @@ class Settings(BaseSettings):
             try:
                 value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
             except ValueError as exc:
-                raise ValueError(
-                    "CRON_OCCURRENCE_NOT_BEFORE must be an ISO 8601 timestamp"
-                ) from exc
+                raise ValueError("CRON_OCCURRENCE_NOT_BEFORE must be an ISO 8601 timestamp") from exc
         if not isinstance(value, datetime):
-            raise ValueError(
-                "CRON_OCCURRENCE_NOT_BEFORE must be an ISO 8601 timestamp"
-            )
+            raise ValueError("CRON_OCCURRENCE_NOT_BEFORE must be an ISO 8601 timestamp")
         if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(
-                "CRON_OCCURRENCE_NOT_BEFORE must include a timezone"
-            )
+            raise ValueError("CRON_OCCURRENCE_NOT_BEFORE must include a timezone")
         return value.astimezone(timezone.utc)
 
     model_config = {

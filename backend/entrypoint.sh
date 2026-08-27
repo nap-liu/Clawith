@@ -60,8 +60,30 @@ echo "[entrypoint] INSTANCE_ID=${INSTANCE_ID}"
 if role_contains "bootstrap"; then
     echo "[entrypoint] Step 1a: Creating/verifying database tables for PROCESS_ROLE=${PROCESS_ROLE}..."
 
+    # A truly empty database is bootstrapped from the current SQLAlchemy
+    # metadata below. Replaying every historical migration afterwards would
+    # try to add columns which already exist. Remember that state so we can
+    # stamp the current migration heads after create_all instead.
+    SCHEMA_BOOTSTRAP_MODE=$(python << 'PYEOF'
+import asyncio
+
+async def main():
+    from app.database import engine
+    from sqlalchemy import inspect
+
+    async with engine.connect() as conn:
+        tables = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
+    await engine.dispose()
+    print("fresh" if not tables else "existing")
+
+asyncio.run(main())
+PYEOF
+    )
+    export SCHEMA_BOOTSTRAP_MODE
+    echo "[entrypoint] Database schema mode: ${SCHEMA_BOOTSTRAP_MODE}"
+
     python << 'PYEOF'
-import asyncio, sys
+import asyncio, os, sys
 
 async def main():
     # Import all models to populate Base.metadata before create_all
@@ -101,6 +123,11 @@ async def main():
     import app.models.onboarding         # noqa
     import app.models.identity           # noqa
     import app.models.published_page     # noqa
+    # Register project metadata on every startup. SubagentRun and ChatSession
+    # have project-scoped foreign keys, so SQLAlchemy must be able to resolve
+    # their target tables even when Alembic (rather than create_all) owns the
+    # actual DDL for an existing installation.
+    import app.models.project            # noqa
 
     # Create all tables that don't exist yet (safe to run on every startup)
     async with engine.begin() as conn:
@@ -163,9 +190,13 @@ async def main():
 asyncio.run(main())
 PYEOF
 
-    echo "[entrypoint] Step 1b: Running alembic migrations for PROCESS_ROLE=${PROCESS_ROLE}..."
+    echo "[entrypoint] Step 1b: Synchronizing alembic state for PROCESS_ROLE=${PROCESS_ROLE}..."
     set +e
-    ALEMBIC_OUTPUT=$(alembic upgrade head 2>&1)
+    if [ "${SCHEMA_BOOTSTRAP_MODE}" = "fresh" ]; then
+        ALEMBIC_OUTPUT=$(alembic stamp heads 2>&1)
+    else
+        ALEMBIC_OUTPUT=$(alembic upgrade heads 2>&1)
+    fi
     ALEMBIC_EXIT=$?
     set -e
 

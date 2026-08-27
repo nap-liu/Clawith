@@ -240,10 +240,10 @@ export default function FileBrowser({
                 setUploadProgress(null);
                 reload();
                 onRefresh?.();
-                showToast('Upload successful');
+                showToast(t('agent.upload.success', 'Upload successful'));
             } catch (err: any) {
                 setUploadProgress(null);
-                showToast('Upload failed: ' + (err.message || ''), 'error');
+                showToast(t('agent.upload.failed', 'Upload failed') + ': ' + (err.message || ''), 'error');
             }
         };
         input.click();
@@ -513,7 +513,7 @@ export default function FileBrowser({
                 {renderBreadcrumbs()}
                 <div style={{ display: 'flex', gap: '6px', marginLeft: 'auto' }}>
                     {upload && api.upload && (
-                        <button className="btn btn-secondary" style={{ fontSize: '12px' }} onClick={handleUpload}><IconUpload size={13} stroke={1.8} /> Upload</button>
+                        <button className="btn btn-secondary" style={{ fontSize: '12px' }} onClick={handleUpload}><IconUpload size={13} stroke={1.8} /> {t('agent.workspace.uploadFile', 'Upload File')}</button>
                     )}
                     {newFolder && (
                         <button className="btn btn-secondary" style={{ fontSize: '12px' }}

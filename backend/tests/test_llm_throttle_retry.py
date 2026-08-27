@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.llm.caller import call_llm
+from app.services.llm.caller import (
+    _complete_with_throttle_retry,
+    _provider_slot,
+    _stream_with_throttle_retry,
+    call_llm,
+)
 from app.services.llm.client import LLMError, LLMResponse
 
 
@@ -65,20 +71,22 @@ def _patch_call_llm_collaborators(monkeypatch, client):
         AsyncMock(return_value=None),
         raising=False,
     )
+    monkeypatch.setattr(
+        "app.services.llm.caller._sleep_before_timeout_retry",
+        AsyncMock(return_value=None),
+        raising=False,
+    )
 
 
 @pytest.mark.asyncio
 async def test_provider_throttle_is_retried_before_returning_success(monkeypatch):
     client = _ThrottleScriptClient(
         [
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
             LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
-            LLMError(
-                "HTTP 500: {\"error\":{\"message\":\"<503> Too many requests. "
-                "Your requests are being throttled due to system capacity limits\","
-                "\"code\":\"ServiceUnavailable\"}}"
+                'HTTP 500: {"error":{"message":"<503> Too many requests. '
+                'Your requests are being throttled due to system capacity limits",'
+                '"code":"ServiceUnavailable"}}'
             ),
             _stop_response("重试后成功"),
         ]
@@ -101,21 +109,196 @@ async def test_provider_throttle_is_retried_before_returning_success(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_provider_round_has_wall_clock_timeout(monkeypatch):
+    class _HeartbeatForeverClient:
+        closed = False
+
+        async def stream(self, **_kwargs):
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.closed = True
+
+    client = _HeartbeatForeverClient()
+    _patch_call_llm_collaborators(monkeypatch, client)
+    model = _FakeModel(request_timeout=0.01)
+
+    result = await call_llm(
+        model=model,
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="测试助手",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="",
+    )
+
+    assert result == "[LLM Error] Request timed out after 0.01s"
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_ttft_timeout_retries_once_before_success(monkeypatch):
+    class _TimeoutThenSuccessClient:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
+        async def stream(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            return _stop_response("retry-ok")
+
+        async def close(self):
+            self.closed = True
+
+    client = _TimeoutThenSuccessClient()
+    _patch_call_llm_collaborators(monkeypatch, client)
+
+    result = await call_llm(
+        model=_FakeModel(request_timeout=0.01),
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="测试助手",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="",
+    )
+
+    assert result == "retry-ok"
+    assert client.calls == 2
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_meaningful_stream_progress_renews_inactivity_timeout(monkeypatch):
+    class _ProgressClient:
+        closed = False
+
+        async def stream(self, **kwargs):
+            for chunk in ("a", "b", "c"):
+                await asyncio.sleep(0.008)
+                await kwargs["on_chunk"](chunk)
+            return _stop_response("done")
+
+        async def close(self):
+            self.closed = True
+
+    client = _ProgressClient()
+    _patch_call_llm_collaborators(monkeypatch, client)
+
+    result = await call_llm(
+        model=_FakeModel(request_timeout=0.01),
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="测试助手",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="",
+        on_chunk=AsyncMock(return_value=None),
+    )
+
+    assert result == "done"
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_slot_bounds_parallel_dispatch(monkeypatch):
+    active = 0
+    maximum = 0
+
+    class _ParallelClient:
+        async def stream(self, **_kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return _stop_response("done")
+
+    monkeypatch.setenv("CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT", "2")
+    model = _FakeModel(request_timeout=1)
+    await asyncio.gather(
+        *(
+            _stream_with_throttle_retry(
+                _ParallelClient(),
+                model=model,
+                round_i=1,
+                messages=[],
+            )
+            for _ in range(4)
+        )
+    )
+
+    assert maximum == 2
+
+
+@pytest.mark.asyncio
+async def test_background_complete_shares_provider_capacity(monkeypatch):
+    active = 0
+    maximum = 0
+
+    class _ParallelCompleteClient:
+        async def complete(self, **_kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return _stop_response("done")
+
+    monkeypatch.setenv("CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT", "2")
+    model = _FakeModel(request_timeout=1)
+    await asyncio.gather(
+        *(
+            _complete_with_throttle_retry(
+                _ParallelCompleteClient(),
+                model=model,
+                round_i=1,
+                messages=[],
+            )
+            for _ in range(4)
+        )
+    )
+
+    assert maximum == 2
+
+
+@pytest.mark.asyncio
+async def test_background_complete_queue_wait_is_outside_request_timeout(monkeypatch):
+    class _ImmediateCompleteClient:
+        async def complete(self, **_kwargs):
+            return _stop_response("done")
+
+    monkeypatch.setenv("CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT", "1")
+    model = _FakeModel(request_timeout=0.01)
+    provider_slot = _provider_slot(model)
+    await provider_slot.acquire()
+    queued = asyncio.create_task(
+        _complete_with_throttle_retry(
+            _ImmediateCompleteClient(),
+            model=model,
+            round_i=1,
+            messages=[],
+        )
+    )
+
+    await asyncio.sleep(0.02)
+    assert not queued.done()
+    provider_slot.release()
+
+    response = await queued
+    assert response.content == "done"
+
+
+@pytest.mark.asyncio
 async def test_provider_throttle_exhaustion_returns_later_user_message(monkeypatch):
     client = _ThrottleScriptClient(
         [
-            LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
-            LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
-            LLMError(
-                "HTTP 429: {\"error\":{\"message\":\"Request rate increased too quickly\","
-                "\"code\":\"limit_burst_rate\"}}"
-            ),
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
+            LLMError('HTTP 429: {"error":{"message":"Request rate increased too quickly","code":"limit_burst_rate"}}'),
         ]
     )
     _patch_call_llm_collaborators(monkeypatch, client)

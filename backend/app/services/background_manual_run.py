@@ -17,6 +17,7 @@ from app.models.schedule import AgentSchedule
 from app.models.task import Task
 from app.models.trigger import AgentTrigger
 from app.services.execution_identity import align_background_execution_user
+from app.services.project_runtime_boundary import lock_and_check_project_agent_runtime
 from app.services.trigger_runtime.queue import enqueue_trigger_execution
 
 
@@ -73,9 +74,7 @@ async def _resolve_resource(
     if not matches:
         raise BackgroundManualRunError(f"{resource_type} not found")
     if len(matches) > 1:
-        choices = ", ".join(
-            f"{item.id}:{getattr(item, name_column.key)}" for item in matches[:10]
-        )
+        choices = ", ".join(f"{item.id}:{getattr(item, name_column.key)}" for item in matches[:10])
         raise BackgroundManualRunConflict(
             f"Multiple {resource_type} resources have that name; use an exact UUID: {choices}"
         )
@@ -93,11 +92,26 @@ async def run_background_resource(
     """Queue one resource run using the current actor as its durable identity."""
     agent = await db.get(Agent, agent_id)
     if agent is None:
-        raise BackgroundManualRunError("Agent not found")
+        raise BackgroundManualRunError("未找到数字员工")
     if is_agent_expired(agent):
-        raise BackgroundManualRunError("Agent has expired")
+        raise BackgroundManualRunError("数字员工已过期")
     if await get_agent_access_level_for_user_id(db, actor_user_id, agent) is None:
         raise BackgroundManualRunError("The current user cannot access this Agent")
+
+    # Serialize manual admission with the owner pause switch. No resource
+    # identity, audit row, durable trigger occurrence, or asyncio task is
+    # created unless the authoritative project runtime accepts this work.
+    if getattr(agent, "scope", "standard") == "project":
+        try:
+            project_running = await lock_and_check_project_agent_runtime(db, agent)
+        except Exception as exc:
+            raise BackgroundManualRunConflict(
+                "Project runtime is unavailable; try again after the project recovers"
+            ) from exc
+        if not project_running:
+            raise BackgroundManualRunConflict(
+                "Project runtime is paused; resume the project before starting background work"
+            )
 
     item = await _resolve_resource(
         db,
@@ -175,22 +189,20 @@ async def _execute_and_track_schedule(
     instruction: str,
     execution_user_id: uuid.UUID,
 ) -> None:
-    """Run first, then persist manual-run counters for the completed attempt."""
+    """Persist manual counters only after a successful schedule execution."""
     from app.database import async_session
-    from app.services.scheduler import _execute_schedule
+    from app.services.scheduler import ScheduleExecutionOutcome, _execute_schedule
 
-    await _execute_schedule(
+    outcome = await _execute_schedule(
         schedule_id,
         agent_id,
         instruction,
         execution_user_id,
     )
+    if outcome is not ScheduleExecutionOutcome.SUCCEEDED:
+        return
     async with async_session() as db:
-        schedule = await db.scalar(
-            select(AgentSchedule)
-            .where(AgentSchedule.id == schedule_id)
-            .with_for_update()
-        )
+        schedule = await db.scalar(select(AgentSchedule).where(AgentSchedule.id == schedule_id).with_for_update())
         if schedule is None:
             return
         schedule.last_run_at = datetime.now(UTC)

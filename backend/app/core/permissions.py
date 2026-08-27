@@ -41,7 +41,13 @@ def build_visible_agents_query(
     - Regular users: own creations + ``company`` agents + agents
       explicitly added to a ``custom`` roster they're on.
     """
-    stmt = select(Agent).where(Agent.is_deleted.is_(False))
+    # Project-owned Agents live inside their project and must never leak into
+    # the global Agent directory, Plaza, relationship picker, or MCP roster.
+    # Project APIs resolve them explicitly through ProjectMemberSnapshot.
+    stmt = select(Agent).where(
+        Agent.is_deleted.is_(False),
+        Agent.scope == "standard",
+    )
     from app.core.okr_feature import hidden_okr_agent_clause, okr_feature_enabled
 
     if not okr_feature_enabled():
@@ -63,13 +69,10 @@ def build_visible_agents_query(
             ),
         )
 
-    explicit_user_ids = (
-        select(AgentPermission.agent_id)
-        .where(
-            and_(
-                AgentPermission.scope_type == "user",
-                AgentPermission.scope_id == user.id,
-            )
+    explicit_user_ids = select(AgentPermission.agent_id).where(
+        and_(
+            AgentPermission.scope_type == "user",
+            AgentPermission.scope_id == user.id,
         )
     )
     department_grants = agent_permission_department_subtree_cte(
@@ -117,9 +120,7 @@ def _is_admin(user: User) -> bool:
 
 def is_platform_admin_user(user: User) -> bool:
     """Single role/Identity interpretation for platform administrator status."""
-    return user.role == "platform_admin" or bool(
-        getattr(getattr(user, "identity", None), "is_platform_admin", False)
-    )
+    return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
 
 
 def current_agent_tenant_matches(user: User, agent: Agent) -> bool:
@@ -151,12 +152,8 @@ def can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
     shared by the REST session/message APIs (list/read) and the live WebSocket
     monitor path. Admins (platform/org/agent) and the agent's creator qualify.
     """
-    return (
-        current_agent_tenant_matches(user, agent)
-        and (
-        user.role in ("platform_admin", "org_admin", "agent_admin")
-        or str(agent.creator_id) == str(user.id)
-        )
+    return current_agent_tenant_matches(user, agent) and (
+        user.role in ("platform_admin", "org_admin", "agent_admin") or str(agent.creator_id) == str(user.id)
     )
 
 
@@ -188,13 +185,11 @@ async def filter_tenant_safe_chat_sessions(
                     Agent.tenant_id == tenant_id,
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
-    required_user_ids = {
-        getattr(session, "user_id", None)
-        for session in sessions
-        if getattr(session, "user_id", None)
-    }
+    required_user_ids = {getattr(session, "user_id", None) for session in sessions if getattr(session, "user_id", None)}
     valid_user_ids = set()
     if required_user_ids:
         valid_user_ids = set(
@@ -205,7 +200,9 @@ async def filter_tenant_safe_chat_sessions(
                         User.tenant_id == tenant_id,
                     )
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
 
     def _safe(session) -> bool:
@@ -219,20 +216,12 @@ async def filter_tenant_safe_chat_sessions(
         if source_channel == "agent":
             return not is_group and user_id is None and peer_id in valid_ids
         if source_channel == "subagent":
-            return (
-                not is_group
-                and peer_id is None
-                and (user_id is None or user_id in valid_user_ids)
-            )
+            return not is_group and peer_id is None and (user_id is None or user_id in valid_user_ids)
         if is_group or source_channel == "trigger":
             return user_id is None and peer_id is None
         return peer_id is None and user_id in valid_user_ids
 
-    return [
-        session
-        for session in sessions
-        if _safe(session)
-    ]
+    return [session for session in sessions if _safe(session)]
 
 
 async def require_tenant_safe_chat_session(
@@ -292,9 +281,7 @@ async def get_agent_access_level_for_user_id(
 
     if access_mode == "custom":
         levels = [
-            perm.access_level or "use"
-            for perm in permissions
-            if perm.scope_type == "user" and perm.scope_id == user.id
+            perm.access_level or "use" for perm in permissions if perm.scope_type == "user" and perm.scope_id == user.id
         ]
         department_level = await _get_department_permission_level(db, user.id, agent)
         if department_level:
@@ -383,12 +370,10 @@ def build_agent_accessible_user_ids_query(
         return select(User.id).where(*base_conditions)
 
     if access_mode == "custom":
-        explicit_user_ids = (
-            select(AgentPermission.scope_id).where(
-                AgentPermission.agent_id == agent.id,
-                AgentPermission.scope_type == "user",
-                AgentPermission.scope_id.isnot(None),
-            )
+        explicit_user_ids = select(AgentPermission.scope_id).where(
+            AgentPermission.agent_id == agent.id,
+            AgentPermission.scope_type == "user",
+            AgentPermission.scope_id.isnot(None),
         )
         access_conditions = [
             User.id == agent.creator_id,
@@ -506,9 +491,9 @@ async def evaluate_agent_relationship_status(
     if created_by_user_id:
         # Source must still be MANAGED by the creator; target need only be VISIBLE
         # (relationship is directional source->target, target is not mutated).
-        if await user_can_manage_agent_id(
-            db, created_by_user_id, source
-        ) and await user_can_view_agent_id(db, created_by_user_id, target):
+        if await user_can_manage_agent_id(db, created_by_user_id, source) and await user_can_view_agent_id(
+            db, created_by_user_id, target
+        ):
             return {
                 "access_allowed": True,
                 "access_status": "active",
@@ -616,14 +601,14 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = result.scalar_one_or_none()
     if not agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到数字员工")
 
     from app.core.okr_feature import is_retired_okr_agent
 
     if await is_retired_okr_agent(db, agent):
         # Deliberately indistinguishable from an unknown Agent for every role,
         # including platform administrators and stale direct links.
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到数字员工")
 
     # Platform admins are the only role with intentional cross-tenant access.
     if is_platform_admin_user(user):
@@ -657,9 +642,7 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
 
     if access_mode == "custom":
         levels = [
-            perm.access_level or "use"
-            for perm in permissions
-            if perm.scope_type == "user" and perm.scope_id == user.id
+            perm.access_level or "use" for perm in permissions if perm.scope_type == "user" and perm.scope_id == user.id
         ]
         department_level = await _get_department_permission_level(db, user.id, agent)
         if department_level:
@@ -679,9 +662,9 @@ def is_agent_creator(user: User, agent: Agent) -> bool:
 
 def is_agent_expired(agent: Agent) -> bool:
     """Return True if the agent is manually marked expired or its expires_at is in the past."""
-    if getattr(agent, 'is_expired', False):
+    if getattr(agent, "is_expired", False):
         return True
-    expires_at = getattr(agent, 'expires_at', None)
+    expires_at = getattr(agent, "expires_at", None)
     if expires_at and datetime.now(timezone.utc) > expires_at:
         return True
     return False

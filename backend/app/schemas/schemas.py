@@ -319,6 +319,32 @@ class AgentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AgentExploreItemOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    avatar_url: str | None = None
+    role_description: str
+    bio: str | None = None
+    status: str
+    creator_id: uuid.UUID
+    creator_display_name: str | None = None
+    creator_username: str | None = None
+    agent_type: str = "native"
+    openclaw_last_seen: datetime | None = None
+    unread_count: int = 0
+    created_at: datetime
+    last_active_at: datetime | None = None
+
+
+class AgentExplorePageOut(BaseModel):
+    items: list[AgentExploreItemOut]
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
+    counts: dict[str, int]
+
+
 class AgentUpdate(BaseModel):
     name: str | None = None
     role_description: str | None = None
@@ -474,6 +500,11 @@ class LLMModelUpdate(BaseModel):
     supports_vision: bool | None = None
     max_output_tokens: int | None = None
     request_timeout: int | None = None
+
+
+class LLMModelClone(BaseModel):
+    model: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=200)
 
 
 class LLMModelOut(BaseModel):

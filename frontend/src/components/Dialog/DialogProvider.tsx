@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconCheck, IconInfoCircle, IconX } from '@tabler/icons-react';
@@ -58,6 +58,35 @@ interface ModalProps {
 // and never need to delay clearing their business state themselves.
 const OVERLAY_TRANSITION_MS = 260;
 
+let bodyLockCount = 0;
+let bodyOverflowBeforeLock = '';
+
+function lockBodyScroll() {
+    if (bodyLockCount === 0) {
+        bodyOverflowBeforeLock = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+    }
+    bodyLockCount += 1;
+}
+
+function unlockBodyScroll() {
+    bodyLockCount = Math.max(0, bodyLockCount - 1);
+    if (bodyLockCount === 0) document.body.style.overflow = bodyOverflowBeforeLock;
+}
+
+function overlayTransitionDelay() {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : OVERLAY_TRANSITION_MS;
+}
+
+const FOCUSABLE_SELECTOR = [
+    'a[href]',
+    'button:not([disabled])',
+    'input:not([disabled])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
 function useOverlayPresence(open: boolean, onAfterClose?: () => void) {
     const [mounted, setMounted] = useState(open);
     const [visible, setVisible] = useState(false);
@@ -88,11 +117,64 @@ function useOverlayPresence(open: boolean, onAfterClose?: () => void) {
         const timer = window.setTimeout(() => {
             setMounted(false);
             afterCloseRef.current?.();
-        }, OVERLAY_TRANSITION_MS);
+        }, overlayTransitionDelay());
         return () => window.clearTimeout(timer);
     }, [mounted, open]);
 
     return { mounted, visible };
+}
+
+function useOverlayInteraction(
+    surfaceRef: RefObject<HTMLElement | null>,
+    open: boolean,
+    mounted: boolean,
+    closeOnEscape: boolean,
+    onCloseRef: RefObject<() => void>,
+) {
+    const invokerRef = useRef<HTMLElement | null>(null);
+
+    useEffect(() => {
+        if (!mounted) return;
+        lockBodyScroll();
+        return unlockBodyScroll;
+    }, [mounted]);
+
+    useEffect(() => {
+        if (!mounted || !open) return;
+        invokerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        const focusTimer = window.setTimeout(() => surfaceRef.current?.focus(), 0);
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape' && closeOnEscape) {
+                event.preventDefault();
+                onCloseRef.current();
+                return;
+            }
+            if (event.key !== 'Tab' || !surfaceRef.current) return;
+            const focusable = Array.from(surfaceRef.current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+                .filter((element) => !element.hasAttribute('inert') && element.offsetParent !== null);
+            if (!focusable.length) {
+                event.preventDefault();
+                surfaceRef.current.focus();
+                return;
+            }
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && (document.activeElement === first || document.activeElement === surfaceRef.current)) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => {
+            window.clearTimeout(focusTimer);
+            window.removeEventListener('keydown', onKeyDown);
+            const invoker = invokerRef.current;
+            if (invoker?.isConnected) invoker.focus();
+        };
+    }, [closeOnEscape, mounted, onCloseRef, open, surfaceRef]);
 }
 
 /**
@@ -120,21 +202,7 @@ export function Modal({
         onCloseRef.current = onClose;
     }, [onClose]);
 
-    useEffect(() => {
-        if (!mounted) return;
-        const previousOverflow = document.body.style.overflow;
-        const focusTimer = window.setTimeout(() => dialogRef.current?.focus(), 0);
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape' && open && closeOnEscape) onCloseRef.current();
-        };
-        document.body.style.overflow = 'hidden';
-        window.addEventListener('keydown', onKeyDown);
-        return () => {
-            window.clearTimeout(focusTimer);
-            document.body.style.overflow = previousOverflow;
-            window.removeEventListener('keydown', onKeyDown);
-        };
-    }, [closeOnEscape, mounted, open]);
+    useOverlayInteraction(dialogRef, open, mounted, closeOnEscape, onCloseRef);
 
     if (!mounted || typeof document === 'undefined') return null;
 
@@ -142,6 +210,8 @@ export function Modal({
         <div
             className="app-modal-overlay"
             data-state={visible ? 'open' : 'closed'}
+            aria-hidden={!open}
+            inert={!open}
             onMouseDown={(event) => {
                 if (open && closeOnBackdrop && event.target === event.currentTarget) onCloseRef.current();
             }}
@@ -186,21 +256,7 @@ export function Drawer({
         onCloseRef.current = onClose;
     }, [onClose]);
 
-    useEffect(() => {
-        if (!mounted) return;
-        const previousOverflow = document.body.style.overflow;
-        const focusTimer = window.setTimeout(() => drawerRef.current?.focus(), 0);
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape' && open && closeOnEscape) onCloseRef.current();
-        };
-        document.body.style.overflow = 'hidden';
-        window.addEventListener('keydown', onKeyDown);
-        return () => {
-            window.clearTimeout(focusTimer);
-            document.body.style.overflow = previousOverflow;
-            window.removeEventListener('keydown', onKeyDown);
-        };
-    }, [closeOnEscape, mounted, open]);
+    useOverlayInteraction(drawerRef, open, mounted, closeOnEscape, onCloseRef);
 
     if (!mounted || typeof document === 'undefined') return null;
 
@@ -208,6 +264,8 @@ export function Drawer({
         <div
             className="app-drawer-overlay"
             data-state={visible ? 'open' : 'closed'}
+            aria-hidden={!open}
+            inert={!open}
             onMouseDown={(event) => {
                 if (open && closeOnBackdrop && event.target === event.currentTarget) onCloseRef.current();
             }}

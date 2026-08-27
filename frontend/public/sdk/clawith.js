@@ -39,12 +39,11 @@
   }
 
   function startOAuth() {
-    var returnTo = location.href.split("#")[0].split("?")[0]; // 干净 URL（不含 query/fragment，兼容 opaque origin）
-    // Published pages run in a sandboxed iframe so their content cannot
-    // replace the platform watermark. Ask the trusted parent viewer to start
-    // OAuth at top level; it builds the return URL itself and forwards the
-    // eventual code/state back into the report iframe.
-    if (window.parent !== window && shortIdFromUrl()) {
+    var returnTo = location.href.split("#")[0].split("?")[0]; // 干净 URL（不含 query/fragment）
+    // Reports inside the platform viewer ask the parent to perform OAuth at
+    // the visible /p/<short_id> URL. The iframe itself remains unrestricted.
+    if (window.parent !== window && shortIdFromUrl()
+        && typeof window.parent.postMessage === "function") {
       window.parent.postMessage({ type: "published-page:sdk-auth-start" }, "*");
       return new Promise(function () { /* 顶层页面即将跳转，永不 resolve */ });
     }

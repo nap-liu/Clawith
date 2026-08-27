@@ -6,10 +6,11 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import String, and_, cast, delete, or_, select, true
+from sqlalchemy import String, and_, cast, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_feature_enabled
+from app.core.plaza_feature import PLAZA_TOOL_NAMES
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.mcp_server import MCPServer
@@ -30,6 +31,7 @@ from app.services.tool_enablement import (
     resolved_agent_tool_enabled,
     tool_is_required,
 )
+from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES
 from app.services.user_output import sanitize_user_visible_text
 
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -93,19 +95,25 @@ def _reject_required_tool_disable(tool: Tool, enabled: bool | None) -> None:
 def _globally_visible_tool_clause():
     """Include required protocol tools even if legacy data marked them disabled."""
     enabled_clause = or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES))
-    if okr_feature_enabled():
-        return enabled_clause
-    return and_(enabled_clause, Tool.name.not_in(OKR_TOOL_NAMES))
+    feature_clauses = [enabled_clause, Tool.name.not_in(PLAZA_TOOL_NAMES)]
+    if not okr_feature_enabled():
+        feature_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
+    return and_(*feature_clauses)
 
 
 def _feature_visible_tool_clause():
-    if okr_feature_enabled():
-        return true()
-    return Tool.name.not_in(OKR_TOOL_NAMES)
+    feature_clauses = [Tool.name.not_in(PLAZA_TOOL_NAMES)]
+    if not okr_feature_enabled():
+        feature_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
+    return and_(*feature_clauses)
 
 
 def _require_feature_visible_tool(tool: Tool | None) -> Tool:
-    if tool is None or is_retired_okr_tool(tool.name):
+    if (
+        tool is None
+        or tool.name in PLAZA_TOOL_NAMES
+        or is_retired_okr_tool(tool.name)
+    ):
         raise HTTPException(status_code=404, detail="Tool not found")
     return tool
 
@@ -117,7 +125,7 @@ async def _load_agent_for_tool_scope(db: AsyncSession, agent_id: uuid.UUID):
     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
     agent = agent_r.scalar_one_or_none()
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+        raise HTTPException(status_code=404, detail="未找到数字员工")
     return agent
 
 
@@ -673,7 +681,7 @@ async def update_agent_tools(
 
     agent_obj, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
-        raise HTTPException(status_code=403, detail="Agent manage permission required")
+        raise HTTPException(status_code=403, detail="需要数字员工管理权限")
     assignments = await _load_agent_tool_assignments(db, agent_id)
     resolved_updates: list[tuple[AgentToolUpdate, Tool]] = []
     for u in updates:
@@ -723,6 +731,42 @@ async def update_agent_tools(
         ] + [
             (
                 AgentToolUpdate(tool_id=str(tool.id), enabled=subagent_enabled),
+                tool,
+            )
+            for tool in group_tools
+        ]
+
+    # Project management is one opt-in capability group. Keep every function
+    # aligned so a digital employee never receives a partial management set.
+    project_management_states = {
+        update.enabled
+        for update, tool in resolved_updates
+        if tool.category == "project_management"
+    }
+    if len(project_management_states) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Project management tools must be enabled or disabled as one group",
+        )
+    if project_management_states:
+        project_management_enabled = next(iter(project_management_states))
+        group_tools = (
+            await db.execute(
+                select(Tool).where(
+                    Tool.name.in_(USER_PROJECT_TOOL_NAMES),
+                    _agent_visible_tool_clause(agent_obj.tenant_id, assignments),
+                )
+            )
+        ).scalars().all()
+        if {tool.name for tool in group_tools} != set(USER_PROJECT_TOOL_NAMES):
+            raise HTTPException(status_code=409, detail="Project management tool group is incomplete")
+        resolved_updates = [
+            (update, tool)
+            for update, tool in resolved_updates
+            if tool.category != "project_management"
+        ] + [
+            (
+                AgentToolUpdate(tool_id=str(tool.id), enabled=project_management_enabled),
                 tool,
             )
             for tool in group_tools
@@ -956,7 +1000,7 @@ async def update_agent_tool_config(
 
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
-        raise HTTPException(status_code=403, detail="Agent manage permission required")
+        raise HTTPException(status_code=403, detail="需要数字员工管理权限")
 
     # Check permission: only platform_admin and org_admin can modify allow_network
     if "allow_network" in data.config:
@@ -1113,6 +1157,30 @@ async def get_agent_tools_with_config(
                 else None
             ),
         })
+
+    project_management_tools = [
+        tool for tool in result if tool.get("category") == "project_management"
+    ]
+    if project_management_tools:
+        visible_names = {str(tool.get("name") or "") for tool in project_management_tools}
+        enabled_count = sum(bool(tool.get("enabled")) for tool in project_management_tools)
+        member_count = len(project_management_tools)
+        complete = visible_names == set(USER_PROJECT_TOOL_NAMES)
+        if enabled_count == 0:
+            state = "disabled"
+        elif complete and enabled_count == member_count:
+            state = "enabled"
+        else:
+            state = "partial"
+        group_contract = {
+            "key": "project_management",
+            "state": state,
+            "member_count": member_count,
+            "enabled_count": enabled_count,
+            "complete": complete,
+        }
+        for tool in project_management_tools:
+            tool["capability_group"] = group_contract
     return result
 
 

@@ -110,6 +110,9 @@ PRESERVE VERBATIM (no paraphrase, no summary):
 - All commands or queries that were issued (tool name + key arguments)
 - All open action items or commitments
 - All errors, exceptions, and failure modes encountered
+- The speaker/Agent/role responsible for each material finding or commitment
+- Role-specific judgments, challenged assumptions, disagreements and unresolved dissent
+- Evidence attribution, decision rationale, trade-offs, next actions and their owners
 - All <persisted-output> envelope metadata (path + size) so the agent
   knows it can read_file these resources later
 
@@ -216,17 +219,14 @@ def estimate_prompt_tokens(api_messages: list[dict]) -> int:
                 _append_text(args)
             elif isinstance(args, dict):
                 import json as _j
+
                 _append_text(_j.dumps(args, ensure_ascii=False))
         reasoning = msg.get("reasoning_content")
         if isinstance(reasoning, str):
             _append_text(reasoning)
 
     combined = "".join(chunks)
-    cjk_chars = sum(
-        1
-        for ch in combined
-        if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff"
-    )
+    cjk_chars = sum(1 for ch in combined if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff")
     return cjk_chars + (len(combined) - cjk_chars + 2) // 3
 
 
@@ -297,9 +297,7 @@ def should_compact(
 # ─── Span selection ──────────────────────────────────────────────────
 
 
-def _is_round_boundary_after(
-    rows: list[ChatMessage], idx: int
-) -> bool:
+def _is_round_boundary_after(rows: list[ChatMessage], idx: int) -> bool:
     """Whether splitting *after* ``rows[idx]`` lands on a round
     boundary — i.e. ``rows[idx]`` is the final message of a complete
     user/assistant exchange (with all tool sub-messages closed).
@@ -377,9 +375,7 @@ def prefilter_message_content(content: str) -> str:
     if len(out) > _LARGE_BODY_HEAD_TAIL_THRESHOLD:
         head = out[:_LARGE_BODY_KEEP_HEAD]
         tail = out[-_LARGE_BODY_KEEP_TAIL:]
-        out = (
-            f"{head}\n\n…[truncated {len(out) - _LARGE_BODY_KEEP_HEAD - _LARGE_BODY_KEEP_TAIL} chars]…\n\n{tail}"
-        )
+        out = f"{head}\n\n…[truncated {len(out) - _LARGE_BODY_KEEP_HEAD - _LARGE_BODY_KEEP_TAIL} chars]…\n\n{tail}"
 
     return out
 
@@ -440,15 +436,15 @@ def estimate_compactable_span_tokens(rows: list[ChatMessage]) -> int:
 # ─── Validation gate ─────────────────────────────────────────────────
 
 
-_UUID_LIKE_RE = re.compile(r"\b[a-f0-9]{32}\b|\b[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\b")
+_UUID_LIKE_RE = re.compile(
+    r"\b[a-f0-9]{32}\b|\b[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\b"
+)
 # Path regex: stops on whitespace, quotes, brackets, **and** common
 # trailing sentence punctuation (.,;:!?) when followed by whitespace or
 # end-of-string — `workspace/draft.md,` should match `workspace/draft.md`,
 # not include the comma. Otherwise recall comparison breaks because
 # the summary writes the path without the trailing punctuation.
-_PATH_RE = re.compile(
-    r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|skills/)[^\s'\"<>]*?)(?=[\s,;:!?]|$)"
-)
+_PATH_RE = re.compile(r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|skills/)[^\s'\"<>]*?)(?=[\s,;:!?]|$)")
 _ATTACHMENT_PATH_RE = re.compile(r"^路径：(.+)$", re.MULTILINE)
 _URL_RE = re.compile(r"\bhttps?://[^\s'\"<>]*?(?=[\s,;!?]|$)", re.IGNORECASE)
 _SLASH_COMMAND_RE = re.compile(
@@ -466,9 +462,7 @@ def extract_preserved_identifiers(text: str) -> set[str]:
     identifiers.update(_URL_RE.findall(source))
     identifiers.update(match.group(0) for match in _SLASH_COMMAND_RE.finditer(source))
     identifiers.update(
-        match.group(1).strip()
-        for match in _ATTACHMENT_PATH_RE.finditer(source)
-        if match.group(1).strip()
+        match.group(1).strip() for match in _ATTACHMENT_PATH_RE.finditer(source) if match.group(1).strip()
     )
 
     for match in _PATH_RE.finditer(source):
@@ -486,9 +480,7 @@ def append_missing_identifiers(*, summary: str, original_text: str) -> tuple[str
     """Mechanically preserve exact identifiers the summary model omitted."""
     rendered = (summary or "").strip()
     missing = sorted(
-        identifier
-        for identifier in extract_preserved_identifiers(original_text)
-        if identifier not in rendered
+        identifier for identifier in extract_preserved_identifiers(original_text) if identifier not in rendered
     )
     if not missing:
         return rendered, []
@@ -577,11 +569,7 @@ async def _summarize_via_llm(
     def _messages(candidate_span: str) -> list[LLMMessage]:
         user_payload = []
         if prior_summary:
-            user_payload.append(
-                "<prior-summary epoch_n_minus_1>\n"
-                + prior_summary
-                + "\n</prior-summary>\n"
-            )
+            user_payload.append("<prior-summary epoch_n_minus_1>\n" + prior_summary + "\n</prior-summary>\n")
         user_payload.append("<chat-segment>\n" + candidate_span + "\n</chat-segment>")
         return [
             LLMMessage(role="system", content=SUMMARY_SYSTEM_PROMPT),
@@ -597,9 +585,7 @@ async def _summarize_via_llm(
     )
     if not budget.fits:
         identifiers = sorted(extract_preserved_identifiers(span_text))
-        identifier_block = "\n\n### Exact identifiers\n" + "\n".join(
-            f"- {identifier}" for identifier in identifiers
-        )
+        identifier_block = "\n\n### Exact identifiers\n" + "\n".join(f"- {identifier}" for identifier in identifiers)
 
         def _candidate(keep_chars: int) -> str:
             head_chars = keep_chars // 2
@@ -682,11 +668,7 @@ async def maybe_compact(
     )
     if force_required and not fire:
         context_window = int(getattr(model, "context_window", 0) or 0)
-        ratio = (
-            (pre_flight_estimate or last_prompt_tokens or 0) / context_window
-            if context_window > 0
-            else 0.0
-        )
+        ratio = (pre_flight_estimate or last_prompt_tokens or 0) / context_window if context_window > 0 else 0.0
         fire = True
         reason = "provider_hard_limit"
     if not fire:
@@ -753,10 +735,7 @@ async def maybe_compact(
             result.required = True
             return result
         except Exception as exc:
-            logger.error(
-                f"[compactor] unexpected failure for session={session_id}: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            logger.error(f"[compactor] unexpected failure for session={session_id}: {type(exc).__name__}: {exc}")
             return CompactionResult(
                 triggered=False,
                 required=True,
@@ -822,9 +801,7 @@ async def _do_compact(
         rows = await _load_active_rows(db, agent_id=agent_id, conversation_id=conversation_id)
 
         if current_anchor_id is not None and (
-            not rows
-            or str(rows[-1].id) != str(current_anchor_id)
-            or rows[-1].role != "user"
+            not rows or str(rows[-1].id) != str(current_anchor_id) or rows[-1].role != "user"
         ):
             return CompactionResult(
                 triggered=False,
@@ -832,9 +809,7 @@ async def _do_compact(
             )
 
         # 2. Pull prior epoch's summary (if any) — chained accumulation
-        prior_summary, prior_epoch, prior_marker_id = await _load_active_marker(
-            db, session_id=session_id
-        )
+        prior_summary, prior_epoch, prior_marker_id = await _load_active_marker(db, session_id=session_id)
 
         # 3. Pick complete historical turns strictly before the protected
         # current/recent suffix.
@@ -880,10 +855,7 @@ async def _do_compact(
                 model=model,
             )
         except Exception as exc:
-            logger.error(
-                f"[compactor] summary LLM call failed for session={session_id}: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            logger.error(f"[compactor] summary LLM call failed for session={session_id}: {type(exc).__name__}: {exc}")
             return CompactionResult(
                 triggered=False,
                 skipped_reason=f"summary_llm_error:{type(exc).__name__}",
@@ -898,8 +870,7 @@ async def _do_compact(
         )
         if appended_identifiers:
             logger.info(
-                f"[compactor] appended {len(appended_identifiers)} missing identifiers "
-                f"for session={session_id}"
+                f"[compactor] appended {len(appended_identifiers)} missing identifiers for session={session_id}"
             )
 
         # 6. Validate
@@ -917,9 +888,7 @@ async def _do_compact(
             conversation_id=conversation_id,
         )
         if current_anchor_id is not None and (
-            not fresh_rows
-            or str(fresh_rows[-1].id) != str(current_anchor_id)
-            or fresh_rows[-1].role != "user"
+            not fresh_rows or str(fresh_rows[-1].id) != str(current_anchor_id) or fresh_rows[-1].role != "user"
         ):
             return CompactionResult(
                 triggered=False,
@@ -1048,18 +1017,13 @@ async def _do_compact(
         prior_summary_tokens = len(prior_summary) // 3 if prior_summary else 0
         savings = span_est_tokens + prior_summary_tokens - summary_tokens
         if savings > 0:
-            notice = (
-                f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}），"
-                f"节省约 {savings} tokens"
-            )
+            notice = f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}），节省约 {savings} tokens"
         else:
             # Synthetic / small-context test scenarios can produce summaries
             # larger than the trigger threshold itself; in real use the
             # ratio is heavily positive. Don't surface a negative number to
             # the user — it's confusing and not actionable.
-            notice = (
-                f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}）"
-            )
+            notice = f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}）"
         return CompactionResult(
             triggered=True,
             summary_id=compaction.id,
@@ -1092,10 +1056,7 @@ async def _load_active_rows(
     return [
         row
         for row in result.scalars().all()
-        if not (
-            isinstance(getattr(row, "message_meta", None), dict)
-            and row.message_meta.get("consumed_by_onmessage")
-        )
+        if not (isinstance(getattr(row, "message_meta", None), dict) and row.message_meta.get("consumed_by_onmessage"))
     ]
 
 

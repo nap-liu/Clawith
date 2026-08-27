@@ -6,10 +6,16 @@ export default function ToolsTab({
     agentId,
     agentName = 'Agent',
     canManage,
+    canConfigure = canManage,
+    scope = 'agent',
+    projectContext,
 }: {
     agentId: string;
     agentName?: string;
     canManage: boolean;
+    canConfigure?: boolean;
+    scope?: 'agent' | 'project';
+    projectContext?: { projectId: string; memberId: string };
 }) {
     const { t } = useTranslation();
 
@@ -19,7 +25,14 @@ export default function ToolsTab({
                 <h3 style={{ marginBottom: '4px' }}>{t('agent.toolMgmt.title')}</h3>
                 <p style={{ fontSize: '13px', color: 'var(--text-tertiary)' }}>{t('agent.toolMgmt.description')}</p>
             </div>
-            <ToolsManager agentId={agentId} agentName={agentName} canManage={canManage} />
+            <ToolsManager
+                agentId={agentId}
+                agentName={agentName}
+                canManage={canManage}
+                canConfigure={canConfigure}
+                scope={scope}
+                projectContext={projectContext}
+            />
         </div>
     );
 }

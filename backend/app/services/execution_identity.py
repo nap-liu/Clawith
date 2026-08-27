@@ -158,7 +158,7 @@ async def align_background_execution_user(
 
     agent = await db.get(Agent, agent_id)
     if agent is None:
-        raise ExecutionIdentityError("Agent not found")
+        raise ExecutionIdentityError("未找到数字员工")
     resource = (
         await db.execute(
             select(model)
@@ -272,7 +272,7 @@ async def reassign_background_execution_user(
     """
     agent = await db.get(Agent, agent_id)
     if agent is None:
-        raise ExecutionIdentityError("Agent not found")
+        raise ExecutionIdentityError("未找到数字员工")
     actor = await db.get(User, actor_user_id)
     if actor is None or not actor.is_active:
         raise ExecutionIdentityError("The administrator identity is missing or inactive")
@@ -281,7 +281,7 @@ async def reassign_background_execution_user(
             "Only platform administrators and organization administrators may reassign execution users"
         )
     if await get_agent_access_level_for_user_id(db, actor_user_id, agent) != "manage":
-        raise ExecutionIdentityPermissionError("Manage access to this Agent is required")
+        raise ExecutionIdentityPermissionError("需要数字员工管理权限")
 
     change = await align_background_execution_user(
         db,

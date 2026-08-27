@@ -4,14 +4,16 @@ import uuid
 import pytest
 from sqlalchemy import func, select
 
+import app.models.chat_compaction  # noqa: F401 - registers ChatMessage FK target
 import app.models.chat_session
 import app.models.participant  # noqa: F401 - registers ChatSession FK target
+import app.models.project  # noqa: F401 - registers ChatSession FK target
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.audit import AuditLog, ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.schedule import AgentSchedule
-from app.models.task import Task
+from app.models.task import Task, TaskLog
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
@@ -104,11 +106,20 @@ async def test_manual_run_uses_one_actor_aligned_path_for_all_resource_types(mon
 
     calls = []
 
-    async def _capture(*args):
+    async def _capture_task(*args):
         calls.append(args)
 
-    monkeypatch.setattr("app.services.task_executor.execute_task", _capture)
-    monkeypatch.setattr("app.services.scheduler._execute_schedule", _capture)
+    async def _capture_schedule(*args):
+        from app.services.scheduler import ScheduleExecutionOutcome
+
+        calls.append(args)
+        return ScheduleExecutionOutcome.SUCCEEDED
+
+    monkeypatch.setattr("app.services.task_executor.execute_task", _capture_task)
+    monkeypatch.setattr(
+        "app.services.scheduler._execute_schedule",
+        _capture_schedule,
+    )
 
     async with async_session() as db:
         await run_background_resource(
@@ -152,19 +163,146 @@ async def test_manual_run_uses_one_actor_aligned_path_for_all_resource_types(mon
         assert execution.source == "manual"
         assert execution.status == "pending"
         assert execution.execution_user_id == actor.id
-        assert await db.scalar(
-            select(func.count(AuditLog.id)).where(
-                AuditLog.action == "background_resource_manual_run",
-                AuditLog.agent_id == agent.id,
+        assert (
+            await db.scalar(
+                select(func.count(AuditLog.id)).where(
+                    AuditLog.action == "background_resource_manual_run",
+                    AuditLog.agent_id == agent.id,
+                )
             )
-        ) == 3
+            == 3
+        )
 
     claimed = await claim_pending_trigger_executions(sources=["manual"])
-    claimed_execution, claimed_trigger = next(
-        pair for pair in claimed if pair[0].id == trigger_result.execution_id
-    )
+    claimed_execution, claimed_trigger = next(pair for pair in claimed if pair[0].id == trigger_result.execution_id)
     assert claimed_execution.execution_user_id == actor.id
     assert claimed_trigger.id == trigger.id
+
+
+async def test_manual_schedule_overload_does_not_record_success(monkeypatch):
+    """A capacity-deferred manual schedule remains absent from success counters."""
+
+    from app.services.background_manual_run import _execute_and_track_schedule
+    from app.services.scheduler import ScheduleExecutionOutcome
+
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        tenant = Tenant(name=f"Manual Overload {suffix}", slug=f"manual-overload-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        actor = await _user(db, tenant.id, f"manual_overload_{suffix}")
+        agent = Agent(
+            tenant_id=tenant.id,
+            creator_id=actor.id,
+            name=f"Manual Overload Agent {suffix}",
+            access_mode="private",
+            status="running",
+        )
+        db.add(agent)
+        await db.flush()
+        schedule = AgentSchedule(
+            agent_id=agent.id,
+            name="Manual overloaded schedule",
+            instruction="Run later",
+            cron_expr="0 9 * * *",
+            is_enabled=False,
+            run_count=0,
+            created_by=actor.id,
+            execution_user_id=actor.id,
+        )
+        db.add(schedule)
+        await db.commit()
+
+    async def _deferred(*_args):
+        return ScheduleExecutionOutcome.RETRYABLE
+
+    monkeypatch.setattr("app.services.scheduler._execute_schedule", _deferred)
+    await _execute_and_track_schedule(
+        schedule.id,
+        agent.id,
+        schedule.instruction,
+        actor.id,
+    )
+
+    async with async_session() as db:
+        stored = await db.get(AgentSchedule, schedule.id)
+        assert stored is not None
+        assert stored.run_count == 0
+        assert stored.last_run_at is None
+
+
+async def test_task_capacity_overload_returns_task_to_retryable_state(monkeypatch):
+    """Capacity pressure must not leave a task doing or mark it failed/done."""
+
+    from contextlib import asynccontextmanager
+
+    from app.services.active_turns import reset_active_turns_for_testing
+    from app.services.task_executor import execute_task
+    from app.services.workload_capacity import (
+        CapacityDimension,
+        WorkloadOverloadedError,
+    )
+
+    class _OverloadedCapacity:
+        @asynccontextmanager
+        async def slot(self, kind, tenant_key):
+            raise WorkloadOverloadedError(
+                kind=kind,
+                tenant_id=str(tenant_key),
+                timeout_seconds=0.01,
+                blocked_by=(CapacityDimension.CATEGORY,),
+            )
+            yield  # pragma: no cover
+
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        tenant = Tenant(name=f"Task Overload {suffix}", slug=f"task-overload-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        actor = await _user(db, tenant.id, f"task_overload_{suffix}")
+        agent = Agent(
+            tenant_id=tenant.id,
+            creator_id=actor.id,
+            name=f"Task Overload Agent {suffix}",
+            access_mode="private",
+            status="running",
+        )
+        db.add(agent)
+        await db.flush()
+        task = Task(
+            agent_id=agent.id,
+            title="Retry after overload",
+            type="todo",
+            status="pending",
+            priority="medium",
+            created_by=actor.id,
+            execution_user_id=actor.id,
+        )
+        db.add(task)
+        await db.commit()
+
+    monkeypatch.setattr(
+        "app.services.task_executor.get_workload_capacity",
+        lambda: _OverloadedCapacity(),
+    )
+    await reset_active_turns_for_testing()
+    try:
+        await execute_task(task.id, agent.id, actor.id)
+    finally:
+        await reset_active_turns_for_testing()
+
+    async with async_session() as db:
+        stored = await db.get(Task, task.id)
+        assert stored is not None
+        assert stored.status == "pending"
+        assert stored.completed_at is None
+        logs = (
+            (await db.execute(select(TaskLog).where(TaskLog.task_id == task.id).order_by(TaskLog.created_at)))
+            .scalars()
+            .all()
+        )
+        assert any("可重新执行" in log.content for log in logs)
+        assert not any("执行出错" in log.content for log in logs)
 
 
 async def test_manual_run_rejects_running_or_ambiguous_tasks(monkeypatch):

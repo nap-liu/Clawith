@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import and_, cast, func, or_, select, String
+from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 
@@ -22,17 +22,23 @@ from app.core.permissions import (
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent, AgentPermission
-from app.models.org import OrgDepartment, OrgMember
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.org import OrgDepartment, OrgMember
 from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
-from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
+from app.schemas.schemas import (
+    AgentCreate,
+    AgentExplorePageOut,
+    AgentOut,
+    AgentUpdate,
+)
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.org_directory import (
     canonical_org_member_id_subquery,
     department_subtree_cte,
-    same_directory_provider,
+    permission_directory_departments,
+    permission_directory_members,
 )
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -122,7 +128,8 @@ async def _lazy_reset_token_counters(agent: Agent, db: AsyncSession) -> bool:
 
     Returns True if any counter was reset (caller should commit/flush).
     """
-    from datetime import datetime, timezone as tz
+    from datetime import datetime
+    from datetime import timezone as tz
     now = datetime.now(tz.utc)
     from sqlalchemy import or_, update
 
@@ -171,10 +178,21 @@ async def _build_unread_count_by_agent(
     the current platform user and ignore agent-to-agent / trigger-only threads.
     """
 
-    if not agents:
+    return await _build_unread_count_by_agent_ids(
+        db,
+        [agent.id for agent in agents],
+        current_user,
+    )
+
+
+async def _build_unread_count_by_agent_ids(
+    db: AsyncSession,
+    agent_ids: list[uuid.UUID],
+    current_user: User,
+) -> dict[str, int]:
+    if not agent_ids:
         return {}
 
-    agent_ids = [agent.id for agent in agents]
     result = await db.execute(
         select(ChatSession.agent_id, func.count(ChatMessage.id))
         .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
@@ -322,6 +340,131 @@ async def list_agents(
     return out
 
 
+@router.get("/explore", response_model=AgentExplorePageOut)
+async def explore_agents(
+    tenant_id: uuid.UUID | None = None,
+    search: str | None = Query(default=None, max_length=120),
+    agent_status: str | None = Query(default=None, alias="status"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=24, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the lightweight, paginated Agent directory used by Explore."""
+    if tenant_id and tenant_id != current_user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Can only list agents in your own company",
+        )
+    if agent_status not in (None, "running", "idle", "stopped", "creating", "error"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid agent status",
+        )
+
+    visible = build_visible_agents_query(
+        current_user,
+        tenant_id=current_user.tenant_id,
+    ).with_only_columns(
+        Agent.id,
+        Agent.name,
+        Agent.avatar_url,
+        Agent.role_description,
+        Agent.bio,
+        Agent.status,
+        Agent.creator_id,
+        Agent.agent_type,
+        Agent.openclaw_last_seen,
+        Agent.created_at,
+        Agent.last_active_at,
+    ).subquery("explore_visible_agents")
+
+    counts_result = await db.execute(
+        select(
+            func.count(visible.c.id),
+            func.coalesce(func.sum(case((visible.c.status == "running", 1), else_=0)), 0),
+            func.coalesce(func.sum(case((visible.c.status == "idle", 1), else_=0)), 0),
+            func.coalesce(func.sum(case((visible.c.status == "stopped", 1), else_=0)), 0),
+        ).select_from(visible)
+    )
+    all_count, running_count, idle_count, stopped_count = counts_result.one()
+
+    filters = []
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        filters.append(
+            or_(
+                visible.c.name.ilike(pattern),
+                visible.c.role_description.ilike(pattern),
+                visible.c.bio.ilike(pattern),
+            )
+        )
+    if agent_status:
+        filters.append(visible.c.status == agent_status)
+
+    filtered = select(visible).where(*filters).subquery("explore_filtered_agents")
+    total_result = await db.execute(select(func.count()).select_from(filtered))
+    total = int(total_result.scalar_one() or 0)
+
+    creator = aliased(User)
+    creator_identity = aliased(Identity)
+    status_order = case(
+        (filtered.c.status == "running", 0),
+        (filtered.c.status == "idle", 1),
+        (filtered.c.status == "creating", 2),
+        (filtered.c.status == "stopped", 3),
+        (filtered.c.status == "error", 4),
+        else_=5,
+    )
+    rows_result = await db.execute(
+        select(
+            filtered.c.id,
+            filtered.c.name,
+            filtered.c.avatar_url,
+            filtered.c.role_description,
+            filtered.c.bio,
+            filtered.c.status,
+            filtered.c.creator_id,
+            creator.display_name.label("creator_display_name"),
+            creator_identity.username.label("creator_username"),
+            filtered.c.agent_type,
+            filtered.c.openclaw_last_seen,
+            filtered.c.created_at,
+            filtered.c.last_active_at,
+        )
+        .select_from(filtered)
+        .outerjoin(creator, creator.id == filtered.c.creator_id)
+        .outerjoin(creator_identity, creator_identity.id == creator.identity_id)
+        .order_by(status_order.asc(), filtered.c.last_active_at.desc().nullslast(), filtered.c.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    rows = [dict(row) for row in rows_result.mappings().all()]
+    unread_by_agent = await _build_unread_count_by_agent_ids(
+        db,
+        [row["id"] for row in rows],
+        current_user,
+    )
+    for row in rows:
+        row["unread_count"] = unread_by_agent.get(str(row["id"]), 0)
+
+    return {
+        "items": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": page * page_size < total,
+        "counts": {
+            "all": int(all_count or 0),
+            "running": int(running_count or 0),
+            "idle": int(idle_count or 0),
+            "stopped": int(stopped_count or 0),
+        },
+    }
+
+
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_agent(
     data: AgentCreate,
@@ -396,6 +539,7 @@ async def get_agent(
     # async lazy-loading errors (SQLAlchemy raises MissingGreenlet in async context).
     if agent.creator_id:
         from sqlalchemy.orm import selectinload
+
         from app.models.user import Identity  # noqa: F401
         creator_result = await db.execute(
             select(User)
@@ -736,22 +880,6 @@ async def update_agent_permissions(
     return {"status": "ok"}
 
 
-def _serialize_permission_department(
-    department: OrgDepartment,
-    *,
-    child_counts: dict[uuid.UUID, int],
-    member_counts: dict[uuid.UUID, int],
-) -> dict:
-    return {
-        "id": str(department.id),
-        "name": department.name,
-        "parent_id": str(department.parent_id) if department.parent_id else None,
-        "path": department.path,
-        "has_children": child_counts.get(department.id, 0) > 0,
-        "direct_member_count": member_counts.get(department.id, 0),
-    }
-
-
 @router.get("/{agent_id}/permissions/directory/departments")
 async def get_agent_permission_departments(
     agent_id: uuid.UUID,
@@ -765,124 +893,14 @@ async def get_agent_permission_departments(
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
-    if not agent.tenant_id:
-        return {"items": [], "my_department": None}
-
-    conditions = [
-        OrgDepartment.tenant_id == agent.tenant_id,
-        OrgDepartment.status == "active",
-    ]
-    normalized_search = (search or "").strip()
-    if normalized_search:
-        pattern = f"%{normalized_search}%"
-        conditions.append(or_(OrgDepartment.name.ilike(pattern), OrgDepartment.path.ilike(pattern)))
-    elif parent_id:
-        parent_result = await db.execute(
-            select(OrgDepartment).where(
-                OrgDepartment.id == parent_id,
-                OrgDepartment.tenant_id == agent.tenant_id,
-                OrgDepartment.status == "active",
-            )
-        )
-        parent = parent_result.scalar_one_or_none()
-        if not parent:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
-        conditions.extend(
-            [
-                OrgDepartment.parent_id == parent_id,
-                (
-                    OrgDepartment.provider_id == parent.provider_id
-                    if parent.provider_id is not None
-                    else OrgDepartment.provider_id.is_(None)
-                ),
-            ]
-        )
-    else:
-        conditions.append(OrgDepartment.parent_id.is_(None))
-
-    departments_result = await db.execute(
-        select(OrgDepartment).where(*conditions).order_by(OrgDepartment.name.asc()).limit(limit)
+    return await permission_directory_departments(
+        db,
+        tenant_id=agent.tenant_id,
+        current_user_id=current_user.id,
+        parent_id=parent_id,
+        search=search,
+        limit=limit,
     )
-    departments = departments_result.scalars().all()
-
-    my_department = None
-    if not normalized_search and parent_id is None:
-        my_department_result = await db.execute(
-            select(OrgDepartment)
-            .join(OrgMember, OrgMember.department_id == OrgDepartment.id)
-            .where(
-                OrgMember.tenant_id == agent.tenant_id,
-                OrgMember.status == "active",
-                OrgMember.user_id == current_user.id,
-                OrgDepartment.status == "active",
-            )
-            .order_by(OrgMember.synced_at.desc())
-            .limit(1)
-        )
-        my_department = my_department_result.scalar_one_or_none()
-
-    target_department_ids = {department.id for department in departments}
-    if my_department:
-        target_department_ids.add(my_department.id)
-
-    child_counts: dict[uuid.UUID, int] = {}
-    member_counts: dict[uuid.UUID, int] = {}
-    if target_department_ids:
-        parent_department = aliased(OrgDepartment)
-        child_counts_result = await db.execute(
-            select(OrgDepartment.parent_id, func.count(OrgDepartment.id))
-            .join(parent_department, parent_department.id == OrgDepartment.parent_id)
-            .where(
-                OrgDepartment.tenant_id == agent.tenant_id,
-                OrgDepartment.status == "active",
-                OrgDepartment.parent_id.in_(target_department_ids),
-                parent_department.tenant_id == agent.tenant_id,
-                parent_department.status == "active",
-                same_directory_provider(
-                    OrgDepartment.provider_id,
-                    parent_department.provider_id,
-                ),
-            )
-            .group_by(OrgDepartment.parent_id)
-        )
-        child_counts = {row[0]: int(row[1]) for row in child_counts_result.all() if row[0]}
-
-        member_counts_result = await db.execute(
-            select(
-                OrgMember.department_id,
-                func.count(func.distinct(OrgMember.user_id)),
-            )
-            .join(User, User.id == OrgMember.user_id)
-            .where(
-                OrgMember.tenant_id == agent.tenant_id,
-                OrgMember.status == "active",
-                OrgMember.department_id.in_(target_department_ids),
-                User.tenant_id == agent.tenant_id,
-                User.is_active == True,  # noqa: E712
-            )
-            .group_by(OrgMember.department_id)
-        )
-        member_counts = {row[0]: int(row[1]) for row in member_counts_result.all() if row[0]}
-
-    return {
-        "items": [
-            _serialize_permission_department(
-                department,
-                child_counts=child_counts,
-                member_counts=member_counts,
-            )
-            for department in departments
-        ],
-        "my_department": (
-            _serialize_permission_department(
-                my_department,
-                child_counts=child_counts,
-                member_counts=member_counts,
-            )
-            if my_department
-            else None
-        ),
-    }
 
 
 @router.get("/{agent_id}/permissions/directory/members")
@@ -1003,95 +1021,15 @@ async def get_agent_permission_members(
             "has_more": page * page_size < total,
         }
 
-    filters = [
-        OrgMember.tenant_id == agent.tenant_id,
-        OrgMember.status == "active",
-        OrgMember.user_id.is_not(None),
-        User.tenant_id == agent.tenant_id,
-        User.is_active == True,  # noqa: E712
-    ]
-    canonical_department_ids = None
-
-    normalized_search = (search or "").strip()
-    if normalized_search:
-        pattern = f"%{normalized_search}%"
-        filters.append(
-            or_(
-                OrgMember.name.ilike(pattern),
-                OrgMember.nickname.ilike(pattern),
-                OrgMember.name_translit_full.ilike(pattern),
-                OrgMember.name_translit_initial.ilike(pattern),
-                OrgMember.department_path.ilike(pattern),
-                OrgMember.title.ilike(pattern),
-                OrgMember.email.ilike(pattern),
-            )
-        )
-    elif department_id:
-        department_result = await db.execute(
-            select(OrgDepartment).where(
-                OrgDepartment.id == department_id,
-                OrgDepartment.tenant_id == agent.tenant_id,
-                OrgDepartment.status == "active",
-            )
-        )
-        department = department_result.scalar_one_or_none()
-        if not department:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
-        if include_descendants:
-            subtree = department_subtree_cte(
-                tenant_id=agent.tenant_id,
-                department_id=department.id,
-                name="permission_picker_department_subtree",
-            )
-            canonical_department_ids = select(subtree.c.department_id)
-            filters.append(OrgMember.department_id.in_(canonical_department_ids))
-        else:
-            canonical_department_ids = [department.id]
-            filters.append(OrgMember.department_id == department.id)
-
-    canonical = canonical_org_member_id_subquery(
+    return await permission_directory_members(
+        db,
         tenant_id=agent.tenant_id,
-        department_ids=canonical_department_ids,
-        prefer_directory_profile=True,
+        department_id=department_id,
+        include_descendants=include_descendants,
+        search=search,
+        page=page,
+        page_size=page_size,
     )
-
-    base_query = (
-        select(OrgMember)
-        .join(canonical, and_(OrgMember.id == canonical.c.om_id, canonical.c.rn == 1))
-        .join(User, User.id == OrgMember.user_id)
-        .where(*filters)
-    )
-    count_result = await db.execute(select(func.count()).select_from(base_query.subquery()))
-    total = int(count_result.scalar_one() or 0)
-
-    members_result = await db.execute(
-        base_query
-        .order_by(OrgMember.name.asc(), OrgMember.id.asc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    members = members_result.scalars().all()
-
-    return {
-        "items": [
-            {
-                "id": str(member.user_id),
-                "member_id": str(member.id),
-                "name": member.name,
-                "nickname": member.nickname,
-                "department_id": str(member.department_id) if member.department_id else None,
-                "department_path": member.department_path or "",
-                "title": member.title or "",
-                "avatar_url": member.avatar_url,
-                "email": member.email,
-            }
-            for member in members
-        ],
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "has_more": page * page_size < total,
-    }
 
 
 @router.get("/{agent_id}/permissions/candidates")
@@ -1198,7 +1136,8 @@ async def update_agent(
     if "expires_at" in update_data:
         if not is_admin:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admin can modify agent expiry time")
-        from datetime import datetime, timezone as tz
+        from datetime import datetime
+        from datetime import timezone as tz
         new_expires = update_data["expires_at"]
         # Allow any value: extend, shorten, or null (permanent).
         # Re-activate the agent if new expiry is in the future or cleared.
@@ -1313,7 +1252,7 @@ async def delete_agent(
     if subagent_audit is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Agents referenced by Subagent audit records cannot be deleted.",
+            detail="被 Subagent 审计记录引用的数字员工不能删除。",
         )
 
     # Stop container and archive files (best effort)

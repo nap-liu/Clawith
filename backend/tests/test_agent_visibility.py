@@ -23,6 +23,7 @@ def test_build_visible_agents_query_restricts_to_same_tenant_and_visible_permiss
     stmt = build_visible_agents_query(user)
     sql = str(stmt)
 
+    assert "agents.scope" in sql
     assert "agents.tenant_id" in sql
     assert "agents.creator_id" in sql
     assert "agent_permissions.scope_type" in sql
@@ -144,15 +145,18 @@ async def test_access_level_platform_admin_can_manage_others_private():
 @pytest.mark.asyncio
 async def test_global_agent_access_still_allows_cross_tenant_platform_admin():
     admin = SimpleNamespace(
-        id=uuid.uuid4(), role="platform_admin", tenant_id=uuid.uuid4(), is_active=True,
+        id=uuid.uuid4(),
+        role="platform_admin",
+        tenant_id=uuid.uuid4(),
+        is_active=True,
     )
     agent = _make_agent(
-        creator_id=uuid.uuid4(), tenant_id=uuid.uuid4(), access_mode="private",
+        creator_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        access_mode="private",
     )
 
-    resolved, level = await permissions.check_agent_access(
-        _AccessLevelDb([_ScalarResult(agent)]), admin, agent.id
-    )
+    resolved, level = await permissions.check_agent_access(_AccessLevelDb([_ScalarResult(agent)]), admin, agent.id)
 
     assert resolved is agent
     assert level == "manage"
@@ -201,10 +205,16 @@ class _RelationshipStatusDb:
 @pytest.mark.asyncio
 async def test_agent_relationship_status_rejects_cross_tenant_edge_before_creator_permissions():
     source = SimpleNamespace(
-        id=uuid.uuid4(), tenant_id=uuid.uuid4(), status="ready", expires_at=None,
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        status="ready",
+        expires_at=None,
     )
     target = SimpleNamespace(
-        id=uuid.uuid4(), tenant_id=uuid.uuid4(), status="ready", expires_at=None,
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        status="ready",
+        expires_at=None,
     )
     rel = SimpleNamespace(
         agent_id=source.id,
@@ -213,9 +223,7 @@ async def test_agent_relationship_status_rejects_cross_tenant_edge_before_creato
         created_by_user_id=uuid.uuid4(),
     )
 
-    status = await permissions.evaluate_agent_relationship_status(
-        _RelationshipStatusDb(source), rel
-    )
+    status = await permissions.evaluate_agent_relationship_status(_RelationshipStatusDb(source), rel)
 
     assert status == {
         "access_allowed": False,

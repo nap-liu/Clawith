@@ -24,7 +24,7 @@ steps:
   # Step 1: 代码克隆 (获取完整历史和 tags)
   # --------------------------------------------------------
   - name: clone
-    image: alpine/git
+    image: docker.m.daocloud.io/alpine/git:latest
     pull: if-not-exists
     environment:
       http_proxy:
@@ -45,19 +45,15 @@ steps:
   # Step 2: 构建新旧版本 Docker 镜像
   # --------------------------------------------------------
   - name: build-images
-    image: docker:24.0.6
+    image: docker.m.daocloud.io/library/docker:24.0.6
     pull: if-not-exists
     privileged: true
     volumes:
       - name: docker-socket
         path: /var/run/docker.sock
-    environment:
-      http_proxy:
-        from_secret: PROXY
-      https_proxy:
-        from_secret: PROXY
     commands:
       - apk add --no-cache git
+      - sh deploy/validate-image-policy.sh
       - echo "========================================"
       - echo "开始构建 Docker 镜像"
       - echo "事件 $DRONE_BUILD_EVENT"
@@ -72,8 +68,8 @@ steps:
           echo "警告: 未找到历史 tag，升级测试将被跳过"
           echo "SKIP_UPGRADE_TEST=true" > .env.drone
           # 仅构建当前版本
-          docker build -t clawith-backend:new --build-arg CLAWITH_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -f backend/Dockerfile ./backend
-          docker build -t clawith-frontend:new -f frontend/Dockerfile ./frontend
+          docker build -t clawith-backend:new --build-arg CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io --build-arg CLAWITH_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -f backend/Dockerfile ./backend
+          docker build -t clawith-frontend:new --build-arg CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io -f frontend/Dockerfile ./frontend
           echo "当前版本镜像构建完成"
           exit 0
         fi
@@ -84,22 +80,25 @@ steps:
       # --- 构建旧版本镜像 ---
       - echo "--- 构建旧版本镜像 ($PREV_TAG) ---"
       - git checkout $PREV_TAG
-      - docker build -t clawith-backend:old --build-arg CLAWITH_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -f backend/Dockerfile ./backend
-      - docker build -t clawith-frontend:old -f frontend/Dockerfile ./frontend
+      - sed -i -E 's#^FROM python:#FROM docker.m.daocloud.io/library/python:#' backend/Dockerfile
+      - sed -i -E 's#^FROM node:#FROM docker.m.daocloud.io/library/node:#; s#^FROM nginx:#FROM docker.m.daocloud.io/library/nginx:#' frontend/Dockerfile
+      - docker build -t clawith-backend:old --build-arg CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io --build-arg CLAWITH_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -f backend/Dockerfile ./backend
+      - docker build -t clawith-frontend:old --build-arg CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io -f frontend/Dockerfile ./frontend
       - echo "旧版本镜像构建完成"
+      - git checkout -- backend/Dockerfile frontend/Dockerfile
 
       # --- 构建当前版本镜像 ---
       - echo "--- 构建当前版本镜像 ($DRONE_COMMIT_SHORT) ---"
       - git checkout $DRONE_COMMIT
-      - docker build -t clawith-backend:new --build-arg CLAWITH_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -f backend/Dockerfile ./backend
-      - docker build -t clawith-frontend:new -f frontend/Dockerfile ./frontend
+      - docker build -t clawith-backend:new --build-arg CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io --build-arg CLAWITH_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple -f backend/Dockerfile ./backend
+      - docker build -t clawith-frontend:new --build-arg CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io -f frontend/Dockerfile ./frontend
       - echo "当前版本镜像构建完成"
 
   # --------------------------------------------------------
   # Step 3: 本地部署测试 (Deploy Test)
   # --------------------------------------------------------
   - name: local-deploy-test
-    image: docker:24.0.6
+    image: docker.m.daocloud.io/library/docker:24.0.6
     privileged: true
     volumes:
       - name: docker-socket
@@ -153,7 +152,7 @@ steps:
   # Step 4: 本地升级测试 (Upgrade Test)
   # --------------------------------------------------------
   - name: local-upgrade-test
-    image: docker:24.0.6
+    image: docker.m.daocloud.io/library/docker:24.0.6
     privileged: true
     volumes:
       - name: docker-socket
@@ -250,7 +249,7 @@ steps:
   # 只有在部署测试通过后才会执行到这一步
   # --------------------------------------------------------
   - name: save-images
-    image: docker:24.0.6
+    image: docker.m.daocloud.io/library/docker:24.0.6
     privileged: true
     volumes:
       - name: docker-socket
@@ -268,7 +267,7 @@ steps:
       - ls -lh *.tar
 
   - name: scp-images
-    image: appleboy/drone-scp
+    image: docker.m.daocloud.io/appleboy/drone-scp:latest
     pull: if-not-exists
     settings:
       host:

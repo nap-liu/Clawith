@@ -13,6 +13,7 @@ from app.core.permissions import (
     is_agent_creator,
     require_current_agent_tenant,
 )
+from app.core.plaza_feature import PLAZA_ACTIVITY_TYPES
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.activity_log import AgentActivityLog
@@ -40,7 +41,10 @@ async def get_agent_activity(
     logs = (
         await db.execute(
             select(AgentActivityLog)
-            .where(AgentActivityLog.agent_id == agent_id)
+            .where(
+                AgentActivityLog.agent_id == agent_id,
+                AgentActivityLog.action_type.not_in(PLAZA_ACTIVITY_TYPES),
+            )
             .order_by(AgentActivityLog.created_at.desc())
             .limit(limit)
         )
@@ -81,6 +85,9 @@ async def list_conversations(
                     (ChatSession.agent_id == agent_id)
                     | (ChatSession.peer_agent_id == agent_id)
                 ),
+                # Project-scoped conversations are discoverable only from the
+                # project surface, never from ordinary Agent chat history.
+                ChatSession.project_id.is_(None),
                 ChatSession.source_channel != "subagent",
             )
         )

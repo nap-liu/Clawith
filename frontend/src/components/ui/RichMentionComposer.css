@@ -1,0 +1,42 @@
+.ui-rich-mention-composer {
+    min-width: 0;
+    max-height: 132px;
+    flex: 1;
+    overflow-y: auto;
+    outline: none;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--text-sm);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.ui-rich-mention-composer:empty::before {
+    color: var(--text-tertiary);
+    content: attr(data-placeholder);
+    pointer-events: none;
+}
+
+.ui-rich-mention-composer__token {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 5px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--accent-subtle);
+    color: var(--accent-text);
+    font-weight: 650;
+    line-height: 1.35;
+    user-select: all;
+    white-space: nowrap;
+}
+
+.ui-rich-mention-composer__token--unresolved {
+    border-color: var(--error);
+    background: var(--error-subtle);
+    color: var(--error);
+    text-decoration: underline wavy currentColor;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+}

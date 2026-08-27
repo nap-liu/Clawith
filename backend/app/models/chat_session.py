@@ -58,6 +58,12 @@ class ChatSession(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Explicit project scope keeps project group and A2A threads isolated from
+    # ordinary Agent conversations and from the same Agent pair in another
+    # project.  Nullable preserves every existing channel contract.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False, index=True)
     # Canonical human counterpart for P2P sessions.  Group, trigger, and A2A
     # sessions do not invent a creator-user placeholder and therefore keep this
@@ -101,5 +107,5 @@ class ChatSession(Base):
 @event.listens_for(ChatSession, "before_insert")
 @event.listens_for(ChatSession, "before_update")
 def _clear_nonhuman_session_user(_mapper, _connection, target: ChatSession) -> None:
-    if target.is_group or target.source_channel in {"agent", "trigger"}:
+    if target.is_group or target.source_channel in {"agent", "trigger", "project"}:
         target.user_id = None

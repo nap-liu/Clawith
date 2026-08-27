@@ -96,29 +96,49 @@ def upgrade() -> None:
         """
     )
 
-    op.create_table(
-        "skill_installs",
-        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("skill_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("agent_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("installed_version", sa.Integer(), server_default="1", nullable=False),
-        sa.Column("installed_by_user_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("installed_by_agent_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("is_active", sa.Boolean(), server_default=sa.true(), nullable=False),
-        sa.Column("installed_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["skill_id"], ["skills.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["agent_id"], ["agents.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["installed_by_user_id"], ["users.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["installed_by_agent_id"], ["agents.id"], ondelete="SET NULL"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("skill_id", "agent_id", name="uq_skill_installs_skill_agent"),
-    )
-    op.create_index("ix_skill_installs_tenant_id", "skill_installs", ["tenant_id"])
-    op.create_index("ix_skill_installs_skill_id", "skill_installs", ["skill_id"])
-    op.create_index("ix_skill_installs_agent_id", "skill_installs", ["agent_id"])
+    # The application bootstrap creates tables from the current SQLAlchemy
+    # metadata before Alembic runs. Existing deployments can therefore already
+    # contain this new table even though this revision is not stamped yet.
+    # Preserve those rows and let Alembic continue instead of attempting to
+    # create the table a second time.
+    if not sa.inspect(op.get_bind()).has_table("skill_installs"):
+        op.create_table(
+            "skill_installs",
+            sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column("skill_id", postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column("agent_id", postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column("installed_version", sa.Integer(), server_default="1", nullable=False),
+            sa.Column("installed_by_user_id", postgresql.UUID(as_uuid=True), nullable=True),
+            sa.Column("installed_by_agent_id", postgresql.UUID(as_uuid=True), nullable=True),
+            sa.Column("is_active", sa.Boolean(), server_default=sa.true(), nullable=False),
+            sa.Column(
+                "installed_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.func.now(),
+                nullable=False,
+            ),
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.func.now(),
+                nullable=False,
+            ),
+            sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"], ondelete="CASCADE"),
+            sa.ForeignKeyConstraint(["skill_id"], ["skills.id"], ondelete="CASCADE"),
+            sa.ForeignKeyConstraint(["agent_id"], ["agents.id"], ondelete="CASCADE"),
+            sa.ForeignKeyConstraint(
+                ["installed_by_user_id"], ["users.id"], ondelete="SET NULL"
+            ),
+            sa.ForeignKeyConstraint(
+                ["installed_by_agent_id"], ["agents.id"], ondelete="SET NULL"
+            ),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("skill_id", "agent_id", name="uq_skill_installs_skill_agent"),
+        )
+        op.create_index("ix_skill_installs_tenant_id", "skill_installs", ["tenant_id"])
+        op.create_index("ix_skill_installs_skill_id", "skill_installs", ["skill_id"])
+        op.create_index("ix_skill_installs_agent_id", "skill_installs", ["agent_id"])
 
     op.execute(
         """

@@ -15,6 +15,16 @@ from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.task import Task, TaskLog
+from app.services.project_runtime_boundary import (
+    is_project_agent,
+    lock_and_check_project_agent_runtime,
+    project_agent_runtime_allows,
+)
+from app.services.workload_capacity import (
+    WorkloadKind,
+    WorkloadOverloadedError,
+    get_workload_capacity,
+)
 
 settings = get_settings()
 
@@ -53,22 +63,58 @@ async def _execute_task_impl(
     logger.info(f"[TaskExec] Starting task {task_id} for agent {agent_id}")
     task_run_id: uuid.UUID | None = None
 
-    # Step 1: Mark as doing
+    # Step 1: Claim only work whose authoritative project runtime is running.
+    # Lock the Project before the Task so this admission boundary serializes
+    # with the owner pause switch and the shared manual-run path.
     async with async_session() as db:
-        result = await db.execute(
-            select(Task).where(Task.id == task_id).with_for_update()
-        )
-        task = result.scalar_one_or_none()
-        if not task:
-            logger.warning(f"[TaskExec] Task {task_id} not found")
+        task_agent_id = await db.scalar(select(Task.agent_id).where(Task.id == task_id))
+        if task_agent_id is None:
+            # Lightweight session doubles and older adapters may not implement
+            # scalar column reads. Keep the standard-Agent path compatible by
+            # falling back to the original locked Task lookup.
+            task = (
+                await db.execute(select(Task).where(Task.id == task_id).with_for_update())
+            ).scalar_one_or_none()
+            if task is None:
+                logger.warning(f"[TaskExec] Task {task_id} not found")
+                return
+            task_agent_id = getattr(task, "agent_id", agent_id)
+            task_agent = None
+        else:
+            task_agent = await db.get(Agent, task_agent_id)
+            if task_agent is None:
+                logger.warning(f"[TaskExec] Agent {task_agent_id} not found for task {task_id}")
+                return
+        if task_agent_id != agent_id:
+            logger.warning(
+                f"[TaskExec] Task {task_id} belongs to agent {task_agent_id}, not {agent_id}"
+            )
             return
+
+        if task_agent is not None and is_project_agent(task_agent):
+            try:
+                project_running = await lock_and_check_project_agent_runtime(db, task_agent)
+            except Exception as exc:  # noqa: BLE001 - defer project-only failure
+                logger.warning(
+                    "[TaskExec] Task {} deferred because its project check failed: {}",
+                    task_id,
+                    exc,
+                )
+                return
+            if not project_running:
+                logger.info(f"[TaskExec] Task {task_id} deferred because its project is paused")
+                return
+
+        if task_agent is not None:
+            task = await db.scalar(select(Task).where(Task.id == task_id).with_for_update())
+            if task is None:
+                logger.warning(f"[TaskExec] Task {task_id} disappeared before claim")
+                return
         if task.status == "doing":
             logger.info(f"[TaskExec] Task {task_id} is already running; duplicate skipped")
             return
 
-        task_execution_user_id = (
-            execution_user_id or task.execution_user_id or task.created_by
-        )
+        task_execution_user_id = execution_user_id or task.execution_user_id or task.created_by
         from app.services.active_turns import ensure_active_turn
 
         await ensure_active_turn(
@@ -96,25 +142,109 @@ async def _execute_task_impl(
     # transaction. This is the source of truth if an administrator reassigns
     # future task runs while this run is already active.
     async with async_session() as db:
-        snapshot = await db.scalar(
-            select(TaskLog.execution_user_id)
-            .where(TaskLog.id == task_run_id)
-        )
+        snapshot = await db.scalar(select(TaskLog.execution_user_id).where(TaskLog.id == task_run_id))
         if snapshot is not None:
             task_execution_user_id = snapshot
 
-    # Step 2: Load agent
+    # Step 2: Load an immutable agent snapshot, then release the read
+    # transaction before storage/context work or provider I/O begins.
     async with async_session() as db:
         agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
         agent = agent_result.scalar_one_or_none()
         if not agent:
             await _log_error(task_id, "数字员工未找到")
-            if task_type == 'supervision':
+            if task_type == "supervision":
                 await _restore_supervision_status(task_id)
             return
-
-
         agent_name = agent.name
+        agent_role_description = agent.role_description or ""
+        project_scoped_agent = is_project_agent(agent)
+        tenant_key = (
+            getattr(agent, "company_id", None)
+            or getattr(agent, "tenant_id", None)
+            or task_execution_user_id
+            or agent_id
+        )
+
+    try:
+        # Admission may wait. All task and agent snapshot transactions are
+        # closed before this point, so a queued background turn cannot pin the
+        # database pool.
+        async with get_workload_capacity().slot(WorkloadKind.BACKGROUND, tenant_key):
+            project_paused = False
+            if project_scoped_agent:
+                async with async_session() as db:
+                    current_agent = await db.get(Agent, agent_id)
+                    try:
+                        project_paused = current_agent is not None and not await project_agent_runtime_allows(
+                            db,
+                            current_agent,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - retry project-only failure
+                        logger.warning(
+                            "[TaskExec] Task {} returned to pending because its project recheck failed: {}",
+                            task_id,
+                            exc,
+                        )
+                        project_paused = True
+                if current_agent is None:
+                    await _log_error(task_id, "数字员工未找到")
+                    if task_type == "supervision":
+                        await _restore_supervision_status(task_id)
+                    return
+            if project_paused:
+                logger.info(
+                    f"[TaskExec] Task {task_id} returned to pending because its project paused before execution"
+                )
+                await _restore_retryable_task(
+                    task_id,
+                    execution_user_id=task_execution_user_id,
+                    log_message="⏸️ 项目已暂停，本次执行未开始；恢复项目后可重新执行。",
+                )
+                return
+            await _execute_admitted_task(
+                task=task,
+                task_id=task_id,
+                agent_id=agent_id,
+                task_execution_user_id=task_execution_user_id,
+                task_title=task_title,
+                task_description=task_description,
+                task_type=task_type,
+                agent_name=agent_name,
+                agent_role_description=agent_role_description,
+            )
+    except asyncio.CancelledError:
+        await _restore_cancelled_task(task_id, execution_user_id=task_execution_user_id)
+        raise
+    except WorkloadOverloadedError as e:
+        logger.warning(f"[TaskExec] Task {task_id} deferred by workload capacity: {e}")
+        await _restore_retryable_task(
+            task_id,
+            execution_user_id=task_execution_user_id,
+        )
+        return
+    except Exception as e:  # noqa: BLE001 - task failures are persisted for operators
+        error_msg = str(e) or repr(e)
+        logger.error(f"[TaskExec] Error: {error_msg}")
+        await _log_error(task_id, f"执行出错: {error_msg[:150]}")
+        if task_type == "supervision":
+            await _restore_supervision_status(task_id)
+        return
+
+
+async def _execute_admitted_task(
+    *,
+    task: Task,
+    task_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    task_execution_user_id: uuid.UUID | None,
+    task_title: str,
+    task_description: str,
+    task_type: str,
+    agent_name: str,
+    agent_role_description: str,
+) -> None:
+    """Execute one admitted background task without carrying snapshot sessions."""
 
     if task_type == "supervision":
         # Supervision has a deterministic canonical delivery path. Do not ask
@@ -129,11 +259,14 @@ async def _execute_task_impl(
         await _restore_supervision_status(task_id)
         return
 
-    # Step 3: Build full agent context (same as chat dialog)
     from app.services.agent_context import build_agent_context
-    static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent_name, agent.role_description or "")
 
-    # Add task-execution-specific instructions
+    static_prompt, dynamic_prompt = await build_agent_context(
+        agent_id,
+        agent_name,
+        agent_role_description,
+    )
+
     task_addendum = """
 
 ## Task Execution Mode
@@ -150,7 +283,6 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
     dynamic_prompt += task_addendum
     system_prompt = f"{static_prompt}\n\n{dynamic_prompt}"
 
-    # Build user prompt
     user_prompt = f"[任务执行] {task_title}"
     if task_description:
         user_prompt += f"\n任务描述: {task_description}"
@@ -158,58 +290,45 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
 
     from app.services.llm import call_agent_llm_with_tools
 
-
-    try:
-        logger.info(f"[TaskExec] Calling LLM with tools for task: {task_title}")
-
-        async with async_session() as db:
-            reply = await call_agent_llm_with_tools(
-                db=db,
-                agent_id=agent_id,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_rounds=50,
-                session_id=str(task_id),
-                execution_user_id=task_execution_user_id,
-                turn_type="task",
-            )
-
-        logger.info(f"[TaskExec] LLM reply: {reply[:80]}")
-
-        # Step 5: Save result and update status
-        async with async_session() as db:
-            result = await db.execute(select(Task).where(Task.id == task_id))
-            task = result.scalar_one_or_none()
-            if task:
-                if task_type == 'supervision':
-                    # Supervision tasks stay active; just log the result
-                    task.status = "pending"
-                    db.add(TaskLog(task_id=task_id, content=f"✅ 督办执行完成\n\n{reply}"))
-                else:
-                    task.status = "done"
-                    task.completed_at = datetime.now(UTC)
-                    db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
-                await db.commit()
-                logger.info(f"[TaskExec] Task {task_id} {'logged' if task_type == 'supervision' else 'completed'}!")
-
-        # Log activity
-        from app.services.activity_logger import log_activity
-        await log_activity(
-            agent_id, "task_updated",
-            f"{'督办' if task_type == 'supervision' else '任务'}执行: {task_title[:60]}",
-            detail={"task_id": str(task_id), "task_type": task_type, "title": task_title, "reply": reply[:500]},
-            related_id=task_id,
+    logger.info(f"[TaskExec] Calling LLM with tools for task: {task_title}")
+    async with async_session() as db:
+        reply = await call_agent_llm_with_tools(
+            db=db,
+            agent_id=agent_id,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_rounds=50,
+            session_id=str(task_id),
+            execution_user_id=task_execution_user_id,
+            turn_type="task",
         )
-    except asyncio.CancelledError:
-        await _restore_cancelled_task(task_id, execution_user_id=task_execution_user_id)
-        raise
-    except Exception as e:  # noqa: BLE001 - task failures are persisted for operators
-        error_msg = str(e) or repr(e)
-        logger.error(f"[TaskExec] Error: {error_msg}")
-        await _log_error(task_id, f"执行出错: {error_msg[:150]}")
-        if task_type == 'supervision':
-            await _restore_supervision_status(task_id)
-        return
+
+    logger.info(f"[TaskExec] LLM reply: {reply[:80]}")
+
+    async with async_session() as db:
+        result = await db.execute(select(Task).where(Task.id == task_id))
+        persisted_task = result.scalar_one_or_none()
+        if persisted_task:
+            persisted_task.status = "done"
+            persisted_task.completed_at = datetime.now(UTC)
+            db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
+            await db.commit()
+            logger.info(f"[TaskExec] Task {task_id} completed!")
+
+    from app.services.activity_logger import log_activity
+
+    await log_activity(
+        agent_id,
+        "task_updated",
+        f"任务执行: {task_title[:60]}",
+        detail={
+            "task_id": str(task_id),
+            "task_type": task_type,
+            "title": task_title,
+            "reply": reply[:500],
+        },
+        related_id=task_id,
+    )
 
 
 async def _log_error(task_id: uuid.UUID, message: str) -> None:
@@ -230,6 +349,29 @@ async def _restore_supervision_status(task_id: uuid.UUID) -> None:
             await db.commit()
 
 
+async def _restore_retryable_task(
+    task_id: uuid.UUID,
+    *,
+    execution_user_id: uuid.UUID | None,
+    log_message: str = "⏳ 系统繁忙，本次执行未开始，可重新执行。",
+) -> None:
+    """Return an admission-deferred task to pending without marking failure."""
+
+    async with async_session() as db:
+        task = await db.scalar(select(Task).where(Task.id == task_id).with_for_update())
+        if task and task.status == "doing":
+            log_execution_user_id = execution_user_id or task.execution_user_id or task.created_by
+            task.status = "pending"
+            db.add(
+                TaskLog(
+                    task_id=task_id,
+                    content=log_message,
+                    execution_user_id=log_execution_user_id,
+                )
+            )
+            await db.commit()
+
+
 async def _restore_cancelled_task(
     task_id: uuid.UUID,
     *,
@@ -240,9 +382,7 @@ async def _restore_cancelled_task(
     async with async_session() as db:
         task = await db.scalar(select(Task).where(Task.id == task_id))
         if task and task.status == "doing":
-            log_execution_user_id = (
-                execution_user_id or task.execution_user_id or task.created_by
-            )
+            log_execution_user_id = execution_user_id or task.execution_user_id or task.created_by
             task.status = "pending"
             db.add(
                 TaskLog(

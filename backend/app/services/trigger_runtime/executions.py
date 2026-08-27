@@ -6,6 +6,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+from loguru import logger
 from sqlalchemy import and_, or_, select, update
 
 from app.config import get_settings
@@ -22,9 +23,7 @@ async def mark_trigger_executions_completed(execution_ids: list[uuid.UUID]) -> N
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-        )
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
         for execution in result.scalars().all():
             execution.status = "completed"
             execution.finished_at = datetime.now(timezone.utc)
@@ -38,9 +37,7 @@ async def mark_trigger_executions_failed(execution_ids: list[uuid.UUID], error_t
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-        )
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
         for execution in result.scalars().all():
             execution.status = "failed"
             execution.finished_at = datetime.now(timezone.utc)
@@ -60,9 +57,7 @@ async def requeue_trigger_executions(execution_ids: list[uuid.UUID], error_text:
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
-        )
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
         for execution in result.scalars().all():
             execution.status = "pending"
             execution.finished_at = None
@@ -72,19 +67,19 @@ async def requeue_trigger_executions(execution_ids: list[uuid.UUID], error_text:
         await db.commit()
 
 
-async def claim_pending_trigger_executions(
+async def _claim_pending_trigger_executions_for_scope(
     *,
-    sources: list[str] | None = None,
-    limit: int = 100,
+    sources: list[str],
+    limit: int,
+    project_agents: bool,
 ) -> list[tuple[TriggerExecution, AgentTrigger]]:
     now = datetime.now(timezone.utc)
     lease_until = now + timedelta(minutes=5)
     claimed_pairs: list[tuple[TriggerExecution, AgentTrigger]] = []
     first_claim_counts: Counter[uuid.UUID] = Counter()
     triggers_by_id: dict[uuid.UUID, AgentTrigger] = {}
-    sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message", "manual"]
     async with async_session() as db:
-        result = await db.execute(
+        statement = (
             select(TriggerExecution, AgentTrigger, Agent)
             .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
             .join(Agent, Agent.id == TriggerExecution.agent_id)
@@ -115,10 +110,23 @@ async def claim_pending_trigger_executions(
                     ),
                 ),
             )
-            .order_by(TriggerExecution.scheduled_at.asc())
-            .with_for_update(skip_locked=True)
+        )
+        if project_agents:
+            from app.models.project import Project
+
+            statement = statement.join(Project, Project.id == Agent.project_id).where(
+                Agent.scope == "project",
+                Project.status == "running",
+            )
+        else:
+            statement = statement.where(Agent.scope != "project")
+
+        statement = (
+            statement.order_by(TriggerExecution.scheduled_at.asc())
+            .with_for_update(of=TriggerExecution, skip_locked=True)
             .limit(limit)
         )
+        result = await db.execute(statement)
         rows = result.all()
         origin_ids: set[uuid.UUID] = set()
         for execution, trigger, _agent in rows:
@@ -134,9 +142,7 @@ async def claim_pending_trigger_executions(
                     pass
         origin_users = {}
         if origin_ids:
-            users = (
-                await db.execute(select(User).where(User.id.in_(origin_ids)))
-            ).scalars().all()
+            users = (await db.execute(select(User).where(User.id.in_(origin_ids)))).scalars().all()
             origin_users = {user.id: user for user in users}
 
         for execution, trigger, agent in rows:
@@ -151,9 +157,7 @@ async def claim_pending_trigger_executions(
                     origin = origin_users.get(candidate)
                     if origin and origin.tenant_id == agent.tenant_id:
                         origin_id = origin.id
-                execution.execution_user_id = (
-                    origin_id or trigger.execution_user_id or agent.creator_id
-                )
+                execution.execution_user_id = origin_id or trigger.execution_user_id or agent.creator_id
             # Transient marker consumed by dispatch before the objects are
             # detached.  Retries must not increment fire_count a second time.
             execution._is_first_claim = execution.started_at is None
@@ -182,6 +186,47 @@ async def claim_pending_trigger_executions(
             if trigger in db:
                 db.expunge(trigger)
     return claimed_pairs
+
+
+async def claim_pending_trigger_executions(
+    *,
+    sources: list[str] | None = None,
+    limit: int = 100,
+) -> list[tuple[TriggerExecution, AgentTrigger]]:
+    """Claim standard executions independently of optional project state."""
+
+    if limit <= 0:
+        return []
+    selected_sources = sources or [
+        "webhook",
+        "cron",
+        "once",
+        "interval",
+        "poll",
+        "on_message",
+        "manual",
+    ]
+    standard = await _claim_pending_trigger_executions_for_scope(
+        sources=selected_sources,
+        limit=limit,
+        project_agents=False,
+    )
+    remaining = limit - len(standard)
+    if remaining <= 0:
+        return standard
+    try:
+        project = await _claim_pending_trigger_executions_for_scope(
+            sources=selected_sources,
+            limit=remaining,
+            project_agents=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - isolate optional project runtime
+        logger.error(
+            "Project trigger claim failed; standard trigger executions remain available: {}",
+            exc,
+        )
+        project = []
+    return [*standard, *project]
 
 
 async def renew_trigger_execution_leases(execution_ids: list[uuid.UUID]) -> None:
@@ -280,9 +325,7 @@ async def mark_base_triggers_fired(trigger_ids: list[uuid.UUID], now: datetime) 
         return
     trigger_counts = Counter(trigger_ids)
     async with async_session() as db:
-        result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.id.in_(trigger_counts))
-        )
+        result = await db.execute(select(AgentTrigger).where(AgentTrigger.id.in_(trigger_counts)))
         for trigger in result.scalars().all():
             apply_base_trigger_fired_state(
                 trigger,
