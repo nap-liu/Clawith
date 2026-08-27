@@ -7,11 +7,25 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class ProjectAgentToolSetting(BaseModel):
+    tool_id: uuid.UUID
+    enabled: bool = True
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectAgentInitialSettings(BaseModel):
+    config_snapshot: dict = Field(default_factory=dict)
+    tools: list[ProjectAgentToolSetting] = Field(default_factory=list)
+    mcp_capability_ids: list[uuid.UUID] = Field(default_factory=list)
+    skill_capability_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
 class ProjectMemberCreate(BaseModel):
     agent_id: uuid.UUID
     is_leader: bool = False
     is_enabled: bool = True
     enabled_inherited_capability_ids: list[uuid.UUID] = Field(default_factory=list)
+    settings: ProjectAgentInitialSettings | None = None
 
 
 class ProjectCapabilityCreate(BaseModel):

@@ -9,7 +9,7 @@ import {
   IconArrowRight,
   IconBolt,
   IconCheck,
-  IconTool,
+  IconCodeDots,
   IconCrown,
   IconLock,
   IconMessageCircle,
@@ -19,11 +19,15 @@ import {
 } from "@tabler/icons-react";
 
 import { projectsApi } from "../../services/projects";
+import { enterpriseApi } from "../../services/api";
 import { useDialog } from "../../components/Dialog/DialogProvider";
 import ToolCatalogPanel from "../../components/tools/ToolCatalogPanel";
+import ToolsTab from "../../pages/agent-detail/tabs/ToolsTab";
 import { getLocalizedToolPresentation } from "../../utils/toolPresentation";
 import type {
   ProjectAgentOption,
+  ProjectAgentSettingsDraft,
+  ProjectAgentToolOption,
   ProjectCapabilityCreateOverride,
   ProjectCapabilityOption,
   ProjectCreatePayload,
@@ -38,7 +42,9 @@ import {
   SearchInput,
   TextInput,
 } from "./components/ProjectUI";
-import ProjectAgentCapabilityPanel from "./components/ProjectAgentCapabilityPanel";
+import ProjectAgentSettingsPanel, {
+  type ProjectAgentSettingsSection,
+} from "./components/ProjectAgentSettingsPanel";
 import { projectUserFacingCopy } from "./projectUserFacingCopy";
 import "./projectPortfolio.css";
 
@@ -48,6 +54,7 @@ type Draft = {
   leaderId: string;
   sharedCapabilityIds: string[];
   inheritedCapabilityIds: string[];
+  agentSettings: Record<string, ProjectAgentSettingsDraft>;
   visibility: ProjectVisibility;
   shareTargets: string[];
 };
@@ -66,8 +73,44 @@ function initialDraft(t: TFunction): Draft {
     leaderId: "",
     sharedCapabilityIds: [],
     inheritedCapabilityIds: [],
+    agentSettings: {},
     visibility: "private",
     shareTargets: [],
+  };
+}
+
+function initialAgentSettings(
+  agent: ProjectAgentOption,
+  tools: ProjectAgentToolOption[],
+  capabilities: ProjectCapabilityOption[],
+): ProjectAgentSettingsDraft {
+  const owned = capabilities.filter(
+    (capability) =>
+      capability.source === "agent" && capability.owner_agent_id === agent.id,
+  );
+  return {
+    config_snapshot: {
+      primary_model_id: agent.primary_model_id || null,
+      fallback_model_id: agent.fallback_model_id || null,
+      max_tool_rounds: agent.max_tool_rounds ?? 50,
+      project_instruction: "",
+    },
+    tools: tools.map((tool) => ({
+      ...tool,
+      agent_config: { ...(tool.agent_config || {}) },
+    })),
+    mcp_capability_ids: owned
+      .filter(
+        (capability) =>
+          capability.kind === "mcp" && capability.enabled_by_default !== false,
+      )
+      .map((capability) => capability.capability_id || capability.id),
+    skill_capability_ids: owned
+      .filter(
+        (capability) =>
+          capability.kind === "skill" && capability.enabled_by_default !== false,
+      )
+      .map((capability) => capability.capability_id || capability.id),
   };
 }
 
@@ -203,6 +246,7 @@ export default function ProjectCreatePage() {
   const options = bootstrapQuery.data;
   const agents = options?.agents ?? [];
   const capabilities = options?.capabilities ?? [];
+  const tools = options?.tools ?? [];
   const selectedAgents = agents.filter((agent) =>
     draft.memberIds.includes(agent.id),
   );
@@ -218,6 +262,32 @@ export default function ProjectCreatePage() {
   const template = templateQuery.data;
   const restoresSnapshot = Boolean(template?.snapshot_backed);
   const needsBootstrap = !templateId || !restoresSnapshot;
+
+  useEffect(() => {
+    if (!options || restoresSnapshot) return;
+    setDraft((current) => {
+      let changed = false;
+      const nextSettings = { ...current.agentSettings };
+      for (const agentId of current.memberIds) {
+        if (nextSettings[agentId]) continue;
+        const agent = options.agents.find((entry) => entry.id === agentId);
+        if (!agent) continue;
+        nextSettings[agentId] = initialAgentSettings(
+          agent,
+          options.tools,
+          options.capabilities,
+        );
+        changed = true;
+      }
+      for (const agentId of Object.keys(nextSettings)) {
+        if (!current.memberIds.includes(agentId)) {
+          delete nextSettings[agentId];
+          changed = true;
+        }
+      }
+      return changed ? { ...current, agentSettings: nextSettings } : current;
+    });
+  }, [draft.memberIds, options, restoresSnapshot]);
 
   const validation = useMemo(
     () => [
@@ -252,6 +322,28 @@ export default function ProjectCreatePage() {
             draft.inheritedCapabilityIds.includes(capability.id),
         )
         .map((capability) => capability.capability_id || capability.id),
+      settings: draft.agentSettings[agentId]
+        ? {
+            config_snapshot: {
+              ...draft.agentSettings[agentId].config_snapshot,
+              max_tool_rounds: (() => {
+                const raw = draft.agentSettings[agentId].config_snapshot.max_tool_rounds;
+                if (raw === "" || raw === null || raw === undefined) return null;
+                const parsed = Number(raw);
+                return Number.isFinite(parsed) ? parsed : null;
+              })(),
+            },
+            tools: draft.agentSettings[agentId].tools.map((tool) => ({
+              tool_id: tool.id,
+              enabled: tool.can_disable === false ? true : tool.enabled,
+              config: tool.agent_config || {},
+            })),
+            mcp_capability_ids:
+              draft.agentSettings[agentId].mcp_capability_ids,
+            skill_capability_ids:
+              draft.agentSettings[agentId].skill_capability_ids,
+          }
+        : undefined,
     }));
     const selectedCapabilities = [
       ...projectCapabilities.filter((capability) =>
@@ -445,6 +537,7 @@ export default function ProjectCreatePage() {
               agents={selectedAgents}
               projectCapabilities={projectCapabilities}
               inheritedCapabilities={inheritedCapabilities}
+              tools={tools}
               template={template}
               draft={draft}
               patch={patchDraft}
@@ -793,6 +886,7 @@ function CapabilitiesStep({
   agents,
   projectCapabilities,
   inheritedCapabilities,
+  tools,
   template,
   draft,
   patch,
@@ -800,6 +894,7 @@ function CapabilitiesStep({
   agents: ProjectAgentOption[];
   projectCapabilities: ProjectCapabilityOption[];
   inheritedCapabilities: ProjectCapabilityOption[];
+  tools: ProjectAgentToolOption[];
   template?: ProjectTemplate;
   draft: Draft;
   patch: PatchDraft;
@@ -808,47 +903,44 @@ function CapabilitiesStep({
   const [activeAgentId, setActiveAgentId] = useState(
     () => draft.leaderId || agents[0]?.id || "",
   );
-  const [capabilityTab, setCapabilityTab] = useState<"tools" | "skills">("tools");
-  const [toolSearch, setToolSearch] = useState("");
-  const [skillSearch, setSkillSearch] = useState("");
-  const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(
+  const [capabilityTab, setCapabilityTab] =
+    useState<ProjectAgentSettingsSection>("config");
+  const [capabilitySearch, setCapabilitySearch] = useState("");
+  const [expandedCapabilityGroups, setExpandedCapabilityGroups] = useState<
+    Set<string>
+  >(
     () => new Set(["general"]),
   );
-  const [expandedSkillGroups, setExpandedSkillGroups] = useState<Set<string>>(
-    () => new Set(["general"]),
-  );
+  const modelsQuery = useQuery({
+    queryKey: ["llm-models", "project-create"],
+    queryFn: enterpriseApi.llmModels,
+  });
   useEffect(() => {
     if (!agents.some((agent) => agent.id === activeAgentId)) {
       setActiveAgentId(draft.leaderId || agents[0]?.id || "");
     }
   }, [activeAgentId, agents, draft.leaderId]);
+  useEffect(() => {
+    setCapabilitySearch("");
+    setCapabilityTab("config");
+  }, [activeAgentId]);
   const allCapabilities = [...projectCapabilities, ...inheritedCapabilities];
+  const activeAgent = agents.find((agent) => agent.id === activeAgentId);
+  const activeSettings = activeAgent
+    ? draft.agentSettings[activeAgent.id] ||
+      initialAgentSettings(activeAgent, tools, allCapabilities)
+    : null;
   const visibleCapabilities = allCapabilities.filter(
     (capability) =>
       capability.source === "project" ||
       capability.owner_agent_id === activeAgentId,
   );
-  const toolCapabilities = visibleCapabilities.filter(
-    (capability) => capability.kind !== "skill",
-  );
-  const skillCapabilities = visibleCapabilities.filter(
-    (capability) => capability.kind === "skill",
-  );
-  const selectedCapabilityIds = useMemo(
-    () =>
-      new Set([
-        ...draft.sharedCapabilityIds,
-        ...draft.inheritedCapabilityIds,
-      ]),
-    [draft.inheritedCapabilityIds, draft.sharedCapabilityIds],
-  );
-  const toggleCapability = (capabilityId: string) => {
-    const capability = allCapabilities.find((item) => item.id === capabilityId);
-    if (!capability) return;
-    const key = capability.source === "agent"
-      ? "inheritedCapabilityIds"
-      : "sharedCapabilityIds";
-    patch(key, toggleItem(draft[key], capabilityId));
+  const updateActiveSettings = (next: ProjectAgentSettingsDraft) => {
+    if (!activeAgent) return;
+    patch("agentSettings", {
+      ...draft.agentSettings,
+      [activeAgent.id]: next,
+    });
   };
   const getPresentation = (capability: ProjectCapabilityOption) =>
     getLocalizedToolPresentation(t, {
@@ -859,6 +951,77 @@ function CapabilitiesStep({
       type: capability.kind,
       mcp_server_name: capability.mcp_server_name,
     });
+  const modelOptions = [
+    { value: "", label: t("projectSnapshot.followSourceAgent") },
+    ...((modelsQuery.data || []) as Array<{
+      id: string;
+      provider: string;
+      model: string;
+      label?: string;
+      enabled?: boolean;
+    }>)
+      .filter((model) => model.enabled !== false)
+      .map((model) => ({
+        value: model.id,
+        label: model.label || `${model.provider} · ${model.model}`,
+      })),
+  ];
+  const renderCapabilityCatalog = (kind: "mcp" | "skill") => {
+    if (!activeSettings) return null;
+    const items = visibleCapabilities.filter(
+      (capability) => capability.kind === kind,
+    );
+    const key = kind === "mcp" ? "mcp_capability_ids" : "skill_capability_ids";
+    const selectedKeys = new Set(activeSettings[key]);
+    return (
+      <ToolCatalogPanel
+        className="pm-capability-catalog"
+        items={items}
+        getKey={(capability) => capability.capability_id || capability.id}
+        getPresentation={getPresentation}
+        searchValue={capabilitySearch}
+        onSearchChange={setCapabilitySearch}
+        searchPlaceholder={t(
+          kind === "mcp"
+            ? "projectCreate.capabilities.searchTools"
+            : "projectCreate.capabilities.searchSkills",
+        )}
+        emptyLabel={t(
+          kind === "mcp"
+            ? "projectCreate.capabilities.noTools"
+            : "projectCreate.capabilities.noSkills",
+        )}
+        ariaLabel={t(
+          kind === "mcp"
+            ? "projectAgents.capabilityPackage.sections.mcp"
+            : "projectAgents.capabilityPackage.sections.skill",
+        )}
+        expandedGroups={expandedCapabilityGroups}
+        onExpandedGroupsChange={setExpandedCapabilityGroups}
+        selectedKeys={selectedKeys}
+        onToggle={(capabilityId) =>
+          updateActiveSettings({
+            ...activeSettings,
+            [key]: toggleItem(activeSettings[key], capabilityId),
+          })
+        }
+        renderGroupIcon={() =>
+          kind === "mcp" ? <IconCodeDots size={15} /> : <IconBolt size={15} />
+        }
+        renderItemBadges={(capability) => (
+          <span className="tool-catalog-panel__badge">
+            {capability.source === "agent"
+              ? t("projectCreate.capabilities.fromEmployee", {
+                  name:
+                    capability.owner_agent_name ||
+                    t("projectCreate.capabilities.employeeShort"),
+                })
+              : t("projectCreate.capabilities.projectShared")}
+          </span>
+        )}
+      />
+    );
+  };
   if (template?.snapshot_backed) {
     return (
       <div className="pm-step-section">
@@ -907,89 +1070,51 @@ function CapabilitiesStep({
             );
           })}
         </div>
-        <ProjectAgentCapabilityPanel
-          className="pm-capability-panel"
-          bodyClassName="pm-capability-panel__body"
-          value={capabilityTab}
-          onChange={setCapabilityTab}
-          ariaLabel={t("projectCreate.capabilities.tabsAria")}
-          tabs={[
-            {
-              value: "tools",
-              icon: <IconTool size={16} />,
-              label: t("projectCreate.capabilities.toolsTab"),
-              count: t("projectAgents.capabilityPackage.count", {
-                count: toolCapabilities.length,
-              }),
-            },
-            {
-              value: "skills",
-              icon: <IconBolt size={16} />,
-              label: t("projectCreate.capabilities.skillsTab"),
-              count: t("projectAgents.capabilityPackage.count", {
-                count: skillCapabilities.length,
-              }),
-            },
-          ] as const}
-        >
-          <ToolCatalogPanel
-            className="pm-capability-catalog"
-            items={
-              capabilityTab === "tools" ? toolCapabilities : skillCapabilities
+        {activeAgent && activeSettings ? (
+          <ProjectAgentSettingsPanel
+            className="pm-capability-panel"
+            title={activeAgent.name}
+            eyebrow={t("projectAgents.teamPage.workSettings")}
+            value={capabilityTab}
+            onChange={setCapabilityTab}
+            config={activeSettings.config_snapshot}
+            onConfigChange={(key, value) =>
+              updateActiveSettings({
+                ...activeSettings,
+                config_snapshot: {
+                  ...activeSettings.config_snapshot,
+                  [key]: value,
+                },
+              })
             }
-            getKey={(capability) => capability.id}
-            getPresentation={getPresentation}
-            searchValue={capabilityTab === "tools" ? toolSearch : skillSearch}
-            onSearchChange={
-              capabilityTab === "tools" ? setToolSearch : setSkillSearch
+            modelOptions={modelOptions}
+            counts={{
+              config: Object.values(activeSettings.config_snapshot).filter(Boolean)
+                .length,
+              tools: activeSettings.tools.length,
+              mcp: activeSettings.mcp_capability_ids.length,
+              skill: activeSettings.skill_capability_ids.length,
+            }}
+            tools={
+              <ToolsTab
+                agentId={activeAgent.id}
+                agentName={activeAgent.name}
+                canManage
+                canConfigure
+                scope="project"
+                draftTools={activeSettings.tools}
+                onDraftToolsChange={(nextTools) =>
+                  updateActiveSettings({
+                    ...activeSettings,
+                    tools: nextTools,
+                  })
+                }
+              />
             }
-            searchPlaceholder={t(
-              capabilityTab === "tools"
-                ? "projectCreate.capabilities.searchTools"
-                : "projectCreate.capabilities.searchSkills",
-            )}
-            emptyLabel={t(
-              capabilityTab === "tools"
-                ? "projectCreate.capabilities.noTools"
-                : "projectCreate.capabilities.noSkills",
-            )}
-            ariaLabel={t(
-              capabilityTab === "tools"
-                ? "projectCreate.capabilities.toolsAria"
-                : "projectCreate.capabilities.skillsAria",
-            )}
-            expandedGroups={
-              capabilityTab === "tools"
-                ? expandedToolGroups
-                : expandedSkillGroups
-            }
-            onExpandedGroupsChange={
-              capabilityTab === "tools"
-                ? setExpandedToolGroups
-                : setExpandedSkillGroups
-            }
-            selectedKeys={selectedCapabilityIds}
-            onToggle={toggleCapability}
-            renderGroupIcon={() =>
-              capabilityTab === "tools" ? (
-                <IconTool size={15} />
-              ) : (
-                <IconBolt size={15} />
-              )
-            }
-            renderItemBadges={(capability) => (
-              <span className="tool-catalog-panel__badge">
-                {capability.source === "agent"
-                  ? t("projectCreate.capabilities.fromEmployee", {
-                      name:
-                        capability.owner_agent_name ||
-                        t("projectCreate.capabilities.employeeShort"),
-                    })
-                  : t("projectCreate.capabilities.projectShared")}
-              </span>
-            )}
+            mcp={renderCapabilityCatalog("mcp")}
+            skill={renderCapabilityCatalog("skill")}
           />
-        </ProjectAgentCapabilityPanel>
+        ) : null}
       </section>
     </div>
   );

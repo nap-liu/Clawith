@@ -509,6 +509,33 @@ export const projectsApi = {
           status: string(agent.status, "idle"),
           skill_count: number(agent.skill_count),
           mcp_count: number(agent.mcp_count),
+          primary_model_id: string(agent.primary_model_id) || null,
+          fallback_model_id: string(agent.fallback_model_id) || null,
+          max_tool_rounds:
+            typeof agent.max_tool_rounds === "number"
+              ? agent.max_tool_rounds
+              : null,
+        };
+      }),
+      tools: array(source.tools).map((item) => {
+        const tool = record(item);
+        return {
+          id: string(tool.id),
+          name: string(tool.name),
+          display_name: string(tool.display_name || tool.name),
+          description: string(tool.description) || null,
+          category: string(tool.category) || null,
+          type: string(tool.type) || null,
+          icon: string(tool.icon) || null,
+          mcp_server_id: string(tool.mcp_server_id) || null,
+          mcp_server_name: string(tool.mcp_server_name) || null,
+          enabled: tool.enabled !== false,
+          can_disable: tool.can_disable !== false,
+          agent_config: record(tool.agent_config),
+          config_schema: Object.keys(record(tool.config_schema)).length
+            ? record(tool.config_schema)
+            : null,
+          source: string(tool.source) || null,
         };
       }),
       capabilities: normalizedCapabilities.length

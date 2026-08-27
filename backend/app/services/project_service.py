@@ -953,6 +953,12 @@ async def _validate_project_create_inputs(
         for member in members
         for capability_id in member.enabled_inherited_capability_ids
     }
+    selected_tool_ids.update(
+        setting.tool_id
+        for member in members
+        if member.settings is not None
+        for setting in member.settings.tools
+    )
     explicit_tool_ids = {
         capability.capability_id
         for capability in data.capabilities
@@ -973,6 +979,46 @@ async def _validate_project_create_inputs(
         )
         if available_tool_ids != tool_ids:
             raise HTTPException(status_code=422, detail="One or more selected tools are unavailable")
+
+    selected_mcp_ids = {
+        capability_id
+        for member in members
+        if member.settings is not None
+        for capability_id in member.settings.mcp_capability_ids
+    }
+    if selected_mcp_ids:
+        available_mcp_ids = set(
+            (
+                await db.execute(
+                    select(MCPServer.id).where(
+                        MCPServer.id.in_(selected_mcp_ids),
+                        or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+        if available_mcp_ids != selected_mcp_ids:
+            raise HTTPException(status_code=422, detail="One or more selected MCP services are unavailable")
+
+    selected_skill_ids = {
+        capability_id
+        for member in members
+        if member.settings is not None
+        for capability_id in member.settings.skill_capability_ids
+    }
+    if selected_skill_ids:
+        available_skill_ids = set(
+            (
+                await db.execute(
+                    select(Skill.id).where(
+                        Skill.id.in_(selected_skill_ids),
+                        or_(Skill.tenant_id == tenant_id, Skill.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+        if available_skill_ids != selected_skill_ids:
+            raise HTTPException(status_code=422, detail="One or more selected Skills are unavailable")
 
     for capability_id in set(data.shared_capability_ids):
         skill_exists = await db.scalar(
@@ -1172,7 +1218,11 @@ async def _create_project_uncompensated(
                 )
             )
 
-    from app.services.project_member_runtime import sync_project_capability_assignment
+    from app.services.project_member_runtime import (
+        apply_project_agent_tool_settings,
+        merge_project_member_runtime_config,
+        sync_project_capability_assignment,
+    )
     from app.services.project_skill_assets import bind_library_skill_to_project_agent
 
     for capability in capabilities:
@@ -1227,6 +1277,77 @@ async def _create_project_uncompensated(
             continue
         binding = await add_capability(db, project, capability, actor_user_id=user.id)
         await sync_project_capability_assignment(db, project, binding)
+
+    for source_member in members:
+        if source_member.settings is None:
+            continue
+        project_agent_id = source_to_project_agent[source_member.agent_id]
+        project_member = (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.agent_id == project_agent_id,
+                )
+            )
+        ).scalar_one()
+        project_member.config_snapshot = await merge_project_member_runtime_config(
+            db,
+            project,
+            project_member,
+            source_member.settings.config_snapshot,
+        )
+        await apply_project_agent_tool_settings(
+            db,
+            project,
+            project_agent_id=project_agent_id,
+            settings=[
+                (setting.tool_id, setting.enabled, setting.config)
+                for setting in source_member.settings.tools
+            ],
+        )
+        for capability_type, capability_ids in (
+            ("mcp", source_member.settings.mcp_capability_ids),
+            ("skill", source_member.settings.skill_capability_ids),
+        ):
+            for capability_id in dict.fromkeys(capability_ids):
+                existing = (
+                    await db.execute(
+                        select(ProjectCapabilityBinding.id).where(
+                            ProjectCapabilityBinding.project_id == project.id,
+                            ProjectCapabilityBinding.capability_type == capability_type,
+                            ProjectCapabilityBinding.capability_id == capability_id,
+                            ProjectCapabilityBinding.inherited_from_agent_id == project_agent_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    continue
+                capability = ProjectCapabilityCreate(
+                    capability_type=capability_type,
+                    capability_id=capability_id,
+                    source="inherited",
+                    inherited_from_agent_id=project_agent_id,
+                    is_enabled=True,
+                )
+                if capability_type == "skill":
+                    await bind_library_skill_to_project_agent(
+                        db,
+                        project,
+                        skill_id=capability_id,
+                        project_agent_id=project_agent_id,
+                        is_enabled=True,
+                        scope={},
+                        actor_user_id=user.id,
+                        actor_display_name=user.display_name,
+                    )
+                else:
+                    binding = await add_capability(
+                        db,
+                        project,
+                        capability,
+                        actor_user_id=user.id,
+                    )
+                    await sync_project_capability_assignment(db, project, binding)
 
     if data.visibility == "shared" and not data.shared_with_user_ids:
         raise HTTPException(status_code=422, detail="shared visibility requires shared_with_user_ids")

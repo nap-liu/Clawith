@@ -9,6 +9,8 @@ export default function ToolsTab({
     canConfigure = canManage,
     scope = 'agent',
     projectContext,
+    draftTools,
+    onDraftToolsChange,
 }: {
     agentId: string;
     agentName?: string;
@@ -16,6 +18,8 @@ export default function ToolsTab({
     canConfigure?: boolean;
     scope?: 'agent' | 'project';
     projectContext?: { projectId: string; memberId: string };
+    draftTools?: any[];
+    onDraftToolsChange?: (tools: any[]) => void;
 }) {
     const { t } = useTranslation();
 
@@ -32,6 +36,8 @@ export default function ToolsTab({
                 canConfigure={canConfigure}
                 scope={scope}
                 projectContext={projectContext}
+                draftTools={draftTools}
+                onDraftToolsChange={onDraftToolsChange}
             />
         </div>
     );
