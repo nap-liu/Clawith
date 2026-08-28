@@ -2061,7 +2061,7 @@ async def deactivate_project_owned_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.services.subagent_runtime import cancel_local_subagent_tasks
+    from app.services.subagent_runtime import finalize_cancelled_project_member_turns
 
     project = await require_owner(db, current_user, project_id)
     agent, member = await get_project_agent_record(db, project, agent_id)
@@ -2074,7 +2074,7 @@ async def deactivate_project_owned_agent(
         reason=data.reason if data else None,
     )
     await db.commit()
-    await cancel_local_subagent_tasks(child_ids)
+    await finalize_cancelled_project_member_turns(project.id, child_ids)
     await db.refresh(agent)
     await db.refresh(member)
     return await serialize_project_agent(project, agent, member)
@@ -2174,7 +2174,7 @@ async def remove_project_member(
 ):
     """Soft-remove a member while retaining every historical project record."""
 
-    from app.services.subagent_runtime import cancel_local_subagent_tasks
+    from app.services.subagent_runtime import finalize_cancelled_project_member_turns
 
     project = await require_project(db, current_user, project_id, edit=True)
     member = await _load_project_member(db, project, member_id)
@@ -2187,7 +2187,7 @@ async def remove_project_member(
         reason=data.reason if data else None,
     )
     await db.commit()
-    await cancel_local_subagent_tasks(child_ids)
+    await finalize_cancelled_project_member_turns(project.id, child_ids)
     await db.refresh(member)
     return member
 
@@ -2242,7 +2242,7 @@ async def patch_project_member(
             updates.pop("config_snapshot"),
         )
     if requested_enabled is False:
-        from app.services.subagent_runtime import cancel_local_subagent_tasks
+        from app.services.subagent_runtime import finalize_cancelled_project_member_turns
 
         child_ids = await deactivate_project_member(
             db,
@@ -2252,7 +2252,7 @@ async def patch_project_member(
             reason="member_patch_disable",
         )
         await db.commit()
-        await cancel_local_subagent_tasks(child_ids)
+        await finalize_cancelled_project_member_turns(project.id, child_ids)
     elif requested_enabled is True:
         await restore_project_member(
             db,
@@ -3516,6 +3516,17 @@ async def patch_project_run(
         run_id=run.id,
     )
     await db.flush()
+    terminal_group_run_id = (
+        run.id if run.status in {"succeeded", "failed", "cancelled"} else None
+    )
+    if terminal_group_run_id is not None:
+        # The websocket projection may only describe committed cohort state.
+        await db.commit()
+        from app.services.project_group_turn_lifecycle import (
+            reconcile_and_publish_project_run_group_turn,
+        )
+
+        await reconcile_and_publish_project_run_group_turn(terminal_group_run_id)
     await db.refresh(run)
     return (await serialize_project_runs(db, project, [run]))[0]
 
@@ -4111,13 +4122,23 @@ async def list_project_group_messages(
     has_more = len(newest_first) > limit
     messages = list(reversed(newest_first[:limit]))
     oldest_message = messages[0] if messages else None
+    from app.services.project_group_turn_lifecycle import reconcile_project_group_turn
+
+    turn_projection = await reconcile_project_group_turn(
+        db,
+        project_id=project.id,
+        session=session,
+    )
+    timeline = await build_project_group_timeline(
+        db,
+        project_id=project.id,
+        group_messages=messages,
+    )
+    await db.commit()
     return {
         "session": _group_session_payload(session, project),
-        "items": await build_project_group_timeline(
-            db,
-            project_id=project.id,
-            group_messages=messages,
-        ),
+        "items": timeline,
+        "turn": turn_projection.to_client_dict(),
         "has_more": has_more,
         "next_cursor": (
             f"{oldest_message.created_at.isoformat()}|{oldest_message.id}" if oldest_message is not None else None
@@ -4150,7 +4171,7 @@ async def create_project_group_message(
                 ChatSession.project_id == project.id,
                 ChatSession.source_channel == "project",
                 ChatSession.is_group.is_(True),
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if session is None:
@@ -4225,19 +4246,53 @@ async def create_project_group_message(
             .scalars()
             .all()
         )
+        from app.services.project_group_turn_lifecycle import reconcile_project_group_turn
+
+        turn_projection = await reconcile_project_group_turn(
+            db,
+            project_id=project.id,
+            session=session,
+        )
         await db.commit()
         for pending_run in pending_runs:
             if not dict(pending_run.output or {}).get("subagent_run_id"):
                 await dispatch_project_run(pending_run.id)
         await db.refresh(existing)
+        turn_projection = await reconcile_project_group_turn(
+            db,
+            project_id=project.id,
+            session=session,
+        )
+        await db.commit()
         meta = dict(existing.message_meta or {})
         return {
             "message": _group_message_payload(existing),
             "awakened_agent_ids": meta.get("awakened_agent_ids", []),
             "default_leader_agent_id": meta.get("default_leader_agent_id"),
             "subagent_runs": meta.get("subagent_runs", []),
+            "turn": turn_projection.to_client_dict(),
             "idempotent_replay": True,
         }
+
+    from app.services.project_group_turn_lifecycle import (
+        find_project_group_blocking_confirmation,
+    )
+
+    blocking_confirmation = await find_project_group_blocking_confirmation(
+        db,
+        project_id=project.id,
+        session_id=session.id,
+    )
+    if blocking_confirmation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "project_group_confirmation_pending",
+                "message": "请先完成当前待确认操作。",
+                "call_id": str(blocking_confirmation.row_id),
+                "client_message_id": data.client_message_id,
+            },
+        )
 
     message = ChatMessage(
         agent_id=session.agent_id,
@@ -4326,9 +4381,30 @@ async def create_project_group_message(
         await db.flush()
         await freeze_run_members(db, project, project_run)
         project_runs.append(project_run)
+    from app.services.project_group_turn_lifecycle import (
+        publish_project_group_turn_event,
+        reconcile_project_group_turn,
+    )
+
+    admitted_turn = await reconcile_project_group_turn(
+        db,
+        project_id=project.id,
+        session=session,
+    )
     # Message and every target run form one durable outbox transaction. The
     # Subagent daemon can recover all rows after a process exit.
     await db.commit()
+    await publish_project_group_turn_event(
+        session=session,
+        projection=admitted_turn,
+        payload={
+            **_group_message_payload(message),
+            "type": "user_message_committed",
+            "client_message_id": data.client_message_id,
+            "message_id": str(message.id),
+        },
+        event_kind="turn_user_committed",
+    )
 
     awakened: list[str] = []
     subagent_rows: list[dict] = []
@@ -4413,6 +4489,13 @@ async def create_project_group_message(
         )
     else:
         event.event_metadata = event_metadata
+    from app.services.project_group_turn_lifecycle import reconcile_project_group_turn
+
+    turn_projection = await reconcile_project_group_turn(
+        db,
+        project_id=project.id,
+        session=session,
+    )
     await db.flush()
     await db.commit()
     await db.refresh(message)
@@ -4422,6 +4505,7 @@ async def create_project_group_message(
         "awakened_agent_ids": awakened,
         "default_leader_agent_id": str(default_leader_agent_id),
         "subagent_runs": subagent_rows,
+        "turn": turn_projection.to_client_dict(),
     }
 
 

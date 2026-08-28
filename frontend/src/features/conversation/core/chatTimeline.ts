@@ -36,7 +36,13 @@ export type ConversationMessage = {
   sender_user_id?: string;
   sender_agent_id?: string;
   confirmationToolCalls?: ConversationMessage[];
+  turnAnchorId?: string;
+  turnGeneration?: number;
+  producerScope?: string;
+  _conversationTurnProgress?: boolean;
   _streaming?: boolean;
+  _canonicalDone?: boolean;
+  _toolCallIdExplicit?: boolean;
 };
 
 /**
@@ -91,6 +97,12 @@ export type AssistantStreamMessage = {
   messageId?: string;
   sender_name?: string;
   sender_agent_id?: string;
+  preserveTransient?: boolean;
+  turnAnchorId?: string;
+  turnGeneration?: number;
+  turnSuspended?: boolean;
+  producerScope?: string;
+  transientMessageId?: string;
 };
 
 const CONFIRMATION_TOOL = "request_confirmation";
@@ -133,6 +145,47 @@ function normalizeToolResult(result: any): string | undefined {
   }
 }
 
+function eventTimelineAnchorId(data: any): string | undefined {
+  const value =
+    data?.timeline_anchor_id ||
+    data?.timelineAnchorId ||
+    data?.turn?.turn_anchor_id;
+  return value ? String(value) : undefined;
+}
+
+function normalizeTurnTimelinePartition<T extends ConversationMessage>(
+  messages: T[],
+  turnAnchorId?: string,
+): T[] {
+  if (!turnAnchorId) return messages;
+  const anchorIndex = messages.findIndex(
+    (message) => message.role === "user" && message.id === turnAnchorId,
+  );
+  if (anchorIndex < 0) return messages;
+  const scoped = messages.filter(
+    (message) =>
+      message.role !== "user" && message.turnAnchorId === turnAnchorId,
+  );
+  if (!scoped.length) return messages;
+  const scopedSet = new Set(scoped);
+  const remaining = messages.filter((message) => !scopedSet.has(message));
+  const remainingAnchorIndex = remaining.findIndex(
+    (message) => message.role === "user" && message.id === turnAnchorId,
+  );
+  const nextUserOffset = remaining
+    .slice(remainingAnchorIndex + 1)
+    .findIndex((message) => message.role === "user");
+  const insertionIndex =
+    nextUserOffset < 0
+      ? remaining.length
+      : remainingAnchorIndex + 1 + nextUserOffset;
+  return [
+    ...remaining.slice(0, insertionIndex),
+    ...scoped,
+    ...remaining.slice(insertionIndex),
+  ];
+}
+
 export function mapHistoryMessage(
   raw: any,
   makeId: () => string = defaultMakeId,
@@ -142,6 +195,12 @@ export function mapHistoryMessage(
 
   if (raw.role === "tool_call") {
     const parsed = parseStoredToolPayload(raw.content);
+    const metadata =
+      raw.message_meta && typeof raw.message_meta === "object"
+        ? raw.message_meta
+        : raw.metadata && typeof raw.metadata === "object"
+          ? raw.metadata
+          : {};
     const id = String(raw.toolCallId || raw.id || makeId());
     const toolArgs = raw.toolArgs ?? parsed.args ?? parsed.arguments ?? {};
     return {
@@ -150,6 +209,10 @@ export function mapHistoryMessage(
       content: parsed.name ? "" : raw.content || "",
       created_at: raw.created_at || null,
       toolCallId: String(raw.toolCallId || parsed.call_id || parsed.id || id),
+      _toolCallIdExplicit:
+        typeof raw.toolCallIdExplicit === "boolean"
+          ? raw.toolCallIdExplicit
+          : Boolean(parsed.call_id || parsed.id),
       toolName: raw.toolName || parsed.name || parsed.tool_name || "tool",
       toolArgs,
       toolStatus: normalizeToolStatus(raw.toolStatus || parsed.status),
@@ -159,9 +222,28 @@ export function mapHistoryMessage(
       sender_name: raw.sender_name || undefined,
       sender_user_id: raw.sender_user_id || undefined,
       sender_agent_id: raw.sender_agent_id || undefined,
+      turnAnchorId:
+        raw.timeline_anchor_id ||
+        raw.turnAnchorId ||
+        metadata.turn_anchor_id ||
+        undefined,
+      turnGeneration:
+        raw.turnGeneration ?? metadata.turn_generation ?? undefined,
+      producerScope:
+        raw.producerScope ||
+        raw.producer_scope ||
+        metadata.producer_scope ||
+        metadata.project_timeline?.subagent_session_id ||
+        undefined,
     };
   }
 
+  const metadata =
+    raw.message_meta && typeof raw.message_meta === "object"
+      ? raw.message_meta
+      : raw.metadata && typeof raw.metadata === "object"
+        ? raw.metadata
+        : {};
   const quotedMessage = normalizeChatQuotedMessage(raw.quoted_message);
   return {
     id: String(raw.id || makeId()),
@@ -173,6 +255,20 @@ export function mapHistoryMessage(
     sender_name: raw.sender_name || undefined,
     sender_user_id: raw.sender_user_id || undefined,
     sender_agent_id: raw.sender_agent_id || undefined,
+    turnAnchorId:
+      raw.timeline_anchor_id ||
+      raw.turnAnchorId ||
+      metadata.turn_anchor_id ||
+      undefined,
+    turnGeneration:
+      raw.turnGeneration ?? metadata.turn_generation ?? undefined,
+    producerScope:
+      raw.producerScope ||
+      raw.producer_scope ||
+      metadata.producer_scope ||
+      metadata.project_timeline?.subagent_session_id ||
+      undefined,
+    _canonicalDone: raw.canonicalDone === true || raw._canonicalDone === true,
     ...(Object.prototype.hasOwnProperty.call(raw, "display_content")
       ? { display_content: raw.display_content || "" }
       : {}),
@@ -193,6 +289,51 @@ export function hasPendingConfirmation(
       message.toolStatus === "running" &&
       parseToolArgs(message.toolArgs).force_confirmation !== false,
   );
+}
+
+export function applyUserMessageCommitted<T extends Record<string, any>>(
+  messages: T[],
+  event: Record<string, any>,
+  makeId: () => string = defaultMakeId,
+): T[] {
+  const clientId = String(event.client_message_id || "");
+  const durableId = String(event.message_id || event.id || "");
+  if (!durableId) return messages;
+  const clientIndex = clientId
+    ? messages.findIndex((message) => String(message.id || "") === clientId)
+    : -1;
+  const durableIndex = messages.findIndex(
+    (message) => String(message.id || "") === durableId,
+  );
+  const index = clientIndex >= 0 ? clientIndex : durableIndex;
+  const hasFullRow = Object.prototype.hasOwnProperty.call(event, "content");
+  if (index < 0 && !hasFullRow) return messages;
+  const existing: Record<string, any> = index >= 0 ? messages[index] : {};
+  const committed = {
+    ...existing,
+    id: durableId || makeId(),
+    role: "user",
+    ...(hasFullRow ? { content: String(event.content || "") } : {}),
+    ...(Object.prototype.hasOwnProperty.call(event, "display_content")
+      ? { display_content: String(event.display_content || "") }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(event, "attachments")
+      ? { attachments: event.attachments || [] }
+      : {}),
+    ...(event.sender_name ? { sender_name: event.sender_name } : {}),
+    ...(event.sender_user_id || event.user_id
+      ? { sender_user_id: String(event.sender_user_id || event.user_id) }
+      : {}),
+    created_at: event.created_at || existing.created_at,
+    timestamp: event.created_at || existing.timestamp,
+  } as unknown as T;
+  if (index < 0) return [...messages, committed];
+  const next = [...messages];
+  next[index] = committed;
+  if (clientIndex >= 0 && durableIndex >= 0 && durableIndex !== clientIndex) {
+    next.splice(durableIndex, 1);
+  }
+  return next;
 }
 
 export function findStreamingAssistantIndex(messages: ConversationMessage[]) {
@@ -222,6 +363,66 @@ function findStreamingAssistantIndexAfterLastTool(
   return -1;
 }
 
+function findStreamingAssistantIndexForAnchor(
+  messages: ConversationMessage[],
+  turnAnchorId: string,
+) {
+  const lastToolIndex = findLastScopedToolIndex(messages, turnAnchorId);
+  for (let i = messages.length - 1; i > lastToolIndex; i -= 1) {
+    const message = messages[i];
+    if (
+      message.role === "assistant" &&
+      Boolean(message.streaming || message._streaming) &&
+      message.turnAnchorId === turnAnchorId
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function findStreamingAssistantIndexForProducer(
+  messages: ConversationMessage[],
+  turnAnchorId: string | undefined,
+  producerScope: string,
+) {
+  const lastToolIndex = findLastScopedToolIndex(
+    messages,
+    turnAnchorId,
+    producerScope,
+  );
+  for (let i = messages.length - 1; i > lastToolIndex; i -= 1) {
+    const message = messages[i];
+    if (
+      message.role === "assistant" &&
+      Boolean(message.streaming || message._streaming) &&
+      message.producerScope === producerScope &&
+      (!turnAnchorId || message.turnAnchorId === turnAnchorId)
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function findLastScopedToolIndex(
+  messages: ConversationMessage[],
+  turnAnchorId?: string,
+  producerScope?: string,
+): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (
+      message.role === "tool_call" &&
+      (!turnAnchorId || message.turnAnchorId === turnAnchorId) &&
+      (!producerScope || message.producerScope === producerScope)
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 export function applyAssistantDoneMessage<T extends Record<string, any>>(
   messages: T[],
   event: {
@@ -230,6 +431,12 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     messageId?: string;
     sender_name?: string;
     sender_agent_id?: string;
+    preserveTransient?: boolean;
+    turnAnchorId?: string;
+    turnGeneration?: number;
+    turnSuspended?: boolean;
+    producerScope?: string;
+    transientMessageId?: string;
   },
   makeId: () => string = defaultMakeId,
 ): T[] {
@@ -240,6 +447,31 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     : -1;
   const content = event.content || "";
   const now = event.now || new Date().toISOString();
+  if (event.preserveTransient) {
+    if (!content.trim()) return messages;
+    const committedId = event.messageId || makeId();
+    const existingIndex = messages.findIndex(
+      (message) => String(message.id || "") === committedId,
+    );
+    const committed = {
+      ...(existingIndex >= 0 ? messages[existingIndex] : {}),
+      id: committedId,
+      role: "assistant",
+      content,
+      created_at: now,
+      timestamp: now,
+      sender_name: event.sender_name,
+      sender_agent_id: event.sender_agent_id,
+      streaming: false,
+      _streaming: false,
+    } as unknown as T;
+    if (existingIndex < 0) return [...messages, committed];
+    return [
+      ...messages.slice(0, existingIndex),
+      committed,
+      ...messages.slice(existingIndex + 1),
+    ];
+  }
   let lastUserIdx = -1;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     if (messages[i].role === "user") {
@@ -250,9 +482,16 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
   const identifiedMessage =
     identifiedIdx >= 0 ? messages[identifiedIdx] : undefined;
   const isCurrentTurnStream = (message: T, index: number) =>
-    index > lastUserIdx &&
     message.role === "assistant" &&
-    Boolean(message.streaming || message._streaming);
+    Boolean(message.streaming || message._streaming) &&
+    (event.producerScope
+      ? String(message.producerScope || "") === event.producerScope &&
+        (!event.turnAnchorId || message.turnAnchorId === event.turnAnchorId)
+      : event.transientMessageId
+        ? String(message.id || "") === event.transientMessageId
+        : event.turnAnchorId
+          ? String(message.turnAnchorId || "") === event.turnAnchorId
+          : index > lastUserIdx);
   const streamed = messages.filter(isCurrentTurnStream);
   const streamedThinking = streamed
     .map((message) => message.thinking || "")
@@ -262,6 +501,31 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     .map((message) => message.content || "")
     .filter((segment) => segment.trim())
     .join("\n\n");
+
+  // Suspension closes the active transport streams without creating or
+  // relocating a timeline message. Every row keeps the position in which the
+  // turn produced it; resuming the turn may append new rows later.
+  if (event.turnSuspended) {
+    if (streamed.length === 0) return messages;
+    const explicitContentTarget = event.messageId
+      ? streamed.find(
+          (message) => String(message.id || "") === event.messageId,
+        )
+      : streamed.length === 1
+        ? streamed[0]
+        : undefined;
+    return messages.map((message, index) => {
+      if (!isCurrentTurnStream(message, index)) return message;
+      return {
+        ...message,
+        ...(message === explicitContentTarget && content
+          ? { content }
+          : {}),
+        streaming: false,
+        _streaming: false,
+      } as T;
+    });
+  }
 
   // Explicit ids address one committed message (currently onboarding and
   // server-committed rows). Preserve its full shape and position, but still
@@ -324,33 +588,36 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     sender_name: event.sender_name || identifiedMessage?.sender_name || streamed[0]?.sender_name,
     sender_agent_id:
       event.sender_agent_id || identifiedMessage?.sender_agent_id || streamed[0]?.sender_agent_id,
+    turnAnchorId:
+      event.turnAnchorId || identifiedMessage?.turnAnchorId || streamed[0]?.turnAnchorId,
+    turnGeneration:
+      event.turnGeneration ?? identifiedMessage?.turnGeneration ?? streamed[0]?.turnGeneration,
+    producerScope:
+      event.producerScope || identifiedMessage?.producerScope || streamed[0]?.producerScope,
     streaming: false,
     _streaming: false,
     _canonicalDone: true,
   } as unknown as T;
 
-  // A blank done denotes suspension. Put the normalized streamed intro just
-  // before the pending confirmation card, matching its durable row order.
-  if (!content) {
-    let nextLastUserIdx = -1;
-    for (let i = next.length - 1; i >= 0; i -= 1) {
-      if (next[i].role === "user") {
-        nextLastUserIdx = i;
-        break;
-      }
-    }
-    const confirmationIdx = next.findIndex(
-      (message, index) =>
-        index > nextLastUserIdx &&
-        message.role === "tool_call" &&
-        message.toolName === CONFIRMATION_TOOL &&
-        normalizeToolStatus(message.toolStatus) === "running",
+  // A late terminal for turn A can arrive after turn B's user message and
+  // stream. Place A's durable reply at A's timeline boundary and remove only
+  // A-scoped transport rows; never append it after or collapse B.
+  if (event.turnAnchorId) {
+    const anchorIndex = messages.findIndex(
+      (message) => String(message.id || "") === event.turnAnchorId,
     );
-    if (confirmationIdx >= 0) {
+    if (anchorIndex >= 0) {
+      const nextUser = messages
+        .slice(anchorIndex + 1)
+        .find((message) => message.role === "user");
+      const insertionIndex = nextUser
+        ? next.findIndex((message) => message === nextUser)
+        : next.length;
+      const safeIndex = insertionIndex >= 0 ? insertionIndex : next.length;
       return [
-        ...next.slice(0, confirmationIdx),
+        ...next.slice(0, safeIndex),
         canonical,
-        ...next.slice(confirmationIdx),
+        ...next.slice(safeIndex),
       ];
     }
   }
@@ -374,15 +641,59 @@ export function applyAssistantStreamMessage(
   event: AssistantStreamMessage,
   makeId: () => string = defaultMakeId,
 ): ConversationMessage[] {
+  if (
+    event.type !== "done" &&
+    event.producerScope &&
+    messages.some(
+      (message) =>
+        message.role === "assistant" &&
+        Boolean((message as any)._canonicalDone) &&
+        message.producerScope === event.producerScope &&
+        (!event.turnAnchorId || message.turnAnchorId === event.turnAnchorId),
+    )
+  ) {
+    return messages;
+  }
+  const scopedToolBoundary = findLastScopedToolIndex(
+    messages,
+    event.turnAnchorId,
+    event.producerScope,
+  );
   const identifiedIdx = event.messageId
-    ? messages.findIndex((message) => message.id === event.messageId)
+    ? messages.findIndex(
+        (message, index) =>
+          message.id === event.messageId &&
+          ((!event.turnAnchorId && !event.producerScope) ||
+            index > scopedToolBoundary),
+      )
     : -1;
-  const idx =
-    identifiedIdx >= 0
-      ? identifiedIdx
-      : findStreamingAssistantIndexAfterLastTool(messages);
+  const producerStreamingIdx = event.producerScope
+    ? findStreamingAssistantIndexForProducer(
+        messages,
+        event.turnAnchorId,
+        event.producerScope,
+      )
+    : -1;
+  const scopedStreamingIdx = !event.producerScope && event.turnAnchorId
+    ? findStreamingAssistantIndexForAnchor(messages, event.turnAnchorId)
+    : -1;
+  const idx = identifiedIdx >= 0
+    ? identifiedIdx
+    : producerStreamingIdx >= 0
+        ? producerStreamingIdx
+        : scopedStreamingIdx >= 0
+          ? scopedStreamingIdx
+          : event.messageId
+            ? -1
+          : event.turnAnchorId || event.producerScope
+        ? -1
+        : findStreamingAssistantIndexAfterLastTool(messages);
   const content = event.content || "";
   const now = event.now || new Date().toISOString();
+  const nextSegmentId = () =>
+    event.messageId && !messages.some((message) => message.id === event.messageId)
+      ? event.messageId
+      : makeId();
 
   if (event.type === "thinking") {
     if (idx >= 0) {
@@ -392,6 +703,9 @@ export function applyAssistantStreamMessage(
         thinking: (next[idx].thinking || "") + content,
         sender_name: event.sender_name || next[idx].sender_name,
         sender_agent_id: event.sender_agent_id || next[idx].sender_agent_id,
+        turnAnchorId: event.turnAnchorId || next[idx].turnAnchorId,
+        turnGeneration: event.turnGeneration ?? next[idx].turnGeneration,
+        producerScope: event.producerScope || next[idx].producerScope,
         streaming: true,
         _streaming: true,
       };
@@ -400,12 +714,15 @@ export function applyAssistantStreamMessage(
     return [
       ...messages,
       {
-        id: event.messageId || makeId(),
+        id: nextSegmentId(),
         role: "assistant",
         content: "",
         thinking: content,
         sender_name: event.sender_name,
         sender_agent_id: event.sender_agent_id,
+        turnAnchorId: event.turnAnchorId,
+        turnGeneration: event.turnGeneration,
+        producerScope: event.producerScope,
         streaming: true,
         _streaming: true,
       },
@@ -420,6 +737,9 @@ export function applyAssistantStreamMessage(
         content: next[idx].content + content,
         sender_name: event.sender_name || next[idx].sender_name,
         sender_agent_id: event.sender_agent_id || next[idx].sender_agent_id,
+        turnAnchorId: event.turnAnchorId || next[idx].turnAnchorId,
+        turnGeneration: event.turnGeneration ?? next[idx].turnGeneration,
+        producerScope: event.producerScope || next[idx].producerScope,
         streaming: true,
         _streaming: true,
       };
@@ -428,11 +748,14 @@ export function applyAssistantStreamMessage(
     return [
       ...messages,
       {
-        id: event.messageId || makeId(),
+        id: nextSegmentId(),
         role: "assistant",
         content,
         sender_name: event.sender_name,
         sender_agent_id: event.sender_agent_id,
+        turnAnchorId: event.turnAnchorId,
+        turnGeneration: event.turnGeneration,
+        producerScope: event.producerScope,
         streaming: true,
         _streaming: true,
       },
@@ -442,13 +765,92 @@ export function applyAssistantStreamMessage(
   return applyAssistantDoneMessage(messages, event, makeId);
 }
 
+function toolTurnScope(message: ConversationMessage): string {
+  const producer = message.producerScope
+    ? `:producer:${message.producerScope}`
+    : "";
+  if (message.turnAnchorId) return `anchor:${message.turnAnchorId}${producer}`;
+  if (message.turnGeneration != null)
+    return `generation:${message.turnGeneration}${producer}`;
+  if (producer) return producer.slice(1);
+  return "legacy";
+}
+
+function sameToolTurn(a: ConversationMessage, b: ConversationMessage): boolean {
+  const aScope = toolTurnScope(a);
+  const bScope = toolTurnScope(b);
+  return aScope === bScope;
+}
+
+function hasExplicitToolCallId(message: ConversationMessage): boolean {
+  return Boolean(
+    message.toolCallId && message._toolCallIdExplicit !== false,
+  );
+}
+
+function mergeToolCallProjection(
+  previous: ConversationMessage,
+  incoming: ConversationMessage,
+  identitySource: "previous" | "incoming",
+): ConversationMessage {
+  const previousParsed = parseStoredToolPayload(previous.content);
+  const incomingParsed = parseStoredToolPayload(incoming.content);
+  const previousStatus = normalizeToolStatus(
+    previous.toolStatus || previousParsed.status,
+  );
+  const incomingStatus = normalizeToolStatus(
+    incoming.toolStatus || incomingParsed.status,
+  );
+  const incomingIsStale =
+    previousStatus === "done" && incomingStatus !== "done";
+  const primary = incomingIsStale ? previous : incoming;
+  const secondary = incomingIsStale ? incoming : previous;
+  const identity = identitySource === "incoming" ? incoming : previous;
+  const fallbackIdentity = identity === incoming ? previous : incoming;
+  const primaryParsed = primary === incoming ? incomingParsed : previousParsed;
+  const secondaryParsed = primary === incoming ? previousParsed : incomingParsed;
+  const primaryArgs = primary.toolArgs ?? primaryParsed.args;
+  const secondaryArgs = secondary.toolArgs ?? secondaryParsed.args;
+  const primaryResult = normalizeToolResult(
+    primary.toolResult || primaryParsed.result,
+  );
+  const secondaryResult = normalizeToolResult(
+    secondary.toolResult || secondaryParsed.result,
+  );
+  const selectedStatus = incomingIsStale ? previousStatus : incomingStatus;
+
+  return {
+    ...secondary,
+    ...primary,
+    id: identity.id || fallbackIdentity.id,
+    created_at: identity.created_at || fallbackIdentity.created_at,
+    timestamp: identity.timestamp || fallbackIdentity.timestamp,
+    toolArgs:
+      Object.keys(parseToolArgs(primaryArgs)).length > 0
+        ? primaryArgs
+        : secondaryArgs,
+    toolStatus: selectedStatus,
+    toolResult: primaryResult || secondaryResult || "",
+    streaming:
+      selectedStatus === "running" &&
+      Boolean(primary.streaming || secondary.streaming),
+    _streaming:
+      selectedStatus === "running" &&
+      Boolean(primary._streaming || secondary._streaming),
+  };
+}
+
 export function isSameMessage(a: ConversationMessage, b: ConversationMessage) {
   if (a.role === "tool_call" || b.role === "tool_call") {
     if (a.role !== b.role) return false;
-    if (a.toolCallId && a.toolCallId === b.toolCallId) return true;
+    if (a.toolCallId && a.toolCallId === b.toolCallId && sameToolTurn(a, b))
+      return true;
+    if (hasExplicitToolCallId(a) || hasExplicitToolCallId(b)) return false;
     const aRenderIdentity = getChatToolRenderIdentity(a);
     return (
-      !!aRenderIdentity && aRenderIdentity === getChatToolRenderIdentity(b)
+      !!aRenderIdentity &&
+      sameToolTurn(a, b) &&
+      aRenderIdentity === getChatToolRenderIdentity(b)
     );
   }
   return (
@@ -464,13 +866,18 @@ export function mergeHistoryMessages(
   history: ConversationMessage[],
 ) {
   if (history.length === 0) return prev;
+  const projectedHistory = [...history];
 
   const mergeKeys = (message: ConversationMessage) => {
     if (message.role === "tool_call") {
       const keys: string[] = [];
-      if (message.toolCallId) keys.push(`tool-call:${message.toolCallId}`);
-      const renderIdentity = getChatToolRenderIdentity(message);
-      if (renderIdentity) keys.push(`tool-render:${renderIdentity}`);
+      const scope = toolTurnScope(message);
+      if (hasExplicitToolCallId(message))
+        keys.push(`tool-call:${scope}:${message.toolCallId}`);
+      else {
+        const renderIdentity = getChatToolRenderIdentity(message);
+        if (renderIdentity) keys.push(`tool-render:${scope}:${renderIdentity}`);
+      }
       return keys;
     }
     const keys: string[] = [];
@@ -526,6 +933,16 @@ export function mergeHistoryMessages(
       }
     }
     if (matchedHistoryIndex >= 0) {
+      if (
+        local.role === "tool_call" &&
+        projectedHistory[matchedHistoryIndex]?.role === "tool_call"
+      ) {
+        projectedHistory[matchedHistoryIndex] = mergeToolCallProjection(
+          local,
+          projectedHistory[matchedHistoryIndex],
+          "incoming",
+        );
+      }
       usedHistoryIndexes.add(matchedHistoryIndex);
       matchedHistoryByLocalIndex.set(localIndex, matchedHistoryIndex);
       previousHistoryIndex = matchedHistoryIndex;
@@ -544,7 +961,7 @@ export function mergeHistoryMessages(
     localOnly.push({ message: local, localIndex, previousHistoryIndex });
   }
 
-  if (localOnly.length === 0) return history;
+  if (localOnly.length === 0) return projectedHistory;
 
   const messageTime = (message: ConversationMessage) => {
     const value = message.created_at || message.timestamp;
@@ -564,7 +981,7 @@ export function mergeHistoryMessages(
 
     const lowerBound = Math.max(0, local.previousHistoryIndex + 1);
     const upperBound =
-      nextHistoryIndex >= 0 ? nextHistoryIndex : history.length;
+      nextHistoryIndex >= 0 ? nextHistoryIndex : projectedHistory.length;
     const localTime = messageTime(local.message);
     // A transient without a server timestamp was already visible before
     // this history request began. Durable rows that appear only in the new
@@ -577,7 +994,7 @@ export function mergeHistoryMessages(
         : upperBound;
     if (localTime != null) {
       for (let index = lowerBound; index < upperBound; index += 1) {
-        const historyTime = messageTime(history[index]);
+        const historyTime = messageTime(projectedHistory[index]);
         if (historyTime != null && historyTime > localTime) {
           insertionIndex = index;
           break;
@@ -590,10 +1007,10 @@ export function mergeHistoryMessages(
   }
 
   const merged: ConversationMessage[] = [];
-  for (let index = 0; index <= history.length; index += 1) {
+  for (let index = 0; index <= projectedHistory.length; index += 1) {
     const localBucket = buckets.get(index);
     if (localBucket) merged.push(...localBucket);
-    if (index < history.length) merged.push(history[index]);
+    if (index < projectedHistory.length) merged.push(projectedHistory[index]);
   }
   return merged;
 }
@@ -601,9 +1018,13 @@ export function mergeHistoryMessages(
 function stableMessageKeys(message: ConversationMessage): string[] {
   const keys: string[] = [];
   if (message.id) keys.push(`message:${message.id}`);
-  if (message.toolCallId) keys.push(`tool-call:${message.toolCallId}`);
-  const renderIdentity = getChatToolRenderIdentity(message);
-  if (renderIdentity) keys.push(`tool-render:${renderIdentity}`);
+  const scope = toolTurnScope(message);
+  if (hasExplicitToolCallId(message))
+    keys.push(`tool-call:${scope}:${message.toolCallId}`);
+  else {
+    const renderIdentity = getChatToolRenderIdentity(message);
+    if (renderIdentity) keys.push(`tool-render:${scope}:${renderIdentity}`);
+  }
   return keys;
 }
 
@@ -689,13 +1110,18 @@ export function upsertToolCallMessage(
   toolMsg: ConversationMessage,
 ) {
   const incomingTarget = getToolTargetKey(toolMsg.toolArgs);
+  const sameTurnIdentity = (msg: ConversationMessage) =>
+    sameToolTurn(msg, toolMsg);
   const exactIdMatch = (msg: ConversationMessage) =>
     msg.role === "tool_call" &&
     !!toolMsg.toolCallId &&
-    msg.toolCallId === toolMsg.toolCallId;
+    msg.toolCallId === toolMsg.toolCallId &&
+    sameTurnIdentity(msg);
   const sameTool = (msg: ConversationMessage) =>
     exactIdMatch(msg) ||
     (msg.role === "tool_call" &&
+      !toolMsg._toolCallIdExplicit &&
+      sameTurnIdentity(msg) &&
       msg.toolName === toolMsg.toolName &&
       msg.toolStatus === "running" &&
       ((!!incomingTarget &&
@@ -706,21 +1132,223 @@ export function upsertToolCallMessage(
 
   const idx = messages.length - 1 - runningIdx;
   const previous = messages[idx];
-  if (previous.toolStatus === "done" && toolMsg.toolStatus !== "done") {
-    return messages;
-  }
   const nextToolArgs =
     Object.keys(parseToolArgs(toolMsg.toolArgs)).length > 0
       ? toolMsg.toolArgs
       : previous.toolArgs;
-  const merged = {
-    ...previous,
+  const merged = mergeToolCallProjection(previous, {
     ...toolMsg,
     toolArgs: nextToolArgs,
-    id: previous.id || toolMsg.id,
-    created_at: previous.created_at || toolMsg.created_at,
-  };
+  }, "previous");
   return [...messages.slice(0, idx), merged, ...messages.slice(idx + 1)];
+}
+
+export function applyConfirmationRequiredEvent(
+  messages: ConversationMessage[],
+  data: any,
+  makeId: () => string = defaultMakeId,
+  now = new Date().toISOString(),
+): ConversationMessage[] {
+  const rejectedOptimisticId = String(data.message_id || "");
+  const withoutRejectedAttempt = rejectedOptimisticId
+    ? messages.filter(
+        (message) => String(message.id || "") !== rejectedOptimisticId,
+      )
+    : messages;
+  return upsertToolCallMessage(
+    withoutRejectedAttempt,
+    toolCallMessageFromEvent(
+      { ...data, status: "running", name: data.name || CONFIRMATION_TOOL },
+      makeId,
+      now,
+    ),
+  );
+}
+
+export function applyAssistantMessageCommitted(
+  messages: ConversationMessage[],
+  data: any,
+  makeId: () => string = defaultMakeId,
+  preserveTransient = false,
+): ConversationMessage[] {
+  const committed = mapHistoryMessage(
+    { ...data, id: data.id || data.message_id, role: "assistant" },
+    makeId,
+  );
+  if (!committed) return messages;
+  const index = messages.findIndex((message) => message.id === committed.id);
+  const staged =
+    index < 0
+      ? [...messages, committed]
+      : [
+          ...messages.slice(0, index),
+          { ...messages[index], ...committed },
+          ...messages.slice(index + 1),
+        ];
+  if (preserveTransient) return staged;
+  const folded = applyAssistantDoneMessage(index < 0 ? messages : staged, {
+    content: committed.content,
+    now: committed.created_at || committed.timestamp || undefined,
+    messageId: committed.id,
+    transientMessageId: data.transient_message_id
+      ? String(data.transient_message_id)
+      : undefined,
+    producerScope: data.producer_scope
+      ? String(data.producer_scope)
+      : committed.producerScope,
+    sender_name: committed.sender_name,
+    sender_agent_id: committed.sender_agent_id,
+    turnAnchorId: eventTimelineAnchorId(data) || committed.turnAnchorId,
+    turnGeneration: Number.isInteger(Number(data.turn?.generation))
+      ? Number(data.turn.generation)
+      : committed.turnGeneration,
+  }, makeId);
+  const committedIndex = folded.findIndex(
+    (message) => message.id === committed.id,
+  );
+  if (committedIndex < 0) return folded;
+  const finalized = {
+    ...folded[committedIndex],
+    ...committed,
+    thinking: committed.thinking || folded[committedIndex].thinking,
+    streaming: false,
+    _streaming: false,
+    _canonicalDone: true,
+  };
+  return [
+    ...folded.slice(0, committedIndex),
+    finalized,
+    ...folded.slice(committedIndex + 1),
+  ];
+}
+
+export type ConversationTimelineFoldResult<T extends ConversationMessage> = {
+  messages: T[];
+  handled: boolean;
+};
+
+/**
+ * The single message-semantic fold used by every chat surface.
+ *
+ * Page adapters may still batch stream frames or react to workspace/toast
+ * events, but they do not decide how a transport event mutates the timeline.
+ * In particular, workspace drafts are page side effects and never tool rows.
+ */
+export function foldConversationTimelineEvent<T extends ConversationMessage>(
+  messages: T[],
+  data: Record<string, any>,
+  options: {
+    makeId?: () => string;
+    now?: string;
+    preserveTransient?: boolean;
+  } = {},
+): ConversationTimelineFoldResult<T> {
+  const makeId = options.makeId || defaultMakeId;
+  const now = options.now || new Date().toISOString();
+  const type = String(data.type || "");
+  const rejectedMessageId = String(data.rejected_message_id || "");
+  const baseMessages = rejectedMessageId
+    ? messages.filter((message) => String(message.id || "") !== rejectedMessageId)
+    : messages;
+  if (type === "workspace_draft") return { messages, handled: false };
+  if (type === "turn_receipt") return { messages: baseMessages, handled: true };
+  if (type === "user_message_committed") {
+    return {
+      messages: applyUserMessageCommitted(baseMessages, data, makeId),
+      handled: true,
+    };
+  }
+  if (type === "assistant_message_committed") {
+    const folded = applyAssistantMessageCommitted(
+      baseMessages,
+      data,
+      makeId,
+      options.preserveTransient === true,
+    ) as T[];
+    return {
+      messages: normalizeTurnTimelinePartition(
+        folded,
+        eventTimelineAnchorId(data),
+      ),
+      handled: true,
+    };
+  }
+  if (type === "confirmation_required") {
+    const folded = applyConfirmationRequiredEvent(
+      baseMessages,
+      data,
+      makeId,
+      now,
+    ) as T[];
+    return {
+      messages: normalizeTurnTimelinePartition(
+        folded,
+        eventTimelineAnchorId(data),
+      ),
+      handled: true,
+    };
+  }
+  if (type === "tool_call") {
+    const folded = upsertToolCallMessage(
+      baseMessages,
+      toolCallMessageFromEvent(data, makeId, now),
+    ) as T[];
+    return {
+      messages: normalizeTurnTimelinePartition(
+        folded,
+        eventTimelineAnchorId(data),
+      ),
+      handled: true,
+    };
+  }
+  if (type === "thinking" || type === "chunk" || type === "done") {
+    const folded = applyAssistantStreamMessage(
+      baseMessages,
+      {
+        type,
+        content: String(data.content || ""),
+        now,
+        messageId: data.message_id ? String(data.message_id) : undefined,
+        sender_name: data.sender_name,
+        sender_agent_id: data.sender_agent_id,
+        preserveTransient: options.preserveTransient === true,
+        turnAnchorId: eventTimelineAnchorId(data),
+        turnGeneration: Number.isInteger(Number(data.turn?.generation))
+          ? Number(data.turn.generation)
+          : undefined,
+        turnSuspended: data.turn?.phase === "suspended",
+        producerScope: data.producer_scope
+          ? String(data.producer_scope)
+          : undefined,
+        transientMessageId: data.transient_message_id
+          ? String(data.transient_message_id)
+          : undefined,
+      },
+      makeId,
+    ) as T[];
+    return {
+      messages: normalizeTurnTimelinePartition(
+        folded,
+        eventTimelineAnchorId(data),
+      ),
+      handled: true,
+    };
+  }
+  if (type === "channel_user_message") {
+    const committed = mapHistoryMessage(
+      { ...data, role: "user", id: data.id || makeId() },
+      makeId,
+    ) as T | null;
+    return {
+      messages:
+        committed && !messages.some((message) => message.id === committed.id)
+          ? [...baseMessages, committed]
+          : baseMessages,
+      handled: true,
+    };
+  }
+  if (rejectedMessageId) return { messages: baseMessages, handled: true };
+  return { messages, handled: false };
 }
 
 export function normalizeChatTimelineMessages<T extends Record<string, any>>(
@@ -765,36 +1393,117 @@ export function normalizeChatTimelineMessages<T extends Record<string, any>>(
     const callId = String(
       message.toolCallId || parsed.call_id || parsed.id || "",
     );
-    if (!callId || !toolIndexByCallId.has(callId)) {
-      if (callId) toolIndexByCallId.set(callId, normalized.length);
+    const identity = `${toolTurnScope(message as unknown as ConversationMessage)}:${callId}`;
+    if (!callId || !toolIndexByCallId.has(identity)) {
+      if (callId) toolIndexByCallId.set(identity, normalized.length);
       normalized.push(message);
       continue;
     }
 
-    const index = toolIndexByCallId.get(callId)!;
+    const index = toolIndexByCallId.get(identity)!;
     const previous = normalized[index];
-    const previousParsed = parseStoredToolPayload(previous.content);
-    const previousStatus = normalizeToolStatus(
-      previous.toolStatus || previousParsed.status,
-    );
-    const incomingStatus = normalizeToolStatus(
-      message.toolStatus || parsed.status,
-    );
-    if (previousStatus === "done" && incomingStatus !== "done") continue;
-
-    normalized[index] = {
-      ...previous,
-      ...message,
-      id: previous.id || message.id,
-      created_at: previous.created_at || message.created_at,
-      toolArgs:
-        Object.keys(parseToolArgs(message.toolArgs ?? parsed.args)).length > 0
-          ? (message.toolArgs ?? parsed.args)
-          : (previous.toolArgs ?? previousParsed.args),
-    };
+    normalized[index] = mergeToolCallProjection(
+      previous as unknown as ConversationMessage,
+      {
+        ...message,
+        toolArgs: message.toolArgs ?? parsed.args,
+      } as unknown as ConversationMessage,
+      "previous",
+    ) as unknown as T;
   }
 
   return normalized;
+}
+
+function hasConversationMessagePayload(message: ConversationMessage): boolean {
+  return Boolean(
+    String(message.display_content ?? message.content ?? "").trim() ||
+      message.fileName ||
+      message.imageUrl ||
+      message.attachments?.length ||
+      message.previewImages?.length,
+  );
+}
+
+/**
+ * Project the single ephemeral progress row from lifecycle state.
+ *
+ * Empty streaming assistant rows are transport artifacts, not durable timeline
+ * entries. Rebuilding the one visible placeholder here keeps it after every
+ * persisted tool/message row and prevents reconnect/history merges from
+ * accumulating multiple "Thinking" bubbles.
+ */
+export function projectConversationTurnProgress<
+  T extends ConversationMessage,
+>(messages: T[], running: boolean, progressMessage?: Partial<T>): T[] {
+  const withoutTransportPlaceholders = messages.flatMap((message) => {
+    if (message.role !== "assistant" || !(message.streaming || message._streaming)) {
+      return [message];
+    }
+    const hasRenderablePayload = hasConversationMessagePayload(message);
+    if (hasRenderablePayload) return [message];
+    // Preserve reasoning for the analysis group, but strip its transport-only
+    // streaming marker so it cannot render a second progress bubble.
+    if (String(message.thinking || "").trim()) {
+      return [{ ...message, streaming: false, _streaming: false } as T];
+    }
+    return [];
+  });
+  if (!running) return withoutTransportPlaceholders;
+  return [
+    ...withoutTransportPlaceholders,
+    {
+      id: "conversation-turn-progress",
+      role: "assistant",
+      content: "",
+      streaming: true,
+      _streaming: true,
+      _conversationTurnProgress: true,
+      ...progressMessage,
+    } as T,
+  ];
+}
+
+/**
+ * Keep the turn progress row visible until the active turn starts rendering
+ * its answer. The latest expanded reasoning/tool group also exposes current
+ * activity, while expanded groups from older turns never suppress progress.
+ */
+export function shouldProjectConversationTurnProgress(
+  entries: ConversationEntry[],
+  running: boolean,
+  expandedAnalysis: Readonly<Record<string, boolean>>,
+): boolean {
+  if (!running) return false;
+  let latestAnalysisKey: string | undefined;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.type === "analysis_group") {
+      latestAnalysisKey ||= entry.key;
+      continue;
+    }
+    if (
+      entry.type === "special_render" &&
+      isConfirmationToolCall(entry.msg) &&
+      entry.msg.toolStatus === "done"
+    ) {
+      // A resolved suspension card starts a new visible activity phase inside
+      // the same logical turn. Content before the card must not suppress the
+      // resumed progress row; content emitted after it still does.
+      return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
+    }
+    if (
+      entry.type === "message" &&
+      entry.msg.role === "assistant" &&
+      hasConversationMessagePayload(entry.msg)
+    ) {
+      return false;
+    }
+    if (entry.type === "message" && entry.msg.role === "user") {
+      return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
+    }
+  }
+  return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
 }
 
 export function toolCallMessageFromEvent(
@@ -803,25 +1512,39 @@ export function toolCallMessageFromEvent(
   now = new Date().toISOString(),
 ): ConversationMessage {
   const toolName = data.name || data.toolName || "tool";
+  const explicitCallId = data.call_id || data.toolCallId || data.id;
   const callId = String(
-    data.call_id ||
-      data.toolCallId ||
-      data.id ||
+    explicitCallId ||
       `${toolName}-${data.index ?? 0}`,
   );
   const status = normalizeToolStatus(data.status);
+  const turn = data.turn && typeof data.turn === "object" ? data.turn : {};
+  const turnAnchorId = eventTimelineAnchorId(data);
+  const producerScope = data.producer_scope
+    ? String(data.producer_scope)
+    : undefined;
+  const scopedUiId =
+    turnAnchorId || producerScope
+      ? `tool:${turnAnchorId || "unanchored"}:${producerScope || "default"}:${callId}`
+      : callId;
   return {
-    id: callId || makeId(),
+    id: scopedUiId || makeId(),
     role: "tool_call",
     content: "",
     created_at: now,
     streaming: status === "running",
     toolCallId: callId,
+    _toolCallIdExplicit: Boolean(explicitCallId),
     toolName,
     toolArgs: parseToolArgs(data.args ?? data.toolArgs),
     toolStatus: status,
     toolResult: normalizeToolResult(data.result ?? data.toolResult) || "",
     toolThinking: data.reasoning_content || data.toolThinking || "",
+    turnAnchorId,
+    turnGeneration: Number.isInteger(Number(turn.generation))
+      ? Number(turn.generation)
+      : undefined,
+    producerScope,
   };
 }
 
@@ -857,20 +1580,6 @@ export function buildConversationEntries(
   messages: ConversationMessage[],
 ): ConversationEntry[] {
   messages = normalizeChatTimelineMessages(messages);
-  let latestEmptyStreamingAssistantIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      message.role === "assistant" &&
-      Boolean(message.streaming || message._streaming) &&
-      !message.content?.trim() &&
-      !(Array.isArray(message.attachments) && message.attachments.length > 0)
-    ) {
-      latestEmptyStreamingAssistantIndex = index;
-      break;
-    }
-  }
-
   const grouped: ConversationEntry[] = [];
   let currentGroup: ConversationAnalysisItem[] | null = null;
   let currentGroupMessageIds: string[] = [];
@@ -936,21 +1645,15 @@ export function buildConversationEntries(
         pushThinking(currentGroup, msg.thinking);
         currentGroupMessageIds.push(msg.id);
       }
-      // A multi-tool turn can create one temporary empty assistant row after
-      // each tool boundary. Keep only the latest row as the live loading
-      // indicator; prior rows remain represented by the unified analysis group.
+      // Empty assistant rows from streaming boundaries are transport artifacts.
+      // Only the lifecycle projection may create the one canonical progress row;
+      // a row carrying thinking still contributes to the analysis group above.
       if (
         !contentText &&
         !hasAttachments &&
         isStreamingPlaceholder &&
-        i !== latestEmptyStreamingAssistantIndex
-      ) {
-        continue;
-      }
-      // Keep the canonical empty streaming row. ConversationTimeline
-      // renders it with the same thinking/loading bubble used by normal
-      // Web Chat. Dropping it here made project group turns appear to be
-      // idle while the composer button alone kept spinning.
+        !msg._conversationTurnProgress
+      ) continue;
       if (!contentText && !hasAttachments && !isStreamingPlaceholder) continue;
       flushGroup();
       grouped.push({
@@ -974,7 +1677,7 @@ function messageAnchor(msg: ConversationMessage) {
     msg.role,
     msg.id,
     msg.streaming ? "streaming" : "done",
-    msg.content.length,
+    (msg.content || "").length,
     (msg.thinking || "").length,
     msg.toolStatus || "",
     msg.toolResult?.length || 0,

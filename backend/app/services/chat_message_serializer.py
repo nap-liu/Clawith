@@ -8,6 +8,7 @@ from app.services.chat_attachments import (
     normalize_attachment_metadata,
     normalize_chat_message_attachments,
 )
+from app.services.chat_history import parse_tool_call_for_display
 from app.services.quoted_message import normalize_quoted_message
 
 
@@ -71,3 +72,52 @@ def serialize_chat_message_for_client(
     if sender_agent_id:
         entry["sender_agent_id"] = str(sender_agent_id)
     return entry
+
+
+def serialize_tool_call_for_client(
+    message: Any,
+    *,
+    source_channel: str | None = None,
+    sender_name: str | None = None,
+    sender_user_id: Any = None,
+    sender_agent_id: Any = None,
+) -> dict[str, Any]:
+    """Serialize one durable tool event through the shared client contract.
+
+    The parsed fields are the public representation. Keeping the raw JSON in
+    ``display_content`` duplicates every argument/result in history responses
+    and bypasses the argument sanitizer, so both generic text fields are empty
+    whenever parsing succeeds.
+    """
+
+    entry = serialize_chat_message_for_client(
+        message,
+        source_channel=source_channel,
+        sender_name=sender_name,
+        sender_user_id=sender_user_id,
+        sender_agent_id=sender_agent_id,
+    )
+    entry["toolCallId"] = str(message.id)
+    parsed = parse_tool_call_for_display(message.content)
+    explicit_tool_call_id = bool(parsed.get("toolCallId"))
+    if parsed:
+        entry["content"] = ""
+        entry["display_content"] = ""
+        entry.update(parsed)
+    if entry.get("toolName") == "request_confirmation":
+        entry["toolCallId"] = str(message.id)
+        explicit_tool_call_id = True
+    entry["toolCallIdExplicit"] = explicit_tool_call_id
+    return entry
+
+
+def merge_tool_call_update_for_client(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Project one append-only tool update without moving its timeline slot."""
+
+    if previous.get("toolStatus") == "done" and current.get("toolStatus") == "running":
+        return previous
+    current["created_at"] = previous.get("created_at") or current.get("created_at")
+    return current

@@ -27,7 +27,7 @@ from typing import Any, AsyncIterator
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models.agent  # noqa: F401
@@ -192,8 +192,13 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
     # that runtime at the same isolated test database instead of the process
     # default database configured for production.
     monkeypatch.setattr("app.services.subagent_runtime.async_session", session_factory)
+    monkeypatch.setattr(
+        "app.services.project_group_turn_lifecycle.async_session",
+        session_factory,
+    )
     monkeypatch.setattr("app.services.project_runtime_tools.async_session", session_factory)
     monkeypatch.setattr("app.api.websocket.async_session", session_factory)
+    monkeypatch.setattr("app.services.channel_llm.async_session", session_factory)
 
     tenant = Tenant(name="Project API", slug=f"project-api-{uuid.uuid4().hex[:8]}")
     session.add(tenant)
@@ -1704,7 +1709,7 @@ async def test_run_event_and_dashboard_expose_frozen_product_summary(project_api
 
 
 async def test_rest_a2a_requires_action_scope_and_ready_dependencies(project_api: ProjectApiEnv):
-    from app.models.project import ProjectRun
+    from app.models.project import ProjectMemberSnapshot, ProjectRun
 
     env = project_api
     project = await _create_project(env, name="Actionable REST A2A")
@@ -1771,6 +1776,7 @@ async def test_rest_a2a_requires_action_scope_and_ready_dependencies(project_api
 
 async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh_child(
     project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     from app.api.websocket import WebSocketChatHandler
     from app.models.chat_session import ChatSession
@@ -1778,6 +1784,9 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     from app.models.subagent_run import SubagentRun
     from app.services.project_runtime_tools import load_project_runtime_scope
     from app.services.project_service import project_session_access_mode
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
 
     env = project_api
     project = await _create_project(env, name="Member lifecycle")
@@ -1830,10 +1839,11 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     live_handler.source_channel = "subagent"
     receipts: list[dict] = []
 
-    async def _capture_ws(payload: dict):
-        receipts.append(payload)
+    async def _capture_ws(_agent_id: str, conversation_id: str, payload: dict):
+        if conversation_id == str(first_child_id):
+            receipts.append(payload)
 
-    live_handler._safe_send = _capture_ws
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", _capture_ws)
     for _retry in range(2):
         assert (
             await live_handler._enqueue_project_subagent_message(
@@ -1860,6 +1870,18 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
         .all()
     )
     durable_child = await env.db.get(SubagentRun, first_child_id)
+    canonical_turn_anchor_id = await env.db.scalar(
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.conversation_id == str(first_child_id),
+            ChatMessage.message_meta["kind"].as_string() == "subagent_input",
+            ChatMessage.message_meta["subagent_input_state"]
+            .as_string()
+            .in_(["pending", "processing"]),
+        )
+        .order_by(ChatMessage.created_at, ChatMessage.id)
+        .limit(1)
+    )
     assert len(drawer_inputs) == 1
     assert drawer_inputs[0].message_meta["kind"] == "subagent_input"
     assert drawer_inputs[0].message_meta["subagent_input_state"] == "pending"
@@ -1871,6 +1893,13 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     committed = [row for row in receipts if row.get("type") == "user_message_committed"]
     assert len(committed) == 2
     assert {row["message_id"] for row in committed} == {str(drawer_inputs[0].id)}
+    assert all(row["turn"]["phase"] == "active" for row in committed)
+    # The receipt identifies the newly committed row separately, while its
+    # lifecycle projection truthfully keeps the oldest queued input as the one
+    # session owner. A later drawer append cannot jump the queue.
+    assert {row["turn"]["turn_anchor_id"] for row in committed} == {
+        str(canonical_turn_anchor_id)
+    }
 
     removed = await env.client.post(
         f"/api/projects/{project_id}/members/{worker['id']}/remove",
@@ -1886,10 +1915,18 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     first_child = await env.db.get(SubagentRun, first_child_id)
     first_project_run = await env.db.get(ProjectRun, first_project_run_id)
     first_child_session = await env.db.get(ChatSession, first_child_id)
+    current_turn = await get_conversation_turn_snapshot(
+        env.db,
+        agent_id=env.worker_id,
+        conversation_id=str(first_child_id),
+    )
     assert first_child is not None and first_child.status == "cancelled"
     assert first_project_run is not None and first_project_run.status == "cancelled"
     assert first_child_session is not None
     assert first_child_session.im_config["membership_revoked"] is True
+    assert current_turn.anchor_id == canonical_turn_anchor_id
+    assert current_turn.status == "cancelled"
+    assert current_turn.revision >= 2
     owner_user = await env.db.get(User, env.owner_id)
     assert owner_user is not None
     assert await project_session_access_mode(env.db, owner_user, first_child_session) == "read"
@@ -3744,6 +3781,7 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     project_api: ProjectApiEnv,
 ):
     from app.models.chat_session import ChatSession
+    from app.models.project import ProjectRun
 
     env = project_api
     project = await _create_project(env, name="Project Agent Group")
@@ -3758,7 +3796,12 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
 
     passive = await env.client.post(
         f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
-        json={"content": "Visible update only", "mentions": [], "attachments": []},
+        json={
+            "content": "Visible update only",
+            "mentions": [],
+            "attachments": [],
+            "client_message_id": "passive-confirmation-anchor",
+        },
     )
     assert passive.status_code == 201, passive.text
     passive_body = passive.json()
@@ -3768,6 +3811,70 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     assert passive_body["subagent_runs"][0]["agent_id"] == str(env.leader_id)
     assert passive_body["message"]["message_meta"]["visible_to_group"] is True
     assert passive_body["message"]["message_meta"]["wake_policy"] == "default_leader_plus_structured_mentions"
+    assert passive_body["turn"]["phase"] == "active"
+    assert passive_body["turn"]["generation"] == 1
+    cohort_anchor_id = passive_body["turn"]["turn_anchor_id"]
+    passive_run = await env.db.get(
+        ProjectRun,
+        uuid.UUID(passive_body["subagent_runs"][0]["project_run_id"]),
+    )
+    assert passive_run is not None
+    passive_run.status = "waiting"
+    passive_child_session_id = passive_body["subagent_runs"][0]["session_id"]
+    pending_tool = ChatMessage(
+        agent_id=env.leader_id,
+        user_id=env.owner_id,
+        role="tool_call",
+        content=json.dumps(
+            {
+                "name": "request_confirmation",
+                "args": {"force_confirmation": True},
+                "status": "pending",
+            }
+        ),
+        conversation_id=passive_child_session_id,
+    )
+    env.db.add(pending_tool)
+    await env.db.commit()
+    suspended = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+    )
+    assert suspended.status_code == 200
+    assert suspended.json()["turn"]["phase"] == "suspended"
+    assert suspended.json()["turn"]["generation"] == 1
+    replay = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Visible update only",
+            "mentions": [],
+            "attachments": [],
+            "client_message_id": "passive-confirmation-anchor",
+        },
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["idempotent_replay"] is True
+    blocked = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Must wait for confirmation",
+            "mentions": [],
+            "attachments": [],
+            "client_message_id": "blocked-while-confirmation-pending",
+        },
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "project_group_confirmation_pending"
+    assert blocked.json()["detail"]["client_message_id"] == "blocked-while-confirmation-pending"
+    passive_run.status = "queued"
+    pending_tool.content = json.dumps(
+        {
+            "name": "request_confirmation",
+            "args": {"force_confirmation": True},
+            "status": "done",
+            "result": "confirmed for lifecycle test",
+        }
+    )
+    await env.db.commit()
 
     mentioned = await env.client.post(
         f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
@@ -3790,6 +3897,9 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     assert len(body["subagent_runs"]) == 3
     assert all(row["project_run_id"] for row in body["subagent_runs"])
     assert body["message"]["display_content"] == "Worker build and Reviewer check"
+    assert body["turn"]["phase"] == "active"
+    assert body["turn"]["generation"] == 1
+    assert body["turn"]["turn_anchor_id"] == cohort_anchor_id
     worker_child = next(row for row in body["subagent_runs"] if row["agent_id"] == str(env.worker_id))
     worker_input = (
         await env.db.execute(
@@ -3895,15 +4005,325 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     history = await env.client.get(f"/api/projects/{project_id}/group-sessions/{group['id']}/messages?limit=500")
     assert history.status_code == 200
     assert len(history.json()["items"]) == 4
+    assert history.json()["turn"]["turn_anchor_id"] == cohort_anchor_id
+    assert history.json()["turn"]["phase"] == "active"
     attachment_message = next(item for item in history.json()["items"] if item["attachments"])
     assert attachment_message["attachments"][0]["name"] == "brief.md"
+    cohort_runs = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.input["group_session_id"].as_string() == str(group["id"])
+                )
+            )
+        ).scalars()
+    )
+    for cohort_run in cohort_runs:
+        cohort_run.status = "succeeded"
+        cohort_run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+    completed_history = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages?limit=500"
+    )
+    assert completed_history.status_code == 200
+    assert completed_history.json()["turn"]["phase"] == "idle"
+    assert completed_history.json()["turn"]["status"] == "completed"
+    assert completed_history.json()["turn"]["generation"] == 1
+
+
+async def test_project_group_partial_completion_versions_cohort_projection(
+    project_api: ProjectApiEnv,
+):
+    from app.models.project import ProjectRun
+
+    env = project_api
+    project = await _create_project(env, name="Versioned group cohort")
+    project_id = project["id"]
+    await _mark_project_running(env, project_id)
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    created = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Run two specialists",
+            "mentions": [str(env.worker_id), str(env.reviewer_id)],
+            "client_message_id": "versioned-cohort-1",
+        },
+    )
+    assert created.status_code == 201, created.text
+    initial = created.json()["turn"]
+    assert initial["phase"] == "active"
+    assert len(initial["active_agent_ids"]) >= 2
+
+    runs = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == uuid.UUID(project_id),
+                    ProjectRun.trigger_type.in_(["group_leader_message", "group_mention"]),
+                    ProjectRun.input["group_session_id"].as_string() == group["id"],
+                )
+            )
+        ).scalars()
+    )
+    first = next(run for run in runs if run.agent_id == env.worker_id)
+    run_ids = [run.id for run in runs]
+    first.status = "failed"
+    first.finished_at = datetime.now(UTC)
+    await env.db.commit()
+    partial = (
+        await env.client.get(
+            f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+        )
+    ).json()["turn"]
+    assert partial["phase"] == "active"
+    assert partial["revision"] > initial["revision"]
+    assert str(env.worker_id) not in partial["active_agent_ids"]
+
+    env.db.expire_all()
+    remaining = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.id.in_(run_ids),
+                    ProjectRun.status.not_in(["succeeded", "failed", "cancelled"]),
+                )
+            )
+        ).scalars()
+    )
+    for run in remaining:
+        run.status = "failed"
+        run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+    terminal = (
+        await env.client.get(
+            f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+        )
+    ).json()["turn"]
+    assert terminal["phase"] == "idle"
+    assert terminal["revision"] > partial["revision"]
+    assert terminal["active_agent_ids"] == []
+
+
+async def test_project_group_reconcile_recomputes_cohort_after_session_mutex(
+    project_api: ProjectApiEnv,
+):
+    from app.models.chat_session import ChatSession
+    from app.models.project import ProjectRun
+    from app.services.project_group_turn_lifecycle import reconcile_project_group_turn
+
+    env = project_api
+    project = await _create_project(env, name="Project cohort mutex")
+    project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    first = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "First cohort", "mentions": [], "attachments": []},
+    )
+    assert first.status_code == 201, first.text
+    first_turn = first.json()["turn"]
+    first_anchor_id = uuid.UUID(first_turn["turn_anchor_id"])
+
+    old_runs = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.input["group_session_id"].as_string() == group["id"],
+                )
+            )
+        ).scalars()
+    )
+    assert old_runs
+    for run in old_runs:
+        run.status = "succeeded"
+        run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+
+    async with env.session_factory() as writer_db, env.session_factory() as poll_db:
+        locked_session = (
+            await writer_db.execute(
+                select(ChatSession)
+                .where(ChatSession.id == uuid.UUID(group["id"]))
+                .with_for_update()
+            )
+        ).scalar_one()
+        second_anchor = ChatMessage(
+            agent_id=env.leader_id,
+            user_id=env.owner_id,
+            sender_user_id=env.owner_id,
+            role="user",
+            content="Second message joins while poll waits",
+            conversation_id=group["id"],
+            message_meta={
+                "kind": "project_group_message",
+                "project_id": str(project_id),
+                "visible_to_group": True,
+            },
+        )
+        writer_db.add(second_anchor)
+        await writer_db.flush()
+        writer_db.add(
+            ProjectRun(
+                tenant_id=env.tenant_id,
+                project_id=project_id,
+                agent_id=env.worker_id,
+                initiated_by_user_id=env.owner_id,
+                execution_user_id=env.owner_id,
+                status="queued",
+                trigger_type="group_mention",
+                input={
+                    "group_session_id": group["id"],
+                    "group_message_id": str(second_anchor.id),
+                },
+                output={"group_session_id": group["id"]},
+            )
+        )
+        await writer_db.flush()
+
+        poll_session = await poll_db.get(ChatSession, locked_session.id)
+        poll_pid = await poll_db.scalar(text("SELECT pg_backend_pid()"))
+        poll_task = asyncio.create_task(
+            reconcile_project_group_turn(
+                poll_db,
+                project_id=project_id,
+                session=poll_session,
+            )
+        )
+
+        async with env.session_factory() as observer_db:
+            for _ in range(100):
+                wait_type = await observer_db.scalar(
+                    text(
+                        "SELECT wait_event_type FROM pg_stat_activity "
+                        "WHERE pid = :pid"
+                    ),
+                    {"pid": poll_pid},
+                )
+                if wait_type == "Lock":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("project cohort reconcile did not wait on the session mutex")
+
+        await writer_db.commit()
+        projection = await asyncio.wait_for(poll_task, timeout=2)
+        await poll_db.commit()
+
+    assert projection.snapshot.phase == "active"
+    assert projection.snapshot.generation == 1
+    assert projection.snapshot.anchor_id == first_anchor_id
+    assert projection.run_count == 1
+    assert projection.active_agent_ids == (env.worker_id,)
+
+
+async def test_project_group_reconcile_refreshes_preloaded_session_pointer(
+    project_api: ProjectApiEnv,
+):
+    from app.models.chat_session import ChatSession
+    from app.models.project import ProjectRun
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+    from app.services.project_group_turn_lifecycle import reconcile_project_group_turn
+
+    env = project_api
+    project = await _create_project(env, name="Project pointer refresh")
+    project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    first = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Generation A", "mentions": [], "attachments": []},
+    )
+    assert first.status_code == 201, first.text
+    first_anchor_id = uuid.UUID(first.json()["turn"]["turn_anchor_id"])
+
+    old_runs = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.input["group_session_id"].as_string() == group["id"],
+                )
+            )
+        ).scalars()
+    )
+    for run in old_runs:
+        run.status = "succeeded"
+        run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+
+    async with env.session_factory() as poll_db, env.session_factory() as writer_db:
+        preloaded = await poll_db.get(ChatSession, uuid.UUID(group["id"]))
+        assert preloaded is not None
+        assert preloaded.im_config["conversation_turn"]["turn_anchor_id"] == str(first_anchor_id)
+
+        second_anchor = ChatMessage(
+            agent_id=env.leader_id,
+            user_id=env.owner_id,
+            sender_user_id=env.owner_id,
+            role="user",
+            content="Generation B",
+            conversation_id=group["id"],
+            message_meta={
+                "kind": "project_group_message",
+                "project_id": str(project_id),
+                "visible_to_group": True,
+            },
+        )
+        writer_db.add(second_anchor)
+        await writer_db.flush()
+        writer_db.add(
+            ProjectRun(
+                tenant_id=env.tenant_id,
+                project_id=project_id,
+                agent_id=env.reviewer_id,
+                initiated_by_user_id=env.owner_id,
+                execution_user_id=env.owner_id,
+                status="queued",
+                trigger_type="group_mention",
+                input={
+                    "group_session_id": group["id"],
+                    "group_message_id": str(second_anchor.id),
+                },
+                output={"group_session_id": group["id"]},
+            )
+        )
+        await writer_db.flush()
+        await transition_conversation_turn(
+            writer_db,
+            agent_id=env.leader_id,
+            conversation_id=group["id"],
+            turn_anchor_id=first_anchor_id,
+            status="completed",
+        )
+        await transition_conversation_turn(
+            writer_db,
+            agent_id=env.leader_id,
+            conversation_id=group["id"],
+            turn_anchor_id=second_anchor.id,
+            status="running",
+        )
+        await writer_db.commit()
+
+        projection = await reconcile_project_group_turn(
+            poll_db,
+            project_id=project_id,
+            session=preloaded,
+        )
+        await poll_db.commit()
+
+    assert projection.snapshot.phase == "active"
+    assert projection.snapshot.generation == 2
+    assert projection.snapshot.anchor_id == second_anchor.id
+    assert projection.run_count == 1
+    assert projection.active_agent_ids == (env.reviewer_id,)
 
 
 async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     project_api: ProjectApiEnv,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from app.models.project import ProjectRun
+    from app.models.project import ProjectMemberSnapshot, ProjectRun
     from app.services import subagent_runtime
 
     env = project_api
@@ -3911,6 +4331,15 @@ async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     project_id = project["id"]
     await _mark_project_running(env, project_id)
     group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    live_events: list[tuple[str, str, dict]] = []
+
+    async def capture_live(agent_id, conversation_id, payload):
+        live_events.append((str(agent_id), str(conversation_id), payload))
+
+    monkeypatch.setattr(
+        "app.api.websocket.manager.send_to_session",
+        capture_live,
+    )
     real_dispatch = subagent_runtime.dispatch_project_run
 
     async def simulated_process_exit(_run_id):
@@ -3942,25 +4371,32 @@ async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     assert len(pending) == 2
     assert all(row.status == "queued" and row.input["dispatch"]["task"] for row in pending)
     pending_ids = [row.id for row in pending]
+    worker_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == uuid.UUID(project_id),
+                ProjectMemberSnapshot.agent_id == env.worker_id,
+            )
+        )
+    ).scalar_one()
+    worker_member.is_enabled = False
+    await env.db.commit()
+    live_events.clear()
 
     monkeypatch.setattr(subagent_runtime, "dispatch_project_run", real_dispatch)
-    replay = await env.client.post(
-        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
-        json={
-            "content": "This message must survive a dispatcher exit",
-            "mentions": [str(env.worker_id)],
-            "client_message_id": "recoverable-group-message",
-        },
-    )
-    assert replay.status_code == 201, replay.text
-    replay_body = replay.json()
-    assert replay_body["idempotent_replay"] is True
-    assert replay_body["awakened_agent_ids"] == [str(env.worker_id)]
-    assert len(replay_body["subagent_runs"]) == 2
+    for pending_id in pending_ids:
+        await real_dispatch(pending_id)
+    group_turn_events = [
+        payload
+        for _agent_id, conversation_id, payload in live_events
+        if conversation_id == group["id"] and payload.get("type") == "turn_state"
+    ]
+    assert group_turn_events
+    assert group_turn_events[-1]["turn"]["phase"] == "idle"
     env.db.expire_all()
     recovered = (await env.db.execute(select(ProjectRun).where(ProjectRun.id.in_(pending_ids)))).scalars().all()
     recovered_by_trigger = {row.trigger_type: row for row in recovered}
-    assert recovered_by_trigger["group_mention"].output["subagent_run_id"]
+    assert recovered_by_trigger["group_mention"].status == "failed"
     assert recovered_by_trigger["group_leader_message"].status == "cancelled"
     assert recovered_by_trigger["group_leader_message"].output == {
         "group_session_id": group["id"],
@@ -4612,6 +5048,15 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
     from app.services import subagent_runtime
 
     env = project_api
+    live_events: list[tuple[str, str, dict]] = []
+
+    async def capture_live(agent_id, conversation_id, payload):
+        live_events.append((str(agent_id), str(conversation_id), payload))
+
+    monkeypatch.setattr(
+        "app.api.websocket.manager.send_to_session",
+        capture_live,
+    )
     project = await _create_project(env, name="Passive child reply")
     await _mark_project_running(env, project["id"])
     group = (await env.client.get(f"/api/projects/{project['id']}/group-session")).json()
@@ -4620,6 +5065,15 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
         json={"content": "Worker answer once", "mentions": [str(env.worker_id)]},
     )
     assert wake.status_code == 201, wake.text
+    group_user_events = [
+        payload
+        for _agent_id, conversation_id, payload in live_events
+        if conversation_id == group["id"]
+        and payload.get("type") == "user_message_committed"
+    ]
+    assert len(group_user_events) == 1
+    assert group_user_events[0]["content"] == "Worker answer once"
+    assert group_user_events[0]["turn"]["phase"] == "active"
     worker_wake = next(row for row in wake.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id))
     child_id = uuid.UUID(worker_wake["session_id"])
     project_run_id = uuid.UUID(worker_wake["project_run_id"])
@@ -4631,6 +5085,7 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
             )
         )
     ).scalar_one()
+    child_input_id = child_input.id
     child_input.message_meta = {
         **dict(child_input.message_meta or {}),
         "subagent_input_state": "processing",
@@ -4645,7 +5100,7 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
 
     terminal = await subagent_runtime._finish_subagent_turn(
         run_id=child_id,
-        anchor_id=child_input.id,
+        anchor_id=child_input_id,
         reply="Worker result",
         failed=False,
     )
@@ -4682,18 +5137,52 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
     assert materialized.message_meta["awakened_agent_ids"] == []
     assert materialized.message_meta["leader_batch_state"] == "pending"
     assert materialized.message_meta["default_leader_agent_id"] == str(env.leader_id)
+    assert materialized.message_meta["timeline_anchor_id"] == wake.json()["message"]["id"]
+    assert materialized.message_meta["producer_scope"] == (
+        f"project:{child_id}:{child_input_id}"
+    )
+    committed_events = [
+        payload
+        for _agent_id, conversation_id, payload in live_events
+        if conversation_id == group["id"]
+        and payload.get("type") == "assistant_message_committed"
+    ]
+    assert len(committed_events) == 1
+    committed_event = committed_events[0]
+    assert committed_event["message_id"] == str(materialized.id)
+    assert committed_event["transient_message_id"] == (
+        f"project-stream:{child_id}:{child_input_id}"
+    )
+    assert committed_event["producer_scope"] == (
+        f"project:{child_id}:{child_input_id}"
+    )
+    assert committed_event["timeline_anchor_id"] == wake.json()["message"]["id"]
+    current_group = await env.client.get(
+        f"/api/projects/{project['id']}/group-sessions/{group['id']}/messages"
+    )
+    assert current_group.status_code == 200
+    assert committed_event["turn"]["status"] == current_group.json()["turn"]["status"]
     parent = await env.db.get(ChatSession, uuid.UUID(group["id"]))
     assert parent is not None and parent.source_channel == "project"
 
 
 async def test_project_group_timeline_reuses_standard_child_message_contract(
     project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     from datetime import timedelta
 
     from app.models.audit import ChatMessage
+    from app.models.project import ProjectRun
+    from app.models.subagent_run import SubagentRun
 
     env = project_api
+    live_events: list[tuple[str, str, dict]] = []
+
+    async def capture_live(agent_id, conversation_id, payload):
+        live_events.append((str(agent_id), str(conversation_id), payload))
+
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", capture_live)
     project = await _create_project(env, name="Standard group timeline")
     project_id = project["id"]
     await _mark_project_running(env, project_id)
@@ -4793,7 +5282,23 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
         },
         created_at=base_time + timedelta(seconds=4),
     )
-    env.db.add_all([running_tool, done_tool, confirmation, fork_context, child_final])
+    later_human = ChatMessage(
+        agent_id=env.leader_id,
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Later Human message C",
+        conversation_id=group["id"],
+        message_meta={
+            "kind": "project_group_message",
+            "project_id": str(project_id),
+            "visible_to_group": True,
+        },
+        created_at=base_time + timedelta(seconds=3, milliseconds=500),
+    )
+    env.db.add_all(
+        [running_tool, done_tool, confirmation, fork_context, child_final, later_human]
+    )
     await env.db.flush()
     materialized = ChatMessage(
         agent_id=env.leader_id,
@@ -4815,10 +5320,47 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     env.db.add(materialized)
     await env.db.commit()
 
+    paged_items: list[dict] = []
+    before = None
+    for _page in range(10):
+        params = {"limit": 1}
+        if before:
+            params["before"] = before
+        page = await env.client.get(
+            f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+            params=params,
+        )
+        assert page.status_code == 200, page.text
+        page_payload = page.json()
+        paged_items.extend(page_payload["items"])
+        if any(
+            item.get("role") == "user"
+            and item.get("content") == "Show the full execution turn"
+            for item in page_payload["items"]
+        ):
+            break
+        before = page_payload["next_cursor"]
+        assert before is not None
+    else:
+        raise AssertionError("group anchor page was not reached")
+
+    paged_finals = [
+        item for item in paged_items if item.get("content") == child_final.content
+    ]
+    assert [item["id"] for item in paged_finals] == [str(materialized.id)]
+    assert paged_finals[0]["turnAnchorId"] == str(
+        wake.json()["message"]["id"]
+    )
+    paged_tools = [item for item in paged_items if item.get("role") == "tool_call"]
+    assert paged_tools
+    assert {
+        item["turnAnchorId"] for item in paged_tools
+    } == {str(wake.json()["message"]["id"])}
+
     response = await env.client.get(f"/api/projects/{project_id}/group-sessions/{group['id']}/messages")
     assert response.status_code == 200, response.text
     items = response.json()["items"]
-    assert len([item for item in items if item["role"] == "user"]) == 1
+    assert len([item for item in items if item["role"] == "user"]) == 2
     assert all(item["content"] != fork_context.content for item in items)
 
     tools = [item for item in items if item["role"] == "tool_call"]
@@ -4827,18 +5369,276 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     assert read_tools[0]["toolCallId"] == "worker-read-1"
     assert read_tools[0]["toolStatus"] == "done"
     assert read_tools[0]["toolResult"] == "# Project evidence"
+    assert read_tools[0]["content"] == ""
+    assert read_tools[0]["display_content"] == ""
     assert read_tools[0]["sender_agent_id"] == str(env.worker_id)
+    group_anchor_id = next(
+        item["id"]
+        for item in items
+        if item["role"] == "user" and item["content"] == "Show the full execution turn"
+    )
+    expected_producer_scope = f"project:{child_id}:{child_input.id}"
+    assert read_tools[0]["turnAnchorId"] == group_anchor_id
+    assert read_tools[0]["producerScope"] == expected_producer_scope
+    assert read_tools[0]["message_meta"]["producer_scope"] == expected_producer_scope
 
     confirmation_item = next(item for item in tools if item.get("toolName") == "request_confirmation")
     assert confirmation_item["toolCallId"] == str(confirmation.id)
     assert confirmation_item["toolStatus"] == "pending"
     assert confirmation_item["sender_agent_id"] == str(env.worker_id)
 
+    confirmation_payload = json.loads(confirmation.content)
+    confirmation_payload.update({"status": "done", "result": "approved"})
+    confirmation.content = json.dumps(confirmation_payload)
+    durable_child = await env.db.get(SubagentRun, child_id)
+    assert durable_child is not None
+    durable_child.status = "running"
+    project_run = await env.db.get(ProjectRun, project_run_id)
+    assert project_run is not None
+    project_run.status = "queued"
+    await env.db.commit()
+    from app.services.subagent_runtime import resume_subagent_after_confirmation
+
+    assert await resume_subagent_after_confirmation(
+        child_id,
+        resolved_tool_payload={
+            "type": "tool_call",
+            "name": "request_confirmation",
+            "call_id": str(confirmation.id),
+            "args": confirmation_payload["args"],
+            "status": "done",
+            "result": "approved",
+        },
+        child_turn_anchor_id=child_input.id,
+    ) is True
+    group_resolved = [
+        payload
+        for _agent_id, conversation_id, payload in live_events
+        if conversation_id == group["id"]
+        and payload.get("type") == "tool_call"
+        and payload.get("call_id") == str(confirmation.id)
+    ]
+    assert len(group_resolved) == 1
+    assert group_resolved[0]["status"] == "done"
+    assert group_resolved[0]["timeline_anchor_id"] == group_anchor_id
+    assert group_resolved[0]["producer_scope"] == expected_producer_scope
+    assert group_resolved[0]["turn"]["phase"] == "active"
+
     final_items = [item for item in items if item["content"] == child_final.content]
     assert len(final_items) == 1
     assert final_items[0]["id"] == str(materialized.id)
     assert final_items[0]["thinking"] == child_final.thinking
     assert final_items[0]["sender_agent_id"] == str(env.worker_id)
+    assert final_items[0]["turnAnchorId"] == group_anchor_id
+    assert final_items[0]["producerScope"] == expected_producer_scope
+    assert final_items[0]["canonicalDone"] is True
+    item_ids = [item["id"] for item in items]
+    later_human_index = item_ids.index(str(later_human.id))
+    assert item_ids.index(str(materialized.id)) < later_human_index
+    assert item_ids.index(str(confirmation.id)) < later_human_index
+
+
+async def test_project_group_history_uses_shared_tool_projection(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    project = await _create_project(env, name="Shared tool projection")
+    group = (await env.client.get(f"/api/projects/{project['id']}/group-session")).json()
+    anchor = ChatMessage(
+        agent_id=env.leader_id,
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Run the batch",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_group_message", "visible_to_group": True},
+    )
+    env.db.add(anchor)
+    await env.db.flush()
+    tool_base = {
+        "name": "toolscall",
+        "call_id": "project-batch-1",
+        "args": {"table_id": 18, "rows": [{"name": "A"}]},
+        "result": "",
+    }
+    running = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.leader_id,
+        role="tool_call",
+        content=json.dumps({**tool_base, "status": "running"}),
+        conversation_id=group["id"],
+        message_meta={"turn_anchor_id": str(anchor.id)},
+    )
+    done = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.leader_id,
+        role="tool_call",
+        content=json.dumps({**tool_base, "status": "done", "result": "created"}),
+        conversation_id=group["id"],
+        message_meta={"turn_anchor_id": str(anchor.id)},
+    )
+    env.db.add_all([running, done])
+    await env.db.commit()
+
+    response = await env.client.get(
+        f"/api/projects/{project['id']}/group-sessions/{group['id']}/messages"
+    )
+    assert response.status_code == 200, response.text
+    tools = [item for item in response.json()["items"] if item["role"] == "tool_call"]
+    assert len(tools) == 1
+    assert tools[0]["toolCallId"] == "project-batch-1"
+    assert tools[0]["toolStatus"] == "done"
+    assert tools[0]["toolResult"] == "created"
+    assert tools[0]["toolArgs"] == {"table_id": 18, "rows": [{"name": "A"}]}
+    assert tools[0]["content"] == ""
+    assert tools[0]["display_content"] == ""
+
+
+async def test_project_group_timeline_page_does_not_materialize_unrelated_history(
+    project_api: ProjectApiEnv,
+):
+    from sqlalchemy import event as sqlalchemy_event
+
+    from app.models.audit import ChatMessage
+    from app.models.project import ProjectRun
+    from app.services.project_group_timeline import build_project_group_timeline
+
+    env = project_api
+    project = await _create_project(env, name="Bounded group timeline")
+    project_id = uuid.UUID(project["id"])
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    child_id = uuid.uuid4()
+    page_message = ChatMessage(
+        agent_id=env.leader_id,
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Current page anchor",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_group_message", "visible_to_group": True},
+    )
+    old_message = ChatMessage(
+        agent_id=env.leader_id,
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Unrelated old anchor",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_group_message", "visible_to_group": True},
+    )
+    env.db.add_all([page_message, old_message])
+    await env.db.flush()
+    relevant_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.worker_id,
+        initiated_by_user_id=env.owner_id,
+        execution_user_id=env.owner_id,
+        status="running",
+        trigger_type="group_mention",
+        input={"group_message_id": str(page_message.id)},
+        output={"subagent_session_id": str(child_id)},
+    )
+    unrelated_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.worker_id,
+        initiated_by_user_id=env.owner_id,
+        execution_user_id=env.owner_id,
+        status="succeeded",
+        trigger_type="group_mention",
+        input={"group_message_id": str(old_message.id)},
+        output={"subagent_session_id": str(child_id)},
+    )
+    env.db.add_all([relevant_run, unrelated_run])
+    await env.db.flush()
+    relevant_input_id = uuid.uuid4()
+    unrelated_input_id = uuid.uuid4()
+    relevant_input = ChatMessage(
+        id=relevant_input_id,
+        agent_id=env.worker_id,
+        user_id=env.owner_id,
+        role="user",
+        content="Relevant child input",
+        conversation_id=str(child_id),
+        message_meta={
+            "kind": "subagent_input",
+            "project_run_id": str(relevant_run.id),
+            "subagent_turn_anchor_id": str(relevant_input_id),
+        },
+    )
+    unrelated_input = ChatMessage(
+        id=unrelated_input_id,
+        agent_id=env.worker_id,
+        user_id=env.owner_id,
+        role="user",
+        content="Unrelated child input",
+        conversation_id=str(child_id),
+        message_meta={
+            "kind": "subagent_input",
+            "project_run_id": str(unrelated_run.id),
+            "subagent_turn_anchor_id": str(unrelated_input_id),
+        },
+    )
+    relevant_reply = ChatMessage(
+        agent_id=env.worker_id,
+        sender_agent_id=env.worker_id,
+        role="assistant",
+        content="Relevant child reply",
+        conversation_id=str(child_id),
+        message_meta={"turn_anchor_id": str(relevant_input_id)},
+    )
+    unrelated_reply = ChatMessage(
+        agent_id=env.worker_id,
+        sender_agent_id=env.worker_id,
+        role="assistant",
+        content="Unrelated child reply",
+        conversation_id=str(child_id),
+        message_meta={"turn_anchor_id": str(unrelated_input_id)},
+    )
+    env.db.add_all(
+        [relevant_input, unrelated_input, relevant_reply, unrelated_reply]
+    )
+    await env.db.commit()
+
+    page_message_id = page_message.id
+    relevant_run_id = relevant_run.id
+    unrelated_run_id = unrelated_run.id
+    relevant_reply_id = relevant_reply.id
+    unrelated_reply_id = unrelated_reply.id
+    env.db.expunge_all()
+    page_row = await env.db.get(ChatMessage, page_message_id)
+    loaded_run_ids: set[uuid.UUID] = set()
+    loaded_message_ids: set[uuid.UUID] = set()
+
+    def capture_loaded(_session, instance):
+        if isinstance(instance, ProjectRun):
+            loaded_run_ids.add(instance.id)
+        elif isinstance(instance, ChatMessage):
+            loaded_message_ids.add(instance.id)
+
+    sqlalchemy_event.listen(env.db.sync_session, "loaded_as_persistent", capture_loaded)
+    try:
+        timeline = await build_project_group_timeline(
+            env.db,
+            project_id=project_id,
+            group_messages=[page_row],
+        )
+    finally:
+        sqlalchemy_event.remove(
+            env.db.sync_session,
+            "loaded_as_persistent",
+            capture_loaded,
+        )
+
+    assert relevant_run_id in loaded_run_ids
+    assert unrelated_run_id not in loaded_run_ids
+    assert relevant_input_id in loaded_message_ids
+    assert unrelated_input_id not in loaded_message_ids
+    assert relevant_reply_id in loaded_message_ids
+    assert unrelated_reply_id not in loaded_message_ids
+    assert any(item["content"] == "Relevant child reply" for item in timeline)
+    assert all(item["content"] != "Unrelated child reply" for item in timeline)
 
 
 async def test_project_participant_replies_coalesce_into_one_durable_leader_turn(

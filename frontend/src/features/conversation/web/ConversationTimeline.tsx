@@ -32,6 +32,8 @@ import {
 } from "../../../utils/chatAttachments";
 import {
   buildConversationEntries,
+  projectConversationTurnProgress,
+  shouldProjectConversationTurnProgress,
   type ConversationAnalysisItem,
   type ConversationMessage,
 } from "../core/chatTimeline";
@@ -53,6 +55,8 @@ export type ConversationTimelineProps = {
   isRunning?: boolean;
   /** Optional domain-specific copy for the standard streaming/thinking row. */
   runningLabel?: string;
+  /** Optional identity/presentation fields for the ephemeral progress row. */
+  progressMessage?: Partial<ConversationMessage>;
   unavailableAttachmentKeys?: ReadonlySet<string>;
   onAttachmentDownload?: (
     path: string,
@@ -734,6 +738,7 @@ export default function ConversationTimeline({
   viewOf,
   isRunning = false,
   runningLabel,
+  progressMessage,
   unavailableAttachmentKeys = new Set<string>(),
   onAttachmentDownload,
   onAttachmentUnavailable,
@@ -749,7 +754,29 @@ export default function ConversationTimeline({
   const [expandedAnalysis, setExpandedAnalysis] = useState<
     Record<string, boolean>
   >({});
-  const entries = useMemo(() => buildConversationEntries(messages), [messages]);
+  const baseEntries = useMemo(
+    () =>
+      buildConversationEntries(
+        projectConversationTurnProgress(messages, false),
+      ),
+    [messages],
+  );
+  const showTurnProgress = shouldProjectConversationTurnProgress(
+    baseEntries,
+    isRunning,
+    expandedAnalysis,
+  );
+  const entries = useMemo(
+    () =>
+      buildConversationEntries(
+        projectConversationTurnProgress(
+          messages,
+          showTurnProgress,
+          progressMessage,
+        ),
+      ),
+    [messages, progressMessage, showTurnProgress],
+  );
   const focusEntryIndex = useMemo(
     () => findConversationAnchorEntryIndex(entries, focusMessageId),
     [entries, focusMessageId],

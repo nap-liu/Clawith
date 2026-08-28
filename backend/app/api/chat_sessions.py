@@ -30,7 +30,11 @@ from app.models.chat_session import ChatSession
 from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
 from app.services.auth_code_exchange import validate_platform_login_channel
-from app.services.chat_message_serializer import serialize_chat_message_for_client
+from app.services.chat_message_serializer import (
+    merge_tool_call_update_for_client,
+    serialize_chat_message_for_client,
+    serialize_tool_call_for_client,
+)
 from app.services.chat_session_service import (
     get_latest_platform_session,
     promote_platform_session,
@@ -914,6 +918,9 @@ async def _get_session_messages_page(
             ChatMessage.message_meta["kind"].as_string().is_distinct_from(
                 "subagent_event"
             ),
+            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
+                "onboarding_turn_anchor"
+            ),
             or_(
                 ChatMessage.role != "assistant",
                 ChatMessage.message_meta["media_kind"].as_string().is_(None),
@@ -1095,8 +1102,7 @@ async def _get_session_messages_page(
             sender_name = agent_name_cache.get(str(sender_agent_id), sender_name)
 
         if m.role == "tool_call":
-            from app.services.chat_history import parse_tool_call_for_display
-            entry = serialize_chat_message_for_client(
+            entry = serialize_tool_call_for_client(
                 m,
                 source_channel=session.source_channel,
                 sender_name=sender_name,
@@ -1106,26 +1112,21 @@ async def _get_session_messages_page(
             # Canonical tool events persist the model call_id, shared by their append-only
             # running/done rows. Pending confirmation rows intentionally have no call_id;
             # their database row id remains the resolve handle.
-            entry["toolCallId"] = str(m.id)
-            parsed = parse_tool_call_for_display(m.content)
-            if parsed:
-                entry["content"] = ""
-                entry.update(parsed)
-            if entry.get("toolName") == "request_confirmation":
-                entry["toolCallId"] = str(m.id)
             tool_call_id = entry["toolCallId"]
-            previous_position = tool_call_positions.get(tool_call_id)
+            turn_anchor_id = str(message_meta.get("turn_anchor_id") or "legacy")
+            entry["turnAnchorId"] = (
+                turn_anchor_id if turn_anchor_id != "legacy" else None
+            )
+            tool_identity = f"{turn_anchor_id}:{tool_call_id}"
+            previous_position = tool_call_positions.get(tool_identity)
             if previous_position is None:
-                tool_call_positions[tool_call_id] = len(out)
+                tool_call_positions[tool_identity] = len(out)
                 out.append(entry)
             else:
-                previous_entry = out[previous_position]
-                if previous_entry.get("toolStatus") == "done" and entry.get("toolStatus") == "running":
-                    continue
-                # Keep the logical call at its original timeline position while replacing
-                # the durable running marker with the latest status/result.
-                entry["created_at"] = previous_entry.get("created_at") or entry["created_at"]
-                out[previous_position] = entry
+                out[previous_position] = merge_tool_call_update_for_client(
+                    out[previous_position],
+                    entry,
+                )
             continue
 
         # For agent sessions, parse inline tool_code blocks from assistant messages

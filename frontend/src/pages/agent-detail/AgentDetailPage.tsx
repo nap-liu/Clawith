@@ -33,8 +33,19 @@ import {
     type ResumeEventGate,
 } from '../../features/conversation/core/resumeRecovery';
 import { buildConversationEntries, getConversationScrollAnchor, isA2AMessageLeft } from '../../features/conversation/core/chatTimeline';
+import {
+    IDLE_CONVERSATION_TURN,
+    beginConversationTurnRecovery,
+    conversationTurnIsStreaming,
+    conversationTurnIsWaiting,
+    conversationTurnEventClosesStream,
+    conversationTurnEventShouldBeHandled,
+    reduceConversationTurnEvent,
+    type ConversationTurnRuntime,
+} from '../../features/conversation/core/conversationTurnLifecycle';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import {
+    CONVERSATION_HISTORY_RECONCILE_TURN_PAGE_SIZE,
     createConversationHistoryPageParams,
     resolveConversationHistoryHasMore,
 } from '../../features/conversation/historyPagination';
@@ -75,10 +86,16 @@ import {
 import { createClientId } from '../../utils/clientId';
 import {
     applyAssistantDoneMessage,
+    applyAssistantMessageCommitted,
     applyAssistantStreamMessage,
+    applyConfirmationRequiredEvent,
+    applyUserMessageCommitted,
+    foldConversationTimelineEvent,
     latestHistoryWindowOverlaps,
     normalizeChatTimelineMessages,
     reconcileLatestHistoryWindow,
+    toolCallMessageFromEvent,
+    upsertToolCallMessage as mergeToolCallMessage,
 } from '../../features/conversation/core/chatTimeline';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
@@ -1844,6 +1861,7 @@ export default function AgentDetailPage() {
     // off instead of hammering every 2s (the WebSocket reconnect-storm fix).
     const reconnectAttemptsRef = useRef<Record<SessionRuntimeKey, number>>({});
     const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean; isStopping: boolean }>>({});
+    const sessionTurnRuntimeRef = useRef<Record<SessionRuntimeKey, ConversationTurnRuntime>>({});
     const activeSessionIdRef = useRef<string | null>(null);
     // True while the active session is a READ-ONLY monitor view (a session the
     // viewer may see but does not own). Live broadcasts are then mirrored into
@@ -1952,6 +1970,7 @@ export default function AgentDetailPage() {
         if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
         delete wsMapRef.current[key];
         delete sessionUiStateRef.current[key];
+        delete sessionTurnRuntimeRef.current[key];
     };
 
     const setSessionUiState = (key: SessionRuntimeKey, next: Partial<{ isWaiting: boolean; isStreaming: boolean; isStopping: boolean }>) => {
@@ -2260,6 +2279,10 @@ export default function AgentDetailPage() {
                 ...(m.quoted_message && { quoted_message: m.quoted_message }),
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.toolCallId && { toolCallId: m.toolCallId }),
+                ...(typeof m.toolCallIdExplicit === 'boolean' && { _toolCallIdExplicit: m.toolCallIdExplicit }),
+                ...((m.turnAnchorId || m.message_meta?.turn_anchor_id) && { turnAnchorId: m.turnAnchorId || m.message_meta?.turn_anchor_id }),
+                ...((m.turnGeneration ?? m.message_meta?.turn_generation) != null && { turnGeneration: m.turnGeneration ?? m.message_meta?.turn_generation }),
+                ...((m.producerScope || m.producer_scope || m.message_meta?.producer_scope) && { producerScope: m.producerScope || m.producer_scope || m.message_meta?.producer_scope }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -2281,7 +2304,12 @@ export default function AgentDetailPage() {
             let before: string | null = null;
 
             do {
-                const params = createConversationHistoryPageParams(before);
+                const params = createConversationHistoryPageParams(
+                    before,
+                    preserveLoadedHistory && !before
+                        ? CONVERSATION_HISTORY_RECONCILE_TURN_PAGE_SIZE
+                        : undefined,
+                );
                 const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/message-turns?${params}`, {
                     headers: { Authorization: `Bearer ${tkn}` },
                     signal: controller.signal,
@@ -2445,7 +2473,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; quoted_message?: ChatQuotedMessage; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; streaming?: boolean; _streaming?: boolean; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; quoted_message?: ChatQuotedMessage; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; streaming?: boolean; _streaming?: boolean; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; turnAnchorId?: string; turnGeneration?: number; producerScope?: string; confirmationToolCalls?: ChatMsg[]; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const chatMessagesSnapshotRef = useRef<ChatMsg[]>(chatMessages);
     const historyMsgsSnapshotRef = useRef<any[]>(historyMsgs);
@@ -2455,6 +2483,9 @@ export default function AgentDetailPage() {
         type: 'thinking' | 'chunk';
         content: string;
         messageId?: string;
+        turnAnchorId?: string;
+        turnGeneration?: number;
+        producerScope?: string;
     }>>([]);
     const chatStreamBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const flushChatStreamBatch = useCallback(() => {
@@ -2466,7 +2497,16 @@ export default function AgentDetailPage() {
         if (batch.length === 0) return;
         chatStreamBatchRef.current = [];
         setChatMessages((prev) => batch.reduce(
-            (next, event) => applyAssistantStreamMessage(next as any, event, createClientId) as ChatMsg[],
+            (next, event) => foldConversationTimelineEvent(next as any, {
+                type: event.type,
+                content: event.content,
+                message_id: event.messageId,
+                producer_scope: event.producerScope,
+                turn: event.turnAnchorId ? {
+                    turn_anchor_id: event.turnAnchorId,
+                    generation: event.turnGeneration,
+                } : undefined,
+            }, { makeId: createClientId }).messages as ChatMsg[],
             prev,
         ));
     }, []);
@@ -2479,9 +2519,14 @@ export default function AgentDetailPage() {
         type: 'thinking' | 'chunk';
         content: string;
         messageId?: string;
+        turnAnchorId?: string;
+        turnGeneration?: number;
+        producerScope?: string;
     }) => {
         const last = chatStreamBatchRef.current[chatStreamBatchRef.current.length - 1];
-        if (last && last.type === event.type && last.messageId === event.messageId) {
+        if (last && last.type === event.type && last.messageId === event.messageId
+            && last.turnAnchorId === event.turnAnchorId
+            && last.producerScope === event.producerScope) {
             last.content += event.content;
         } else {
             chatStreamBatchRef.current.push({ ...event });
@@ -2491,55 +2536,8 @@ export default function AgentDetailPage() {
         }
     }, [flushChatStreamBatch]);
     const confirmationPending = chatMessages.some(isPendingConfirmationToolCall);
-    const getToolTargetKey = (args: any): string => {
-        if (!args) return '';
-        const parsed = typeof args === 'string'
-            ? (() => {
-                try { return JSON.parse(args); } catch { return null; }
-            })()
-            : args;
-        if (!parsed || typeof parsed !== 'object') return '';
-        const value = parsed.path
-            || parsed.file_path
-            || parsed.output_path
-            || parsed.target_path
-            || parsed.filename
-            || parsed.url
-            || parsed.query
-            || parsed.name
-            || '';
-        return typeof value === 'string' ? value.trim() : '';
-    };
     const upsertToolCallMessage = (toolMsg: ChatMsg) => {
-        setChatMessages(prev => {
-            const incomingTarget = getToolTargetKey(toolMsg.toolArgs);
-            // An EXACT toolCallId match is the same tool call — update it in place regardless
-            // of status (e.g. a confirmation card loaded 'pending' from history being flipped
-            // to 'done' by the resolve broadcast; without this it appends a duplicate card).
-            const exactIdMatch = (msg: ChatMsg) =>
-                msg.role === 'tool_call' && !!toolMsg.toolCallId && msg.toolCallId === toolMsg.toolCallId;
-            const sameTool = (msg: ChatMsg) => (
-                exactIdMatch(msg)
-                || (
-                    msg.role === 'tool_call'
-                    && msg.toolName === toolMsg.toolName
-                    && msg.toolStatus === 'running'
-                    && (
-                        (!!incomingTarget && getToolTargetKey(msg.toolArgs) === incomingTarget)
-                        || (!toolMsg.toolCallId && !incomingTarget)
-                    )
-                )
-            );
-            const runningIdx = [...prev].reverse().findIndex(sameTool);
-            if (runningIdx >= 0) {
-                const idx = prev.length - 1 - runningIdx;
-                if (prev[idx].toolStatus === 'done' && toolMsg.toolStatus !== 'done') {
-                    return prev;
-                }
-                return [...prev.slice(0, idx), { ...prev[idx], ...toolMsg }, ...prev.slice(idx + 1)];
-            }
-            return [...prev, toolMsg];
-        });
+        setChatMessages(prev => mergeToolCallMessage(prev as any, toolMsg as any) as ChatMsg[]);
     };
     // Transient info banner (e.g. fallback model switch notification)
     const [chatInfoMsg, setChatInfoMsg] = useState<string | null>(null);
@@ -2816,75 +2814,10 @@ export default function AgentDetailPage() {
     // streamed assistant reply) while keeping the read-only view's pagination and
     // sender attribution intact. Returns the list unchanged for unhandled types.
     const applyMonitorEvent = (prev: any[], d: any): any[] => {
-        const last = prev[prev.length - 1];
-        const isStreamingAssistant = last && last.role === 'assistant' && (last as any)._streaming;
-        if (d.type === 'channel_user_message') {
-            if (d.id && prev.some((message) => message.id === String(d.id))) return prev;
-            if (last && last.role === 'user' && last.content === d.content
-                && ((last as any).sender_name || '') === (d.sender_name || '')) return prev;
-            return [...prev, parseChatMsg({
-                id: d.id ? String(d.id) : undefined,
-                role: 'user', content: d.content || '',
-                ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
-                ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
-                ...(d.quoted_message ? { quoted_message: d.quoted_message } : {}),
-                ...(d.sender_name ? { sender_name: d.sender_name } : {}),
-                ...(d.user_id ? { sender_user_id: String(d.user_id) } : {}),
-                timestamp: d.created_at || new Date().toISOString(),
-            } as any)];
-        }
-        if (d.type === 'assistant_message_committed') {
-            const committed = parseChatMsg({
-                id: d.id ? String(d.id) : undefined,
-                role: 'assistant',
-                content: d.content || '',
-                ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
-                ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
-                timestamp: d.created_at || new Date().toISOString(),
-            } as any);
-            const index = committed.id ? prev.findIndex((message) => message.id === committed.id) : -1;
-            if (index < 0) return [...prev, committed];
-            return [...prev.slice(0, index), { ...prev[index], ...committed }, ...prev.slice(index + 1)];
-        }
-        if (d.type === 'thinking') {
-            if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, thinking: (last.thinking || '') + d.content }];
-            return [...prev, { role: 'assistant', content: '', thinking: d.content, _streaming: true } as any];
-        }
-        if (d.type === 'chunk') {
-            if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, content: last.content + d.content }];
-            return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
-        }
-        if (d.type === 'done') {
-            return applyAssistantDoneMessage(prev, {
-                content: d.content || '',
-                now: new Date().toISOString(),
-                messageId: d.message_id ? String(d.message_id) : undefined,
-            });
-        }
-        if (d.type === 'tool_call') {
-            const toolMsg = {
-                role: 'tool_call',
-                content: '',
-                toolName: d.name,
-                toolCallId: String(d.call_id || d.id || d.index || ''),
-                toolArgs: d.args,
-                toolStatus: d.status,
-                toolResult: d.result,
-                toolThinking: d.reasoning_content,
-                timestamp: new Date().toISOString(),
-            } as any;
-            const revIdx = [...prev].reverse().findIndex((msg: any) => (
-                msg.role === 'tool_call'
-                && toolMsg.toolCallId
-                && msg.toolCallId === toolMsg.toolCallId
-            ));
-            if (revIdx >= 0) {
-                const realIdx = prev.length - 1 - revIdx;
-                return [...prev.slice(0, realIdx), { ...prev[realIdx], ...toolMsg }, ...prev.slice(realIdx + 1)];
-            }
-            return [...prev, toolMsg];
-        }
-        return prev;
+        return foldConversationTimelineEvent(prev, d, {
+            makeId: createClientId,
+            preserveTransient: d._preserveTurnStream === true,
+        }).messages;
     };
 
     const applyMonitorEventRef = useRef(applyMonitorEvent);
@@ -2915,6 +2848,7 @@ export default function AgentDetailPage() {
             last
             && last.type === event.type
             && String(last.message_id || '') === String(event.message_id || '')
+            && String(last.turn?.turn_anchor_id || '') === String(event.turn?.turn_anchor_id || '')
         ) {
             last.content = `${last.content || ''}${event.content || ''}`;
         } else {
@@ -3163,6 +3097,9 @@ export default function AgentDetailPage() {
             delete wsMapRef.current[key];
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
             const runtimeBeforeClose = sessionUiStateRef.current[key];
+            sessionTurnRuntimeRef.current[key] = beginConversationTurnRecovery(
+                sessionTurnRuntimeRef.current[key] || IDLE_CONVERSATION_TURN,
+            );
             const turnWasActive = Boolean(runtimeBeforeClose
                 && (runtimeBeforeClose.isWaiting || runtimeBeforeClose.isStreaming || runtimeBeforeClose.isStopping));
             if (turnWasActive && isActiveRuntime) {
@@ -3198,7 +3135,27 @@ export default function AgentDetailPage() {
         };
         const handleSocketMessage = (d: any) => {
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
-            const isTerminalEvent = ['done', 'error', 'quota_exceeded', 'confirmation_required'].includes(d.type);
+            const turnReduction = reduceConversationTurnEvent(
+                sessionTurnRuntimeRef.current[key] || IDLE_CONVERSATION_TURN,
+                d,
+            );
+            if (!conversationTurnEventShouldBeHandled(turnReduction)) return;
+            sessionTurnRuntimeRef.current[key] = turnReduction.runtime;
+            if (turnReduction.controlsLifecycle && turnReduction.hasSnapshot) {
+                const nextWaiting = conversationTurnIsWaiting(turnReduction.runtime);
+                const nextStreaming = conversationTurnIsStreaming(turnReduction.runtime);
+                setSessionUiState(key, {
+                    isWaiting: nextWaiting,
+                    isStreaming: nextStreaming,
+                    ...(turnReduction.runtime.snapshot.phase !== 'active' ? { isStopping: false } : {}),
+                });
+                if (isActiveRuntime) {
+                    setIsWaiting(nextWaiting);
+                    setIsStreaming(nextStreaming);
+                    if (turnReduction.runtime.snapshot.phase !== 'active') setIsStopping(false);
+                }
+            }
+            const isTerminalEvent = conversationTurnEventClosesStream(turnReduction, d);
             if (isTerminalEvent && pcPageSuspendedRef.current && isActiveRuntime) {
                 // The terminal frame may precede durable persistence. Resume
                 // reconciliation therefore keeps a short polling window alive.
@@ -3287,7 +3244,8 @@ export default function AgentDetailPage() {
                 queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
                 return;
             }
-            if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
+            if (d.type === 'turn_receipt') return;
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot && ['thinking', 'chunk', 'workspace_draft', 'tool_call', 'confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                 const nextStreaming = ['thinking', 'chunk', 'workspace_draft', 'tool_call'].includes(d.type);
                 const endStreaming = ['confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type);
                 setSessionUiState(key, {
@@ -3301,7 +3259,7 @@ export default function AgentDetailPage() {
                     fetchMySessions(true, agentId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });
                 }
-                if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
+                if (conversationTurnEventClosesStream(turnReduction, d)) {
                     closeSessionSocket(key, true);
                 }
                 if (['confirmation_card', 'confirmation_update'].includes(d.type)) {
@@ -3317,9 +3275,12 @@ export default function AgentDetailPage() {
             // conversation as it streams in, so a monitored channel / other-user
             // session updates live instead of only on reload.
             if (activeReadOnlyRef.current) {
-                if (['channel_user_message', 'assistant_message_committed', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
+                if (['channel_user_message', 'user_message_committed', 'assistant_message_committed', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
                     if (d.type === 'thinking' || d.type === 'chunk') enqueueMonitorStreamEvent(d);
-                    else setHistoryMsgs(prev => applyMonitorEvent(prev, d));
+                    else setHistoryMsgs(prev => applyMonitorEvent(prev, {
+                        ...d,
+                        _preserveTurnStream: !turnReduction.controlsLifecycle,
+                    }));
                     if (d.type === 'done') {
                         const sid = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                         if (sid) clearUnreadForSession(sid);
@@ -3329,7 +3290,7 @@ export default function AgentDetailPage() {
                 return;
             }
 
-            if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot && ['thinking', 'chunk', 'workspace_draft', 'tool_call', 'confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                 setIsWaiting(false);
                 if (['thinking', 'chunk', 'workspace_draft', 'tool_call'].includes(d.type)) setIsStreaming(true);
                 if (['confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
@@ -3339,22 +3300,17 @@ export default function AgentDetailPage() {
             }
 
             if (d.type === 'confirmation_required') {
-                setChatMessages((prev) => prev.filter(
-                    (message) => String(message.id || '') !== String(d.message_id || ''),
-                ));
-                upsertToolCallMessage({
-                    role: 'tool_call',
-                    content: '',
-                    toolName: d.name || 'request_confirmation',
-                    toolCallId: String(d.call_id || ''),
-                    toolArgs: d.args,
-                    toolStatus: 'running',
-                });
+                setChatMessages((prev) => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                }).messages as ChatMsg[]);
             } else if (d.type === 'thinking') {
                 enqueueChatStreamEvent({
                     type: 'thinking',
                     content: d.content || '',
                     messageId: d.message_id ? String(d.message_id) : undefined,
+                    turnAnchorId: d.turn?.turn_anchor_id ? String(d.turn.turn_anchor_id) : undefined,
+                    turnGeneration: Number.isInteger(d.turn?.generation) ? Number(d.turn.generation) : undefined,
+                    producerScope: d.producer_scope ? String(d.producer_scope) : undefined,
                 });
             } else if (d.type === 'workspace_draft') {
                 if (WORKSPACE_TOOLS.has(d.name)) {
@@ -3377,20 +3333,6 @@ export default function AgentDetailPage() {
                         setLivePanelVisible(true);
                         collapseSidebarsForLivePanel();
                     }
-                    let toolArgs: any = parsedDraft;
-                    try {
-                        toolArgs = JSON.parse(d.arguments || '{}');
-                    } catch {
-                        toolArgs = parsedDraft;
-                    }
-                    upsertToolCallMessage({
-                        role: 'tool_call',
-                        content: '',
-                        toolName: d.name,
-                        toolCallId: draft.id,
-                        toolArgs,
-                        toolStatus: 'running',
-                    });
                 }
             } else if (d.type === 'tool_call') {
                 if (AWARE_TOOLS.has(d.name)) {
@@ -3486,66 +3428,30 @@ export default function AgentDetailPage() {
                     }
                     queryClient.invalidateQueries({ queryKey: ['files', id, workspacePath] });
                 }
-                upsertToolCallMessage({
-                    role: 'tool_call',
-                    content: '',
-                    toolName: d.name,
-                    toolCallId: String(d.call_id || d.id || d.index || ''),
-                    toolArgs: d.args,
-                    toolStatus: d.status,
-                    toolResult: d.result,
-                    toolThinking: d.reasoning_content,
-                });
+                setChatMessages((prev) => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                }).messages as ChatMsg[]);
                 if (d.status === 'done') {
                     const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                     if (currentSessionId) clearUnreadForSession(currentSessionId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });
                 }
             } else if (d.type === 'user_message_committed') {
-                const clientMessageId = String(d.client_message_id || '');
-                const messageId = String(d.message_id || '');
-                if (clientMessageId && messageId) {
-                    setChatMessages(prev => prev.map(message => (
-                        String(message.id || '') === clientMessageId ? { ...message, id: messageId } : message
-                    )));
-                }
+                setChatMessages(prev => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                }).messages as ChatMsg[]);
             } else if (d.type === 'assistant_message_committed') {
-                const committed = parseChatMsg({
-                    id: d.id ? String(d.id) : undefined,
-                    role: 'assistant',
-                    content: d.content || '',
-                    ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
-                    ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
-                    timestamp: d.created_at || new Date().toISOString(),
-                });
-                setChatMessages(prev => {
-                    const index = committed.id ? prev.findIndex(message => message.id === committed.id) : -1;
-                    if (index < 0) return [...prev, committed];
-                    return [...prev.slice(0, index), { ...prev[index], ...committed }, ...prev.slice(index + 1)];
-                });
+                setChatMessages(prev => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                    preserveTransient: !turnReduction.controlsLifecycle && !turnReduction.hasSnapshot,
+                }).messages as ChatMsg[]);
             } else if (d.type === 'channel_user_message') {
                 // An IM (DingTalk/Feishu/…) user sent a message in this session —
                 // mirror it live so a web viewer sees the user's own message
                 // without reloading (the agent reply already streams in).
-                setChatMessages(prev => {
-                    const last = prev[prev.length - 1];
-                    if (d.id && prev.some((message) => message.id === String(d.id))) return prev;
-                    if (last && last.role === 'user' && last.content === d.content
-                        && ((last as any).sender_name || '') === (d.sender_name || '')
-                        && ((last as any).sender_user_id || '') === (d.sender_user_id || d.user_id || '')) return prev;
-                    return [...prev, parseChatMsg({
-                        id: d.id ? String(d.id) : undefined,
-                        role: 'user',
-                        content: d.content,
-                        ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
-                        ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
-                        ...(d.quoted_message ? { quoted_message: d.quoted_message } : {}),
-                        ...(d.sender_name ? { sender_name: d.sender_name } : {}),
-                        ...((d.sender_user_id || d.user_id) ? { sender_user_id: d.sender_user_id || d.user_id } : {}),
-                        ...(d.sender_agent_id ? { sender_agent_id: d.sender_agent_id } : {}),
-                        timestamp: d.created_at || new Date().toISOString(),
-                    })];
-                });
+                setChatMessages(prev => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                }).messages as ChatMsg[]);
                 const cuSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (cuSessionId) clearUnreadForSession(cuSessionId);
             } else if (d.type === 'chunk') {
@@ -3553,13 +3459,15 @@ export default function AgentDetailPage() {
                     type: 'chunk',
                     content: d.content || '',
                     messageId: d.message_id ? String(d.message_id) : undefined,
+                    turnAnchorId: d.turn?.turn_anchor_id ? String(d.turn.turn_anchor_id) : undefined,
+                    turnGeneration: Number.isInteger(d.turn?.generation) ? Number(d.turn.generation) : undefined,
+                    producerScope: d.producer_scope ? String(d.producer_scope) : undefined,
                 });
             } else if (d.type === 'done') {
-                setChatMessages(prev => applyAssistantDoneMessage(prev, {
-                    content: d.content || '',
-                    messageId: d.message_id ? String(d.message_id) : undefined,
-                    now: new Date().toISOString(),
-                }));
+                setChatMessages(prev => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                    preserveTransient: !turnReduction.controlsLifecycle && !turnReduction.hasSnapshot,
+                }).messages as ChatMsg[]);
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (currentSessionId) clearUnreadForSession(currentSessionId);
                 fetchMySessions(true, agentId);
@@ -3568,6 +3476,9 @@ export default function AgentDetailPage() {
                 }
                 queryClient.invalidateQueries({ queryKey: ['agents'] });
             } else if (d.type === 'error' || d.type === 'quota_exceeded') {
+                setChatMessages(prev => foldConversationTimelineEvent(prev as any, d, {
+                    makeId: createClientId,
+                }).messages as ChatMsg[]);
                 const msg = d.content || d.detail || d.message || 'Request denied';
                 const isNoModelError = msg.includes('no LLM model') || msg.includes('No model');
                 if (isNoModelError) {
@@ -3626,7 +3537,10 @@ export default function AgentDetailPage() {
                         collapseSidebarsForLivePanel();
                     }
                 }
-            } else {
+            } else if (
+                ['user', 'assistant', 'system'].includes(String(d.role || ''))
+                && typeof d.content === 'string'
+            ) {
                 setChatMessages(prev => [...prev, parseChatMsg({ role: d.role, content: d.content })]);
             }
         };
@@ -3793,6 +3707,9 @@ export default function AgentDetailPage() {
             const ws = wsMapRef.current[key];
             const turnWasActive = !!runtime
                 && (runtime.isWaiting || runtime.isStreaming || runtime.isStopping);
+            sessionTurnRuntimeRef.current[key] = beginConversationTurnRecovery(
+                sessionTurnRuntimeRef.current[key] || IDLE_CONVERSATION_TURN,
+            );
             pcResumeHadActiveTurnRef.current = turnWasActive;
             if (turnWasActive) pcRecoveryPollingNeededRef.current = true;
             reconnectDisabledRef.current[key] = true;
@@ -3925,6 +3842,9 @@ export default function AgentDetailPage() {
             if (activeAgentId && activeSessionId) {
                 const runtimeKey = buildSessionRuntimeKey(activeAgentId, activeSessionId);
                 const runtime = sessionUiStateRef.current[runtimeKey];
+                sessionTurnRuntimeRef.current[runtimeKey] = beginConversationTurnRecovery(
+                    sessionTurnRuntimeRef.current[runtimeKey] || IDLE_CONVERSATION_TURN,
+                );
                 if (
                     pcRecoveryPollingNeededRef.current
                     || runtime?.isWaiting
@@ -3960,14 +3880,20 @@ export default function AgentDetailPage() {
     const [chatScrollBtnBottom, setChatScrollBtnBottom] = useState(96);
     const historyContainerRef = useRef<HTMLDivElement>(null);
     const historyAutoLoadCursorRef = useRef<string | null>(null);
+    const generationActive = isWaiting || isStreaming || isStopping;
     const liveScrollAnchor = useMemo(() => getConversationScrollAnchor(
         buildConversationEntries(chatMessages as any),
-        isWaiting,
-    ), [chatMessages, isWaiting]);
+        generationActive,
+    ), [chatMessages, generationActive]);
+    const readonlyGenerationActive = Boolean(
+        activeSession
+        && !isWritableSession(activeSession)
+        && generationActive
+    );
     const historyScrollAnchor = useMemo(() => getConversationScrollAnchor(
         buildConversationEntries(historyMsgs as any),
-        false,
-    ), [historyMsgs]);
+        readonlyGenerationActive,
+    ), [historyMsgs, readonlyGenerationActive]);
     const {
         showScrollToBottom: showScrollBtn,
         resumeAutoFollow: scrollToBottom,
@@ -4051,6 +3977,10 @@ export default function AgentDetailPage() {
                 ...(m.quoted_message && { quoted_message: m.quoted_message }),
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.toolCallId && { toolCallId: m.toolCallId }),
+                ...(typeof m.toolCallIdExplicit === 'boolean' && { _toolCallIdExplicit: m.toolCallIdExplicit }),
+                ...((m.turnAnchorId || m.message_meta?.turn_anchor_id) && { turnAnchorId: m.turnAnchorId || m.message_meta?.turn_anchor_id }),
+                ...((m.turnGeneration ?? m.message_meta?.turn_generation) != null && { turnGeneration: m.turnGeneration ?? m.message_meta?.turn_generation }),
+                ...((m.producerScope || m.producer_scope || m.message_meta?.producer_scope) && { producerScope: m.producerScope || m.producer_scope || m.message_meta?.producer_scope }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -4064,14 +3994,10 @@ export default function AgentDetailPage() {
             const oldScrollTop = el?.scrollTop ?? 0;
             const prependPage = (prev: any[]) => {
                 const newerMessageIds = new Set(prev.map(m => m.id).filter(Boolean));
-                const newerToolCalls = new Set(prev.map(m => m.toolCallId).filter(Boolean));
-                return [
-                    ...preParsed.filter((m: any) => (
-                        (!m.id || !newerMessageIds.has(m.id))
-                        && (!m.toolCallId || !newerToolCalls.has(m.toolCallId))
-                    )),
+                return normalizeChatTimelineMessages([
+                    ...preParsed.filter((m: any) => !m.id || !newerMessageIds.has(m.id)),
                     ...prev,
-                ];
+                ]);
             };
             if (writable) setChatMessages(prependPage);
             else setHistoryMsgs(prependPage);
@@ -6541,6 +6467,10 @@ export default function AgentDetailPage() {
                                                     scrollerRef={historyContainerRef}
                                                     resumeMeasurementKey={pcResumeMeasurementKey}
                                                     provenance={activeSessionExecution}
+                                                    isRunning={readonlyGenerationActive}
+                                                    progressMessage={{
+                                                        id: `conversation-turn-progress:${activeSession?.id || 'history'}:${sessionTurnRuntimeRef.current[`${id}:${activeSession?.id}`]?.snapshot.generation || 0}`,
+                                                    }}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
                                                     onAttachmentDownload={handleAttachmentDownload}
                                                     onAttachmentUnavailable={markAttachmentUnavailable}
@@ -6634,7 +6564,10 @@ export default function AgentDetailPage() {
                                                     scrollerRef={chatContainerRef}
                                                     resumeMeasurementKey={pcResumeMeasurementKey}
                                                     provenance={activeSessionExecution}
-                                                    isRunning={isWaiting || isStreaming || isStopping}
+                                                    isRunning={generationActive}
+                                                    progressMessage={{
+                                                        id: `conversation-turn-progress:${activeSession?.id || 'new'}:${sessionTurnRuntimeRef.current[`${id}:${activeSession?.id}`]?.snapshot.generation || 0}`,
+                                                    }}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
                                                     onAttachmentDownload={handleAttachmentDownload}
                                                     onAttachmentUnavailable={markAttachmentUnavailable}
@@ -6653,19 +6586,6 @@ export default function AgentDetailPage() {
                                                 />;
                                             })()
                                             }
-                                            {isWaiting && (
-                                                <div className="chat-msg-row">
-                                                    <div className="chat-msg-avatar">A</div>
-                                                    <div className="chat-msg-bubble chat-msg-bubble--thinking">
-                                                        <div className="thinking-indicator">
-                                                            <div className="thinking-dots">
-                                                                <span /><span /><span />
-                                                            </div>
-                                                            <span style={{ color: 'var(--text-tertiary)', fontSize: '13px' }}>{t('agent.chat.thinking', 'Thinking...')}</span>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            )}
                                         </div>
                                         {showScrollBtn && (
                                             <ConversationScrollToBottomButton

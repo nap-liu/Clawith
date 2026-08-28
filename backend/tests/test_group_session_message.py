@@ -321,6 +321,7 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
         user_id=recipient.id,
     )
     delivered: list[dict] = []
+    live_events: list[dict] = []
 
     async def fake_deliver(**kwargs):
         delivered.append(kwargs)
@@ -333,8 +334,8 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
             ),
         )
 
-    async def fake_live_mirror(*_args, **_kwargs):
-        return None
+    async def fake_live_mirror(*args, **_kwargs):
+        live_events.append(args[-1])
 
     monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
     monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
@@ -357,6 +358,15 @@ async def test_send_session_message_uses_exact_person_route_and_active_relations
         "conversation_type": "person",
         "conversation_name": recipient.display_name,
     }
+    assert live_events == [
+        {
+            "type": "assistant_message_committed",
+            "id": message_id,
+            "role": "assistant",
+            "content": "按原会话投递",
+            "session_id": str(target.id),
+        }
+    ]
     assert len(delivered) == 1
     assert delivered[0]["runtime"] == TurnRuntime(
         session_found=True,

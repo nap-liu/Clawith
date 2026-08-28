@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { IconX } from '@tabler/icons-react';
 
 export function EnvGrid({
   env,
@@ -45,7 +46,8 @@ export function EnvGrid({
               color: 'var(--text-tertiary)', fontSize: '14px', padding: '4px 8px',
             }}
             title={k('envRemove', 'Remove')}
-          >✕</button>
+            aria-label={k('envRemove', 'Remove')}
+          ><IconX size={15} /></button>
         </div>
       ))}
       <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '4px' }}>

@@ -56,6 +56,7 @@ class PendingConfirmation:
     user_id: uuid.UUID | None
     args: dict
     created_at: datetime | None
+    turn_anchor_id: uuid.UUID | None = None
     force_confirmation: bool = True
 
 
@@ -107,6 +108,11 @@ async def find_pending_confirmation(
             user_id=row.user_id,
             args=normalized_args,
             created_at=row.created_at,
+            turn_anchor_id=(
+                uuid.UUID(str((row.message_meta or {}).get("turn_anchor_id")))
+                if (row.message_meta or {}).get("turn_anchor_id")
+                else None
+            ),
             force_confirmation=normalized_args.get("force_confirmation") is not False,
         )
     return None
@@ -284,6 +290,7 @@ async def suspend_for_confirmation(
     has_intro = bool(intro_text and intro_text.strip())
     created_at = datetime.now(timezone.utc)
     intro_message_id: uuid.UUID | None = None
+    turn_snapshot = None
     async with async_session() as db:
         # The session row is the cross-process serialization boundary shared with
         # inbound message ingestion and confirmation resolution.  Either the user
@@ -369,6 +376,16 @@ async def suspend_for_confirmation(
             confirmation_row.message_meta,
             IMDeliveryResult.pending("dingtalk" if resolved_channel == "dingtalk" else "web"),
         )
+        if turn_anchor_id is not None:
+            from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+            turn_snapshot = await transition_conversation_turn(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(conversation_id),
+                turn_anchor_id=turn_anchor_id,
+                status="suspended",
+            )
         await db.commit()
 
     # ALWAYS mirror the card to live web viewers — the card IS a tool_call, so broadcast it
@@ -377,16 +394,25 @@ async def suspend_for_confirmation(
     from app.services.im_delivery import IMDeliveryResult, register_delivery
 
     try:
+        payload = {
+            "type": "tool_call",
+            "name": REQUEST_CONFIRMATION_TOOL_NAME,
+            "call_id": str(row_id),
+            "args": args,
+            "status": "running",
+        }
+        if turn_snapshot is not None:
+            from app.services.conversation_turn_lifecycle import with_turn_envelope
+
+            payload = with_turn_envelope(
+                payload,
+                turn_snapshot,
+                event_kind="turn_suspended",
+            )
         await _broadcast(
             agent_id,
             conversation_id,
-            {
-                "type": "tool_call",
-                "name": REQUEST_CONFIRMATION_TOOL_NAME,
-                "call_id": str(row_id),
-                "args": args,
-                "status": "running",
-            },
+            payload,
         )
         if resolved_channel != "dingtalk":
             await register_delivery(
@@ -501,6 +527,7 @@ async def resolve_confirmation(
 
     now = datetime.now(timezone.utc)
     result_text: str | None = None
+    turn_snapshot = None
 
     async with async_session() as db:
         # The row's conversation_id is immutable — read it first (unlocked) so we know which
@@ -558,23 +585,54 @@ async def resolve_confirmation(
         payload["status"] = "done"
         payload["result"] = result_text
         row.content = json.dumps(payload, ensure_ascii=False, default=str)
+        if turn_anchor_id is not None:
+            from app.services.conversation_turn_lifecycle import (
+                transition_conversation_turn,
+            )
+
+            turn_snapshot = await transition_conversation_turn(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(conversation_id),
+                turn_anchor_id=turn_anchor_id,
+                status="running",
+            )
         await db.commit()
+        if turn_anchor_id is not None:
+            from app.services.conversation_turn_lifecycle import get_conversation_turn_snapshot
+
+            turn_snapshot = await get_conversation_turn_snapshot(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(conversation_id),
+                turn_anchor_id=turn_anchor_id,
+            )
 
     # Flip the card for any live web viewer (the click optimistically updates the clicker's
     # own card; this updates other watchers + is the authoritative live signal).
+    resolved_tool_payload = {
+        "type": "tool_call",
+        "name": REQUEST_CONFIRMATION_TOOL_NAME,
+        "call_id": str(call_id),
+        # Carry args so the live merge keeps the card's content (the web merge spreads
+        # the event and would otherwise overwrite toolArgs with undefined).
+        "args": payload.get("args"),
+        "status": "done",
+        "result": result_text,
+    }
+    resolved_payload = resolved_tool_payload
+    if turn_snapshot is not None:
+        from app.services.conversation_turn_lifecycle import with_turn_envelope
+
+        resolved_payload = with_turn_envelope(
+            resolved_payload,
+            turn_snapshot,
+            event_kind="turn_tool",
+        )
     await _broadcast(
         agent_id,
         conversation_id,
-        {
-            "type": "tool_call",
-            "name": REQUEST_CONFIRMATION_TOOL_NAME,
-            "call_id": str(call_id),
-            # Carry args so the live merge keeps the card's content (the web merge spreads
-            # the event and would otherwise overwrite toolArgs with undefined).
-            "args": payload.get("args"),
-            "status": "done",
-            "result": result_text,
-        },
+        resolved_payload,
     )
 
     # Keep the origin IM card in sync: a card delivered to DingTalk — resolved here on web OR
@@ -604,9 +662,35 @@ async def resolve_confirmation(
             str(conversation_id),
             resolving_user_id,
             turn_anchor_id=turn_anchor_id,
+            resolved_tool_payload=resolved_tool_payload,
         )
     except Exception:
         logger.exception("Reenter after resolving confirmation %s failed; resolution stands.", call_id)
+        if turn_anchor_id is not None:
+            from app.services.conversation_turn_lifecycle import (
+                publish_conversation_turn_event,
+                transition_conversation_turn,
+            )
+
+            try:
+                async with async_session() as lifecycle_db:
+                    failed_snapshot = await transition_conversation_turn(
+                        lifecycle_db,
+                        agent_id=agent_id,
+                        conversation_id=str(conversation_id),
+                        turn_anchor_id=turn_anchor_id,
+                        status="failed",
+                    )
+                    await lifecycle_db.commit()
+                await publish_conversation_turn_event(
+                    agent_id=agent_id,
+                    conversation_id=str(conversation_id),
+                    payload={"type": "error", "content": "确认后的处理未能继续。"},
+                    snapshot=failed_snapshot,
+                    event_kind="turn_terminal",
+                )
+            except Exception:
+                logger.exception("Failed to close confirmation continuation %s", call_id)
 
     return result_text
 
@@ -617,6 +701,7 @@ async def _reenter_loop(
     resolving_user_id: uuid.UUID,
     *,
     turn_anchor_id: uuid.UUID | None = None,
+    resolved_tool_payload: dict | None = None,
 ) -> None:
     """Resume the agent's LLM loop from existing history (which now ends with the filled
     request_confirmation tool result) WITHOUT injecting a user message. Per-session lock via
@@ -637,6 +722,48 @@ async def _reenter_loop(
     )
 
     async def _work() -> str:
+        if turn_anchor_id is not None:
+            async with async_session() as lifecycle_check_db:
+                from app.models.audit import ChatMessage
+
+                lifecycle_anchor = await lifecycle_check_db.get(ChatMessage, turn_anchor_id)
+                lifecycle_meta = (
+                    lifecycle_anchor.message_meta
+                    if lifecycle_anchor is not None
+                    and isinstance(lifecycle_anchor.message_meta, dict)
+                    else {}
+                )
+                if lifecycle_meta.get("turn_status") == "cancelled":
+                    logger.info(
+                        "Confirmation continuation skipped for cancelled turn %s",
+                        turn_anchor_id,
+                    )
+                    return ""
+            from app.services.conversation_turn_lifecycle import (
+                publish_conversation_turn_event,
+                transition_conversation_turn,
+            )
+
+            try:
+                async with async_session() as lifecycle_db:
+                    resumed_snapshot = await transition_conversation_turn(
+                        lifecycle_db,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                        turn_anchor_id=turn_anchor_id,
+                        status="running",
+                    )
+                    await lifecycle_db.commit()
+                await publish_conversation_turn_event(
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    payload={"type": "turn_state"},
+                    snapshot=resumed_snapshot,
+                    event_kind="turn_lifecycle",
+                )
+            except LookupError:
+                # Legacy confirmation rows may predate durable ChatSession rows.
+                pass
         async with async_session() as db:
             if turn_anchor_id is not None:
                 from app.models.audit import ChatMessage
@@ -736,7 +863,11 @@ async def _reenter_loop(
                 resume_subagent_after_confirmation,
             )
 
-            await resume_subagent_after_confirmation(session.id)
+            await resume_subagent_after_confirmation(
+                session.id,
+                resolved_tool_payload=resolved_tool_payload,
+                child_turn_anchor_id=turn_anchor_id,
+            )
             return
         # Legacy confirmation rows can outlive a deleted/missing ChatSession.
         # Preserve their UUID lock identity; durable sessions use the same
@@ -1021,6 +1152,16 @@ async def ignore_pending_confirmation_for_new_input(
     payload["status"] = "done"
     payload["result"] = IGNORED_CONFIRMATION_RESULT
     row.content = json.dumps(payload, ensure_ascii=False, default=str)
+    if pending.turn_anchor_id is not None:
+        from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+        await transition_conversation_turn(
+            db,
+            agent_id=pending.agent_id,
+            conversation_id=pending.conversation_id,
+            turn_anchor_id=pending.turn_anchor_id,
+            status="cancelled",
+        )
     await db.flush()
     return IGNORED_CONFIRMATION_RESULT
 

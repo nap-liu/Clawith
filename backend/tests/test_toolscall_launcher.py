@@ -184,6 +184,7 @@ def test_standard_rejects_mixed_stdin_and_flags(tmp_path, bridge_server):
 
     assert result.returncode == 2
     assert b"cannot be used together" in result.stderr
+    assert b"pipe one complete JSON object and remove all flags" in result.stderr
     assert _BridgeHandler.calls == []
 
 

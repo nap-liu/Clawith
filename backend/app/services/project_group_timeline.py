@@ -11,13 +11,16 @@ import uuid
 from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.project import ProjectRun
-from app.services.chat_history import parse_tool_call_for_display
-from app.services.chat_message_serializer import serialize_chat_message_for_client
+from app.services.chat_message_serializer import (
+    merge_tool_call_update_for_client,
+    serialize_chat_message_for_client,
+    serialize_tool_call_for_client,
+)
 
 _GROUP_RUN_TRIGGERS = {"group_leader_message", "group_mention", "leader_reply_batch"}
 _HIDDEN_CHILD_KINDS = {"subagent_fork_context", "subagent_input"}
@@ -32,7 +35,12 @@ def serialize_project_group_message(message: ChatMessage) -> dict[str, Any]:
     """Serialize a stored group row through the standard client serializer."""
 
     metadata = _metadata(message)
-    entry = serialize_chat_message_for_client(
+    serializer = (
+        serialize_tool_call_for_client
+        if message.role == "tool_call"
+        else serialize_chat_message_for_client
+    )
+    entry = serializer(
         message,
         source_channel="project",
         sender_user_id=message.sender_user_id,
@@ -59,21 +67,18 @@ def _serialize_child_message(message: ChatMessage) -> dict[str, Any]:
     """Apply the same serializer/parser contract as the Web Chat history API."""
 
     sender_agent_id = message.sender_agent_id or message.agent_id
-    entry = serialize_chat_message_for_client(
-        message,
-        source_channel="subagent",
-        sender_agent_id=sender_agent_id,
-    )
     if message.role == "tool_call":
-        # Pending confirmations intentionally use the row id as their resolve
-        # handle. Canonical running/done tool rows use their persisted call id.
-        entry["toolCallId"] = str(message.id)
-        parsed = parse_tool_call_for_display(message.content)
-        if parsed:
-            entry["content"] = ""
-            entry.update(parsed)
-        if entry.get("toolName") == "request_confirmation":
-            entry["toolCallId"] = str(message.id)
+        entry = serialize_tool_call_for_client(
+            message,
+            source_channel="subagent",
+            sender_agent_id=sender_agent_id,
+        )
+    else:
+        entry = serialize_chat_message_for_client(
+            message,
+            source_channel="subagent",
+            sender_agent_id=sender_agent_id,
+        )
     metadata = _metadata(message)
     entry.update(
         {
@@ -125,15 +130,34 @@ async def build_project_group_timeline(
     if not group_messages:
         return []
     group_message_ids = {str(message.id) for message in group_messages}
+    referenced_run_ids: set[uuid.UUID] = set()
+    for message in group_messages:
+        metadata = _metadata(message)
+        raw_run_ids = list(metadata.get("source_project_run_ids") or [])
+        raw_run_ids.extend(
+            raw.get("project_run_id")
+            for raw in metadata.get("subagent_runs") or []
+            if isinstance(raw, dict)
+        )
+        for raw_run_id in raw_run_ids:
+            try:
+                referenced_run_ids.add(uuid.UUID(str(raw_run_id)))
+            except (TypeError, ValueError):
+                continue
+    run_scope = ProjectRun.input["group_message_id"].as_string().in_(
+        group_message_ids
+    )
+    if referenced_run_ids:
+        run_scope = or_(run_scope, ProjectRun.id.in_(referenced_run_ids))
     runs = (
         await db.execute(
             select(ProjectRun).where(
                 ProjectRun.project_id == project_id,
                 ProjectRun.trigger_type.in_(_GROUP_RUN_TRIGGERS),
+                run_scope,
             )
         )
     ).scalars().all()
-    runs = [run for run in runs if _group_anchor_id(run) in group_message_ids]
     run_by_id = {str(run.id): run for run in runs}
 
     child_ids_by_run: dict[str, str] = {}
@@ -177,6 +201,9 @@ async def build_project_group_timeline(
                     .where(
                         ChatMessage.conversation_id.in_(child_ids),
                         ChatMessage.role == "user",
+                        ChatMessage.message_meta["project_run_id"]
+                        .as_string()
+                        .in_(set(run_by_id)),
                     )
                     .order_by(ChatMessage.created_at, ChatMessage.id)
                 )
@@ -198,8 +225,13 @@ async def build_project_group_timeline(
         if group_anchor:
             group_id_by_anchor[(child_input.conversation_id, anchor_id)] = group_anchor
 
+    allowed_anchor_ids = {
+        anchor_id
+        for anchor_ids in allowed_anchors_by_child.values()
+        for anchor_id in anchor_ids
+    }
     child_rows: list[ChatMessage] = []
-    if child_ids:
+    if child_ids and allowed_anchor_ids:
         child_rows.extend(
             list(
                 (
@@ -208,6 +240,9 @@ async def build_project_group_timeline(
                         .where(
                             ChatMessage.conversation_id.in_(child_ids),
                             ChatMessage.role.in_(["assistant", "tool_call"]),
+                            ChatMessage.message_meta["turn_anchor_id"]
+                            .as_string()
+                            .in_(allowed_anchor_ids),
                         )
                         .order_by(ChatMessage.created_at, ChatMessage.id)
                     )
@@ -221,6 +256,26 @@ async def build_project_group_timeline(
         ).scalars().all()
         child_rows.extend(row for row in materialized_rows if row.id not in existing_ids)
 
+    final_key_to_id = {
+        f"project-subagent:{row.id}": str(row.id)
+        for row in child_rows
+        if row.role == "assistant"
+    }
+    globally_materialized_child_ids: set[str] = set()
+    if final_key_to_id:
+        materialized_keys = (
+            await db.execute(
+                select(ChatMessage.external_event_key).where(
+                    ChatMessage.external_event_key.in_(set(final_key_to_id))
+                )
+            )
+        ).scalars().all()
+        globally_materialized_child_ids = {
+            final_key_to_id[key]
+            for key in materialized_keys
+            if key in final_key_to_id
+        }
+
     visible_child_rows: list[ChatMessage] = []
     child_row_by_id: dict[str, ChatMessage] = {}
     for row in child_rows:
@@ -229,11 +284,18 @@ async def build_project_group_timeline(
         if metadata.get("kind") in _HIDDEN_CHILD_KINDS:
             continue
         anchor_id = str(metadata.get("turn_anchor_id") or "")
-        if anchor_id and anchor_id in allowed_anchors_by_child.get(row.conversation_id, set()):
+        anchor_key = (row.conversation_id, anchor_id)
+        if (
+            anchor_id
+            and anchor_id
+            in allowed_anchors_by_child.get(row.conversation_id, set())
+            and group_id_by_anchor.get(anchor_key) in group_message_ids
+        ):
             visible_child_rows.append(row)
 
     projected: list[tuple[Any, str, dict[str, Any]]] = []
-    consumed_child_ids: set[str] = set()
+    group_tool_positions: dict[tuple[str, str, str], int] = {}
+    consumed_child_ids: set[str] = set(globally_materialized_child_ids)
     for message in group_messages:
         entry = serialize_project_group_message(message)
         child_message_id = str(_metadata(message).get("child_message_id") or "")
@@ -243,10 +305,49 @@ async def build_project_group_timeline(
             for key in ("content", "display_content", "attachments", "thinking"):
                 if key in standard_final:
                     entry[key] = standard_final[key]
+            child_anchor_id = str(_metadata(child_final).get("turn_anchor_id") or "")
+            anchor_key = (child_final.conversation_id, child_anchor_id)
+            message_metadata = _metadata(message)
+            group_anchor_id = str(
+                message_metadata.get("timeline_anchor_id")
+                or group_id_by_anchor.get(anchor_key)
+                or ""
+            ) or None
+            producer_scope = str(
+                message_metadata.get("producer_scope")
+                or f"project:{child_final.conversation_id}:{child_anchor_id}"
+            )
+            entry["metadata"] = {
+                **entry["metadata"],
+                "turn_anchor_id": group_anchor_id,
+                "producer_scope": producer_scope,
+            }
+            entry["message_meta"] = entry["metadata"]
+            entry["turnAnchorId"] = group_anchor_id
+            entry["producerScope"] = producer_scope
+            entry["producer_scope"] = producer_scope
+            entry["canonicalDone"] = True
             consumed_child_ids.add(child_message_id)
-        projected.append((message.created_at, str(message.id), entry))
+        item = (message.created_at, str(message.id), entry)
+        if message.role != "tool_call":
+            projected.append(item)
+            continue
+        metadata = _metadata(message)
+        tool_key = (
+            message.conversation_id,
+            str(metadata.get("turn_anchor_id") or "legacy"),
+            str(entry.get("toolCallId") or message.id),
+        )
+        previous_position = group_tool_positions.get(tool_key)
+        if previous_position is None:
+            group_tool_positions[tool_key] = len(projected)
+            projected.append(item)
+            continue
+        previous = projected[previous_position]
+        merged = merge_tool_call_update_for_client(previous[2], entry)
+        projected[previous_position] = (previous[0], previous[1], merged)
 
-    tool_positions: dict[tuple[str, str], int] = {}
+    tool_positions: dict[tuple[str, str, str], int] = {}
     child_projected: list[tuple[Any, str, dict[str, Any]]] = []
     for row in visible_child_rows:
         if str(row.id) in consumed_child_ids:
@@ -254,31 +355,84 @@ async def build_project_group_timeline(
         entry = _serialize_child_message(row)
         anchor_id = str(_metadata(row).get("turn_anchor_id") or "")
         anchor_key = (row.conversation_id, anchor_id)
+        group_anchor_id = group_id_by_anchor.get(anchor_key)
+        producer_scope = f"project:{row.conversation_id}:{anchor_id}"
         entry["metadata"] = {
             **entry["metadata"],
+            "turn_anchor_id": group_anchor_id,
+            "producer_scope": producer_scope,
             "project_timeline": {
-                "group_message_id": group_id_by_anchor.get(anchor_key),
+                "group_message_id": group_anchor_id,
                 "project_run_ids": sorted(run_ids_by_anchor.get(anchor_key, set())),
                 "subagent_session_id": row.conversation_id,
             },
         }
         entry["message_meta"] = entry["metadata"]
+        entry["turnAnchorId"] = group_anchor_id
+        entry["producerScope"] = producer_scope
+        entry["producer_scope"] = producer_scope
         item = (row.created_at, str(row.id), entry)
         if row.role != "tool_call":
             child_projected.append(item)
             continue
-        tool_key = (row.conversation_id, str(entry.get("toolCallId") or row.id))
+        tool_key = (
+            row.conversation_id,
+            anchor_id,
+            str(entry.get("toolCallId") or row.id),
+        )
         previous_position = tool_positions.get(tool_key)
         if previous_position is None:
             tool_positions[tool_key] = len(child_projected)
             child_projected.append(item)
             continue
         previous = child_projected[previous_position]
-        if previous[2].get("toolStatus") == "done" and entry.get("toolStatus") == "running":
-            continue
-        entry["created_at"] = previous[2].get("created_at") or entry.get("created_at")
-        child_projected[previous_position] = (previous[0], previous[1], entry)
+        merged = merge_tool_call_update_for_client(previous[2], entry)
+        child_projected[previous_position] = (previous[0], previous[1], merged)
 
     projected.extend(child_projected)
     projected.sort(key=lambda item: (item[0], item[1]))
+    # Keep every child event inside the Human message partition that caused
+    # its ProjectRun. A later Human message may join the same lifecycle cohort
+    # while an older producer is still emitting tools/chunks; global timestamp
+    # order would otherwise place those older-turn events after the new anchor.
+    for group_anchor in [row for row in group_messages if row.role == "user"]:
+        anchor_id = str(group_anchor.id)
+        scoped = [
+            item
+            for item in projected
+            if item[2].get("role") != "user"
+            and str(
+                item[2].get("turnAnchorId")
+                or dict(item[2].get("metadata") or {}).get("turn_anchor_id")
+                or ""
+            )
+            == anchor_id
+        ]
+        if not scoped:
+            continue
+        scoped_ids = {id(item) for item in scoped}
+        remaining = [item for item in projected if id(item) not in scoped_ids]
+        anchor_index = next(
+            (
+                index
+                for index, item in enumerate(remaining)
+                if str(item[2].get("id") or "") == anchor_id
+            ),
+            -1,
+        )
+        if anchor_index < 0:
+            continue
+        next_user_index = next(
+            (
+                index
+                for index in range(anchor_index + 1, len(remaining))
+                if remaining[index][2].get("role") == "user"
+            ),
+            len(remaining),
+        )
+        projected = [
+            *remaining[:next_user_index],
+            *scoped,
+            *remaining[next_user_index:],
+        ]
     return [entry for _created_at, _message_id, entry in projected]

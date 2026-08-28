@@ -11,6 +11,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 
 from loguru import logger
 
@@ -140,6 +141,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         agent_is_private = False
         model_provider = ""
         model_api_key = ""
+        model_api_key_encrypted = ""
         model_model = ""
         model_base_url = None
         model_temperature = None
@@ -172,6 +174,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             agent_is_private = (getattr(agent, "access_mode", None) or "company") != "company"
             model_provider = model.provider
             model_api_key = get_model_api_key(model)
+            model_api_key_encrypted = model.api_key_encrypted
             model_model = model.model
             model_base_url = model.base_url
             model_temperature = model.temperature
@@ -277,6 +280,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             get_model_api_key,
         )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
+        from app.services.llm.caller import _complete_with_throttle_retry
 
         try:
             client = create_llm_client(
@@ -285,6 +289,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 model=model_model,
                 base_url=model_base_url,
                 timeout=float(model_request_timeout or 120.0),
+                provider_managed_timeout=True,
             )
             client_guard = LLMClientCloseGuard(client)
         except Exception as e:
@@ -292,6 +297,13 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             return
 
         tools_for_llm = await get_agent_tools_for_llm(agent_id)
+        runtime_model = SimpleNamespace(
+            provider=model_provider,
+            model=model_model,
+            base_url=model_base_url,
+            api_key_encrypted=model_api_key_encrypted,
+            request_timeout=model_request_timeout,
+        )
 
         reply = ""
         _hb_accumulated_usage = None
@@ -331,7 +343,10 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
 
             try:
                 _round_t0 = perf_counter()
-                response = await client.complete(
+                response = await _complete_with_throttle_retry(
+                    client,
+                    model=runtime_model,
+                    round_i=round_i + 1,
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
@@ -603,6 +618,7 @@ async def run_agent_oneshot(
         execution_user_id = None
         model_provider = ""
         model_api_key = ""
+        model_api_key_encrypted = ""
         model_model = ""
         model_base_url = None
         model_temperature = None
@@ -648,6 +664,7 @@ async def run_agent_oneshot(
             )
             model_provider = model.provider
             model_api_key = get_model_api_key(model)
+            model_api_key_encrypted = model.api_key_encrypted
             model_model = model.model
             model_base_url = model.base_url
             model_temperature = model.temperature
@@ -680,6 +697,7 @@ async def run_agent_oneshot(
             LLMError,
         )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
+        from app.services.llm.caller import _complete_with_throttle_retry
         from app.services.token_tracker import (
             TokenUsage,
             record_token_usage,
@@ -694,6 +712,7 @@ async def run_agent_oneshot(
                 model=model_model,
                 base_url=model_base_url,
                 timeout=float(model_request_timeout or 120.0),
+                provider_managed_timeout=True,
             )
             client_guard = LLMClientCloseGuard(client)
         except Exception as e:
@@ -703,6 +722,13 @@ async def run_agent_oneshot(
             return ""
 
         tools_for_llm = await get_agent_tools_for_llm(agent_id)
+        runtime_model = SimpleNamespace(
+            provider=model_provider,
+            model=model_model,
+            base_url=model_base_url,
+            api_key_encrypted=model_api_key_encrypted,
+            request_timeout=model_request_timeout,
+        )
         llm_messages = [
             LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt),
             LLMMessage(role="user", content=prompt),
@@ -731,7 +757,10 @@ async def run_agent_oneshot(
 
             try:
                 _round_t0 = perf_counter()
-                response = await client.complete(
+                response = await _complete_with_throttle_retry(
+                    client,
+                    model=runtime_model,
+                    round_i=round_i + 1,
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,

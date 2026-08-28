@@ -79,11 +79,11 @@ export function BasicInfoStep({
       <div>
         <label style={labelStyle}>{k('fieldDescription', 'Description')}</label>
         <textarea
-          className="form-input"
+          className="form-textarea"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          rows={3}
-          style={{ resize: 'vertical' }}
+          rows={8}
+          style={{ minHeight: '220px', lineHeight: 1.6 }}
           placeholder={k('fieldDescriptionPlaceholder', 'What this tool does and when to call it')}
         />
         <div style={hintStyle}>

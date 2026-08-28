@@ -1156,9 +1156,14 @@ async def execute_project_runtime_tool(
                 )
             await db.commit()
             if cancelled_child_ids:
-                from app.services.subagent_runtime import cancel_local_subagent_tasks
+                from app.services.subagent_runtime import (
+                    finalize_cancelled_project_member_turns,
+                )
 
-                await cancel_local_subagent_tasks(cancelled_child_ids)
+                await finalize_cancelled_project_member_turns(
+                    attached.id,
+                    cancelled_child_ids,
+                )
             return json.dumps({"agent_id": str(target.agent_id), "is_enabled": target.is_enabled})
 
         if tool_name == "project_set_capability_enabled":

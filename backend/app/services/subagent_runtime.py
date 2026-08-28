@@ -346,7 +346,6 @@ async def _requeue_capacity_blocked_subagent(
         meta = _message_meta(anchor)
         if meta.get("subagent_input_state") == INPUT_PROCESSING:
             meta["subagent_input_state"] = INPUT_PENDING
-            meta["turn_status"] = "pending"
             anchor.message_meta = meta
             raw_project_run_id = meta.get("project_run_id")
             try:
@@ -902,25 +901,58 @@ async def append_subagent_message(
                     ),
                 }
         supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
-        db.add(
-            ChatMessage(
-                agent_id=child.agent_id,
-                user_id=run.execution_user_id,
-                sender_user_id=run.execution_user_id,
-                role="user",
-                content=content,
-                conversation_id=str(child_id),
-                external_event_key=event_key,
-                message_meta={
-                    **supplied_metadata,
-                    "kind": SUBAGENT_INPUT,
-                    "subagent_input_state": INPUT_PENDING,
-                    "attachments": supplied_attachments,
-                    **({"project_run_id": str(project_run_id)} if project_run_id else {}),
-                },
-                created_at=now,
-            )
+        input_row = ChatMessage(
+            agent_id=child.agent_id,
+            user_id=run.execution_user_id,
+            sender_user_id=run.execution_user_id,
+            role="user",
+            content=content,
+            conversation_id=str(child_id),
+            external_event_key=event_key,
+            message_meta={
+                **supplied_metadata,
+                "kind": SUBAGENT_INPUT,
+                "subagent_input_state": INPUT_PENDING,
+                "attachments": supplied_attachments,
+                **({"project_run_id": str(project_run_id)} if project_run_id else {}),
+            },
+            created_at=now,
         )
+        db.add(input_row)
+        await db.flush()
+        # Admission owns the durable lifecycle. Always admit the oldest live
+        # input, never merely the row appended by this call: a queued or
+        # processing predecessor remains the single session owner until it
+        # reaches a terminal state.
+        from app.services.conversation_turn_lifecycle import (
+            ConversationTurnConflict,
+            transition_conversation_turn,
+        )
+
+        lifecycle_anchor = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(child.id),
+                    ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+                    ChatMessage.message_meta["subagent_input_state"]
+                    .as_string()
+                    .in_([INPUT_PENDING, INPUT_PROCESSING]),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+                .limit(1)
+            )
+        ).scalar_one()
+        try:
+            await transition_conversation_turn(
+                db,
+                agent_id=child.agent_id,
+                conversation_id=str(child.id),
+                turn_anchor_id=lifecycle_anchor.id,
+                status="running",
+            )
+        except ConversationTurnConflict:
+            pass
         child.last_message_at = now
         if run.status in {RUN_COMPLETED, RUN_FAILED, RUN_WAITING}:
             run.status = RUN_QUEUED
@@ -1036,6 +1068,15 @@ async def stop_subagent(
         if run.status in TERMINAL_STATUSES:
             return run.status
 
+        from app.services.conversation_turn_lifecycle import (
+            cancel_current_conversation_turn,
+        )
+
+        await cancel_current_conversation_turn(
+            db,
+            agent_id=child.agent_id,
+            conversation_id=str(child.id),
+        )
         run.status = RUN_CANCELLED
         run.lease_owner = None
         run.lease_expires_at = None
@@ -1057,10 +1098,39 @@ async def stop_subagent(
         for row in rows:
             meta = _message_meta(row)
             meta["subagent_input_state"] = INPUT_CANCELLED
-            meta["turn_status"] = "cancelled"
             row.message_meta = meta
+        project_id = run.project_id
+        project_run_ids = {
+            uuid.UUID(str(raw_id))
+            for row in rows
+            for raw_id in [_message_meta(row).get("project_run_id")]
+            if raw_id
+        }
+        if project_run_ids:
+            from app.models.project import ProjectRun
+            from app.services.project_service import TERMINAL_PROJECT_RUN_STATUSES
+
+            project_runs = list(
+                (
+                    await db.execute(
+                        select(ProjectRun).where(
+                            ProjectRun.id.in_(project_run_ids),
+                            ProjectRun.status.not_in(TERMINAL_PROJECT_RUN_STATUSES),
+                        )
+                    )
+                ).scalars()
+            )
+            now = datetime.now(UTC)
+            for project_run in project_runs:
+                project_run.status = "cancelled"
+                project_run.finished_at = now
+                project_run.error = "Project subagent was stopped"
         await db.commit()
 
+    await publish_cancelled_subagent_turns(
+        [child_id],
+        project_id=project_id,
+    )
     async with _running_tasks_guard:
         task = _running_tasks.get(child_id)
         if task is not None and not task.done():
@@ -1082,6 +1152,56 @@ async def cancel_local_subagent_tasks(run_ids: list[uuid.UUID]) -> None:
     for task in tasks:
         if task is not None and not task.done():
             task.cancel()
+
+
+async def publish_cancelled_subagent_turns(
+    run_ids: list[uuid.UUID],
+    *,
+    project_id: uuid.UUID | None = None,
+) -> None:
+    """Publish committed child and Project-cohort cancellation state."""
+
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+        publish_conversation_turn_event,
+    )
+
+    for run_id in dict.fromkeys(run_ids):
+        async with async_session() as db:
+            child = await db.get(ChatSession, run_id)
+            if child is None:
+                continue
+            snapshot = await get_conversation_turn_snapshot(
+                db,
+                agent_id=child.agent_id,
+                conversation_id=str(child.id),
+            )
+            if snapshot.status != "cancelled" or snapshot.anchor_id is None:
+                continue
+        await publish_conversation_turn_event(
+            agent_id=child.agent_id,
+            conversation_id=str(child.id),
+            payload={"type": "done", "role": "assistant", "content": ""},
+            snapshot=snapshot,
+            event_kind="turn_terminal",
+        )
+
+    if project_id is not None:
+        from app.services.project_group_turn_lifecycle import (
+            reconcile_and_publish_project_group_turns,
+        )
+
+        await reconcile_and_publish_project_group_turns(project_id)
+
+
+async def finalize_cancelled_project_member_turns(
+    project_id: uuid.UUID,
+    run_ids: list[uuid.UUID],
+) -> None:
+    """Post-commit observer publication and local worker interruption."""
+
+    await publish_cancelled_subagent_turns(run_ids, project_id=project_id)
+    await cancel_local_subagent_tasks(run_ids)
 
 
 async def prepare_subagent_tools(
@@ -1651,12 +1771,20 @@ async def _load_or_start_input(
                 run.lease_expires_at = None
                 await db.commit()
                 return None
+        from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+        await transition_conversation_turn(
+            db,
+            agent_id=anchor.agent_id,
+            conversation_id=str(run_id),
+            turn_anchor_id=anchor.id,
+            status="running",
+        )
         meta = _message_meta(anchor)
         meta.update(
             {
                 "subagent_input_state": INPUT_PROCESSING,
                 "subagent_turn_anchor_id": str(anchor.id),
-                "turn_status": "running",
             }
         )
         anchor.message_meta = meta
@@ -1868,15 +1996,51 @@ async def _park_subagent_confirmation(
                             },
                         )
         await db.commit()
+        if run.project_id is not None:
+            from app.services.project_group_turn_lifecycle import (
+                reconcile_and_publish_project_group_turn,
+            )
+
+            await reconcile_and_publish_project_group_turn(
+                project_id=run.project_id,
+                session_id=run.parent_session_id,
+                payload={"type": "turn_state"},
+                event_kind="turn_lifecycle",
+            )
         return True
 
 
-async def resume_subagent_after_confirmation(run_id: uuid.UUID) -> bool:
+async def resume_subagent_after_confirmation(
+    run_id: uuid.UUID,
+    *,
+    resolved_tool_payload: dict | None = None,
+    child_turn_anchor_id: uuid.UUID | None = None,
+) -> bool:
     """Persist a resolved child confirmation and run it when its project allows."""
+    already_running = False
+    project_id = None
+    parent_session_id = None
+    group_timeline_anchor_id = None
+    child_agent_id = None
     async with async_session() as db:
         run = await db.get(SubagentRun, run_id, with_for_update=True)
         if run is None or run.status in TERMINAL_STATUSES:
             return False
+        project_id = run.project_id
+        parent_session_id = run.parent_session_id
+        child = await db.get(ChatSession, run_id)
+        child_agent_id = child.agent_id if child is not None else None
+        if project_id is not None and child_turn_anchor_id is not None:
+            from app.services.project_group_turn_lifecycle import (
+                project_group_timeline_anchor_for_child_turn,
+            )
+
+            group_timeline_anchor_id = await project_group_timeline_anchor_for_child_turn(
+                db,
+                project_id=project_id,
+                child_session_id=run_id,
+                child_turn_anchor_id=child_turn_anchor_id,
+            )
         if run.status == RUN_WAITING:
             run.status = RUN_QUEUED
             run.lease_owner = None
@@ -1885,7 +2049,34 @@ async def resume_subagent_after_confirmation(run_id: uuid.UUID) -> bool:
         elif run.status == RUN_RUNNING:
             # The original worker will observe the resolved tool row and queue
             # restart recovery after the caller returns.
-            return True
+            already_running = True
+    if project_id is not None and parent_session_id is not None:
+        from app.services.project_group_turn_lifecycle import (
+            reconcile_and_publish_project_group_turn,
+        )
+
+        group_payload = {"type": "turn_state"}
+        event_kind = "turn_lifecycle"
+        if resolved_tool_payload is not None and group_timeline_anchor_id is not None:
+            group_payload = {
+                **resolved_tool_payload,
+                "timeline_anchor_id": str(group_timeline_anchor_id),
+                "producer_scope": f"project:{run_id}:{child_turn_anchor_id}",
+                **(
+                    {"sender_agent_id": str(child_agent_id)}
+                    if child_agent_id is not None
+                    else {}
+                ),
+            }
+            event_kind = "turn_tool"
+        await reconcile_and_publish_project_group_turn(
+            project_id=project_id,
+            session_id=parent_session_id,
+            payload=group_payload,
+            event_kind=event_kind,
+        )
+    if already_running:
+        return True
     # Confirmation resolution is durable even while the project is paused.
     # The canonical claim boundary leaves it queued until runtime resumes.
     claimed = await _claim_subagent(run_id)
@@ -1933,12 +2124,6 @@ async def _finish_subagent_turn(
             .scalars()
             .all()
         )
-        for row in processed:
-            meta = _message_meta(row)
-            meta["subagent_input_state"] = INPUT_DONE
-            meta["turn_status"] = "completed" if not failed else "failed"
-            row.message_meta = meta
-
         pending_exists = bool(
             (
                 await db.execute(
@@ -2069,7 +2254,6 @@ async def _finish_subagent_turn(
                             "status": project_run.status,
                         },
                     )
-
             owner_run = next(
                 (
                     project_run
@@ -2147,7 +2331,7 @@ async def _finish_subagent_turn(
                                 "unresolved_work_item_ids": [str(item.id) for item in unresolved_items],
                             },
                         )
-        await persist_assistant_reply_row(
+        assistant_message_id = await persist_assistant_reply_row(
             db,
             agent_id=child.agent_id,
             user_id=run.execution_user_id,
@@ -2167,11 +2351,13 @@ async def _finish_subagent_turn(
                 **({"reply_quality": reply_quality} if reply_quality else {}),
             },
             turn_anchor_id=anchor_id,
+            turn_terminal_status="failed" if failed else "completed",
         )
         for row in processed:
             meta = _message_meta(row)
             meta["subagent_input_state"] = INPUT_DONE
-            meta["turn_status"] = "completed" if not failed else "failed"
+            if row.id != anchor_id:
+                meta["turn_status"] = "completed" if not failed else "failed"
             row.message_meta = meta
         child.last_message_at = now
         if terminal:
@@ -2186,6 +2372,15 @@ async def _finish_subagent_turn(
                 _signal_project_dispatch_work()
             else:
                 _signal_dispatch_work()
+        from app.services.conversation_turn_lifecycle import publish_committed_turn_terminal
+
+        await publish_committed_turn_terminal(
+            agent_id=child.agent_id,
+            conversation_id=str(run_id),
+            turn_anchor_id=anchor_id,
+            message_id=assistant_message_id,
+            content=content,
+        )
         return terminal
 
 
@@ -2364,18 +2559,50 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                 if child.project_id is not None:
                     parent_session = await db.get(ChatSession, run.parent_session_id)
                     if parent_session is not None and parent_session.source_channel == "project":
+                        from app.services.project_group_turn_lifecycle import (
+                            publish_project_group_turn_event,
+                            project_group_timeline_anchor_for_child_turn,
+                            reconcile_project_group_turn,
+                        )
+
                         child_config = dict(child.im_config or {})
+                        group_timeline_anchor_id = (
+                            await project_group_timeline_anchor_for_child_turn(
+                                db,
+                                project_id=parent_session.project_id,
+                                child_session_id=child.id,
+                                child_turn_anchor_id=anchor_id,
+                            )
+                        )
+                        parent_projection = await reconcile_project_group_turn(
+                            db,
+                            project_id=parent_session.project_id,
+                            session=parent_session,
+                        )
+                        await db.commit()
+                        await publish_project_group_turn_event(
+                            session=parent_session,
+                            projection=parent_projection,
+                            payload={"type": "turn_state"},
+                            event_kind="turn_lifecycle",
+                        )
                         web_broadcast_targets.append(
                             (
                                 parent_session.agent_id,
                                 str(parent_session.id),
                                 {
-                                    "message_id": f"project-stream:{run_id}:{anchor_id}",
+                                    "producer_scope": f"project:{run_id}:{anchor_id}",
                                     "sender_agent_id": str(child_agent_id),
                                     "sender_name": str(
                                         child_config.get("project_member_name_snapshot")
                                         or agent.name
                                     ),
+                                    "timeline_anchor_id": (
+                                        str(group_timeline_anchor_id)
+                                        if group_timeline_anchor_id is not None
+                                        else None
+                                    ),
+                                    "turn": parent_projection.to_client_dict(),
                                 },
                             )
                         )
@@ -2543,6 +2770,18 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
             async with async_session() as cancel_db:
                 owned = await cancel_db.get(SubagentRun, run_id, with_for_update=True)
                 if owned is not None and owned.status == RUN_RUNNING and owned.lease_owner == settings.INSTANCE_ID:
+                    if control_plane_cancelled:
+                        from app.services.conversation_turn_lifecycle import (
+                            cancel_current_conversation_turn,
+                        )
+
+                        child = await cancel_db.get(ChatSession, run_id)
+                        if child is not None:
+                            await cancel_current_conversation_turn(
+                                cancel_db,
+                                agent_id=child.agent_id,
+                                conversation_id=str(child.id),
+                            )
                     owned.status = RUN_CANCELLED if control_plane_cancelled else RUN_QUEUED
                     owned.lease_owner = None
                     owned.lease_expires_at = None
@@ -2564,7 +2803,6 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                         for row in rows:
                             meta = _message_meta(row)
                             meta["subagent_input_state"] = INPUT_CANCELLED
-                            meta["turn_status"] = "cancelled"
                             row.message_meta = meta
                     await cancel_db.commit()
         except Exception as exc:  # noqa: BLE001 - lease expiry remains the fallback
@@ -3021,20 +3259,29 @@ async def _finish_parent_events_for_root(
     root_id: uuid.UUID,
     candidate_ids: list[uuid.UUID],
 ) -> None:
-    """Close only source events durably projected onto one accepted turn."""
+    """Close every source event durably projected onto one accepted turn."""
 
-    if not candidate_ids:
-        return
     keys = {
         _parent_event_external_key(message_id): message_id
         for message_id in candidate_ids
     }
     async with async_session() as db:
+        root = await db.get(ChatMessage, root_id)
+        if root is None:
+            return
         projections = (
             (
                 await db.execute(
                     select(ChatMessage).where(
-                        ChatMessage.external_event_key.in_(list(keys)),
+                        ChatMessage.conversation_id == root.conversation_id,
+                        or_(
+                            ChatMessage.id == root_id,
+                            ChatMessage.message_meta["subagent_turn_anchor_id"]
+                            .as_string()
+                            == str(root_id),
+                        ),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == SUBAGENT_PARENT_EVENT,
                     )
                 )
             )
@@ -3046,10 +3293,13 @@ async def _finish_parent_events_for_root(
             raw_root_id = _message_meta(projection).get("subagent_turn_anchor_id")
             if str(raw_root_id or projection.id) != str(root_id):
                 continue
+            raw_source_id = _message_meta(projection).get("child_message_id")
             try:
-                source_ids.append(keys[str(projection.external_event_key)])
-            except KeyError:
-                pass
+                source_ids.append(uuid.UUID(str(raw_source_id)))
+            except (TypeError, ValueError):
+                source_id = keys.get(str(projection.external_event_key))
+                if source_id is not None:
+                    source_ids.append(source_id)
         if not source_ids:
             return
         events = (
@@ -3634,6 +3884,23 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
             leader_agent_id = repaired_leader.agent_id if repaired_leader is not None else None
             is_leader_reply = leader_agent_id == child.agent_id
             event_meta = _message_meta(event)
+            from app.services.project_group_turn_lifecycle import (
+                project_group_timeline_anchor_for_child_turn,
+            )
+
+            child_anchor_id = str(event_meta.get("turn_anchor_id") or "")
+            producer_scope = f"project:{child.id}:{child_anchor_id}"
+            try:
+                group_timeline_anchor_id = (
+                    await project_group_timeline_anchor_for_child_turn(
+                        db,
+                        project_id=parent.project_id,
+                        child_session_id=child.id,
+                        child_turn_anchor_id=uuid.UUID(child_anchor_id),
+                    )
+                )
+            except (TypeError, ValueError):
+                group_timeline_anchor_id = None
             materialized = ChatMessage(
                 agent_id=parent.agent_id,
                 sender_agent_id=child.agent_id,
@@ -3650,6 +3917,12 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                     "subagent_id": str(child.id),
                     "child_message_id": str(child_message_id),
                     "source_project_run_ids": event_meta.get("project_run_ids", []),
+                    "timeline_anchor_id": (
+                        str(group_timeline_anchor_id)
+                        if group_timeline_anchor_id is not None
+                        else None
+                    ),
+                    "producer_scope": producer_scope,
                     "attachments": event_meta.get("attachments", []),
                     "wake_policy": (
                         "blocked_no_leader"
@@ -3683,6 +3956,36 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                 return False
             if not is_leader_reply:
                 _signal_project_dispatch_work()
+            from app.services.project_group_turn_lifecycle import (
+                reconcile_and_publish_project_group_turn,
+            )
+            await reconcile_and_publish_project_group_turn(
+                project_id=parent.project_id,
+                session_id=parent.id,
+                payload={
+                    "type": "assistant_message_committed",
+                    "id": str(materialized.id),
+                    "message_id": str(materialized.id),
+                    "transient_message_id": f"project-stream:{child.id}:{child_anchor_id}",
+                    "producer_scope": producer_scope,
+                    "timeline_anchor_id": (
+                        str(group_timeline_anchor_id)
+                        if group_timeline_anchor_id is not None
+                        else None
+                    ),
+                    "role": "assistant",
+                    "content": event.content,
+                    "thinking": event.thinking,
+                    "attachments": event_meta.get("attachments", []),
+                    "sender_agent_id": str(child.agent_id),
+                    "created_at": (
+                        materialized.created_at.isoformat()
+                        if materialized.created_at is not None
+                        else None
+                    ),
+                },
+                event_kind="turn_assistant_committed",
+            )
             return True
     return await _dispatch_parent_event_batch([child_message_id])
 
@@ -3756,12 +4059,9 @@ async def _persist_parent_batch_identity_failure(
         )
         if completed is not None:
             return
-        meta = _message_meta(stored_anchor)
-        meta["turn_status"] = "failed"
-        stored_anchor.message_meta = meta
-        await persist_assistant_reply_row(
+        assistant_message_id = await persist_assistant_reply_row(
             db,
-            agent_id=child.agent_id,
+            agent_id=parent.agent_id,
             user_id=run.execution_user_id,
             conversation_id=str(parent.id),
             content=(
@@ -3773,11 +4073,25 @@ async def _persist_parent_batch_identity_failure(
                 "attachments": [],
             },
             turn_anchor_id=stored_anchor.id,
+            sender_agent_id=child.agent_id,
+            turn_terminal_status="failed",
         )
         stored_parent = await db.get(ChatSession, parent.id)
         if stored_parent is not None:
             stored_parent.last_message_at = datetime.now(UTC)
         await db.commit()
+    from app.services.conversation_turn_lifecycle import publish_committed_turn_terminal
+
+    await publish_committed_turn_terminal(
+        agent_id=parent.agent_id,
+        conversation_id=str(parent.id),
+        turn_anchor_id=stored_anchor.id,
+        message_id=assistant_message_id,
+        content=(
+            "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
+            f"Agent 访问权限。({type(exc).__name__})"
+        ),
+    )
 
 
 async def _dispatch_parent_event_batch(message_ids: list[uuid.UUID]) -> bool:
@@ -4694,7 +5008,7 @@ async def _dispatch_project_leader_batch(
                 },
             )
         await db.commit()
-    return True
+        return True
 
 
 PROJECT_DISPATCH_TRIGGERS = frozenset(
@@ -5003,6 +5317,14 @@ async def _project_run_child_input_state(
     )
 
 
+async def _publish_project_run_group_turn(project_run_id: uuid.UUID) -> None:
+    from app.services.project_group_turn_lifecycle import (
+        reconcile_and_publish_project_run_group_turn,
+    )
+
+    await reconcile_and_publish_project_run_group_turn(project_run_id)
+
+
 async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
     """Idempotently deliver one durable project dispatch outbox row.
 
@@ -5048,6 +5370,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 repaired = True
             if repaired:
                 await db.commit()
+                await _publish_project_run_group_turn(project_run.id)
             return {**output, "status": project_run.status}
         dispatch = dict((project_run.input or {}).get("dispatch") or {})
         try:
@@ -5096,6 +5419,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
             project_run.error = "The selected project member is no longer available"
             project_run.finished_at = datetime.now(UTC)
             await db.commit()
+            await _publish_project_run_group_turn(project_run.id)
             return {"status": "failed", "error": project_run.error}
         agent_id = member.agent_id
         execution_user_id = project_run.execution_user_id or project.owner_user_id
@@ -5121,6 +5445,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                         "owner_deferred_until_specialist_result": True,
                     }
                 await db.commit()
+                await _publish_project_run_group_turn(project_run.id)
                 return dict(project_run.output)
         existing_child = (
             await db.execute(
@@ -5452,9 +5777,18 @@ async def _pending_project_dispatch_batch(
             .scalars()
             .all()
         )
-        repaired = sum(reconcile_project_run_terminal_state(row) for row in repair_rows)
+        repaired_rows = [
+            row for row in repair_rows if reconcile_project_run_terminal_state(row)
+        ]
+        repaired = len(repaired_rows)
         if repaired:
             await db.commit()
+            from app.services.project_group_turn_lifecycle import (
+                reconcile_and_publish_project_run_group_turn,
+            )
+
+            for repaired_row in repaired_rows:
+                await reconcile_and_publish_project_run_group_turn(repaired_row.id)
 
         # JSON ``as_string`` compiles to JSON_EXTRACT on SQLite and ->> on
         # PostgreSQL. Applying every durable marker in SQL ensures an arbitrary

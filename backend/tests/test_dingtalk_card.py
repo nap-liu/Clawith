@@ -90,7 +90,8 @@ async def test_message_card_renders_labels_and_delivers_native_mentions(
                     "## 发布通知\n今晚十点发布\n\n"
                     "<font colorTokenV2=common_blue1_color>"
                     f"{mention_text}</font>"
-                )
+                ),
+                "sys_full_json_obj": '{"config":{"autoLayout":true}}',
             },
         },
         "callbackType": "STREAM",
@@ -141,6 +142,44 @@ async def test_message_card_escapes_visible_mention_labels(monkeypatch):
     assert body["imGroupOpenDeliverModel"]["atUserIds"] == {
         "staff-id": '<张&李>"'
     }
+
+
+async def test_message_card_keeps_full_long_content_and_limits_preview(monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_token(*_args, **_kwargs):
+        return "app-access-token"
+
+    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
+    monkeypatch.setattr(
+        dingtalk_card.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(calls),
+    )
+    content = "# 超长组合正文\n\n" + ("完整内容不得截断 **Markdown** `code`。" * 80)
+
+    result = await dingtalk_card.send_message_card(
+        app_id="ding-app",
+        app_secret="ding-secret",
+        card_template_id="message-template.schema",
+        out_track_id="message.track-id",
+        content=content,
+        external_conv_id="dingtalk_group_open-conversation-id",
+        at_user_ids={"@ALL": "@ALL"},
+    )
+
+    assert result == "message.track-id"
+    body = calls[0]["json"]
+    card_data = body["cardData"]["cardParamMap"]
+    assert card_data["content"] == (
+        f"{content}\n\n"
+        "<font colorTokenV2=common_blue1_color>@所有人</font>"
+    )
+    assert card_data["sys_full_json_obj"] == '{"config":{"autoLayout":true}}'
+    preview = body["imGroupOpenSpaceModel"]["lastMessageI18n"]["ZH_CN"]
+    assert len(preview) == 100
+    assert preview.endswith("…")
+    assert body["imGroupOpenSpaceModel"]["lastMessageI18n"]["EN_US"] == preview
 
 
 async def test_confirmation_card_keeps_shared_transport_without_mentions(monkeypatch):

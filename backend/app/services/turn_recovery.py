@@ -670,6 +670,28 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                     sender_agent_id=execution_agent_id,
                 )
                 await db.commit()
+                from app.services.conversation_turn_lifecycle import get_conversation_turn_snapshot
+
+                turn_snapshot = await get_conversation_turn_snapshot(
+                    db,
+                    agent_id=anchor.agent_id,
+                    conversation_id=anchor.conversation_id,
+                    turn_anchor_id=anchor.id,
+                )
+            from app.services.conversation_turn_lifecycle import publish_conversation_turn_event
+
+            await publish_conversation_turn_event(
+                agent_id=anchor.agent_id,
+                conversation_id=anchor.conversation_id,
+                payload={
+                    "type": "done",
+                    "role": "assistant",
+                    "content": reply,
+                    "message_id": str(assistant_message_id),
+                },
+                snapshot=turn_snapshot,
+                event_kind="turn_terminal",
+            )
             delivered = await _deliver_recovered_reply(
                 anchor,
                 expected_origin=expected_origin,

@@ -180,6 +180,7 @@ async def _commit_reserved_stop(
     """Drive a reserved stop to one definite state outside request cancellation."""
 
     completed_anchors = 0
+    cancelled_anchors = []
     try:
         async with async_session() as db:
             for anchor in tuple(record.durable_anchors):
@@ -197,6 +198,8 @@ async def _commit_reserved_stop(
                     turn_anchor_id=anchor.message_id,
                 ):
                     completed_anchors += 1
+                elif cancelled_id is not None:
+                    cancelled_anchors.append(anchor)
             db.add(
                 AuditLog(
                     user_id=actor_user_id,
@@ -218,6 +221,27 @@ async def _commit_reserved_stop(
     except BaseException:
         await release_active_turn_stop(record, stop_token)
         raise
+
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+        publish_conversation_turn_event,
+    )
+
+    for anchor in cancelled_anchors:
+        async with async_session() as db:
+            snapshot = await get_conversation_turn_snapshot(
+                db,
+                agent_id=anchor.agent_id,
+                conversation_id=anchor.session_id,
+                turn_anchor_id=anchor.message_id,
+            )
+        await publish_conversation_turn_event(
+            agent_id=anchor.agent_id,
+            conversation_id=anchor.session_id,
+            payload={"type": "done", "role": "assistant", "content": ""},
+            snapshot=snapshot,
+            event_kind="turn_terminal",
+        )
 
     if record.durable_anchors and completed_anchors == len(record.durable_anchors):
         await release_active_turn_stop(record, stop_token)

@@ -35,9 +35,14 @@ _LOCAL_SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 TOOLSCALL_USAGE_DESCRIPTION = (
     "\n\nBash tool composition with toolscall (enabled for this Agent):\n"
+    "- `toolscall` is a CLI executable, not a Python or JavaScript function. "
+    "Prefer `language=\"bash\"`; from another language invoke it as a subprocess.\n"
     "- `toolscall <tool> --key value` invokes any standard builtin or MCP "
-    "tool already present in the current turn. Pipe one JSON object to "
-    "stdin for structured arguments; do not combine stdin JSON with flags.\n"
+    "tool already present in the current turn. For structured or batch "
+    "arguments, pipe exactly one complete JSON object to stdin, for example "
+    "`jq -c '{table_id: 18, rows: .}' workspace/batch.json | "
+    "toolscall <tool>`. Never combine stdin JSON with flags, `--stdin`, or "
+    "`--key/--value` pairs. Check the command exit status before reporting success.\n"
     "- `toolscall <cli-tool> <argv...>` invokes an available native CLI "
     "tool with ordinary argv/stdin/stdout/stderr and exit-code semantics.\n"
     "- `toolscall` has no list or describe operation because the current "
@@ -407,7 +412,7 @@ if schema is None:
 
 stdin_data = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
 if stdin_data.strip() and len(sys.argv) > 2:
-    _fail("stdin JSON and CLI arguments cannot be used together")
+    _fail("stdin JSON and CLI arguments cannot be used together; pipe one complete JSON object and remove all flags")
 if stdin_data.strip():
     try:
         arguments = json.loads(stdin_data)

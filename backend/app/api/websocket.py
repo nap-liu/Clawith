@@ -42,6 +42,14 @@ from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_history import persist_initial_assistant_message_if_pristine
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.confirmation_service import PendingConfirmation
+from app.services.conversation_turn_lifecycle import (
+    ConversationTurnConflict,
+    ConversationTurnSnapshot,
+    get_conversation_turn_snapshot,
+    publish_conversation_turn_event,
+    transition_conversation_turn,
+    with_turn_envelope,
+)
 from app.services.llm import call_llm_with_failover
 from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.onboarding import (
@@ -353,6 +361,7 @@ class WebSocketChatHandler:
         # Set true when the browser drops mid-turn: the turn still runs to
         # completion + persists, then we tear the handler down cleanly.
         self.client_disconnected: bool = False
+        self.current_client_message_id: str | None = None
 
     async def _safe_send(self, payload: dict):
         """Broadcast turn output to EVERY live connection viewing this session —
@@ -518,21 +527,92 @@ class WebSocketChatHandler:
         await manager.connect(agent_id_str, self.websocket, self.conv_id, str(user_id))
         logger.info(f"[WS] Ready! Agent={self.agent_name} (live conns for agent: {len(_conns)})")
 
-        # Send session_id to frontend
+        # The durable snapshot lets a reconnect render the same lifecycle as a
+        # live tab. Live events carry the same generation/revision envelope, so
+        # clients can discard anything older if registration races this read.
+        turn_snapshot = await self._load_turn_snapshot()
         await self.websocket.send_json(
-            {
-                "type": "connected",
-                "session_id": self.conv_id,
-                "read_only": self.read_only,
-                "source_channel": self.source_channel,
-                "onboarding_required": self.onboarding_required,
-            }
+            with_turn_envelope(
+                {
+                    "type": "connected",
+                    "session_id": self.conv_id,
+                    "read_only": self.read_only,
+                    "source_channel": self.source_channel,
+                    "onboarding_required": self.onboarding_required,
+                },
+                turn_snapshot,
+                event_kind="turn_snapshot",
+            )
         )
 
         # Build conversation context
         self.conversation = self._build_conversation_context()
 
         return True
+
+    async def _load_turn_snapshot(
+        self,
+        turn_anchor_id: uuid.UUID | None = None,
+    ) -> ConversationTurnSnapshot:
+        async with async_session() as db:
+            return await get_conversation_turn_snapshot(
+                db,
+                agent_id=self.agent_id,
+                conversation_id=self.conv_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+
+    async def _transition_turn(
+        self,
+        turn_anchor_id: uuid.UUID | None,
+        status: str,
+    ) -> ConversationTurnSnapshot | None:
+        if turn_anchor_id is None:
+            return None
+        async with async_session() as db:
+            snapshot = await transition_conversation_turn(
+                db,
+                agent_id=self.agent_id,
+                conversation_id=self.conv_id,
+                turn_anchor_id=turn_anchor_id,
+                status=status,
+            )
+            await db.commit()
+        return snapshot
+
+    async def _publish_turn_lifecycle(self, snapshot: ConversationTurnSnapshot | None) -> None:
+        if snapshot is None:
+            return
+        await self._safe_send(
+            with_turn_envelope(
+                {"type": "turn_state"},
+                snapshot,
+                event_kind="turn_lifecycle",
+            )
+        )
+
+    async def _send_current_turn_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        event_kind: str = "turn_rejected",
+        reject_attempt: bool = True,
+    ) -> None:
+        """Close a local send attempt against the durable current snapshot."""
+
+        snapshot = await self._load_turn_snapshot()
+        normalized_payload = dict(payload)
+        if reject_attempt and self.current_client_message_id:
+            normalized_payload.setdefault(
+                "rejected_message_id", self.current_client_message_id
+            )
+        # A rejected send belongs only to the socket that attempted it.  The
+        # canonical snapshot is still attached so this client can reconcile,
+        # but broadcasting the rejection would surface another viewer's local
+        # error in every tab watching the same session.
+        await self.websocket.send_json(
+            with_turn_envelope(normalized_payload, snapshot, event_kind=event_kind)
+        )
 
     async def _load_models(self, db: AsyncSession, agent: Agent):
         """Loads primary and fallback models for the agent."""
@@ -675,13 +755,17 @@ class WebSocketChatHandler:
         if self.source_channel != "subagent" or self.project_session_access is None:
             return False
         if not self.conv_id or self.user_id is None:
-            await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+            await self._send_current_turn_event(
+                {"type": "error", "content": "项目工作会话无效。"}
+            )
             return True
 
         try:
             child_id = uuid.UUID(self.conv_id)
         except (TypeError, ValueError):
-            await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+            await self._send_current_turn_event(
+                {"type": "error", "content": "项目工作会话无效。"}
+            )
             return True
 
         from app.models.project import ProjectRun
@@ -698,7 +782,9 @@ class WebSocketChatHandler:
                 or run.project_id != child.project_id
                 or child.agent_id != self.agent_id
             ):
-                await self._safe_send({"type": "error", "content": "项目工作会话无效。"})
+                await self._send_current_turn_event(
+                    {"type": "error", "content": "项目工作会话无效。"}
+                )
                 return True
 
             # Preserve an exact active ProjectRun association when this child is
@@ -763,22 +849,78 @@ class WebSocketChatHandler:
             # Membership/confirmation may have changed after the per-turn ACL
             # check.  Keep the historical session visible, but never fall back
             # to a direct model call.
-            await self._safe_send({"type": "error", "content": str(exc)})
-            return True
-
-        if raw_client_id:
             async with async_session() as db:
-                persisted_id = (
-                    await db.execute(select(ChatMessage.id).where(ChatMessage.external_event_key == event_key))
-                ).scalar_one_or_none()
-            if persisted_id is not None:
-                await self._safe_send(
+                from app.services.confirmation_service import find_pending_confirmation
+
+                pending = await find_pending_confirmation(
+                    db,
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                )
+            if pending is not None and pending.force_confirmation:
+                await self._send_current_turn_event(
                     {
-                        "type": "user_message_committed",
-                        "client_message_id": raw_client_id,
-                        "message_id": str(persisted_id),
+                        "type": "confirmation_required",
+                        "content": "请先完成待确认操作。",
+                        "message_id": raw_client_id or None,
+                        "name": "request_confirmation",
+                        "call_id": str(pending.row_id),
+                        "args": pending.args,
+                        "status": "running",
                     }
                 )
+            else:
+                await self._send_current_turn_event(
+                    {"type": "error", "content": str(exc)}
+                )
+            return True
+
+        async with async_session() as db:
+            persisted = (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.external_event_key == event_key
+                    )
+                )
+            ).scalar_one_or_none()
+            snapshot = await get_conversation_turn_snapshot(
+                db,
+                agent_id=self.agent_id,
+                conversation_id=self.conv_id,
+            )
+        if persisted is not None:
+            metadata = dict(persisted.message_meta or {})
+            await publish_conversation_turn_event(
+                agent_id=self.agent_id,
+                conversation_id=self.conv_id,
+                payload={
+                    "type": "user_message_committed",
+                    **(
+                        {"client_message_id": raw_client_id}
+                        if raw_client_id
+                        else {}
+                    ),
+                    "message_id": str(persisted.id),
+                    "id": str(persisted.id),
+                    "role": "user",
+                    "content": persisted.content,
+                    "display_content": metadata.get("display_content")
+                    or persisted.content,
+                    "attachments": list(metadata.get("attachments") or []),
+                    "sender_user_id": (
+                        str(persisted.sender_user_id)
+                        if persisted.sender_user_id is not None
+                        else None
+                    ),
+                    "created_at": (
+                        persisted.created_at.isoformat()
+                        if persisted.created_at is not None
+                        else None
+                    ),
+                },
+                snapshot=snapshot,
+                event_kind="turn_user_committed",
+            )
         return True
 
     async def _load_scene_manifest(self, db: AsyncSession | None = None) -> None:
@@ -919,6 +1061,12 @@ class WebSocketChatHandler:
             set_trace_id(trace_id)
 
             content = data.get("content", "")
+            raw_client_message_id = data.get("message_id") or data.get(
+                "client_message_id"
+            )
+            self.current_client_message_id = (
+                str(raw_client_message_id) if raw_client_message_id else None
+            )
             display_content = data.get("display_content", "")
             file_name = data.get("file_name", "")
             raw_attachments = data.get("attachments") if "attachments" in data else None
@@ -940,7 +1088,9 @@ class WebSocketChatHandler:
             # but must never drive a turn or post as the session owner. The UI
             # also disables the composer, but THIS is the authoritative guard.
             if self.read_only:
-                await self.websocket.send_json({"type": "error", "content": "只读监看会话,无法在此发送消息。"})
+                await self._send_current_turn_event(
+                    {"type": "error", "content": "只读监看会话,无法在此发送消息。"}
+                )
                 continue
 
             validated_attachments = None
@@ -953,7 +1103,9 @@ class WebSocketChatHandler:
                         raw_attachments,
                     )
                 except (TypeError, ValueError) as exc:
-                    await self.websocket.send_json({"type": "error", "content": f"附件无效：{exc}"})
+                    await self._send_current_turn_event(
+                        {"type": "error", "content": f"附件无效：{exc}"}
+                    )
                     continue
 
             if await self._enqueue_project_subagent_message(
@@ -999,6 +1151,28 @@ class WebSocketChatHandler:
 
             client_message_id = data.get("message_id") or data.get("client_message_id")
 
+            turn_lease = None
+            if self.agent_type != "openclaw":
+                try:
+                    turn_lease = await get_workload_capacity().acquire(
+                        WorkloadKind.INTERACTIVE,
+                        self.tenant_id or self.user_id or self.conv_id,
+                    )
+                except WorkloadOverloadedError:
+                    await self._send_current_turn_event(
+                        {
+                            "type": "error",
+                            "code": "turn_capacity_busy",
+                            "retryable": True,
+                            "content": (
+                                "当前请求较多，请稍后重试。"
+                                if self.lang.lower().startswith("zh")
+                                else "The service is busy. Please try again shortly."
+                            ),
+                        }
+                    )
+                    continue
+
             # Persist the first fixed greeting, if any, in the same transaction
             # as the first real user message. Opening a session alone never
             # writes the greeting to history.
@@ -1009,6 +1183,7 @@ class WebSocketChatHandler:
                     persisted_initial_assistant,
                     pending_confirmation,
                     ignored_confirmation,
+                    turn_snapshot,
                 ) = await self._save_user_message(
                     content,
                     display_content,
@@ -1018,26 +1193,50 @@ class WebSocketChatHandler:
                     model_id=(str(effective_llm_model.id) if effective_llm_model is not None else None),
                     attachments=validated_attachments,
                 )
-            except SessionTurnBusyError:
-                await self._safe_send(
+            except (SessionTurnBusyError, ConversationTurnConflict):
+                if turn_lease is not None:
+                    await turn_lease.release()
+                await self._send_current_turn_event(
                     {
                         "type": "error",
-                        "content": "当前会话正在处理 Subagent 消息，请稍后重试。",
+                        "code": "turn_already_running",
+                        "retryable": True,
+                        "content": "当前会话已有消息正在处理，请稍后重试。",
                     }
                 )
                 continue
+            except BaseException:
+                if turn_lease is not None:
+                    await turn_lease.release()
+                raise
 
-            if turn_anchor_id is not None and client_message_id:
-                await self._safe_send(
-                    {
+            if turn_anchor_id is not None and not is_onboarding_trigger:
+                await publish_conversation_turn_event(
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                    payload={
                         "type": "user_message_committed",
-                        "client_message_id": str(client_message_id),
+                        **(
+                            {"client_message_id": str(client_message_id)}
+                            if client_message_id
+                            else {}
+                        ),
                         "message_id": str(turn_anchor_id),
-                    }
+                        "id": str(turn_anchor_id),
+                        "role": "user",
+                        "content": content,
+                        "display_content": display_content,
+                        "attachments": validated_attachments or [],
+                        "sender_user_id": str(self.user_id),
+                    },
+                    snapshot=turn_snapshot,
+                    event_kind="turn_user_committed",
                 )
 
             if pending_confirmation is not None:
-                await self._safe_send(
+                if turn_lease is not None:
+                    await turn_lease.release()
+                await self._send_current_turn_event(
                     {
                         "type": "confirmation_required",
                         "content": "请先完成待确认操作。",
@@ -1067,7 +1266,20 @@ class WebSocketChatHandler:
                         include_thinking=True,
                     )
                 if refreshed_prefix is None:
-                    raise RuntimeError("confirmation ignore committed but history prefix could not be rebuilt")
+                    failed_snapshot = await self._transition_turn(turn_anchor_id, "failed")
+                    await self._safe_send(
+                        with_turn_envelope(
+                            {
+                                "type": "error",
+                                "content": "确认状态已更新，但会话上下文恢复失败，请重试。",
+                            },
+                            failed_snapshot,
+                            event_kind="turn_terminal",
+                        )
+                    )
+                    if turn_lease is not None:
+                        await turn_lease.release()
+                    continue
                 self.conversation = refreshed_prefix
 
             if persisted_initial_assistant is not None:
@@ -1083,7 +1295,22 @@ class WebSocketChatHandler:
                 # on_message subscriptions.  Their origin sessions will run
                 # the corresponding event turns; do not also answer it in this
                 # remote session.
-                await self._safe_send({"type": "done", "role": "assistant", "content": ""})
+                await self._send_current_turn_event(
+                    {
+                        "type": "turn_receipt",
+                        "status": "delegated",
+                        "message_id": str(turn_anchor_id),
+                        **(
+                            {"client_message_id": str(client_message_id)}
+                            if client_message_id
+                            else {}
+                        ),
+                    },
+                    event_kind="turn_delegated",
+                    reject_attempt=False,
+                )
+                if turn_lease is not None:
+                    await turn_lease.release()
                 continue
 
             # Add the real user message after any assistant-first greeting so
@@ -1115,7 +1342,22 @@ class WebSocketChatHandler:
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
-                await self._route_openclaw(content)
+                try:
+                    await self._route_openclaw(
+                        content,
+                        turn_anchor_id=turn_anchor_id,
+                        turn_snapshot=turn_snapshot,
+                    )
+                except Exception:
+                    logger.exception("[WS] OpenClaw queue failed")
+                    failed_snapshot = await self._transition_turn(turn_anchor_id, "failed")
+                    await self._safe_send(
+                        with_turn_envelope(
+                            {"type": "error", "content": "OpenClaw 消息转发失败，请重试。"},
+                            failed_snapshot,
+                            event_kind="turn_terminal",
+                        )
+                    )
                 continue
 
             # Detect task creation intent
@@ -1131,25 +1373,15 @@ class WebSocketChatHandler:
                     is_onboarding_trigger=is_onboarding_trigger,
                     onboarding_claim=onboarding_claim,
                     turn_anchor_id=turn_anchor_id,
+                    turn_snapshot=turn_snapshot,
                     task_match=task_match,
                 )
             )
             try:
                 disposition = await turn_task
-            except WorkloadOverloadedError:
-                await self._safe_send(
-                    {
-                        "type": "error",
-                        "code": "turn_capacity_busy",
-                        "retryable": True,
-                        "content": (
-                            "当前请求较多，请稍后重试。"
-                            if self.lang.lower().startswith("zh")
-                            else "The service is busy. Please try again shortly."
-                        ),
-                    }
-                )
-                continue
+            finally:
+                if turn_lease is not None:
+                    await turn_lease.release()
             if disposition == "disconnect":
                 break
             if disposition == "continue":
@@ -1162,18 +1394,13 @@ class WebSocketChatHandler:
         is_onboarding_trigger: bool,
         onboarding_claim: OnboardingClaim | None,
         turn_anchor_id: uuid.UUID | None,
+        turn_snapshot: ConversationTurnSnapshot | None,
         task_match,
     ) -> str:
         """Run one web turn in its own cancellable task through persistence."""
 
-        capacity = get_workload_capacity()
-        async with (
-            capacity.slot(
-                WorkloadKind.INTERACTIVE,
-                self.tenant_id or self.user_id or self.conv_id,
-            ),
-            active_turn_boundary(),
-        ):
+        async with active_turn_boundary():
+            await self._publish_turn_lifecycle(turn_snapshot)
             current_user_content = next(
                 (str(item.get("content") or "") for item in reversed(self.conversation) if item.get("role") == "user"),
                 "",
@@ -1201,6 +1428,7 @@ class WebSocketChatHandler:
                         is_onboarding_trigger,
                         onboarding_claim=onboarding_claim,
                         turn_anchor_id=turn_anchor_id,
+                        turn_snapshot=turn_snapshot,
                     )
                 else:
                     assistant_response = (
@@ -1224,18 +1452,38 @@ class WebSocketChatHandler:
                 if is_onboarding_trigger and not produced_output and turn_outcome in {"failed", "aborted"}:
                     if self.conversation and self.conversation[-1].get("role") == "user":
                         self.conversation.pop()
+                    terminal_snapshot = await self._transition_turn(
+                        turn_anchor_id,
+                        "cancelled" if turn_outcome == "aborted" else "failed",
+                    )
                     await self._safe_send(
-                        {
-                            "type": "onboarding_skipped",
-                            "reason": ("generation_aborted" if turn_outcome == "aborted" else "generation_failed"),
-                            "agent_id": str(self.agent_id),
-                        }
+                        with_turn_envelope(
+                            {
+                                "type": "onboarding_skipped",
+                                "reason": (
+                                    "generation_aborted"
+                                    if turn_outcome == "aborted"
+                                    else "generation_failed"
+                                ),
+                                "agent_id": str(self.agent_id),
+                            },
+                            terminal_snapshot,
+                            event_kind="turn_terminal",
+                        )
                     )
                     return "continue"
 
                 # request_confirmation persisted a suspended turn itself.
                 if assistant_response == "":
-                    await self._safe_send({"type": "done", "role": "assistant", "content": ""})
+                    turn_snapshot = await self._transition_turn(turn_anchor_id, "suspended")
+                    await self._publish_turn_lifecycle(turn_snapshot)
+                    await self._safe_send(
+                        with_turn_envelope(
+                            {"type": "done", "role": "assistant", "content": ""},
+                            turn_snapshot,
+                            event_kind="turn_suspended",
+                        )
+                    )
                     if self.client_disconnected:
                         await manager.disconnect(str(self.agent_id), self.websocket)
                         return "disconnect"
@@ -1248,20 +1496,33 @@ class WebSocketChatHandler:
                     )
 
                 self.conversation.append({"role": "assistant", "content": assistant_response})
+                terminal_status = (
+                    "cancelled"
+                    if turn_outcome == "aborted"
+                    else "failed"
+                    if turn_outcome == "failed"
+                    else "completed"
+                )
                 await self._save_assistant_reply(
                     assistant_response,
                     thinking_content,
                     message_id=terminal_message_id,
                     turn_anchor_id=turn_anchor_id,
-                    turn_status=("cancelled" if turn_outcome == "aborted" else "completed"),
+                    turn_status=terminal_status,
                     complete_onboarding=(is_onboarding_trigger and produced_output and self.source_channel != "web"),
                 )
+                turn_snapshot = await self._load_turn_snapshot(turn_anchor_id)
                 await self._safe_send(
-                    {
-                        "type": "done",
-                        "role": "assistant",
-                        "content": assistant_response,
-                    }
+                    with_turn_envelope(
+                        {
+                            "type": "done",
+                            "role": "assistant",
+                            "content": assistant_response,
+                            "message_id": str(terminal_message_id),
+                        },
+                        turn_snapshot,
+                        event_kind="turn_terminal",
+                    )
                 )
 
                 if self.client_disconnected:
@@ -1293,17 +1554,35 @@ class WebSocketChatHandler:
                     if self.conversation and self.conversation[-1].get("role") == "assistant":
                         self.conversation.pop()
                     self.conversation.append({"role": "assistant", "content": stopped})
-                    await self._safe_send({"type": "done", "role": "assistant", "content": stopped})
+                    turn_snapshot = await self._load_turn_snapshot(turn_anchor_id)
+                    await self._safe_send(
+                        with_turn_envelope(
+                            {
+                                "type": "done",
+                                "role": "assistant",
+                                "content": stopped,
+                                "message_id": str(terminal_message_id),
+                            },
+                            turn_snapshot,
+                            event_kind="turn_terminal",
+                        )
+                    )
                 elif self.conversation and self.conversation[-1].get("role") == "assistant":
                     # The completed row won the commit race. Its streaming
                     # chunks may already be visible, but cancellation skipped
                     # the normal terminal event, so close the frontend state.
+                    turn_snapshot = await self._load_turn_snapshot(turn_anchor_id)
                     await self._safe_send(
-                        {
-                            "type": "done",
-                            "role": "assistant",
-                            "content": self.conversation[-1].get("content", ""),
-                        }
+                        with_turn_envelope(
+                            {
+                                "type": "done",
+                                "role": "assistant",
+                                "content": self.conversation[-1].get("content", ""),
+                                "message_id": str(terminal_message_id),
+                            },
+                            turn_snapshot,
+                            event_kind="turn_terminal",
+                        )
                     )
                 return "continue"
 
@@ -1383,10 +1662,14 @@ class WebSocketChatHandler:
             await check_agent_expired(self.agent_id)
             return True
         except QuotaExceeded as qe:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {qe.message}"})
+            await self._send_current_turn_event(
+                {"type": "error", "content": f"⚠️ {qe.message}"}
+            )
             return False
         except AgentExpired as ae:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {ae.message}"})
+            await self._send_current_turn_event(
+                {"type": "error", "content": f"⚠️ {ae.message}"}
+            )
             return False
 
     async def _save_user_message(
@@ -1404,6 +1687,7 @@ class WebSocketChatHandler:
         ChatMessage | None,
         PendingConfirmation | None,
         bool,
+        ConversationTurnSnapshot | None,
     ]:
         """Saves user message to the database and updates session title/time."""
         from app.services.chat_attachments import strip_image_data_markers
@@ -1420,8 +1704,43 @@ class WebSocketChatHandler:
                 saved_content = f"[file:{file_name}]\n{saved_content}"
 
         if is_onboarding_trigger:
-            logger.info("[WS] Onboarding trigger — skipping user-message persistence")
-            return None, False, None, None, False
+            from app.services.chat_history import HIDDEN_ONBOARDING_ANCHOR_KIND
+
+            async with async_session() as db:
+                session = (
+                    await db.execute(
+                        select(ChatSession)
+                        .where(ChatSession.id == uuid.UUID(self.conv_id))
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if session is None:
+                    raise RuntimeError("chat session no longer exists")
+                anchor = ChatMessage(
+                    agent_id=self.agent_id,
+                    user_id=self.user_id,
+                    role="system",
+                    content=content,
+                    conversation_id=self.conv_id,
+                    message_meta={
+                        "kind": HIDDEN_ONBOARDING_ANCHOR_KIND,
+                        **self._scene_message_meta(),
+                        **({"model_id": model_id} if model_id else {}),
+                    },
+                )
+                db.add(anchor)
+                await db.flush()
+                turn_snapshot = await transition_conversation_turn(
+                    db,
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                    turn_anchor_id=anchor.id,
+                    status="running",
+                )
+                session.last_message_at = datetime.now(tz.utc)
+                await db.commit()
+            logger.info("[WS] Onboarding trigger anchored as a hidden system turn")
+            return anchor.id, False, None, None, False, turn_snapshot
         else:
             from app.services.chat_history import ingest_incoming_chat_message
 
@@ -1480,7 +1799,16 @@ class WebSocketChatHandler:
                         "[WS] Message blocked by pending confirmation %s",
                         ingested.message.id,
                     )
-                    return None, True, None, ingested.pending_confirmation, False
+                    return None, True, None, ingested.pending_confirmation, False, None
+                turn_snapshot = None
+                if not ingested.consumed_by_onmessage:
+                    turn_snapshot = await transition_conversation_turn(
+                        db,
+                        agent_id=self.agent_id,
+                        conversation_id=self.conv_id,
+                        turn_anchor_id=ingested.message.id,
+                        status="running",
+                    )
                 # Update session
                 _now = datetime.now(tz.utc)
                 if _sess:
@@ -1507,9 +1835,16 @@ class WebSocketChatHandler:
                 initial_assistant,
                 None,
                 ingested.ignored_confirmation is not None,
+                turn_snapshot,
             )
 
-    async def _route_openclaw(self, content: str):
+    async def _route_openclaw(
+        self,
+        content: str,
+        *,
+        turn_anchor_id: uuid.UUID | None,
+        turn_snapshot: ConversationTurnSnapshot | None,
+    ):
         """Enqueues message for OpenClaw edge node poll."""
         from app.models.gateway_message import GatewayMessage as GwMsg
 
@@ -1522,14 +1857,27 @@ class WebSocketChatHandler:
                 status="pending",
             )
             db.add(gw_msg)
+            await db.flush()
+            if turn_anchor_id is not None:
+                anchor = await db.get(ChatMessage, turn_anchor_id)
+                if anchor is None:
+                    raise RuntimeError("OpenClaw turn anchor disappeared before queue commit")
+                anchor.message_meta = {
+                    **dict(anchor.message_meta or {}),
+                    "gateway_message_id": str(gw_msg.id),
+                }
             await db.commit()
         logger.info("[WS] OpenClaw: message queued for gateway poll")
-        await self.websocket.send_json(
-            {
-                "type": "done",
-                "role": "assistant",
-                "content": "Message forwarded to OpenClaw agent. Waiting for response...",
-            }
+        await self._publish_turn_lifecycle(turn_snapshot)
+        await self._safe_send(
+            with_turn_envelope(
+                {
+                    "type": "info",
+                    "content": "Message forwarded to OpenClaw agent. Waiting for response...",
+                },
+                turn_snapshot,
+                event_kind="turn_stream",
+            )
         )
 
     async def _run_llm_and_stream(
@@ -1539,6 +1887,7 @@ class WebSocketChatHandler:
         *,
         onboarding_claim: OnboardingClaim | None = None,
         turn_anchor_id: uuid.UUID | None = None,
+        turn_snapshot: ConversationTurnSnapshot | None = None,
     ) -> tuple[str, list[str], list[dict], str, bool]:
         """Calls the LLM and streams response chunks to WebSocket."""
         start_gen = perf_counter()
@@ -1660,7 +2009,13 @@ class WebSocketChatHandler:
                 if not await reserve_visible_output():
                     raise RuntimeError("Onboarding claim lost before first output")
                 partial_chunks.append(text)
-                await self._safe_send({"type": "chunk", "content": text})
+                await self._safe_send(
+                    with_turn_envelope(
+                        {"type": "chunk", "content": text},
+                        turn_snapshot,
+                        event_kind="turn_stream",
+                    )
+                )
 
             async def tool_call_to_ws(data: dict):
                 """Send tool call info to client and persist completed ones."""
@@ -1679,7 +2034,13 @@ class WebSocketChatHandler:
                     if "args" in public_data
                     else public_data
                 )
-                await self._safe_send({"type": "tool_call", **_ws_data})
+                await self._safe_send(
+                    with_turn_envelope(
+                        {"type": "tool_call", **_ws_data},
+                        turn_snapshot,
+                        event_kind="turn_tool",
+                    )
+                )
 
                 # Save tool-call markers to DB before execution and after completion.
                 if public_data.get("status") in {"running", "done"} and not data.get("_durable_persisted"):
@@ -1691,7 +2052,13 @@ class WebSocketChatHandler:
                 if not await reserve_visible_output():
                     raise RuntimeError("Onboarding claim lost before thinking output")
                 thinking_content.append(text)
-                await self._safe_send({"type": "thinking", "content": text})
+                await self._safe_send(
+                    with_turn_envelope(
+                        {"type": "thinking", "content": text},
+                        turn_snapshot,
+                        event_kind="turn_stream",
+                    )
+                )
 
             _workspace_draft_cache: dict[str, str] = {}
 
@@ -1729,13 +2096,17 @@ class WebSocketChatHandler:
                 _workspace_draft_cache[draft_id] = raw_args
 
                 await self._safe_send(
-                    {
-                        "type": "workspace_draft",
-                        "id": draft_id,
-                        "index": data.get("index", 0),
-                        "name": tool_name,
-                        "arguments": raw_args,
-                    }
+                    with_turn_envelope(
+                        {
+                            "type": "workspace_draft",
+                            "id": draft_id,
+                            "index": data.get("index", 0),
+                            "name": tool_name,
+                            "arguments": raw_args,
+                        },
+                        turn_snapshot,
+                        event_kind="turn_tool_delta",
+                    )
                 )
 
             # Run call_llm_with_failover as a cancellable task
@@ -1762,7 +2133,13 @@ class WebSocketChatHandler:
                 async def _on_failover(reason: str):
                     if not await reserve_visible_output():
                         raise RuntimeError("Onboarding claim lost before failover output")
-                    await self._safe_send({"type": "info", "content": f"Primary model error, {reason}"})
+                    await self._safe_send(
+                        with_turn_envelope(
+                            {"type": "info", "content": f"Primary model error, {reason}"},
+                            turn_snapshot,
+                            event_kind="turn_stream",
+                        )
+                    )
 
                 # History loading is turn-aware, so do not re-apply a row/message
                 # slice here: it could split one tool-heavy protected turn.
@@ -2202,6 +2579,14 @@ class WebSocketChatHandler:
                 ),
             )
             db.add(assistant_msg)
+            if turn_anchor_id is not None:
+                await transition_conversation_turn(
+                    db,
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                    turn_anchor_id=turn_anchor_id,
+                    status=turn_status,
+                )
             if complete_onboarding:
                 completed = await db.execute(
                     update(AgentUserOnboarding)

@@ -27,9 +27,14 @@ import ConversationTimeline, {
 import ConversationScrollToBottomButton from "../features/conversation/ConversationScrollToBottomButton";
 import {
   applyAssistantDoneMessage,
+  applyAssistantMessageCommitted,
   applyAssistantStreamMessage,
+  applyConfirmationRequiredEvent,
+  applyUserMessageCommitted,
   buildConversationEntries,
+  foldConversationTimelineEvent,
   getConversationScrollAnchor,
+  hasPendingConfirmation,
   mapHistoryMessage,
   mergeHistoryMessages,
   toolCallMessageFromEvent,
@@ -37,6 +42,14 @@ import {
   type ConversationMessage,
 } from "../features/conversation/core/chatTimeline";
 import { resolveConversationMessageAnchor } from "../features/conversation/core/conversationAnchoring";
+import {
+  IDLE_CONVERSATION_TURN,
+  beginConversationTurnRecovery,
+  conversationTurnIsRunning,
+  conversationTurnEventShouldBeHandled,
+  reduceConversationTurnEvent,
+  type ConversationTurnRuntime,
+} from "../features/conversation/core/conversationTurnLifecycle";
 import { useConversationAutoFollow } from "../features/conversation/useConversationAutoFollow";
 import ChatImageLightbox from "./ChatImageLightbox";
 import RichMentionComposer, {
@@ -47,6 +60,18 @@ import {
   fileApi,
   uploadFileWithProgress,
 } from "../services/api";
+
+const TIMELINE_EVENT_TYPES = new Set([
+  "turn_receipt",
+  "thinking",
+  "chunk",
+  "done",
+  "tool_call",
+  "confirmation_required",
+  "assistant_message_committed",
+  "user_message_committed",
+  "channel_user_message",
+]);
 import {
   buildChatAttachmentPayload,
   downloadChatAttachment,
@@ -87,6 +112,7 @@ export type SessionViewerGroupConfig = {
     items: unknown[];
     hasMore: boolean;
     nextCursor: string | null;
+    turn?: Record<string, any>;
   }>;
   sendMessage: (
     sessionId: string,
@@ -95,6 +121,7 @@ export type SessionViewerGroupConfig = {
       llm_content?: string;
       mentions: string[];
       attachments: ReturnType<typeof buildChatAttachmentPayload>["attachments"];
+      client_message_id?: string;
     },
   ) => Promise<{
     message?: Record<string, any>;
@@ -107,6 +134,7 @@ export type SessionViewerGroupConfig = {
       status: string;
       error?: string;
     }>;
+    turn?: Record<string, any>;
   }>;
 };
 
@@ -291,12 +319,16 @@ export default function SessionViewerDrawer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const richMentionComposerRef = useRef<RichMentionComposerHandle>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const groupConfigRef = useRef(groupConfig);
+  groupConfigRef.current = groupConfig;
+  const turnRuntimeBySessionRef = useRef<Record<string, ConversationTurnRuntime>>({});
   const uploadAbortRef = useRef(new Map<string, () => void>());
   const requestSequenceRef = useRef(0);
   const groupSendInFlightRef = useRef(false);
   const sessionId = target?.sessionId;
   const accessAgentId = target?.agentId || agentId;
   const targetReadOnly = target?.readOnly === true;
+  const groupMode = Boolean(groupConfig);
   const canCompose = interactive && !targetReadOnly && !serverReadOnly;
   const mentionLimit = Math.max(0, groupConfig?.maxMentions ?? 8);
   const mentionOptions = useMemo(
@@ -319,8 +351,9 @@ export default function SessionViewerDrawer({
       if (!background) setLoading(true);
       try {
         const loadHistoryPage = async (before?: string) => {
-          if (groupConfig) {
-            return groupConfig.loadMessages(sessionId, {
+          const currentGroupConfig = groupConfigRef.current;
+          if (currentGroupConfig) {
+            return currentGroupConfig.loadMessages(sessionId, {
               before,
               limit: SESSION_HISTORY_PAGE_SIZE,
             });
@@ -337,6 +370,7 @@ export default function SessionViewerDrawer({
             items: Array.isArray(page.items) ? page.items : [],
             hasMore: Boolean(page.has_more),
             nextCursor: page.next_cursor || null,
+            turn: undefined,
           };
         };
         const [detail, firstPage] = await Promise.all([
@@ -434,17 +468,35 @@ export default function SessionViewerDrawer({
             ? t("agent.sessionViewer.anchorNotFound")
             : "",
         );
-        const nextGroupTurn = groupConfig
-          ? deriveGroupTurnState(Array.isArray(rows) ? rows : [])
-          : null;
+        let nextGroupTurn: GroupTurnState | null = null;
+        if (groupMode && firstPage.turn) {
+          const turnReduction = reduceConversationTurnEvent(
+            turnRuntimeBySessionRef.current[sessionId] || IDLE_CONVERSATION_TURN,
+            { type: "turn_state", turn: firstPage.turn },
+          );
+          if (turnReduction.accepted) {
+            turnRuntimeBySessionRef.current[sessionId] = turnReduction.runtime;
+            const activeAgentIds = Array.isArray(firstPage.turn.active_agent_ids)
+              ? firstPage.turn.active_agent_ids.map(String)
+              : [];
+            if (conversationTurnIsRunning(turnReduction.runtime)) {
+              nextGroupTurn = {
+                phase: "active",
+                anchorMessageId: String(firstPage.turn.anchor_message_id || ""),
+                agentIds: activeAgentIds,
+                runCount: Number(firstPage.turn.run_count || activeAgentIds.length),
+              };
+            }
+            if (!groupSendInFlightRef.current)
+              setSending(conversationTurnIsRunning(turnReduction.runtime));
+          }
+        }
         setSession(detail);
         setMessages((previous) =>
           background ? mergeHistoryMessages(previous, normalized) : normalized,
         );
-        if (groupConfig) {
+        if (groupMode) {
           setGroupTurn(nextGroupTurn);
-          if (!groupSendInFlightRef.current)
-            setSending(nextGroupTurn?.phase === "active");
         }
         setError("");
         return nextGroupTurn;
@@ -459,7 +511,7 @@ export default function SessionViewerDrawer({
     },
     [
       accessAgentId,
-      groupConfig,
+      groupMode,
       sessionId,
       t,
       target?.anchorMessageId,
@@ -499,12 +551,7 @@ export default function SessionViewerDrawer({
   }, [loadSession, sessionId]);
 
   useEffect(() => {
-    if (
-      !interactive ||
-      targetReadOnly ||
-      !sessionId ||
-      !accessAgentId
-    )
+    if (!sessionId || !accessAgentId)
       return;
     const token = localStorage.getItem("token");
     if (!token) {
@@ -540,9 +587,36 @@ export default function SessionViewerDrawer({
         } catch {
           return;
         }
-        const messageId = payload.message_id
-          ? String(payload.message_id)
-          : undefined;
+        const turnReduction = reduceConversationTurnEvent(
+          turnRuntimeBySessionRef.current[sessionId] || IDLE_CONVERSATION_TURN,
+          payload,
+        );
+        if (!conversationTurnEventShouldBeHandled(turnReduction)) return;
+        turnRuntimeBySessionRef.current[sessionId] = turnReduction.runtime;
+        if (turnReduction.controlsLifecycle && turnReduction.hasSnapshot) {
+          setSending(conversationTurnIsRunning(turnReduction.runtime));
+          if (groupMode && payload.turn) {
+            const activeAgentIds = Array.isArray(payload.turn.active_agent_ids)
+              ? payload.turn.active_agent_ids.map(String)
+              : [];
+            setGroupTurn(
+              conversationTurnIsRunning(turnReduction.runtime)
+                ? {
+                    phase: "active",
+                    anchorMessageId: String(
+                      payload.turn.anchor_message_id ||
+                        payload.turn.turn_anchor_id ||
+                        "",
+                    ),
+                    agentIds: activeAgentIds,
+                    runCount: Number(
+                      payload.turn.run_count || activeAgentIds.length,
+                    ),
+                  }
+                : null,
+            );
+          }
+        }
         if (payload.type === "connected") {
           setConnected(true);
           setServerReadOnly(payload.read_only === true);
@@ -551,115 +625,51 @@ export default function SessionViewerDrawer({
           }
           return;
         }
-        if (payload.type === "thinking" || payload.type === "chunk") {
-          setSending(true);
-          setMessages((previous) =>
-            applyAssistantStreamMessage(previous, {
-              type: payload.type,
-              content: String(payload.content || ""),
-              messageId,
-              sender_name: payload.sender_name,
-              sender_agent_id: payload.sender_agent_id,
-            }),
-          );
-          return;
-        }
-        if (
-          payload.type === "workspace_draft" ||
-          payload.type === "tool_call" ||
-          payload.type === "confirmation_required"
-        ) {
-          setSending(true);
-          setMessages((previous) =>
-            upsertToolCallMessage(
-              previous,
-              toolCallMessageFromEvent({
-                ...payload,
-                status:
-                  payload.type === "confirmation_required"
-                    ? "running"
-                    : payload.status,
-              }),
-            ),
-          );
-          return;
-        }
-        if (payload.type === "assistant_message_committed") {
-          const committed = mapHistoryMessage({
-            id: payload.id,
-            role: "assistant",
-            content: payload.content || "",
-            display_content: payload.display_content,
-            attachments: payload.attachments,
-            created_at: payload.created_at,
-          });
-          if (committed) {
-            setMessages((previous) => {
-              const index = previous.findIndex(
-                (message) => message.id === committed.id,
-              );
-              return index < 0
-                ? [...previous, committed]
-                : [
-                    ...previous.slice(0, index),
-                    { ...previous[index], ...committed },
-                    ...previous.slice(index + 1),
-                  ];
-            });
+        if (payload.type === "workspace_draft") return;
+        if (TIMELINE_EVENT_TYPES.has(String(payload.type || ""))) {
+          if (
+            turnReduction.controlsLifecycle &&
+            !turnReduction.hasSnapshot &&
+            ["thinking", "chunk", "tool_call", "confirmation_required"].includes(payload.type)
+          ) {
+            setSending(true);
           }
-          return;
-        }
-        if (payload.type === "user_message_committed") {
-          const clientId = String(payload.client_message_id || "");
-          const durableId = String(payload.message_id || "");
-          if (clientId && durableId) {
-            setMessages((previous) =>
-              previous.map((message) =>
-                message.id === clientId
-                  ? { ...message, id: durableId }
-                  : message,
-              ),
-            );
-          }
-          return;
-        }
-        if (payload.type === "channel_user_message") {
-          const committed = mapHistoryMessage({
-            ...payload,
-            role: "user",
-            id: payload.id || createClientId(),
-          });
-          if (committed)
-            setMessages((previous) =>
-              previous.some((message) => message.id === committed.id)
-                ? previous
-                : [...previous, committed],
-            );
-          return;
-        }
-        if (payload.type === "done") {
           setMessages((previous) =>
-            applyAssistantDoneMessage(previous, {
-              content: String(payload.content || ""),
-              messageId,
-              sender_name: payload.sender_name,
-              sender_agent_id: payload.sender_agent_id,
-            }),
+            foldConversationTimelineEvent(previous, payload, {
+              preserveTransient:
+                !turnReduction.controlsLifecycle && !turnReduction.hasSnapshot,
+            }).messages,
           );
-          setSending(false);
-          window.setTimeout(() => void loadSession(true), 250);
+          if (payload.type === "done") {
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+              setSending(false);
+            }
+            window.setTimeout(() => void loadSession(true), 250);
+          }
           return;
         }
         if (payload.type === "error" || payload.type === "quota_exceeded") {
+          setMessages((previous) =>
+            foldConversationTimelineEvent(previous, payload).messages,
+          );
           setComposerError(t("agent.sessionViewer.sendError"));
-          setSending(false);
+          if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+            setSending(false);
+          }
         }
       };
-      socket.onerror = () => setConnected(false);
+      socket.onerror = () => {
+        if (socketRef.current === socket) setConnected(false);
+      };
       socket.onclose = (event) => {
-        if (socketRef.current === socket) socketRef.current = null;
+        if (socketRef.current !== socket) return;
+        socketRef.current = null;
         setConnected(false);
-        setSending(false);
+        const durableRuntime = beginConversationTurnRecovery(
+          turnRuntimeBySessionRef.current[sessionId] || IDLE_CONVERSATION_TURN,
+        );
+        turnRuntimeBySessionRef.current[sessionId] = durableRuntime;
+        setSending(conversationTurnIsRunning(durableRuntime));
         if (
           disposed ||
           event.code === 4001 ||
@@ -688,23 +698,13 @@ export default function SessionViewerDrawer({
     };
   }, [
     accessAgentId,
-    groupConfig,
+    groupMode,
     interactive,
     loadSession,
     sessionId,
     t,
     targetReadOnly,
   ]);
-
-  useEffect(() => {
-    if (!interactive || targetReadOnly || !groupConfig || !sessionId) return;
-    setConnected(true);
-    const timer = window.setInterval(() => void loadSession(true), 3000);
-    return () => {
-      setConnected(false);
-      window.clearInterval(timer);
-    };
-  }, [groupConfig, interactive, loadSession, sessionId, targetReadOnly]);
 
   useEffect(
     () => () => {
@@ -736,12 +736,6 @@ export default function SessionViewerDrawer({
       sessionId && !loading && !error && !resolvedAnchorMessageId,
     ),
   });
-
-  useEffect(() => {
-    if (!sessionId || !active) return;
-    const timer = window.setInterval(() => void loadSession(true), 3000);
-    return () => window.clearInterval(timer);
-  }, [active, loadSession, sessionId]);
 
   useEffect(() => {
     if (!target || embedded) return;
@@ -875,7 +869,7 @@ export default function SessionViewerDrawer({
     mentionsOverride?: string[],
   ) => {
     const socket = socketRef.current;
-    if (!canCompose || !connected || sending) return;
+    if (!canCompose || !connected || sending || confirmationPending) return;
     const effectiveDraft = draftOverride ?? draft;
     const effectiveMentions = mentionsOverride ?? mentions;
     if (!effectiveDraft.trim() && attachedFiles.length === 0) return;
@@ -909,6 +903,7 @@ export default function SessionViewerDrawer({
           llm_content: attachmentPayload.contentForLLM,
           mentions: effectiveMentions,
           attachments: attachmentPayload.attachments,
+          client_message_id: clientMessageId,
         });
         const committed = result.message
           ? mapHistoryMessage(result.message)
@@ -920,26 +915,27 @@ export default function SessionViewerDrawer({
             ),
           );
         }
-        const responseRuns = Array.isArray(result.subagent_runs)
-          ? result.subagent_runs
-          : [];
-        const activeResponseRuns = responseRuns.filter((run) =>
-          GROUP_RUN_ACTIVE_STATUSES.has(String(run.status || "").toLowerCase()),
-        );
-        const responseTurn: GroupTurnState | null = activeResponseRuns.length
-          ? {
-              phase: "active",
-              anchorMessageId: String(result.message?.id || clientMessageId),
-              agentIds: Array.from(
-                new Set(
-                  activeResponseRuns
-                    .map((run) => String(run.agent_id || ""))
-                    .filter(Boolean),
-                ),
-              ),
-              runCount: activeResponseRuns.length,
-            }
+        const responseRuns = Array.isArray(result.subagent_runs) ? result.subagent_runs : [];
+        const responseReduction = result.turn
+          ? reduceConversationTurnEvent(
+              turnRuntimeBySessionRef.current[sessionId] || IDLE_CONVERSATION_TURN,
+              { type: "turn_state", turn: result.turn },
+            )
           : null;
+        if (responseReduction?.accepted)
+          turnRuntimeBySessionRef.current[sessionId] = responseReduction.runtime;
+        const responseAgentIds = Array.isArray(result.turn?.active_agent_ids)
+          ? result.turn.active_agent_ids.map(String)
+          : [];
+        const responseTurn: GroupTurnState | null =
+          responseReduction && conversationTurnIsRunning(responseReduction.runtime)
+            ? {
+                phase: "active",
+                anchorMessageId: String(result.turn?.anchor_message_id || result.message?.id || clientMessageId),
+                agentIds: responseAgentIds,
+                runCount: Number(result.turn?.run_count || responseAgentIds.length),
+              }
+            : null;
         setGroupTurn(responseTurn);
         setDraft("");
         setAttachedFiles([]);
@@ -963,13 +959,16 @@ export default function SessionViewerDrawer({
         ) {
           setComposerError(t("agent.sessionViewer.groupTurnNoActiveRun"));
         }
-      } catch (sendError: any) {
+      } catch {
         setMessages((previous) =>
           previous.filter((message) => message.id !== clientMessageId),
         );
         setComposerError(t("agent.sessionViewer.sendError"));
-        setSending(false);
-        setGroupTurn(null);
+        const recoveredTurn = await loadSession(true);
+        if (recoveredTurn !== undefined) {
+          setGroupTurn(recoveredTurn);
+          setSending(recoveredTurn?.phase === "active");
+        }
       } finally {
         groupSendInFlightRef.current = false;
       }
@@ -1092,25 +1091,21 @@ export default function SessionViewerDrawer({
             name: groupProcessingAgentName,
           })
       : "";
-  const timelineMessages =
-    groupConfig && sending
-      ? [
-          ...messages,
-          {
-            id: `group-pending-${groupTurn?.anchorMessageId || "sending"}`,
-            role: "assistant" as const,
-            content: "",
-            created_at: null,
-            sender_agent_id:
-              activeGroupAgents[0]?.agentId || groupLeader?.agentId,
-            sender_name:
-              activeGroupAgents[0]?.name ||
-              groupLeader?.name ||
-              t("projectTerminology.groupProcessingFallback"),
-            _streaming: true,
-          },
-        ]
-      : messages;
+  const progressMessage: Partial<ConversationMessage> = groupConfig
+    ? {
+        id: `group-pending-${groupTurn?.anchorMessageId || "sending"}`,
+        created_at: null,
+        sender_agent_id:
+          activeGroupAgents[0]?.agentId || groupLeader?.agentId,
+        sender_name:
+          activeGroupAgents[0]?.name ||
+          groupLeader?.name ||
+          t("projectTerminology.groupProcessingFallback"),
+      }
+    : {
+        id: `conversation-turn-progress:${sessionId || "unknown"}:${turnRuntimeBySessionRef.current[String(sessionId || "")]?.snapshot.generation || 0}`,
+      };
+  const confirmationPending = hasPendingConfirmation(messages);
   const routePrefix = routeMode === "h5" ? "/h5/agents" : "/agents";
   const fullSessionHref = `${routePrefix}/${executionAgentId}/chat?session_id=${encodeURIComponent(sessionId)}`;
   const isSubagent =
@@ -1213,7 +1208,7 @@ export default function SessionViewerDrawer({
                 {t("agent.sessionViewer.retry")}
               </button>
             </div>
-          ) : timelineMessages.length === 0 ? (
+          ) : messages.length === 0 && !active ? (
             <div className="session-viewer-drawer__state">
               {t("agent.sessionViewer.empty")}
             </div>
@@ -1230,11 +1225,12 @@ export default function SessionViewerDrawer({
               <ConversationTimeline
                 agentId={executionAgentId}
                 agentName={executionAgentName}
-                messages={timelineMessages}
+                messages={messages}
                 scrollerRef={scrollerRef}
                 focusMessageId={resolvedAnchorMessageId || undefined}
                 isRunning={active}
                 runningLabel={groupProcessingLabel || undefined}
+                progressMessage={progressMessage}
                 mode={routeMode}
                 onPreviewImages={handlePreviewImages}
                 unavailableAttachmentKeys={effectiveUnavailableAttachments}
@@ -1367,6 +1363,7 @@ export default function SessionViewerDrawer({
                   !canCompose ||
                   !connected ||
                   sending ||
+                  confirmationPending ||
                   uploads.length > 0 ||
                   attachedFiles.length >= 10
                 }
@@ -1380,7 +1377,7 @@ export default function SessionViewerDrawer({
                   value={draft}
                   options={mentionOptions}
                   maxMentions={mentionLimit}
-                  disabled={!canCompose || sending}
+                  disabled={!canCompose || sending || confirmationPending}
                   placeholder={
                     targetReadOnly || serverReadOnly
                       ? t("agent.sessionViewer.readOnlySession")
@@ -1420,7 +1417,7 @@ export default function SessionViewerDrawer({
                   onKeyDown={handleComposerKeyDown}
                   onPaste={handlePaste}
                   rows={1}
-                  disabled={!canCompose || sending}
+                  disabled={!canCompose || sending || confirmationPending}
                   placeholder={
                     targetReadOnly || serverReadOnly
                       ? t("agent.sessionViewer.readOnlySession")

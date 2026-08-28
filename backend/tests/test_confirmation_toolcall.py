@@ -586,6 +586,9 @@ async def test_resolve_fills_tool_result_and_reenters():
 async def test_confirmation_pending_tool_call_is_the_suspended_state():
     """A confirmation turn is suspended by the pending tool_call row itself."""
     from app.services import confirmation_service as cs
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
 
     agent_id, user_id = await _make_agent()
     session = await _make_session(agent_id, user_id, source_channel="web")
@@ -617,6 +620,19 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
         pending_row = await db.get(ChatMessage, row_id)
         assert pending_row.message_meta["turn_anchor_id"] == str(anchor_id)
         assert pending_row.message_meta["turn_status"] == "suspended"
+        suspended_current = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+        )
+        suspended_exact = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+            turn_anchor_id=anchor_id,
+        )
+        assert suspended_current == suspended_exact
+        assert suspended_current.status == "suspended"
 
     with (
         patch.object(cs, "_reenter_loop", new=AsyncMock()) as reenter,
@@ -634,6 +650,20 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
     assert result is not None
     reenter.assert_awaited_once()
     assert reenter.await_args.kwargs["turn_anchor_id"] == anchor_id
+    async with async_session() as db:
+        resumed_current = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+        )
+        resumed_exact = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+            turn_anchor_id=anchor_id,
+        )
+    assert resumed_current == resumed_exact
+    assert resumed_current.status == "running"
 
 
 async def test_session_lock_reuses_existing_pending_confirmation():
