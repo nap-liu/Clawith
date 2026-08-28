@@ -1,0 +1,93 @@
+.project-agent-settings {
+  min-width: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.project-agent-settings__header {
+  min-height: 72px;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.project-agent-settings__header span {
+  color: var(--accent-primary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.project-agent-settings__header h3 {
+  margin: 4px 0 0;
+  color: var(--text-primary);
+  font-size: var(--text-lg);
+}
+
+.project-agent-settings__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.project-agent-settings .project-workspace__member-capability-rail {
+  margin: 0;
+}
+
+.project-agent-settings .project-workspace__member-capability-body {
+  min-height: 360px;
+  max-height: min(620px, calc(100vh - 260px));
+  padding: 20px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.project-agent-settings__config-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 20px;
+}
+
+.project-agent-settings__config-form > .is-wide {
+  grid-column: 1 / -1;
+}
+
+.project-agent-settings__config-form input,
+.project-agent-settings__config-form textarea,
+.project-agent-settings__config-form .project-select {
+  width: 100%;
+}
+
+.project-agent-settings.is-readonly {
+  background: var(--bg-secondary);
+}
+
+@media (max-width: 760px) {
+  .project-agent-settings__header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .project-agent-settings__actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .project-agent-settings__config-form {
+    grid-template-columns: 1fr;
+  }
+
+  .project-agent-settings__config-form > .is-wide {
+    grid-column: auto;
+  }
+
+  .project-agent-settings .project-workspace__member-capability-body {
+    max-height: min(560px, calc(100vh - 220px));
+    padding: 16px;
+  }
+}

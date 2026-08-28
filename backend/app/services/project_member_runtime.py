@@ -87,6 +87,65 @@ async def initialize_project_agent_tool_policy(
     await db.flush()
 
 
+async def apply_project_agent_tool_settings(
+    db: AsyncSession,
+    project: Project,
+    *,
+    project_agent_id: uuid.UUID,
+    settings: list[tuple[uuid.UUID, bool, dict[str, Any]]],
+) -> None:
+    """Apply the create form through the same project-local AgentTool rows."""
+
+    if not settings:
+        return
+    requested_ids = {tool_id for tool_id, _enabled, _config in settings}
+    tools = (
+        await db.execute(
+            select(Tool).where(
+                Tool.id.in_(requested_ids),
+                Tool.enabled.is_(True),
+                or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+            )
+        )
+    ).scalars().all()
+    tools_by_id = {tool.id: tool for tool in tools}
+    if set(tools_by_id) != requested_ids:
+        raise HTTPException(status_code=422, detail="One or more selected tools are unavailable")
+    assignments = {
+        row.tool_id: row
+        for row in (
+            (
+                await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == project_agent_id,
+                        AgentTool.tool_id.in_(requested_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    for tool_id, requested_enabled, requested_config in settings:
+        tool = tools_by_id[tool_id]
+        enabled = True if tool_is_required(tool.name) else requested_enabled
+        assignment = assignments.get(tool_id)
+        if assignment is None:
+            db.add(
+                AgentTool(
+                    agent_id=project_agent_id,
+                    tool_id=tool_id,
+                    enabled=enabled,
+                    config=requested_config,
+                    source="user_installed",
+                )
+            )
+        else:
+            assignment.enabled = enabled
+            assignment.config = requested_config
+    await db.flush()
+
+
 class ProjectMemberRuntimeConfig(BaseModel):
     """Typed product-owned fields stored in ``config_snapshot``.
 

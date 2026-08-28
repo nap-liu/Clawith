@@ -28,6 +28,8 @@ export default function ToolsManager({
     canConfigure = canManage,
     scope = 'agent',
     projectContext,
+    draftTools,
+    onDraftToolsChange,
 }: {
     agentId: string;
     agentName?: string;
@@ -35,6 +37,8 @@ export default function ToolsManager({
     canConfigure?: boolean;
     scope?: 'agent' | 'project';
     projectContext?: { projectId: string; memberId: string };
+    draftTools?: any[];
+    onDraftToolsChange?: (tools: any[]) => void;
 }) {
     const { t } = useTranslation();
     const dialog = useDialog();
@@ -83,6 +87,11 @@ export default function ToolsManager({
     };
 
     const loadTools = async () => {
+        if (draftTools) {
+            setTools(draftTools);
+            setLoading(false);
+            return;
+        }
         try {
             const token = localStorage.getItem('token');
             const res = await fetch(projectContext ? assignmentUrl : `${assignmentUrl}/with-config`, {
@@ -104,7 +113,7 @@ export default function ToolsManager({
         setLoading(false);
     };
 
-    useEffect(() => { loadTools(); }, [agentId, scope, projectContext?.projectId, projectContext?.memberId]);
+    useEffect(() => { loadTools(); }, [agentId, scope, projectContext?.projectId, projectContext?.memberId, draftTools]);
 
     const toggleTool = async (toolId: string, enabled: boolean) => {
         const previous = tools;
@@ -118,6 +127,12 @@ export default function ToolsManager({
         setTools(prev => prev.map(tool => (
             affectedToolIds.has(tool.id) ? { ...tool, enabled } : tool
         )));
+        if (draftTools && onDraftToolsChange) {
+            onDraftToolsChange(tools.map(tool => (
+                affectedToolIds.has(tool.id) ? { ...tool, enabled } : tool
+            )));
+            return;
+        }
         try {
             const token = localStorage.getItem('token');
             const response = await fetch(assignmentUrl, {
@@ -186,6 +201,12 @@ export default function ToolsManager({
         setConfigGlobalData({});
         setConfigSaving(true);
         setFocusedField(null);
+        if (draftTools) {
+            const configured = draftTools.find(tool => tool.category === category)?.agent_config || {};
+            setConfigData(configured);
+            setConfigSaving(false);
+            return;
+        }
         try {
             const token = localStorage.getItem('token');
             const res = await fetch(`/api/tools/agents/${agentId}/category-config/${category}`, {
@@ -217,6 +238,24 @@ export default function ToolsManager({
         if (!configTool && !configCategory) return;
         setConfigSaving(true);
         try {
+            if (draftTools && onDraftToolsChange) {
+                const targetConfig = configTool
+                    ? (configTool.config_schema?.fields?.length > 0
+                        ? configData
+                        : JSON.parse(configJson || '{}'))
+                    : configData;
+                const next = draftTools.map(tool => (
+                    configTool?.id === tool.id || (configCategory && tool.category === configCategory)
+                        ? { ...tool, agent_config: targetConfig }
+                        : tool
+                ));
+                setTools(next);
+                onDraftToolsChange(next);
+                setConfigTool(null);
+                setConfigCategory(null);
+                setConfigSaving(false);
+                return;
+            }
             const token = localStorage.getItem('token');
 
             if (configCategory) {
@@ -337,6 +376,17 @@ export default function ToolsManager({
         );
         setUpdatingCategories(prev => new Set(prev).add(category));
         setTools(prev => prev.map(t => catToolIds.has(t.id) ? { ...t, enabled } : t));
+        if (draftTools && onDraftToolsChange) {
+            const next = tools.map(tool => catToolIds.has(tool.id) ? { ...tool, enabled } : tool);
+            setTools(next);
+            onDraftToolsChange(next);
+            setUpdatingCategories(prev => {
+                const updated = new Set(prev);
+                updated.delete(category);
+                return updated;
+            });
+            return;
+        }
         try {
             const token = localStorage.getItem('token');
             const payload = Array.from(catToolIds).map(id => ({ tool_id: id, enabled }));

@@ -17,6 +17,8 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { IconPlus, IconSettings, IconTool, IconTrash, IconX } from '@tabler/icons-react';
+import { useDialog } from '../Dialog/DialogProvider';
 import { CliToolWizard } from './CliToolWizard';
 import { cliToolsApi } from './api';
 import type { CliTool } from './types';
@@ -30,6 +32,7 @@ export interface CliToolsSectionProps {
 
 export function CliToolsSection({ tenantId: _tenantId }: CliToolsSectionProps) {
   const { t } = useTranslation();
+  const dialog = useDialog();
   const queryClient = useQueryClient();
 
   const [showWizard, setShowWizard] = useState(false);
@@ -103,8 +106,8 @@ export function CliToolsSection({ tenantId: _tenantId }: CliToolsSectionProps) {
             )}
           </div>
         </div>
-        <button className="btn btn-secondary" onClick={openCreate}>
-          + {t('enterprise.cliTools.addButton', 'Add CLI Tool')}
+        <button className="btn btn-secondary" onClick={openCreate} style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+          <IconPlus size={15} /> {t('enterprise.cliTools.addButton', 'Add CLI Tool')}
         </button>
       </div>
 
@@ -125,6 +128,7 @@ export function CliToolsSection({ tenantId: _tenantId }: CliToolsSectionProps) {
           <span>{errorMsg}</span>
           <button
             onClick={() => setErrorMsg(null)}
+            aria-label={t('common.close', 'Close')}
             style={{
               background: 'none',
               border: 'none',
@@ -133,7 +137,7 @@ export function CliToolsSection({ tenantId: _tenantId }: CliToolsSectionProps) {
               fontSize: '14px',
             }}
           >
-            ✕
+            <IconX size={15} />
           </button>
         </div>
       )}
@@ -169,9 +173,17 @@ export function CliToolsSection({ tenantId: _tenantId }: CliToolsSectionProps) {
                 toggleMutation.mutate({ id: tool.id, is_active: checked })
               }
               onEdit={() => openEdit(tool)}
-              onDelete={() => {
+              onDelete={async () => {
                 const label = tool.display_name || tool.name;
-                if (!confirm(`${t('common.delete', 'Delete')} ${label}?`)) return;
+                const confirmed = await dialog.confirm(
+                  t('enterprise.cliTools.deleteConfirm', 'Delete “{{name}}”? Its binary and persistent data will also be removed.', { name: label }),
+                  {
+                    title: t('enterprise.cliTools.deleteTitle', 'Delete CLI tool'),
+                    danger: true,
+                    confirmLabel: t('enterprise.cliTools.deleteAction', 'Delete'),
+                  },
+                );
+                if (!confirmed) return;
                 deleteMutation.mutate(tool.id);
               }}
             />
@@ -213,7 +225,7 @@ function CliToolRow({ tool, onToggle, onEdit, onDelete }: CliToolRowProps) {
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1, minWidth: 0 }}>
-          <span style={{ fontSize: '18px' }}>🛠️</span>
+          <IconTool size={19} style={{ color: 'var(--text-secondary)', flexShrink: 0 }} />
           <div style={{ minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
               <span style={{ fontWeight: 500, fontSize: '13px' }}>{tool.display_name}</span>
@@ -250,7 +262,7 @@ function CliToolRow({ tool, onToggle, onEdit, onDelete }: CliToolRowProps) {
                   }}
                   title={t(
                     'enterprise.cliTools.wizard.binaryEmpty',
-                    'No binary yet. Accepted: ELF / Mach-O / shebang script. Max 100 MB.',
+                    'No binary yet. Accepted: ELF / Mach-O / shebang script.',
                   )}
                 >
                   {t('enterprise.cliTools.noBinary', 'No binary')}
@@ -274,17 +286,17 @@ function CliToolRow({ tool, onToggle, onEdit, onDelete }: CliToolRowProps) {
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
           <button
             className="btn btn-secondary"
-            style={{ padding: '4px 8px', fontSize: '11px' }}
+            style={{ padding: '4px 8px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
             onClick={onEdit}
           >
-            ⚙️ {t('common.edit', 'Edit')}
+            <IconSettings size={14} /> {t('common.edit', 'Edit')}
           </button>
           <button
             className="btn btn-danger"
-            style={{ padding: '4px 8px', fontSize: '11px' }}
+            style={{ padding: '4px 8px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
             onClick={onDelete}
           >
-            {t('common.delete', 'Delete')}
+            <IconTrash size={14} /> {t('common.delete', 'Delete')}
           </button>
 
           {/* Enable toggle */}

@@ -25,13 +25,12 @@ surface.
 from __future__ import annotations
 
 import logging
-import os
 import time
 import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,7 +49,6 @@ from app.services.cli_tools.storage import (
     BINARY_ROOT,
     BinaryStorage,
     MagicNumberError,
-    SizeLimitExceededError,
 )
 from app.services.cli_tools import versioning as versioning_service
 
@@ -58,13 +56,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tools/cli", tags=["cli-tools"])
 
-# Upload size cap for CLI tool binaries, in bytes. Default 100 MiB; override
-# via the CLI_BINARY_MAX_BYTES env var so prod can raise it without a code
-# change (mirrors MAX_SKILL_SIZE). Node SEA / pkg / bun single-file builds
-# embed the JS runtime and routinely exceed 100 MiB, so large first-party
-# binaries need a higher cap. Read once at import — change it in compose/.env
-# and restart the backend to take effect.
-_BINARY_MAX_BYTES = int(os.getenv("CLI_BINARY_MAX_BYTES", str(100 * 1024 * 1024)))
 _STORAGE_ROOT = BINARY_ROOT
 
 
@@ -390,12 +381,9 @@ async def upload_binary(
             tenant_key=tenant_key,
             tool_id=str(tool.id),
             stream=file.file,
-            max_bytes=_BINARY_MAX_BYTES,
         )
     except MagicNumberError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unrecognised binary format: {exc}") from exc
-    except SizeLimitExceededError as exc:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc)) from exc
 
     # Delegate to the versioning service: it inserts a row, flips the
     # previous current flag, rewrites tool.config.binary, and evicts
@@ -411,6 +399,163 @@ async def upload_binary(
     )
 
     _audit(db, user, "cli_tool.upload_binary", tool, detail={"sha256": sha, "size": size})
+    await db.commit()
+    await db.refresh(tool)
+    return _to_out(tool)
+
+
+class ResumableUploadStatus(BaseModel):
+    upload_id: uuid.UUID
+    received: int
+    total: int
+    original_name: str
+
+
+async def _managed_cli_tool(db: AsyncSession, user: User, tool_id: uuid.UUID) -> Tool:
+    tool = await db.get(Tool, tool_id)
+    if tool is None or tool.type != "cli":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
+    _require_manage(user, tool)
+    return tool
+
+
+@router.get(
+    "/{tool_id}/binary/uploads/{upload_id}",
+    response_model=ResumableUploadStatus,
+)
+async def get_binary_upload_status(
+    tool_id: uuid.UUID,
+    upload_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return the durable server offset used to resume an interrupted upload."""
+    tool = await _managed_cli_tool(db, user, tool_id)
+    tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
+    current = BinaryStorage(root=_STORAGE_ROOT).upload_status(
+        tenant_key=tenant_key,
+        tool_id=str(tool.id),
+        upload_id=str(upload_id),
+    )
+    if current is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found")
+    received, total, original_name = current
+    return ResumableUploadStatus(
+        upload_id=upload_id,
+        received=received,
+        total=total,
+        original_name=original_name,
+    )
+
+
+@router.put(
+    "/{tool_id}/binary/uploads/{upload_id}",
+    response_model=ResumableUploadStatus,
+)
+async def append_binary_upload_chunk(
+    tool_id: uuid.UUID,
+    upload_id: uuid.UUID,
+    request: Request,
+    offset: int = Query(ge=0),
+    total: int = Query(ge=0),
+    original_name: str = Query(min_length=1, max_length=1024),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Append one chunk. Chunks are deliberately sequential for simplicity."""
+    tool = await _managed_cli_tool(db, user, tool_id)
+    tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
+    storage = BinaryStorage(root=_STORAGE_ROOT)
+    current = storage.upload_status(
+        tenant_key=tenant_key,
+        tool_id=str(tool.id),
+        upload_id=str(upload_id),
+    )
+    if current is not None and offset != current[0]:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"message": "upload offset mismatch", "expected_offset": current[0]},
+        )
+
+    chunk = await request.body()
+    try:
+        received = storage.append_upload_chunk(
+            tenant_key=tenant_key,
+            tool_id=str(tool.id),
+            upload_id=str(upload_id),
+            offset=offset,
+            total=total,
+            original_name=original_name,
+            chunk=chunk,
+        )
+    except ValueError as exc:
+        latest = storage.upload_status(
+            tenant_key=tenant_key,
+            tool_id=str(tool.id),
+            upload_id=str(upload_id),
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "expected_offset": latest[0] if latest is not None else 0,
+            },
+        ) from exc
+
+    return ResumableUploadStatus(
+        upload_id=upload_id,
+        received=received,
+        total=total,
+        original_name=original_name,
+    )
+
+
+@router.post(
+    "/{tool_id}/binary/uploads/{upload_id}/complete",
+    response_model=CliToolOut,
+)
+async def complete_binary_upload(
+    tool_id: uuid.UUID,
+    upload_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Validate, promote and version one fully received upload."""
+    tool = await _managed_cli_tool(db, user, tool_id)
+    tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
+    storage = BinaryStorage(root=_STORAGE_ROOT)
+    try:
+        sha, size, original_name = storage.finalize_upload(
+            tenant_key=tenant_key,
+            tool_id=str(tool.id),
+            upload_id=str(upload_id),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found") from exc
+    except MagicNumberError as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"unrecognised binary format: {exc}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    await versioning_service.record_new_version(
+        db,
+        tool,
+        sha256=sha,
+        size=size,
+        original_name=original_name,
+        user_id=user.id,
+        binary_storage=storage,
+    )
+    _audit(
+        db,
+        user,
+        "cli_tool.upload_binary",
+        tool,
+        detail={"sha256": sha, "size": size, "resumable": True},
+    )
     await db.commit()
     await db.refresh(tool)
     return _to_out(tool)

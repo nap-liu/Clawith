@@ -38,10 +38,10 @@ def _mock_db_with_tools(tools: list[MagicMock]) -> MagicMock:
 async def test_gc_deletes_orphan_older_than_threshold(tmp_path):
     storage = BinaryStorage(root=tmp_path)
     sha_a, _ = await storage.write(
-        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG), max_bytes=1_000_000,
+        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG),
     )
     sha_b, _ = await storage.write(
-        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG + b"\n"), max_bytes=1_000_000,
+        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG + b"\n"),
     )
 
     orphan_path = storage.resolve("t1", "tool1", sha_b)
@@ -61,7 +61,7 @@ async def test_gc_deletes_orphan_older_than_threshold(tmp_path):
 async def test_gc_keeps_referenced_even_when_old(tmp_path):
     storage = BinaryStorage(root=tmp_path)
     sha_a, _ = await storage.write(
-        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG), max_bytes=1_000_000,
+        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG),
     )
     _age_file(storage.resolve("t1", "tool1", sha_a), days=365)
 
@@ -78,7 +78,7 @@ async def test_gc_keeps_referenced_even_when_old(tmp_path):
 async def test_gc_keeps_young_orphan(tmp_path):
     storage = BinaryStorage(root=tmp_path)
     sha, _ = await storage.write(
-        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG), max_bytes=1_000_000,
+        tenant_key="t1", tool_id="tool1", stream=io.BytesIO(_SHEBANG),
     )
     # File is fresh. No referencing Tool row.
     db = _mock_db_with_tools([])

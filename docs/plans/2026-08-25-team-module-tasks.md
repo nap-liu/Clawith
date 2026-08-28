@@ -621,3 +621,17 @@
 - [x] 完整后端唯一行为用例按数据库前提分区执行为 `2741 passed, 28 skipped`，无产品断言失败；项目协作 `515 passed`；市场与项目设置 `41 passed`；主线合并影响 `78 passed`；不把重叠分区相加为虚假的总数，不把源码正则/形状检查计为产品验证。
 - [x] Fresh PostgreSQL 历史迁移重复列通过 Git blob 与行为对比确认在最新主线同样存在，不属于本 feature diff；现有生产结构升级和兼容回滚通过。该问题作为独立主线 fresh-install 整改，不计为本迭代遗留。
 - [x] 详细审计见 `docs/plans/2026-08-26-ai-native-project-full-diff-stability-audit.md`；研发尾项为 0，结论为 `GO for production preparation`，不构成生产发布授权。
+
+## 三十、Subagent 空队列调度性能收口（2026-08-27）
+
+- [x] 生产只读证据确认 `chat_messages` 空队列查询反复顺序扫描：10 秒内出现 19 次；Project Leader 空扫描约占活动采样 58%，普通 Subagent wake 扫描约占 15%；单次 Leader 空结果仍约 162 ms、读取约 95,617 个 8KB 数据页。
+- [x] 热路径改为提交后进程内事件唤醒，普通 Subagent 与 Project Leader 共用 0.5 秒合并窗口和同一耐久调度循环；空闲期不再每 0.5 秒查询数据库。
+- [x] `chat_messages` 继续作为唯一耐久事实来源；未引入 Redis 队列、新队列表、通知通道、生成列或第二套调度器。
+- [x] 保留 60 秒低频耐久恢复和 300 秒旧消息兼容扫描；项目 outbox 只随恢复周期执行，不再被每次普通消息唤醒连带扫描。
+- [x] 普通异步事件增加 `pending / delivered / discarded` 生命周期，同时保留旧版 `subagent_wake` 字段；新旧服务滚动切换时旧二进制仍可识别新事件，历史事件由低频兼容扫描收敛。
+- [x] 投影、重试与完成状态保持幂等：恢复繁忙不重复投影；“最终回复已提交但状态未收口”的崩溃窗口不重复恢复；永久无效的孤立事件退出活动队列。
+- [x] 新增两个 PostgreSQL partial index，分别覆盖普通待分发事件和 Leader `pending / claimed` 批次；使用 `CREATE INDEX CONCURRENTLY`、5 秒 `lock_timeout` 和无效同名索引重试处理，不要求停机。
+- [x] 在隔离 PostgreSQL 的 100 万条历史消息样本上执行最终精确 SQL 的 `EXPLAIN (ANALYZE, BUFFERS)`：普通队列 0.510 ms / 196 buffers（返回 1 条待处理记录），项目队列空结果 0.064 ms / 9 buffers，Leader 空结果 0.017 ms / 1 buffer；`chat_messages` 均命中 partial index，无顺序或并行顺序扫描。
+- [x] Docker 可观察行为验证覆盖稳定启动后的提交唤醒、合并窗口、自动重试、唯一投影、崩溃窗口收敛、并发幂等、空闲期不轮询、Leader 单项目故障隔离及项目阻塞不影响普通 Subagent；聚焦结果 `7 passed`，相关普通 Subagent 回归 `9 passed`，项目 Leader/A2A 直接行为 `2 passed`。
+- [x] 两项项目 API 用例受主分支现有 SQLite 夹具无法编译 PostgreSQL `JSONB` 类型阻断，未把环境错误计作产品通过，也未为测试结果修改生产逻辑。
+- [x] 架构、索引和行为三名中立审计 Subagent 基于最终 diff 完成多轮终审；按用户明确的“只发布并运行新版本、不要求旧服务回滚性能兼容”范围，三方结论均为无 P0/P1。

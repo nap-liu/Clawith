@@ -103,7 +103,7 @@ import ProjectFileWorkspace from "./components/ProjectFileWorkspace";
 import ProjectEventContent, {
   ProjectEventLabel,
 } from "./components/ProjectEventContent";
-import ProjectAgentCapabilityPanel from "./components/ProjectAgentCapabilityPanel";
+import ProjectAgentSettingsPanel from "./components/ProjectAgentSettingsPanel";
 import {
   closestProjectTraceValue as closestTraceValue,
   inferProjectSessionIntent as inferredSessionIntent,
@@ -5318,16 +5318,46 @@ function MembersPanel({
             </div>
           </section>
           {settingsOpen && (
-            <section
-              id="project-member-work-settings"
-              className={`project-workspace__action-panel project-workspace__member-editor${departed ? " is-readonly" : ""}`}
-            >
-              <header>
-                <div>
-                  <span>{t("projectAgents.teamPage.workSettings")}</span>
-                  <h3>{memberName}</h3>
+            <>
+              {departed && (
+                <div className="project-workspace__member-history-note">
+                  <IconArchive size={17} />
+                  <div>
+                    <strong>
+                      {t("projectWorkspacePage.members.historical.title")}
+                    </strong>
+                    <p>
+                      {t("projectWorkspacePage.members.historical.description")}
+                    </p>
+                  </div>
                 </div>
-                <div className="project-workspace__member-actions">
+              )}
+              <ProjectAgentSettingsPanel
+                className="project-workspace__action-panel project-workspace__member-editor"
+                title={memberName}
+                eyebrow={t("projectAgents.teamPage.workSettings")}
+                value={capabilitySection}
+                onChange={setCapabilitySection}
+                config={{
+                  primary_model_id: text(configDraft, "primary_model_id") || null,
+                  fallback_model_id: text(configDraft, "fallback_model_id") || null,
+                  max_tool_rounds: text(configDraft, "max_tool_rounds"),
+                  project_instruction: text(configDraft, "project_instruction"),
+                }}
+                onConfigChange={(key, value) => updateConfigField(key, value)}
+                modelOptions={modelOptions}
+                counts={{
+                  config: configCount,
+                  tools: effectiveProjectToolCount + platformTools.length,
+                  mcp: memberMcps.length,
+                  skill: memberSkills.length,
+                }}
+                canManage={canManage}
+                isReadonly={departed}
+                onSave={saveSnapshot}
+                saving={busyAction === "save-member"}
+                headerActions={
+                  <>
                   {projectAgent && (
                     <Button
                       variant="secondary"
@@ -5395,169 +5425,9 @@ function MembersPanel({
                       {t("projectTerminology.currentOwner")}
                     </ProjectStatusBadge>
                   )}
-                </div>
-              </header>
-              {departed && (
-                <div className="project-workspace__member-history-note">
-                  <IconArchive size={17} />
-                  <div>
-                    <strong>
-                      {t("projectWorkspacePage.members.historical.title")}
-                    </strong>
-                    <p>
-                      {t("projectWorkspacePage.members.historical.description")}
-                    </p>
-                  </div>
-                </div>
-              )}
-              <ProjectAgentCapabilityPanel
-                value={capabilitySection}
-                onChange={setCapabilitySection}
-                ariaLabel={t("projectAgents.capabilityPackage.title")}
-                tabs={[
-                  {
-                    value: "config",
-                    icon: <IconSettings size={16} />,
-                    label: t(
-                      "projectAgents.capabilityPackage.sections.config",
-                    ),
-                    count: t("projectAgents.capabilityPackage.count", {
-                      count: configCount,
-                    }),
-                  },
-                  {
-                    value: "tools",
-                    icon: <IconTool size={16} />,
-                    label: t(
-                      "projectAgents.capabilityPackage.sections.tools",
-                    ),
-                    count: t("projectAgents.capabilityPackage.count", {
-                      count: effectiveProjectToolCount + platformTools.length,
-                    }),
-                  },
-                  {
-                    value: "mcp",
-                    icon: <IconCodeDots size={16} />,
-                    label: t(
-                      "projectAgents.capabilityPackage.sections.mcp",
-                    ),
-                    count: t("projectAgents.capabilityPackage.count", {
-                      count: memberMcps.length,
-                    }),
-                  },
-                  {
-                    value: "skill",
-                    icon: <IconBolt size={16} />,
-                    label: t(
-                      "projectAgents.capabilityPackage.sections.skill",
-                    ),
-                    count: t("projectAgents.capabilityPackage.count", {
-                      count: memberSkills.length,
-                    }),
-                  },
-                ] as const}
-              >
-                {capabilitySection === "config" ? (
-                  <>
-                    <div className="project-workspace__snapshot-form">
-                <ProjectField
-                  label={t("projectWorkspacePage.members.fields.primaryModel")}
-                  hint={t(
-                    "projectWorkspacePage.members.fields.primaryModelHint",
-                  )}
-                >
-                  <ProjectSelect
-                    value={text(configDraft, "primary_model_id")}
-                    options={modelOptions}
-                    onChange={(value) =>
-                      updateConfigField("primary_model_id", value || null)
-                    }
-                    ariaLabel={t(
-                      "projectWorkspacePage.members.fields.primaryModelAria",
-                    )}
-                    disabled={departed || !canManage}
-                  />
-                </ProjectField>
-                <ProjectField
-                  label={t("projectWorkspacePage.members.fields.fallbackModel")}
-                >
-                  <ProjectSelect
-                    value={text(configDraft, "fallback_model_id")}
-                    options={modelOptions}
-                    onChange={(value) =>
-                      updateConfigField("fallback_model_id", value || null)
-                    }
-                    ariaLabel={t(
-                      "projectWorkspacePage.members.fields.fallbackModelAria",
-                    )}
-                    disabled={departed || !canManage}
-                  />
-                </ProjectField>
-                <ProjectField
-                  label={t("projectWorkspacePage.members.fields.maxToolRounds")}
-                  labelFor="project-member-max-tool-rounds"
-                >
-                  <TextInput
-                    id="project-member-max-tool-rounds"
-                    type="number"
-                    min="1"
-                    max="200"
-                    value={text(configDraft, "max_tool_rounds")}
-                    onChange={(event) =>
-                      updateConfigField("max_tool_rounds", event.target.value)
-                    }
-                    disabled={departed || !canManage}
-                  />
-                </ProjectField>
-                <ProjectField
-                  className="is-wide"
-                  label={t("projectWorkspacePage.members.fields.instructions")}
-                  labelFor="project-member-instruction"
-                  hint={
-                    departed
-                      ? t("projectWorkspacePage.members.fields.departedHint")
-                      : t(
-                          "projectWorkspacePage.members.fields.instructionsHint",
-                        )
-                  }
-                >
-                  <ProjectTextarea
-                    id="project-member-instruction"
-                    value={text(configDraft, "project_instruction")}
-                    onChange={(event) =>
-                      updateConfigField(
-                        "project_instruction",
-                        event.target.value,
-                      )
-                    }
-                    rows={3}
-                    disabled={departed || !canManage}
-                  />
-                </ProjectField>
-                    </div>
-                    {canManage && !departed && (
-                      <footer>
-                        <Button
-                          variant="primary"
-                          onClick={saveSnapshot}
-                          disabled={busyAction === "save-member"}
-                        >
-                          {busyAction === "save-member" ? (
-                            <IconLoader2
-                              className="project-workspace__spinner"
-                              size={16}
-                            />
-                          ) : (
-                            <IconDeviceFloppy size={16} />
-                          )}
-                          {t(
-                            "projectWorkspacePage.members.actions.saveSnapshot",
-                          )}
-                        </Button>
-                      </footer>
-                    )}
                   </>
-                ) : capabilitySection === "tools" ? (
+                }
+                tools={
                   <ToolsTab
                     agentId={projectAgent?.id || agentId}
                     agentName={memberName}
@@ -5570,20 +5440,22 @@ function MembersPanel({
                       projectAgent ? undefined : { projectId, memberId }
                     }
                   />
-                ) : capabilitySection === "mcp" ? (
+                }
+                mcp={
                   renderCapabilityGroup(
                     "mcp",
                     memberMcps,
                     t("projectAgents.capabilityPackage.sections.mcp"),
                   )
-                ) : (
+                }
+                skill={
                   <SkillsTab
                     agentId={projectAgent?.id || agentId}
                     canManage={Boolean(projectAgent) && canManage && !departed}
                   />
-                )}
-              </ProjectAgentCapabilityPanel>
-            </section>
+                }
+              />
+            </>
           )}
         </>
       ) : (

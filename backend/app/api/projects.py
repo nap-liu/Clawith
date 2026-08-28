@@ -193,6 +193,7 @@ from app.services.project_template_snapshot import (
     restore_project_template_files,
     sanitize_template_settings,
 )
+from app.services.tool_enablement import tool_is_required
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 _PROJECT_FILE_TICKET_TTL_SECONDS = 15 * 60
@@ -670,6 +671,21 @@ async def get_project_bootstrap_options(
         .scalars()
         .all()
     )
+    platform_tools = (
+        (
+            await db.execute(
+                select(Tool)
+                .where(
+                    Tool.enabled.is_(True),
+                    Tool.source.in_(("builtin", "admin")),
+                    or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
+                )
+                .order_by(Tool.category, Tool.display_name, Tool.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
     users = (
         (
             await db.execute(
@@ -750,8 +766,31 @@ async def get_project_bootstrap_options(
                 "avatar_url": agent.avatar_url,
                 "status": agent.status,
                 "agent_type": agent.agent_type,
+                "primary_model_id": str(agent.primary_model_id) if agent.primary_model_id else None,
+                "fallback_model_id": str(agent.fallback_model_id) if agent.fallback_model_id else None,
+                "max_tool_rounds": agent.max_tool_rounds,
             }
             for agent in agents
+        ],
+        "tools": [
+            {
+                "id": str(tool.id),
+                "name": tool.name,
+                "display_name": tool.display_name,
+                "description": tool.description,
+                "category": tool.category,
+                "type": tool.type,
+                "icon": tool.icon,
+                "source": tool.source,
+                "config_schema": tool.config_schema or {},
+                "agent_config": {},
+                "mcp_server_id": str(tool.mcp_server_id) if tool.mcp_server_id else None,
+                "mcp_server_name": tool.mcp_server_name,
+                "enabled": tool_is_required(tool.name) or tool.name in PROJECT_AGENT_DEFAULT_TOOL_NAMES,
+                "can_disable": not tool_is_required(tool.name),
+            }
+            for tool in platform_tools
+            if tool.type != "mcp"
         ],
         "skills": [
             {"id": str(skill.id), "name": skill.name, "description": skill.description, "category": skill.category}

@@ -52,10 +52,18 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
+from app.models.mcp_server import MCPServer
 from app.models.org import OrgDepartment, OrgMember
-from app.models.project import Project, ProjectAccessGrant, ProjectEvent, ProjectMemberSnapshot
+from app.models.project import (
+    Project,
+    ProjectAccessGrant,
+    ProjectCapabilityBinding,
+    ProjectEvent,
+    ProjectMemberSnapshot,
+)
+from app.models.skill import Skill, SkillFile
 from app.models.tenant import Tenant
-from app.models.tool import Tool
+from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
 from app.services.project_git_service import project_repo_path
 
@@ -425,6 +433,161 @@ async def test_project_create_removes_managed_storage_after_commit_failure(
     tenant_storage = env.storage_root / "_projects" / str(env.tenant_id)
     assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
     assert await env.db.scalar(select(func.count()).select_from(Project)) == 0
+
+
+async def test_project_create_applies_member_settings_only_to_project_agent(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    model = LLMModel(
+        tenant_id=env.tenant_id,
+        provider="openai",
+        model="project-member-model",
+        api_key_encrypted="test-only",
+        label="Project member model",
+        enabled=True,
+        context_window=128000,
+    )
+    tool = Tool(
+        name=f"project_member_tool_{uuid.uuid4().hex[:8]}",
+        display_name="Project member tool",
+        description="Project-local test tool",
+        type="builtin",
+        category="general",
+        parameters_schema={"type": "object", "properties": {}},
+        config_schema={"fields": [{"key": "mode", "type": "text"}]},
+        enabled=True,
+        is_default=False,
+        source="builtin",
+        tenant_id=env.tenant_id,
+    )
+    mcp = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"project-member-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Project member MCP",
+        base_url_template="https://mcp.project.test",
+        headers_template={},
+        created_by_user_id=env.owner_id,
+    )
+    skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Project member Skill",
+        description="Project-local Skill",
+        category="general",
+        folder_name=f"project-member-skill-{uuid.uuid4().hex[:8]}",
+        visibility="tenant",
+        status="published",
+    )
+    env.db.add_all([model, tool, mcp, skill])
+    await env.db.flush()
+    env.db.add(
+        Tool(
+            name=f"project_member_mcp_tool_{uuid.uuid4().hex[:8]}",
+            display_name="Project member MCP tool",
+            description="Project-local MCP tool",
+            type="mcp",
+            category="general",
+            parameters_schema={"type": "object", "properties": {}},
+            enabled=True,
+            is_default=False,
+            source="admin",
+            tenant_id=env.tenant_id,
+            mcp_server_id=mcp.id,
+            mcp_server_name=mcp.display_name,
+            mcp_tool_name="project_member_action",
+        )
+    )
+    env.db.add(
+        SkillFile(
+            skill_id=skill.id,
+            path="SKILL.md",
+            content="---\nname: Project member Skill\ndescription: Project-local Skill\n---\n",
+        )
+    )
+    env.db.add(
+        AgentTool(
+            agent_id=env.source_leader_id,
+            tool_id=tool.id,
+            enabled=False,
+            config={"mode": "source"},
+            source="user_installed",
+        )
+    )
+    await env.db.commit()
+
+    response = await env.client.post(
+        "/api/projects",
+        json={
+            "name": "Create settings isolation",
+            "members": [
+                {
+                    "agent_id": str(env.source_leader_id),
+                    "is_leader": True,
+                    "settings": {
+                        "config_snapshot": {
+                            "primary_model_id": str(model.id),
+                            "max_tool_rounds": 33,
+                            "project_instruction": "Only for this project",
+                        },
+                        "tools": [
+                            {
+                                "tool_id": str(tool.id),
+                                "enabled": True,
+                                "config": {"mode": "project"},
+                            }
+                        ],
+                        "mcp_capability_ids": [str(mcp.id)],
+                        "skill_capability_ids": [str(skill.id)],
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+    project_id = uuid.UUID(response.json()["id"])
+    created_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(ProjectMemberSnapshot.project_id == project_id)
+        )
+    ).scalar_one()
+    assert created_member.agent_id != env.source_leader_id
+    assert created_member.config_snapshot["primary_model_id"] == str(model.id)
+    assert created_member.config_snapshot["max_tool_rounds"] == 33
+    assert created_member.config_snapshot["project_instruction"] == "Only for this project"
+
+    source_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == env.source_leader_id,
+                AgentTool.tool_id == tool.id,
+            )
+        )
+    ).scalar_one()
+    project_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == created_member.agent_id,
+                AgentTool.tool_id == tool.id,
+            )
+        )
+    ).scalar_one()
+    assert source_assignment.enabled is False
+    assert source_assignment.config == {"mode": "source"}
+    assert project_assignment.enabled is True
+    assert project_assignment.config == {"mode": "project"}
+
+    bindings = (
+        await env.db.execute(
+            select(ProjectCapabilityBinding).where(
+                ProjectCapabilityBinding.project_id == project_id,
+                ProjectCapabilityBinding.inherited_from_agent_id == created_member.agent_id,
+            )
+        )
+    ).scalars().all()
+    assert {(binding.capability_type, binding.capability_id) for binding in bindings} >= {
+        ("mcp", mcp.id),
+        ("skill", skill.id),
+    }
 
 
 async def test_private_share_settings_and_audit_are_a_real_api_round_trip(project_api: ProjectApiEnv):

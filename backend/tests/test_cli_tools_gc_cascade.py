@@ -49,7 +49,6 @@ async def test_delete_tool_removes_binary_and_state(tmp_path):
         tenant_key=str(tenant),
         tool_id=str(tool),
         stream=io.BytesIO(_SHEBANG),
-        max_bytes=1_000_000,
     )
     assert binary.resolve(str(tenant), str(tool), sha).exists()
 
@@ -160,11 +159,11 @@ async def test_delete_tenant_removes_all_tools_and_users(tmp_path):
     # Two tools under victim tenant, each with binary + per-user state.
     sha1, _ = await binary.write(
         tenant_key=str(victim_tenant), tool_id=str(tool_1),
-        stream=io.BytesIO(_SHEBANG), max_bytes=1_000_000,
+        stream=io.BytesIO(_SHEBANG),
     )
     sha2, _ = await binary.write(
         tenant_key=str(victim_tenant), tool_id=str(tool_2),
-        stream=io.BytesIO(_SHEBANG + b"\n"), max_bytes=1_000_000,
+        stream=io.BytesIO(_SHEBANG + b"\n"),
     )
     _seed_user_home(state, victim_tenant, tool_1, user_a)
     _seed_user_home(state, victim_tenant, tool_1, user_b)
@@ -173,7 +172,7 @@ async def test_delete_tenant_removes_all_tools_and_users(tmp_path):
     # Bystander tenant must survive untouched.
     sha3, _ = await binary.write(
         tenant_key=str(bystander_tenant), tool_id=str(tool_1),
-        stream=io.BytesIO(b"#!/bin/sh\n# bystander\n"), max_bytes=1_000_000,
+        stream=io.BytesIO(b"#!/bin/sh\n# bystander\n"),
     )
     _seed_user_home(state, bystander_tenant, tool_1, user_a, b"bystander-secret")
 

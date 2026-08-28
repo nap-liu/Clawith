@@ -150,6 +150,38 @@ export interface ProjectAgentOption {
   status: string;
   skill_count?: number;
   mcp_count?: number;
+  primary_model_id?: string | null;
+  fallback_model_id?: string | null;
+  max_tool_rounds?: number | null;
+}
+
+export interface ProjectAgentToolOption {
+  id: string;
+  name: string;
+  display_name: string;
+  description?: string | null;
+  category?: string | null;
+  type?: string | null;
+  icon?: string | null;
+  mcp_server_id?: string | null;
+  mcp_server_name?: string | null;
+  enabled: boolean;
+  can_disable: boolean;
+  agent_config?: Record<string, unknown>;
+  config_schema?: Record<string, unknown> | null;
+  source?: string | null;
+}
+
+export interface ProjectAgentSettingsDraft {
+  config_snapshot: {
+    primary_model_id?: string | null;
+    fallback_model_id?: string | null;
+    max_tool_rounds?: number | string | null;
+    project_instruction?: string;
+  };
+  tools: ProjectAgentToolOption[];
+  mcp_capability_ids: string[];
+  skill_capability_ids: string[];
 }
 
 export interface ProjectOwnedAgent {
@@ -216,6 +248,7 @@ export interface ProjectCapabilityOption {
 
 export interface ProjectBootstrapOptions {
   agents: ProjectAgentOption[];
+  tools: ProjectAgentToolOption[];
   capabilities: ProjectCapabilityOption[];
   users: ProjectShareTarget[];
 }
@@ -237,6 +270,16 @@ export interface ProjectCreatePayload {
     agent_id: string;
     is_leader: boolean;
     enabled_inherited_capability_ids: string[];
+    settings?: {
+      config_snapshot: ProjectAgentSettingsDraft["config_snapshot"];
+      tools: Array<{
+        tool_id: string;
+        enabled: boolean;
+        config?: Record<string, unknown>;
+      }>;
+      mcp_capability_ids: string[];
+      skill_capability_ids: string[];
+    };
   }>;
   shared_capability_ids: string[];
   git: {
@@ -272,6 +315,7 @@ export interface ProjectMemberCreateOverride {
   agent_id: string;
   is_leader: boolean;
   enabled_inherited_capability_ids: string[];
+  settings?: ProjectCreatePayload["members"][number]["settings"];
 }
 
 export interface ProjectCapabilityCreateOverride {
