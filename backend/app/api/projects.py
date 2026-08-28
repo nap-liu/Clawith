@@ -1,6 +1,7 @@
 """REST API for closed-loop AI-native project management."""
 
 import hashlib
+import json
 import posixpath
 import re
 import uuid
@@ -17,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.events import get_redis
 from app.core.permissions import build_visible_agents_query, is_platform_admin_user
 from app.core.security import get_current_user
 from app.database import get_db
@@ -660,6 +662,8 @@ async def create_project_template(
             status_code=422,
             detail="Final project assets can only be published from an owned project",
         )
+    if "roles" in definition and not isinstance(definition["roles"], list):
+        raise HTTPException(status_code=422, detail="项目模板角色配置必须为列表。")
     template_agents = definition.get("agents", [])
     try:
         sanitized_agents = sanitize_project_agent_template_assets(template_agents)
@@ -721,6 +725,13 @@ async def get_project_bootstrap_options(
     db: AsyncSession = Depends(get_db),
 ):
     tenant_id = _tenant_id(current_user)
+    cache_key = f"projects:bootstrap:v1:{tenant_id}:{current_user.id}"
+    try:
+        cached = await (await get_redis()).get(cache_key)
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        logger.debug("Project bootstrap cache read failed; loading from the database")
     agents = (
         (await db.execute(build_visible_agents_query(current_user, tenant_id=tenant_id).order_by(Agent.name)))
         .scalars()
@@ -776,7 +787,7 @@ async def get_project_bootstrap_options(
         and capability.get("capability_id")
         and capability.get("name")
     }
-    return {
+    payload = {
         "agents": [
             {
                 "id": str(agent.id),
@@ -864,6 +875,11 @@ async def get_project_bootstrap_options(
             if capability.get("type") == "skill"
         ],
     }
+    try:
+        await (await get_redis()).set(cache_key, json.dumps(payload, ensure_ascii=False), ex=30)
+    except Exception:
+        logger.debug("Project bootstrap cache write failed; returning database result")
+    return payload
 
 
 @router.post("/from-template", status_code=status.HTTP_201_CREATED)
@@ -892,6 +908,39 @@ async def _create_project_from_template(
         )
     stored_definition = dict(template.definition or {})
     definition = {**stored_definition, **data.overrides}
+    template_agents = list(definition.get("agents") or [])
+    if not template_agents:
+        if "roles" in definition and not isinstance(definition["roles"], list):
+            raise HTTPException(status_code=422, detail="项目模板角色配置必须为列表。")
+        normalized_roles: list[tuple[str, str]] = []
+        for role in list(definition.get("roles") or []):
+            if isinstance(role, dict):
+                role_name = str(role.get("name") or role.get("key") or "").strip()
+                role_description = str(
+                    role.get("description") or role.get("role_description") or ""
+                ).strip()
+            else:
+                role_name = str(role).strip()
+                role_description = ""
+            if not role_name:
+                continue
+            normalized_roles.append(
+                (
+                    role_name[:200],
+                    (role_description or f"负责{role_name}相关工作。")[:500],
+                )
+            )
+        if not normalized_roles:
+            normalized_roles = [("项目负责人", "负责项目整体协调与推进。")]
+        template_agents = [
+            {
+                "name": role_name,
+                "role_description": role_description,
+                "is_leader": index == 0,
+                "is_enabled": True,
+            }
+            for index, (role_name, role_description) in enumerate(normalized_roles)
+        ]
     packaged_snapshot = stored_definition.get("project_snapshot")
     packaged_skill_assets = stored_definition.get("skill_assets", []) if packaged_snapshot is not None else []
     packaged_capabilities = stored_definition.get("capabilities", []) if packaged_snapshot is not None else []
@@ -924,7 +973,7 @@ async def _create_project_from_template(
         db,
         current_user,
         payload,
-        allow_template_agents=bool(definition.get("agents")),
+        allow_template_agents=True,
     )
     try:
         await restore_project_template_files(
@@ -937,7 +986,7 @@ async def _create_project_from_template(
             db,
             project,
             current_user,
-            definition.get("agents", []),
+            template_agents,
         )
         if packaged_snapshot is not None:
             await instantiate_project_skills_from_template(
@@ -965,9 +1014,8 @@ async def _create_project_from_template(
         raise
 
     try:
-        if definition.get("agents"):
-            await ensure_project_group_session(db, project)
-            await ensure_project_leader_session(db, project)
+        await ensure_project_group_session(db, project)
+        await ensure_project_leader_session(db, project)
         explicit_leader_id = next(
             (member.agent_id for member in payload.members if member.is_leader),
             None,
@@ -2388,6 +2436,7 @@ async def put_project_member_tools(
     from app.services.project_member_runtime import (
         merge_project_member_runtime_config,
         sync_project_agent_mcp_bindings,
+        sync_project_agent_tool_bindings,
     )
     from app.services.tool_enablement import tool_is_required
 
@@ -2421,6 +2470,7 @@ async def put_project_member_tools(
 
     if agent.scope == "project" and agent.project_id == project.id:
         affected_mcp_server_ids: set[uuid.UUID] = set()
+        affected_tool_ids: set[uuid.UUID] = set()
         for update in updates:
             tool = tool_by_id[update.tool_id]
             assignment = assignments.get(str(update.tool_id))
@@ -2436,7 +2486,15 @@ async def put_project_member_tools(
                 assignment.enabled = update.enabled
             if tool.type == "mcp" and tool.mcp_server_id is not None:
                 affected_mcp_server_ids.add(tool.mcp_server_id)
+            elif tool.type != "mcp":
+                affected_tool_ids.add(tool.id)
         await db.flush()
+        await sync_project_agent_tool_bindings(
+            db,
+            project,
+            project_agent_id=agent.id,
+            tool_ids=affected_tool_ids,
+        )
         await sync_project_agent_mcp_bindings(
             db,
             project,
@@ -3708,9 +3766,11 @@ def _kickoff_transcript(
         "## 方案讨论",
         "",
     ]
-    role_labels = {"user": "用户", "assistant": "负责人", "system": "系统", "tool_call": "工具"}
+    role_labels = {"user": "用户", "assistant": "负责人"}
     for message in messages:
-        actor = role_labels.get(message.role, message.role.title())
+        if message.role not in role_labels:
+            continue
+        actor = role_labels.get(message.role, "参与者")
         timestamp = message.created_at.isoformat() if message.created_at else "时间未记录"
         lines.extend([f"### {actor} · {timestamp}", ""])
         content = message.content.strip() or "（无内容）"
@@ -3905,7 +3965,7 @@ async def confirm_project_kickoff(
         )
 
     confirmation = (
-        data.confirmation or "I confirm this plan and authorize the project owner to begin execution."
+        data.confirmation or "确认当前方案并开始执行。"
     ).strip()
     confirmed_at = datetime.now(UTC)
     transcript = _kickoff_transcript(project, discussion, confirmation, confirmed_at)
@@ -4022,7 +4082,8 @@ async def confirm_project_kickoff(
     except Exception as exc:
         # The committed ProjectRun is the durable outbox. A daemon retry owns
         # recovery, so this response never rolls the project back to planning.
-        dispatch_result = {"status": "initializing", "error": str(exc)}
+        logger.exception("Project kickoff dispatch is waiting for retry: project={} run={}", project.id, run.id)
+        dispatch_result = {"status": "initializing", "error": "项目正在等待处理。"}
     event_id = (
         await db.execute(
             select(ProjectEvent.id)
@@ -4427,6 +4488,12 @@ async def create_project_group_message(
             )
         except Exception as exc:
             # Keep the durable queued run retryable; the daemon owns recovery.
+            logger.exception(
+                "Project member dispatch is waiting for retry: project={} run={} agent={}",
+                project.id,
+                project_run.id,
+                agent_id,
+            )
             subagent_rows.append(
                 {
                     "project_run_id": str(project_run.id),
@@ -4434,7 +4501,7 @@ async def create_project_group_message(
                     "session_id": None,
                     "agent_id": str(agent_id),
                     "status": "queued",
-                    "error": str(exc),
+                    "error": "任务正在等待处理。",
                 }
             )
 
@@ -4821,7 +4888,7 @@ async def create_git_restore(
         db,
         project,
         "git.restore_commit.created",
-        f"Created a new restore commit from {data.commit[:12]}",
+        "项目版本已恢复",
         actor_user_id=current_user.id,
         metadata={**result, "forbidden_operations": ["reset", "force_push"]},
     )
@@ -5077,7 +5144,7 @@ async def put_project_file(
         db,
         project,
         "project.file.committed",
-        f"Wrote and committed project file {result['path']}",
+        f"项目文件已保存：{result['path']}",
         actor_user_id=current_user.id,
         metadata={
             "path": result["path"],

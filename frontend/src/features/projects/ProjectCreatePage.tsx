@@ -109,18 +109,76 @@ function toggleItem(items: string[], id: string) {
 
 function AgentAvatar({ agent }: { agent: ProjectAgentOption }) {
   const [failed, setFailed] = useState(false);
-  const token = typeof window === "undefined" ? "" : localStorage.getItem("token") || "";
-  const avatarUrl = agent.avatar_url?.startsWith("/api") && token
-    ? `${agent.avatar_url}${agent.avatar_url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`
-    : agent.avatar_url;
-  useEffect(() => setFailed(false), [avatarUrl]);
+  const [authenticatedAvatarUrl, setAuthenticatedAvatarUrl] = useState<
+    string | null
+  >(null);
+  const avatarUrl = agent.avatar_url || "";
+  const requiresAuthentication = avatarUrl.startsWith("/api");
+
+  useEffect(() => {
+    setFailed(false);
+    setAuthenticatedAvatarUrl(null);
+    if (!requiresAuthentication) return;
+
+    const token = localStorage.getItem("token") || "";
+    if (!token) {
+      setFailed(true);
+      return;
+    }
+
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    const requestUrl = new URL(avatarUrl, window.location.origin);
+    // Authentication belongs in the request header. Never preserve credentials
+    // from stored avatar URLs in a request URI where proxies can log them.
+    requestUrl.searchParams.delete("token");
+    requestUrl.searchParams.delete("access_token");
+
+    void fetch(`${requestUrl.pathname}${requestUrl.search}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      credentials: "same-origin",
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (!response.ok)
+          throw new Error(`Avatar request failed: ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl);
+          objectUrl = null;
+          return;
+        }
+        setAuthenticatedAvatarUrl(objectUrl);
+      })
+      .catch((error) => {
+        if (!cancelled && error instanceof Error && error.name !== "AbortError") {
+          setFailed(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [avatarUrl, requiresAuthentication]);
+
+  const displayUrl = requiresAuthentication ? authenticatedAvatarUrl : avatarUrl;
   return avatarUrl && !failed ? (
-    <img
-      className="pm-agent-avatar"
-      src={avatarUrl}
-      alt=""
-      onError={() => setFailed(true)}
-    />
+    displayUrl ? (
+      <img
+        className="pm-agent-avatar"
+        src={displayUrl}
+        alt=""
+        onError={() => setFailed(true)}
+      />
+    ) : (
+      <span className="pm-agent-avatar">{agent.name.slice(0, 1)}</span>
+    )
   ) : (
     <span className="pm-agent-avatar">{agent.name.slice(0, 1)}</span>
   );
@@ -152,6 +210,7 @@ export default function ProjectCreatePage() {
   const bootstrapQuery = useQuery({
     queryKey: ["projects", "bootstrap-options"],
     queryFn: projectsApi.bootstrapOptions,
+    staleTime: 30_000,
   });
   const templateQuery = useQuery({
     queryKey: ["projects", "template", templateId],

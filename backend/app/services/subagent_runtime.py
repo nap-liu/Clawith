@@ -1443,7 +1443,7 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
                     or_(
                         Project.status.in_(["running", "planning"]),
                         and_(
-                            Project.status.in_(["paused", "completed"]),
+                            Project.status.in_(["paused", "waiting", "completed"]),
                             advisory_project_run_exists,
                         ),
                     ),
@@ -1985,7 +1985,7 @@ async def _park_subagent_confirmation(
                             db,
                             project,
                             "run.waiting_confirmation",
-                            "Project run is waiting for human confirmation",
+                            "本次执行正在等待人工确认",
                             actor_agent_id=project_run.agent_id,
                             work_item_id=project_run.work_item_id,
                             run_id=project_run.id,
@@ -2150,7 +2150,9 @@ async def _finish_subagent_turn(
             if terminal
             else "subagent_turn_result"
         )
-        content = (reply or "").strip() or ("Subagent 执行失败，未返回错误详情。" if failed else "Subagent 已完成。")
+        content = (reply or "").strip() or (
+            "本次执行未完成，请稍后重试或查看项目状态。" if failed else "协作任务已完成。"
+        )
         # One durable child Session may process many separately auditable
         # project mentions. Complete every ProjectRun whose exact input was
         # consumed by this turn; do not leave the Runs UI permanently queued.
@@ -2241,7 +2243,7 @@ async def _finish_subagent_turn(
                         db,
                         project,
                         terminal_event_type,
-                        "Project run failed" if failed else "Project run succeeded",
+                        "本次执行未完成" if failed else "本次执行已完成",
                         actor_user_id=project_run.initiated_by_user_id,
                         actor_agent_id=child.agent_id,
                         work_item_id=project_run.work_item_id,
@@ -2814,7 +2816,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
             terminal = await _finish_subagent_turn(
                 run_id=run_id,
                 anchor_id=current_anchor_id,
-                reply=f"Subagent 执行失败: {type(exc).__name__}: {str(exc)[:400]}",
+                reply="本次执行未完成，请稍后重试或查看项目状态。",
                 failed=True,
             )
             if not terminal:
@@ -4043,6 +4045,8 @@ async def _persist_parent_batch_identity_failure(
 ) -> None:
     from app.services.chat_history import persist_assistant_reply_row
 
+    logger.warning("Subagent event execution identity is unavailable: {}", exc)
+    visible_error = "协作任务未能继续，请检查资源访问权限后重试。"
     async with async_session() as db:
         stored_anchor = await db.get(ChatMessage, anchor.id, with_for_update=True)
         if stored_anchor is None:
@@ -4064,10 +4068,7 @@ async def _persist_parent_batch_identity_failure(
             agent_id=parent.agent_id,
             user_id=run.execution_user_id,
             conversation_id=str(parent.id),
-            content=(
-                "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
-                f"Agent 访问权限。({type(exc).__name__})"
-            ),
+            content=visible_error,
             message_meta={
                 "kind": "subagent_event_failure",
                 "attachments": [],
@@ -4087,10 +4088,7 @@ async def _persist_parent_batch_identity_failure(
         conversation_id=str(parent.id),
         turn_anchor_id=stored_anchor.id,
         message_id=assistant_message_id,
-        content=(
-            "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
-            f"Agent 访问权限。({type(exc).__name__})"
-        ),
+        content=visible_error,
     )
 
 
@@ -4644,7 +4642,7 @@ async def _dispatch_project_leader_batch(
                     db,
                     project,
                     "leader.missing",
-                    "Project coordination requires an enabled project owner",
+                    "当前没有可用的项目负责人",
                     metadata={"blocked_reply_ids": [str(row.id) for row in blocked_rows]},
                 )
                 await db.commit()
@@ -4720,6 +4718,20 @@ async def _dispatch_project_leader_batch(
                 group.id,
                 source_rows,
             )
+            cohort_anchor_id = (
+                str(original_human_request.get("message_id") or "")
+                if original_human_request is not None
+                else ""
+            )
+            if not cohort_anchor_id:
+                cohort_anchor_id = next(
+                    (
+                        str(_message_meta(row).get("timeline_anchor_id") or "")
+                        for row in source_rows
+                        if _message_meta(row).get("timeline_anchor_id")
+                    ),
+                    "",
+                )
             work_item_snapshots = await _project_work_item_snapshots(
                 db,
                 project.id,
@@ -4747,6 +4759,11 @@ async def _dispatch_project_leader_batch(
                 input={
                     "title": f"汇总 {len(source_rows)} 条成员回复并推进项目",
                     "group_session_id": str(group.id),
+                    **(
+                        {"group_message_id": cohort_anchor_id}
+                        if cohort_anchor_id
+                        else {}
+                    ),
                     "leader_agent_id": str(leader.agent_id),
                     "leader_batch_id": batch_id,
                     "source_group_message_ids": [str(row.id) for row in source_rows],
@@ -5007,8 +5024,11 @@ async def _dispatch_project_leader_batch(
                     ),
                 },
             )
+        published_project_run_id = project_run.id if project_run is not None else None
         await db.commit()
-        return True
+    if published_project_run_id is not None:
+        await _publish_project_run_group_turn(published_project_run_id)
+    return True
 
 
 PROJECT_DISPATCH_TRIGGERS = frozenset(

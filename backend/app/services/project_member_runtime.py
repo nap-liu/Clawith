@@ -231,6 +231,85 @@ async def sync_project_agent_mcp_bindings(
     await db.flush()
 
 
+async def sync_project_agent_tool_bindings(
+    db: AsyncSession,
+    project: Project,
+    *,
+    project_agent_id: uuid.UUID,
+    tool_ids: set[uuid.UUID],
+) -> None:
+    """Keep inherited platform-tool bindings aligned with the standard tool panel."""
+
+    if not tool_ids:
+        return
+    tools = {
+        tool.id: tool
+        for tool in (
+            (
+                await db.execute(
+                    select(Tool).where(
+                        Tool.id.in_(tool_ids),
+                        Tool.type != "mcp",
+                        or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    assignments = {
+        assignment.tool_id: assignment
+        for assignment in (
+            (
+                await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == project_agent_id,
+                        AgentTool.tool_id.in_(tool_ids),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    bindings = {
+        binding.capability_id: binding
+        for binding in (
+            (
+                await db.execute(
+                    select(ProjectCapabilityBinding).where(
+                        ProjectCapabilityBinding.project_id == project.id,
+                        ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                        ProjectCapabilityBinding.capability_type == "tool",
+                        ProjectCapabilityBinding.source == "inherited",
+                        ProjectCapabilityBinding.inherited_from_agent_id == project_agent_id,
+                        ProjectCapabilityBinding.capability_id.in_(tool_ids),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    for tool_id, tool in tools.items():
+        assignment = assignments.get(tool_id)
+        enabled = tool_is_required(tool.name) or bool(assignment and assignment.enabled)
+        binding = bindings.get(tool_id)
+        if binding is not None:
+            binding.is_enabled = enabled
+        elif enabled:
+            db.add(
+                ProjectCapabilityBinding(
+                    tenant_id=project.tenant_id,
+                    project_id=project.id,
+                    capability_type="tool",
+                    capability_id=tool_id,
+                    capability_name=tool.display_name or tool.name,
+                    source="inherited",
+                    inherited_from_agent_id=project_agent_id,
+                    is_enabled=True,
+                    scope={},
+                    config={},
+                )
+            )
+    await db.flush()
+
+
 class ProjectMemberRuntimeConfig(BaseModel):
     """Typed product-owned fields stored in ``config_snapshot``.
 

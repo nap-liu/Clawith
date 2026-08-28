@@ -4078,9 +4078,9 @@ async def execute_tool(
         except (ValueError, HTTPException) as exc:
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
             return f"❌ {detail}"
-        except Exception as exc:
+        except Exception:
             logger.exception("[ProjectTool] {} failed", tool_name)
-            return f"❌ Project tool failed: {type(exc).__name__}"
+            return "❌ 项目操作未完成，请稍后重试。"
 
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
@@ -13612,11 +13612,11 @@ async def _send_message_to_agent(
                     )
                 except Exception as exc:
                     logger.exception("[project-a2a] durable target dispatch failed: {}", exc)
-                    return f"❌ Project A2A dispatch failed: {type(exc).__name__}: {exc!s}"
+                    return "❌ 成员协作请求未能提交，请稍后重试。"
                 return json.dumps(
                     {
                         "status": "queued",
-                        "message": f"Message queued for {target.name}",
+                        "message": f"已向 {target.name} 提交成员协作请求",
                         "session_id": session_id,
                         "a2a_session_id": session_id,
                         "project_run_id": str(scoped_project_run_id or dispatch_result.get("project_run_id") or ""),

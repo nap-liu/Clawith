@@ -206,7 +206,7 @@ async def instantiate_project_agents_from_template(
 
         commit = await commit_project_changes(
             project,
-            f"Create {len(created)} project digital employees from template",
+            f"从模板创建 {len(created)} 个项目数字员工",
             [".agents"],
             author_name=owner.display_name,
             author_email=project_user_git_email(owner.id),
@@ -236,6 +236,42 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
     member_rows = await _template_member_rows(db, project)
     agent_ids = [agent.id for agent, _member in member_rows]
     agent_index = {agent_id: index for index, agent_id in enumerate(agent_ids)}
+    assignments = list(
+        (
+            await db.execute(
+                select(AgentTool, Tool)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id.in_(agent_ids),
+                    Tool.enabled.is_(True),
+                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                )
+            )
+        ).all()
+    ) if agent_ids else []
+    assignments_by_agent: dict[uuid.UUID, list[tuple[AgentTool, Tool]]] = {}
+    assignment_by_pair: dict[tuple[uuid.UUID, uuid.UUID], AgentTool] = {}
+    for assignment, tool in assignments:
+        assignments_by_agent.setdefault(assignment.agent_id, []).append((assignment, tool))
+        assignment_by_pair[(assignment.agent_id, tool.id)] = assignment
+
+    def member_tool_enabled(index: int, tool: Tool) -> bool:
+        agent, member = member_rows[index]
+        if not member.is_enabled:
+            return False
+        assignment = assignment_by_pair.get((agent.id, tool.id))
+        enabled = resolved_agent_tool_enabled(tool.name, assignment)
+        if agent.scope == "project" and agent.project_id == project.id:
+            return tool_is_required(tool.name) or enabled
+        config = dict(member.config_snapshot or {})
+        enabled_overrides = {str(name) for name in config.get("enabled_platform_tools", [])}
+        disabled_overrides = {str(name) for name in config.get("disabled_platform_tools", [])}
+        return (
+            tool_is_required(tool.name)
+            or tool.name in enabled_overrides
+            or (enabled and tool.name not in disabled_overrides)
+        )
+
     bindings = list(
         (
             await db.execute(
@@ -259,6 +295,27 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
             tool = await db.get(Tool, binding.capability_id)
             if tool is None or tool.type == "mcp" or tool.tenant_id not in {None, project.tenant_id}:
                 continue
+            target_indexes = (
+                range(len(member_rows))
+                if binding.source == "shared"
+                else [agent_index.get(binding.inherited_from_agent_id)]
+            )
+            for index in target_indexes:
+                if index is None:
+                    continue
+                exported.append(
+                    {
+                        "schema_version": 1,
+                        "capability_type": "tool",
+                        "capability_id": str(binding.capability_id),
+                        "capability_name": binding.capability_name,
+                        "source": "inherited",
+                        "digital_employee_index": index,
+                        "is_enabled": member_tool_enabled(index, tool),
+                        "scope": sanitize_template_scope(binding.scope or {}),
+                    }
+                )
+            continue
         else:
             continue
         inherited_index = agent_index.get(binding.inherited_from_agent_id)
@@ -285,23 +342,6 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
     # Tool/MCP state lives on AgentTool plus the project member overrides, not
     # on ProjectCapabilityBinding. Preserve those platform dependency IDs only;
     # per-Agent configuration is intentionally never exported.
-    assignments = list(
-        (
-            await db.execute(
-                select(AgentTool, Tool)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id.in_(agent_ids),
-                    Tool.enabled.is_(True),
-                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
-                )
-            )
-        ).all()
-    ) if agent_ids else []
-    assignments_by_agent: dict[uuid.UUID, list[tuple[AgentTool, Tool]]] = {}
-    for assignment, tool in assignments:
-        assignments_by_agent.setdefault(assignment.agent_id, []).append((assignment, tool))
-
     effective: dict[tuple[str, uuid.UUID, str], set[int]] = {}
     for index, (agent, member) in enumerate(member_rows):
         if not member.is_enabled:
@@ -384,7 +424,16 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
                     "scope": {},
                 }
             )
-    return exported
+    deduplicated: dict[tuple[str, str, str, int | None], dict] = {}
+    for item in exported:
+        key = (
+            str(item["capability_type"]),
+            str(item["capability_id"]),
+            str(item["source"]),
+            item["digital_employee_index"],
+        )
+        deduplicated[key] = item
+    return list(deduplicated.values())
 
 
 async def instantiate_project_capabilities_from_template(

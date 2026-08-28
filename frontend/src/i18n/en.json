@@ -472,7 +472,7 @@
         "primaryModelAria": "Project primary model",
         "fallbackModel": "Fallback model",
         "fallbackModelAria": "Project fallback model",
-        "maxToolRounds": "Tool call limit",
+        "maxToolRounds": "Maximum actions per execution",
         "instructions": "Project-specific instructions",
         "departedHint": "Project settings from the time of departure are retained.",
         "instructionsHint": "Applies only to this Digital Employee's execution in the current project."
@@ -521,7 +521,7 @@
     },
     "visibility": {
       "title": "Access scope",
-      "description": "Set project access, shared members, and the execution account.",
+      "description": "Set project access, shared members, and the resource access member.",
       "label": "Visibility",
       "shared": "Shared",
       "private": "Only me",
@@ -535,11 +535,11 @@
       "loadingMembers": "Loading organization members…",
       "selectMembers": "Select shared members",
       "selectedMembers": "{{count}} members selected",
-      "executionUser": "Execution account",
-      "executionUserHint": "Project execution uses resources available to the selected member.",
+      "executionUser": "Resource access member",
+      "executionUserHint": "Executions use resources authorized for the selected member.",
       "executionUserOwner": "Project owner",
-      "selectExecutionUser": "Select an execution account",
-      "executionUserRequired": "Select the project execution account.",
+      "selectExecutionUser": "Select a resource access member",
+      "executionUserRequired": "Select a resource access member.",
       "executionUserRequiredShort": "Select one shared member",
       "searchMembers": "Search organization members",
       "membersUnavailable": "Organization members are temporarily unavailable",
@@ -548,7 +548,7 @@
       "selectMembersAria": "Select project sharing members",
       "membersLoadFailed": "Organization members are temporarily unavailable.",
       "readOnly": "This account cannot manage project visibility.",
-      "permissionDeniedDraft": "You cannot manage this project's visibility. The draft has been preserved.",
+      "permissionDeniedDraft": "This account cannot manage project access. Unsaved changes have been preserved.",
       "save": "Save access settings",
       "feedback": {
         "shared": "Project sharing saved",
@@ -769,6 +769,8 @@
       "backlog": "Backlog",
       "todo": "To do",
       "queued": "Queued",
+      "planning": "Planning",
+      "initializing": "Preparing",
       "running": "Running",
       "doing": "In progress",
       "in_progress": "In progress",
@@ -778,6 +780,7 @@
       "blocked": "Blocked",
       "done": "Completed",
       "completed": "Completed",
+      "archived": "Archived",
       "success": "Completed",
       "succeeded": "Completed",
       "failed": "Failed",
@@ -1042,6 +1045,9 @@
     "description": "Manage project goals, execution records, members, and outcomes.",
     "templateMarket": "Template market",
     "manageTemplates": "Manage templates",
+    "ownerUnspecified": "Not specified",
+    "completedSignal": "Project completed",
+    "completedAction": "Review outcomes or continue the conversation",
     "createProject": "Create project",
     "overviewAria": "Project overview",
     "runningProjects_one": "{{count}} project is running",
@@ -1551,7 +1557,7 @@
         "plan": { "updated": "Project plan updated" },
         "status": { "updated": "Project status updated" },
         "management": {
-          "action": { "completed": "Project collaboration action completed" }
+          "action": { "completed": "Project work updated" }
         },
         "trace": { "repaired": "Project relations updated" },
         "template": {
@@ -1567,7 +1573,7 @@
           "failed": "Project kickoff failed"
         },
         "agent_reply_batch": {
-          "dispatched": "Digital Employee reply batch dispatched"
+          "dispatched": "Digital Employee replies collected"
         }
       },
       "member": {
@@ -1579,7 +1585,11 @@
         "departed": "Project member departed",
         "restored": "Project member restored"
       },
-      "leader": { "changed": "Project owner changed", "repaired": "Project owner restored" },
+      "leader": {
+        "changed": "Project owner changed",
+        "repaired": "Project owner restored",
+        "missing": "Project owner unavailable"
+      },
       "project_agent": {
         "created": "Project Digital Employee created",
         "updated": "Project Digital Employee updated",
@@ -1604,6 +1614,7 @@
         "queued": "Execution waiting",
         "running": "Execution started",
         "waiting": "Execution awaiting input",
+        "waiting_confirmation": "Execution awaiting confirmation",
         "succeeded": "Execution completed",
         "failed": "Execution failed",
         "cancelled": "Execution cancelled"
@@ -1683,7 +1694,11 @@
         "departed": "The member left the project; their history remains visible and read-only.",
         "restored": "The member rejoined; future work uses the current configuration."
       },
-      "leader": { "changed": "The project owner was changed.", "repaired": "The project owner was restored." },
+      "leader": {
+        "changed": "The project owner was changed.",
+        "repaired": "The project owner was restored.",
+        "missing": "No project owner is currently available."
+      },
       "project_agent": {
         "created": "The Project Digital Employee was created and added to the project.",
         "updated": "The Project Digital Employee identity or core memory was updated.",
@@ -1708,6 +1723,7 @@
         "queued": "The execution is waiting for an available Digital Employee.",
         "running": "The Digital Employee started this execution.",
         "waiting": "The execution is waiting for input or confirmation.",
+        "waiting_confirmation": "The execution is waiting for human confirmation.",
         "succeeded": "The execution completed.",
         "failed": "The execution failed.",
         "cancelled": "The execution was cancelled."
@@ -2731,7 +2747,7 @@
       "okr": "OKR"
     },
     "toolCategoryDescriptions": {
-      "project_management": "Review progress and maintain project work, runs, milestones, and workspace assets",
+      "project_management": "Review project progress and manage tasks, execution records, milestones, and workspace content",
       "subagent": "Delegate tasks, review progress, and provide additional guidance"
     },
     "toolTranslations": {
@@ -2773,11 +2789,11 @@
       },
       "user_project_git_get": {
         "name": "View version status",
-        "description": "View the current version, branches, file count, and recent commits."
+        "description": "View the current version, branches, file count, and recent versions."
       },
       "user_project_git_diff": {
         "name": "View version changes",
-        "description": "View change statistics or a file diff for a selected commit."
+        "description": "View change statistics or a file diff for a selected version."
       },
       "user_project_message_list": {
         "name": "View project activity",

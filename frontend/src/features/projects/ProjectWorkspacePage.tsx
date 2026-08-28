@@ -9,6 +9,7 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
   Link,
@@ -4721,6 +4722,7 @@ function MembersPanel({
   busyAction: string;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const activeMembers = useMemo(
     () => members.filter((entry) => entry.is_enabled !== false),
     [members],
@@ -4812,8 +4814,12 @@ function MembersPanel({
     let mounted = true;
     setAgentsLoading(true);
     setAgentsError("");
-    void projectsApi
-      .bootstrapOptions()
+    void queryClient
+      .fetchQuery({
+        queryKey: ["projects", "bootstrap-options"],
+        queryFn: projectsApi.bootstrapOptions,
+        staleTime: 30_000,
+      })
       .then((options) => {
         if (mounted) {
           setAvailableAgents(options.agents.map((agent) => ({ ...agent })));
@@ -4832,7 +4838,7 @@ function MembersPanel({
     return () => {
       mounted = false;
     };
-  }, [agentDrawerMode, canManage, settingsOpen, t]);
+  }, [agentDrawerMode, canManage, queryClient, settingsOpen, t]);
 
   const memberId = text(member || {}, "id", "member_id");
   const agentId = text(member || {}, "agent_id");
@@ -7857,7 +7863,11 @@ function GitRepositoryControls({
   const initializationOnly =
     source !== "cloned" &&
     commits.length === 1 &&
-    ["Initialize project", "Initialize AI-native project"].includes(
+    [
+      "Initialize project",
+      "Initialize AI-native project",
+      "创建项目初始版本",
+    ].includes(
       text(commits[0], "message", "subject", "title"),
     ) &&
     repositoryFiles.length === 2 &&

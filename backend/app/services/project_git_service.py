@@ -459,7 +459,7 @@ def _initialize(
             _commit_with_author(
                 repo,
                 "-m",
-                "Initialize project",
+                "创建项目初始版本",
                 author_name=author_name,
                 author_email=author_email,
             )
@@ -510,7 +510,7 @@ def _restore(
             repo,
             "--allow-empty",
             "-m",
-            message or f"Restore project tree from {commit[:12]}",
+            message or "恢复项目版本",
             author_name=author_name,
             author_email=author_email,
         )
@@ -660,7 +660,8 @@ def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
         else set()
     )
     generated_subjects_only = all(
-        subject == "Ensure project member directories" or subject.startswith("Create project Agent: ")
+        subject in {"Ensure project member directories", "创建项目成员目录"}
+        or subject.startswith(("Create project Agent: ", "创建项目数字员工："))
         for subject in generated_subjects
     )
     generated_authors_only = all(
@@ -675,7 +676,7 @@ def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
     if (
         baseline_files != {"PROJECT.json", "README.md"}
         or baseline_subject
-        not in {"Initialize project", "Initialize AI-native project"}
+        not in {"Initialize project", "Initialize AI-native project", "创建项目初始版本"}
         or not baseline_is_ancestor
         or not generated_only
     ):
@@ -700,7 +701,7 @@ def _copy_generated_member_baseline(repo: Path, candidate: Path) -> None:
     _commit_with_author(
         candidate,
         "-m",
-        "Ensure project member directories",
+        "创建项目成员目录",
         author_name=None,
         author_email=None,
     )
@@ -998,7 +999,7 @@ def _commit_project_member_workspace_paths(project: Project, paths: list[str]) -
             repo,
             "--only",
             "-m",
-            "Ensure project member directories",
+            "创建项目成员目录",
             "--",
             *normalized_paths,
             author_name=None,
@@ -1628,7 +1629,7 @@ def _write_file(
         _commit_with_author(
             repo,
             "-m",
-            f"Update project file: {normalized}",
+            f"更新项目文件：{normalized}",
             "--",
             normalized,
             author_name=author_name,

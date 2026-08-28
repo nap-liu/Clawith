@@ -65,7 +65,7 @@
       "planTitle": "执行方案",
       "planDescription": "拆解阶段、责任与首批任务",
       "members": "项目成员",
-      "ownerScope": "可在项目范围内管理任务、运行、交付物、成员协作与项目能力。",
+      "ownerScope": "可在项目范围内管理任务、执行记录、交付物、成员协作与项目能力。",
       "memberScope": "按角色分工协作。",
       "recordPreserved": "保留项目规划记录",
       "capabilitiesConfirmed": "项目能力按已确认的配置生效",
@@ -107,7 +107,7 @@
   "projectWorkspaceNav": {
     "groups": {
       "workspace": "项目工作区",
-      "collaboration": "运行与协作",
+      "collaboration": "执行与协作",
       "governance": "设置与记录"
     },
     "domains": {
@@ -472,7 +472,7 @@
         "primaryModelAria": "项目主模型",
         "fallbackModel": "备用模型",
         "fallbackModelAria": "项目备用模型",
-        "maxToolRounds": "工具调用上限",
+        "maxToolRounds": "单次执行操作上限",
         "instructions": "项目专属指令",
         "departedHint": "保留退出时的项目设置。",
         "instructionsHint": "仅作用于该数字员工在当前项目中的执行。"
@@ -521,7 +521,7 @@
     },
     "visibility": {
       "title": "访问范围",
-      "description": "设置项目访问范围、共享成员和运行身份。",
+      "description": "设置项目访问范围、共享成员和授权资源成员。",
       "label": "可见范围",
       "shared": "已共享",
       "private": "仅自己可见",
@@ -535,11 +535,11 @@
       "loadingMembers": "正在读取组织成员…",
       "selectMembers": "选择共享成员",
       "selectedMembers": "已选择 {{count}} 名成员",
-      "executionUser": "运行身份",
-      "executionUserHint": "项目运行使用所选成员已授权的资源。",
+      "executionUser": "授权资源成员",
+      "executionUserHint": "执行时使用所选成员已授权的资源。",
       "executionUserOwner": "项目所有者",
-      "selectExecutionUser": "选择运行身份",
-      "executionUserRequired": "请选择项目运行身份。",
+      "selectExecutionUser": "选择授权资源成员",
+      "executionUserRequired": "请选择授权资源成员。",
       "executionUserRequiredShort": "请选择一名共享成员",
       "searchMembers": "搜索组织成员",
       "membersUnavailable": "组织成员暂不可用",
@@ -548,7 +548,7 @@
       "selectMembersAria": "选择项目共享成员",
       "membersLoadFailed": "组织成员暂时无法加载。",
       "readOnly": "当前账号不能管理此项目的可见范围。",
-      "permissionDeniedDraft": "你没有管理此项目可见范围的权限，草稿已保留。",
+      "permissionDeniedDraft": "当前账号无权管理项目访问范围；未提交的修改已保留。",
       "save": "保存访问设置",
       "feedback": {
         "shared": "项目共享范围已保存",
@@ -769,6 +769,8 @@
       "backlog": "待规划",
       "todo": "待处理",
       "queued": "排队中",
+      "planning": "规划中",
+      "initializing": "准备中",
       "running": "运行中",
       "doing": "进行中",
       "in_progress": "进行中",
@@ -778,6 +780,7 @@
       "blocked": "受阻",
       "done": "已完成",
       "completed": "已完成",
+      "archived": "已归档",
       "success": "已完成",
       "succeeded": "已完成",
       "failed": "失败",
@@ -876,7 +879,7 @@
       "blank": "空白创建",
       "source": "选择现有数字员工",
       "loading": "正在读取数字员工",
-      "loadingDescription": "请稍候。",
+      "loadingDescription": "正在加载可用数字员工。",
       "noSource": "没有可复制的数字员工",
       "noSourceDescription": "可以切换到空白创建。"
     },
@@ -1039,9 +1042,12 @@
   "projectPortfolio": {
     "eyebrow": "项目组合",
     "title": "项目资产库",
-    "description": "管理由多个数字员工共同负责的目标、运行和项目成果。",
+    "description": "管理由多个数字员工共同负责的目标、执行进展和项目成果。",
     "templateMarket": "模板市场",
     "manageTemplates": "模板管理",
+    "ownerUnspecified": "未指定",
+    "completedSignal": "项目已完成",
+    "completedAction": "可继续查看成果或发起对话",
     "createProject": "创建项目",
     "overviewAria": "项目概览",
     "runningProjects": "{{count}} 个项目正在运行",
@@ -1379,10 +1385,10 @@
       "boundaryDescription": "可见性与下一步规划"
     },
     "team": {
-      "title": "先组建项目团队",
+      "title": "组建项目团队",
       "snapshotTitle": "确认项目模板",
       "projectName": "项目名称",
-      "projectNameHint": "已提供默认名称，可以随时修改。",
+      "projectNameHint": "项目名称可修改。",
       "startingTemplate": "起始模板",
       "planningTitle": "目标将在项目内共同形成",
       "selected": "已选择 {{count}} 个数字员工",
@@ -1395,9 +1401,9 @@
       "searchAria": "搜索数字员工",
       "paginationAria": "数字员工搜索结果分页",
       "noSearchResults": "没有匹配的数字员工",
-      "noSearchResultsHint": "请调整搜索内容。",
+      "noSearchResultsHint": "未找到匹配结果，可调整搜索条件。",
       "emptyTitle": "没有可加入项目的数字员工",
-      "emptyDescription": "请先创建或启用至少一个数字员工。",
+      "emptyDescription": "当前没有可用数字员工。",
       "snapshotDescription": "该模板已包含项目团队，使用模板时将创建对应的项目专用数字员工。",
       "snapshotFiles": "{{count}} 个已保存文件",
       "snapshotEmployees": "{{count}} 个项目专用数字员工"
@@ -1546,7 +1552,7 @@
         "plan": { "updated": "更新项目计划" },
         "status": { "updated": "更新项目状态" },
         "management": {
-          "action": { "completed": "完成项目协作操作" }
+          "action": { "completed": "项目工作已更新" }
         },
         "trace": { "repaired": "更新项目关联信息" },
         "template": {
@@ -1559,7 +1565,7 @@
           "confirmed": "确认项目方案并启动",
           "failed": "项目启动失败"
         },
-        "agent_reply_batch": { "dispatched": "派发数字员工批量回复" }
+        "agent_reply_batch": { "dispatched": "数字员工回复已汇总" }
       },
       "member": {
         "snapshot": { "created": "创建成员设置", "updated": "更新成员设置" },
@@ -1567,7 +1573,11 @@
         "departed": "成员退出项目",
         "restored": "恢复项目成员"
       },
-      "leader": { "changed": "变更项目负责人", "repaired": "负责人已补充" },
+      "leader": {
+        "changed": "变更项目负责人",
+        "repaired": "负责人已补充",
+        "missing": "项目负责人不可用"
+      },
       "project_agent": {
         "created": "创建项目专用数字员工",
         "updated": "更新项目专用数字员工",
@@ -1589,6 +1599,7 @@
         "queued": "执行等待处理",
         "running": "执行已开始",
         "waiting": "执行等待继续",
+        "waiting_confirmation": "执行等待确认",
         "succeeded": "执行已完成",
         "failed": "执行未完成",
         "cancelled": "执行已取消"
@@ -1629,7 +1640,7 @@
         "plan": { "updated": "项目计划已更新。" },
         "status": { "updated": "项目状态已更新。" },
         "management": {
-          "action": { "completed": "项目工作已完成查询或更新。" }
+          "action": { "completed": "项目工作已更新。" }
         },
         "trace": { "repaired": "项目执行、会话与成果的关联信息已更新。" },
         "template": {
@@ -1639,8 +1650,8 @@
         },
         "agent": { "message": { "sent": "项目数字员工消息已发送。" } },
         "kickoff": {
-          "confirmed": "方案已确认，负责人已开始自驱推进。",
-          "failed": "项目启动失败，相关上下文已保留。"
+          "confirmed": "方案已确认，项目已开始执行。",
+          "failed": "项目启动未完成，请稍后重试。"
         },
         "agent_reply_batch": {
           "dispatched": "负责人已收到本批数字员工回复。"
@@ -1655,7 +1666,11 @@
         "departed": "成员已退出项目，历史记录保持只读可见。",
         "restored": "成员已恢复参与项目，后续执行将使用当前配置。"
       },
-      "leader": { "changed": "项目负责人已变更。", "repaired": "项目负责人已补充。" },
+      "leader": {
+        "changed": "项目负责人已变更。",
+        "repaired": "项目负责人已补充。",
+        "missing": "当前没有可用的项目负责人。"
+      },
       "project_agent": {
         "created": "项目专用数字员工已创建并加入项目。",
         "updated": "项目专用数字员工的身份设定或核心记忆已更新。",
@@ -1677,9 +1692,10 @@
         "updated": "任务内容、进度或证据已更新。"
       },
       "run": {
-        "queued": "运行已进入队列，等待可用数字员工处理。",
+        "queued": "执行正在等待处理。",
         "running": "数字员工已开始本次执行。",
         "waiting": "本次执行正在等待后续输入或确认。",
+        "waiting_confirmation": "本次执行正在等待人工确认。",
         "succeeded": "本次执行已完成。",
         "failed": "本次执行失败。",
         "cancelled": "本次执行已取消。"
@@ -2747,7 +2763,7 @@
       "okr": "OKR"
     },
     "toolCategoryDescriptions": {
-      "project_management": "查看项目进展，维护工作项、运行、里程碑和工作区",
+      "project_management": "查看项目进展，管理任务、执行记录、里程碑和工作区",
       "subagent": "委派协作任务，并持续查看进展或补充要求"
     },
     "toolTranslations": {
@@ -2760,7 +2776,7 @@
         "description": "查看项目目标、进展、状态和交付概况。"
       },
       "user_project_work_item_list": {
-        "name": "查看工作项",
+        "name": "查看任务",
         "description": "查看项目任务的状态、优先级、分工和计划时间。"
       },
       "user_project_work_item_get": {
@@ -2789,11 +2805,11 @@
       },
       "user_project_git_get": {
         "name": "查看版本状态",
-        "description": "查看当前版本、分支、文件数量和最近提交。"
+        "description": "查看当前版本、分支、文件数量和最近版本。"
       },
       "user_project_git_diff": {
         "name": "查看版本变更",
-        "description": "查看指定提交的变更统计或文件差异。"
+        "description": "查看指定版本的变更统计或文件差异。"
       },
       "user_project_message_list": {
         "name": "查看项目协作记录",

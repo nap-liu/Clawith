@@ -437,7 +437,13 @@ async def test_project_create_removes_managed_storage_after_commit_failure(
 
     monkeypatch.setattr(env.db, "commit", fail_commit)
     with pytest.raises(RuntimeError, match="forced commit failure"):
-        await env.client.post("/api/projects", json={"name": "Commit failure"})
+        await env.client.post(
+            "/api/projects",
+            json={
+                "name": "Commit failure",
+                "members": [{"agent_id": str(env.leader_id), "is_leader": True}],
+            },
+        )
 
     tenant_storage = env.storage_root / "_projects" / str(env.tenant_id)
     assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
@@ -1745,7 +1751,7 @@ async def test_rest_a2a_requires_action_scope_and_ready_dependencies(project_api
 
     blocked = await env.client.post(f"/api/projects/{project['id']}/a2a", json=request)
     assert blocked.status_code == 409
-    assert "before its dependencies are done" in blocked.text
+    assert "该任务的前置任务尚未完成" in blocked.text
     assert "Produce reviewed input evidence" in blocked.text
 
     completed = await env.client.patch(
@@ -3442,7 +3448,7 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
     assert message_schema["parameters"]["properties"]["mode"]["description"] == (
         "Choose task_delegate for assigned work and consult for a review or decision."
     )
-    with pytest.raises(ValueError, match="only accepts actionable"):
+    with pytest.raises(ValueError, match="成员协作请求需要明确任务或咨询内容。"):
         await project_runtime_tools.execute_project_runtime_tool(
             "project_message_agent",
             {
@@ -3456,7 +3462,7 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
             tool_call_id="worker-passive-notify-blocked",
             turn_anchor_id=child_input.id,
         )
-    with pytest.raises(ValueError, match="title is required"):
+    with pytest.raises(ValueError, match="成员协作请求需要填写标题。"):
         await project_runtime_tools.execute_project_runtime_tool(
             "project_message_agent",
             {
@@ -3471,7 +3477,7 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
             tool_call_id="worker-untitled-delegation-blocked",
             turn_anchor_id=child_input.id,
         )
-    with pytest.raises(ValueError, match="actionable professional handoff"):
+    with pytest.raises(ValueError, match="成员协作请求需要包含可执行的工作内容和预期结果。"):
         await project_runtime_tools.execute_project_runtime_tool(
             "project_message_agent",
             {
@@ -4102,6 +4108,115 @@ async def test_project_group_partial_completion_versions_cohort_projection(
     assert terminal["phase"] == "idle"
     assert terminal["revision"] > partial["revision"]
     assert terminal["active_agent_ids"] == []
+
+
+async def test_explicit_mention_cohort_waits_for_leader_reply_batch_terminal(
+    project_api: ProjectApiEnv,
+):
+    from app.models.project import ProjectRun
+    from app.services.project_group_turn_lifecycle import (
+        reconcile_and_publish_project_run_group_turn,
+    )
+
+    env = project_api
+    project = await _create_project(env, name="Mention owner summary cohort")
+    project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, str(project_id))
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    created = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Worker produce the result before the owner summarizes it",
+            "mentions": [str(env.worker_id)],
+            "client_message_id": "mention-owner-summary-cohort",
+        },
+    )
+    assert created.status_code == 201, created.text
+    anchor_id = uuid.UUID(created.json()["message"]["id"])
+    runs = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.input["group_message_id"].as_string()
+                    == str(anchor_id),
+                )
+            )
+        ).scalars()
+    )
+    owner_run = next(run for run in runs if run.trigger_type == "group_leader_message")
+    specialist_run = next(run for run in runs if run.trigger_type == "group_mention")
+    assert owner_run.status == "cancelled"
+    assert owner_run.output["skip_reason"] == "explicit_mentions_route_to_specialists"
+
+    specialist_run.status = "succeeded"
+    specialist_run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+
+    reply = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.worker_id,
+        role="assistant",
+        content="Specialist result ready for owner summary",
+        conversation_id=group["id"],
+        message_meta={
+            "kind": "project_subagent_reply",
+            "timeline_anchor_id": str(anchor_id),
+            "leader_batch_state": "pending",
+            "default_leader_agent_id": str(env.leader_id),
+            "source_project_run_ids": [str(specialist_run.id)],
+        },
+    )
+    env.db.add(reply)
+    await env.db.commit()
+    pending_projection = await reconcile_and_publish_project_run_group_turn(
+        specialist_run.id
+    )
+    assert pending_projection is not None
+    assert pending_projection.snapshot.phase == "active"
+    assert pending_projection.snapshot.status == "running"
+    assert pending_projection.active_agent_ids == (env.leader_id,)
+
+    reply.message_meta = {
+        **dict(reply.message_meta or {}),
+        "leader_batch_state": "claimed",
+    }
+    batch_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        execution_user_id=env.owner_id,
+        status="queued",
+        trigger_type="leader_reply_batch",
+        input={
+            "group_session_id": group["id"],
+            "group_message_id": str(anchor_id),
+            "source_group_message_ids": [str(reply.id)],
+        },
+        output={"group_session_id": group["id"]},
+    )
+    env.db.add(batch_run)
+    await env.db.commit()
+    claimed_projection = await reconcile_and_publish_project_run_group_turn(batch_run.id)
+    assert claimed_projection is not None
+    assert claimed_projection.snapshot.phase == "active"
+    assert claimed_projection.run_count == 2
+    assert claimed_projection.snapshot.revision > pending_projection.snapshot.revision
+
+    reply.message_meta = {
+        **dict(reply.message_meta or {}),
+        "leader_batch_state": "delivered",
+    }
+    batch_run.status = "succeeded"
+    batch_run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+    terminal_projection = await reconcile_and_publish_project_run_group_turn(batch_run.id)
+    assert terminal_projection is not None
+    assert terminal_projection.snapshot.phase == "idle"
+    assert terminal_projection.snapshot.status == "completed"
+    assert terminal_projection.snapshot.anchor_id == anchor_id
+    assert terminal_projection.run_count == 0
 
 
 async def test_project_group_reconcile_recomputes_cohort_after_session_mutex(
@@ -5874,6 +5989,7 @@ async def test_project_participant_replies_coalesce_into_one_durable_leader_turn
     )
     assert len(batch_runs) == 1
     assert batch_runs[0].work_item_id == work_item_id
+    assert batch_runs[0].input["group_message_id"] == wake.json()["message"]["id"]
     assert batch_runs[0].input["related_work_item_ids"] == [str(work_item_id)]
     assert batch_runs[0].input["original_human_request"] == batch_input.message_meta["original_human_request"]
     assert batch_runs[0].input["work_item_snapshots"] == batch_input.message_meta["work_item_snapshots"]
@@ -9047,6 +9163,92 @@ async def test_template_manifest_and_restore_include_legacy_members_effective_pl
     assert all(item.config in ({}, None) for item in restored_dependency_assignments)
 
 
+async def test_template_export_preserves_member_override_of_shared_tool(
+    project_api: ProjectApiEnv,
+):
+    from app.models.project import ProjectTemplate
+    from app.models.tool import AgentTool
+
+    env = project_api
+    shared_tool = Tool(
+        name=f"template-shared-{uuid.uuid4().hex[:8]}",
+        display_name="Shared project tool",
+        description="A shared tool with a member-level override.",
+        type="builtin",
+        category="project",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="builtin",
+    )
+    env.db.add(shared_tool)
+    await env.db.commit()
+    project = await _create_project(env, name="Shared tool override source")
+    project_id = project["id"]
+    capability_response = await env.client.post(
+        f"/api/projects/{project_id}/capabilities",
+        json={
+            "capability_type": "tool",
+            "capability_id": str(shared_tool.id),
+            "capability_name": shared_tool.display_name,
+            "source": "shared",
+            "is_enabled": True,
+        },
+    )
+    assert capability_response.status_code == 201, capability_response.text
+    members = (await env.client.get(f"/api/projects/{project_id}/members")).json()
+    disabled_member = members[-1]
+    disable_response = await env.client.put(
+        f"/api/projects/{project_id}/members/{disabled_member['id']}/tools",
+        json=[{"tool_id": str(shared_tool.id), "enabled": False}],
+    )
+    assert disable_response.status_code == 200, disable_response.text
+    enable_response = await env.client.put(
+        f"/api/projects/{project_id}/members/{disabled_member['id']}/tools",
+        json=[{"tool_id": str(shared_tool.id), "enabled": True}],
+    )
+    assert enable_response.status_code == 200, enable_response.text
+    disable_response = await env.client.put(
+        f"/api/projects/{project_id}/members/{disabled_member['id']}/tools",
+        json=[{"tool_id": str(shared_tool.id), "enabled": False}],
+    )
+    assert disable_response.status_code == 200, disable_response.text
+
+    template_response = await env.client.post(
+        f"/api/projects/{project_id}/templates",
+        json={"name": "Shared tool override template"},
+    )
+    assert template_response.status_code == 201, template_response.text
+    template = await env.db.get(ProjectTemplate, uuid.UUID(template_response.json()["id"]))
+    assert template is not None
+    exported = [
+        item
+        for item in template.definition["capabilities"]
+        if item["capability_type"] == "tool" and item["capability_id"] == str(shared_tool.id)
+    ]
+    assert len(exported) == len(members)
+    assert {item["source"] for item in exported} == {"inherited"}
+    assert sum(bool(item["is_enabled"]) for item in exported) == len(members) - 1
+
+    restored_response = await env.client.post(
+        "/api/projects/from-template",
+        json={"template_id": str(template.id), "name": "Shared tool override target"},
+    )
+    assert restored_response.status_code == 201, restored_response.text
+    restored_agents = (await env.client.get(f"/api/projects/{restored_response.json()['id']}/agents")).json()
+    restored_assignments = list(
+        (
+            await env.db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id.in_([uuid.UUID(item["id"]) for item in restored_agents]),
+                    AgentTool.tool_id == shared_tool.id,
+                )
+            )
+        ).scalars()
+    )
+    assert len(restored_assignments) == len(members)
+    assert sum(item.enabled for item in restored_assignments) == len(members) - 1
+
+
 @pytest.mark.parametrize("invalid_agents", [None, {}, "not-a-list"])
 async def test_generic_project_template_rejects_non_list_agent_assets(
     project_api: ProjectApiEnv,
@@ -9273,3 +9475,50 @@ async def test_template_editor_is_hidden_and_overwrite_uses_same_project_snapsho
     assert "template_editor" not in persisted_editor.settings
     ordinary_projects = await env.client.get("/api/projects", params={"scope": "all"})
     assert editor_id in {uuid.UUID(item["id"]) for item in ordinary_projects.json()}
+
+
+async def test_template_editor_normalizes_structured_roles_into_digital_employees(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    template_response = await env.client.post(
+        "/api/projects/templates",
+        json={
+            "name": "Structured role template",
+            "definition": {
+                "roles": [
+                    {
+                        "key": "research_lead",
+                        "name": "研究负责人",
+                        "description": "统筹研究范围、证据质量与交付结论。",
+                    },
+                    {
+                        "key": "fact_reviewer",
+                        "name": "事实核查员",
+                        "description": "核验关键事实与引用来源。",
+                    },
+                ]
+            },
+        },
+    )
+    assert template_response.status_code == 201, template_response.text
+    template_id = template_response.json()["id"]
+
+    editor_response = await env.client.post(f"/api/projects/templates/{template_id}/editor")
+    assert editor_response.status_code == 201, editor_response.text
+    editor_id = editor_response.json()["id"]
+    members_response = await env.client.get(f"/api/projects/{editor_id}/members")
+    assert members_response.status_code == 200, members_response.text
+    members = members_response.json()
+    assert [(item["name_snapshot"], item["role_snapshot"]) for item in members] == [
+        ("研究负责人", "统筹研究范围、证据质量与交付结论。"),
+        ("事实核查员", "核验关键事实与引用来源。"),
+    ]
+    assert members[0]["is_leader"] is True
+
+    invalid_response = await env.client.post(
+        "/api/projects/templates",
+        json={"name": "Invalid role template", "definition": {"roles": "负责人"}},
+    )
+    assert invalid_response.status_code == 422
+    assert invalid_response.json()["detail"] == "项目模板角色配置必须为列表。"

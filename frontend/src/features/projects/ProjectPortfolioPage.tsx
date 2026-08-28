@@ -473,16 +473,22 @@ export default function ProjectPortfolioPage() {
                 </div>
                 <div className="pm-project-signal">
                   <strong>
-                    {project.current_signal ||
-                      (project.status === "running"
-                        ? t("projectTerminology.ownerDriving")
-                        : t("projectPortfolio.noRunEvents"))}
+                    {project.status === "completed"
+                      ? t("projectPortfolio.completedSignal")
+                      : project.current_signal ||
+                        (project.status === "running"
+                          ? t("projectTerminology.ownerDriving")
+                          : t("projectPortfolio.noRunEvents"))}
                   </strong>
                   <small>
-                    {project.next_action ||
-                      t("projectTerminology.ownerSummary", {
-                        name: project.leader_name || t("common.notSpecified"),
-                      })}
+                    {project.status === "completed"
+                      ? t("projectPortfolio.completedAction")
+                      : project.next_action ||
+                        t("projectTerminology.ownerSummary", {
+                          name:
+                            project.leader_name ||
+                            t("projectPortfolio.ownerUnspecified"),
+                        })}
                   </small>
                 </div>
                 <ProjectProgressBar

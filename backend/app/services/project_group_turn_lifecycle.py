@@ -21,7 +21,24 @@ from app.services.conversation_turn_lifecycle import (
 )
 from app.services.project_service import TERMINAL_PROJECT_RUN_STATUSES
 
-GROUP_RUN_TRIGGERS = ("group_leader_message", "group_mention")
+GROUP_RUN_TRIGGERS = (
+    "group_leader_message",
+    "group_mention",
+    "leader_reply_batch",
+)
+
+ACTIVE_LEADER_REPLY_STATES = ("pending", "claimed")
+
+
+def _is_deferred_owner_run(run: ProjectRun) -> bool:
+    """Treat the intentionally skipped owner dispatch as routing, not failure."""
+
+    output = run.output if isinstance(run.output, dict) else {}
+    return (
+        run.trigger_type == "group_leader_message"
+        and run.status == "cancelled"
+        and output.get("skip_reason") == "explicit_mentions_route_to_specialists"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,11 +224,37 @@ async def reconcile_and_publish_project_run_group_turn(
             or session.source_channel != "project"
         ):
             return None
-        projection = await reconcile_project_group_turn(
-            db,
-            project_id=run.project_id,
-            session=session,
-        )
+        projection = None
+        if run.trigger_type == "leader_reply_batch":
+            raw_anchor_id = run_input.get("group_message_id")
+            try:
+                batch_anchor_id = uuid.UUID(str(raw_anchor_id))
+            except (TypeError, ValueError):
+                batch_anchor_id = None
+            if batch_anchor_id is not None:
+                existing = await get_conversation_turn_snapshot(
+                    db,
+                    agent_id=session.agent_id,
+                    conversation_id=str(session.id),
+                    turn_anchor_id=batch_anchor_id,
+                )
+                if existing.status in {"completed", "failed", "cancelled"}:
+                    # A member may return after the initiating Human turn has
+                    # already completed. The durable Leader batch is background
+                    # project progress; never reopen that terminal turn merely
+                    # to deliver the later summary.
+                    projection = ProjectGroupTurnProjection(
+                        existing,
+                        batch_anchor_id,
+                        (),
+                        0,
+                    )
+        if projection is None:
+            projection = await reconcile_project_group_turn(
+                db,
+                project_id=run.project_id,
+                session=session,
+            )
         await db.commit()
     await publish_project_group_turn_event(
         session=session,
@@ -319,6 +362,21 @@ async def reconcile_project_group_turn(
             # creating a second visible progress turn.
             anchor = existing_anchor
 
+    cohort_anchors = list(
+        (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(session.id),
+                    ChatMessage.role == "user",
+                    ChatMessage.message_meta["kind"].as_string()
+                    == "project_group_message",
+                    ChatMessage.created_at >= anchor.created_at,
+                )
+            )
+        ).scalars()
+    )
+    cohort_anchor_ids = tuple(str(row.id) for row in cohort_anchors)
+
     runs = list(
         (
             await db.execute(
@@ -331,39 +389,76 @@ async def reconcile_project_group_turn(
             )
         ).scalars()
     )
+    active_reply_rows = (
+        list(
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == str(session.id),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == "project_subagent_reply",
+                        ChatMessage.message_meta["leader_batch_state"]
+                        .as_string()
+                        .in_(ACTIVE_LEADER_REPLY_STATES),
+                        ChatMessage.message_meta["timeline_anchor_id"]
+                        .as_string()
+                        .in_(cohort_anchor_ids),
+                    )
+                )
+            ).scalars()
+        )
+        if cohort_anchor_ids
+        else []
+    )
     nonterminal = [run for run in runs if run.status not in TERMINAL_PROJECT_RUN_STATUSES]
+    deferred_owner_runs = [run for run in runs if _is_deferred_owner_run(run)]
+    reply_owner_ids: list[uuid.UUID] = []
+    for row in active_reply_rows:
+        raw_owner_id = dict(row.message_meta or {}).get("default_leader_agent_id")
+        try:
+            reply_owner_ids.append(uuid.UUID(str(raw_owner_id)))
+        except (TypeError, ValueError):
+            continue
     active_agent_ids = tuple(
-        dict.fromkeys(run.agent_id for run in nonterminal if run.agent_id is not None)
+        dict.fromkeys(
+            [run.agent_id for run in nonterminal if run.agent_id is not None]
+            + reply_owner_ids
+        )
     )
 
-    if nonterminal:
+    if nonterminal or active_reply_rows:
         suspended = True
-        for run in nonterminal:
-            if run.status != "waiting" or run.agent_id is None:
-                suspended = False
-                break
-            output = run.output if isinstance(run.output, dict) else {}
-            child_session_id = (
-                output.get("session_id")
-                or output.get("subagent_session_id")
-                or output.get("subagent_run_id")
-            )
-            if not child_session_id:
-                suspended = False
-                break
-            pending = await find_pending_confirmation(
-                db,
-                agent_id=run.agent_id,
-                conversation_id=str(child_session_id),
-            )
-            if pending is None:
-                suspended = False
-                break
+        if active_reply_rows:
+            suspended = False
+        else:
+            for run in nonterminal:
+                if run.status != "waiting" or run.agent_id is None:
+                    suspended = False
+                    break
+                output = run.output if isinstance(run.output, dict) else {}
+                child_session_id = (
+                    output.get("session_id")
+                    or output.get("subagent_session_id")
+                    or output.get("subagent_run_id")
+                )
+                if not child_session_id:
+                    suspended = False
+                    break
+                pending = await find_pending_confirmation(
+                    db,
+                    agent_id=run.agent_id,
+                    conversation_id=str(child_session_id),
+                )
+                if pending is None:
+                    suspended = False
+                    break
         target_status = "suspended" if suspended else "running"
     else:
+        terminal_runs = [run for run in runs if not _is_deferred_owner_run(run)]
         target_status = (
             "completed"
-            if runs and all(run.status == "succeeded" for run in runs)
+            if terminal_runs
+            and all(run.status == "succeeded" for run in terminal_runs)
             else "failed"
         )
 
@@ -378,8 +473,13 @@ async def reconcile_project_group_turn(
                 str(anchor.id),
                 target_status,
                 *sorted(
-                    f"{run.id}:{run.agent_id}"
+                    f"run:{run.id}:{run.agent_id}:{run.status}"
                     for run in nonterminal
+                ),
+                *sorted(
+                    "reply:"
+                    f"{row.id}:{dict(row.message_meta or {}).get('leader_batch_state')}"
+                    for row in active_reply_rows
                 ),
             ]
         ),
@@ -388,5 +488,8 @@ async def reconcile_project_group_turn(
         snapshot=snapshot,
         anchor_message_id=anchor.id,
         active_agent_ids=active_agent_ids,
-        run_count=len(nonterminal),
+        run_count=(
+            len(nonterminal)
+            + len(active_reply_rows)
+        ),
     )

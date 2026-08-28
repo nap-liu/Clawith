@@ -738,23 +738,21 @@ async def execute_project_runtime_tool(
             raise ValueError("message is required")
         if mode not in {"task_delegate", "consult"}:
             raise ValueError(
-                "Project A2A only accepts actionable task_delegate or consult requests; "
-                "record passive status on the work item or project timeline"
+                "成员协作请求需要明确任务或咨询内容。"
             )
         if not title:
-            raise ValueError("title is required for project A2A collaboration")
+            raise ValueError("成员协作请求需要填写标题。")
         if not expected_output:
-            raise ValueError("expected_output is required for project A2A collaboration")
+            raise ValueError("成员协作请求需要填写预期结果。")
         from app.services.project_reply_quality import project_handoff_rejection_reasons
 
         handoff_reasons = project_handoff_rejection_reasons(message)
         if handoff_reasons:
             raise ValueError(
-                "Project A2A requires an actionable professional handoff, not an acknowledgement, "
-                "status update, activity log, or internal narration"
+                "成员协作请求需要包含可执行的工作内容和预期结果。"
             )
         if target_id == agent_id:
-            raise ValueError("A project Agent cannot delegate a task to itself")
+            raise ValueError("不能向当前数字员工发起成员协作请求。")
         explicit_work_item_id = _uuid(arguments.get("work_item_id"), "work_item_id", optional=True)
         related_work_item_id = explicit_work_item_id or (project_run.work_item_id if project_run else None)
         async with async_session() as db:
@@ -762,7 +760,7 @@ async def execute_project_runtime_tool(
             if related_work_item_id is not None:
                 related_work_item = await db.get(ProjectWorkItem, related_work_item_id)
                 if related_work_item is None or related_work_item.project_id != project.id:
-                    raise ValueError("work_item_id must identify a work item in the current project")
+                    raise ValueError("关联任务必须属于当前项目。")
                 dependency_ids = list(related_work_item.dependency_ids or [])
                 if dependency_ids:
                     dependency_rows = (
@@ -780,12 +778,12 @@ async def execute_project_runtime_tool(
                     unfinished = [row.title for row in dependency_rows if row.status != "done"]
                     missing = len(dependency_rows) != len(set(dependency_ids))
                     if unfinished or missing:
-                        labels = ", ".join(unfinished) or "missing dependency records"
+                        labels = ", ".join(unfinished) or "未找到前置任务记录"
                         raise ValueError(
-                            "Project A2A cannot wake this work item before its dependencies are done: " + labels
+                            "前置任务尚未完成，暂不能发起成员协作：" + labels
                         )
         if mode == "task_delegate" and related_work_item_id is None:
-            raise ValueError("work_item_id is required when delegating work from an unlinked project Run")
+            raise ValueError("委派任务前需要关联一个项目任务。")
         from app.services.agent_tools import _send_message_to_agent
 
         result = await _send_message_to_agent(
@@ -814,7 +812,7 @@ async def execute_project_runtime_tool(
             or delivery.get("status") not in {"queued", "running"}
             or not (delivery.get("a2a_session_id") or delivery.get("session_id"))
         ):
-            raise RuntimeError("Project message could not be queued")
+            raise RuntimeError("成员协作请求暂未提交成功，请稍后重试。")
         delivered_session_id = str(delivery.get("a2a_session_id") or delivery.get("session_id") or "") or None
         async with async_session() as db:
             attached = await db.get(Project, project.id)
@@ -933,7 +931,7 @@ async def execute_project_runtime_tool(
                 db,
                 attached,
                 "git.restored",
-                f"{member.name_snapshot} restored {commit[:12]} as a new commit",
+                f"{member.name_snapshot} 恢复了项目版本",
                 actor_agent_id=agent_id,
                 metadata={**result, "session_id": session_id},
             )
@@ -961,7 +959,7 @@ async def execute_project_runtime_tool(
                 db,
                 attached,
                 "project.file.committed",
-                f"{member.name_snapshot} wrote and committed {result['path']}",
+                f"{member.name_snapshot} 保存了项目文件：{result['path']}",
                 actor_agent_id=agent_id,
                 work_item_id=project_run.work_item_id if project_run else None,
                 run_id=project_run.id if project_run else None,
@@ -1046,7 +1044,7 @@ async def execute_project_runtime_tool(
                     db,
                     project,
                     "git.milestone.prepared",
-                    f"{member.name_snapshot} prepared a project Git milestone",
+                    f"{member.name_snapshot} 正在创建交付里程碑",
                     actor_agent_id=agent_id,
                     work_item_id=project_run.work_item_id if project_run else None,
                     run_id=project_run.id if project_run else None,
@@ -1077,7 +1075,7 @@ async def execute_project_runtime_tool(
             settings["git"] = {**dict(settings.get("git") or {}), "head": result["commit"]}
             attached.settings = settings
             operation_event.event_type = "git.milestone.created"
-            operation_event.summary = f"{member.name_snapshot} created project Git milestone {result['commit'][:12]}"
+            operation_event.summary = f"{member.name_snapshot} 创建了交付里程碑"
             operation_event.event_metadata = {
                 **dict(operation_event.event_metadata or {}),
                 **result,
