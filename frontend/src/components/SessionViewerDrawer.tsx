@@ -37,7 +37,6 @@ import {
   hasPendingConfirmation,
   mapHistoryMessage,
   mergeHistoryMessages,
-  projectConversationTurnProgress,
   toolCallMessageFromEvent,
   upsertToolCallMessage,
   type ConversationMessage,
@@ -47,7 +46,6 @@ import {
   IDLE_CONVERSATION_TURN,
   beginConversationTurnRecovery,
   conversationTurnIsRunning,
-  conversationTurnIsWaiting,
   conversationTurnEventShouldBeHandled,
   reduceConversationTurnEvent,
   type ConversationTurnRuntime,
@@ -303,7 +301,6 @@ export default function SessionViewerDrawer({
   >([]);
   const [connected, setConnected] = useState(false);
   const [sending, setSending] = useState(false);
-  const [turnWaiting, setTurnWaiting] = useState(false);
   const [groupTurn, setGroupTurn] = useState<GroupTurnState | null>(null);
   const [resolvedAnchorMessageId, setResolvedAnchorMessageId] = useState("");
   const [anchorNotice, setAnchorNotice] = useState("");
@@ -490,7 +487,6 @@ export default function SessionViewerDrawer({
                 runCount: Number(firstPage.turn.run_count || activeAgentIds.length),
               };
             }
-            setTurnWaiting(conversationTurnIsWaiting(turnReduction.runtime));
             if (!groupSendInFlightRef.current)
               setSending(conversationTurnIsRunning(turnReduction.runtime));
           }
@@ -599,7 +595,6 @@ export default function SessionViewerDrawer({
         turnRuntimeBySessionRef.current[sessionId] = turnReduction.runtime;
         if (turnReduction.controlsLifecycle && turnReduction.hasSnapshot) {
           setSending(conversationTurnIsRunning(turnReduction.runtime));
-          setTurnWaiting(conversationTurnIsWaiting(turnReduction.runtime));
           if (groupMode && payload.turn) {
             const activeAgentIds = Array.isArray(payload.turn.active_agent_ids)
               ? payload.turn.active_agent_ids.map(String)
@@ -638,7 +633,6 @@ export default function SessionViewerDrawer({
             ["thinking", "chunk", "tool_call", "confirmation_required"].includes(payload.type)
           ) {
             setSending(true);
-            setTurnWaiting(false);
           }
           setMessages((previous) =>
             foldConversationTimelineEvent(previous, payload, {
@@ -649,7 +643,6 @@ export default function SessionViewerDrawer({
           if (payload.type === "done") {
             if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
               setSending(false);
-              setTurnWaiting(false);
             }
             window.setTimeout(() => void loadSession(true), 250);
           }
@@ -669,7 +662,6 @@ export default function SessionViewerDrawer({
           );
           if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
             setSending(false);
-            setTurnWaiting(false);
           }
         }
       };
@@ -685,7 +677,6 @@ export default function SessionViewerDrawer({
         );
         turnRuntimeBySessionRef.current[sessionId] = durableRuntime;
         setSending(conversationTurnIsRunning(durableRuntime));
-        setTurnWaiting(conversationTurnIsWaiting(durableRuntime));
         if (
           disposed ||
           event.code === 4001 ||
@@ -1015,7 +1006,6 @@ export default function SessionViewerDrawer({
       setAttachedFiles([]);
       setComposerError("");
       setSending(true);
-      setTurnWaiting(true);
       if (textareaRef.current) textareaRef.current.style.height = "auto";
     } catch {
       setMessages((previous) =>
@@ -1112,24 +1102,20 @@ export default function SessionViewerDrawer({
             name: groupProcessingAgentName,
           })
       : "";
-  const timelineMessages = projectConversationTurnProgress(
-    messages,
-    groupConfig ? sending : turnWaiting,
-    groupConfig
-      ? {
-          id: `group-pending-${groupTurn?.anchorMessageId || "sending"}`,
-          created_at: null,
-          sender_agent_id:
-            activeGroupAgents[0]?.agentId || groupLeader?.agentId,
-          sender_name:
-            activeGroupAgents[0]?.name ||
-            groupLeader?.name ||
-            t("projectTerminology.groupProcessingFallback"),
-        }
-      : {
-          id: `conversation-turn-progress:${sessionId || "unknown"}:${turnRuntimeBySessionRef.current[String(sessionId || "")]?.snapshot.generation || 0}`,
-        },
-  );
+  const progressMessage: Partial<ConversationMessage> = groupConfig
+    ? {
+        id: `group-pending-${groupTurn?.anchorMessageId || "sending"}`,
+        created_at: null,
+        sender_agent_id:
+          activeGroupAgents[0]?.agentId || groupLeader?.agentId,
+        sender_name:
+          activeGroupAgents[0]?.name ||
+          groupLeader?.name ||
+          t("projectTerminology.groupProcessingFallback"),
+      }
+    : {
+        id: `conversation-turn-progress:${sessionId || "unknown"}:${turnRuntimeBySessionRef.current[String(sessionId || "")]?.snapshot.generation || 0}`,
+      };
   const confirmationPending = hasPendingConfirmation(messages);
   const routePrefix = routeMode === "h5" ? "/h5/agents" : "/agents";
   const fullSessionHref = `${routePrefix}/${executionAgentId}/chat?session_id=${encodeURIComponent(sessionId)}`;
@@ -1234,7 +1220,7 @@ export default function SessionViewerDrawer({
                 {t("agent.sessionViewer.retry")}
               </button>
             </div>
-          ) : timelineMessages.length === 0 ? (
+          ) : messages.length === 0 && !active ? (
             <div className="session-viewer-drawer__state">
               {t("agent.sessionViewer.empty")}
             </div>
@@ -1251,11 +1237,12 @@ export default function SessionViewerDrawer({
               <ConversationTimeline
                 agentId={executionAgentId}
                 agentName={executionAgentName}
-                messages={timelineMessages}
+                messages={messages}
                 scrollerRef={scrollerRef}
                 focusMessageId={resolvedAnchorMessageId || undefined}
                 isRunning={active}
                 runningLabel={groupProcessingLabel || undefined}
+                progressMessage={progressMessage}
                 mode={routeMode}
                 onPreviewImages={handlePreviewImages}
                 unavailableAttachmentKeys={effectiveUnavailableAttachments}

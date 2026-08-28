@@ -100,6 +100,7 @@ export type AssistantStreamMessage = {
   preserveTransient?: boolean;
   turnAnchorId?: string;
   turnGeneration?: number;
+  turnSuspended?: boolean;
   producerScope?: string;
   transientMessageId?: string;
 };
@@ -433,6 +434,7 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     preserveTransient?: boolean;
     turnAnchorId?: string;
     turnGeneration?: number;
+    turnSuspended?: boolean;
     producerScope?: string;
     transientMessageId?: string;
   },
@@ -499,6 +501,31 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     .map((message) => message.content || "")
     .filter((segment) => segment.trim())
     .join("\n\n");
+
+  // Suspension closes the active transport streams without creating or
+  // relocating a timeline message. Every row keeps the position in which the
+  // turn produced it; resuming the turn may append new rows later.
+  if (event.turnSuspended) {
+    if (streamed.length === 0) return messages;
+    const explicitContentTarget = event.messageId
+      ? streamed.find(
+          (message) => String(message.id || "") === event.messageId,
+        )
+      : streamed.length === 1
+        ? streamed[0]
+        : undefined;
+    return messages.map((message, index) => {
+      if (!isCurrentTurnStream(message, index)) return message;
+      return {
+        ...message,
+        ...(message === explicitContentTarget && content
+          ? { content }
+          : {}),
+        streaming: false,
+        _streaming: false,
+      } as T;
+    });
+  }
 
   // Explicit ids address one committed message (currently onboarding and
   // server-committed rows). Preserve its full shape and position, but still
@@ -591,32 +618,6 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
         ...next.slice(0, safeIndex),
         canonical,
         ...next.slice(safeIndex),
-      ];
-    }
-  }
-
-  // A blank done denotes suspension. Put the normalized streamed intro just
-  // before the pending confirmation card, matching its durable row order.
-  if (!content) {
-    let nextLastUserIdx = -1;
-    for (let i = next.length - 1; i >= 0; i -= 1) {
-      if (next[i].role === "user") {
-        nextLastUserIdx = i;
-        break;
-      }
-    }
-    const confirmationIdx = next.findIndex(
-      (message, index) =>
-        index > nextLastUserIdx &&
-        message.role === "tool_call" &&
-        message.toolName === CONFIRMATION_TOOL &&
-        normalizeToolStatus(message.toolStatus) === "running",
-    );
-    if (confirmationIdx >= 0) {
-      return [
-        ...next.slice(0, confirmationIdx),
-        canonical,
-        ...next.slice(confirmationIdx),
       ];
     }
   }
@@ -1258,6 +1259,7 @@ export function foldConversationTimelineEvent<T extends ConversationMessage>(
         turnGeneration: Number.isInteger(Number(data.turn?.generation))
           ? Number(data.turn.generation)
           : undefined,
+        turnSuspended: data.turn?.phase === "suspended",
         producerScope: data.producer_scope
           ? String(data.producer_scope)
           : undefined,
@@ -1367,6 +1369,16 @@ export function normalizeChatTimelineMessages<T extends Record<string, any>>(
   return normalized;
 }
 
+function hasConversationMessagePayload(message: ConversationMessage): boolean {
+  return Boolean(
+    String(message.display_content ?? message.content ?? "").trim() ||
+      message.fileName ||
+      message.imageUrl ||
+      message.attachments?.length ||
+      message.previewImages?.length,
+  );
+}
+
 /**
  * Project the single ephemeral progress row from lifecycle state.
  *
@@ -1377,18 +1389,12 @@ export function normalizeChatTimelineMessages<T extends Record<string, any>>(
  */
 export function projectConversationTurnProgress<
   T extends ConversationMessage,
->(messages: T[], waiting: boolean, progressMessage?: Partial<T>): T[] {
+>(messages: T[], running: boolean, progressMessage?: Partial<T>): T[] {
   const withoutTransportPlaceholders = messages.flatMap((message) => {
     if (message.role !== "assistant" || !(message.streaming || message._streaming)) {
       return [message];
     }
-    const hasRenderablePayload = Boolean(
-      String(message.content || "").trim() ||
-        message.fileName ||
-        message.imageUrl ||
-        message.attachments?.length ||
-        message.previewImages?.length,
-    );
+    const hasRenderablePayload = hasConversationMessagePayload(message);
     if (hasRenderablePayload) return [message];
     // Preserve reasoning for the analysis group, but strip its transport-only
     // streaming marker so it cannot render a second progress bubble.
@@ -1397,7 +1403,7 @@ export function projectConversationTurnProgress<
     }
     return [];
   });
-  if (!waiting) return withoutTransportPlaceholders;
+  if (!running) return withoutTransportPlaceholders;
   return [
     ...withoutTransportPlaceholders,
     {
@@ -1410,6 +1416,38 @@ export function projectConversationTurnProgress<
       ...progressMessage,
     } as T,
   ];
+}
+
+/**
+ * Keep the turn progress row visible until the active turn starts rendering
+ * its answer. The latest expanded reasoning/tool group also exposes current
+ * activity, while expanded groups from older turns never suppress progress.
+ */
+export function shouldProjectConversationTurnProgress(
+  entries: ConversationEntry[],
+  running: boolean,
+  expandedAnalysis: Readonly<Record<string, boolean>>,
+): boolean {
+  if (!running) return false;
+  let latestAnalysisKey: string | undefined;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.type === "analysis_group") {
+      latestAnalysisKey ||= entry.key;
+      continue;
+    }
+    if (
+      entry.type === "message" &&
+      entry.msg.role === "assistant" &&
+      hasConversationMessagePayload(entry.msg)
+    ) {
+      return false;
+    }
+    if (entry.type === "message" && entry.msg.role === "user") {
+      return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
+    }
+  }
+  return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
 }
 
 export function toolCallMessageFromEvent(
