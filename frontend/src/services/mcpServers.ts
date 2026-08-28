@@ -14,7 +14,10 @@ import type {
 
 export const mcpServersApi = {
   list: () => fetchJson<MCPServer[]>('/admin/mcp-servers'),
-  get: (id: string) => fetchJson<MCPServer>(`/admin/mcp-servers/${id}`),
+  get: (id: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
+    return fetchJson<MCPServer>(`/admin/mcp-servers/${id}${qs}`);
+  },
   create: (data: MCPServerCreatePayload) =>
     fetchJson<MCPServer>('/admin/mcp-servers', {
       method: 'POST',

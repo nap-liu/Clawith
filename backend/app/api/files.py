@@ -1475,11 +1475,34 @@ async def import_skill_to_agent(
 
     if agent.scope == "project":
         from app.models.project import Project
+        from app.services.project_capability_options import load_project_capability_options
         from app.services.project_skill_assets import bind_library_skill_to_project_agent
 
         project = await db.get(Project, agent.project_id)
         if project is None or project.tenant_id != agent.tenant_id:
             raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
+        source_agent = await db.get(Agent, agent.source_agent_id) if agent.source_agent_id is not None else None
+        if (
+            source_agent is not None
+            and (
+                source_agent.tenant_id != project.tenant_id
+                or source_agent.scope != "standard"
+                or source_agent.is_deleted
+            )
+        ):
+            source_agent = None
+        options = await load_project_capability_options(
+            db,
+            project.tenant_id,
+            [source_agent] if source_agent is not None else [],
+        )
+        allowed = (
+            options.allows(source_agent.id, "skill", skill.id)
+            if source_agent is not None
+            else options.allows_shared("skill", skill.id)
+        )
+        if not allowed:
+            raise HTTPException(status_code=422, detail="Selected project Skill is unavailable")
         binding = await bind_library_skill_to_project_agent(
             db,
             project,

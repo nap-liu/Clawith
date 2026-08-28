@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -10,13 +10,19 @@ import {
   IconCheck,
   IconChevronRight,
   IconCode,
+  IconEdit,
+  IconLoader2,
   IconRefresh,
   IconSparkles,
+  IconTrash,
   IconUsers,
   IconX,
 } from "@tabler/icons-react";
 import { projectsApi } from "../../services/projects";
 import Pagination from "../../components/Pagination";
+import { useDialog } from "../../components/Dialog/DialogProvider";
+import { useToast } from "../../components/Toast/ToastProvider";
+import { useAuthStore } from "../../stores";
 import type { ProjectTemplate } from "./types";
 import {
   Button,
@@ -33,10 +39,20 @@ function TemplateDetail({
   template,
   onClose,
   onUse,
+  onEdit,
+  onDelete,
+  canEdit,
+  canDelete,
+  busyAction,
 }: {
   template: ProjectTemplate;
   onClose: () => void;
   onUse: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  canEdit: boolean;
+  canDelete: boolean;
+  busyAction: "edit" | "delete" | null;
 }) {
   const { t } = useTranslation();
   return (
@@ -200,6 +216,34 @@ function TemplateDetail({
         >
           {t("projectTemplates.cancel")}
         </Button>
+        {canDelete && (
+          <Button
+            variant="danger"
+            onClick={onDelete}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "delete" ? (
+              <IconLoader2 className="pm-spinner-icon" size={16} />
+            ) : (
+              <IconTrash size={16} />
+            )}
+            {t("projectTemplates.management.delete")}
+          </Button>
+        )}
+        {canEdit && (
+          <Button
+            variant="secondary"
+            onClick={onEdit}
+            disabled={busyAction !== null}
+          >
+            {busyAction === "edit" ? (
+              <IconLoader2 className="pm-spinner-icon" size={16} />
+            ) : (
+              <IconEdit size={16} />
+            )}
+            {t("projectTemplates.management.edit")}
+          </Button>
+        )}
         <Button
           variant="primary"
           className="pm-button pm-button-primary"
@@ -216,11 +260,20 @@ function TemplateDetail({
 export default function ProjectTemplatesPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const dialog = useDialog();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const currentUser = useAuthStore((state) => state.user);
   const [searchParams, setSearchParams] = useSearchParams();
   const category = searchParams.get("category") || "all";
   const query = searchParams.get("q")?.trim() || "";
   const [queryDraft, setQueryDraft] = useState(query);
   const selectedId = searchParams.get("template");
+  const isPlatformAdmin =
+    currentUser?.role === "platform_admin" ||
+    currentUser?.is_platform_admin === true;
+  const isOrganizationAdmin = currentUser?.role === "org_admin";
+  const isTemplateManager = isPlatformAdmin || isOrganizationAdmin;
 
   useEffect(() => setQueryDraft(query), [query]);
 
@@ -289,6 +342,42 @@ export default function ProjectTemplatesPage() {
 
   const useTemplate = (id: string) =>
     navigate(`/projects/new?template=${encodeURIComponent(id)}`);
+  const canEditTemplate = (template: ProjectTemplate) =>
+    isPlatformAdmin || (isOrganizationAdmin && template.can_edit === true);
+  const canDeleteTemplate = (template: ProjectTemplate) =>
+    isPlatformAdmin || (isOrganizationAdmin && template.can_delete === true);
+  const editMutation = useMutation({
+    mutationFn: (templateId: string) =>
+      projectsApi.createTemplateEditor(templateId),
+    onSuccess: (project) => navigate(`/projects/${project.id}`),
+    onError: () => toast.error(t("projectTemplates.management.editFailed")),
+  });
+  const deleteMutation = useMutation({
+    mutationFn: (templateId: string) => projectsApi.deleteTemplate(templateId),
+    onSuccess: async (_, templateId) => {
+      if (selectedId === templateId) {
+        updateUrlState({ template: undefined });
+      }
+      await queryClient.invalidateQueries({
+        queryKey: ["projects", "templates"],
+      });
+      toast.success(t("projectTemplates.management.deleteSuccess"));
+    },
+    onError: () => toast.error(t("projectTemplates.management.deleteFailed")),
+  });
+  const deleteTemplate = async (template: ProjectTemplate) => {
+    const confirmed = await dialog.confirm(
+      t("projectTemplates.management.deleteDescription", {
+        name: projectUserFacingCopy(template.name, t),
+      }),
+      {
+        title: t("projectTemplates.management.deleteTitle"),
+        danger: true,
+        confirmLabel: t("projectTemplates.management.delete"),
+      },
+    );
+    if (confirmed) deleteMutation.mutate(template.id);
+  };
 
   return (
     <main className="pm-page pm-template-market">
@@ -302,9 +391,27 @@ export default function ProjectTemplatesPage() {
       </Button>
       <header className="pm-page-header">
         <div>
-          <span className="pm-eyebrow">{t("projectTemplates.eyebrow")}</span>
-          <h1>{t("projectTemplates.title")}</h1>
-          <p>{t("projectTemplates.description")}</p>
+          <span className="pm-eyebrow">
+            {t(
+              isTemplateManager
+                ? "projectTemplates.management.eyebrow"
+                : "projectTemplates.eyebrow",
+            )}
+          </span>
+          <h1>
+            {t(
+              isTemplateManager
+                ? "projectTemplates.management.title"
+                : "projectTemplates.title",
+            )}
+          </h1>
+          <p>
+            {t(
+              isTemplateManager
+                ? "projectTemplates.management.description"
+                : "projectTemplates.description",
+            )}
+          </p>
         </div>
         <Button
           variant="primary"
@@ -440,11 +547,7 @@ export default function ProjectTemplatesPage() {
         <ProjectEmptyState
           tone="error"
           title={t("projectTemplates.loadFailed")}
-          description={
-            templatesQuery.error instanceof Error
-              ? templatesQuery.error.message
-              : t("projectTemplates.serviceUnavailable")
-          }
+          description={t("projectTemplates.serviceUnavailable")}
           action={
             <Button
               variant="secondary"
@@ -557,16 +660,48 @@ export default function ProjectTemplatesPage() {
                       count: template.usage_count,
                     })}
                   </span>
-                  <Button
-                    variant="ghost"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      useTemplate(template.id);
-                    }}
-                  >
-                    {t("projectTemplates.use")}
-                    <IconChevronRight size={14} />
-                  </Button>
+                  <div className="pm-template-card-actions">
+                    {canEditTemplate(template) && (
+                      <Button
+                        variant="ghost"
+                        disabled={
+                          editMutation.isPending || deleteMutation.isPending
+                        }
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          editMutation.mutate(template.id);
+                        }}
+                      >
+                        <IconEdit size={14} />
+                        {t("projectTemplates.management.edit")}
+                      </Button>
+                    )}
+                    {canDeleteTemplate(template) && (
+                      <Button
+                        variant="ghost"
+                        disabled={
+                          editMutation.isPending || deleteMutation.isPending
+                        }
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void deleteTemplate(template);
+                        }}
+                      >
+                        <IconTrash size={14} />
+                        {t("projectTemplates.management.delete")}
+                      </Button>
+                    )}
+                    <Button
+                      variant="ghost"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        useTemplate(template.id);
+                      }}
+                    >
+                      {t("projectTemplates.use")}
+                      <IconChevronRight size={14} />
+                    </Button>
+                  </div>
                 </footer>
               </ProjectCard>
             ))}
@@ -605,11 +740,7 @@ export default function ProjectTemplatesPage() {
             <IconX size={18} />
           </ProjectIconButton>
           <strong>{t("projectTemplates.detailLoadFailed")}</strong>
-          <p>
-            {detailQuery.error instanceof Error
-              ? detailQuery.error.message
-              : t("projectTemplates.tryAgain")}
-          </p>
+          <p>{t("projectTemplates.tryAgain")}</p>
           <Button
             variant="secondary"
             className="pm-button pm-button-secondary"
@@ -625,6 +756,17 @@ export default function ProjectTemplatesPage() {
           template={detailQuery.data}
           onClose={() => updateUrlState({ template: undefined })}
           onUse={() => useTemplate(detailQuery.data.id)}
+          onEdit={() => editMutation.mutate(detailQuery.data.id)}
+          onDelete={() => void deleteTemplate(detailQuery.data)}
+          canEdit={canEditTemplate(detailQuery.data)}
+          canDelete={canDeleteTemplate(detailQuery.data)}
+          busyAction={
+            editMutation.isPending
+              ? "edit"
+              : deleteMutation.isPending
+                ? "delete"
+                : null
+          }
         />
       )}
     </main>

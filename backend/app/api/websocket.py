@@ -579,6 +579,14 @@ class WebSocketChatHandler:
                     # chat becomes the sole writable planning transport.
                     if bool(dict(_existing.im_config or {}).get("read_only")):
                         self.read_only = True
+                    if (
+                        self.project_session_access is not None
+                        and _existing.source_channel != "subagent"
+                    ):
+                        self.read_only = (
+                            self.read_only
+                            or self.project_session_access != "edit"
+                        )
                     is_subagent_owner = False
                     if _existing.source_channel == "subagent":
                         # Subagent sessions are runtime-owned but may be opened
@@ -607,6 +615,7 @@ class WebSocketChatHandler:
                     and _existing.source_channel != "agent"
                     and str(_existing.user_id) != str(user_id)
                     and not is_subagent_owner
+                    and self.project_session_access is None
                 ):
                     # Not the owner. Allow a READ-ONLY monitor connection if the
                     # viewer may see others' sessions (same gate as the REST

@@ -1,3 +1,5 @@
+import type { MCPServerEditorDraftOverride } from '../../types/mcpServer';
+
 export type EditorMode = 'server-admin' | 'agent';
 export type EditorTab = 'basic' | 'advanced' | 'override' | 'test';
 export type EditorRole = 'platform_admin' | 'org_admin' | 'agent_admin' | 'member';
@@ -11,6 +13,8 @@ export interface MCPServerEditorProps {
   titleSuffix?: string;
   onClose: () => void;
   onSaved?: () => void;
+  draftOverride?: MCPServerEditorDraftOverride | null;
+  onDraftOverrideChange?: (value: MCPServerEditorDraftOverride | null) => void;
 }
 
 /** Which tabs to render given role + mode.

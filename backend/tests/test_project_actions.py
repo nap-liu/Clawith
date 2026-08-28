@@ -45,6 +45,7 @@ import app.models.tenant  # noqa: F401
 import app.models.tool  # noqa: F401
 import app.models.user  # noqa: F401
 from app.api import files as files_api
+from app.api import mcp_servers as mcp_servers_api
 from app.api import projects as projects_api
 from app.core.security import get_current_user
 from app.database import Base, get_db
@@ -60,8 +61,9 @@ from app.models.project import (
     ProjectCapabilityBinding,
     ProjectEvent,
     ProjectMemberSnapshot,
+    ProjectTemplate,
 )
-from app.models.skill import Skill, SkillFile
+from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
@@ -80,12 +82,14 @@ TABLES = [
     "agents",
     "agent_permissions",
     "mcp_servers",
+    "mcp_server_overrides",
     "tools",
     "agent_tools",
     "agent_agent_relationships",
     "participants",
     "skills",
     "skill_files",
+    "skill_installs",
     "project_templates",
     "projects",
     "project_repository_operations",
@@ -254,6 +258,9 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
         # external agent transport is independently covered by bridge tests.
         return None
 
+    async def skip_external_audit(**_kwargs) -> None:
+        return None
+
     monkeypatch.setattr(
         "app.services.project_git_service.get_settings",
         lambda: SimpleNamespace(STORAGE_LOCAL_ROOT=str(tmp_path)),
@@ -263,10 +270,12 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
         lambda: SimpleNamespace(STORAGE_LOCAL_ROOT=str(tmp_path), AGENT_DATA_DIR=str(tmp_path)),
     )
     monkeypatch.setattr(projects_api, "deliver_project_a2a", skip_external_delivery)
+    monkeypatch.setattr(mcp_servers_api, "write_audit_log", skip_external_audit)
 
     test_app = FastAPI()
     test_app.include_router(projects_api.router, prefix="/api")
     test_app.include_router(files_api.router, prefix="/api")
+    test_app.include_router(mcp_servers_api.router, prefix="/api")
     test_app.dependency_overrides[get_db] = override_db
     test_app.dependency_overrides[get_current_user] = override_user
 
@@ -433,6 +442,8 @@ async def test_project_create_removes_managed_storage_after_commit_failure(
 async def test_project_create_applies_member_settings_only_to_project_agent(
     project_api: ProjectApiEnv,
 ):
+    from app.models.mcp_server import MCPServerOverride
+
     env = project_api
     model = LLMModel(
         tenant_id=env.tenant_id,
@@ -462,7 +473,7 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
         display_name="Project member MCP",
         base_url_template="https://mcp.project.test",
         headers_template={},
-        created_by_user_id=env.owner_id,
+        created_by_user_id=env.viewer_id,
     )
     skill = Skill(
         tenant_id=env.tenant_id,
@@ -472,11 +483,11 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
         folder_name=f"project-member-skill-{uuid.uuid4().hex[:8]}",
         visibility="tenant",
         status="published",
+        publisher_agent_id=env.source_leader_id,
     )
     env.db.add_all([model, tool, mcp, skill])
     await env.db.flush()
-    env.db.add(
-        Tool(
+    mcp_tool = Tool(
             name=f"project_member_mcp_tool_{uuid.uuid4().hex[:8]}",
             display_name="Project member MCP tool",
             description="Project-local MCP tool",
@@ -490,8 +501,23 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
             mcp_server_id=mcp.id,
             mcp_server_name=mcp.display_name,
             mcp_tool_name="project_member_action",
-        )
     )
+    disabled_mcp_tool = Tool(
+        name=f"project_member_mcp_disabled_{uuid.uuid4().hex[:8]}",
+        display_name="Project member disabled MCP tool",
+        description="Second independently selectable MCP tool",
+        type="mcp",
+        category="general",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        is_default=False,
+        source="admin",
+        tenant_id=env.tenant_id,
+        mcp_server_id=mcp.id,
+        mcp_server_name=mcp.display_name,
+        mcp_tool_name="project_member_disabled_action",
+    )
+    env.db.add_all([mcp_tool, disabled_mcp_tool])
     env.db.add(
         SkillFile(
             skill_id=skill.id,
@@ -509,6 +535,7 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
         )
     )
     await env.db.commit()
+    mcp_id = mcp.id
 
     response = await env.client.post(
         "/api/projects",
@@ -529,9 +556,26 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
                                 "tool_id": str(tool.id),
                                 "enabled": True,
                                 "config": {"mode": "project"},
+                            },
+                            {
+                                "tool_id": str(mcp_tool.id),
+                                "enabled": True,
+                                "config": {"scope": "project-only"},
+                            },
+                            {
+                                "tool_id": str(disabled_mcp_tool.id),
+                                "enabled": False,
+                                "config": {},
+                            },
+                        ],
+                        "mcp_server_overrides": [
+                            {
+                                "server_id": str(mcp.id),
+                                "system_prompt_block": "Use the project evidence scope only.",
+                                "headers_template": {"X-Project-Scope": "${agent.id}"},
+                                "credential_template": "project-only-test-token",
                             }
                         ],
-                        "mcp_capability_ids": [str(mcp.id)],
                         "skill_capability_ids": [str(skill.id)],
                     },
                 }
@@ -545,6 +589,7 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
             select(ProjectMemberSnapshot).where(ProjectMemberSnapshot.project_id == project_id)
         )
     ).scalar_one()
+    project_agent_id = created_member.agent_id
     assert created_member.agent_id != env.source_leader_id
     assert created_member.config_snapshot["primary_model_id"] == str(model.id)
     assert created_member.config_snapshot["max_tool_rounds"] == 33
@@ -570,7 +615,43 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
     assert source_assignment.config == {"mode": "source"}
     assert project_assignment.enabled is True
     assert project_assignment.config == {"mode": "project"}
+    project_mcp_assignments = {
+        assignment.tool_id: assignment
+        for assignment in (
+            await env.db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == created_member.agent_id,
+                    AgentTool.tool_id.in_([mcp_tool.id, disabled_mcp_tool.id]),
+                )
+            )
+        ).scalars()
+    }
+    assert project_mcp_assignments[mcp_tool.id].enabled is True
+    assert project_mcp_assignments[mcp_tool.id].config == {"scope": "project-only"}
+    assert project_mcp_assignments[disabled_mcp_tool.id].enabled is False
+    project_override = (
+        await env.db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == mcp.id,
+                MCPServerOverride.scope_type == "agent",
+                MCPServerOverride.scope_id == created_member.agent_id,
+            )
+        )
+    ).scalar_one()
+    assert project_override.system_prompt_block == "Use the project evidence scope only."
+    assert project_override.headers_template == {"X-Project-Scope": "${agent.id}"}
+    assert project_override.credential_template == "project-only-test-token"
 
+    source_override = (
+        await env.db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == mcp.id,
+                MCPServerOverride.scope_type == "agent",
+                MCPServerOverride.scope_id == env.source_leader_id,
+            )
+        )
+    ).scalar_one_or_none()
+    assert source_override is None
     bindings = (
         await env.db.execute(
             select(ProjectCapabilityBinding).where(
@@ -583,6 +664,478 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
         ("mcp", mcp.id),
         ("skill", skill.id),
     }
+    mcp_binding = next(
+        binding
+        for binding in bindings
+        if binding.capability_type == "mcp" and binding.capability_id == mcp.id
+    )
+    assert mcp_binding.is_enabled is True
+
+    disable_selected = await env.client.put(
+        f"/api/projects/{project_id}/members/{created_member.id}/tools",
+        json=[{"tool_id": str(mcp_tool.id), "enabled": False}],
+    )
+    assert disable_selected.status_code == 200, disable_selected.text
+    await env.db.refresh(mcp_binding)
+    assert mcp_binding.is_enabled is False
+
+    enable_other = await env.client.put(
+        f"/api/projects/{project_id}/members/{created_member.id}/tools",
+        json=[{"tool_id": str(disabled_mcp_tool.id), "enabled": True}],
+    )
+    assert enable_other.status_code == 200, enable_other.text
+    await env.db.refresh(mcp_binding)
+    assert mcp_binding.is_enabled is True
+    project_mcp_state = {
+        assignment.tool_id: assignment.enabled
+        for assignment in (
+            await env.db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == created_member.agent_id,
+                    AgentTool.tool_id.in_([mcp_tool.id, disabled_mcp_tool.id]),
+                )
+            )
+        ).scalars()
+    }
+    assert project_mcp_state == {
+        mcp_tool.id: False,
+        disabled_mcp_tool.id: True,
+    }
+    source_mcp_assignments = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == env.source_leader_id,
+                AgentTool.tool_id.in_([mcp_tool.id, disabled_mcp_tool.id]),
+            )
+        )
+    ).scalars().all()
+    assert source_mcp_assignments == []
+    invalid_override = await env.client.post(
+        "/api/projects",
+        json={
+            "name": "Reject detached MCP configuration",
+            "members": [
+                {
+                    "agent_id": str(env.source_leader_id),
+                    "is_leader": True,
+                    "settings": {
+                        "tools": [
+                            {
+                                "tool_id": str(mcp_tool.id),
+                                "enabled": False,
+                                "config": {},
+                            }
+                        ],
+                        "mcp_server_overrides": [
+                            {
+                                "server_id": str(mcp.id),
+                                "headers_template": {"X-Project-Scope": "blocked"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    assert invalid_override.status_code == 422, invalid_override.text
+    assert "requires at least one enabled tool" in invalid_override.json()["detail"]
+
+    # Project editors can maintain the isolated Agent override without gaining
+    # authority over the company MCP definition or its shared tool catalog.
+    agent_override_url = (
+        f"/api/admin/mcp-servers/{mcp_id}/overrides/agent/{project_agent_id}"
+    )
+    override_view = await env.client.get(
+        f"/api/admin/mcp-servers/{mcp_id}/overrides",
+        params={"agent_id": str(project_agent_id)},
+    )
+    assert override_view.status_code == 200, override_view.text
+    assert [item["scope_id"] for item in override_view.json()["agent"]] == [
+        str(project_agent_id)
+    ]
+    override_update = await env.client.put(
+        agent_override_url,
+        json={"headers_template": {"X-Project-Scope": "updated-project-only"}},
+    )
+    assert override_update.status_code == 200, override_update.text
+    assert override_update.json()["headers_template"] == {
+        "X-Project-Scope": "updated-project-only"
+    }
+    global_patch = await env.client.patch(
+        f"/api/admin/mcp-servers/{mcp_id}",
+        json={"display_name": "Must not change globally"},
+    )
+    assert global_patch.status_code == 403, global_patch.text
+    refresh_global_catalog = await env.client.post(
+        f"/api/admin/mcp-servers/{mcp_id}/refresh-tools",
+        params={"agent_id": str(project_agent_id)},
+    )
+    assert refresh_global_catalog.status_code == 403, refresh_global_catalog.text
+
+    detached_mcp = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"detached-project-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Detached project MCP",
+        base_url_template="https://detached.project.test",
+        headers_template={},
+        created_by_user_id=env.viewer_id,
+    )
+    env.db.add(detached_mcp)
+    await env.db.commit()
+    detached_mcp_id = detached_mcp.id
+    detached_override = await env.client.put(
+        f"/api/admin/mcp-servers/{detached_mcp_id}/overrides/agent/{project_agent_id}",
+        json={"headers_template": {"X-Project-Scope": "forged"}},
+    )
+    assert detached_override.status_code == 404, detached_override.text
+    detached_row = (
+        await env.db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == detached_mcp_id,
+                MCPServerOverride.scope_type == "agent",
+                MCPServerOverride.scope_id == project_agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    assert detached_row is None
+
+
+async def test_project_capability_options_are_the_create_authorization_boundary(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    shared_mcp = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"shared-project-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Shared Project MCP",
+        base_url_template="https://shared.project.test/mcp",
+        headers_template={},
+    )
+    worker_mcp = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"worker-project-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Worker Project MCP",
+        base_url_template="https://worker.project.test/mcp",
+        headers_template={},
+    )
+    market_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Market Project Skill",
+        description="A published project Skill.",
+        category="general",
+        folder_name=f"market-project-skill-{uuid.uuid4().hex[:8]}",
+        visibility="public",
+        status="published",
+    )
+    worker_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Worker Project Skill",
+        description="A Skill installed for one digital employee.",
+        category="general",
+        folder_name=f"worker-project-skill-{uuid.uuid4().hex[:8]}",
+        visibility="tenant",
+        status="published",
+        publisher_agent_id=env.source_reviewer_id,
+    )
+    draft_market_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Draft Market Project Skill",
+        description="Not published.",
+        category="general",
+        folder_name=f"draft-market-project-skill-{uuid.uuid4().hex[:8]}",
+        visibility="public",
+        status="draft",
+    )
+    offline_worker_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Offline Worker Project Skill",
+        description="No longer available.",
+        category="general",
+        folder_name=f"offline-worker-project-skill-{uuid.uuid4().hex[:8]}",
+        visibility="tenant",
+        status="offline",
+        publisher_agent_id=env.source_worker_id,
+    )
+    draft_worker_skill = Skill(
+        tenant_id=env.tenant_id,
+        name="Draft Worker Project Skill",
+        description="Not ready for project use.",
+        category="general",
+        folder_name=f"draft-worker-project-skill-{uuid.uuid4().hex[:8]}",
+        visibility="tenant",
+        status="draft",
+        publisher_agent_id=env.source_worker_id,
+    )
+    env.db.add_all(
+        [
+            shared_mcp,
+            worker_mcp,
+            market_skill,
+            worker_skill,
+            draft_market_skill,
+            offline_worker_skill,
+            draft_worker_skill,
+        ]
+    )
+    await env.db.flush()
+    shared_tool = Tool(
+        name=f"shared_project_mcp_tool_{uuid.uuid4().hex[:8]}",
+        display_name="Shared project action",
+        description="Perform an approved shared action.",
+        type="mcp",
+        category="general",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="admin",
+        tenant_id=env.tenant_id,
+        mcp_server_id=shared_mcp.id,
+    )
+    worker_tool = Tool(
+        name=f"worker_project_mcp_tool_{uuid.uuid4().hex[:8]}",
+        display_name="Worker project action",
+        description="Perform an action installed by one digital employee.",
+        type="mcp",
+        category="general",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="agent",
+        tenant_id=env.tenant_id,
+        mcp_server_id=worker_mcp.id,
+    )
+    env.db.add_all([shared_tool, worker_tool])
+    await env.db.flush()
+    env.db.add_all(
+        [
+            AgentTool(
+                agent_id=env.source_worker_id,
+                tool_id=worker_tool.id,
+                enabled=True,
+                source="user_installed",
+            ),
+            SkillInstall(
+                tenant_id=env.tenant_id,
+                skill_id=worker_skill.id,
+                agent_id=env.source_worker_id,
+                installed_by_user_id=env.owner_id,
+                is_active=True,
+            ),
+            SkillFile(
+                skill_id=market_skill.id,
+                path="SKILL.md",
+                content="---\nname: Market Project Skill\ndescription: Published\n---\n",
+            ),
+            SkillFile(
+                skill_id=worker_skill.id,
+                path="SKILL.md",
+                content="---\nname: Worker Project Skill\ndescription: Installed\n---\n",
+            ),
+        ]
+    )
+    await env.db.commit()
+    shared_mcp_id = shared_mcp.id
+    worker_mcp_id = worker_mcp.id
+    worker_tool_id = worker_tool.id
+    market_skill_id = market_skill.id
+    worker_skill_id = worker_skill.id
+    draft_market_skill_id = draft_market_skill.id
+    offline_worker_skill_id = offline_worker_skill.id
+    draft_worker_skill_id = draft_worker_skill.id
+
+    bootstrap = await env.client.get("/api/projects/bootstrap-options")
+    assert bootstrap.status_code == 200, bootstrap.text
+    bootstrap_payload = bootstrap.json()
+    assert "skills" not in bootstrap_payload
+    assert "mcp_servers" not in bootstrap_payload
+    capabilities = bootstrap_payload["capabilities"]
+    tool_options = bootstrap_payload["tools"]
+    shared_mcp_tool_option = next(
+        item for item in tool_options if item["id"] == str(shared_tool.id)
+    )
+    worker_mcp_tool_option = next(
+        item
+        for item in tool_options
+        if item["id"] == str(worker_tool_id)
+        and item["installed_by_agent_id"] == str(env.source_worker_id)
+    )
+    worker_skill_option = next(
+        item
+        for item in capabilities
+        if item["capability_id"] == str(worker_skill_id)
+        and item["owner_agent_id"] == str(env.source_worker_id)
+    )
+    assert shared_mcp_tool_option["source"] == "admin"
+    assert shared_mcp_tool_option["installed_by_agent_id"] is None
+    assert shared_mcp_tool_option["enabled"] is False
+    assert worker_mcp_tool_option["source"] == "agent"
+    assert worker_mcp_tool_option["agent_tool_source"] == "user_installed"
+    assert worker_mcp_tool_option["enabled"] is False
+    assert all(item["type"] != "mcp" for item in capabilities)
+    assert worker_skill_option["owner_agent_id"] == str(env.source_worker_id)
+    assert all(item["capability_id"] != str(draft_market_skill_id) for item in capabilities)
+    assert all(item["capability_id"] != str(offline_worker_skill_id) for item in capabilities)
+    assert all(item["capability_id"] != str(draft_worker_skill_id) for item in capabilities)
+    assert all("key" not in item for item in capabilities)
+
+    async def create_with(
+        *,
+        member_id: uuid.UUID,
+        mcp_ids: list[uuid.UUID] | None = None,
+        skill_ids: list[uuid.UUID] | None = None,
+        tool_ids: list[uuid.UUID] | None = None,
+    ):
+        return await env.client.post(
+            "/api/projects",
+            json={
+                "name": f"Capability boundary {uuid.uuid4().hex[:8]}",
+                "members": [
+                    {
+                        "agent_id": str(member_id),
+                        "is_leader": True,
+                        "settings": {
+                            "tools": [
+                                {"tool_id": str(value), "enabled": True}
+                                for value in (tool_ids or [])
+                            ],
+                            "mcp_capability_ids": [str(value) for value in (mcp_ids or [])],
+                            "skill_capability_ids": [str(value) for value in (skill_ids or [])],
+                        },
+                    }
+                ],
+            },
+        )
+
+    before_projects = await env.db.scalar(select(func.count()).select_from(Project))
+    before_agents = await env.db.scalar(select(func.count()).select_from(Agent))
+    before_bindings = await env.db.scalar(
+        select(func.count()).select_from(ProjectCapabilityBinding)
+    )
+    rejected = [
+        await create_with(member_id=env.source_leader_id, tool_ids=[worker_tool_id]),
+        await create_with(member_id=env.source_leader_id, mcp_ids=[worker_mcp_id]),
+        await create_with(member_id=env.source_leader_id, skill_ids=[worker_skill_id]),
+        await create_with(member_id=env.source_leader_id, skill_ids=[draft_market_skill_id]),
+        await create_with(member_id=env.source_worker_id, skill_ids=[offline_worker_skill_id]),
+        await create_with(member_id=env.source_worker_id, skill_ids=[draft_worker_skill_id]),
+        await env.client.post(
+            "/api/projects",
+            json={
+                "name": f"Forged inherited capability {uuid.uuid4().hex[:8]}",
+                "members": [{"agent_id": str(env.source_leader_id), "is_leader": True}],
+                "capabilities": [
+                    {
+                        "capability_type": "skill",
+                        "capability_id": str(worker_skill_id),
+                        "source": "inherited",
+                        "inherited_from_agent_id": str(env.source_leader_id),
+                    }
+                ],
+            },
+        ),
+        await env.client.post(
+            "/api/projects",
+            json={
+                "name": f"Forged shared capability {uuid.uuid4().hex[:8]}",
+                "members": [{"agent_id": str(env.source_leader_id), "is_leader": True}],
+                "shared_capability_ids": [str(worker_skill_id)],
+            },
+        ),
+    ]
+    assert [response.status_code for response in rejected] == [422] * 8
+    assert await env.db.scalar(select(func.count()).select_from(Project)) == before_projects
+    assert await env.db.scalar(select(func.count()).select_from(Agent)) == before_agents
+    assert (
+        await env.db.scalar(select(func.count()).select_from(ProjectCapabilityBinding)
+        ) == before_bindings
+    )
+    tenant_storage = env.storage_root / "_projects" / str(env.tenant_id)
+    assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
+
+    leader_project_response = await create_with(member_id=env.source_leader_id)
+    assert leader_project_response.status_code == 201, leader_project_response.text
+    leader_project_id = uuid.UUID(leader_project_response.json()["id"])
+    leader_project_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == leader_project_id
+            )
+        )
+    ).scalar_one()
+    leader_project_agent_id = leader_project_member.agent_id
+    binding_count = await env.db.scalar(
+        select(func.count()).select_from(ProjectCapabilityBinding)
+    )
+    cross_member_adds = [
+        await env.client.post(
+            f"/api/projects/{leader_project_id}/capabilities",
+            json={
+                "capability_type": capability_type,
+                "capability_id": str(capability_id),
+                "source": "inherited",
+                "inherited_from_agent_id": str(leader_project_agent_id),
+            },
+        )
+        for capability_type, capability_id in (
+            ("mcp", worker_mcp_id),
+            ("skill", worker_skill_id),
+        )
+    ]
+    assert [response.status_code for response in cross_member_adds] == [422, 422]
+    cross_member_import = await env.client.post(
+        f"/api/agents/{leader_project_agent_id}/files/import-skill",
+        json={"skill_id": str(worker_skill_id)},
+    )
+    assert cross_member_import.status_code == 422
+    assert (
+        await env.db.scalar(select(func.count()).select_from(ProjectCapabilityBinding))
+        == binding_count
+    )
+
+    allowed = await create_with(
+        member_id=env.source_worker_id,
+        mcp_ids=[shared_mcp_id, worker_mcp_id],
+        skill_ids=[market_skill_id, worker_skill_id],
+    )
+    assert allowed.status_code == 201, allowed.text
+    project_id = uuid.UUID(allowed.json()["id"])
+    project_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(ProjectMemberSnapshot.project_id == project_id)
+        )
+    ).scalar_one()
+    bindings = list(
+        (
+            await env.db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == project_id,
+                    ProjectCapabilityBinding.inherited_from_agent_id == project_member.agent_id,
+                )
+            )
+        ).scalars()
+    )
+    assert {(binding.capability_type, binding.capability_id) for binding in bindings} >= {
+        ("mcp", shared_mcp_id),
+        ("mcp", worker_mcp_id),
+        ("skill", market_skill_id),
+        ("skill", worker_skill_id),
+    }
+    source_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == env.source_worker_id,
+                AgentTool.tool_id == worker_tool_id,
+            )
+        )
+    ).scalar_one()
+    source_install = (
+        await env.db.execute(
+            select(SkillInstall).where(
+                SkillInstall.agent_id == env.source_worker_id,
+                SkillInstall.skill_id == worker_skill_id,
+            )
+        )
+    ).scalar_one()
+    assert source_assignment.enabled is True
+    assert source_install.is_active is True
 
 
 async def test_private_share_settings_and_audit_are_a_real_api_round_trip(project_api: ProjectApiEnv):
@@ -3481,7 +4034,7 @@ async def test_planning_group_message_only_wakes_owner_without_execution_tools(
         },
     )
     assert mentioned.status_code == 422
-    assert "start the project" in mentioned.json()["detail"]
+    assert "project owner" in mentioned.json()["detail"]
 
     stored_project = await env.db.get(Project, uuid.UUID(project_id))
     assert stored_project is not None
@@ -3489,10 +4042,70 @@ async def test_planning_group_message_only_wakes_owner_without_execution_tools(
     await env.db.commit()
     paused = await env.client.post(
         f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
-        json={"content": "This must wait until resume.", "mentions": []},
+        json={"content": "Summarize the current paused state.", "mentions": []},
     )
-    assert paused.status_code == 409
-    assert "resume" in paused.json()["detail"]
+    assert paused.status_code == 201, paused.text
+    paused_body = paused.json()
+    assert paused_body["awakened_agent_ids"] == [str(env.leader_id)]
+    assert len(paused_body["subagent_runs"]) == 1
+    paused_run = await env.db.get(
+        ProjectRun,
+        uuid.UUID(paused_body["subagent_runs"][0]["project_run_id"]),
+    )
+    assert paused_run is not None
+    assert paused_run.agent_id == env.leader_id
+    assert paused_run.input["dispatch"]["execution_tools_enabled"] is False
+    assert paused_run.input["dispatch"]["read_only_conversation"] is True
+    assert "project is paused" in paused_run.input["dispatch"]["task"]
+    assert "Do not restart delivery" in paused_run.input["dispatch"]["task"]
+    await env.db.refresh(stored_project)
+    assert stored_project.status == "paused"
+    paused_mention = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Wake the specialist.", "mentions": [str(env.worker_id)]},
+    )
+    assert paused_mention.status_code == 422
+
+    # The boundary belongs to the queued message, not the project's later
+    # status. Resuming must not retroactively add tools to this advisory turn.
+    stored_project.status = "running"
+    await env.db.commit()
+    assert (
+        await prepare_subagent_tools(
+            env.leader_id,
+            uuid.UUID(paused_body["subagent_runs"][0]["session_id"]),
+            execution_user_id=env.owner_id,
+        )
+        == []
+    )
+
+    stored_project.status = "completed"
+    await env.db.commit()
+    completed = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Explain the completed result.", "mentions": []},
+    )
+    assert completed.status_code == 201, completed.text
+    completed_body = completed.json()
+    assert completed_body["awakened_agent_ids"] == [str(env.leader_id)]
+    assert len(completed_body["subagent_runs"]) == 1
+    completed_run = await env.db.get(
+        ProjectRun,
+        uuid.UUID(completed_body["subagent_runs"][0]["project_run_id"]),
+    )
+    assert completed_run is not None
+    assert completed_run.agent_id == env.leader_id
+    assert completed_run.input["dispatch"]["execution_tools_enabled"] is False
+    assert completed_run.input["dispatch"]["read_only_conversation"] is True
+    assert "project is completed" in completed_run.input["dispatch"]["task"]
+    assert "Do not restart delivery" in completed_run.input["dispatch"]["task"]
+    await env.db.refresh(stored_project)
+    assert stored_project.status == "completed"
+    completed_mention = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Wake the specialist.", "mentions": [str(env.worker_id)]},
+    )
+    assert completed_mention.status_code == 422
 
 
 async def test_planning_leader_session_never_gets_project_runtime_tools(
@@ -4679,8 +5292,18 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         "send_message_to_parent",
         "send_session_message",
     }
-    private_file_mutation_names = {"delete_file", "edit_file", "move_file", "write_file"}
-    ordinary_read_names = {"read_file"}
+    private_file_names = {
+        "delete_file",
+        "edit_file",
+        "find_files",
+        "list_files",
+        "move_file",
+        "read_document",
+        "read_file",
+        "read_image",
+        "search_files",
+        "write_file",
+    }
 
     async def normal_tools_with_collaboration_bypasses(_agent_id, *, assignment_snapshot=None):
         return [
@@ -4692,7 +5315,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
-            for name in collaboration_bypass_names | private_file_mutation_names | ordinary_read_names
+            for name in collaboration_bypass_names | private_file_names
         ]
 
     monkeypatch.setattr(
@@ -4763,10 +5386,8 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     assert "project_set_status" not in worker_names
     assert worker_names.isdisjoint(collaboration_bypass_names)
     assert leader_names.isdisjoint(collaboration_bypass_names)
-    assert worker_names.isdisjoint(private_file_mutation_names)
-    assert leader_names.isdisjoint(private_file_mutation_names)
-    assert ordinary_read_names <= worker_names
-    assert ordinary_read_names <= leader_names
+    assert worker_names.isdisjoint(private_file_names)
+    assert leader_names.isdisjoint(private_file_names)
     assert {
         "project_create_work_item",
         "project_update_plan",
@@ -6243,7 +6864,14 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         headers_template={},
         instructions="Internal protocol instructions must not be product copy.",
     )
-    env.db.add(mcp_server)
+    shared_mcp_server = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"shared-runtime-{uuid.uuid4().hex[:8]}",
+        display_name="Shared Runtime MCP",
+        base_url_template="https://shared.example.invalid/mcp",
+        headers_template={},
+    )
+    env.db.add_all([mcp_server, shared_mcp_server])
     await env.db.flush()
     source_mcp_tool = Tool(
         name=f"mcp_release_evidence_{uuid.uuid4().hex[:8]}",
@@ -6253,11 +6881,23 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         category="engineering",
         parameters_schema={"type": "object", "properties": {}},
         enabled=True,
-        source="admin",
+        source="agent",
         tenant_id=env.tenant_id,
         mcp_server_id=mcp_server.id,
     )
-    env.db.add(source_mcp_tool)
+    shared_mcp_tool = Tool(
+        name=f"shared_mcp_release_evidence_{uuid.uuid4().hex[:8]}",
+        display_name="Shared release evidence query",
+        description="Read release evidence from a shared connection.",
+        type="mcp",
+        category="engineering",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        source="admin",
+        tenant_id=env.tenant_id,
+        mcp_server_id=shared_mcp_server.id,
+    )
+    env.db.add_all([source_mcp_tool, shared_mcp_tool])
     await env.db.flush()
     source_mcp_assignment = AgentTool(
         agent_id=env.source_worker_id,
@@ -6271,17 +6911,24 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
 
     bootstrap_response = await env.client.get("/api/projects/bootstrap-options")
     assert bootstrap_response.status_code == 200, bootstrap_response.text
-    bootstrap_capabilities = bootstrap_response.json()["capabilities"]
+    bootstrap_payload = bootstrap_response.json()
+    bootstrap_capabilities = bootstrap_payload["capabilities"]
     bootstrap_tool = next(
-        item for item in bootstrap_capabilities if item["capability_id"] == str(source_tool_id)
+        item for item in bootstrap_payload["tools"] if item["id"] == str(source_tool_id)
     )
-    assert bootstrap_tool["key"] == source_tool.name
-    assert "config" not in bootstrap_tool
-    bootstrap_mcp = next(
-        item for item in bootstrap_capabilities if item["capability_id"] == str(mcp_server.id)
+    assert bootstrap_tool["name"] == source_tool.name
+    assert bootstrap_tool["agent_config"] == {}
+    bootstrap_mcp_tool = next(
+        item
+        for item in bootstrap_payload["tools"]
+        if item["id"] == str(source_mcp_tool.id)
+        and item["installed_by_agent_id"] == str(env.source_worker_id)
     )
-    assert bootstrap_mcp["key"] == mcp_server.name
-    assert bootstrap_mcp["description"] == ""
+    assert bootstrap_mcp_tool["mcp_server_name"] == mcp_server.display_name
+    assert bootstrap_mcp_tool["agent_tool_source"] == "user_installed"
+    assert bootstrap_mcp_tool["agent_config"] == {}
+    assert bootstrap_mcp_tool["enabled"] is False
+    assert all(item["type"] != "mcp" for item in bootstrap_capabilities)
     folder = f"release-check-{uuid.uuid4().hex[:8]}"
     source_prefix = normalize_storage_key(f"{env.source_worker_id}/skills/{folder}")
     storage = get_storage_backend()
@@ -6324,7 +6971,22 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
             "inherited_from_agent_id": str(project_agent_id),
         },
     )
-    assert explicit_tool_binding.status_code == explicit_mcp_binding.status_code == 201
+    shared_mcp_binding = await env.client.post(
+        f"/api/projects/{source_project_id}/capabilities",
+        json={
+            "capability_type": "mcp",
+            "capability_id": str(shared_mcp_server.id),
+            "capability_name": shared_mcp_server.display_name,
+            "source": "inherited",
+            "inherited_from_agent_id": str(project_agent_id),
+        },
+    )
+    assert (
+        explicit_tool_binding.status_code
+        == explicit_mcp_binding.status_code
+        == shared_mcp_binding.status_code
+        == 201
+    )
 
     capabilities_response = await env.client.get(f"/api/projects/{source_project_id}/capabilities")
     assert capabilities_response.status_code == 200, capabilities_response.text
@@ -6460,6 +7122,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         version=5,
         visibility="tenant",
         status="published",
+        publisher_agent_id=env.source_worker_id,
     )
     env.db.add(library_skill)
     await env.db.flush()
@@ -6638,6 +7301,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         json={
             "name": "Release Skill template",
             "version": "1.0.0",
+            "is_published": True,
             "included_skill_binding_ids": [skill_binding["id"]],
         },
     )
@@ -6664,10 +7328,49 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     packaged_tool = next(
         item for item in selected_template.definition["capabilities"] if item["capability_type"] == "tool"
     )
+    packaged_mcp = [
+        item for item in selected_template.definition["capabilities"] if item["capability_type"] == "mcp"
+    ]
     assert packaged_tool["capability_id"] == str(source_tool_id)
+    assert [item["capability_id"] for item in packaged_mcp] == [str(shared_mcp_server.id)]
+    assert packaged_mcp[0]["source"] == "inherited"
+    assert packaged_mcp[0]["digital_employee_index"] == 3
+    assert str(mcp_server.id) not in str(selected_template.definition["capabilities"])
     assert "config" not in packaged_tool
     assert "must-not-cross-project-boundary" not in str(selected_template.definition)
 
+    # Older published snapshots may still contain registry identifiers that
+    # were portable before the canonical authorization boundary existed.
+    # They must not become authority when another user instantiates them.
+    selected_template.definition = {
+        **selected_template.definition,
+        "capabilities": [
+            *selected_template.definition["capabilities"],
+            {
+                "schema_version": 1,
+                "capability_type": "mcp",
+                "capability_id": str(mcp_server.id),
+                "capability_name": mcp_server.display_name,
+                "source": "inherited",
+                "digital_employee_index": 3,
+                "is_enabled": True,
+                "scope": {},
+            },
+                {
+                    "schema_version": 1,
+                    "capability_type": "skill",
+                    "capability_id": str(library_skill_id),
+                    "capability_name": "Library Check",
+                "source": "inherited",
+                "digital_employee_index": 3,
+                "is_enabled": True,
+                "scope": {},
+            },
+        ],
+    }
+    await env.db.commit()
+
+    env.authenticate_as(env.viewer_id)
     restored_response = await env.client.post(
         "/api/projects/from-template",
         json={"template_id": selected_template_body["id"], "name": "Restored Skill project"},
@@ -6718,6 +7421,20 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     ).scalar_one()
     assert restored_assignment.enabled is True
     assert restored_assignment.config == {}
+    restored_mcp_bindings = list(
+        (
+            await env.db.execute(
+                select(ProjectCapabilityBinding).where(
+                    ProjectCapabilityBinding.project_id == restored_project_id,
+                    ProjectCapabilityBinding.capability_type == "mcp",
+                )
+            )
+        ).scalars()
+    )
+    assert [(item.capability_id, item.source) for item in restored_mcp_bindings] == [
+        (shared_mcp_server.id, "inherited")
+    ]
+    assert restored_mcp_bindings[0].inherited_from_agent_id == restored_agent_id
     restored_project = await env.db.get(Project, restored_project_id)
     assert restored_project is not None
     restored_layout = project_agent_workspace(
@@ -6726,6 +7443,7 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
     )
     assert (restored_layout.root / "skills" / folder / "SKILL.md").read_text(encoding="utf-8") == manifest_content
 
+    env.authenticate_as(env.owner_id)
     deactivated = await env.client.post(f"/api/projects/{source_project_id}/agents/{project_agent_id}/deactivate")
     assert deactivated.status_code == 200, deactivated.text
     assert copied_manifest.read_text(encoding="utf-8") == manifest_content
@@ -7589,3 +8307,169 @@ async def test_generic_project_template_persists_only_sanitized_agent_assets(
     stored = await project_api.db.get(ProjectTemplate, uuid.UUID(response.json()["id"]))
     assert stored is not None
     assert stored.definition == definition
+
+
+async def test_template_market_admin_visibility_and_cross_tenant_management_boundaries(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    source_project = await _create_project(env, name="Template boundary source")
+    company_admin = await _user(
+        env.db,
+        await env.db.get(Tenant, env.tenant_id),
+        "CompanyAdmin",
+    )
+    company_admin.role = "org_admin"
+    platform_admin = await _user(
+        env.db,
+        await env.db.get(Tenant, env.tenant_id),
+        "PlatformAdmin",
+    )
+    platform_admin.role = "platform_admin"
+    other_tenant = Tenant(name="Other company", slug=f"other-{uuid.uuid4().hex[:8]}")
+    env.db.add(other_tenant)
+    await env.db.flush()
+    other_creator = await _user(env.db, other_tenant, "OtherCreator")
+    current_private = ProjectTemplate(
+        tenant_id=env.tenant_id,
+        created_by_user_id=env.viewer_id,
+        name="Company private template",
+        is_published=False,
+        definition={"goal": "Company-only draft"},
+    )
+    current_public = ProjectTemplate(
+        tenant_id=env.tenant_id,
+        created_by_user_id=env.owner_id,
+        name="Company public template",
+        is_published=True,
+        definition={"goal": "Published by this company"},
+    )
+    other_public = ProjectTemplate(
+        tenant_id=other_tenant.id,
+        created_by_user_id=other_creator.id,
+        name="Other public template",
+        is_published=True,
+        definition={"goal": "Published by another company"},
+    )
+    other_private = ProjectTemplate(
+        tenant_id=other_tenant.id,
+        created_by_user_id=other_creator.id,
+        name="Other private template",
+        is_published=False,
+        definition={"goal": "Other company draft"},
+    )
+    env.db.add_all((current_private, current_public, other_public, other_private))
+    await env.db.commit()
+    current_private_id = current_private.id
+    current_public_id = current_public.id
+    other_public_id = other_public.id
+    other_private_id = other_private.id
+    company_admin_id = company_admin.id
+    platform_admin_id = platform_admin.id
+
+    env.authenticate_as(company_admin_id)
+    admin_response = await env.client.get("/api/projects/templates")
+    assert admin_response.status_code == 200, admin_response.text
+    admin_templates = {uuid.UUID(item["id"]): item for item in admin_response.json()}
+    assert current_private_id in admin_templates
+    assert current_public_id in admin_templates
+    assert other_public_id in admin_templates
+    assert other_private_id not in admin_templates
+    assert admin_templates[current_private_id]["can_edit"] is True
+    assert admin_templates[current_private_id]["can_delete"] is True
+    assert admin_templates[other_public_id]["can_edit"] is False
+    assert admin_templates[other_public_id]["can_delete"] is False
+
+    market_overwrite = await env.client.put(
+        f"/api/projects/templates/{other_public_id}/from-project/{source_project['id']}"
+    )
+    assert market_overwrite.status_code == 404, market_overwrite.text
+    company_overwrite = await env.client.put(
+        f"/api/projects/templates/{current_public_id}/from-project/{source_project['id']}"
+    )
+    assert company_overwrite.status_code == 200, company_overwrite.text
+    assert company_overwrite.json()["can_edit"] is True
+
+    env.authenticate_as(env.viewer_id)
+    creator_response = await env.client.get(f"/api/projects/templates/{current_private_id}")
+    assert creator_response.status_code == 200, creator_response.text
+    assert creator_response.json()["can_edit"] is True
+    creator_delete = await env.client.delete(f"/api/projects/templates/{current_private_id}")
+    assert creator_delete.status_code == 204, creator_delete.text
+    assert await env.db.get(ProjectTemplate, current_private_id) is None
+
+    env.authenticate_as(platform_admin_id)
+    platform_response = await env.client.get("/api/projects/templates")
+    assert platform_response.status_code == 200, platform_response.text
+    platform_templates = {uuid.UUID(item["id"]): item for item in platform_response.json()}
+    assert other_private_id in platform_templates
+    assert platform_templates[other_private_id]["can_edit"] is True
+    assert platform_templates[other_private_id]["can_delete"] is True
+    platform_delete = await env.client.delete(f"/api/projects/templates/{other_private_id}")
+    assert platform_delete.status_code == 204, platform_delete.text
+    assert await env.db.get(ProjectTemplate, other_private_id) is None
+
+
+async def test_template_editor_is_hidden_and_overwrite_uses_same_project_snapshot(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    source = await _create_project(env, name="Template editor source")
+    template_response = await env.client.post(
+        f"/api/projects/{source['id']}/templates",
+        json={
+            "name": "Editable project template",
+            "description": "Original description",
+            "category": "operations",
+            "version": "2.0.0",
+            "is_published": False,
+        },
+    )
+    assert template_response.status_code == 201, template_response.text
+    template = template_response.json()
+    template_id = uuid.UUID(template["id"])
+
+    env.authenticate_as(env.viewer_id)
+    denied_editor = await env.client.post(f"/api/projects/templates/{template_id}/editor")
+    assert denied_editor.status_code == 404
+
+    env.authenticate_as(env.owner_id)
+    editor_response = await env.client.post(f"/api/projects/templates/{template_id}/editor")
+    assert editor_response.status_code == 201, editor_response.text
+    editor = editor_response.json()
+    editor_id = uuid.UUID(editor["id"])
+    assert editor["settings"]["template_editor"] == {"template_id": str(template_id)}
+
+    ordinary_projects = await env.client.get("/api/projects", params={"scope": "all"})
+    assert ordinary_projects.status_code == 200, ordinary_projects.text
+    assert editor_id not in {uuid.UUID(item["id"]) for item in ordinary_projects.json()}
+    direct_editor = await env.client.get(f"/api/projects/{editor_id}")
+    assert direct_editor.status_code == 200, direct_editor.text
+
+    changed = await env.client.patch(
+        f"/api/projects/{editor_id}",
+        json={"goal": "Updated through the template editor project"},
+    )
+    assert changed.status_code == 200, changed.text
+    overwrite = await env.client.put(
+        f"/api/projects/templates/{template_id}/from-project/{editor_id}"
+    )
+    assert overwrite.status_code == 200, overwrite.text
+    updated_template = overwrite.json()
+    assert updated_template["name"] == "Editable project template"
+    assert updated_template["description"] == "Original description"
+    assert updated_template["category"] == "operations"
+    assert updated_template["version"] == "2.0.0"
+    assert updated_template["is_published"] is False
+    assert updated_template["definition"]["goal"] == "Updated through the template editor project"
+    assert "template_editor" not in updated_template["definition"].get("settings", {})
+
+    deleted = await env.client.delete(f"/api/projects/templates/{template_id}")
+    assert deleted.status_code == 204, deleted.text
+    env.db.expire_all()
+    persisted_editor = await env.db.get(Project, editor_id)
+    assert persisted_editor is not None
+    assert persisted_editor.template_id is None
+    assert "template_editor" not in persisted_editor.settings
+    ordinary_projects = await env.client.get("/api/projects", params={"scope": "all"})
+    assert editor_id in {uuid.UUID(item["id"]) for item in ordinary_projects.json()}

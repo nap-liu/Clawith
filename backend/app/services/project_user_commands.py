@@ -402,7 +402,7 @@ async def create_milestone(
         raise RuntimeError("Milestone operation journal is unavailable")
     _git_head(attached, result["commit"])
     event.event_type = "git.milestone.created"
-    event.summary = f"Created delivery milestone {result['commit'][:12]}"
+    event.summary = "交付里程碑已创建"
     event.event_metadata = {
         **dict(event.event_metadata or {}),
         **result,

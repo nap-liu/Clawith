@@ -315,7 +315,7 @@
   display: grid;
   grid-template-columns:
     39px minmax(220px, 1.45fr) 130px minmax(170px, 0.8fr)
-    105px 112px 18px;
+    105px 112px 62px;
   align-items: center;
   gap: 14px;
   min-height: 96px;
@@ -514,6 +514,23 @@
 .pm-project-arrow {
   color: var(--text-tertiary);
 }
+.pm-project-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.pm-project-delete.btn {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--text-tertiary);
+}
+.pm-project-delete.btn:hover {
+  color: var(--error);
+  background: var(--error-subtle);
+}
 .pm-project-meta-mobile {
   display: none;
 }
@@ -525,7 +542,7 @@
 .pm-projects-grid .pm-project-card {
   min-height: 240px;
   display: grid;
-  grid-template-columns: 39px 1fr 18px;
+  grid-template-columns: 39px 1fr 62px;
   grid-template-rows: auto auto auto;
   align-items: start;
   border: 1px solid var(--border-subtle);
@@ -867,8 +884,18 @@
   border-top: 1px solid var(--border-subtle);
 }
 .pm-template-card footer > span {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-tertiary);
   font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pm-template-card-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
 }
 .pm-template-card footer button {
   display: flex;
@@ -1046,6 +1073,14 @@
   gap: 8px;
   padding-top: 20px;
 }
+.pm-template-detail > footer .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pm-spinner-icon {
+  animation: pm-spin 0.8s linear infinite;
+}
 .pm-modal-loading {
   display: flex;
   align-items: center;
@@ -1074,9 +1109,11 @@
 
 /* Creation flow */
 .pm-create-page {
-  min-height: calc(100vh - var(--header-height, 52px));
+  height: calc(100vh - var(--header-height, 52px));
+  min-height: 0;
   display: grid;
   grid-template-columns: 270px minmax(0, 1fr);
+  overflow: hidden;
   background: var(--bg-primary);
 }
 .pm-create-aside {
@@ -1223,9 +1260,11 @@
 }
 .pm-create-main {
   min-width: 0;
+  min-height: 0;
+  height: 100%;
   display: grid;
-  grid-template-rows: 58px 1fr 64px;
-  min-height: calc(100vh - var(--header-height, 52px));
+  grid-template-rows: 58px minmax(0, 1fr) 64px;
+  overflow: hidden;
 }
 .pm-create-main > header {
   display: flex;
@@ -1255,6 +1294,7 @@
 }
 .pm-create-content {
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   padding: 35px clamp(22px, 5vw, 78px) 60px;
 }
@@ -1529,6 +1569,52 @@
   gap: 9px;
   margin-top: 13px;
 }
+.pm-selected-agent-section {
+  margin-top: 13px;
+  padding: 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-primary);
+}
+.pm-selected-agent-section > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.pm-selected-agent-section > header strong {
+  color: var(--text-primary);
+  font-size: 10px;
+}
+.pm-selected-agent-section > header small {
+  color: var(--text-tertiary);
+  font-size: 8px;
+}
+.pm-selected-agent-section > header > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.pm-selected-agent-section > header > span i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--success);
+}
+.pm-agent-grid--selected {
+  max-height: 196px;
+  margin-top: 9px;
+  padding-right: 3px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.pm-agent-results {
+  max-height: 330px;
+  overflow: hidden;
+}
+.pm-agent-pagination {
+  margin-top: 10px;
+}
 .pm-agent-search {
   margin-top: 13px;
 }
@@ -1657,10 +1743,19 @@
   display: grid;
   gap: 14px;
 }
+.pm-capability-agent-search {
+  width: 100%;
+}
 .pm-selected-agent-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 8px;
+  max-height: 190px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.pm-capability-agent-pagination {
+  justify-self: end;
 }
 .pm-selected-agent-list > .btn {
   min-width: 0;
@@ -1696,6 +1791,9 @@
 }
 .pm-capability-panel .project-workspace__member-capability-rail {
   margin: 0 0 14px;
+}
+.pm-capability-panel .project-workspace__member-capability-body {
+  min-height: 0;
 }
 .pm-capability-panel__body {
   min-height: 0;
@@ -2006,6 +2104,17 @@
   flex: 1;
   padding: 0 10px;
 }
+.pm-share-search {
+  display: flex;
+  margin: 12px 12px 0;
+}
+.pm-share-search input {
+  width: 100%;
+}
+.pm-share-search .ui-search-input__control {
+  padding-right: 12px;
+  padding-left: 38px;
+}
 .pm-share-box > .pm-chip-row {
   padding: 0 12px 12px;
 }
@@ -2060,6 +2169,13 @@
   color: var(--text-tertiary);
   font-size: 8px;
 }
+.pm-share-pagination {
+  margin: 0 12px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
 .pm-final-review dl {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -2102,7 +2218,7 @@
   .pm-project-card {
     grid-template-columns:
       39px minmax(230px, 1.4fr) 110px minmax(160px, 0.8fr)
-      95px 18px;
+      95px 62px;
   }
   .pm-project-update {
     display: none;
@@ -2132,7 +2248,7 @@
     border-right: 1px solid var(--border-subtle);
   }
   .pm-project-card {
-    grid-template-columns: 39px 1fr 18px;
+    grid-template-columns: 39px 1fr 62px;
   }
   .pm-project-team,
   .pm-project-signal,
@@ -2162,7 +2278,11 @@
     width: auto;
   }
   .pm-create-page {
+    height: calc(100vh - var(--header-height, 52px));
+    min-height: 0;
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
   }
   .pm-create-aside {
     position: static;
@@ -2201,10 +2321,14 @@
     display: none;
   }
   .pm-create-main {
-    min-height: auto;
+    height: 100%;
+    min-height: 0;
+    grid-template-rows: 58px minmax(0, 1fr) 64px;
+    overflow: hidden;
   }
   .pm-create-content {
-    overflow: visible;
+    min-height: 0;
+    overflow-y: auto;
   }
 }
 @media (max-width: 620px) {
@@ -2302,6 +2426,24 @@
   }
   .pm-template-detail {
     padding: 18px;
+  }
+}
+@media (max-width: 480px) {
+  .pm-header-actions {
+    flex-direction: column;
+  }
+  .pm-header-actions .pm-button {
+    width: 100%;
+  }
+  .pm-project-card {
+    grid-template-columns: 34px minmax(0, 1fr) 54px;
+    gap: 9px;
+    padding-inline: 12px;
+  }
+  .pm-project-title {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
   }
 }
 @media (prefers-reduced-motion: reduce) {

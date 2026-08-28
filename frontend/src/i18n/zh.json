@@ -9,7 +9,7 @@
     "dynamicCopy": {
       "owner": "负责人",
       "projectOwner": "负责人",
-      "sourceDigitalEmployee": "源数字员工",
+      "sourceDigitalEmployee": "原数字员工",
       "projectDigitalEmployee": "项目专用数字员工",
       "digitalEmployee": "数字员工",
       "digitalEmployees": "数字员工",
@@ -26,33 +26,33 @@
     "planningConnection": "正在连接项目负责人",
     "planningUnavailable": "项目规划暂时不可用，请稍后重试。",
     "planningTogether": "与负责人共同规划",
-    "planningPrompt": "说明背景、约束和期望结果。负责人会与你一起收敛可执行方案。",
+    "planningPrompt": "填写项目背景、约束和期望结果，用于形成项目方案。",
     "ownerRole": "负责人 · 全项目操作",
     "confirmAndStart": "确认方案并启动负责人",
-    "confirmHintReady": "确认后将保留规划记录，并由负责人开始推进。",
-    "confirmHintWaiting": "与负责人至少完成一轮问答后，才可确认并启动。",
+    "confirmHintReady": "确认方案后开始项目执行。",
+    "confirmHintWaiting": "完成项目方案讨论后可确认启动。",
     "groupProcessingFallback": "负责人",
     "create": {
       "teamStep": "项目名、数字员工与负责人",
-      "planningIntro": "先建立协作空间，再与负责人完成规划",
+      "planningIntro": "建立项目团队并完成项目规划",
       "createAndPlan": "创建并与负责人规划",
-      "teamDescription": "这里只建立协作空间，不要求提前写完整目标。创建后与负责人讨论目标和方案，再确认启动。",
-      "planningDescription": "项目创建后先进入规划阶段，由你和负责人澄清背景、目标、成功标准与执行方案；确认后再启动数字员工运行。",
+      "teamDescription": "设置项目名称、数字员工和负责人。项目目标与方案可在创建后继续完善。",
+      "planningDescription": "项目创建后进入规划阶段，用于确认背景、目标、成功标准与执行方案。",
       "teamOwner": "{{count}} 个数字员工 · 负责人：",
       "nextStep": "与负责人讨论目标和方案，再确认启动",
-      "workspaceNext": "协作空间准备完成后，将进入项目工作区，与负责人共同补齐目标、成功标准和执行方案。"
+      "workspaceNext": "项目创建后进入工作区，可继续完善目标、成功标准和执行方案。"
     },
     "planning": {
       "sessionTitle": "{{name}} · 项目规划",
-      "loadingDescription": "正在准备项目规划会话…",
+      "loadingDescription": "正在加载项目规划…",
       "unavailableTitle": "规划会话暂时不可用",
       "reload": "重新加载",
       "backToProjects": "项目列表",
       "eyebrow": "项目规划",
-      "description": "通过对话形成目标、成功标准与执行方案，无需预先填写流程表单。",
+      "description": "通过讨论明确项目目标、成功标准与执行方案。",
       "started": "已启动",
       "planning": "规划中",
-      "ownerDescription": "负责将讨论收敛为可执行计划，并在确认后持续推进项目目标。",
+      "ownerDescription": "负责制定执行计划并推进项目目标。",
       "messageCount": "规划会话已有 {{count}} 条消息",
       "startMessage": "先发送一条消息开始规划",
       "continue": "继续规划",
@@ -63,36 +63,36 @@
       "successTitle": "成功标准",
       "successDescription": "形成可验收、可回溯的完成定义",
       "planTitle": "执行方案",
-      "planDescription": "拆解阶段、责任与首批工作项",
+      "planDescription": "拆解阶段、责任与首批任务",
       "members": "项目成员",
-      "ownerScope": "可在项目范围内管理工作项、运行、交付物、成员协作与项目能力。",
+      "ownerScope": "可在项目范围内管理任务、运行、交付物、成员协作与项目能力。",
       "memberScope": "按角色分工协作。",
-      "recordPreserved": "规划确认记录将被保留",
+      "recordPreserved": "保留项目规划记录",
       "capabilitiesConfirmed": "项目能力按已确认的配置生效",
       "approvalRequired": "高风险操作仍需审批",
       "startFailed": "启动失败，请检查规划对话后重试。",
       "enterWorkspace": "进入项目工作区"
     },
     "workspace": {
-      "planningBanner": "继续与负责人讨论目标与方案；确认无误后，再由你启动负责人推进项目。",
+      "planningBanner": "继续完善项目目标与方案，确认后启动项目执行。",
       "planningStarted": "方案已确认，负责人开始推进项目",
-      "projectDescriptionFallback": "项目说明将在与负责人的方案讨论中逐步收敛。",
-      "workItemsAfterPlanning": "在项目群聊中与负责人确认方案后，工作项会自动出现在这里。",
+      "projectDescriptionFallback": "项目说明尚未完善。",
+      "workItemsAfterPlanning": "项目方案确认后，任务将在此显示。",
       "meshDescription": "查看团队成员之间的协作关系与分工。",
-      "workItemsAfterBreakdown": "负责人拆解目标后，工作项会显示在这里。",
+      "workItemsAfterBreakdown": "项目目标拆解后，任务将在此显示。",
       "runByOwner": "由负责人执行",
-      "runsAfterKickoff": "在项目群聊中确认目标并启动负责人后，运行记录会自动生成并持续保留。",
+      "runsAfterKickoff": "项目启动后，执行记录将在此显示。",
       "ownerChanged": "执行负责人已切换",
       "addMemberBeforeOwner": "先添加一个数字员工，再从在岗成员中指定负责人。",
       "memberOwner": "{{name}} · 负责人",
-      "ownerToolDescription": "参与者仅更新本人工作项；负责人可编辑和指派。",
+      "ownerToolDescription": "参与者仅更新本人任务；负责人可编辑和指派。",
       "memberLifecycleToolDescription": "启用或停用非负责人项目成员。",
       "ownerTools": "负责人专用",
       "ownerToolScope": "仅负责人",
       "allMembers": "全部成员",
       "projectMembers": "项目成员",
       "currentExecutionOwner": "本次执行负责人",
-      "shareOwnerExcluded": "成员必须来自当前组织；无需重复选择项目负责人。",
+      "shareOwnerExcluded": "共享成员须属于当前组织，项目负责人已包含在访问范围内。",
       "repositoryOwnerRequired": "只有项目负责人可以替换仓库来源。",
       "repositoryOwnerVisibility": "仅负责人可见",
       "repositoryOwnerManagement": "远端仅负责人可管理",
@@ -108,7 +108,7 @@
     "groups": {
       "workspace": "项目工作区",
       "collaboration": "运行与协作",
-      "governance": "治理与追溯"
+      "governance": "设置与记录"
     },
     "domains": {
       "overview": "概览",
@@ -120,30 +120,30 @@
     },
     "secondaryAria": "{{domain}}视图",
     "tabs": {
-      "cockpit": "项目驾驶舱",
+      "cockpit": "项目概览",
       "group": "项目群聊",
       "work": "目标与任务",
-      "mesh": "A2A Mesh",
-      "detail": "工作项",
+      "mesh": "协作关系",
+      "detail": "任务",
       "workspace": "工作区",
       "milestones": "交付里程碑",
-      "runs": "运行控制",
+      "runs": "执行记录",
       "projectAgents": "数字员工",
       "capabilities": "能力中心",
       "matrix": "可用范围",
       "policies": "项目设置",
-      "git": "Git 历史与恢复",
-      "audit": "项目事件审计"
+      "git": "版本历史与恢复",
+      "audit": "项目操作记录"
     }
   },
   "projectRuntime": {
-    "badge": "项目运行控制",
+    "badge": "项目状态",
     "pauseAction": "暂停项目",
     "resumeAction": "恢复项目",
-    "pauseTitle": "暂停这个项目？",
-    "resumeTitle": "恢复这个项目？",
-    "pauseDescription": "项目内数字员工将停止接收新消息、A2A 请求、Run、调度和排队工作；历史记录与追溯保持可见，已经执行中的工作会安全完成。",
-    "resumeDescription": "项目内数字员工将重新接收新工作，已延后的队列与调度可以继续。",
+    "pauseTitle": "确认暂停项目？",
+    "resumeTitle": "确认恢复项目？",
+    "pauseDescription": "暂停期间不再启动新的执行任务；项目记录和群聊仍可查看和继续。",
+    "resumeDescription": "恢复后可继续启动执行任务和协作流程。",
     "confirmPause": "暂停项目",
     "confirmResume": "恢复项目",
     "pauseSuccess": "项目已暂停",
@@ -158,30 +158,30 @@
       "retry": "重试"
     },
     "loading": {
-      "title": "正在建立项目运行视图",
-      "description": "正在读取成员、能力、运行与追溯信息…"
+      "title": "正在加载项目",
+      "description": "正在加载成员、能力和执行信息…"
     },
     "errors": {
       "requestFailed": "请求失败，请稍后重试。",
-      "missingProjectId": "缺少项目 ID，无法加载项目工作台。",
+      "missingProjectId": "无法识别项目，请返回项目列表后重试。",
       "loadTitle": "项目工作台未能加载",
       "noProjectData": "没有可显示的项目数据。",
       "refreshFailed": "后台刷新暂时失败",
-      "dashboardProjectMissing": "项目驾驶舱未返回项目摘要。"
+      "dashboardProjectMissing": "项目概览暂不可用。"
     },
     "planning": {
       "title": "方案仍处于规划阶段"
     },
     "resources": {
       "warningTitle": "部分项目资源暂不可用",
-      "memberSnapshots": "成员快照",
-      "capabilityBindings": "能力绑定",
-      "gitRepository": "Git 仓库",
-      "projectPolicies": "项目策略",
+      "memberSnapshots": "成员设置",
+      "capabilityBindings": "成员能力",
+      "gitRepository": "项目仓库",
+      "projectPolicies": "项目设置",
       "workspace": "工作区",
-      "runRecords": "运行记录",
+      "runRecords": "执行记录",
       "projectEvents": "项目事件",
-      "loadFailed": "{{resource}}：{{error}}"
+      "loadFailed": "{{resource}}暂不可用"
     },
     "session": {
       "view": "查看会话",
@@ -189,14 +189,14 @@
       "projectChat": "项目群聊",
       "projectChatTitle": "{{project}} · 项目群聊",
       "collaborationRecord": "协作记录",
-      "a2a": "A2A 会话",
-      "a2aTitle": "{{name}} · A2A 会话",
-      "run": "运行会话",
-      "noDeliveredA2A": "该记录还没有已送达的 A2A 会话",
-      "noAnchor": "该记录还没有可查看的会话锚点",
-      "missingEmployee": "会话缺少归属数字员工，暂时无法打开",
+      "a2a": "成员协作会话",
+      "a2aTitle": "{{name}} · 成员协作会话",
+      "run": "执行会话",
+      "noDeliveredA2A": "暂无可查看的成员协作会话",
+      "noAnchor": "暂无可查看的关联会话",
+      "missingEmployee": "暂时无法打开该会话",
       "unavailableTitle": "项目群聊暂不可用",
-      "unavailableDescription": "请稍后重试，或刷新项目后再次打开。"
+      "unavailableDescription": "可稍后重试或刷新项目。"
     },
     "priority": {
       "low": "低",
@@ -210,48 +210,50 @@
     "mesh": {
       "title": "协作网络",
       "emptyTitle": "项目还没有数字员工成员",
-      "emptyDescription": "添加成员后，协作关系将显示在这里。"
+      "emptyDescription": "添加成员后可查看协作关系。"
     },
     "audit": {
-      "searchPlaceholder": "搜索事件、会话或 Commit",
-      "searchAria": "搜索审计事件",
-      "typeFilterAria": "筛选事件类型",
-      "allTypes": "全部事件",
+      "searchPlaceholder": "搜索操作、会话或版本",
+      "searchAria": "搜索项目操作记录",
+      "typeFilterAria": "筛选操作类型",
+      "allTypes": "全部操作",
       "clearFilters": "清除筛选",
       "refresh": "刷新",
-      "noMatchesTitle": "没有符合条件的事件",
-      "emptyTitle": "还没有审计事件",
+      "noMatchesTitle": "没有符合条件的记录",
+      "emptyTitle": "暂无项目操作记录",
       "noMatchesDescription": "调整或清除筛选条件后重试。",
-      "emptyDescription": "项目操作发生后，审计事件会按时间和因果链显示。"
+      "emptyDescription": "项目操作记录将按时间顺序显示。"
     },
     "workItems": {
+      "eyebrow": "任务管理",
       "title": "目标与任务",
-      "description": "从项目结果拆解到可验收工作项，依赖、委派与证据保持关联。",
-      "noDescription": "未提供工作项背景。",
+      "description": "从项目结果拆解到可验收任务，依赖、委派与证据保持关联。",
+      "noDescription": "未提供任务背景。",
       "noAcceptance": "尚未定义验收条件",
       "notReported": "未上报",
       "statusCompleted": "状态已完成",
       "noExecutionData": "暂无执行数据",
+      "latestExecution": "最近执行",
       "acceptanceNotReported": "未逐项上报",
       "acceptanceCount": "{{count}} 条验收条件",
       "executionAria": "{{title}} 执行进度",
-      "listAria": "项目工作项列表，共 {{count}} 项",
+      "listAria": "项目任务列表，共 {{count}} 项",
       "historicalAssigneeSuffix": " · 已退出（历史指派）",
       "views": {
         "graph": "依赖图",
         "board": "看板",
         "list": "列表",
-        "aria": "工作项视图"
+        "aria": "任务视图"
       },
       "actions": {
-        "create": "创建工作项",
-        "createFirst": "创建第一个工作项",
-        "createRun": "创建 Run",
+        "create": "创建任务",
+        "createFirst": "创建第一个任务",
+        "createRun": "开始执行",
         "return": "退回修改",
         "approve": "验收通过"
       },
       "create": {
-        "title": "创建并指派工作项"
+        "title": "创建并指派任务"
       },
       "fields": {
         "title": "标题",
@@ -276,8 +278,8 @@
         "approved": "任务已验收通过"
       },
       "empty": {
-        "title": "目标还没有拆成工作项",
-        "description": "创建工作项后，项目成员即可开始推进。"
+        "title": "目标还没有拆成任务",
+        "description": "创建任务后，项目成员即可开始推进。"
       },
       "detail": {
         "singlePage": {
@@ -290,10 +292,11 @@
           "acceptancePending": "等待验收",
           "acceptancePassed": "已满足验收标准",
           "evidenceCount": "已有 {{count}} 项验收依据",
-          "evidencePending": "成果就绪后，可在这里查看验收依据。",
+          "evidencePending": "成果就绪后可查看验收依据。",
           "nextStep": "下一步",
           "progressTitle": "最近进展",
           "progressEmpty": "任务尚未开始",
+          "executionUnavailable": "本次执行未完成，可查看执行记录或重新推进。",
           "viewAllProgress": "查看全部进展",
           "edit": "编辑任务",
           "save": "保存修改",
@@ -329,9 +332,9 @@
           }
         },
         "tabs": {
-          "aria": "工作项详情分区",
+          "aria": "任务详情分区",
           "context": "上下文与验收",
-          "execution": "执行与事件 · {{runs}} Run / {{events}} 事件",
+          "execution": "执行记录 · {{runs}} 次执行 / {{events}} 条记录",
           "conversation": "关联会话",
           "changes": "代码与文件变化",
           "review": "证据与审批"
@@ -340,9 +343,9 @@
           "taskDescription": "任务说明",
           "deliverable": "交付内容",
           "inputsDependencies": "输入与依赖",
-          "relatedWorkItem": "关联工作项",
+          "relatedWorkItem": "关联任务",
           "noDependencies": "无前置依赖，可直接开始。",
-          "verifyEvidence": "工作项已完成，请核对关联证据",
+          "verifyEvidence": "任务已完成，请核对关联证据",
           "awaitEvidence": "等待执行结果或评审证据",
           "defineAcceptance": "请先完善验收边界，再启动执行。"
         },
@@ -351,43 +354,43 @@
           "title": "指派与状态推进"
         },
         "execution": {
-          "runWorkItem": "执行工作项",
-          "snapshotFrozen": "已冻结本次执行的成员、能力与输入快照。",
+          "runWorkItem": "执行任务",
+          "snapshotFrozen": "本次执行使用已确认的成员、能力与输入设置。",
           "viewAll": "查看全部活动",
           "emptyTitle": "还没有执行记录",
-          "emptyDescription": "当数字员工接受、运行或更新该工作项时，这里会按时间展示。"
+          "emptyDescription": "数字员工执行或更新任务后，将按时间显示执行记录。"
         },
         "conversation": {
-          "preserved": "会话已作为工作项的执行证据保留。",
+          "preserved": "会话已作为任务的执行证据保留。",
           "viewAll": "查看全部关联活动",
           "emptyTitle": "还没有关联会话",
-          "emptyDescription": "该工作项触发数字员工执行或 A2A 协作后，会话锚点会出现在这里。"
+          "emptyDescription": "任务产生执行或成员协作会话后，将在此显示。"
         },
         "changes": {
           "fileCount": "{{count}} 个关联文件",
-          "commitCount": "{{count}} 个 Commit",
-          "traced": "已追溯",
-          "projectCommit": "项目提交",
+          "commitCount": "{{count}} 个版本",
+          "traced": "已关联",
+          "projectCommit": "项目版本",
           "viewAll": "查看全部交付内容",
           "relatedChange": "关联变更",
           "openWorkspace": "在工作区中打开",
-          "viewGit": "查看 Git 历史",
-          "relatedCommit": "关联提交",
+          "viewGit": "查看版本历史",
+          "relatedCommit": "关联版本",
           "emptyTitle": "还没有关联的代码或文件变化",
-          "emptyDescription": "项目提交包含 Work-Item 追溯信息后，变更会自动归集。"
+          "emptyDescription": "与任务关联的文件变更将在此显示。"
         },
         "review": {
           "coverage": "验收覆盖",
           "summary": "{{criteria}} 条验收条件 · {{runs}} 次执行 · {{evidence}} 项验收记录",
-          "verifyResult": "已有关联运行或版本，请核对结果。",
+          "verifyResult": "已有关联执行记录或版本，请核对结果。",
           "noResult": "还没有可核对的结果。",
           "noEvidence": "无验收记录",
-          "noEvidenceDescription": "验收记录会显示在这里。",
+          "noEvidenceDescription": "完成验收后可查看相关记录。",
           "approval": "结果审批",
-          "relatedRuns": "关联 Run",
-          "sessions": "A2A / 会话",
-          "commitsFiles": "Commit / 文件",
-          "latestRun": "最近运行",
+          "relatedRuns": "关联执行",
+          "sessions": "协作会话",
+          "commitsFiles": "版本 / 文件",
+          "latestRun": "最近执行",
           "lastUpdated": "最后更新"
         },
         "meta": {
@@ -416,20 +419,21 @@
       },
       "empty": {
         "title": "还没有交付里程碑",
-        "description": "阶段成果确认后，可在这里创建里程碑。"
+        "description": "阶段成果确认后可创建里程碑。"
       }
     },
     "runs": {
+      "eyebrow": "执行记录",
       "defaultObjective": "推进项目目标",
       "historicalMember": "历史成员 · 会话只读",
-      "emptyTitle": "还没有运行记录",
+      "emptyTitle": "还没有执行记录",
       "triggers": {
-        "manual": "手动启动的项目运行",
+        "manual": "手动启动的项目执行",
         "groupMessage": "处理项目群聊消息",
         "collaborationBatch": "汇总协作结果并推进项目",
         "a2a": "处理数字员工协作请求",
         "schedule": "执行计划中的项目任务",
-        "system": "执行项目自动任务"
+        "system": "执行项目任务"
       },
       "actions": {
         "pause": "暂停",
@@ -437,10 +441,10 @@
         "complete": "完成"
       },
       "feedback": {
-        "retried": "已创建新的重试 Run；原运行记录保持不变",
-        "waiting": "Run 已转为等待",
-        "resumed": "Run 已恢复",
-        "completed": "Run 已标记完成"
+        "retried": "已重新执行，原执行记录保持不变",
+        "waiting": "执行已转为等待",
+        "resumed": "执行已恢复",
+        "completed": "执行已完成"
       }
     },
     "members": {
@@ -460,47 +464,47 @@
       },
       "historical": {
         "title": "历史只读",
-        "description": "该数字员工不再接收 @、新指派或项目工具调用。恢复前只能查看其快照、Run 与关联会话。"
+        "description": "该数字员工不再接收消息、任务或项目操作，恢复前可查看已有设置、执行记录和关联会话。"
       },
       "fields": {
         "primaryModel": "主模型",
         "primaryModelHint": "仅覆盖当前项目中的数字员工模型。",
-        "primaryModelAria": "项目快照主模型",
+        "primaryModelAria": "项目主模型",
         "fallbackModel": "备用模型",
-        "fallbackModelAria": "项目快照备用模型",
-        "maxToolRounds": "最大工具轮次",
+        "fallbackModelAria": "项目备用模型",
+        "maxToolRounds": "工具调用上限",
         "instructions": "项目专属指令",
-        "departedHint": "退出时的项目快照保持原样。",
+        "departedHint": "保留退出时的项目设置。",
         "instructionsHint": "仅作用于该数字员工在当前项目中的执行。"
       },
       "facts": {
-        "generation": "快照代次",
+        "generation": "设置版本",
         "inheritedCapabilities": "继承能力",
         "disabledTools": "关闭工具",
-        "updated": "快照更新"
+        "updated": "设置更新时间"
       }
     },
     "capabilities": {
-      "description": "项目共享 Skill/MCP 对成员可见；数字员工带入能力可逐项关闭，均不影响源数字员工。",
+      "description": "项目共享 Skill 和 MCP 可供成员使用；数字员工的项目能力可独立调整，不影响原数字员工。",
       "projectShared": "项目共享",
       "inherited": "数字员工带入",
       "filterAria": "能力筛选",
       "capability": "能力",
       "inheritedFrom": "由 {{name}} 带入{{departed}}",
       "departedSuffix": " · 成员已退出",
-      "departedDescription": "成员已退出，带入能力保持冻结；恢复成员后可重新配置。",
+      "departedDescription": "成员已退出，原设置保持不变；恢复成员后可重新配置。",
       "noDescription": "没有能力说明。",
       "scopeCount": "{{count}} 项权限范围",
       "noScope": "未配置权限范围",
       "departedHistorical": "已退出 · 历史",
-      "policyResolved": "按策略解析",
+      "policyResolved": "由项目设置决定",
       "actions": {
         "enable": "启用 {{name}}",
         "disable": "关闭 {{name}}"
       },
       "feedback": {
         "enabled": "能力已在项目内启用",
-        "disabled": "能力已在项目内关闭；源数字员工不受影响"
+        "disabled": "能力已在项目内关闭，原数字员工不受影响"
       },
       "columns": {
         "capability": "能力",
@@ -508,11 +512,11 @@
       },
       "empty": {
         "title": "没有符合条件的能力",
-        "description": "添加项目共享 Skill/MCP，或启用成员带入的能力后会出现在这里。"
+        "description": "添加项目共享 Skill、MCP 或启用成员能力后可在此管理。"
       },
       "matrixEmpty": {
         "title": "能力矩阵尚不可计算",
-        "description": "至少需要一个项目成员和一个能力绑定。"
+        "description": "至少需要一个项目成员和一项可用能力。"
       }
     },
     "visibility": {
@@ -542,7 +546,7 @@
       "noMembers": "暂无可共享成员",
       "noMatches": "没有匹配的组织成员",
       "selectMembersAria": "选择项目共享成员",
-      "membersLoadFailed": "组织成员读取失败：{{error}}",
+      "membersLoadFailed": "组织成员暂时无法加载。",
       "readOnly": "当前账号不能管理此项目的可见范围。",
       "permissionDeniedDraft": "你没有管理此项目可见范围的权限，草稿已保留。",
       "save": "保存访问设置",
@@ -553,25 +557,25 @@
     },
     "policies": {
       "eyebrow": "项目设置",
-      "runtimeTitle": "运行设置",
-      "runtimeDescription": "设置项目使用的模型、并行数量和成员协作边界。",
-      "defaultTenantModel": "跟随租户默认模型",
+      "runtimeTitle": "执行设置",
+      "runtimeDescription": "设置项目模型、同时处理任务数和成员协作范围。",
+      "defaultTenantModel": "使用组织默认模型",
       "loadingModels": "正在读取模型…",
       "selectModel": "选择模型",
-      "modelsLoadFailed": "模型读取失败：{{error}}",
+      "modelsLoadFailed": "模型暂时无法加载。",
       "actions": {
-        "save": "保存运行设置"
+        "save": "保存执行设置"
       },
       "feedback": {
         "saved": "项目设置已保存"
       },
       "fields": {
         "defaultModel": "默认模型",
-        "defaultModelHint": "使用当前租户已启用的模型。",
-        "maxParallelRuns": "并行任务数",
+        "defaultModelHint": "使用当前组织已启用的模型。",
+        "maxParallelRuns": "同时处理任务数",
         "maxA2AWakes": "单次协作上限",
-        "loopGuard": "防止重复协作",
-        "loopGuardHint": "限制成员之间重复发起相同协作。",
+        "loopGuard": "避免重复协作",
+        "loopGuardHint": "避免成员之间重复发起相同协作。",
         "enabled": "已开启",
         "disabled": "已关闭"
       }
@@ -585,20 +589,23 @@
       "projectSourceHint": "当前内容由项目创建",
       "defaultBranch": "默认分支",
       "remoteCount": "远端数量",
-      "standardGitHint": "支持标准 Git 仓库地址",
+      "standardGitHint": "支持常用代码仓库地址",
+      "remoteSection": "远端管理",
       "remoteList": "远端列表",
       "notPlanning": "项目已离开规划阶段，不能再替换仓库。",
-      "hasDeliverables": "仓库已包含项目产出，不能再执行初始化克隆。",
+      "hasDeliverables": "项目已有成果，不能再替换初始仓库内容。",
       "loadingRemotes": "正在读取远端",
       "noRemotes": "还没有配置远端",
       "noRemotesDescription": "添加远端后即可同步代码。",
-      "memberHistoryHint": "共享成员可以查看提交历史。",
-      "initializeRemote": "从远程初始化",
-      "cloneAvailable": "可克隆",
-      "cloneUnavailable": "不可克隆",
-      "confirmAria": "确认从远程仓库初始化",
+      "memberHistoryHint": "共享成员可以查看版本记录。",
+      "initialSourceSection": "初始仓库",
+      "initializeRemote": "从远程仓库导入",
+      "cloneAvailable": "可导入",
+      "cloneUnavailable": "暂不可导入",
+      "confirmAria": "确认从远程仓库导入",
       "importTitle": "导入远程仓库",
-      "importDescription": "将使用该仓库内容初始化项目。请确认仓库地址与分支。",
+      "importEyebrow": "导入仓库",
+      "importDescription": "将使用该仓库内容创建项目，请确认仓库地址与分支。",
       "remote": "远端",
       "branch": "分支",
       "remoteDefaultBranch": "远端默认分支",
@@ -633,7 +640,7 @@
     }
   },
   "projectCockpit": {
-    "title": "项目驾驶舱",
+    "title": "项目概览",
     "description": "目标、成员和执行信号的项目摘要。",
     "openGroupChat": "打开项目群聊",
     "objective": "项目目标",
@@ -645,30 +652,31 @@
     "criteriaCount": "{{count}} 条",
     "criteriaMaintainedWithPlan": "随方案维护",
     "projectProgress": "项目进度",
-    "workItems": "工作项",
+    "workItems": "任务",
     "workItemSummary": "{{running}} 项执行中 · {{completed}} 项已完成",
     "risks": "风险与问题",
     "needsFollowUp": "需要跟进",
     "noKnownIssues": "当前无已知问题",
     "activeMemberMetric": "在岗成员",
-    "runCount": "{{count}} 次运行",
+    "runCount": "{{count}} 次执行",
     "collaborationEvents": "协作事件",
-    "collaborationEventsHint": "A2A 与系统事件",
+    "collaborationEventsHint": "成员协作与项目操作",
     "executionOverview": "执行态势",
-    "workItemProgress": "工作项进展",
+    "workItemProgress": "任务进展",
     "viewAll": "查看全部",
-    "noWorkItems": "项目还没有工作项",
+    "noWorkItems": "项目还没有任务",
     "attentionNeeded": "需要关注",
     "noKnownRisks": "没有已知风险或问题",
-    "noKnownRisksHint": "失败、阻塞和风险事件会从真实项目记录汇总到这里。",
+    "noKnownRisksHint": "汇总项目中的失败、阻塞和风险记录。",
     "unnamedMember": "未命名数字员工",
     "unassigned": "未委派",
-    "blockedWorkItem": "工作项阻塞",
-    "blockedWorkItemHint": "工作项已停止推进，请查看执行记录。",
-    "viewBlockedWorkItems": "查看阻塞工作项",
+    "blockedWorkItem": "任务阻塞",
+    "blockedWorkItemHint": "任务已停止推进，请查看执行记录。",
+    "viewBlockedWorkItems": "查看阻塞任务",
     "viewRiskEvents": "查看风险事件"
   },
   "projectMesh": {
+    "eyebrow": "成员协作",
     "viewEvents": "查看协作记录",
     "recentIssue": "最近协作异常"
   },
@@ -687,12 +695,12 @@
     "newFile": "新建文件",
     "empty": "工作区暂无文件",
     "metadataAria": "文件元数据",
-    "notCommitted": "未提交",
+    "notCommitted": "未保存",
     "unavailableTitle": "此文件不能在线预览",
-    "unavailableDescription": "文件保持原样存储在项目 Git 仓库中，可下载到本地使用对应应用打开。",
+    "unavailableDescription": "该文件暂不支持在线预览，可下载后使用对应应用打开。",
     "downloadFile": "下载文件",
     "loadFailed": "文件加载失败",
-    "saved": "文件已保存并创建 Git 提交",
+    "saved": "文件已保存并记录新版本",
     "downloadFailed": "下载准备失败",
     "newFileBadge": "新建文件",
     "htmlPreviewBadge": "HTML 预览",
@@ -707,13 +715,13 @@
     "editorAria": "工作区文件编辑器",
     "diffAria": "工作区文件变更对比",
     "markdownPreviewAria": "{{name}} Markdown 预览",
-    "save": "保存并提交",
+    "save": "保存新版本",
     "loadingHead": "正在读取当前版本文件…",
     "retry": "重试",
     "htmlPreviewTitle": "{{name}} HTML 预览",
     "truncatedTitle": "当前仅显示文件前部内容",
     "readOnlyTitle": "此文件只允许在线查看",
-    "readOnlyDescription": "为避免使用截断内容覆盖原文件，请在数字员工工作区修改后提交。",
+    "readOnlyDescription": "当前内容未完整加载，请在数字员工工作区修改并保存新版本。",
     "loadingEditor": "正在载入代码编辑器…",
     "loadingPreview": "正在生成 Markdown 预览…",
     "loadingDiff": "正在载入代码差异…",
@@ -732,24 +740,25 @@
     "collaborationEntry": "协作入口",
     "times": "{{count}} 次",
     "meshAria": "数字员工协作关系图，共 {{members}} 名成员、{{edges}} 条协作关系",
-    "sourceAgent": "源数字员工",
-    "sourceCaption": "平台能力与基础配置",
+    "sourceAgent": "原数字员工",
+    "sourceCaption": "原有能力与基础设置",
     "readOnlySource": "只读源",
-    "isolatedSnapshot": "项目隔离快照",
+    "isolatedSnapshot": "项目独立设置",
     "memberConfig": "成员配置",
     "active": "在岗",
-    "snapshotCreated": "创建快照",
-    "frozen": "已冻结",
-    "runtimeFrozen": "执行快照",
-    "snapshotAria": "成员快照关系图：{{name}}，共 {{runs}} 次运行",
-    "snapshotSummary": "最近 {{shown}} / 共 {{total}} 次运行",
-    "unnamedWorkItem": "未命名工作项",
+    "snapshotCreated": "设置已创建",
+    "frozen": "已确认",
+    "runtimeFrozen": "执行设置",
+    "snapshotAria": "成员设置关系图：{{name}}，共 {{runs}} 次执行",
+    "snapshotSummary": "最近 {{shown}} / 共 {{total}} 次执行",
+    "unnamedWorkItem": "未命名任务",
     "unassigned": "未指派",
     "dependency": "依赖",
-    "workAria": "工作依赖图，共 {{nodes}} 个工作项、{{edges}} 条依赖",
-    "commitNoMessage": "未填写提交说明",
-    "projectSystem": "项目系统",
-    "gitAria": "Git 历史图，共 {{count}} 个提交",
+    "workAria": "工作依赖图，共 {{nodes}} 个任务、{{edges}} 条依赖",
+    "commitNoMessage": "未填写版本说明",
+    "projectSystem": "系统",
+    "gitAria": "版本历史图，共 {{count}} 个版本",
+    "execution": "项目执行",
     "legendAria": "关系图图例",
     "legendInfo": "当前或运行中",
     "legendSuccess": "正常或已完成",
@@ -772,7 +781,8 @@
       "success": "已完成",
       "succeeded": "已完成",
       "failed": "失败",
-      "error": "异常"
+      "error": "异常",
+      "unknown": "状态未知"
     }
   },
   "projectAgents": {
@@ -802,17 +812,17 @@
       "activeEmptyTitle": "没有在岗的数字员工",
       "activeEmptyDescription": "恢复一位已退出的数字员工，或创建新的数字员工。",
       "departedEmptyTitle": "没有已退出的数字员工",
-      "departedEmptyDescription": "停用或移出的数字员工会保留在这里，便于查看历史。",
+      "departedEmptyDescription": "保留已停用或移出成员的历史记录。",
       "noMembersTitle": "项目还没有数字员工",
       "noMembersDescription": "创建第一位数字员工，明确由谁推进项目。",
       "noMatchesTitle": "没有符合条件的数字员工",
       "noMatchesDescription": "调整或清除筛选条件后重试。",
       "clearFilters": "清除筛选",
       "capabilitiesEmptyTitle": "还没有可用能力",
-      "capabilitiesEmptyDescription": "添加项目能力后，可在这里管理数字员工的可用范围。",
+      "capabilitiesEmptyDescription": "添加项目能力后可管理数字员工的可用范围。",
       "matrixEmptyTitle": "暂无可用范围",
-      "matrixEmptyDescription": "添加数字员工和能力后，可在这里比较每位数字员工能做什么。",
-      "readOnly": "你可以查看团队设置，但不能修改。"
+      "matrixEmptyDescription": "添加数字员工和能力后可查看成员能力范围。",
+      "readOnly": "当前权限仅支持查看团队设置。"
     },
     "capabilityPackage": {
       "title": "成员能力包",
@@ -880,13 +890,13 @@
     },
     "workspaceDescription": "成员配置和文件属于当前项目。",
     "sectionTitle": "项目数字员工与成员",
-    "sectionDescription": "从现有数字员工固化快照或直接创建项目专用数字员工；项目负责人可维护其身份与核心记忆，并按需提升为标准数字员工。",
+    "sectionDescription": "可从现有数字员工创建项目专用成员，也可直接新建；项目内设置独立生效。",
     "summary": "项目数字员工",
     "summaryDescription": "身份、记忆和文件随项目版本管理",
     "activeMembers": "在岗成员",
     "activeMembersDescription": "可被 @、指派与调用项目能力",
     "departedMembers": "历史成员",
-    "departedMembersDescription": "保留身份、快照与历史记录",
+    "departedMembersDescription": "保留身份、项目设置与历史记录",
     "viewActivity": "查看完整活动",
     "assetLocation": "成员文件",
     "status": {
@@ -894,15 +904,15 @@
       "departed": "已退出"
     },
     "snapshot": {
-      "currentDescription": "当前项目快照 · 仅在本项目生效",
-      "historicalDescription": "历史快照 · 不再接收新消息或任务",
-      "currentLabel": "项目快照",
-      "historicalLabel": "历史快照",
-      "editTitle": "编辑 {{name}} 的项目快照",
-      "viewTitle": "查看 {{name}} 的历史快照",
+      "currentDescription": "当前项目设置 · 仅在本项目生效",
+      "historicalDescription": "历史设置 · 不再接收新消息或任务",
+      "currentLabel": "项目设置",
+      "historicalLabel": "历史设置",
+      "editTitle": "编辑 {{name}} 的项目设置",
+      "viewTitle": "查看 {{name}} 的历史设置",
       "runHistory": "历史执行记录",
       "recentCollaboration": "最近协作记录",
-      "sessionUnavailable": "该快照还没有对应的项目运行会话"
+      "sessionUnavailable": "暂无关联的项目执行会话"
     },
     "promotion": {
       "badge": "数字员工升级",
@@ -962,7 +972,7 @@
       "available": "可用",
       "unavailable": "不可用",
       "restricted": "受限",
-      "policyBlocked": "项目策略禁用",
+      "policyBlocked": "项目设置已关闭",
       "snapshotBlocked": "项目配置限制",
       "memberDisabled": "成员已关闭",
       "memberDeparted": "成员已退出"
@@ -973,8 +983,8 @@
         "description": "查看项目目标、方案、状态和当前版本。"
       },
       "project_list_work_items": {
-        "label": "查看工作项",
-        "description": "查看项目工作项或本人负责的工作。"
+        "label": "查看任务",
+        "description": "查看项目任务或本人负责的工作。"
       },
       "project_list_files": {
         "label": "查看工作区",
@@ -985,8 +995,8 @@
         "description": "读取指定的项目文本文件；文件必须已经存在。"
       },
       "project_update_work_item": {
-        "label": "更新工作项",
-        "description": "更新已有工作项的状态、进展或证据。"
+        "label": "更新任务",
+        "description": "更新已有任务的状态、进展或证据。"
       },
       "project_write_file": {
         "label": "写入工作区文件",
@@ -1001,8 +1011,8 @@
         "description": "更新目标、成功标准和当前进展；仅执行负责人可用。"
       },
       "project_create_work_item": {
-        "label": "创建工作项",
-        "description": "创建并指派工作项；仅执行负责人可用。"
+        "label": "创建任务",
+        "description": "创建并指派任务；仅执行负责人可用。"
       },
       "project_set_member_enabled": {
         "label": "管理项目成员",
@@ -1031,6 +1041,7 @@
     "title": "项目资产库",
     "description": "管理由多个数字员工共同负责的目标、运行和项目成果。",
     "templateMarket": "模板市场",
+    "manageTemplates": "模板管理",
     "createProject": "创建项目",
     "overviewAria": "项目概览",
     "runningProjects": "{{count}} 个项目正在运行",
@@ -1040,6 +1051,7 @@
     "averageProgress": "平均进度",
     "scopeAria": "项目范围",
     "scope": {
+      "all": "全部项目",
       "mine": "我的项目",
       "shared": "与我共享",
       "running": "运行中",
@@ -1050,7 +1062,7 @@
     "status": {
       "all": "全部状态",
       "planning": "规划中",
-      "initializing": "初始化中",
+      "initializing": "创建中",
       "running": "进行中",
       "waiting": "等待确认",
       "paused": "已暂停",
@@ -1062,18 +1074,22 @@
     "listView": "列表视图",
     "gridView": "网格视图",
     "loadingTitle": "正在读取项目",
-    "loadingDescription": "正在同步项目状态与数字员工运行信号…",
+    "loadingDescription": "正在加载项目状态和执行信息…",
     "errorTitle": "项目列表加载失败",
     "serviceError": "无法连接项目服务",
     "reload": "重新加载",
-    "emptyTitle": "这里还没有项目",
+    "emptyTitle": "暂无项目",
     "filteredEmptyDescription": "当前筛选条件没有匹配结果，调整条件后再试。",
     "emptyDescription": "创建第一个项目，让一组数字员工围绕同一个目标协作。",
     "clearFilters": "清除筛选",
+    "deleteProject": "删除项目",
+    "deleteAction": "确认删除",
+    "deleteNamedProject": "删除项目 {{name}}",
+    "deleteConfirm": "确认删除“{{name}}”？此操作不可撤销。",
     "private": "仅自己",
     "shared": "已分享",
     "digitalEmployeeCount": "{{count}} 个数字员工",
-    "noRunEvents": "暂无运行事件",
+    "noRunEvents": "暂无执行记录",
     "nameSeparator": "、",
     "relative": {
       "justNow": "刚刚",
@@ -1082,42 +1098,43 @@
     }
   },
   "projectGit": {
-    "title": "Git 历史与恢复",
-    "historyAria": "Git 提交历史",
-    "history": "提交历史",
-    "commit": "Commit",
+    "title": "版本历史与恢复",
+    "historyAria": "项目版本历史",
+    "history": "版本历史",
+    "commit": "版本",
     "message": "说明",
     "author": "作者",
     "time": "时间",
     "references": "引用",
     "projectMember": "项目成员",
-    "unnamedCommit": "未命名提交",
+    "unnamedCommit": "未命名版本",
     "milestone": "里程碑",
-    "detail": "提交详情",
+    "detail": "版本详情",
     "recoverable": "版本可恢复",
-    "relatedRun": "关联运行",
-    "workItem": "工作项",
+    "relatedRun": "关联执行",
+    "workItem": "任务",
     "conversation": "会话",
     "changedFiles": "变更文件",
-    "createBranch": "从此创建分支",
+    "linked": "已关联",
+    "createBranch": "从此版本创建分支",
     "restoreVersion": "恢复到此版本",
-    "emptyTitle": "还没有提交历史",
-    "emptyDescription": "工作区文件保存后，版本记录会显示在这里。",
+    "emptyTitle": "暂无版本历史",
+    "emptyDescription": "保存工作区文件后生成版本记录。",
     "diff": {
       "emptyTree": "空树",
-      "loadFallback": "无法读取 Git 变更",
+      "loadFallback": "无法读取版本变更",
       "noCommitTitle": "没有关联版本",
       "noCommitDescription": "该文件尚未关联版本记录。",
-      "loadFailed": "Git 变更加载失败",
+      "loadFailed": "版本变更加载失败",
       "retry": "重试",
       "loading": "正在读取文件变更",
-      "noFileChange": "该 Commit 没有修改此文件",
+      "noFileChange": "该版本没有修改此文件",
       "status": {
         "added": "新增",
         "deleted": "删除",
         "modified": "修改"
       },
-      "rootCommit": "根提交",
+      "rootCommit": "初始版本",
       "binaryTitle": "二进制文件变更",
       "binaryDescription": "二进制文件不支持在线对比。",
       "loadingEditor": "正在载入差异视图…",
@@ -1136,7 +1153,7 @@
       "cancel": "取消",
       "restoreSubmit": "恢复到此版本",
       "branchSubmit": "创建分支",
-      "restoreSuccess": "恢复提交已创建；原历史保持不变",
+      "restoreSuccess": "已创建恢复版本，原版本历史保持不变",
       "branchSuccess": "新分支已创建"
     }
   },
@@ -1144,7 +1161,7 @@
     "action": "发布为项目模板",
     "eyebrow": "项目模板",
     "title": "发布为项目模板",
-    "description": "模板会保留已提交的项目成果、团队配置和本次勾选的 Skill 文件。",
+    "description": "模板包含已保存的项目成果、团队设置和本次选择的 Skill 文件。",
     "name": "模板名称",
     "namePlaceholder": "输入模板名称",
     "close": "关闭",
@@ -1162,13 +1179,13 @@
       "skills": "Skill",
       "sharedConnections": "共享 MCP",
       "capabilities": "共享能力",
-      "platformDependencies": "平台依赖",
+      "platformDependencies": "所需能力",
       "none": "无",
-      "capabilityListTitle": "能力与依赖",
-      "capabilityListHint": "Skill 默认不携带；工具和 MCP 仅保留依赖声明，并在新项目中重新核对可用性。",
+      "capabilityListTitle": "所需能力",
+      "capabilityListHint": "创建项目时将确认这些能力是否可用。",
       "selectSkill": "随模板携带 {{name}}",
       "unnamedCapability": "未命名能力",
-      "platformDependency": "平台依赖",
+      "platformDependency": "所需能力",
       "included": "随模板携带",
       "notIncluded": "不携带",
       "affectedMembers": "影响 {{count}} 人：{{names}}",
@@ -1204,20 +1221,20 @@
     "description": "复用经过验证的项目结构、数字员工配置、能力边界、运行策略和交付标准。",
     "createBlank": "从空白创建",
     "featuredLabel": "精选模板 / {{category}}",
-    "heroTitleFirst": "不只是一组起始提示，",
-    "heroTitleSecond": "更是一套可恢复的协作系统",
-    "heroDescription": "{{description}} 快照模板会恢复已提交的项目成果与脱敏后的数字员工配置；创建前仍可确认可见性。",
+    "heroTitleFirst": "复用项目模板",
+    "heroTitleSecond": "",
+    "heroDescription": "{{description}} 模板可包含项目成果、团队设置和能力配置。",
     "viewFeatured": "查看精选模板",
     "blueprintAria": "项目模板内容",
     "blueprint": {
       "goal": "目标",
       "success": "成功标准",
       "team": "团队",
-      "employees": "数字员工快照",
+      "employees": "数字员工设置",
       "capabilities": "能力",
       "skillMcp": "Skill / MCP",
       "delivery": "交付",
-      "gitOutputs": "已提交成果"
+      "gitOutputs": "已保存成果"
     },
     "searchPlaceholder": "搜索场景、角色、Skill 或 MCP",
     "searchAria": "搜索项目模板",
@@ -1243,7 +1260,7 @@
     "detailAria": "{{name}} 模板详情",
     "author": "模板作者",
     "used": "已被使用",
-    "snapshotVersion": "快照版本",
+    "snapshotVersion": "模板版本",
     "teamRoles": "团队角色",
     "roleFallback": "恢复为项目专用数字员工",
     "roleFallbackLegacy": "创建时选择对应数字员工",
@@ -1253,9 +1270,9 @@
     "sharedMcp": "共享 MCP",
     "noMcp": "此模板未预设共享 MCP",
     "configuration": "模板内容",
-    "restoreFiles": "恢复 {{count}} 个已提交项目文件",
-    "restoreEmployees": "恢复 {{count}} 个项目专用数字员工及其脱敏工作区设置",
-    "restoreSettings": "恢复可移植的能力与项目策略设置",
+    "restoreFiles": "恢复 {{count}} 个已保存项目文件",
+    "restoreEmployees": "恢复 {{count}} 个项目专用数字员工及其可共享工作区设置",
+    "restoreSettings": "恢复项目能力与设置",
     "legacyConfiguration": "使用当前模板配置作为项目起点",
     "membersAdjustable": "创建时可调整项目成员",
     "versionRecovery": "项目成果支持版本恢复",
@@ -1263,6 +1280,25 @@
     "useThis": "使用此模板",
     "fileCount": "{{count}} 个文件",
     "employeeCount": "{{count}} 个数字员工",
+    "management": {
+      "eyebrow": "模板管理",
+      "title": "项目模板管理",
+      "description": "查看可用模板，并管理有权限修改的模板。",
+      "edit": "编辑",
+      "delete": "删除",
+      "editFailed": "暂时无法编辑此模板",
+      "deleteTitle": "删除模板",
+      "deleteDescription": "删除后，项目模板中将不再显示“{{name}}”。",
+      "deleteSuccess": "模板已删除",
+      "deleteFailed": "模板删除失败",
+      "save": "保存模板",
+      "saveSuccess": "模板已保存",
+      "saveFailed": "模板保存失败",
+      "cancelEdit": "取消编辑",
+      "cancelTitle": "取消模板编辑",
+      "cancelDescription": "当前修改将不会保存。",
+      "cancelFailed": "暂时无法取消编辑"
+    },
     "builtin": {
       "productSprint": {
         "name": "产品研发冲刺",
@@ -1270,7 +1306,7 @@
       },
       "marketResearch": {
         "name": "市场洞察研究",
-        "description": "并行采集、交叉验证并形成有证据链的研究报告。"
+        "description": "采集并交叉验证信息，形成包含依据的研究报告。"
       },
       "contentPipeline": {
         "name": "内容发布流水线",
@@ -1312,19 +1348,19 @@
     "templateRestoring": "正在从模板恢复项目",
     "useTemplate": "使用模板并进入规划",
     "templateProjectName": "{{name}}项目",
-    "templateSnapshotHint": "{{version}} · 等价恢复已提交成果、项目专用数字员工与可移植设置，不叠加外部成员",
+    "templateSnapshotHint": "{{version}} · 恢复已保存成果、项目数字员工与可用设置，不添加其他成员",
     "templateLegacyHint": "{{version}} · 以当前模板为起点，并确认成员与能力",
     "defaultName": "新项目 · {{date}}",
     "loadingTitle": "正在准备项目空间",
-    "loadingDescription": "读取可用数字员工、Skill、MCP 和模板版本…",
+    "loadingDescription": "正在加载数字员工、Skill、MCP 和项目模板…",
     "loadFailedTitle": "创建环境加载失败",
-    "loadFailedDescription": "无法读取项目初始化选项",
+    "loadFailedDescription": "无法加载项目创建选项",
     "reload": "重新加载",
     "exit": "退出创建",
-    "brand": "创建 AI Native 项目",
-    "progress": "初始化 {{step}} / 3",
+    "brand": "创建协作项目",
+    "progress": "步骤 {{step}} / 3",
     "basedOn": "基于 {{name}} · {{version}}",
-    "minimalSetup": "最小配置 · 创建后进入规划",
+    "minimalSetup": "创建后进入规划",
     "templateSetup": {
       "title": "项目已准备就绪",
       "message": "模板中的项目资产与团队配置已恢复。",
@@ -1350,17 +1386,20 @@
       "startingTemplate": "起始模板",
       "planningTitle": "目标将在项目内共同形成",
       "selected": "已选择 {{count}} 个数字员工",
-      "snapshotCreated": "创建时分别生成项目专用快照",
-      "a2a": "成员间 A2A 直接协作",
+      "snapshotCreated": "创建独立的项目成员设置",
+      "selectedPinned": "项目团队",
+      "selectedPinnedHint": "已选择 {{count}} 个数字员工",
+      "a2a": "成员协作已启用",
       "capabilityCount": "{{count}} 项能力",
       "searchPlaceholder": "搜索数字员工",
       "searchAria": "搜索数字员工",
+      "paginationAria": "数字员工搜索结果分页",
       "noSearchResults": "没有匹配的数字员工",
       "noSearchResultsHint": "请调整搜索内容。",
       "emptyTitle": "没有可加入项目的数字员工",
       "emptyDescription": "请先创建或启用至少一个数字员工。",
-      "snapshotDescription": "该快照模板已包含项目团队。恢复时会根据模板创建全新的项目专用数字员工，不会叠加标准数字员工。",
-      "snapshotFiles": "{{count}} 个已提交文件",
+      "snapshotDescription": "该模板已包含项目团队，使用模板时将创建对应的项目专用数字员工。",
+      "snapshotFiles": "{{count}} 个已保存文件",
       "snapshotEmployees": "{{count}} 个项目专用数字员工"
     },
     "capabilities": {
@@ -1370,19 +1409,36 @@
       "toolsTab": "工具",
       "skillsTab": "技能",
       "searchTools": "搜索工具",
+      "searchMcp": "搜索 MCP",
       "searchSkills": "搜索技能",
       "noTools": "当前成员没有可配置的工具。",
+      "noMcp": "当前没有可选择的 MCP。",
       "noSkills": "当前项目没有可配置的技能。",
+      "noSelected": "尚未选择任何内容。",
+      "selectedOnly": "仅看已选",
+      "showAll": "查看全部",
+      "groupCount": "{{selected}} / {{total}}",
+      "mcpToolCount": "{{count}} 项工具",
+    "groups": {
+      "mcp": {
+        "company": "共享 MCP",
+        "digital_employee": "当前数字员工的 MCP"
+      },
+      "skill": {
+        "market": "市场 Skill",
+        "digital_employee": "当前数字员工的 Skill"
+      }
+      },
       "toolsAria": "项目工具",
       "skillsAria": "项目技能",
       "projectShared": "项目共享",
       "employeeShort": "当前成员",
       "fromEmployee": "来自 {{name}}",
       "snapshotTitle": "恢复模板能力",
-      "snapshotDescription": "模板中的可移植项目能力和项目专用数字员工能力设置会原样恢复；私密连接与凭证不会被复制。",
-      "snapshotDetail": "已提交的项目文件与脱敏后的数字员工身份、记忆和工作区设置会一并恢复。",
+      "snapshotDescription": "模板中的项目能力和数字员工设置将应用到新项目，私密连接与凭证不包含在内。",
+      "snapshotDetail": "模板包含已保存的项目文件、数字员工身份、记忆和工作区设置。",
       "shared": "项目共享 Skill / MCP",
-      "sharedHint": "项目成员共同使用，版本与权限由项目固定",
+      "sharedHint": "供项目成员共同使用，仅在当前项目生效",
       "employee": "数字员工带入能力",
       "employeeHint": "选择本项目可使用的能力",
       "count": "已启用 {{count}} 项",
@@ -1397,15 +1453,19 @@
     },
     "boundary": {
       "title": "确认项目边界",
-      "description": "项目默认只有你可见，也可以分享给指定组织成员。",
+      "description": "项目默认仅项目所有者可见，也可与指定组织成员共享。",
       "private": "仅自己可见",
-      "privateHint": "只有你可以查看和管理项目",
+      "privateHint": "仅项目所有者可访问",
       "shared": "与指定成员共享",
       "sharedHint": "选择组织成员查看项目进展与产出",
       "shareMembers": "共享成员",
       "shareHint": "创建后仍可继续调整项目访问",
-      "noShareTargets": "组织内没有其他可共享成员；请保持仅自己可见。",
-      "review": "初始化确认",
+      "searchMembers": "搜索成员",
+      "searchMembersAria": "搜索共享成员",
+      "paginationAria": "共享成员搜索结果分页",
+      "noSearchResults": "没有匹配的成员",
+      "noShareTargets": "当前没有可共享的其他组织成员，项目将保持私有。",
+      "review": "创建确认",
       "reviewHint": "确认设置后创建项目",
       "project": "项目",
       "team": "团队",
@@ -1417,25 +1477,25 @@
       "visibility": "可见性",
       "sharedCount": "与 {{count}} 名成员共享",
       "next": "下一步",
-      "planningTitle": "创建后先进入规划，不直接运行"
+      "planningTitle": "创建后进入项目规划"
     },
     "capabilityKind": {
       "tool": "工具"
     }
   },
   "projectRuns": {
-    "clearMemberFilter": "{{name}} 的运行 · 清除筛选"
+    "clearMemberFilter": "{{name}} 的执行记录 · 清除筛选"
   },
   "projectSnapshot": {
     "followSourceAgent": "使用项目默认模型",
-    "sourceLayerTitle": "源数字员工",
-    "sourceLayerDescription": "平台中的稳定配置，项目修改不会反向影响它。",
-    "projectLayerTitle": "项目成员快照",
-    "projectLayerDescription": "加入项目时复制，可在本项目独立调整模型、指令和权限。",
-    "runLayerTitle": "Run 冻结快照",
-    "runLayerDescription": "每次执行永久记录当时的成员与能力配置，便于追溯。",
+    "sourceLayerTitle": "原数字员工设置",
+    "sourceLayerDescription": "原有设置保持不变。",
+    "projectLayerTitle": "项目成员设置",
+    "projectLayerDescription": "可在当前项目独立调整模型、指令和权限。",
+    "runLayerTitle": "执行设置",
+    "runLayerDescription": "保留每次执行使用的成员与能力设置。",
     "memberStatus": "项目成员状态",
-    "sourceStatus": "加入时源数字员工状态",
+    "sourceStatus": "加入项目时的原状态",
     "unknown": "未记录",
     "lifecycle": {
       "active": "在岗，可继续参与项目",
@@ -1465,16 +1525,16 @@
     "noDetails": "该事件没有附加说明。",
     "expandDetails": "展开完整内容",
     "riskEventHint": "失败记录已保留，可在项目事件审计中查看完整上下文。",
-    "relatedWorkItem": "关联工作项",
-    "relatedRun": "关联运行",
+    "relatedWorkItem": "关联任务",
+    "relatedRun": "关联执行",
     "relatedCodeChange": "关联代码变更",
     "projectScope": "项目范围",
     "viewSession": "查看会话",
-    "internalReferenceHidden": "内部引用已隐藏",
+    "internalReferenceHidden": "关联信息不可用",
     "events": {
       "project": {
         "created": "创建项目",
-        "initialized": "初始化项目",
+        "initialized": "创建项目",
         "updated": "更新项目",
         "paused": "暂停项目",
         "resumed": "恢复项目",
@@ -1482,13 +1542,18 @@
         "shared": "共享项目",
         "unshared": "取消共享",
         "settings": { "updated": "更新项目设置" },
-        "file": { "committed": "提交工作区文件" },
+        "file": { "committed": "保存工作区文件" },
         "plan": { "updated": "更新项目计划" },
         "status": { "updated": "更新项目状态" },
         "management": {
           "action": { "completed": "完成项目协作操作" }
         },
-        "trace": { "repaired": "修复项目追溯关联" },
+        "trace": { "repaired": "更新项目关联信息" },
+        "template": {
+          "restored": "模板内容已恢复",
+          "published": "模板已发布",
+          "updated": "模板已更新"
+        },
         "agent": { "message": { "sent": "发送项目数字员工消息" } },
         "kickoff": {
           "confirmed": "确认项目方案并启动",
@@ -1497,46 +1562,56 @@
         "agent_reply_batch": { "dispatched": "派发数字员工批量回复" }
       },
       "member": {
-        "snapshot": { "created": "创建成员快照", "updated": "更新成员快照" },
+        "snapshot": { "created": "创建成员设置", "updated": "更新成员设置" },
+        "tools": { "updated": "成员工具已更新" },
         "departed": "成员退出项目",
         "restored": "恢复项目成员"
       },
-      "leader": { "changed": "变更项目负责人" },
+      "leader": { "changed": "变更项目负责人", "repaired": "负责人已补充" },
       "project_agent": {
         "created": "创建项目专用数字员工",
         "updated": "更新项目专用数字员工",
         "promoted": "晋升为独立数字员工",
         "template_instantiated": "从模板创建项目数字员工"
       },
-      "capability": { "bound": "绑定项目能力", "updated": "更新项目能力" },
-      "work_item": { "created": "创建工作项", "updated": "更新工作项" },
+      "capability": {
+        "bound": "绑定项目能力",
+        "updated": "更新项目能力",
+        "deleted": "技能已删除",
+        "refreshed": "技能已更新",
+        "skill_backfill": {
+          "applied": "技能设置已整理",
+          "rolled_back": "技能整理已撤销"
+        }
+      },
+      "work_item": { "created": "创建任务", "updated": "更新任务" },
       "run": {
-        "queued": "运行进入队列",
-        "running": "运行已开始",
-        "waiting": "运行进入等待",
-        "succeeded": "运行已成功完成",
-        "failed": "运行执行失败",
-        "cancelled": "运行已取消"
+        "queued": "执行等待处理",
+        "running": "执行已开始",
+        "waiting": "执行等待继续",
+        "succeeded": "执行已完成",
+        "failed": "执行未完成",
+        "cancelled": "执行已取消"
       },
       "a2a": {
-        "queued": "A2A 请求进入队列",
-        "delivered": "A2A 消息已送达",
-        "completed": "A2A 协作已完成",
-        "cancelled": "A2A 协作已取消",
-        "delivery_failed": "A2A 消息送达失败"
+        "queued": "成员协作请求已提交",
+        "delivered": "成员协作消息已送达",
+        "completed": "成员协作已完成",
+        "cancelled": "成员协作已取消",
+        "delivery_failed": "成员协作消息送达失败"
       },
       "group": { "message": { "created": "创建项目群消息" } },
       "git": {
-        "commit": { "created": "创建 Git 提交" },
+        "commit": { "created": "创建项目版本" },
         "milestone": {
           "prepared": "准备交付里程碑",
           "created": "创建交付里程碑"
         },
-        "branch": { "created": "创建 Git 分支" },
-        "restore_commit": { "created": "创建恢复提交" },
-        "restored": "恢复 Git 版本",
-        "remote": { "configured": "配置 Git 远端", "deleted": "删除 Git 远端" },
-        "repository": { "cloned": "从远程克隆项目仓库" }
+        "branch": { "created": "创建项目分支" },
+        "restore_commit": { "created": "创建恢复版本" },
+        "restored": "恢复项目版本",
+        "remote": { "configured": "配置远程仓库", "deleted": "删除远程仓库" },
+        "repository": { "cloned": "远程仓库已导入" }
       }
     },
     "details": {
@@ -1556,7 +1631,12 @@
         "management": {
           "action": { "completed": "项目工作已完成查询或更新。" }
         },
-        "trace": { "repaired": "项目运行、会话与产物的追溯关联已修复。" },
+        "trace": { "repaired": "项目执行、会话与成果的关联信息已更新。" },
+        "template": {
+          "restored": "模板内容已恢复。",
+          "published": "模板已发布。",
+          "updated": "模板内容已更新。"
+        },
         "agent": { "message": { "sent": "项目数字员工消息已发送。" } },
         "kickoff": {
           "confirmed": "方案已确认，负责人已开始自驱推进。",
@@ -1568,13 +1648,14 @@
       },
       "member": {
         "snapshot": {
-          "created": "项目成员快照已创建。",
-          "updated": "项目成员快照已更新。"
+          "created": "项目成员设置已创建。",
+          "updated": "项目成员设置已更新。"
         },
+        "tools": { "updated": "成员工具设置已更新。" },
         "departed": "成员已退出项目，历史记录保持只读可见。",
         "restored": "成员已恢复参与项目，后续执行将使用当前配置。"
       },
-      "leader": { "changed": "项目负责人已变更。" },
+      "leader": { "changed": "项目负责人已变更。", "repaired": "项目负责人已补充。" },
       "project_agent": {
         "created": "项目专用数字员工已创建并加入项目。",
         "updated": "项目专用数字员工的身份设定或核心记忆已更新。",
@@ -1583,26 +1664,32 @@
       },
       "capability": {
         "bound": "项目共享能力已绑定。",
-        "updated": "项目能力启用范围已更新。"
+        "updated": "项目能力启用范围已更新。",
+        "deleted": "技能已从项目中删除。",
+        "refreshed": "项目技能已更新。",
+        "skill_backfill": {
+          "applied": "项目技能设置已整理。",
+          "rolled_back": "项目技能整理已撤销。"
+        }
       },
       "work_item": {
-        "created": "工作项已创建。",
-        "updated": "工作项内容、进度或证据已更新。"
+        "created": "任务已创建。",
+        "updated": "任务内容、进度或证据已更新。"
       },
       "run": {
         "queued": "运行已进入队列，等待可用数字员工处理。",
-        "running": "数字员工已开始处理本次运行。",
-        "waiting": "本次运行正在等待后续输入或确认。",
-        "succeeded": "本次运行已完成。",
-        "failed": "本次运行失败。",
-        "cancelled": "本次运行已取消。"
+        "running": "数字员工已开始本次执行。",
+        "waiting": "本次执行正在等待后续输入或确认。",
+        "succeeded": "本次执行已完成。",
+        "failed": "本次执行失败。",
+        "cancelled": "本次执行已取消。"
       },
       "a2a": {
-        "queued": "一条点对点 A2A 请求已进入目标数字员工队列。",
-        "delivered": "A2A 消息已送达指定数字员工。",
-        "completed": "目标数字员工已完成本轮 A2A 协作。",
-        "cancelled": "本轮 A2A 协作已取消。",
-        "delivery_failed": "A2A 消息未能送达，失败上下文已保留。"
+        "queued": "成员协作请求已提交。",
+        "delivered": "成员协作消息已送达。",
+        "completed": "成员协作已完成。",
+        "cancelled": "成员协作已取消。",
+        "delivery_failed": "成员协作消息送达失败。"
       },
       "group": {
         "message": {
@@ -1610,19 +1697,19 @@
         }
       },
       "git": {
-        "commit": { "created": "项目变更已创建 Git 提交。" },
+        "commit": { "created": "项目变更已记录为新版本。" },
         "milestone": {
           "prepared": "交付里程碑正在创建。",
           "created": "交付里程碑已创建。"
         },
-        "branch": { "created": "Git 分支已创建。" },
+        "branch": { "created": "项目分支已创建。" },
         "restore_commit": {
-          "created": "恢复操作已创建新的 Git 提交，原历史保持不变。"
+          "created": "已创建恢复版本，原版本历史保持不变。"
         },
-        "restored": "指定 Git 版本已通过新提交恢复。",
+        "restored": "指定项目版本已恢复。",
         "remote": {
-          "configured": "Git 远端已配置。",
-          "deleted": "Git 远端已删除。"
+          "configured": "远程仓库已配置。",
+          "deleted": "远程仓库已删除。"
         },
         "repository": { "cloned": "远程仓库已导入。" }
       }
@@ -2211,19 +2298,19 @@
       "confirmCancelled": "已取消"
     },
     "subagentRun": {
-      "title": "子智能体",
+      "title": "协作任务",
       "taskFallback": "委派任务",
       "viewSession": "查看会话",
-      "sessionPending": "子会话创建后即可查看。",
+      "sessionPending": "相关会话创建后即可查看。",
       "mode": {
-        "sync": "同步",
-        "async": "异步"
+        "sync": "即时执行",
+        "async": "后台执行"
       },
-      "forked": "已复制当前上下文",
-      "soulOff": "不加载 Soul",
-      "memoryOff": "不加载记忆",
+      "forked": "保留当前对话信息",
+      "soulOff": "未使用身份设置",
+      "memoryOff": "未使用历史信息",
       "model": "模型",
-      "sessionId": "会话 ID",
+      "sessionId": "相关会话",
       "status": {
         "queued": "排队中",
         "running": "执行中",
@@ -2233,14 +2320,14 @@
         "stopped": "已停止",
         "unknown": "未知状态"
       },
-      "drawerTitle": "子智能体会话",
+      "drawerTitle": "协作任务会话",
       "readOnly": "只读执行记录",
-      "loading": "正在加载子智能体会话...",
-      "loadError": "无法加载此子智能体会话。",
+      "loading": "正在加载协作任务会话...",
+      "loadError": "无法加载此协作任务会话。",
       "retry": "重试",
       "empty": "暂无执行消息。",
       "close": "关闭",
-      "liveRefresh": "子智能体执行期间自动更新",
+      "liveRefresh": "协作任务执行期间自动更新",
       "openFullSession": "打开完整会话"
     },
     "sessionViewer": {
@@ -2266,15 +2353,16 @@
       "projectUser": "项目成员",
       "mentionLimit": "每条消息最多可邀请 {{count}} 位成员。",
       "unresolvedMention": "部分成员无法识别，请删除红色标记或从候选列表中重新选择。",
-      "sendError": "消息发送失败。",
-      "uploadError": "附件上传失败。",
+      "sendError": "消息发送失败，请稍后重试。",
+      "uploadError": "附件上传失败，请稍后重试。",
       "attachmentOnlyMessage": "请查看附件",
       "reconnecting": "正在恢复连接，草稿和附件已保留。",
       "interactive": "可继续对话",
+      "untitled": "未命名会话",
       "groupProcessing": "{{name}} 正在处理本轮消息",
-      "groupProcessingQueued": "{{name}} 正在处理，另有 {{count}} 位数字员工已进入本轮队列",
-      "groupTurnExpired": "上一轮处理超过 45 分钟，已停止等待；请在运行控制中检查。",
-      "groupTurnNoActiveRun": "本轮没有可继续处理的数字员工运行，请在运行控制中查看失败原因。",
+      "groupProcessingQueued": "{{name}} 正在处理，另有 {{count}} 位数字员工等待处理",
+      "groupTurnExpired": "上一轮处理已结束，可在执行记录中查看详情。",
+      "groupTurnNoActiveRun": "本轮处理未能继续，可在执行记录中查看详情。",
       "status": {
         "queued": "排队中",
         "pending": "等待中",
@@ -2283,7 +2371,9 @@
         "completed": "已完成",
         "failed": "执行失败",
         "cancelled": "已取消",
-        "canceled": "已取消"
+        "canceled": "已取消",
+        "planning": "规划中",
+        "unknown": "状态未知"
       }
     },
     "activityLog": {
@@ -2645,7 +2735,7 @@
       "custom": "自定义",
       "general": "通用",
       "projectManagement": "项目管理",
-      "subagent": "子智能体",
+      "subagent": "协作任务",
       "email": "邮件",
       "aware": "感知与触发器",
       "social": "社交",
@@ -2658,7 +2748,7 @@
     },
     "toolCategoryDescriptions": {
       "project_management": "查看项目进展，维护工作项、运行、里程碑和工作区",
-      "subagent": "将任务委派给子智能体，并支持父子会话之间的多轮双向协作"
+      "subagent": "委派协作任务，并持续查看进展或补充要求"
     },
     "toolTranslations": {
       "user_project_search": {
@@ -2671,15 +2761,15 @@
       },
       "user_project_work_item_list": {
         "name": "查看工作项",
-        "description": "查看项目工作项的状态、优先级、分工和计划时间。"
+        "description": "查看项目任务的状态、优先级、分工和计划时间。"
       },
       "user_project_work_item_get": {
-        "name": "查看工作项详情",
-        "description": "查看工作项说明、验收条件、依赖和进展状态。"
+        "name": "查看任务详情",
+        "description": "查看任务说明、验收条件、依赖和进展状态。"
       },
       "user_project_run_list": {
-        "name": "查看运行记录",
-        "description": "查看项目运行的状态、分工、触发方式和时间。"
+        "name": "查看执行记录",
+        "description": "查看项目执行的状态、分工和时间。"
       },
       "user_project_member_list": {
         "name": "查看项目成员",
@@ -2710,16 +2800,16 @@
         "description": "查看项目群聊中的近期协作消息。"
       },
       "user_project_work_item_create": {
-        "name": "创建工作项",
-        "description": "创建工作项并设置交付条件、分工和计划时间。"
+        "name": "创建任务",
+        "description": "创建任务并设置交付条件、分工和计划时间。"
       },
       "user_project_work_item_update": {
-        "name": "更新工作项",
-        "description": "更新工作项内容、状态、优先级、分工或依赖。"
+        "name": "更新任务",
+        "description": "更新任务内容、状态、优先级、分工或依赖。"
       },
       "user_project_run_start": {
-        "name": "发起项目运行",
-        "description": "围绕工作项或明确指令发起一次项目运行。"
+        "name": "发起项目执行",
+        "description": "围绕任务或明确指令发起一次项目执行。"
       },
       "user_project_message_send": {
         "name": "发送项目消息",
@@ -2734,24 +2824,24 @@
         "description": "写入项目文本文件并生成版本记录。"
       },
       "user_project_status_update": {
-        "name": "控制项目运行",
-        "description": "暂停或恢复项目运行。"
+        "name": "控制项目执行",
+        "description": "暂停或恢复项目执行。"
       },
       "run_subagent": {
-        "name": "运行子智能体",
-        "description": "为子智能体命名并把目标明确的任务委派给独立会话；支持同步或异步执行、模型选择、上下文复制，以及按需关闭 Soul 或记忆。"
+        "name": "委派协作任务",
+        "description": "将目标明确的任务交给数字员工处理，并设置执行方式和所需信息。"
       },
       "send_message_to_subagent": {
-        "name": "向子智能体发送消息",
-        "description": "向已创建的子智能体追加消息。执行中的消息会在下一轮模型循环插入；已结束的子智能体会沿用原会话异步恢复。"
+        "name": "补充协作任务信息",
+        "description": "向已委派的协作任务补充要求或背景信息。"
       },
       "stop_subagent": {
-        "name": "停止子智能体",
-        "description": "停止正在排队或执行的子智能体；已经开始的外部工具调用及其副作用不会被回滚。"
+        "name": "停止协作任务",
+        "description": "停止正在等待或执行的协作任务。"
       },
       "send_message_to_parent": {
-        "name": "向父智能体发送消息",
-        "description": "从子智能体向创建它的父会话发送一次或多次阶段性消息；异步执行时会唤醒父智能体，同步执行时会随最终结果一并返回；仅在子智能体会话中可用。"
+        "name": "发送任务进展",
+        "description": "向任务发起方发送阶段性进展或结果。"
       }
     },
     "upload": {

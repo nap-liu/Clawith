@@ -707,7 +707,18 @@ async def execute_project_runtime_tool(
     if tool_name == "project_list_work_items":
         return await _list_work_items(project, agent_id, bool(arguments.get("mine_only", False)))
     if tool_name == "project_list_files":
-        return json.dumps(await list_project_files(project), ensure_ascii=False)
+        files = await list_project_files(project)
+        # Project collaboration exposes one shared, versioned deliverable
+        # tree. Member identity files are loaded by the runtime itself and do
+        # not belong in the project file catalogue shown to the model.
+        return json.dumps(
+            [
+                item
+                for item in files
+                if not str(item.get("path") or "").startswith(".agents/")
+            ],
+            ensure_ascii=False,
+        )
     if tool_name == "project_read_file":
         path = str(arguments.get("path") or "").strip()
         if not path:
@@ -798,9 +809,26 @@ async def execute_project_runtime_tool(
             delivery = json.loads(result)
         except (TypeError, ValueError):
             delivery = {}
+        if (
+            not isinstance(delivery, dict)
+            or delivery.get("status") not in {"queued", "running"}
+            or not (delivery.get("a2a_session_id") or delivery.get("session_id"))
+        ):
+            raise RuntimeError("Project message could not be queued")
         delivered_session_id = str(delivery.get("a2a_session_id") or delivery.get("session_id") or "") or None
         async with async_session() as db:
             attached = await db.get(Project, project.id)
+            delegated_item = None
+            delegated_before = None
+            if mode == "task_delegate" and related_work_item_id is not None:
+                delegated_item = await db.get(
+                    ProjectWorkItem,
+                    related_work_item_id,
+                    with_for_update=True,
+                )
+                if delegated_item is not None and delegated_item.status in {"backlog", "todo"}:
+                    delegated_before = delegated_item.status
+                    delegated_item.status = "in_progress"
             add_event(
                 db,
                 attached,
@@ -821,10 +849,29 @@ async def execute_project_runtime_tool(
                     "project_run_id": delivery.get("project_run_id"),
                     "subagent_run_id": delivery.get("subagent_run_id"),
                     "subagent_session_id": delivery.get("subagent_session_id"),
-                    "delivery_result": result,
+                    "delivery_status": "delivered",
                     "visible_to_group": False,
                 },
             )
+            if delegated_item is not None and delegated_before is not None:
+                add_event(
+                    db,
+                    attached,
+                    "work_item.updated",
+                    f"{member.name_snapshot} started work item {delegated_item.title}",
+                    actor_agent_id=agent_id,
+                    from_agent_id=agent_id,
+                    to_agent_id=target_id,
+                    work_item_id=delegated_item.id,
+                    run_id=project_run.id if project_run else None,
+                    metadata={
+                        "before": {"status": delegated_before},
+                        "after": {"status": delegated_item.status},
+                        "reason": "task_delegate_dispatched",
+                        "session_id": delivered_session_id,
+                        "project_run_id": delivery.get("project_run_id"),
+                    },
+                )
             await db.commit()
         return result
 

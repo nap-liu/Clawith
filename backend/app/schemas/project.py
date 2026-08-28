@@ -13,9 +13,21 @@ class ProjectAgentToolSetting(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectAgentMCPServerOverrideSetting(BaseModel):
+    server_id: uuid.UUID
+    system_prompt_block: str | None = None
+    url_template: str | None = None
+    headers_template: dict | None = None
+    credential_template: str | None = None
+    command_template: str | None = None
+    args_template: list[str] | None = None
+    env_template: dict | None = None
+
+
 class ProjectAgentInitialSettings(BaseModel):
     config_snapshot: dict = Field(default_factory=dict)
     tools: list[ProjectAgentToolSetting] = Field(default_factory=list)
+    mcp_server_overrides: list[ProjectAgentMCPServerOverrideSetting] = Field(default_factory=list)
     mcp_capability_ids: list[uuid.UUID] = Field(default_factory=list)
     skill_capability_ids: list[uuid.UUID] = Field(default_factory=list)
 
@@ -284,6 +296,15 @@ class ProjectTemplateFromProjectCreate(BaseModel):
     category: str = "general"
     version: str = "1.0.0"
     is_published: bool = False
+    included_skill_binding_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class ProjectTemplateFromProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    category: str | None = None
+    version: str | None = None
+    is_published: bool | None = None
     included_skill_binding_ids: list[uuid.UUID] = Field(default_factory=list)
 
 

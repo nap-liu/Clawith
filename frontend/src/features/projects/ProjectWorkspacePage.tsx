@@ -10,7 +10,12 @@ import {
   type ReactNode,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import {
   IconActivityHeartbeat,
   IconAlertTriangle,
@@ -50,7 +55,7 @@ import {
 } from "@tabler/icons-react";
 
 import { useToast } from "../../components/Toast/ToastProvider";
-import { Drawer } from "../../components/Dialog/DialogProvider";
+import { Drawer, useDialog } from "../../components/Dialog/DialogProvider";
 import OrgMemberAccessPicker, {
   type AgentAccessUser,
 } from "../../components/OrgMemberAccessPicker";
@@ -334,6 +339,19 @@ const text = (source: RecordValue, ...keys: string[]): string => {
   }
   return "";
 };
+const templateEditorId = (
+  project: ProjectSummary,
+  policies: RecordValue | null,
+): string => {
+  const sources = [obj(project.settings), obj(policies)];
+  for (const source of sources) {
+    const marker = source.template_editor;
+    if (typeof marker === "string" && marker) return marker;
+    const id = text(obj(marker), "template_id");
+    if (id) return id;
+  }
+  return "";
+};
 const bool = (source: RecordValue, ...keys: string[]): boolean =>
   keys.some((key) => source[key] === true);
 const num = (source: RecordValue, ...keys: string[]): number => {
@@ -371,7 +389,7 @@ const statusLabel = (
   t: ReturnType<typeof useTranslation>["t"],
 ): string =>
   t(`projectGraphs.status.${status || "unset"}`, {
-    defaultValue: status || t("projectGraphs.status.unset"),
+    defaultValue: t("projectGraphs.status.unknown"),
   });
 
 type ProjectToolDefinition = {
@@ -391,9 +409,9 @@ const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
   },
   {
     name: "project_list_work_items",
-    label: "View work items",
+    label: "View tasks",
     description:
-      "Review project work items or work assigned to the current member.",
+      "Review project tasks or work assigned to the current member.",
     participant: true,
   },
   {
@@ -410,8 +428,8 @@ const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
   },
   {
     name: "project_update_work_item",
-    label: "Update work item",
-    description: "Update the status, progress, or evidence of an existing work item.",
+    label: "Update task",
+    description: "Update the status, progress, or evidence of an existing task.",
     descriptionKey: "projectTerminology.workspace.ownerToolDescription",
     participant: true,
   },
@@ -437,9 +455,9 @@ const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
   },
   {
     name: "project_create_work_item",
-    label: "Create work item",
+    label: "Create task",
     description:
-      "Create and assign a work item. Available to the execution lead.",
+      "Create and assign a task. Available to the execution lead.",
     participant: false,
   },
   {
@@ -530,8 +548,8 @@ function projectToolResolution(
       !memberDisabled.has(tool.name),
   };
 }
-const errorMessage = (error: unknown, fallback = "Request failed"): string =>
-  error instanceof Error ? error.message : fallback;
+const errorMessage = (_error: unknown, fallback = "Request failed"): string =>
+  fallback;
 
 function sessionIdOf(source: RecordValue): string {
   return sessionRouteOf(source)?.sessionId || "";
@@ -682,6 +700,8 @@ function SectionHeading({
 
 export default function ProjectWorkspacePage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
+  const dialog = useDialog();
   const routeParams = useParams<{ projectId?: string; id?: string }>();
   const projectId = routeParams.projectId || routeParams.id || "";
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1360,6 +1380,47 @@ export default function ProjectWorkspacePage() {
     null;
   const activeDomain = workspaceDomainForTab(tab);
   const isOwner = data.project.access_role === "owner";
+  const editingTemplateId = templateEditorId(data.project, data.policies);
+  const saveTemplate = async () => {
+    if (!editingTemplateId) return;
+    setBusyAction("template-editor-save");
+    try {
+      await projectsApi.updateTemplateFromProject(
+        editingTemplateId,
+        projectId,
+      );
+      await projectsApi.delete(projectId);
+      toast.success(t("projectTemplates.management.saveSuccess"));
+      navigate(
+        `/projects/templates?template=${encodeURIComponent(editingTemplateId)}`,
+        { replace: true },
+      );
+    } catch {
+      toast.error(t("projectTemplates.management.saveFailed"));
+    } finally {
+      setBusyAction("");
+    }
+  };
+  const cancelTemplateEditing = async () => {
+    if (!editingTemplateId) return;
+    const confirmed = await dialog.confirm(
+      t("projectTemplates.management.cancelDescription"),
+      {
+        title: t("projectTemplates.management.cancelTitle"),
+        confirmLabel: t("projectTemplates.management.cancelEdit"),
+      },
+    );
+    if (!confirmed) return;
+    setBusyAction("template-editor-cancel");
+    try {
+      await projectsApi.delete(projectId);
+      navigate("/projects/templates", { replace: true });
+    } catch {
+      toast.error(t("projectTemplates.management.cancelFailed"));
+    } finally {
+      setBusyAction("");
+    }
+  };
   const selectWorkItem = (id: string) =>
     updateWorkspaceUrl(
       projectWorkItemUrlPatch(id || undefined, selectedWorkItemId || undefined),
@@ -1420,7 +1481,10 @@ export default function ProjectWorkspacePage() {
             groupSession={data.groupSession}
             groupConfig={groupConfig}
             canSend={
-              canEdit && ["planning", "running"].includes(data.project.status)
+              canEdit &&
+              ["planning", "running", "paused", "waiting", "completed"].includes(
+                data.project.status,
+              )
             }
           />
         );
@@ -1553,7 +1617,7 @@ export default function ProjectWorkspacePage() {
 
   return (
     <main
-      className={`project-workspace${tab === "files" ? " project-workspace--files" : ""}`}
+      className={`project-workspace${tab === "files" ? " project-workspace--files" : ""}${tab === "group" ? " project-workspace--chat" : ""}`}
     >
       <header className="project-workspace__header">
         <div className="project-workspace__project-mark">
@@ -1581,6 +1645,34 @@ export default function ProjectWorkspacePage() {
             )}
           </p>
         </div>
+        {editingTemplateId && (
+          <div className="project-workspace__template-actions">
+            <Button
+              variant="secondary"
+              disabled={busyAction.startsWith("template-editor-")}
+              onClick={() => void cancelTemplateEditing()}
+            >
+              {busyAction === "template-editor-cancel" ? (
+                <IconLoader2 className="project-workspace__spinner" size={16} />
+              ) : (
+                <IconX size={16} />
+              )}
+              {t("projectTemplates.management.cancelEdit")}
+            </Button>
+            <Button
+              variant="primary"
+              disabled={busyAction.startsWith("template-editor-")}
+              onClick={() => void saveTemplate()}
+            >
+              {busyAction === "template-editor-save" ? (
+                <IconLoader2 className="project-workspace__spinner" size={16} />
+              ) : (
+                <IconDeviceFloppy size={16} />
+              )}
+              {t("projectTemplates.management.save")}
+            </Button>
+          </div>
+        )}
         {isOwner && ["running", "paused", "waiting"].includes(data.project.status) && (
           <Button
             variant={data.project.status === "running" ? "secondary" : "primary"}
@@ -1916,9 +2008,7 @@ function Cockpit({
       id: `work:${text(item, "id", "work_item_id")}`,
       kind: "work" as const,
       title: text(item, "title", "name") || t("projectCockpit.blockedWorkItem"),
-      description:
-        text(item, "blocked_reason", "error", "description") ||
-        t("projectCockpit.blockedWorkItemHint"),
+      description: t("projectCockpit.blockedWorkItemHint"),
       time: item.updated_at,
       source: item,
     })),
@@ -2339,7 +2429,7 @@ function WorkBoard({
         <form className="project-workspace__action-panel" onSubmit={submit}>
           <header>
             <div>
-              <span>NEW WORK ITEM</span>
+              <span>{t("projectWorkspacePage.workItems.eyebrow")}</span>
               <h3>{t("projectWorkspacePage.workItems.create.title")}</h3>
             </div>
             <ProjectIconButton
@@ -2468,7 +2558,6 @@ function WorkBoard({
                           onClick={() => onSelect(id)}
                         >
                           <div className="project-workspace__kanban-card-meta">
-                            <code title={id}>{compactId(id)}</code>
                             <em data-priority={itemPriority}>
                               {priorityLabels.get(itemPriority) || itemPriority}
                             </em>
@@ -2653,7 +2742,7 @@ function MeshPanel({
   return (
     <>
       <SectionHeading
-        eyebrow="A2A DIRECT MESH"
+        eyebrow={t("projectMesh.eyebrow")}
         title={t("projectWorkspacePage.mesh.title")}
         description={t("projectTerminology.workspace.meshDescription")}
         actions={
@@ -2869,7 +2958,6 @@ function WorkItemList({
                   onClick={() => onSelect(id)}
                 >
                   <span className="project-workspace__item-list-copy">
-                    <code title={id}>{compactId(id)}</code>
                     <strong>
                       {text(item, "title", "name") ||
                         t("projectGraphs.unnamedWorkItem")}
@@ -2906,7 +2994,7 @@ function WorkItemList({
                         </strong>
                         <small>
                           {text(latestRun, "id", "run_id")
-                            ? `Run ${compactId(text(latestRun, "id", "run_id"))}`
+                            ? t("projectWorkspacePage.workItems.latestExecution")
                             : [
                                   "done",
                                   "completed",
@@ -3756,7 +3844,7 @@ function WorkItemDetail({
             <span id="work-item-changes" />
             <section
               id="work-item-execution"
-              className="project-workspace__item-section"
+              className="project-workspace__item-section project-workspace__item-progress"
             >
               <header>
                 <h3>
@@ -3764,6 +3852,7 @@ function WorkItemDetail({
                     "projectWorkspacePage.workItems.detail.singlePage.progressTitle",
                   )}
                 </h3>
+                {recentActivity.length > 0 && <span>{recentActivity.length}</span>}
               </header>
               {recentActivity.length ? (
                 <>
@@ -3773,16 +3862,19 @@ function WorkItemDetail({
                         "projectWorkspacePage.workItems.detail.singlePage.activity." +
                           activity.kind,
                       );
+                      const executionStatus = text(activity.source, "status");
                       const activityContent =
                         activity.kind === "execution"
-                          ? text(
-                              obj(activity.source.output),
-                              "summary",
-                              "result",
-                              "message",
-                            ) ||
-                            text(activity.source, "error") ||
-                            statusLabel(text(activity.source, "status"), t)
+                          ? ["failed", "cancelled"].includes(executionStatus)
+                            ? t(
+                                "projectWorkspacePage.workItems.detail.singlePage.executionUnavailable",
+                              )
+                            : text(
+                                obj(activity.source.output),
+                                "summary",
+                                "result",
+                                "message",
+                              ) || statusLabel(executionStatus, t)
                           : activity.kind === "discussion"
                             ? traceValue(
                                 traceRecords(activity.source),
@@ -3804,22 +3896,36 @@ function WorkItemDetail({
                             ? IconMessageCircle
                             : IconFile;
                       return (
-                        <article key={activity.key}>
-                          <span>
+                        <article
+                          className={`project-workspace__item-activity is-${activity.kind}`}
+                          key={activity.key}
+                        >
+                          <span
+                            className="project-workspace__item-activity-marker"
+                            aria-hidden="true"
+                          >
                             <ActivityIcon size={17} />
                           </span>
-                          <div>
-                            <strong>{activityLabel}</strong>
-                            <ProjectEventContent
-                              content={activityContent}
-                              maxChars={140}
-                            />
-                            {activity.createdAt && (
-                              <time>{dateLabel(activity.createdAt)}</time>
-                            )}
+                          <div className="project-workspace__item-activity-body">
+                            <div className="project-workspace__item-activity-meta">
+                              <strong>{activityLabel}</strong>
+                              {activity.createdAt && (
+                                <time>{dateLabel(activity.createdAt)}</time>
+                              )}
+                            </div>
+                            <div
+                              className="project-workspace__item-activity-summary"
+                              title={activityContent}
+                            >
+                              <ProjectEventContent
+                                content={activityContent}
+                                maxChars={100}
+                              />
+                            </div>
                           </div>
                           <Button
-                            variant="secondary"
+                            variant="ghost"
+                            className="project-workspace__item-activity-action"
                             onClick={() => openActivity(activity)}
                           >
                             {t(
@@ -3828,8 +3934,9 @@ function WorkItemDetail({
                                   ? "viewResult"
                                   : activity.kind === "discussion"
                                     ? "viewDiscussion"
-                                    : "viewDelivery"),
+                                  : "viewDelivery"),
                             )}
+                            <IconArrowRight size={14} />
                           </Button>
                         </article>
                       );
@@ -3974,10 +4081,7 @@ function MilestonesPanel({
     const records = traceRecords(event);
     const hash = closestTraceValue(records, "commit_hash", "commit", "hash");
     const commit = commitByHash.get(hash);
-    const title =
-      text(event, "message", "summary", "detail") ||
-      text(commit || {}, "message", "subject", "title") ||
-      t("projectWorkspaceNav.tabs.milestones");
+    const title = t("projectAudit.events.git.milestone.created");
     const commitEvents = events.filter((candidate) => {
       const candidateHash = closestTraceValue(
         traceRecords(candidate),
@@ -4364,7 +4468,7 @@ function RunsPanel({
   return (
     <>
       <SectionHeading
-        eyebrow="RUN CONTROL"
+        eyebrow={t("projectWorkspacePage.runs.eyebrow")}
         title={t("projectWorkspaceNav.tabs.runs")}
         description=""
         actions={
@@ -4454,7 +4558,6 @@ function RunsPanel({
                 <div className="project-workspace__run-copy">
                   <div>
                     <StatusPill status={runStatus} />
-                    <code>{runId}</code>
                   </div>
                   <h3>{originalObjective}</h3>
                   <p>{dateLabel(run.started_at || run.created_at)}</p>
@@ -4659,7 +4762,7 @@ function MembersPanel({
     Boolean(selectedId && member),
   );
   const [capabilitySection, setCapabilitySection] = useState<
-    "config" | "tools" | "mcp" | "skill"
+    "config" | "tools" | "skill"
   >("config");
   const [addingCapabilityKind, setAddingCapabilityKind] = useState<
     "mcp" | "skill" | null
@@ -4955,6 +5058,103 @@ function MembersPanel({
   const platformTools = capabilitiesByKind("tool");
   const memberMcps = capabilitiesByKind("mcp");
   const memberSkills = capabilitiesByKind("skill");
+  const memberSkillOptions = (() => {
+    const options = new Map<string, ProjectCapabilityOption>();
+    availableCapabilities
+      .filter(
+        (capability) =>
+          capability.kind === "skill" &&
+          (capability.source === "project" ||
+            capability.owner_agent_id === agentId),
+      )
+      .forEach((capability) => {
+        const id = capability.capability_id || capability.id;
+        if (id) options.set(id, capability);
+      });
+    memberSkills.forEach((capability) => {
+      const id = text(capability, "capability_id", "id");
+      if (!id || options.has(id)) return;
+      options.set(id, {
+        id,
+        capability_id: id,
+        name:
+          text(capability, "name", "capability_name") ||
+          t("projectWorkspacePage.capabilities.capability"),
+        description: text(capability, "description", "purpose", "summary"),
+        kind: "skill",
+        source: text(capability, "source") === "shared" ? "project" : "agent",
+        origin:
+          text(capability, "source") === "shared"
+            ? "market"
+            : "digital_employee",
+        owner_agent_id: text(
+          capability,
+          "inherited_from_agent_id",
+          "owner_agent_id",
+        ),
+      });
+    });
+    return [...options.values()];
+  })();
+  const selectedMemberSkillIds = memberSkills
+    .filter((capability) => capability.is_enabled !== false)
+    .map((capability) => text(capability, "capability_id", "id"))
+    .filter(Boolean);
+  const updateMemberSkills = (nextIds: string[]) => {
+    if (!canManage || departed || !agentId) return;
+    const selected = new Set(nextIds);
+    const existingByCapability = new Map(
+      memberSkills.map((capability) => [
+        text(capability, "capability_id", "id"),
+        capability,
+      ]),
+    );
+    void runAction(
+      `member-skills-${memberId}`,
+      () =>
+        Promise.all([
+          ...memberSkills
+            .filter((capability) => {
+              const capabilityId = text(capability, "capability_id", "id");
+              return (
+                Boolean(capabilityId) &&
+                selected.has(capabilityId) !==
+                  (capability.is_enabled !== false)
+              );
+            })
+            .map((capability) =>
+              projectsApi.patchCapability(
+                projectId,
+                text(capability, "id", "binding_id"),
+                {
+                  is_enabled: selected.has(
+                    text(capability, "capability_id", "id"),
+                  ),
+                },
+              ),
+            ),
+          ...nextIds
+            .filter((capabilityId) => !existingByCapability.has(capabilityId))
+            .map((capabilityId) => {
+              const option = memberSkillOptions.find(
+                (candidate) =>
+                  (candidate.capability_id || candidate.id) === capabilityId,
+              );
+              return projectsApi.createCapability(projectId, {
+                capability_type: "skill",
+                capability_id: capabilityId,
+                capability_name:
+                  option?.name ||
+                  t("projectWorkspacePage.capabilities.capability"),
+                source: "inherited",
+                inherited_from_agent_id: agentId,
+                is_enabled: true,
+              });
+            }),
+        ]),
+      t("projectWorkspacePage.capabilities.feedback.enabled"),
+    );
+  };
   const effectiveProjectToolCount = member
     ? PROJECT_TOOL_REGISTRY.filter(
         (tool) => projectToolResolution(tool, member, policies).effective,
@@ -5347,8 +5547,10 @@ function MembersPanel({
                 modelOptions={modelOptions}
                 counts={{
                   config: configCount,
-                  tools: effectiveProjectToolCount + platformTools.length,
-                  mcp: memberMcps.length,
+                  tools:
+                    effectiveProjectToolCount +
+                    platformTools.length +
+                    memberMcps.length,
                   skill: memberSkills.length,
                 }}
                 canManage={canManage}
@@ -5434,23 +5636,20 @@ function MembersPanel({
                     canConfigure={
                       Boolean(projectAgent) && canManage && !departed
                     }
-                    scope="project"
+                    scope={projectAgent ? "agent" : "project"}
                     projectContext={
                       projectAgent ? undefined : { projectId, memberId }
                     }
                   />
                 }
-                mcp={
-                  renderCapabilityGroup(
-                    "mcp",
-                    memberMcps,
-                    t("projectAgents.capabilityPackage.sections.mcp"),
-                  )
-                }
                 skill={
                   <SkillsTab
                     agentId={projectAgent?.id || agentId}
-                    canManage={Boolean(projectAgent) && canManage && !departed}
+                    canManage={canManage && !departed}
+                    scope="project"
+                    draftCapabilities={memberSkillOptions}
+                    selectedCapabilityIds={selectedMemberSkillIds}
+                    onSelectedCapabilityIdsChange={updateMemberSkills}
                   />
                 }
               />
@@ -7657,8 +7856,9 @@ function GitRepositoryControls({
   const initializationOnly =
     source !== "cloned" &&
     commits.length === 1 &&
-    text(commits[0], "message", "subject", "title") ===
-      "Initialize AI-native project" &&
+    ["Initialize project", "Initialize AI-native project"].includes(
+      text(commits[0], "message", "subject", "title"),
+    ) &&
     repositoryFiles.length === 2 &&
     repositoryFiles[0] === "PROJECT.json" &&
     repositoryFiles[1] === "README.md";
@@ -7807,7 +8007,7 @@ function GitRepositoryControls({
         <section>
           <header>
             <div>
-              <span>REMOTES</span>
+              <span>{t("projectWorkspacePage.repository.remoteSection")}</span>
               <h4>{t("projectWorkspacePage.repository.remoteList")}</h4>
             </div>
             <ProjectCountBadge>
@@ -7971,7 +8171,7 @@ function GitRepositoryControls({
         <section>
           <header>
             <div>
-              <span>INITIAL SOURCE</span>
+              <span>{t("projectWorkspacePage.repository.initialSourceSection")}</span>
               <h4>{t("projectWorkspacePage.repository.initializeRemote")}</h4>
             </div>
             <ProjectStatusBadge tone={canClone ? "success" : "neutral"}>
@@ -8047,7 +8247,7 @@ function GitRepositoryControls({
         <form className="project-workspace__modal" onSubmit={cloneRepository}>
           <header>
             <div>
-              <span>IMPORT REPOSITORY</span>
+              <span>{t("projectWorkspacePage.repository.importEyebrow")}</span>
               <h2>{t("projectWorkspacePage.repository.importTitle")}</h2>
             </div>
             <ProjectIconButton
@@ -8272,14 +8472,25 @@ function GitPanel({
                       <code title={hash}>
                         {text(commit, "short_commit") || hash.slice(0, 12)}
                       </code>
-                      <span className="project-workspace__git-log-message">
+                      <span
+                        className="project-workspace__git-log-message"
+                        title={
+                          text(commit, "message", "subject", "title") ||
+                          t("projectGit.unnamedCommit")
+                        }
+                      >
                         <strong>
                           {text(commit, "message", "subject", "title") ||
                             t("projectGit.unnamedCommit")}
                         </strong>
                         <small>{hash}</small>
                       </span>
-                      <span>{responsibleAgentForCommit(commit)}</span>
+                      <span
+                        className="project-workspace__git-log-author"
+                        title={responsibleAgentForCommit(commit)}
+                      >
+                        {responsibleAgentForCommit(commit)}
+                      </span>
                       <time dateTime={text(commit, "created_at", "timestamp")}>
                         {dateLabel(commit.created_at || commit.timestamp)}
                       </time>
@@ -8326,7 +8537,7 @@ function GitPanel({
               <div>
                 <dt>{t("projectGit.commit")}</dt>
                 <dd>
-                  <code>{selectedId || "—"}</code>
+                  <code>{selectedId ? compactId(selectedId) : "—"}</code>
                 </dd>
               </div>
               <div>
@@ -8342,10 +8553,10 @@ function GitPanel({
               <div>
                 <dt>{t("projectGit.references")}</dt>
                 <dd className="project-workspace__git-detail-refs">
-                  {selectedRefs.map((ref) => (
+                  {selectedRefs.filter((ref) => ref !== "HEAD").map((ref) => (
                     <ProjectStatusBadge
                       key={ref}
-                      tone={ref === "HEAD" ? "success" : "info"}
+                      tone="info"
                     >
                       {ref}
                     </ProjectStatusBadge>
@@ -8355,7 +8566,7 @@ function GitPanel({
                       {t("projectGit.milestone")}
                     </ProjectStatusBadge>
                   )}
-                  {!selectedRefs.length &&
+                  {!selectedRefs.filter((ref) => ref !== "HEAD").length &&
                     !(selected && isMilestone(selected)) &&
                     "—"}
                 </dd>
@@ -8366,7 +8577,9 @@ function GitPanel({
                   {traceValue(
                     traceRecords(linkedEvent || selected || {}),
                     "run_id",
-                  ) || "—"}
+                  )
+                    ? t("projectGit.linked")
+                    : "—"}
                 </dd>
               </div>
               <div>
@@ -8375,13 +8588,15 @@ function GitPanel({
                   {traceValue(
                     traceRecords(linkedEvent || selected || {}),
                     "work_item_id",
-                  ) || "—"}
+                  )
+                    ? t("projectGit.linked")
+                    : "—"}
                 </dd>
               </div>
               <div>
                 <dt>{t("projectGit.conversation")}</dt>
                 <dd>
-                  {sessionIdOf(sessionSource) || "—"}
+                  {sessionIdOf(sessionSource) ? t("projectGit.linked") : "—"}
                   <SessionButton
                     source={sessionSource}
                     onOpen={onOpenSession}

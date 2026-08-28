@@ -48,7 +48,10 @@ export default function ProjectEventContent({
     ? t(`projectAudit.details.${eventType}`, { defaultValue: "" }).trim()
     : "";
   const value = String(
-    translatedDetail || content || empty || t("projectAudit.noDetails"),
+    translatedDetail ||
+      (eventType ? "" : content) ||
+      empty ||
+      t("projectAudit.noDetails"),
   ).trim();
   const long =
     Array.from(value).length > maxChars || value.split("\n").length > 6;

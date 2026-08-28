@@ -15,7 +15,6 @@ from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.participant import Participant
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
-from app.models.skill import Skill
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
@@ -27,6 +26,7 @@ from app.services.project_agent_template_assets import (
     instantiate_project_agent_template_assets,
     remove_project_agent_template_instances,
 )
+from app.services.project_capability_options import load_project_capability_options
 from app.services.project_git_service import (
     commit_project_changes,
     project_repo_path,
@@ -232,6 +232,7 @@ async def instantiate_project_agents_from_template(
 async def export_project_capabilities_for_template(db: AsyncSession, project: Project) -> list[dict]:
     """Export neutral Tool/MCP dependencies; Skill files use their own package."""
 
+    capability_options = await load_project_capability_options(db, project.tenant_id, [])
     member_rows = await _template_member_rows(db, project)
     agent_ids = [agent.id for agent, _member in member_rows]
     agent_index = {agent_id: index for index, agent_id in enumerate(agent_ids)}
@@ -252,8 +253,7 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
         if binding.capability_id is None or binding.capability_type == "skill":
             continue
         if binding.capability_type == "mcp":
-            server = await db.get(MCPServer, binding.capability_id)
-            if server is None or server.tenant_id not in {None, project.tenant_id}:
+            if not capability_options.allows_shared("mcp", binding.capability_id):
                 continue
         elif binding.capability_type == "tool":
             tool = await db.get(Tool, binding.capability_id)
@@ -324,7 +324,10 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
                 if tool.mcp_server_id is None:
                     continue
                 server = await db.get(MCPServer, tool.mcp_server_id)
-                if server is None or server.tenant_id not in {None, project.tenant_id}:
+                if (
+                    server is None
+                    or not capability_options.allows_shared("mcp", server.id)
+                ):
                     continue
                 dependency = ("mcp", server.id, server.display_name or server.name)
             else:
@@ -405,6 +408,7 @@ async def instantiate_project_capabilities_from_template(
         "is_enabled",
         "scope",
     }
+    capability_options = await load_project_capability_options(db, project.tenant_id, [])
     for item in raw_capabilities:
         if not isinstance(item, dict) or set(item) != allowed_keys or item.get("schema_version") != 1:
             raise ProjectTemplateSnapshotError("Project template capability entry is invalid")
@@ -417,13 +421,13 @@ async def instantiate_project_capabilities_from_template(
         except ValueError as exc:
             raise ProjectTemplateSnapshotError("Project template capability identifier is invalid") from exc
         if capability_type == "mcp":
-            server = await db.get(MCPServer, capability_id)
-            if server is None or server.tenant_id not in {None, project.tenant_id}:
-                raise ProjectTemplateSnapshotError("Project template MCP server is unavailable")
+            if not capability_options.allows_shared("mcp", capability_id):
+                continue
         elif capability_type == "skill":
-            skill = await db.get(Skill, capability_id)
-            if skill is None or skill.tenant_id not in {None, project.tenant_id}:
-                raise ProjectTemplateSnapshotError("Project template skill is unavailable")
+            # Project Skills are restored only from explicitly selected,
+            # self-contained template assets. Registry identifiers are not
+            # portable authorization and are ignored for older templates.
+            continue
         else:
             tool = await db.get(Tool, capability_id)
             if tool is None or tool.type == "mcp" or tool.tenant_id not in {None, project.tenant_id}:

@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 
 import ToolsManager from '../components/ToolsManager';
+import type { MCPServerEditorDraftOverride } from '../../../types/mcpServer';
 
 export default function ToolsTab({
     agentId,
@@ -11,6 +12,8 @@ export default function ToolsTab({
     projectContext,
     draftTools,
     onDraftToolsChange,
+    draftMcpOverrides,
+    onDraftMcpOverridesChange,
 }: {
     agentId: string;
     agentName?: string;
@@ -20,6 +23,8 @@ export default function ToolsTab({
     projectContext?: { projectId: string; memberId: string };
     draftTools?: any[];
     onDraftToolsChange?: (tools: any[]) => void;
+    draftMcpOverrides?: Record<string, MCPServerEditorDraftOverride>;
+    onDraftMcpOverridesChange?: (value: Record<string, MCPServerEditorDraftOverride>) => void;
 }) {
     const { t } = useTranslation();
 
@@ -38,6 +43,8 @@ export default function ToolsTab({
                 projectContext={projectContext}
                 draftTools={draftTools}
                 onDraftToolsChange={onDraftToolsChange}
+                draftMcpOverrides={draftMcpOverrides}
+                onDraftMcpOverridesChange={onDraftMcpOverridesChange}
             />
         </div>
     );

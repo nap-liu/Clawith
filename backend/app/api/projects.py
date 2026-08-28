@@ -5,24 +5,24 @@ import posixpath
 import re
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 from jose import JWTError, jwt
 from loguru import logger
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, text, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.permissions import build_visible_agents_query
+from app.core.permissions import build_visible_agents_query, is_platform_admin_user
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
-from app.models.mcp_server import MCPServer
 from app.models.project import (
     Project,
     ProjectAccessGrant,
@@ -35,7 +35,6 @@ from app.models.project import (
     ProjectTemplate,
     ProjectWorkItem,
 )
-from app.models.skill import Skill
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.project import (
@@ -78,6 +77,7 @@ from app.schemas.project import (
     ProjectSkillBackfillRequest,
     ProjectTemplateCreate,
     ProjectTemplateFromProjectCreate,
+    ProjectTemplateFromProjectUpdate,
     ProjectUpdate,
     WorkItemCreate,
     WorkItemDetailOut,
@@ -113,6 +113,7 @@ from app.services.project_agent_template_service import (
     instantiate_project_capabilities_from_template,
 )
 from app.services.project_capability_contract import serialize_project_capability
+from app.services.project_capability_options import load_project_capability_options
 from app.services.project_collaboration_prompt import build_project_kickoff_task
 from app.services.project_git_service import (
     apply_project_repository_clone,
@@ -155,6 +156,7 @@ from app.services.project_service import (
     deactivate_project_member,
     deliver_project_a2a,
     ensure_project_accepts_group_message,
+    ensure_enabled_project_leader,
     ensure_project_group_session,
     ensure_project_leader_session,
     ensure_project_running,
@@ -433,7 +435,68 @@ def _git_remote_audit_metadata(remote: dict, *, history_changed: bool) -> dict:
     }
 
 
-async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict:
+def _can_manage_template(user: User, template: ProjectTemplate) -> bool:
+    if is_platform_admin_user(user):
+        return True
+    if user.role == "org_admin":
+        return bool(user.tenant_id is not None and template.tenant_id == user.tenant_id)
+    if user.tenant_id is None or template.tenant_id != user.tenant_id:
+        return False
+    return template.created_by_user_id == user.id
+
+
+def _visible_template_clause(user: User):
+    if is_platform_admin_user(user):
+        return true()
+    tenant_id = _tenant_id(user)
+    if user.role == "org_admin":
+        return or_(
+            ProjectTemplate.is_published.is_(True),
+            ProjectTemplate.tenant_id == tenant_id,
+        )
+    return and_(
+        or_(
+            ProjectTemplate.tenant_id.is_(None),
+            ProjectTemplate.tenant_id == tenant_id,
+        ),
+        or_(
+            ProjectTemplate.is_published.is_(True),
+            ProjectTemplate.created_by_user_id == user.id,
+        ),
+    )
+
+
+def _manageable_template_clause(user: User):
+    if is_platform_admin_user(user):
+        return true()
+    tenant_id = _tenant_id(user)
+    if user.role == "org_admin":
+        return ProjectTemplate.tenant_id == tenant_id
+    return and_(
+        ProjectTemplate.tenant_id == tenant_id,
+        ProjectTemplate.created_by_user_id == user.id,
+    )
+
+
+async def _require_template(
+    db: AsyncSession,
+    user: User,
+    template_id: uuid.UUID,
+    *,
+    manage: bool = False,
+    lock: bool = False,
+) -> ProjectTemplate:
+    clause = _manageable_template_clause(user) if manage else _visible_template_clause(user)
+    stmt = select(ProjectTemplate).where(ProjectTemplate.id == template_id, clause)
+    if lock:
+        stmt = stmt.with_for_update()
+    template = (await db.execute(stmt)).scalar_one_or_none()
+    if template is None:
+        raise HTTPException(status_code=404, detail="Project template not found")
+    return template
+
+
+async def _template_payload(db: AsyncSession, template: ProjectTemplate, user: User) -> dict:
     definition = template.definition or {}
     public_definition = public_template_definition(definition) if "project_snapshot" in definition else definition
     usage_count = (
@@ -444,6 +507,7 @@ async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict
         author_name = (
             await db.execute(select(User.display_name).where(User.id == template.created_by_user_id))
         ).scalar_one_or_none()
+    can_manage = _can_manage_template(user, template)
     return {
         "id": str(template.id),
         "tenant_id": str(template.tenant_id) if template.tenant_id else None,
@@ -453,6 +517,8 @@ async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict
         "category": template.category,
         "version": template.version,
         "is_published": template.is_published,
+        "can_edit": can_manage,
+        "can_delete": can_manage,
         "definition": public_definition,
         "author_name": author_name or "平台模板",
         "usage_count": usage_count,
@@ -572,21 +638,14 @@ async def list_project_templates(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    tenant_id = _tenant_id(current_user)
     await _ensure_builtin_templates(db)
-    stmt = select(ProjectTemplate).where(
-        or_(
-            ProjectTemplate.tenant_id.is_(None),
-            ProjectTemplate.tenant_id == tenant_id,
-        ),
-        or_(ProjectTemplate.is_published.is_(True), ProjectTemplate.created_by_user_id == current_user.id),
-    )
+    stmt = select(ProjectTemplate).where(_visible_template_clause(current_user))
     if category:
         stmt = stmt.where(ProjectTemplate.category == category)
     if q:
         stmt = stmt.where(ProjectTemplate.name.ilike(f"%{q}%"))
     templates = (await db.execute(stmt.order_by(ProjectTemplate.created_at.desc()))).scalars().all()
-    return [await _template_payload(db, template) for template in templates]
+    return [await _template_payload(db, template, current_user) for template in templates]
 
 
 @router.post("/templates", status_code=status.HTTP_201_CREATED)
@@ -616,7 +675,7 @@ async def create_project_template(
     )
     db.add(template)
     await db.flush()
-    return await _template_payload(db, template)
+    return await _template_payload(db, template, current_user)
 
 
 @router.get("/templates/{template_id}")
@@ -625,19 +684,35 @@ async def get_project_template(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    tenant_id = _tenant_id(current_user)
-    template = (
-        await db.execute(
-            select(ProjectTemplate).where(
-                ProjectTemplate.id == template_id,
-                or_(ProjectTemplate.tenant_id.is_(None), ProjectTemplate.tenant_id == tenant_id),
-                or_(ProjectTemplate.is_published.is_(True), ProjectTemplate.created_by_user_id == current_user.id),
+    template = await _require_template(db, current_user, template_id)
+    return await _template_payload(db, template, current_user)
+
+
+@router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_project_template(
+    template_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    template = await _require_template(db, current_user, template_id, manage=True, lock=True)
+    editor_projects = (
+        (
+            await db.execute(
+                select(Project).where(
+                    Project.settings["template_editor"]["template_id"].as_string() == str(template.id)
+                )
             )
         )
-    ).scalar_one_or_none()
-    if template is None:
-        raise HTTPException(status_code=404, detail="Project template not found")
-    return await _template_payload(db, template)
+        .scalars()
+        .all()
+    )
+    for project in editor_projects:
+        settings = dict(project.settings or {})
+        settings.pop("template_editor", None)
+        project.settings = settings
+    await db.delete(template)
+    await db.flush()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/bootstrap-options")
@@ -648,26 +723,6 @@ async def get_project_bootstrap_options(
     tenant_id = _tenant_id(current_user)
     agents = (
         (await db.execute(build_visible_agents_query(current_user, tenant_id=tenant_id).order_by(Agent.name)))
-        .scalars()
-        .all()
-    )
-    skills = (
-        (
-            await db.execute(
-                select(Skill).where(or_(Skill.tenant_id == tenant_id, Skill.tenant_id.is_(None))).order_by(Skill.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    mcp_servers = (
-        (
-            await db.execute(
-                select(MCPServer)
-                .where(or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None)))
-                .order_by(MCPServer.display_name)
-            )
-        )
         .scalars()
         .all()
     )
@@ -686,6 +741,24 @@ async def get_project_bootstrap_options(
         .scalars()
         .all()
     )
+    agent_installed_mcp_tools = (
+        (
+            await db.execute(
+                select(AgentTool, Tool)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id.in_([agent.id for agent in agents]),
+                    AgentTool.enabled.is_(True),
+                    Tool.enabled.is_(True),
+                    Tool.type == "mcp",
+                    Tool.source == "agent",
+                    or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
+                )
+                .order_by(AgentTool.agent_id, Tool.mcp_server_name, Tool.display_name, Tool.name)
+            )
+        )
+        .all()
+    ) if agents else []
     users = (
         (
             await db.execute(
@@ -695,68 +768,14 @@ async def get_project_bootstrap_options(
         .scalars()
         .all()
     )
-    agent_ids = [agent.id for agent in agents]
-    agent_names = {agent.id: agent.name for agent in agents}
-    inherited_tools = []
-    if agent_ids:
-        inherited_tools = (
-            await db.execute(
-                select(AgentTool, Tool)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id.in_(agent_ids),
-                    AgentTool.enabled.is_(True),
-                    Tool.enabled.is_(True),
-                    or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
-                )
-                .order_by(AgentTool.agent_id, Tool.display_name)
-            )
-        ).all()
-    capabilities = [
-        {
-            "id": str(skill.id),
-            "capability_id": str(skill.id),
-            "key": skill.folder_name,
-            "type": "skill",
-            "name": skill.name,
-            "description": skill.description,
-            "source": "shared",
-            "owner_agent_id": None,
-            "enabled": True,
-        }
-        for skill in skills
-    ] + [
-        {
-            "id": str(server.id),
-            "capability_id": str(server.id),
-            "key": server.name,
-            "type": "mcp",
-            "name": server.display_name or server.name,
-            "description": "",
-            "source": "shared",
-            "owner_agent_id": None,
-            "enabled": True,
-        }
-        for server in mcp_servers
-    ]
-    capabilities.extend(
-        {
-            "id": f"{assignment.agent_id}:{tool.id}",
-            "capability_id": str(tool.id),
-            "key": tool.name,
-            "type": "mcp" if tool.type == "mcp" else "tool",
-            "name": tool.display_name or tool.name,
-            "description": tool.description,
-            "category": tool.category,
-            "mcp_server_name": tool.mcp_server_name,
-            "source": "inherited",
-            "owner_agent_id": str(assignment.agent_id),
-            "owner_agent_name": agent_names.get(assignment.agent_id),
-            "enabled": assignment.enabled,
-            "enabled_by_default": tool.name in PROJECT_AGENT_DEFAULT_TOOL_NAMES,
-        }
-        for assignment, tool in inherited_tools
-    )
+    capability_options = await load_project_capability_options(db, tenant_id, agents)
+    selectable_mcp_names = {
+        uuid.UUID(str(capability["capability_id"])): str(capability["name"])
+        for capability in capability_options.capabilities
+        if capability.get("type") == "mcp"
+        and capability.get("capability_id")
+        and capability.get("name")
+    }
     return {
         "agents": [
             {
@@ -782,28 +801,52 @@ async def get_project_bootstrap_options(
                 "type": tool.type,
                 "icon": tool.icon,
                 "source": tool.source,
+                "agent_tool_source": None,
+                "installed_by_agent_id": None,
                 "config_schema": tool.config_schema or {},
                 "agent_config": {},
                 "mcp_server_id": str(tool.mcp_server_id) if tool.mcp_server_id else None,
-                "mcp_server_name": tool.mcp_server_name,
-                "enabled": tool_is_required(tool.name) or tool.name in PROJECT_AGENT_DEFAULT_TOOL_NAMES,
+                "mcp_server_name": selectable_mcp_names.get(
+                    tool.mcp_server_id,
+                    tool.mcp_server_name,
+                ),
+                "enabled": tool.type != "mcp" and (
+                    tool_is_required(tool.name) or tool.name in PROJECT_AGENT_DEFAULT_TOOL_NAMES
+                ),
                 "can_disable": not tool_is_required(tool.name),
             }
             for tool in platform_tools
             if tool.type != "mcp"
-        ],
-        "skills": [
-            {"id": str(skill.id), "name": skill.name, "description": skill.description, "category": skill.category}
-            for skill in skills
-        ],
-        "mcp_servers": [
+            or (
+                tool.mcp_server_id is not None
+                and tool.mcp_server_id in capability_options.shared_mcp_ids
+            )
+        ] + [
             {
-                "id": str(server.id),
-                "name": server.name,
-                "display_name": server.display_name,
-                "transport": server.transport,
+                "id": str(tool.id),
+                "name": tool.name,
+                "display_name": tool.display_name,
+                "description": tool.description,
+                "category": tool.category,
+                "type": tool.type,
+                "icon": tool.icon,
+                "source": tool.source,
+                "agent_tool_source": "user_installed",
+                "installed_by_agent_id": str(assignment.agent_id),
+                "config_schema": tool.config_schema or {},
+                "agent_config": {},
+                "mcp_server_id": str(tool.mcp_server_id) if tool.mcp_server_id else None,
+                "mcp_server_name": selectable_mcp_names.get(
+                    tool.mcp_server_id,
+                    tool.mcp_server_name,
+                ),
+                "enabled": False,
+                "can_disable": True,
             }
-            for server in mcp_servers
+            for assignment, tool in agent_installed_mcp_tools
+            if tool.mcp_server_id is not None
+            and tool.mcp_server_id
+            in capability_options.agent_mcp_ids.get(assignment.agent_id, frozenset())
         ],
         "users": [
             {
@@ -815,7 +858,11 @@ async def get_project_bootstrap_options(
             for user in users
             if user.id != current_user.id
         ],
-        "capabilities": capabilities,
+        "capabilities": [
+            capability
+            for capability in capability_options.capabilities
+            if capability.get("type") == "skill"
+        ],
     }
 
 
@@ -825,18 +872,17 @@ async def create_project_from_template(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    tenant_id = _tenant_id(current_user)
-    template = (
-        await db.execute(
-            select(ProjectTemplate).where(
-                ProjectTemplate.id == data.template_id,
-                or_(ProjectTemplate.tenant_id.is_(None), ProjectTemplate.tenant_id == tenant_id),
-                or_(ProjectTemplate.is_published.is_(True), ProjectTemplate.created_by_user_id == current_user.id),
-            )
-        )
-    ).scalar_one_or_none()
-    if template is None:
-        raise HTTPException(status_code=404, detail="Project template not found")
+    return await _create_project_from_template(data, current_user, db)
+
+
+async def _create_project_from_template(
+    data: ProjectFromTemplateCreate,
+    current_user: User,
+    db: AsyncSession,
+    *,
+    editor_template_id: uuid.UUID | None = None,
+):
+    template = await _require_template(db, current_user, data.template_id)
     allowed_override_keys = {"members", "capabilities", "shared_with_user_ids"}
     unknown_override_keys = set(data.overrides) - allowed_override_keys
     if unknown_override_keys:
@@ -859,6 +905,9 @@ async def create_project_from_template(
         if packaged_snapshot is not None
         else list(definition.get("capabilities", []))
     )
+    project_settings = dict(definition.get("settings", {}))
+    if editor_template_id is not None:
+        project_settings["template_editor"] = {"template_id": str(editor_template_id)}
     payload = ProjectCreate(
         name=data.name or template.name,
         description=data.description if data.description is not None else template.description,
@@ -866,12 +915,17 @@ async def create_project_from_template(
         success_criteria=definition.get("success_criteria", []),
         visibility=data.visibility,
         template_id=template.id,
-        settings=definition.get("settings", {}),
+        settings=project_settings,
         members=definition.get("members", []),
         capabilities=definition.get("capabilities", []) if capabilities_overridden or packaged_snapshot is None else [],
         shared_with_user_ids=definition.get("shared_with_user_ids", []),
     )
-    project = await create_project(db, current_user, payload)
+    project = await create_project(
+        db,
+        current_user,
+        payload,
+        allow_template_agents=bool(definition.get("agents")),
+    )
     try:
         await restore_project_template_files(
             project,
@@ -909,6 +963,7 @@ async def create_project_from_template(
         if isinstance(exc, (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError)):
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         raise
+
     try:
         if definition.get("agents"):
             await ensure_project_group_session(db, project)
@@ -918,6 +973,26 @@ async def create_project_from_template(
             None,
         )
         if explicit_leader_id is not None:
+            project_leader_id = (
+                await db.execute(
+                    select(Agent.id)
+                    .where(
+                        Agent.project_id == project.id,
+                        Agent.tenant_id == project.tenant_id,
+                        Agent.is_deleted.is_(False),
+                        or_(
+                            Agent.id == explicit_leader_id,
+                            Agent.source_agent_id == explicit_leader_id,
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if project_leader_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Selected project owner is unavailable",
+                )
             await db.execute(
                 ProjectMemberSnapshot.__table__.update()
                 .where(
@@ -931,7 +1006,7 @@ async def create_project_from_template(
                 .where(
                     ProjectMemberSnapshot.project_id == project.id,
                     ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                    ProjectMemberSnapshot.agent_id == explicit_leader_id,
+                    ProjectMemberSnapshot.agent_id == project_leader_id,
                 )
                 .values(is_leader=True)
             )
@@ -941,7 +1016,7 @@ async def create_project_from_template(
                 "leader.changed",
                 "Applied the responsible person selected during template creation",
                 actor_user_id=current_user.id,
-                actor_agent_id=explicit_leader_id,
+                actor_agent_id=project_leader_id,
                 metadata={"source": "template_override"},
             )
             await db.flush()
@@ -1011,6 +1086,23 @@ async def create_project_from_template(
         raise
 
 
+@router.post("/templates/{template_id}/editor", status_code=status.HTTP_201_CREATED)
+async def create_project_template_editor(
+    template_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an isolated, hidden project for editing one manageable template."""
+
+    template = await _require_template(db, current_user, template_id, manage=True)
+    return await _create_project_from_template(
+        ProjectFromTemplateCreate(template_id=template.id),
+        current_user,
+        db,
+        editor_template_id=template.id,
+    )
+
+
 @router.get("")
 async def list_projects(
     scope: str = Query("mine", pattern="^(mine|shared|running|archived|all)$"),
@@ -1019,7 +1111,10 @@ async def list_projects(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Project).where(accessible_projects_clause(current_user))
+    stmt = select(Project).where(
+        accessible_projects_clause(current_user),
+        func.coalesce(Project.settings["template_editor"]["template_id"].as_string(), "") == "",
+    )
     if scope == "mine":
         stmt = stmt.where(Project.owner_user_id == current_user.id)
     elif scope == "shared":
@@ -1121,7 +1216,7 @@ async def create_template_from_project(
         None,
     )
     if existing is not None:
-        return await _template_payload(db, existing)
+        return await _template_payload(db, existing, current_user)
     definition["_publication_key"] = publication_key
     template = ProjectTemplate(
         tenant_id=project.tenant_id,
@@ -1151,7 +1246,82 @@ async def create_template_from_project(
         },
     )
     await db.flush()
-    return await _template_payload(db, template)
+    await db.refresh(template)
+    return await _template_payload(db, template, current_user)
+
+
+@router.put("/templates/{template_id}/from-project/{project_id}")
+async def update_template_from_project(
+    template_id: uuid.UUID,
+    project_id: uuid.UUID,
+    data: ProjectTemplateFromProjectUpdate | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace a manageable template definition with one project snapshot."""
+
+    template = await _require_template(db, current_user, template_id, manage=True, lock=True)
+    project = await require_owner(db, current_user, project_id)
+    await db.refresh(project, with_for_update=True)
+    if (
+        not is_platform_admin_user(current_user)
+        and template.tenant_id is not None
+        and template.tenant_id != project.tenant_id
+    ):
+        raise HTTPException(status_code=404, detail="Project template not found")
+    update = data or ProjectTemplateFromProjectUpdate()
+    try:
+        definition, snapshot = await _build_project_template_definition(
+            db,
+            project,
+            included_skill_binding_ids=update.included_skill_binding_ids,
+        )
+    except (ProjectAgentTemplateAssetError, ProjectTemplateSnapshotError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    next_name = update.name if update.name is not None else template.name
+    next_description = update.description if update.description is not None else template.description
+    next_category = update.category if update.category is not None else template.category
+    next_version = update.version if update.version is not None else template.version
+    next_published = update.is_published if update.is_published is not None else template.is_published
+    definition["_publication_key"] = hashlib.sha256(
+        "\x1f".join(
+            (
+                str(template.id),
+                str(project.id),
+                snapshot.head,
+                next_name,
+                next_description or "",
+                next_category,
+                next_version,
+                "published" if next_published else "draft",
+                ",".join(sorted(str(value) for value in update.included_skill_binding_ids)),
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    template.name = next_name
+    template.description = next_description
+    template.category = next_category
+    template.version = next_version
+    template.is_published = next_published
+    template.definition = definition
+    add_event(
+        db,
+        project,
+        "project.template.updated",
+        "Updated a project template from the current project snapshot",
+        actor_user_id=current_user.id,
+        metadata={
+            "template_id": str(template.id),
+            "source_head": snapshot.head,
+            "file_count": len(snapshot.project_files["files"]),
+            "digital_employee_count": len(definition["agents"]),
+            "skill_count": len(definition["skill_assets"]),
+            "excluded_file_count": snapshot.project_files["excluded_file_count"],
+        },
+    )
+    await db.flush()
+    await db.refresh(template)
+    return await _template_payload(db, template, current_user)
 
 
 @router.get("/{project_id}/template-manifest")
@@ -1621,18 +1791,98 @@ async def patch_project_settings(
     return project.settings
 
 
-@router.delete("/{project_id}")
-async def archive_project(
+@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_project(
     project_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_owner(db, current_user, project_id)
-    project.status = "archived"
-    add_event(
-        db, project, "project.archived", "Project archived without deleting history", actor_user_id=current_user.id
+    cleanup_target = SimpleNamespace(id=project.id, tenant_id=project.tenant_id)
+
+    # Project-scoped Agents and conversations are owned by the project and are
+    # removed by the project's database cascades.  Chat messages predate that
+    # ownership model and intentionally have no session/project foreign key, so
+    # delete the exact project conversation rows before the cascades reach the
+    # project Agents they reference.
+    project_agent_ids = list(
+        (
+            await db.execute(
+                select(Agent.id).where(
+                    Agent.project_id == project.id,
+                    Agent.tenant_id == project.tenant_id,
+                    Agent.scope == "project",
+                )
+            )
+        ).scalars()
     )
-    return {"ok": True, "status": "archived"}
+    project_session_ids = [
+        str(session_id)
+        for session_id in (
+            (
+                await db.execute(
+                    select(ChatSession.id).where(ChatSession.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    ]
+    message_scope = []
+    if project_session_ids:
+        message_scope.append(ChatMessage.conversation_id.in_(project_session_ids))
+    if project_agent_ids:
+        message_scope.extend(
+            (
+                ChatMessage.agent_id.in_(project_agent_ids),
+                ChatMessage.sender_agent_id.in_(project_agent_ids),
+            )
+        )
+    if message_scope:
+        await db.execute(delete(ChatMessage).where(or_(*message_scope)))
+
+    # Project digital employees are deleted by the project FK cascade, but a
+    # small set of older Agent-owned tables intentionally has no cascade. Clear
+    # those exact project-owned rows first so a used project remains deletable.
+    # The table names are fixed application schema identifiers; values remain
+    # bound parameters.
+    if project_agent_ids:
+        cleanup_tables = (
+            "agent_activity_logs",
+            "audit_logs",
+            "approval_requests",
+            "channel_configs",
+            "dingtalk_channel_provisioning_sessions",
+            "gateway_messages",
+            "published_pages",
+            "notifications",
+            "agent_permissions",
+        )
+        for agent_id in project_agent_ids:
+            await db.execute(
+                text(
+                    "DELETE FROM task_logs WHERE task_id IN "
+                    "(SELECT id FROM tasks WHERE agent_id = :agent_id)"
+                ),
+                {"agent_id": agent_id},
+            )
+            await db.execute(
+                text("DELETE FROM tasks WHERE agent_id = :agent_id"),
+                {"agent_id": agent_id},
+            )
+            for table_name in cleanup_tables:
+                await db.execute(
+                    text(f"DELETE FROM {table_name} WHERE agent_id = :agent_id"),
+                    {"agent_id": agent_id},
+                )
+
+    await db.delete(project)
+    await db.commit()
+    try:
+        await remove_project_repository(cleanup_target)
+    except Exception:
+        logger.exception("Project {} was deleted but managed storage cleanup failed", project_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{project_id}/access-grants", response_model=list[ProjectAccessGrantOut])
@@ -2135,7 +2385,10 @@ async def put_project_member_tools(
         _load_agent_tool_assignments,
         _tool_record_visible_to_agent,
     )
-    from app.services.project_member_runtime import merge_project_member_runtime_config
+    from app.services.project_member_runtime import (
+        merge_project_member_runtime_config,
+        sync_project_agent_mcp_bindings,
+    )
     from app.services.tool_enablement import tool_is_required
 
     project = await require_owner(db, current_user, project_id)
@@ -2167,6 +2420,7 @@ async def put_project_member_tools(
             raise HTTPException(status_code=409, detail="Required tools cannot be disabled")
 
     if agent.scope == "project" and agent.project_id == project.id:
+        affected_mcp_server_ids: set[uuid.UUID] = set()
         for update in updates:
             tool = tool_by_id[update.tool_id]
             assignment = assignments.get(str(update.tool_id))
@@ -2180,27 +2434,15 @@ async def put_project_member_tools(
                 db.add(assignment)
             else:
                 assignment.enabled = update.enabled
-            capability_type = "mcp" if tool.type == "mcp" else "tool"
-            capability_id = tool.mcp_server_id if capability_type == "mcp" else tool.id
-            if capability_id is not None:
-                matching_bindings = (
-                    (
-                        await db.execute(
-                            select(ProjectCapabilityBinding).where(
-                                ProjectCapabilityBinding.project_id == project.id,
-                                ProjectCapabilityBinding.tenant_id == project.tenant_id,
-                                ProjectCapabilityBinding.capability_type == capability_type,
-                                ProjectCapabilityBinding.capability_id == capability_id,
-                                ProjectCapabilityBinding.source == "inherited",
-                                ProjectCapabilityBinding.inherited_from_agent_id == agent.id,
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                for binding in matching_bindings:
-                    binding.is_enabled = update.enabled
+            if tool.type == "mcp" and tool.mcp_server_id is not None:
+                affected_mcp_server_ids.add(tool.mcp_server_id)
+        await db.flush()
+        await sync_project_agent_mcp_bindings(
+            db,
+            project,
+            project_agent_id=agent.id,
+            server_ids=affected_mcp_server_ids,
+        )
     else:
         config = dict(member.config_snapshot or {})
         enabled = {str(name) for name in config.get("enabled_platform_tools", [])}
@@ -2398,6 +2640,40 @@ async def create_project_capability(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_owner(db, current_user, project_id)
+    if data.capability_type in {"mcp", "skill"}:
+        if data.capability_id is None:
+            raise HTTPException(status_code=422, detail="A registered capability is required")
+        source_agent = None
+        if data.source == "inherited" and data.inherited_from_agent_id is not None:
+            project_agent = await db.get(Agent, data.inherited_from_agent_id)
+            if (
+                project_agent is not None
+                and project_agent.tenant_id == project.tenant_id
+                and project_agent.project_id == project.id
+                and project_agent.scope == "project"
+                and not project_agent.is_deleted
+                and project_agent.source_agent_id is not None
+            ):
+                source_agent = await db.get(Agent, project_agent.source_agent_id)
+                if (
+                    source_agent is None
+                    or source_agent.tenant_id != project.tenant_id
+                    or source_agent.scope != "standard"
+                    or source_agent.is_deleted
+                ):
+                    source_agent = None
+        options = await load_project_capability_options(
+            db,
+            project.tenant_id,
+            [source_agent] if source_agent is not None else [],
+        )
+        allowed = (
+            options.allows(source_agent.id, data.capability_type, data.capability_id)
+            if data.source == "inherited" and source_agent is not None
+            else options.allows_shared(data.capability_type, data.capability_id)
+        )
+        if not allowed:
+            raise HTTPException(status_code=422, detail="Selected project capability is unavailable")
     if data.capability_type == "skill":
         if data.source != "inherited":
             raise HTTPException(status_code=422, detail="Project Skills must belong to a project digital employee")
@@ -3067,7 +3343,7 @@ async def create_project_run(
     if data.trigger_type == "a2a":
         raise HTTPException(
             status_code=422,
-            detail="数字员工之间发送消息请使用项目 A2A 接口",
+            detail="请通过项目协作功能向数字员工发送消息。",
         )
     work_item = None
     if data.work_item_id:
@@ -3081,7 +3357,7 @@ async def create_project_run(
             )
         ).scalar_one_or_none()
         if work_item is None:
-            raise HTTPException(status_code=422, detail="Work item is not in this project")
+            raise HTTPException(status_code=422, detail="所选任务不属于当前项目。")
 
     requested_agent_id = data.agent_id or (work_item.assignee_agent_id if work_item else None)
     member_conditions = [
@@ -3107,7 +3383,7 @@ async def create_project_run(
                 status_code=422,
                 detail="数字员工必须是已启用的项目成员",
             )
-        raise HTTPException(status_code=422, detail="Project needs an enabled project owner for a default run")
+        raise HTTPException(status_code=422, detail="项目需要一名可用的负责人。")
 
     supplied_input = dict(data.input or {})
     task = str(
@@ -3124,7 +3400,7 @@ async def create_project_run(
     if not task:
         raise HTTPException(
             status_code=422,
-            detail="work_item_id or an explicit task/objective/message is required",
+            detail="请选择任务或填写执行内容。",
         )
     run_title = str(supplied_input.get("title") or supplied_input.get("objective") or "").strip()
     if work_item is not None:
@@ -3233,7 +3509,7 @@ async def patch_project_run(
         db,
         project,
         f"run.{run.status}",
-        f"Run status changed to {run.status}",
+        "Execution status updated",
         actor_user_id=current_user.id,
         actor_agent_id=run.agent_id,
         work_item_id=run.work_item_id,
@@ -3414,24 +3690,22 @@ def _kickoff_transcript(
     confirmed_at: datetime,
 ) -> str:
     lines = [
-        f"# {project.name} · Kickoff transcript",
+        f"# {project.name} · 项目启动记录",
         "",
-        f"Project ID: `{project.id}`",
+        f"项目目标：{project.goal}",
         "",
-        f"Goal: {project.goal}",
-        "",
-        "## Planning discussion",
+        "## 方案讨论",
         "",
     ]
     role_labels = {"user": "用户", "assistant": "负责人", "system": "系统", "tool_call": "工具"}
     for message in messages:
         actor = role_labels.get(message.role, message.role.title())
-        timestamp = message.created_at.isoformat() if message.created_at else "unknown time"
+        timestamp = message.created_at.isoformat() if message.created_at else "时间未记录"
         lines.extend([f"### {actor} · {timestamp}", ""])
-        content = message.content.strip() or "_(empty message)_"
+        content = message.content.strip() or "（无内容）"
         lines.extend([f"> {line}" if line else ">" for line in content.splitlines()])
         lines.append("")
-    lines.extend(["## User confirmation", "", f"Confirmed at: {confirmed_at.isoformat()}", "", confirmation, ""])
+    lines.extend(["## 方案确认", "", f"确认时间：{confirmed_at.isoformat()}", "", confirmation, ""])
     return "\n".join(lines)
 
 
@@ -3526,18 +3800,7 @@ async def confirm_project_kickoff(
     if project.status != "planning":
         raise HTTPException(status_code=409, detail="Only a planning project can be confirmed")
 
-    leader = (
-        await db.execute(
-            select(ProjectMemberSnapshot).where(
-                ProjectMemberSnapshot.project_id == project.id,
-                ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                ProjectMemberSnapshot.is_leader.is_(True),
-                ProjectMemberSnapshot.is_enabled.is_(True),
-            )
-        )
-    ).scalar_one_or_none()
-    if leader is None:
-        raise HTTPException(status_code=422, detail="Project needs an enabled project owner before kickoff")
+    leader = await ensure_enabled_project_leader(db, project)
     leader_session = await ensure_project_leader_session(db, project)
     group_session = await ensure_project_group_session(db, project)
     group_planning = _uses_project_group_planning(project)
@@ -3652,10 +3915,7 @@ async def confirm_project_kickoff(
         user_id=current_user.id,
         sender_user_id=current_user.id,
         role="user",
-        content=(
-            f"Kickoff confirmed. Project owner @{leader.name_snapshot} may begin driving the project. "
-            "The frozen planning record is in docs/kickoff-transcript.md."
-        ),
+        content=f"项目方案已确认，负责人 @{leader.name_snapshot} 可以开始推进。",
         conversation_id=str(group_session.id),
         external_event_key=f"project-kickoff:{project.id}:{transcript_sha256}",
         message_meta={
@@ -3719,6 +3979,7 @@ async def confirm_project_kickoff(
                 "project_member_id": str(leader.id),
                 "turn_anchor_id": str(kickoff_message.id),
                 "task": task,
+                "execution_tools_enabled": True,
                 "kickoff": kickoff_snapshot,
             },
         },
@@ -3844,7 +4105,7 @@ async def list_project_group_messages(
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400,
-                detail=("Invalid `before` cursor. Use ISO 8601 or <ISO 8601>|<message UUID>."),
+                detail="分页位置无效，请刷新后重试。",
             )
     newest_first = (await db.execute(messages_query.limit(limit + 1))).scalars().all()
     has_more = len(newest_first) > limit
@@ -3880,7 +4141,7 @@ async def create_project_group_message(
     if data.sender_agent_id is not None:
         raise HTTPException(
             status_code=422,
-            detail="项目 REST 请求不能冒用数字员工身份发送消息",
+            detail="当前请求不能以数字员工身份发送消息。",
         )
     session = (
         await db.execute(
@@ -3896,29 +4157,14 @@ async def create_project_group_message(
         raise HTTPException(status_code=404, detail="Project group session not found")
 
     mention_ids = list(dict.fromkeys(data.mentions))
-    if project.status == "planning" and mention_ids:
+    if project.status in {"planning", "paused", "waiting", "completed"} and mention_ids:
         raise HTTPException(
             status_code=422,
             detail=(
-                "Planning discussion is handled by the project owner; "
-                + "start the project before mentioning other members"
+                "Discussion outside active execution is handled by the project owner"
             ),
         )
-    leader = (
-        await db.execute(
-            select(ProjectMemberSnapshot).where(
-                ProjectMemberSnapshot.project_id == project.id,
-                ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                ProjectMemberSnapshot.is_leader.is_(True),
-                ProjectMemberSnapshot.is_enabled.is_(True),
-            )
-        )
-    ).scalar_one_or_none()
-    if leader is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Project needs an enabled project owner for Human group messages",
-        )
+    leader = await ensure_enabled_project_leader(db, project)
     default_leader_agent_id = leader.agent_id
     policies = dict((project.settings or {}).get("policies") or {})
     mention_limit = min(8, max(1, int(policies.get("max_group_mentions_per_message", 4))))
@@ -4025,6 +4271,7 @@ async def create_project_group_message(
     from app.services.project_collaboration_prompt import (
         build_project_group_task,
         build_project_planning_task,
+        build_project_read_only_conversation_task,
     )
 
     message_title = execution_content.splitlines()[0].strip()[:96] or "处理项目群聊消息"
@@ -4056,9 +4303,16 @@ async def create_project_group_message(
                     "group_session_id": str(session.id),
                     "project_member_id": str(member.id),
                     "turn_anchor_id": str(message.id),
+                    "execution_tools_enabled": project.status == "running",
+                    "read_only_conversation": project.status in {"paused", "waiting", "completed"},
                     "task": (
                         build_project_planning_task(execution_content)
                         if project.status == "planning"
+                        else build_project_read_only_conversation_task(
+                            execution_content,
+                            status=project.status,
+                        )
+                        if project.status in {"paused", "waiting", "completed"}
                         else build_project_group_task(
                             execution_content,
                             is_owner=agent_id == default_leader_agent_id,
@@ -4217,7 +4471,7 @@ async def wake_project_agent(
             labels = ", ".join(unfinished) or "missing dependency records"
             raise HTTPException(
                 status_code=409,
-                detail=f"Project A2A cannot wake this work item before its dependencies are done: {labels}",
+                detail=f"该任务的前置任务尚未完成，暂不能发起成员协作：{labels}",
             )
     run_title = data.title.strip()[:120]
     expected_output = data.expected_output.strip()
@@ -4773,7 +5027,7 @@ async def create_git_commit(
         db,
         project,
         "git.commit.created",
-        f"Created project Git commit {result['commit'][:12]}",
+        "项目版本已创建",
         actor_user_id=current_user.id,
         metadata=result,
     )
@@ -4783,7 +5037,7 @@ async def create_git_commit(
             db,
             project,
             "git.milestone.created",
-            f"Created delivery milestone {result['commit'][:12]}",
+            "交付里程碑已创建",
             actor_user_id=current_user.id,
             metadata={
                 **result,

@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import and_, delete, exists, func, or_, select
+from loguru import logger
+from sqlalchemy import and_, delete, exists, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
@@ -15,7 +16,7 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
-from app.models.mcp_server import MCPServer
+from app.models.mcp_server import MCPServer, MCPServerOverride
 from app.models.project import (
     Project,
     ProjectAccessGrant,
@@ -36,11 +37,20 @@ from app.schemas.project import (
     ProjectCreate,
     ProjectMemberCreate,
 )
+from app.services.project_capability_options import load_project_capability_options
 
 PROJECT_EVENT_SUMMARY_MAX_LENGTH = 500
 PROJECT_RUNTIME_STATUS_RUNNING = "running"
 PROJECT_RUNTIME_STATUS_PAUSED = "paused"
-PROJECT_CONVERSATION_STATUSES = frozenset({"planning", PROJECT_RUNTIME_STATUS_RUNNING})
+PROJECT_CONVERSATION_STATUSES = frozenset(
+    {
+        "planning",
+        PROJECT_RUNTIME_STATUS_RUNNING,
+        PROJECT_RUNTIME_STATUS_PAUSED,
+        "waiting",
+        "completed",
+    }
+)
 
 
 def ensure_project_running(project: Project) -> None:
@@ -54,9 +64,9 @@ def ensure_project_running(project: Project) -> None:
 
 
 def ensure_project_accepts_group_message(project: Project) -> None:
-    """Allow Human planning discussion before execution starts.
+    """Allow project conversation independently from execution scheduling.
 
-    Planning messages are routed only to the project owner by the API. All
+    Planning, waiting, paused, and completed projects remain conversational. All new
     execution, A2A, scheduling, and specialist wakes still require ``running``.
     """
 
@@ -151,8 +161,22 @@ async def resolve_project_execution_user(
     return user
 
 
+def _is_platform_project_admin(user: User) -> bool:
+    return user.role == "platform_admin" or bool(
+        user.identity and getattr(user.identity, "is_platform_admin", False)
+    )
+
+
+def _is_company_project_admin(user: User) -> bool:
+    return user.role == "org_admin" and user.tenant_id is not None
+
+
 def accessible_projects_clause(user: User, *, edit: bool = False):
+    if _is_platform_project_admin(user):
+        return true()
     tenant_id = _tenant_id(user)
+    if _is_company_project_admin(user):
+        return Project.tenant_id == tenant_id
     grant = exists().where(
         ProjectAccessGrant.project_id == Project.id,
         ProjectAccessGrant.tenant_id == tenant_id,
@@ -180,7 +204,12 @@ async def require_project(
     if project is None:
         # Deliberately hide existence across tenants and unauthorized users.
         raise HTTPException(status_code=404, detail="Project not found")
-    if lock and project.owner_user_id != user.id:
+    if (
+        lock
+        and project.owner_user_id != user.id
+        and not _is_platform_project_admin(user)
+        and not _is_company_project_admin(user)
+    ):
         grant_role = await db.scalar(
             select(ProjectAccessGrant.role)
             .where(
@@ -203,11 +232,16 @@ async def require_owner(
     *,
     lock: bool = False,
 ) -> Project:
-    statement = select(Project).where(
-        Project.id == project_id,
-        Project.tenant_id == _tenant_id(user),
-        Project.owner_user_id == user.id,
-    )
+    statement = select(Project).where(Project.id == project_id)
+    if _is_platform_project_admin(user):
+        pass
+    elif _is_company_project_admin(user):
+        statement = statement.where(Project.tenant_id == _tenant_id(user))
+    else:
+        statement = statement.where(
+            Project.tenant_id == _tenant_id(user),
+            Project.owner_user_id == user.id,
+        )
     if lock:
         statement = statement.with_for_update()
     project = (await db.execute(statement)).scalar_one_or_none()
@@ -255,7 +289,7 @@ async def ensure_project_group_session(db: AsyncSession, project: Project) -> Ch
     session = ChatSession(
         project_id=project.id,
         agent_id=anchor.agent_id,
-        title=f"{project.name} · Agent Group",
+        title=f"{project.name} · 项目协作",
         source_channel="project",
         external_conv_id=f"project:{project.id}",
         is_group=True,
@@ -271,6 +305,124 @@ async def ensure_project_group_session(db: AsyncSession, project: Project) -> Ch
     db.add(session)
     await db.flush()
     return session
+
+
+async def ensure_enabled_project_leader(
+    db: AsyncSession,
+    project: Project,
+) -> ProjectMemberSnapshot:
+    """Return the enabled project owner and repair legacy projects without one."""
+
+    leader = (
+        await db.execute(
+            select(ProjectMemberSnapshot)
+            .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
+            .where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.is_leader.is_(True),
+                ProjectMemberSnapshot.is_enabled.is_(True),
+                Agent.project_id == project.id,
+                Agent.tenant_id == project.tenant_id,
+                Agent.scope == "project",
+                Agent.is_deleted.is_(False),
+                Agent.status.in_(["running", "idle"]),
+            )
+            .order_by(ProjectMemberSnapshot.created_at, ProjectMemberSnapshot.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if leader is not None:
+        await _restore_blocked_project_replies(db, project, leader)
+        return leader
+
+    leader = (
+        await db.execute(
+            select(ProjectMemberSnapshot)
+            .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
+            .where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.is_enabled.is_(True),
+                Agent.project_id == project.id,
+                Agent.tenant_id == project.tenant_id,
+                Agent.scope == "project",
+                Agent.is_deleted.is_(False),
+                Agent.status.in_(["running", "idle"]),
+            )
+            .order_by(ProjectMemberSnapshot.created_at, ProjectMemberSnapshot.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if leader is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Project needs at least one enabled digital employee",
+        )
+    await db.execute(
+        ProjectMemberSnapshot.__table__.update()
+        .where(ProjectMemberSnapshot.project_id == project.id)
+        .values(is_leader=False)
+    )
+    leader.is_leader = True
+    await _restore_blocked_project_replies(db, project, leader)
+    add_event(
+        db,
+        project,
+        "leader.repaired",
+        f"Assigned {leader.name_snapshot} as project owner",
+        actor_agent_id=leader.agent_id,
+        metadata={"member_id": str(leader.id), "reason": "missing_enabled_leader"},
+    )
+    await db.flush()
+    return leader
+
+
+async def _restore_blocked_project_replies(
+    db: AsyncSession,
+    project: Project,
+    leader: ProjectMemberSnapshot,
+) -> None:
+    """Return replies blocked by a missing owner to the normal durable queue."""
+
+    group_ids = [
+        str(value)
+        for value in (
+            await db.execute(
+                select(ChatSession.id).where(
+                    ChatSession.project_id == project.id,
+                    ChatSession.source_channel == "project",
+                )
+            )
+        ).scalars()
+    ]
+    if not group_ids:
+        return
+    rows = (
+        (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id.in_(group_ids),
+                    ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+                    ChatMessage.message_meta["leader_batch_state"].as_string() == "blocked_no_leader",
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        metadata = dict(row.message_meta or {})
+        metadata.update(
+            {
+                "leader_batch_state": "pending",
+                "wake_policy": "leader_batch_pending",
+                "default_leader_agent_id": str(leader.agent_id),
+            }
+        )
+        row.message_meta = metadata
 
 
 async def ensure_project_leader_session(db: AsyncSession, project: Project) -> ChatSession:
@@ -296,23 +448,7 @@ async def ensure_project_leader_session(db: AsyncSession, project: Project) -> C
             .limit(1)
         )
     ).scalar_one_or_none()
-    leader = (
-        await db.execute(
-            select(ProjectMemberSnapshot)
-            .where(
-                ProjectMemberSnapshot.project_id == project.id,
-                ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                ProjectMemberSnapshot.is_leader.is_(True),
-                ProjectMemberSnapshot.is_enabled.is_(True),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if leader is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Project needs an enabled project owner before planning can start",
-        )
+    leader = await ensure_enabled_project_leader(db, project)
     if session is not None:
         # Keep historical links attached to the current project owner without
         # creating a second compatibility thread.
@@ -696,36 +832,24 @@ async def project_session_access_mode(
     user: User,
     session: ChatSession,
 ) -> str | None:
-    """Return ``read``/``edit`` for an auditable project Subagent session.
+    """Return ``read``/``edit`` for a project-owned conversation.
 
-    Historical sessions remain readable after departure. Writing additionally
-    requires an owner/editor ACL and the exact durable member snapshot to still
-    be enabled.
+    The project group uses the project's Human ACL directly. Subagent history
+    additionally requires its durable member snapshot to remain enabled before
+    it can accept new turns.
     """
 
-    if session.source_channel != "subagent" or session.project_id is None or user.tenant_id is None:
+    if session.project_id is None:
         return None
     project = await db.get(Project, session.project_id)
-    run = await db.get(SubagentRun, session.id)
-    if (
-        project is None
-        or project.tenant_id != user.tenant_id
-        or run is None
-        or run.project_id != project.id
-        or run.project_member_id is None
-        or session.agent_id is None
-    ):
+    if project is None:
         return None
-    member = await db.get(ProjectMemberSnapshot, run.project_member_id)
-    if (
-        member is None
-        or member.project_id != project.id
-        or member.tenant_id != project.tenant_id
-        or member.agent_id != session.agent_id
-    ):
+
+    if _is_platform_project_admin(user):
+        human_role = "edit"
+    elif user.tenant_id is None or project.tenant_id != user.tenant_id:
         return None
-    member_is_writable = member.is_enabled and not bool(dict(session.im_config or {}).get("membership_revoked"))
-    if project.owner_user_id == user.id:
+    elif _is_company_project_admin(user) or project.owner_user_id == user.id:
         human_role = "edit"
     else:
         grant = (
@@ -740,6 +864,29 @@ async def project_session_access_mode(
         if grant is None:
             return None
         human_role = "edit" if grant.role == "edit" else "read"
+
+    if session.source_channel == "project" and session.is_group:
+        return human_role
+    if session.source_channel != "subagent":
+        return None
+
+    run = await db.get(SubagentRun, session.id)
+    if (
+        run is None
+        or run.project_id != project.id
+        or run.project_member_id is None
+        or session.agent_id is None
+    ):
+        return None
+    member = await db.get(ProjectMemberSnapshot, run.project_member_id)
+    if (
+        member is None
+        or member.project_id != project.id
+        or member.tenant_id != project.tenant_id
+        or member.agent_id != session.agent_id
+    ):
+        return None
+    member_is_writable = member.is_enabled and not bool(dict(session.im_config or {}).get("membership_revoked"))
     return "edit" if human_role == "edit" and member_is_writable else "read"
 
 
@@ -883,6 +1030,8 @@ async def _validate_project_create_inputs(
     user: User,
     data: ProjectCreate,
     tenant_id: uuid.UUID,
+    *,
+    allow_template_agents: bool = False,
 ) -> list[ProjectMemberCreate]:
     """Validate every external reference before creating managed storage."""
 
@@ -910,6 +1059,11 @@ async def _validate_project_create_inputs(
             raise HTTPException(status_code=422, detail="Every shared user must be active in the project tenant")
 
     members = [member.model_copy(deep=True) for member in data.members]
+    if not members and not allow_template_agents:
+        raise HTTPException(
+            status_code=422,
+            detail="A project requires at least one digital employee",
+        )
     member_ids = [member.agent_id for member in members]
     if len(member_ids) != len(set(member_ids)):
         raise HTTPException(status_code=422, detail="A project cannot include the same digital employee twice")
@@ -936,6 +1090,8 @@ async def _validate_project_create_inputs(
             raise HTTPException(status_code=422, detail="源数字员工不可用")
         if any(source.agent_type != "native" for source in sources):
             raise HTTPException(status_code=422, detail="仅原生数字员工可复制到项目")
+    else:
+        sources = []
 
     inherited_sources = {
         capability.inherited_from_agent_id
@@ -944,6 +1100,23 @@ async def _validate_project_create_inputs(
     }
     if None in inherited_sources or not inherited_sources.issubset(set(member_ids)):
         raise HTTPException(status_code=422, detail="Inherited capability source must be a selected project member")
+
+    capability_options = await load_project_capability_options(db, tenant_id, sources)
+
+    for capability in data.capabilities:
+        if capability.capability_type not in {"mcp", "skill"} or capability.capability_id is None:
+            continue
+        allowed = (
+            capability_options.allows_shared(capability.capability_type, capability.capability_id)
+            if capability.source == "shared"
+            else capability_options.allows(
+                capability.inherited_from_agent_id,
+                capability.capability_type,
+                capability.capability_id,
+            )
+        )
+        if not allowed:
+            raise HTTPException(status_code=422, detail="Selected project capability is unavailable")
 
     for capability in data.capabilities:
         await _resolve_capability(db, tenant_id, capability)
@@ -980,69 +1153,75 @@ async def _validate_project_create_inputs(
         if available_tool_ids != tool_ids:
             raise HTTPException(status_code=422, detail="One or more selected tools are unavailable")
 
-    selected_mcp_ids = {
-        capability_id
-        for member in members
-        if member.settings is not None
-        for capability_id in member.settings.mcp_capability_ids
-    }
-    if selected_mcp_ids:
-        available_mcp_ids = set(
-            (
-                await db.execute(
-                    select(MCPServer.id).where(
-                        MCPServer.id.in_(selected_mcp_ids),
-                        or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None)),
-                    )
-                )
-            ).scalars()
-        )
-        if available_mcp_ids != selected_mcp_ids:
+    for member in members:
+        if member.settings is None:
+            continue
+        if any(
+            not capability_options.allows_tool(member.agent_id, setting.tool_id)
+            for setting in member.settings.tools
+        ):
+            raise HTTPException(status_code=422, detail="One or more selected tools are unavailable for this digital employee")
+        if any(
+            not capability_options.allows(member.agent_id, "mcp", capability_id)
+            for capability_id in member.settings.mcp_capability_ids
+        ):
             raise HTTPException(status_code=422, detail="One or more selected MCP services are unavailable")
-
-    selected_skill_ids = {
-        capability_id
-        for member in members
-        if member.settings is not None
-        for capability_id in member.settings.skill_capability_ids
-    }
-    if selected_skill_ids:
-        available_skill_ids = set(
+        override_server_ids = [
+            setting.server_id for setting in member.settings.mcp_server_overrides
+        ]
+        if len(override_server_ids) != len(set(override_server_ids)):
+            raise HTTPException(status_code=422, detail="MCP service configuration is duplicated")
+        if any(
+            not capability_options.allows(member.agent_id, "mcp", server_id)
+            for server_id in override_server_ids
+        ):
+            raise HTTPException(status_code=422, detail="One or more configured MCP services are unavailable")
+        enabled_tool_ids = [
+            setting.tool_id for setting in member.settings.tools if setting.enabled
+        ]
+        enabled_mcp_server_ids = set(
             (
                 await db.execute(
-                    select(Skill.id).where(
-                        Skill.id.in_(selected_skill_ids),
-                        or_(Skill.tenant_id == tenant_id, Skill.tenant_id.is_(None)),
+                    select(Tool.mcp_server_id).where(
+                        Tool.id.in_(enabled_tool_ids),
+                        Tool.type == "mcp",
+                        Tool.mcp_server_id.is_not(None),
                     )
                 )
             ).scalars()
-        )
-        if available_skill_ids != selected_skill_ids:
+        ) if enabled_tool_ids else set()
+        if not set(override_server_ids).issubset(enabled_mcp_server_ids):
+            raise HTTPException(
+                status_code=422,
+                detail="MCP configuration requires at least one enabled tool from that service",
+            )
+        if any(
+            not capability_options.allows(member.agent_id, "skill", capability_id)
+            for capability_id in member.settings.skill_capability_ids
+        ):
             raise HTTPException(status_code=422, detail="One or more selected Skills are unavailable")
 
     for capability_id in set(data.shared_capability_ids):
-        skill_exists = await db.scalar(
-            select(Skill.id).where(
-                Skill.id == capability_id,
-                or_(Skill.tenant_id == tenant_id, Skill.tenant_id.is_(None)),
-            )
-        )
-        if skill_exists is not None:
-            continue
-        mcp_exists = await db.scalar(
-            select(MCPServer.id).where(
-                MCPServer.id == capability_id,
-                or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None)),
-            )
-        )
-        if mcp_exists is None:
+        if capability_id not in capability_options.market_skill_ids | capability_options.shared_mcp_ids:
             raise HTTPException(status_code=422, detail=f"Capability {capability_id} is unavailable")
     return members
 
 
-async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> Project:
+async def create_project(
+    db: AsyncSession,
+    user: User,
+    data: ProjectCreate,
+    *,
+    allow_template_agents: bool = False,
+) -> Project:
     tenant_id = _tenant_id(user)
-    members = await _validate_project_create_inputs(db, user, data, tenant_id)
+    members = await _validate_project_create_inputs(
+        db,
+        user,
+        data,
+        tenant_id,
+        allow_template_agents=allow_template_agents,
+    )
     project_id = uuid.uuid4()
     try:
         return await _create_project_uncompensated(
@@ -1305,8 +1484,47 @@ async def _create_project_uncompensated(
                 for setting in source_member.settings.tools
             ],
         )
+        for override in source_member.settings.mcp_server_overrides:
+            db.add(
+                MCPServerOverride(
+                    mcp_server_id=override.server_id,
+                    scope_type="agent",
+                    scope_id=project_agent_id,
+                    system_prompt_block=override.system_prompt_block,
+                    url_template=override.url_template,
+                    headers_template=override.headers_template,
+                    credential_template=override.credential_template,
+                    command_template=override.command_template,
+                    args_template=override.args_template,
+                    env_template=override.env_template,
+                    last_modified_by_user_id=user.id,
+                )
+            )
+        enabled_mcp_tool_ids = [
+            setting.tool_id
+            for setting in source_member.settings.tools
+            if setting.enabled
+        ]
+        selected_mcp_server_ids = list(
+            (
+                await db.execute(
+                    select(Tool.mcp_server_id).where(
+                        Tool.id.in_(enabled_mcp_tool_ids),
+                        Tool.type == "mcp",
+                        Tool.mcp_server_id.is_not(None),
+                    )
+                )
+            ).scalars()
+        ) if enabled_mcp_tool_ids else []
+        selected_mcp_server_id_set = set(selected_mcp_server_ids)
         for capability_type, capability_ids in (
-            ("mcp", source_member.settings.mcp_capability_ids),
+            (
+                "mcp",
+                [
+                    *source_member.settings.mcp_capability_ids,
+                    *selected_mcp_server_ids,
+                ],
+            ),
             ("skill", source_member.settings.skill_capability_ids),
         ):
             for capability_id in dict.fromkeys(capability_ids):
@@ -1347,7 +1565,11 @@ async def _create_project_uncompensated(
                         capability,
                         actor_user_id=user.id,
                     )
-                    await sync_project_capability_assignment(db, project, binding)
+                    if not (
+                        capability_type == "mcp"
+                        and capability_id in selected_mcp_server_id_set
+                    ):
+                        await sync_project_capability_assignment(db, project, binding)
 
     if data.visibility == "shared" and not data.shared_with_user_ids:
         raise HTTPException(status_code=422, detail="shared visibility requires shared_with_user_ids")
@@ -2041,6 +2263,13 @@ async def project_summary(
     ).scalar_one_or_none()
     access_role = "owner" if actor_user_id == project.owner_user_id else None
     if access_role is None and actor_user_id is not None:
+        actor = await db.get(User, actor_user_id)
+        if actor is not None and (
+            _is_platform_project_admin(actor)
+            or (_is_company_project_admin(actor) and actor.tenant_id == project.tenant_id)
+        ):
+            access_role = "owner"
+    if access_role is None and actor_user_id is not None:
         access_role = next(
             (grant.role for grant, _display_name in grants if grant.user_id == actor_user_id),
             None,
@@ -2165,12 +2394,12 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
             return
         if project.status != PROJECT_RUNTIME_STATUS_RUNNING:
             apply_run_status(run, "cancelled")
-            run.error = "Project runtime paused before A2A delivery"
+            run.error = "Member collaboration was cancelled because the project is paused"
             add_event(
                 db,
                 project,
                 "a2a.cancelled",
-                "Cancelled project A2A because the project runtime was paused",
+                "Member collaboration was cancelled because the project is paused",
                 actor_user_id=run.initiated_by_user_id,
                 from_agent_id=uuid.UUID(str((run.input or {})["from_agent_id"])),
                 to_agent_id=uuid.UUID(str((run.input or {})["to_agent_id"])),
@@ -2198,12 +2427,12 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         )
         if active_member_ids != {from_agent_id, to_agent_id}:
             apply_run_status(run, "cancelled")
-            run.error = "Project A2A sender or recipient is no longer an active member"
+            run.error = "Member collaboration was cancelled because a member is no longer active"
             add_event(
                 db,
                 project,
                 "a2a.cancelled",
-                "Cancelled project A2A because a participant left the project",
+                "Member collaboration was cancelled because a member is no longer active",
                 actor_user_id=initiated_by_user_id,
                 from_agent_id=from_agent_id,
                 to_agent_id=to_agent_id,
@@ -2231,8 +2460,9 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
             },
             user_id=initiated_by_user_id,
         )
-    except Exception as exc:  # delivery failures must become durable run state
-        result = f"❌ Project A2A delivery raised {type(exc).__name__}: {exc!s}"
+    except Exception:  # delivery failures must become durable run state
+        logger.exception("Project member collaboration delivery failed for run {}", run_id)
+        result = "❌ Member collaboration could not be delivered"
     receipt, _ = _project_a2a_receipt(result)
     failed = result.startswith("❌") or bool(receipt and receipt.get("status") == "error")
     session_info: dict[str, Any] = {}
@@ -2249,7 +2479,12 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         )
         if identity_error:
             failed = True
-            result = f"❌ Project A2A delivery receipt rejected: {identity_error}"
+            logger.warning(
+                "Project member collaboration receipt rejected for run {}: {}",
+                run_id,
+                identity_error,
+            )
+            result = "❌ Member collaboration could not be delivered"
     async with async_session() as db:
         run = await db.get(ProjectRun, run_id)
         project = await db.get(Project, run.project_id) if run else None
@@ -2263,13 +2498,13 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
             # project A2A remains live until the durable child turn finishes.
             apply_run_status(run, "succeeded")
         delivery_metadata = {
-            "delivery_result": result,
+            "delivery_status": "failed" if failed else "delivered",
             "group_session_id": payload.get("group_session_id"),
             **session_info,
         }
         run.output = {**dict(run.output or {}), **delivery_metadata}
         if failed:
-            run.error = result
+            run.error = "Member collaboration could not be delivered"
         existing_delivery_event = (
             await db.execute(
                 select(ProjectEvent.id).where(
@@ -2283,7 +2518,7 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
                 db,
                 project,
                 "a2a.delivery_failed" if failed else "a2a.delivered",
-                "Project A2A delivery failed" if failed else "Project A2A message delivered and target wake requested",
+                "Member collaboration could not be delivered" if failed else "Member collaboration message delivered",
                 actor_user_id=run.initiated_by_user_id,
                 actor_agent_id=uuid.UUID(payload["from_agent_id"]),
                 from_agent_id=uuid.UUID(payload["from_agent_id"]),

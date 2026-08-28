@@ -143,12 +143,12 @@ export default function OverrideFieldsEditor({
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       {show.prompt && (
         <div>
-          <label style={labelStyle}>Prompt 片段 (追加到 platform/tenant 之后)</label>
+          <label style={labelStyle}>执行说明</label>
           <textarea
             value={draft.system_prompt_block}
             onChange={(e) => onChange({ ...draft, system_prompt_block: e.target.value })}
             rows={4}
-            placeholder="留空 = 该 override 字段不生效"
+            placeholder="可选；补充该服务在当前数字员工中的使用说明"
             style={{ ...inputStyle, resize: 'vertical' }}
           />
           {placeholdersHint && (
@@ -162,14 +162,14 @@ export default function OverrideFieldsEditor({
       {show.headers && (
         <div>
           <label style={labelStyle}>
-            HTTP Headers (覆盖 server / tenant 默认值)
+            请求头
           </label>
           {pairs.length === 0 && (
             <div style={{
               fontSize: 11, color: 'var(--text-tertiary)',
               padding: '6px 0',
             }}>
-              当前为空(将完全继承上层)。
+              暂未设置，将使用默认配置。
             </div>
           )}
           {pairs.map((p, idx) => (
@@ -177,13 +177,13 @@ export default function OverrideFieldsEditor({
               <input
                 value={p.key}
                 onChange={(e) => updateHeader(idx, e.target.value, p.value)}
-                placeholder="Header-Name"
+                placeholder="名称"
                 style={{ ...inputStyle, flex: '0 0 35%' }}
               />
               <input
                 value={p.value}
                 onChange={(e) => updateHeader(idx, p.key, e.target.value)}
-                placeholder="value (支持 ${tenant.id} 等占位符)"
+                placeholder="值"
                 style={{ ...inputStyle, flex: 1 }}
               />
               <button
@@ -212,7 +212,7 @@ export default function OverrideFieldsEditor({
               cursor: 'pointer',
             }}
           >
-            + 添加 header
+            添加请求头
           </button>
         </div>
       )}
@@ -220,7 +220,7 @@ export default function OverrideFieldsEditor({
       {show.credential && (
         <div>
           <label style={labelStyle}>
-            Credential (API key / token)
+            访问凭证
             {savedCredentialState && credBadge}
           </label>
           <input
@@ -229,14 +229,14 @@ export default function OverrideFieldsEditor({
             onChange={(e) => onChange({ ...draft, credential_input: e.target.value })}
             placeholder={
               savedCredentialState === 'set'
-                ? '留空 = 保留已设置的值;填值 = 覆盖'
-                : '填值 = 设置 credential;留空 = 不设置(继承上层)'
+                ? '留空则保留当前凭证，输入新值可更新'
+                : '输入服务访问凭证（可选）'
             }
             autoComplete="new-password"
             style={inputStyle}
           />
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
-            出于安全,服务端不回传已保存的 credential 原文。要改动请重新输入完整值。
+            已保存的凭证不会在页面中显示；更新时请重新输入完整内容。
           </div>
         </div>
       )}

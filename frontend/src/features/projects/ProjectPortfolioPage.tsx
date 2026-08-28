@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { TFunction } from "i18next";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -13,10 +13,13 @@ import {
   IconPlus,
   IconRefresh,
   IconTemplate,
+  IconTrash,
   IconUsers,
 } from "@tabler/icons-react";
 import { projectsApi } from "../../services/projects";
 import Pagination from "../../components/Pagination";
+import { useDialog } from "../../components/Dialog/DialogProvider";
+import { useAuthStore } from "../../stores";
 import type { ProjectScope, ProjectStatus, ProjectSummary } from "./types";
 import {
   Button,
@@ -30,7 +33,7 @@ import {
 } from "./components/ProjectUI";
 import "./projectPortfolio.css";
 
-const scopeTabs: ProjectScope[] = ["mine", "shared", "running", "archived"];
+const memberScopeTabs: ProjectScope[] = ["mine", "shared", "running", "archived"];
 
 const portfolioStatuses = new Set([
   "all",
@@ -104,11 +107,23 @@ function AgentStack({
 export default function ProjectPortfolioPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const dialog = useDialog();
+  const currentUser = useAuthStore((state) => state.user);
+  const isProjectAdmin =
+    currentUser?.role === "platform_admin" ||
+    currentUser?.role === "org_admin" ||
+    currentUser?.is_platform_admin === true;
+  const scopeTabs = useMemo<ProjectScope[]>(
+    () => (isProjectAdmin ? ["all", ...memberScopeTabs] : memberScopeTabs),
+    [isProjectAdmin],
+  );
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedScope = searchParams.get("scope");
   const scope = scopeTabs.some((item) => item === requestedScope)
     ? (requestedScope as ProjectScope)
-    : "mine";
+    : isProjectAdmin
+      ? "all"
+      : "mine";
   const query = searchParams.get("q")?.trim() || "";
   const [queryDraft, setQueryDraft] = useState(query);
   const requestedStatus = searchParams.get("status") || "all";
@@ -134,6 +149,21 @@ export default function ProjectPortfolioPage() {
     queryKey: ["projects", "portfolio", scope, query, status],
     queryFn: () => projectsApi.list({ scope, query, status }),
   });
+  const deleteMutation = useMutation({
+    mutationFn: projectsApi.delete,
+    onSuccess: () => projectQuery.refetch(),
+  });
+  const deleteProject = async (project: ProjectSummary) => {
+    const confirmed = await dialog.confirm(
+      t("projectPortfolio.deleteConfirm", { name: project.name }),
+      {
+        title: t("projectPortfolio.deleteProject"),
+        danger: true,
+        confirmLabel: t("projectPortfolio.deleteAction"),
+      },
+    );
+    if (confirmed) await deleteMutation.mutateAsync(project.id);
+  };
   const projects = projectQuery.data?.items ?? [];
   const pageSize = 10;
   const requestedPage = Number.parseInt(searchParams.get("page") || "1", 10);
@@ -187,7 +217,11 @@ export default function ProjectPortfolioPage() {
             onClick={() => navigate("/projects/templates")}
           >
             <IconTemplate size={17} />
-            {t("projectPortfolio.templateMarket")}
+            {t(
+              isProjectAdmin
+                ? "projectPortfolio.manageTemplates"
+                : "projectPortfolio.templateMarket",
+            )}
           </Button>
           <Button
             variant="primary"
@@ -243,7 +277,10 @@ export default function ProjectPortfolioPage() {
             className={scope === tab ? "is-active" : ""}
             onClick={() => {
               updateUrlState({
-                scope: tab === "mine" ? undefined : tab,
+                scope:
+                  tab === (isProjectAdmin ? "all" : "mine")
+                    ? undefined
+                    : tab,
                 page: undefined,
               });
             }}
@@ -332,11 +369,7 @@ export default function ProjectPortfolioPage() {
         <ProjectEmptyState
           tone="error"
           title={t("projectPortfolio.errorTitle")}
-          description={
-            projectQuery.error instanceof Error
-              ? projectQuery.error.message
-              : t("projectPortfolio.serviceError")
-          }
+          description={t("projectPortfolio.serviceError")}
           action={
             <Button
               variant="secondary"
@@ -474,7 +507,28 @@ export default function ProjectPortfolioPage() {
                         ) || t("projectPortfolio.shared")}
                   </small>
                 </div>
-                <IconArrowRight className="pm-project-arrow" size={17} />
+                <div className="pm-project-actions">
+                  {(project.access_role === "owner" || isProjectAdmin) && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="pm-project-delete"
+                      title={t("projectPortfolio.deleteProject")}
+                      aria-label={t("projectPortfolio.deleteNamedProject", {
+                        name: project.name,
+                      })}
+                      disabled={deleteMutation.isPending}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void deleteProject(project);
+                      }}
+                      onKeyDown={(event) => event.stopPropagation()}
+                    >
+                      <IconTrash size={16} />
+                    </Button>
+                  )}
+                  <IconArrowRight className="pm-project-arrow" size={17} />
+                </div>
               </ProjectCard>
             ))}
           </section>

@@ -138,11 +138,96 @@ async def apply_project_agent_tool_settings(
                     enabled=enabled,
                     config=requested_config,
                     source="user_installed",
+                    installed_by_agent_id=(
+                        project_agent_id if tool.source == "agent" else None
+                    ),
                 )
             )
         else:
             assignment.enabled = enabled
             assignment.config = requested_config
+            if tool.source == "agent":
+                assignment.source = "user_installed"
+                assignment.installed_by_agent_id = project_agent_id
+    await db.flush()
+
+
+async def sync_project_agent_mcp_bindings(
+    db: AsyncSession,
+    project: Project,
+    *,
+    project_agent_id: uuid.UUID,
+    server_ids: set[uuid.UUID],
+) -> None:
+    """Keep server lifecycle bindings aligned with per-tool MCP switches."""
+
+    if not server_ids:
+        return
+    enabled_server_ids = set(
+        (
+            await db.execute(
+                select(Tool.mcp_server_id)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(
+                    AgentTool.agent_id == project_agent_id,
+                    AgentTool.enabled.is_(True),
+                    Tool.type == "mcp",
+                    Tool.mcp_server_id.in_(server_ids),
+                )
+                .distinct()
+            )
+        ).scalars()
+    )
+    servers = {
+        server.id: server
+        for server in (
+            (
+                await db.execute(
+                    select(MCPServer).where(
+                        MCPServer.id.in_(server_ids),
+                        or_(MCPServer.tenant_id == project.tenant_id, MCPServer.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    bindings = {
+        binding.capability_id: binding
+        for binding in (
+            (
+                await db.execute(
+                    select(ProjectCapabilityBinding).where(
+                        ProjectCapabilityBinding.project_id == project.id,
+                        ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                        ProjectCapabilityBinding.capability_type == "mcp",
+                        ProjectCapabilityBinding.source == "inherited",
+                        ProjectCapabilityBinding.inherited_from_agent_id == project_agent_id,
+                        ProjectCapabilityBinding.capability_id.in_(server_ids),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    for server_id in server_ids:
+        enabled = server_id in enabled_server_ids
+        binding = bindings.get(server_id)
+        if binding is not None:
+            binding.is_enabled = enabled
+        elif enabled and (server := servers.get(server_id)) is not None:
+            db.add(
+                ProjectCapabilityBinding(
+                    tenant_id=project.tenant_id,
+                    project_id=project.id,
+                    capability_type="mcp",
+                    capability_id=server_id,
+                    capability_name=server.display_name or server.name,
+                    source="inherited",
+                    inherited_from_agent_id=project_agent_id,
+                    is_enabled=True,
+                    scope={},
+                    config={},
+                )
+            )
     await db.flush()
 
 

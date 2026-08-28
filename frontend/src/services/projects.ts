@@ -176,6 +176,7 @@ function normalizeProject(value: unknown): ProjectSummary {
       .filter(Boolean),
     execution_user_id: string(source.execution_user_id) || null,
     execution_user_name: string(source.execution_user_name) || null,
+    settings,
     created_at: string(source.created_at, new Date(0).toISOString()),
     updated_at: string(
       source.updated_at || source.created_at,
@@ -343,6 +344,11 @@ function normalizeTemplate(value: unknown): ProjectTemplate {
     asset_summary: rawAssetSummary
       ? normalizeTemplateAssetSummary(rawAssetSummary)
       : null,
+    tenant_id: string(source.tenant_id) || null,
+    created_by_user_id:
+      string(source.created_by_user_id || source.author_user_id) || null,
+    can_edit: boolean(source.can_edit),
+    can_delete: boolean(source.can_delete),
     created_at: string(source.created_at) || null,
     updated_at: string(source.updated_at) || null,
   };
@@ -383,6 +389,12 @@ export const projectsApi = {
     );
   },
 
+  async delete(projectId: string): Promise<void> {
+    await fetchJson<void>(`/projects/${encodeURIComponent(projectId)}`, {
+      method: "DELETE",
+    });
+  },
+
   async listTemplates(params?: {
     category?: string;
     query?: string;
@@ -402,6 +414,34 @@ export const projectsApi = {
       await fetchJson<JsonRecord>(
         `/projects/templates/${encodeURIComponent(templateId)}`,
       ),
+    );
+  },
+
+  async createTemplateEditor(templateId: string): Promise<ProjectSummary> {
+    return normalizeProject(
+      await fetchJson<JsonRecord>(
+        `/projects/templates/${encodeURIComponent(templateId)}/editor`,
+        { method: "POST" },
+      ),
+    );
+  },
+
+  async updateTemplateFromProject(
+    templateId: string,
+    projectId: string,
+  ): Promise<ProjectTemplate> {
+    return normalizeTemplate(
+      await fetchJson<JsonRecord>(
+        `/projects/templates/${encodeURIComponent(templateId)}/from-project/${encodeURIComponent(projectId)}`,
+        { method: "PUT" },
+      ),
+    );
+  },
+
+  async deleteTemplate(templateId: string): Promise<void> {
+    await fetchJson<void>(
+      `/projects/templates/${encodeURIComponent(templateId)}`,
+      { method: "DELETE" },
     );
   },
 
@@ -434,32 +474,6 @@ export const projectsApi = {
     const source = record(
       await fetchJson<JsonRecord>("/projects/bootstrap-options"),
     );
-    const skills = array(source.skills).map((item) => {
-      const skill = record(item);
-      return {
-        id: string(skill.id),
-        name: string(skill.name, "未命名 Skill"),
-        description: string(skill.description) || null,
-        kind: "skill" as const,
-        source: "project" as const,
-        version: string(skill.version) || null,
-        risk_level: null,
-        enabled_by_default: true,
-      };
-    });
-    const mcpServers = array(source.mcp_servers).map((item) => {
-      const mcp = record(item);
-      return {
-        id: string(mcp.id),
-        name: string(mcp.display_name || mcp.name, "未命名 MCP"),
-        description: string(mcp.description) || null,
-        kind: "mcp" as const,
-        source: "project" as const,
-        version: string(mcp.version) || null,
-        risk_level: null,
-        enabled_by_default: true,
-      };
-    });
     const normalizedCapabilities = array(source.capabilities).map((item) => {
       const capability = record(item);
       const risk = string(capability.risk_level);
@@ -468,12 +482,6 @@ export const projectsApi = {
         capability_id: string(capability.capability_id) || null,
         name: string(capability.name || capability.display_name, "未命名能力"),
         description: string(capability.description) || null,
-        internal_name:
-          string(
-            capability.key || capability.internal_name || capability.tool_name,
-          ) || null,
-        category: string(capability.category) || null,
-        mcp_server_name: string(capability.mcp_server_name) || null,
         kind:
           capability.kind === "mcp" || capability.type === "mcp"
             ? ("mcp" as const)
@@ -484,15 +492,27 @@ export const projectsApi = {
           capability.source === "agent" || capability.source === "inherited"
             ? ("agent" as const)
             : ("project" as const),
+        origin:
+          capability.origin === "company" ||
+          capability.origin === "digital_employee" ||
+          capability.origin === "market"
+            ? capability.origin
+            : capability.source === "agent" ||
+                capability.source === "inherited"
+              ? ("digital_employee" as const)
+              : capability.kind === "mcp" || capability.type === "mcp"
+                ? ("company" as const)
+                : ("market" as const),
         owner_agent_id:
           string(capability.owner_agent_id || capability.agent_id) || null,
         owner_agent_name:
           string(capability.owner_agent_name || capability.agent_name) || null,
         version: string(capability.version) || null,
+        tool_count: number(capability.tool_count),
         risk_level: ["low", "medium", "high"].includes(risk)
           ? (risk as "low" | "medium" | "high")
           : null,
-        enabled_by_default: capability.enabled_by_default !== false,
+        enabled_by_default: capability.enabled_by_default === true,
       };
     });
     return {
@@ -536,11 +556,11 @@ export const projectsApi = {
             ? record(tool.config_schema)
             : null,
           source: string(tool.source) || null,
+          agent_tool_source: string(tool.agent_tool_source) || null,
+          installed_by_agent_id: string(tool.installed_by_agent_id) || null,
         };
       }),
-      capabilities: normalizedCapabilities.length
-        ? normalizedCapabilities
-        : [...skills, ...mcpServers],
+      capabilities: normalizedCapabilities,
       users: array(source.users).map((item) => {
         const user = record(item);
         return {

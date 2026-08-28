@@ -1,4 +1,6 @@
-export type ProjectScope = "mine" | "shared" | "running" | "archived";
+import type { MCPServerEditorDraftOverride } from "../../types/mcpServer";
+
+export type ProjectScope = "mine" | "shared" | "running" | "archived" | "all";
 
 export type ProjectStatus =
   | "planning"
@@ -43,6 +45,7 @@ export interface ProjectSummary {
   shared_with_names?: string[];
   execution_user_id?: string | null;
   execution_user_name?: string | null;
+  settings?: Record<string, unknown>;
   updated_at: string;
   created_at: string;
 }
@@ -129,6 +132,10 @@ export interface ProjectTemplate {
   mcp_servers: ProjectTemplateCapability[];
   snapshot_backed: boolean;
   asset_summary: ProjectTemplateAssetSummary | null;
+  tenant_id?: string | null;
+  created_by_user_id?: string | null;
+  can_edit?: boolean;
+  can_delete?: boolean;
   created_at?: string | null;
   updated_at?: string | null;
 }
@@ -170,6 +177,8 @@ export interface ProjectAgentToolOption {
   agent_config?: Record<string, unknown>;
   config_schema?: Record<string, unknown> | null;
   source?: string | null;
+  agent_tool_source?: string | null;
+  installed_by_agent_id?: string | null;
 }
 
 export interface ProjectAgentSettingsDraft {
@@ -180,7 +189,7 @@ export interface ProjectAgentSettingsDraft {
     project_instruction?: string;
   };
   tools: ProjectAgentToolOption[];
-  mcp_capability_ids: string[];
+  mcp_server_overrides: Record<string, MCPServerEditorDraftOverride>;
   skill_capability_ids: string[];
 }
 
@@ -228,19 +237,19 @@ export interface ProjectOwnedAgentPromotion {
 
 export type CapabilitySource = "project" | "agent";
 export type CapabilityKind = "skill" | "mcp" | "tool";
+export type CapabilityOrigin = "company" | "digital_employee" | "market";
 
 export interface ProjectCapabilityOption {
   id: string;
   capability_id?: string | null;
   name: string;
   description?: string | null;
-  internal_name?: string | null;
-  category?: string | null;
-  mcp_server_name?: string | null;
   kind: CapabilityKind;
   source: CapabilitySource;
+  origin?: CapabilityOrigin | null;
   owner_agent_id?: string | null;
   owner_agent_name?: string | null;
+  tool_count?: number;
   version?: string | null;
   risk_level?: "low" | "medium" | "high" | null;
   enabled_by_default?: boolean;
@@ -277,7 +286,11 @@ export interface ProjectCreatePayload {
         enabled: boolean;
         config?: Record<string, unknown>;
       }>;
-      mcp_capability_ids: string[];
+      mcp_server_overrides: Array<
+        Omit<MCPServerEditorDraftOverride, "credential_state"> & {
+          server_id: string;
+        }
+      >;
       skill_capability_ids: string[];
     };
   }>;

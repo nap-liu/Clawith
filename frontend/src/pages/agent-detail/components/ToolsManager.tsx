@@ -21,6 +21,7 @@ import MCPServerEditor from '../../../components/MCPServerEditor';
 import { effectiveEditorRole } from '../../../components/MCPServerEditor/role';
 import ToolCatalogPanel, { type ToolCatalogPanelGroup } from '../../../components/tools/ToolCatalogPanel';
 import { getLocalizedToolPresentation } from '../../../utils/toolPresentation';
+import type { MCPServerEditorDraftOverride } from '../../../types/mcpServer';
 
 export default function ToolsManager({
     agentId,
@@ -30,6 +31,8 @@ export default function ToolsManager({
     projectContext,
     draftTools,
     onDraftToolsChange,
+    draftMcpOverrides,
+    onDraftMcpOverridesChange,
 }: {
     agentId: string;
     agentName?: string;
@@ -39,6 +42,8 @@ export default function ToolsManager({
     projectContext?: { projectId: string; memberId: string };
     draftTools?: any[];
     onDraftToolsChange?: (tools: any[]) => void;
+    draftMcpOverrides?: Record<string, MCPServerEditorDraftOverride>;
+    onDraftMcpOverridesChange?: (value: Record<string, MCPServerEditorDraftOverride>) => void;
 }) {
     const { t } = useTranslation();
     const dialog = useDialog();
@@ -99,14 +104,14 @@ export default function ToolsManager({
             });
             if (res.ok) {
                 const payload = await res.json();
-                setTools(scope === 'project' ? payload.filter((tool: any) => tool.type !== 'mcp') : payload);
+                setTools(payload);
             }
             else {
                 // Fallback to old endpoint
                 const res2 = await fetch(assignmentUrl, { headers: { Authorization: `Bearer ${token}` } });
                 if (res2.ok) {
                     const payload = await res2.json();
-                    setTools(scope === 'project' ? payload.filter((tool: any) => tool.type !== 'mcp') : payload);
+                    setTools(payload);
                 }
             }
         } catch (e) { console.error(e); }
@@ -146,7 +151,7 @@ export default function ToolsManager({
             await tmQueryClient.invalidateQueries({ queryKey: ['agent', agentId] });
         } catch (e: any) {
             setTools(previous);
-            toast.error(t('agent.tools.updateFailed', 'Tool update failed'), { details: String(e?.message || e) });
+            toast.error(t('agent.tools.updateFailed', 'Tool update failed'), { details: scope === 'project' ? undefined : String(e?.message || e) });
         }
     };
 
@@ -293,7 +298,7 @@ export default function ToolsManager({
                 setConfigTool(null);
             }
             loadTools();
-        } catch (e: any) { toast.error(t('common.error.saveFailed'), { details: String(e?.message || e) }); }
+        } catch (e: any) { toast.error(t('common.error.saveFailed'), { details: scope === 'project' ? undefined : String(e?.message || e) }); }
         setConfigSaving(false);
     };
 
@@ -416,7 +421,7 @@ export default function ToolsManager({
                     : tool
             )));
             toast.error(t('common.error.batchUpdateFailed', 'Batch update failed'), {
-                details: String(err?.message || err),
+                details: scope === 'project' ? undefined : String(err?.message || err),
             });
         } finally {
             setUpdatingCategories(prev => {
@@ -452,7 +457,7 @@ export default function ToolsManager({
             await loadTools();
             toast.success(t('agent.tools.mcpGroupRemoved', 'MCP group removed'));
         } catch (e: any) {
-            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: String(e?.message || e) });
+            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: scope === 'project' ? undefined : String(e?.message || e) });
         } finally {
             setDeletingMcpServerId(null);
         }
@@ -483,7 +488,7 @@ export default function ToolsManager({
             await loadTools();
             toast.success(t('agent.tools.companyMcpGroupDeleted', 'Company MCP tool group deleted'));
         } catch (e: any) {
-            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: String(e?.message || e) });
+            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: scope === 'project' ? undefined : String(e?.message || e) });
         } finally {
             setDeletingMcpServerId(null);
         }
@@ -505,7 +510,7 @@ export default function ToolsManager({
                             style={{ border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
                         ><IconFileText size={12} stroke={1.8} /> {t('agent.tools.managePublishedContent')}</a>
                     )}
-                    {!categoryOnlyToggle && canConfigure && tool.type === 'mcp' && tool.mcp_server_id && (
+                    {!categoryOnlyToggle && canConfigure && tool.type === 'mcp' && tool.mcp_server_id && scope === 'agent' && (
                         <button
                             onClick={(e) => {
                                 e.stopPropagation();
@@ -519,14 +524,14 @@ export default function ToolsManager({
                         ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                     )}
                     {/* Non-MCP tools that have a config_schema still use the legacy openConfig path */}
-                    {!categoryOnlyToggle && canConfigure && hasConfig && !isGlobalCategoryConfig && !(tool.type === 'mcp' && tool.mcp_server_id) && (
+                    {!categoryOnlyToggle && canConfigure && hasConfig && !isGlobalCategoryConfig && !(tool.type === 'mcp' && tool.mcp_server_id && scope === 'agent') && (
                         <button
                             onClick={() => openConfig(tool)}
                             style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                             title={t('agent.tools.config', 'Config')}
                         ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                     )}
-                    {!categoryOnlyToggle && canConfigure && tool.source === 'agent' && tool.agent_tool_id && (
+                    {!categoryOnlyToggle && canConfigure && scope === 'agent' && !draftTools && tool.source === 'agent' && tool.agent_tool_id && (
                         <button
                             onClick={async () => {
                                 const ok = await dialog.confirm(
@@ -590,7 +595,9 @@ export default function ToolsManager({
         );
     };
 
-    const activeTools = toolTab === 'company' ? companyTools : agentInstalledTools;
+    const activeTools = toolTab === 'company'
+        ? companyTools
+        : agentInstalledTools;
     const matchesStatusFilter = (tool: any) => {
         if (toolStatusFilter === 'enabled') return !!tool.enabled;
         if (toolStatusFilter === 'disabled') return !tool.enabled;
@@ -639,11 +646,11 @@ export default function ToolsManager({
         const mixed = enabledCount > 0 && enabledCount < controllableTools.length;
         const updating = updatingCategories.has(group.key);
         const mcpServerId = group.allItems[0]?.mcp_server_id as string | undefined;
-        const removableMcpGroup = toolTab === 'installed'
+        const removableMcpGroup = scope === 'agent' && !draftTools && toolTab === 'installed'
             && group.key.startsWith('mcp:')
             && !!mcpServerId
             && group.allItems.every(tool => tool.agent_tool_source === 'user_installed' && tool.installed_by_agent_id === agentId);
-        const deletableCompanyMcpGroup = toolTab === 'company'
+        const deletableCompanyMcpGroup = scope === 'agent' && !draftTools && toolTab === 'company'
             && currentUser?.role === 'platform_admin'
             && group.key.startsWith('mcp:')
             && !!mcpServerId
@@ -1054,11 +1061,11 @@ export default function ToolsManager({
                                                         if (status) {
                                                             status.textContent = data.ok
                                                                 ? `${data.imap}\n${data.smtp}`
-                                                                : `${data.imap || ''}\n${data.smtp || ''}\n${data.error || ''}`;
+                                                                : scope === 'project' ? t('common.error.testFailed') : `${data.imap || ''}\n${data.smtp || ''}\n${data.error || ''}`;
                                                             status.style.color = data.ok ? 'var(--success)' : 'var(--error)';
                                                         }
                                                     } catch (e: any) {
-                                                        if (status) { status.textContent = t('agent.tools.testError', { message: e.message }); status.style.color = 'var(--error)'; }
+                                                        if (status) { status.textContent = scope === 'project' ? t('common.error.testFailed') : t('agent.tools.testError', { message: e.message }); status.style.color = 'var(--error)'; }
                                                     } finally {
                                                         if (btn) { btn.textContent = t('agent.tools.testConnection'); (btn as HTMLButtonElement).disabled = false; }
                                                     }
@@ -1110,9 +1117,9 @@ export default function ToolsManager({
                                                 if (data.ok) {
                                                     await dialog.alert(data.message || t('common.error.testSuccess'), { type: 'success', title: t('common.model.connectivityTest') });
                                                 } else {
-                                                    await dialog.alert(t('common.error.testFailed'), { type: 'error', title: t('common.model.connectivityTest'), details: typeof data.error === 'string' ? data.error : JSON.stringify(data, null, 2) });
+                                                    await dialog.alert(t('common.error.testFailed'), { type: 'error', title: t('common.model.connectivityTest'), details: scope === 'project' ? undefined : (typeof data.error === 'string' ? data.error : JSON.stringify(data, null, 2)) });
                                                 }
-                                            } catch (e: any) { await dialog.alert(t('common.error.testFailed'), { type: 'error', title: t('common.model.connectivityTest'), details: String(e?.message || e) }); }
+                                            } catch (e: any) { await dialog.alert(t('common.error.testFailed'), { type: 'error', title: t('common.model.connectivityTest'), details: scope === 'project' ? undefined : String(e?.message || e) }); }
                                             finally { if (btn) btn.textContent = t('agent.tools.testConnection'); }
                                         }}
                                         id="cat-test-btn"
@@ -1138,6 +1145,13 @@ export default function ToolsManager({
                         loadTools();
                         tmQueryClient.invalidateQueries({ queryKey: ['agent-tools', agentId] });
                     }}
+                    draftOverride={draftMcpOverrides?.[mcpEditor.serverId] ?? null}
+                    onDraftOverrideChange={onDraftMcpOverridesChange ? (override) => {
+                        const next = { ...(draftMcpOverrides || {}) };
+                        if (override) next[mcpEditor.serverId] = override;
+                        else delete next[mcpEditor.serverId];
+                        onDraftMcpOverridesChange(next);
+                    } : undefined}
                 />
             )}
         </>

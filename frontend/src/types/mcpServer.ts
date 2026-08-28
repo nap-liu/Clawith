@@ -88,6 +88,10 @@ export interface MCPServerOverridePutPayload {
   env_template?: Record<string, string> | null;
 }
 
+export interface MCPServerEditorDraftOverride extends MCPServerOverridePutPayload {
+  credential_state?: 'set' | 'unset';
+}
+
 export interface DraftOverrides {
   base_url_template?: string | null;
   headers_template?: Record<string, string> | null;

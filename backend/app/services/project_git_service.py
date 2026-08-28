@@ -459,7 +459,7 @@ def _initialize(
             _commit_with_author(
                 repo,
                 "-m",
-                "Initialize AI-native project",
+                "Initialize project",
                 author_name=author_name,
                 author_email=author_email,
             )
@@ -674,7 +674,8 @@ def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
     )
     if (
         baseline_files != {"PROJECT.json", "README.md"}
-        or baseline_subject != "Initialize AI-native project"
+        or baseline_subject
+        not in {"Initialize project", "Initialize AI-native project"}
         or not baseline_is_ancestor
         or not generated_only
     ):
