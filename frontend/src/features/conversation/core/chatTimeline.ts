@@ -1483,6 +1483,16 @@ export function shouldProjectConversationTurnProgress(
       continue;
     }
     if (
+      entry.type === "special_render" &&
+      isConfirmationToolCall(entry.msg) &&
+      entry.msg.toolStatus === "done"
+    ) {
+      // A resolved suspension card starts a new visible activity phase inside
+      // the same logical turn. Content before the card must not suppress the
+      // resumed progress row; content emitted after it still does.
+      return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
+    }
+    if (
       entry.type === "message" &&
       entry.msg.role === "assistant" &&
       hasConversationMessagePayload(entry.msg)

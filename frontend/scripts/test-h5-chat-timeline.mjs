@@ -1307,6 +1307,35 @@ const {
         false,
         'later tool activity cannot restore progress after the answer has started',
     );
+
+    const resumedAfterConfirmationEntries = buildH5ConversationEntries(projectConversationTurnProgress([
+        ...messages,
+        { id: 'suspension-intro', role: 'assistant', content: '请先确认后继续' },
+        {
+            id: 'confirmation-1', role: 'tool_call', toolName: 'request_confirmation',
+            toolCallId: 'confirmation-1', toolStatus: 'done', toolResult: 'YES',
+        },
+    ], false));
+    assert.equal(
+        shouldProjectConversationTurnProgress(resumedAfterConfirmationEntries, true, {}),
+        true,
+        'a resolved suspension card restores progress for the resumed phase',
+    );
+
+    const resumedAnswerEntries = buildH5ConversationEntries(projectConversationTurnProgress([
+        ...messages,
+        { id: 'suspension-intro', role: 'assistant', content: '请先确认后继续' },
+        {
+            id: 'confirmation-1', role: 'tool_call', toolName: 'request_confirmation',
+            toolCallId: 'confirmation-1', toolStatus: 'done', toolResult: 'YES',
+        },
+        { id: 'resumed-answer', role: 'assistant', content: '恢复后的正式答复' },
+    ], false));
+    assert.equal(
+        shouldProjectConversationTurnProgress(resumedAnswerEntries, true, {}),
+        false,
+        'the restored progress row still disappears when the resumed answer starts',
+    );
 }
 
 {
