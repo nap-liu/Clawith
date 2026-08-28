@@ -291,6 +291,38 @@ async def _call_agent_llm(
     if not model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
 
+    if runtime_session is None and session_id:
+        from app.models.chat_session import ChatSession
+
+        try:
+            runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
+        except (AttributeError, TypeError, ValueError):
+            runtime_session = None
+
+    turn_snapshot = None
+    if turn_anchor_id is not None and runtime_session is not None:
+        from app.services.conversation_turn_lifecycle import (
+            publish_conversation_turn_event,
+            transition_conversation_turn,
+        )
+
+        async with async_session() as lifecycle_db:
+            turn_snapshot = await transition_conversation_turn(
+                lifecycle_db,
+                agent_id=history_agent_id,
+                conversation_id=str(session_id),
+                turn_anchor_id=turn_anchor_id,
+                status="running",
+            )
+            await lifecycle_db.commit()
+        await publish_conversation_turn_event(
+            agent_id=history_agent_id,
+            conversation_id=str(session_id),
+            payload={"type": "turn_state"},
+            snapshot=turn_snapshot,
+            event_kind="turn_lifecycle",
+        )
+
     # Build conversation messages (without system prompt — call_llm adds it)
     messages: list[dict] = []
     from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
@@ -432,12 +464,27 @@ async def _call_agent_llm(
     async def _web_broadcast(payload: dict):
         if not broadcast_web:
             return
-        await _broadcast_to_web_session(history_agent_id, session_id, payload)
+        from app.services.conversation_turn_lifecycle import with_turn_envelope
+
+        await _broadcast_to_web_session(
+            history_agent_id,
+            session_id,
+            with_turn_envelope(
+                payload,
+                turn_snapshot,
+                event_kind=("turn_tool" if payload.get("type") == "tool_call" else "turn_stream"),
+            ),
+        )
         for target_agent_id, target_session_id, target_context in web_broadcast_targets or []:
+            event_kind = (
+                "turn_tool"
+                if payload.get("type") == "tool_call"
+                else "turn_stream"
+            )
             await _broadcast_to_web_session(
                 target_agent_id,
                 target_session_id,
-                {**payload, **target_context},
+                {**payload, **target_context, "event_kind": event_kind},
             )
 
     from app.services.user_output import (
@@ -564,10 +611,6 @@ async def _call_agent_llm(
     await _emit_chunk(chunk_guard.flush())
     await _emit_thinking(thinking_guard.flush())
     reply = sanitize_user_visible_text(_context_reply(reply))
-
-    # Finalize the streamed bubble for any web client watching this session, so
-    # an IM-driven conversation updates live in the web UI (not only on reload).
-    await _web_broadcast({"type": "done", "role": "assistant", "content": reply})
 
     # IM channels render this reply directly to the end user. Keep the original
     # error sentinel visible (it carries the concrete failure reason) and append

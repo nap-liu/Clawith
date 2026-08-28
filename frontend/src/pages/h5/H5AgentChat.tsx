@@ -41,6 +41,18 @@ import {
     shouldScheduleResumeReconnect,
     type ResumeEventGate,
 } from '../../features/conversation/core/resumeRecovery';
+import {
+    IDLE_CONVERSATION_TURN,
+    beginConversationTurnRecovery,
+    conversationTurnIsRunning,
+    conversationTurnIsStreaming,
+    conversationTurnIsWaiting,
+    conversationTurnEventClosesStream,
+    conversationTurnEventShouldBeHandled,
+    reduceConversationTurnEvent,
+    type ConversationTurnRuntime,
+} from '../../features/conversation/core/conversationTurnLifecycle';
+import { projectConversationTurnProgress } from '../../features/conversation/core/chatTimeline';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
 import {
@@ -80,12 +92,17 @@ import {
 } from '../../utils/sceneQuickActions';
 import {
     applyAssistantStreamMessage,
+    applyAssistantMessageCommitted,
+    applyConfirmationRequiredEvent,
+    applyUserMessageCommitted,
     buildH5ConversationEntries,
+    foldConversationTimelineEvent,
     getH5ScrollAnchor,
     hasPendingConfirmation,
     latestHistoryWindowOverlaps,
     mapHistoryMessage,
     mergeHistoryMessages,
+    normalizeChatTimelineMessages,
     reconcileLatestHistoryWindow,
     toolCallMessageFromEvent,
     upsertToolCallMessage,
@@ -453,6 +470,7 @@ export default function H5AgentChat() {
         typeof document !== 'undefined' && document.visibilityState === 'hidden',
     );
     const generationActiveRef = useRef(false);
+    const turnRuntimeBySessionRef = useRef<Record<string, ConversationTurnRuntime>>({});
     const hiddenTerminalEventRef = useRef(false);
     const hiddenDroppedEventRef = useRef(false);
     const unmountedRef = useRef(false);
@@ -555,14 +573,26 @@ export default function H5AgentChat() {
         if (batch.length === 0) return;
         streamBatchRef.current = [];
         setMessages((prev) => batch.reduce(
-            (next, event) => applyAssistantStreamMessage(next, event, makeId),
+            (next, event) => foldConversationTimelineEvent(next, {
+                type: event.type,
+                content: event.content,
+                message_id: event.messageId,
+                producer_scope: event.producerScope,
+                transient_message_id: event.transientMessageId,
+                turn: event.turnAnchorId ? {
+                    turn_anchor_id: event.turnAnchorId,
+                    generation: event.turnGeneration,
+                } : undefined,
+            }, { makeId, now: event.now }).messages,
             prev,
         ));
     }, []);
 
     const enqueueStreamEvent = useCallback((event: H5AssistantStreamMessage) => {
         const last = streamBatchRef.current[streamBatchRef.current.length - 1];
-        if (last && last.type === event.type && last.messageId === event.messageId) {
+        if (last && last.type === event.type && last.messageId === event.messageId
+            && last.turnAnchorId === event.turnAnchorId
+            && last.producerScope === event.producerScope) {
             last.content = `${last.content || ''}${event.content || ''}`;
         } else {
             streamBatchRef.current.push({ ...event });
@@ -705,6 +735,15 @@ export default function H5AgentChat() {
     const closeCurrentSocket = useCallback(() => {
         clearSocketConnectTimer();
         const socket = wsRef.current;
+        const runtimeKey = String(
+            (socket as any)?._runtimeSessionId || sessionIdRef.current || '',
+        );
+        if (runtimeKey) {
+            turnRuntimeBySessionRef.current[runtimeKey] =
+                beginConversationTurnRecovery(
+                    turnRuntimeBySessionRef.current[runtimeKey] || IDLE_CONVERSATION_TURN,
+                );
+        }
         wsRef.current = null;
         if (socket && socket.readyState < WebSocket.CLOSING) {
             socket.close();
@@ -1081,10 +1120,7 @@ export default function H5AgentChat() {
                 const normalized = collectedRows
                     .map(normalizeHistoryMessage)
                     .filter(Boolean) as H5ChatMessage[];
-                const seenToolCalls = new Set<string>();
-                const history = normalized.reverse().filter((msg) => (
-                    !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
-                )).reverse();
+                const history = normalizeChatTimelineMessages(normalized);
                 setMessages((prev) => {
                     const prepared = options.prepareActiveTurnResume
                         ? prepareMessagesForActiveTurnResume(prev)
@@ -1162,21 +1198,16 @@ export default function H5AgentChat() {
             const normalized = rows
                 .map(normalizeHistoryMessage)
                 .filter(Boolean) as H5ChatMessage[];
-            const seenToolCalls = new Set<string>();
-            const olderPage = normalized.reverse().filter((msg) => (
-                !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
-            )).reverse();
+            const olderPage = normalizeChatTimelineMessages(normalized);
             // The stable cursor guarantees this page is strictly older than the
             // current window. Prepend it directly so distinct messages with the
             // same role/content remain distinct.
             setMessages((prev) => {
                 const newerMessageIds = new Set(prev.map((message) => message.id).filter(Boolean));
-                const newerToolCallIds = new Set(prev.map((message) => message.toolCallId).filter(Boolean));
-                const distinctOlderPage = olderPage.filter((message) => (
-                    (!message.id || !newerMessageIds.has(message.id))
-                    && (!message.toolCallId || !newerToolCallIds.has(message.toolCallId))
-                ));
-                return [...distinctOlderPage, ...prev];
+                const distinctOlderPage = olderPage.filter(
+                    (message) => !message.id || !newerMessageIds.has(message.id),
+                );
+                return normalizeChatTimelineMessages([...distinctOlderPage, ...prev]);
             });
 
             const oldestRow = rows[0];
@@ -1406,7 +1437,24 @@ export default function H5AgentChat() {
     }, [scheduleReconnect]);
 
     const handleSocketMessage = useCallback((data: any, socket: WebSocket) => {
-        const isTerminalEvent = ['done', 'error', 'quota_exceeded', 'confirmation_required'].includes(data.type);
+        const runtimeSessionId = String(
+            data.session_id || (socket as any)._runtimeSessionId || sessionIdRef.current || '',
+        );
+        const turnReduction = reduceConversationTurnEvent(
+            turnRuntimeBySessionRef.current[runtimeSessionId] || IDLE_CONVERSATION_TURN,
+            data,
+        );
+        if (!conversationTurnEventShouldBeHandled(turnReduction)) return;
+        turnRuntimeBySessionRef.current[runtimeSessionId] = turnReduction.runtime;
+        if (turnReduction.controlsLifecycle && turnReduction.hasSnapshot) {
+            const nextWaiting = conversationTurnIsWaiting(turnReduction.runtime);
+            const nextStreaming = conversationTurnIsStreaming(turnReduction.runtime);
+            generationActiveRef.current = conversationTurnIsRunning(turnReduction.runtime);
+            setIsWaiting(nextWaiting);
+            setIsStreaming(nextStreaming);
+            if (!generationActiveRef.current) setIsStopping(false);
+        }
+        const isTerminalEvent = conversationTurnEventClosesStream(turnReduction, data);
         if (pageSuspendedRef.current) {
             hiddenDroppedEventRef.current = true;
             historyLoadedSessionRef.current = null;
@@ -1474,100 +1522,100 @@ export default function H5AgentChat() {
             return;
         }
 
+        if (data.type === 'turn_receipt') return;
+
         if (data.type === 'channel_user_message') {
-            const normalized = normalizeHistoryMessage({ ...data, role: 'user' });
-            if (!normalized) return;
-            setMessages((prev) => {
-                if (normalized.id && prev.some((message) => message.id === normalized.id)) return prev;
-                return [...prev, normalized];
-            });
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, { makeId }).messages);
             return;
         }
 
         if (data.type === 'user_message_committed') {
-            const clientMessageId = String(data.client_message_id || '');
-            const messageId = String(data.message_id || '');
-            if (clientMessageId && messageId) {
-                setMessages((prev) => prev.map((message) => (
-                    message.id === clientMessageId ? { ...message, id: messageId } : message
-                )));
-            }
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, { makeId }).messages);
             return;
         }
 
         if (data.type === 'assistant_message_committed') {
-            const normalized = normalizeHistoryMessage({ ...data, role: 'assistant' });
-            if (!normalized) return;
-            setMessages((prev) => {
-                const index = prev.findIndex((message) => message.id === normalized.id);
-                if (index < 0) return [...prev, normalized];
-                return [...prev.slice(0, index), { ...prev[index], ...normalized }, ...prev.slice(index + 1)];
-            });
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, {
+                makeId,
+                preserveTransient: !turnReduction.controlsLifecycle && !turnReduction.hasSnapshot,
+            }).messages);
             return;
         }
 
         if (data.type === 'thinking') {
-            generationActiveRef.current = true;
-            setIsWaiting(false);
-            setIsStreaming(true);
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+                generationActiveRef.current = true;
+                setIsWaiting(false);
+                setIsStreaming(true);
+            }
             enqueueStreamEvent({
                 type: 'thinking',
                 content: data.content || '',
                 messageId: data.message_id ? String(data.message_id) : undefined,
+                turnAnchorId: data.turn?.turn_anchor_id ? String(data.turn.turn_anchor_id) : undefined,
+                turnGeneration: Number.isInteger(data.turn?.generation) ? Number(data.turn.generation) : undefined,
+                producerScope: data.producer_scope ? String(data.producer_scope) : undefined,
             });
             return;
         }
 
         if (data.type === 'chunk') {
-            generationActiveRef.current = true;
-            setIsWaiting(false);
-            setIsStreaming(true);
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+                generationActiveRef.current = true;
+                setIsWaiting(false);
+                setIsStreaming(true);
+            }
             enqueueStreamEvent({
                 type: 'chunk',
                 content: data.content || '',
                 messageId: data.message_id ? String(data.message_id) : undefined,
+                turnAnchorId: data.turn?.turn_anchor_id ? String(data.turn.turn_anchor_id) : undefined,
+                turnGeneration: Number.isInteger(data.turn?.generation) ? Number(data.turn.generation) : undefined,
+                producerScope: data.producer_scope ? String(data.producer_scope) : undefined,
             });
             return;
         }
 
         if (data.type === 'done') {
-            setIsWaiting(false);
-            setIsStreaming(false);
-            setIsStopping(false);
-            setMessages((prev) => applyAssistantStreamMessage(prev, {
-                type: 'done',
-                content: data.content || '',
-                now: new Date().toISOString(),
-                messageId: data.message_id ? String(data.message_id) : undefined,
-            }, makeId));
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+                setIsWaiting(false);
+                setIsStreaming(false);
+                setIsStopping(false);
+            }
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, {
+                makeId,
+                preserveTransient: !turnReduction.controlsLifecycle && !turnReduction.hasSnapshot,
+            }).messages);
             return;
         }
 
         if (data.type === 'tool_call') {
-            generationActiveRef.current = true;
-            setIsWaiting(false);
-            setIsStreaming(true);
-            const toolMsg = toolCallMessageFromEvent(data, makeId, new Date().toISOString());
-            setMessages((prev) => upsertToolCallMessage(prev, toolMsg));
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+                generationActiveRef.current = true;
+                setIsWaiting(false);
+                setIsStreaming(true);
+            }
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, { makeId }).messages);
             return;
         }
 
         if (data.type === 'confirmation_required') {
-            setIsWaiting(false);
-            setIsStreaming(false);
-            setIsStopping(false);
-            const toolMsg = toolCallMessageFromEvent(data, makeId, new Date().toISOString());
-            setMessages((prev) => upsertToolCallMessage(
-                prev.filter((message) => message.id !== String(data.message_id || '')),
-                toolMsg,
-            ));
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+                setIsWaiting(false);
+                setIsStreaming(false);
+                setIsStopping(false);
+            }
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, { makeId }).messages);
             return;
         }
 
         if (data.type === 'error' || data.type === 'quota_exceeded') {
-            setIsWaiting(false);
-            setIsStreaming(false);
-            setIsStopping(false);
+            setMessages((prev) => foldConversationTimelineEvent(prev, data, { makeId }).messages);
+            if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
+                setIsWaiting(false);
+                setIsStreaming(false);
+                setIsStopping(false);
+            }
             setMessages((prev) => [...prev, {
                 id: makeId(),
                 role: 'system',
@@ -1662,6 +1710,13 @@ export default function H5AgentChat() {
             resolveServerConnected(false);
             if (wsRef.current !== ws) return;
             const turnWasActive = generationActiveRef.current;
+            const runtimeKey = String(
+                (ws as any)._runtimeSessionId || effectiveSessionId || sessionIdRef.current || '',
+            );
+            const runtimeBeforeClose =
+                turnRuntimeBySessionRef.current[runtimeKey] || IDLE_CONVERSATION_TURN;
+            turnRuntimeBySessionRef.current[runtimeKey] =
+                beginConversationTurnRecovery(runtimeBeforeClose);
             if (turnWasActive) {
                 recoveryPollingNeededRef.current = true;
             }
@@ -2236,11 +2291,20 @@ export default function H5AgentChat() {
         }
     };
 
-    const conversationEntries = useMemo(() => buildH5ConversationEntries(messages), [messages]);
+    const projectedMessages = useMemo(
+        () => projectConversationTurnProgress(messages, isWaiting, {
+            id: `conversation-turn-progress:${sessionId || 'new'}:${turnRuntimeBySessionRef.current[String(sessionId || '')]?.snapshot.generation || 0}`,
+        }),
+        [isWaiting, messages, sessionId],
+    );
+    const conversationEntries = useMemo(
+        () => buildH5ConversationEntries(projectedMessages),
+        [projectedMessages],
+    );
     const attachedImagePreviews = useMemo(() => buildPreviewImagesFromAttachments(attachedFiles), [attachedFiles]);
     const scrollAnchor = useMemo(() => getH5ScrollAnchor(conversationEntries, isWaiting), [conversationEntries, isWaiting]);
     const virtualizeMessages = conversationEntries.length > VIRTUALIZE_ENTRY_THRESHOLD;
-    const virtualItemCount = conversationEntries.length + (isWaiting ? 1 : 0);
+    const virtualItemCount = conversationEntries.length;
     const rowVirtualizer = useVirtualizer({
         count: virtualizeMessages ? virtualItemCount : 0,
         getScrollElement: () => messagesScrollerRef.current,
@@ -2250,7 +2314,6 @@ export default function H5AgentChat() {
             return estimateConversationEntrySize(entry, entry.type === 'analysis_group' && !!analysisExpanded[entry.key]);
         },
         getItemKey: (index) => {
-            if (index >= conversationEntries.length) return 'h5-waiting';
             return conversationEntries[index].key;
         },
         overscan: 8,
@@ -2944,11 +3007,6 @@ export default function H5AgentChat() {
                                             {renderConversationEntry(entry)}
                                         </div>
                                     ))}
-                                    {isWaiting ? (
-                                        <div className="h5-chat__flow-row">
-                                            {renderWaitingMessage()}
-                                        </div>
-                                    ) : null}
                                 </div>
                             )}
                         </section>

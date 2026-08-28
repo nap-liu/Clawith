@@ -1319,6 +1319,7 @@ export default function ProjectWorkspacePage() {
           llm_content?: string;
           mentions: string[];
           attachments: Array<Record<string, unknown>>;
+          client_message_id?: string;
         },
       ) => projectsApi.sendGroupMessage(projectId, sessionId, payload),
     };

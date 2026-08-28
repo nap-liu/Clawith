@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
+from app.models.chat_session import ChatSession
 from app.models.user import User
 from app.services.chat_attachments import normalize_chat_message_attachments
 from app.services.sender_attribution import wrap_with_sender
@@ -47,6 +48,16 @@ from app.services.user_output import sanitize_user_visible_text
 
 if TYPE_CHECKING:
     from app.services.confirmation_service import PendingConfirmation
+
+HIDDEN_ONBOARDING_ANCHOR_KIND = "onboarding_turn_anchor"
+
+
+def _is_hidden_runtime_anchor(row: Any) -> bool:
+    metadata = getattr(row, "message_meta", None)
+    return bool(
+        isinstance(metadata, dict)
+        and metadata.get("kind") == HIDDEN_ONBOARDING_ANCHOR_KIND
+    )
 
 
 @dataclass
@@ -196,6 +207,8 @@ async def load_messages_for_session(
         row
         for row in reversed(rows_q.scalars().all())
         if not (
+            _is_hidden_runtime_anchor(row)
+            or
             isinstance(getattr(row, "message_meta", None), dict)
             and (
                 row.message_meta.get("consumed_by_onmessage")
@@ -253,6 +266,8 @@ async def load_recoverable_messages_for_turn(
         for row in result.scalars().all()
         if row.id == turn_anchor_id
         or not (
+            _is_hidden_runtime_anchor(row)
+            or
             is_incomplete_delivery_progress(row)
             or (
                 isinstance(getattr(row, "message_meta", None), dict)
@@ -632,6 +647,16 @@ async def mark_latest_incomplete_turn_cancelled(
     startup recovery infers interrupted turns from durable chat rows. Marking
     the latest unanswered user anchor keeps those two views consistent.
     """
+    try:
+        session_id = uuid.UUID(conversation_id)
+    except (TypeError, ValueError):
+        session_id = None
+    if session_id is not None:
+        await db.execute(
+            select(ChatSession.id)
+            .where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
+            .with_for_update()
+        )
     latest = (
         await db.execute(
             select(ChatMessage)
@@ -721,6 +746,20 @@ async def mark_latest_incomplete_turn_cancelled(
     if completed is not None:
         return None
 
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+    try:
+        await transition_conversation_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=anchor.id,
+            status="cancelled",
+        )
+    except LookupError:
+        # Pre-ChatSession channel histories retain their legacy cancellation
+        # marker but cannot participate in the normalized generation contract.
+        pass
     meta = dict(anchor.message_meta or {})
     meta.update(
         {
@@ -744,6 +783,16 @@ async def mark_turn_cancelled(
 ) -> uuid.UUID | None:
     """Mark one exact active user anchor cancelled without guessing latest state."""
 
+    try:
+        session_id = uuid.UUID(conversation_id)
+    except (TypeError, ValueError):
+        session_id = None
+    if session_id is not None:
+        await db.execute(
+            select(ChatSession.id)
+            .where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
+            .with_for_update()
+        )
     anchor = (
         await db.execute(
             select(ChatMessage)
@@ -768,6 +817,18 @@ async def mark_turn_cancelled(
     ):
         return None
 
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+    try:
+        await transition_conversation_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=anchor.id,
+            status="cancelled",
+        )
+    except LookupError:
+        pass
     meta = dict(anchor.message_meta or {})
     meta.update(
         {
@@ -1340,6 +1401,21 @@ async def lock_turn_anchor_for_finalization(
     from app.services.active_turns import wait_for_current_turn_stop_resolution
 
     await wait_for_current_turn_stop_resolution(allow_cancelled=allow_cancelled)
+    try:
+        session_id = uuid.UUID(conversation_id)
+    except (TypeError, ValueError):
+        session_id = None
+    if session_id is not None:
+        # Every lifecycle writer uses the same session -> anchor lock order.
+        # The session row is also the admission mutex for the conversation.
+        await db.execute(
+            select(ChatSession.id)
+            .where(
+                ChatSession.id == session_id,
+                ChatSession.agent_id == agent_id,
+            )
+            .with_for_update()
+        )
     anchor = (
         await db.execute(
             select(ChatMessage)
@@ -1402,12 +1478,26 @@ async def persist_assistant_reply(
                 turn_anchor_id=turn_anchor_id,
             )
             await db.commit()
-            return message_id
     except Exception as e:
         if required:
             raise
         logger.warning(f"[chat_history] persist_assistant_reply failed (non-fatal): {e}")
         return None
+
+    # Persistence succeeded. Observer lookup/publication is deliberately
+    # isolated so a disconnected viewer can never make a caller retry the
+    # already committed assistant row.
+    if turn_anchor_id is not None:
+        from app.services.conversation_turn_lifecycle import publish_committed_turn_terminal
+
+        await publish_committed_turn_terminal(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=turn_anchor_id,
+            message_id=message_id,
+            content=content,
+        )
+    return message_id
 
 
 async def persist_assistant_reply_row(
@@ -1422,13 +1512,15 @@ async def persist_assistant_reply_row(
     message_meta: dict[str, Any] | None = None,
     turn_anchor_id: uuid.UUID | None = None,
     sender_agent_id: uuid.UUID | None = None,
+    turn_terminal_status: str = "completed",
 ) -> uuid.UUID:
     """Persist a non-empty assistant reply in the caller's transaction."""
     content = sanitize_user_visible_text(content or "")
     if not content.strip():
         raise ValueError("assistant reply content must be non-empty")
+    turn_anchor = None
     if turn_anchor_id is not None:
-        await lock_turn_anchor_for_finalization(
+        turn_anchor = await lock_turn_anchor_for_finalization(
             db,
             agent_id=agent_id,
             conversation_id=conversation_id,
@@ -1437,10 +1529,12 @@ async def persist_assistant_reply_row(
     final_meta = dict(message_meta or {})
     final_meta.setdefault("attachments", [])
     if turn_anchor_id is not None:
+        if turn_terminal_status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("assistant reply turn status must be terminal")
         final_meta.update(
             {
                 "turn_anchor_id": str(turn_anchor_id),
-                "turn_status": "completed",
+                "turn_status": turn_terminal_status,
             }
         )
     msg = ChatMessage(
@@ -1457,6 +1551,29 @@ async def persist_assistant_reply_row(
     if _capped:
         msg.thinking = _capped
     db.add(msg)
+    if turn_anchor_id is not None:
+        from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+        try:
+            await transition_conversation_turn(
+                db,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                turn_anchor_id=turn_anchor_id,
+                status=turn_terminal_status,
+            )
+            msg.message_meta = {
+                **dict(msg.message_meta or {}),
+                "turn_terminal_published_by_lifecycle": True,
+            }
+        except LookupError:
+            # Historical confirmation rows may outlive their pre-ChatSession
+            # conversation. Preserve their existing terminal assistant write,
+            # but never downgrade a lifecycle that was already admitted.
+            if (getattr(turn_anchor, "message_meta", None) or {}).get(
+                "conversation_turn_lifecycle"
+            ) is True:
+                raise
     await db.flush()
     return msg.id
 
@@ -1514,19 +1631,19 @@ async def persist_assistant_reply_and_complete_turn(
     Completion is represented by the assistant row itself. ``turn_anchor_id`` is
     accepted for older callers but no longer persists turn state.
     """
-    async with db_session_factory() as db:
-        row_id = await persist_assistant_reply_row(
-            db,
-            agent_id=agent_id,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            content=content,
-            thinking=thinking,
-            message_meta=message_meta,
-            turn_anchor_id=turn_anchor_id,
-        )
-        await db.commit()
-        return row_id
+    row_id = await persist_assistant_reply(
+        db_session_factory,
+        agent_id=agent_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        content=content,
+        thinking=thinking,
+        message_meta=message_meta,
+        turn_anchor_id=turn_anchor_id,
+        required=True,
+    )
+    assert row_id is not None
+    return row_id
 
 
 def parse_tool_call_for_display(content: str) -> dict[str, Any]:

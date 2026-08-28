@@ -424,9 +424,8 @@ async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current
 async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):
     """An IM-driven turn mirrors its live stream to web clients viewing the SAME
     session, so a DingTalk/Feishu conversation updates in real time in the web UI
-    (not only on reload). Verifies `_call_agent_llm` broadcasts chunk/thinking/
-    tool_call/done via the WebSocket `ConnectionManager.send_to_session` for the
-    turn's session_id — the cross-channel half of the live-broadcast fix."""
+    (not only on reload). The terminal event is deliberately absent here: the
+    durable final-reply writer publishes it only after commit."""
     agent, model = _make_agent_and_model()
 
     import app.api.websocket as ws_mod
@@ -483,9 +482,10 @@ async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):
     assert len(original) == len(mirrored)
     assert all(payload["message_id"] == "project-stream-1" for payload in mirrored)
     assert all(payload["sender_name"] == agent.name for payload in mirrored)
-    for expected in ("thinking", "chunk", "tool_call", "done"):
+    for expected in ("thinking", "chunk", "tool_call"):
         assert expected in types, f"web viewer must receive the {expected!r} event of an IM turn"
         assert expected in [payload["type"] for payload in mirrored]
+    assert "done" not in types
 
 
 async def test_broadcast_channel_user_message_emits_event(monkeypatch):

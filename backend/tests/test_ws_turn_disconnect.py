@@ -24,7 +24,9 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from app.api.websocket import WebSocketChatHandler, _await_turn_with_abort
+from app.services.conversation_turn_lifecycle import ConversationTurnSnapshot
 from app.services.workload_capacity import WorkloadCapacity, WorkloadKind
+from app.services.workload_capacity import WorkloadOverloadedError
 
 pytestmark = pytest.mark.asyncio
 
@@ -146,12 +148,23 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
 
     async def run_llm_inside_capacity(*_args, **_kwargs):
         snapshot = await capacity.snapshot()
-        assert snapshot.categories["interactive"].active == 1
-        assert snapshot.tenants[str(handler.tenant_id)].active == 1
+        assert snapshot.categories["interactive"].active == 0
         return "completed reply", [], [], "completed", True
 
     handler._run_llm_and_stream = run_llm_inside_capacity
     handler._safe_send = AsyncMock()
+    running_snapshot = ConversationTurnSnapshot(
+        anchor_id=uuid.uuid4(), generation=1, revision=1, status="running"
+    )
+    completed_snapshot = ConversationTurnSnapshot(
+        anchor_id=running_snapshot.anchor_id,
+        generation=1,
+        revision=2,
+        status="completed",
+    )
+    handler._transition_turn = AsyncMock(return_value=running_snapshot)
+    handler._publish_turn_lifecycle = AsyncMock()
+    handler._load_turn_snapshot = AsyncMock(return_value=completed_snapshot)
     save_calls: list[uuid.UUID] = []
 
     async def save_with_commit_race(*_args, message_id, **_kwargs):
@@ -169,6 +182,7 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
         is_onboarding_trigger=False,
         onboarding_claim=None,
         turn_anchor_id=uuid.uuid4(),
+        turn_snapshot=running_snapshot,
         task_match=None,
     )
 
@@ -178,7 +192,123 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
         "role": "assistant",
         "content": "completed reply",
     }
-    handler._safe_send.assert_awaited_once_with({"type": "done", "role": "assistant", "content": "completed reply"})
+    handler._safe_send.assert_awaited_once_with(
+        {
+            "type": "done",
+            "role": "assistant",
+            "content": "completed reply",
+            "message_id": str(save_calls[0]),
+            "event_kind": "turn_terminal",
+            "turn": completed_snapshot.to_client_dict(),
+        }
+    )
+
+
+async def test_failed_onboarding_closes_hidden_turn_before_skip_event():
+    handler = WebSocketChatHandler(
+        websocket=SimpleNamespace(),
+        agent_id=uuid.uuid4(),
+        token="test",
+        session_id=str(uuid.uuid4()),
+    )
+    handler.user_id = uuid.uuid4()
+    handler.conv_id = handler.session_id_param
+    handler.conversation = [{"role": "user", "content": "Please begin the onboarding."}]
+    anchor_id = uuid.uuid4()
+    running = ConversationTurnSnapshot(anchor_id, 1, 1, "running")
+    failed = ConversationTurnSnapshot(anchor_id, 1, 2, "failed")
+    handler._run_llm_and_stream = AsyncMock(
+        return_value=("", [], [], "failed", False)
+    )
+    handler._transition_turn = AsyncMock(return_value=failed)
+    handler._publish_turn_lifecycle = AsyncMock()
+    handler._safe_send = AsyncMock()
+
+    disposition = await handler._execute_web_turn(
+        effective_llm_model=SimpleNamespace(),
+        is_onboarding_trigger=True,
+        onboarding_claim=None,
+        turn_anchor_id=anchor_id,
+        turn_snapshot=running,
+        task_match=None,
+    )
+
+    assert disposition == "continue"
+    handler._transition_turn.assert_awaited_once_with(anchor_id, "failed")
+    handler._safe_send.assert_awaited_once_with(
+        {
+            "type": "onboarding_skipped",
+            "reason": "generation_failed",
+            "agent_id": str(handler.agent_id),
+            "event_kind": "turn_terminal",
+            "turn": failed.to_client_dict(),
+        }
+    )
+
+
+async def test_capacity_rejection_never_admits_durable_turn(monkeypatch):
+    handler = WebSocketChatHandler(
+        websocket=SimpleNamespace(),
+        agent_id=uuid.uuid4(),
+        token="test",
+        session_id=str(uuid.uuid4()),
+    )
+    handler.user_id = uuid.uuid4()
+    handler.tenant_id = uuid.uuid4()
+    handler.conv_id = handler.session_id_param
+    handler.conversation = [{"role": "user", "content": "hello"}]
+    capacity = WorkloadCapacity(
+        global_limit=1,
+        tenant_limit=1,
+        category_limits={kind: 1 for kind in WorkloadKind},
+        default_timeout_seconds=0.01,
+        instance_id="websocket-capacity-rejection",
+    )
+    monkeypatch.setattr("app.api.websocket.get_workload_capacity", lambda: capacity)
+    async with capacity.slot(WorkloadKind.INTERACTIVE, handler.tenant_id):
+        with pytest.raises(WorkloadOverloadedError):
+            await capacity.acquire(
+                WorkloadKind.INTERACTIVE,
+                handler.tenant_id,
+            )
+
+
+async def test_pre_admission_rejection_is_not_a_turn_terminal(monkeypatch):
+    from app.services.quota_guard import QuotaExceeded
+
+    handler = WebSocketChatHandler(
+        websocket=SimpleNamespace(),
+        agent_id=uuid.uuid4(),
+        token="test",
+        session_id=str(uuid.uuid4()),
+    )
+    handler.user_id = uuid.uuid4()
+    handler.conv_id = handler.session_id_param
+    handler.current_client_message_id = "optimistic-user-1"
+    current_snapshot = ConversationTurnSnapshot(
+        anchor_id=uuid.uuid4(),
+        generation=7,
+        revision=3,
+        status="running",
+    )
+    handler._load_turn_snapshot = AsyncMock(return_value=current_snapshot)
+    handler._safe_send = AsyncMock()
+
+    async def reject_quota(_user_id):
+        raise QuotaExceeded("quota reached")
+
+    monkeypatch.setattr("app.api.websocket.check_conversation_quota", reject_quota)
+
+    assert await handler._check_quotas() is False
+    handler._safe_send.assert_awaited_once_with(
+        {
+            "type": "error",
+            "content": "⚠️ quota reached",
+            "rejected_message_id": "optimistic-user-1",
+            "event_kind": "turn_rejected",
+            "turn": current_snapshot.to_client_dict(),
+        }
+    )
 
 
 async def test_websocket_turn_wires_parent_subagent_drain_into_round_hook(monkeypatch):

@@ -69,11 +69,14 @@ def _serialize_child_message(message: ChatMessage) -> dict[str, Any]:
         # handle. Canonical running/done tool rows use their persisted call id.
         entry["toolCallId"] = str(message.id)
         parsed = parse_tool_call_for_display(message.content)
+        explicit_tool_call_id = bool(parsed.get("toolCallId"))
         if parsed:
             entry["content"] = ""
             entry.update(parsed)
         if entry.get("toolName") == "request_confirmation":
             entry["toolCallId"] = str(message.id)
+            explicit_tool_call_id = True
+        entry["toolCallIdExplicit"] = explicit_tool_call_id
     metadata = _metadata(message)
     entry.update(
         {
@@ -243,10 +246,24 @@ async def build_project_group_timeline(
             for key in ("content", "display_content", "attachments", "thinking"):
                 if key in standard_final:
                     entry[key] = standard_final[key]
+            child_anchor_id = str(_metadata(child_final).get("turn_anchor_id") or "")
+            anchor_key = (child_final.conversation_id, child_anchor_id)
+            group_anchor_id = group_id_by_anchor.get(anchor_key)
+            producer_scope = f"project:{child_final.conversation_id}:{child_anchor_id}"
+            entry["metadata"] = {
+                **entry["metadata"],
+                "turn_anchor_id": group_anchor_id,
+                "producer_scope": producer_scope,
+            }
+            entry["message_meta"] = entry["metadata"]
+            entry["turnAnchorId"] = group_anchor_id
+            entry["producerScope"] = producer_scope
+            entry["producer_scope"] = producer_scope
+            entry["canonicalDone"] = True
             consumed_child_ids.add(child_message_id)
         projected.append((message.created_at, str(message.id), entry))
 
-    tool_positions: dict[tuple[str, str], int] = {}
+    tool_positions: dict[tuple[str, str, str], int] = {}
     child_projected: list[tuple[Any, str, dict[str, Any]]] = []
     for row in visible_child_rows:
         if str(row.id) in consumed_child_ids:
@@ -254,20 +271,31 @@ async def build_project_group_timeline(
         entry = _serialize_child_message(row)
         anchor_id = str(_metadata(row).get("turn_anchor_id") or "")
         anchor_key = (row.conversation_id, anchor_id)
+        group_anchor_id = group_id_by_anchor.get(anchor_key)
+        producer_scope = f"project:{row.conversation_id}:{anchor_id}"
         entry["metadata"] = {
             **entry["metadata"],
+            "turn_anchor_id": group_anchor_id,
+            "producer_scope": producer_scope,
             "project_timeline": {
-                "group_message_id": group_id_by_anchor.get(anchor_key),
+                "group_message_id": group_anchor_id,
                 "project_run_ids": sorted(run_ids_by_anchor.get(anchor_key, set())),
                 "subagent_session_id": row.conversation_id,
             },
         }
         entry["message_meta"] = entry["metadata"]
+        entry["turnAnchorId"] = group_anchor_id
+        entry["producerScope"] = producer_scope
+        entry["producer_scope"] = producer_scope
         item = (row.created_at, str(row.id), entry)
         if row.role != "tool_call":
             child_projected.append(item)
             continue
-        tool_key = (row.conversation_id, str(entry.get("toolCallId") or row.id))
+        tool_key = (
+            row.conversation_id,
+            anchor_id,
+            str(entry.get("toolCallId") or row.id),
+        )
         previous_position = tool_positions.get(tool_key)
         if previous_position is None:
             tool_positions[tool_key] = len(child_projected)
@@ -281,4 +309,48 @@ async def build_project_group_timeline(
 
     projected.extend(child_projected)
     projected.sort(key=lambda item: (item[0], item[1]))
+    # Keep every child event inside the Human message partition that caused
+    # its ProjectRun. A later Human message may join the same lifecycle cohort
+    # while an older producer is still emitting tools/chunks; global timestamp
+    # order would otherwise place those older-turn events after the new anchor.
+    for group_anchor in [row for row in group_messages if row.role == "user"]:
+        anchor_id = str(group_anchor.id)
+        scoped = [
+            item
+            for item in projected
+            if item[2].get("role") != "user"
+            and str(
+                item[2].get("turnAnchorId")
+                or dict(item[2].get("metadata") or {}).get("turn_anchor_id")
+                or ""
+            )
+            == anchor_id
+        ]
+        if not scoped:
+            continue
+        scoped_ids = {id(item) for item in scoped}
+        remaining = [item for item in projected if id(item) not in scoped_ids]
+        anchor_index = next(
+            (
+                index
+                for index, item in enumerate(remaining)
+                if str(item[2].get("id") or "") == anchor_id
+            ),
+            -1,
+        )
+        if anchor_index < 0:
+            continue
+        next_user_index = next(
+            (
+                index
+                for index in range(anchor_index + 1, len(remaining))
+                if remaining[index][2].get("role") == "user"
+            ),
+            len(remaining),
+        )
+        projected = [
+            *remaining[:next_user_index],
+            *scoped,
+            *remaining[next_user_index:],
+        ]
     return [entry for _created_at, _message_id, entry in projected]

@@ -350,6 +350,8 @@ async def report_result(
 
     # Save result as assistant chat message and push via WebSocket
     # (works for both user-originated and agent-to-agent messages)
+    turn_snapshot = None
+    terminal_message_id = None
     if body.result and msg.conversation_id:
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
@@ -360,6 +362,19 @@ async def report_result(
             select(Participant).where(Participant.type == "agent", Participant.ref_id == agent.id)
         )
         participant = part_r.scalar_one_or_none()
+
+        turn_anchor = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.agent_id == agent.id,
+                    ChatMessage.conversation_id == msg.conversation_id,
+                    ChatMessage.role.in_(("user", "system")),
+                    ChatMessage.message_meta["gateway_message_id"].as_string() == str(msg.id),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
         # A gateway client may retry /report. Persist one stable reply row so
         # the same remote event cannot enqueue a second on_message execution.
@@ -381,6 +396,14 @@ async def report_result(
                     "direction": "inbound",
                     "source_channel": "agent",
                     "actor_ref": str(participant.id if participant else agent.id),
+                    **(
+                        {
+                            "turn_anchor_id": str(turn_anchor.id),
+                            "turn_status": "completed",
+                        }
+                        if turn_anchor is not None
+                        else {}
+                    ),
                 },
             )
             db.add(assistant_msg)
@@ -395,6 +418,17 @@ async def report_result(
                 )
 
                 await match_incoming_chat_message(db, assistant_msg, report_session)
+        terminal_message_id = assistant_msg.id
+        if turn_anchor is not None:
+            from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+            turn_snapshot = await transition_conversation_turn(
+                db,
+                agent_id=agent.id,
+                conversation_id=msg.conversation_id,
+                turn_anchor_id=turn_anchor.id,
+                status="completed",
+            )
 
     # Route an A2A reply in the same transaction as completion and exact
     # on_message matching. Concurrent/retried reports therefore create neither
@@ -412,21 +446,22 @@ async def report_result(
 
     await db.commit()
 
-    # Push to WebSocket if user is connected
-    if body.result and msg.conversation_id and msg.sender_user_id:
-        try:
-            from app.api.websocket import manager
+    # Publish only after the reply row and terminal lifecycle committed.
+    if body.result and msg.conversation_id and turn_snapshot is not None:
+        from app.services.conversation_turn_lifecycle import publish_conversation_turn_event
 
-            await manager.send_message(
-                str(agent.id),
-                {
-                    "type": "done",
-                    "role": "assistant",
-                    "content": body.result,
-                },
-            )
-        except Exception:
-            pass  # User may have disconnected
+        await publish_conversation_turn_event(
+            agent_id=agent.id,
+            conversation_id=msg.conversation_id,
+            payload={
+                "type": "done",
+                "role": "assistant",
+                "content": body.result,
+                "message_id": str(terminal_message_id) if terminal_message_id else None,
+            },
+            snapshot=turn_snapshot,
+            event_kind="turn_terminal",
+        )
 
     if body.result and msg.sender_agent_id and first_completion:
         logger.info(f"[Gateway] Reply routed back to sender agent {msg.sender_agent_id}")

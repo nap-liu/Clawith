@@ -425,6 +425,42 @@ async def test_persisted_delivery_rejects_terminal_receipt_before_provider(monke
         )
 
 
+async def test_lifecycle_terminal_delivery_does_not_publish_second_web_done(monkeypatch):
+    from app.services import turn_runtime
+    from app.services.turn_runtime import TurnRuntime
+
+    agent, user = await _seed_agent()
+    row = await _seed_message(agent, user, IMDeliveryResult.pending("web"))
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, row.id)
+        stored.message_meta = {
+            **dict(stored.message_meta or {}),
+            "turn_terminal_published_by_lifecycle": True,
+        }
+        await db.commit()
+    monkeypatch.setattr(
+        turn_runtime,
+        "deliver_message_with_receipt",
+        pytest.fail,
+    )
+
+    result = await im_delivery.deliver_persisted_message(
+        message_id=row.id,
+        agent_id=agent.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="web",
+            conversation_id=row.conversation_id,
+            external_conv_id="web_lifecycle_terminal",
+            is_group=False,
+        ),
+        message=row.content,
+    )
+
+    assert result.channel == "web"
+    assert result.parts[0].transport == "websocket"
+
+
 async def test_persisted_delivery_claim_allows_only_one_provider_call(monkeypatch):
     from app.services import turn_runtime
     from app.services.turn_runtime import TurnRuntime

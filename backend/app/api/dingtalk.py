@@ -1069,6 +1069,15 @@ async def process_dingtalk_message(
                     turn_anchor_id=turn_anchor_id,
                 )
                 await reply_db.commit()
+            from app.services.conversation_turn_lifecycle import publish_committed_turn_terminal
+
+            await publish_committed_turn_terminal(
+                agent_id=agent_id,
+                conversation_id=session_conv_id,
+                turn_anchor_id=turn_anchor_id,
+                message_id=assistant_message_id,
+                content=reply_text,
+            )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 

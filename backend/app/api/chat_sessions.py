@@ -914,6 +914,9 @@ async def _get_session_messages_page(
             ChatMessage.message_meta["kind"].as_string().is_distinct_from(
                 "subagent_event"
             ),
+            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
+                "onboarding_turn_anchor"
+            ),
             or_(
                 ChatMessage.role != "assistant",
                 ChatMessage.message_meta["media_kind"].as_string().is_(None),
@@ -1108,15 +1111,23 @@ async def _get_session_messages_page(
             # their database row id remains the resolve handle.
             entry["toolCallId"] = str(m.id)
             parsed = parse_tool_call_for_display(m.content)
+            explicit_tool_call_id = bool(parsed.get("toolCallId"))
             if parsed:
                 entry["content"] = ""
                 entry.update(parsed)
             if entry.get("toolName") == "request_confirmation":
                 entry["toolCallId"] = str(m.id)
+                explicit_tool_call_id = True
+            entry["toolCallIdExplicit"] = explicit_tool_call_id
             tool_call_id = entry["toolCallId"]
-            previous_position = tool_call_positions.get(tool_call_id)
+            turn_anchor_id = str(message_meta.get("turn_anchor_id") or "legacy")
+            entry["turnAnchorId"] = (
+                turn_anchor_id if turn_anchor_id != "legacy" else None
+            )
+            tool_identity = f"{turn_anchor_id}:{tool_call_id}"
+            previous_position = tool_call_positions.get(tool_identity)
             if previous_position is None:
-                tool_call_positions[tool_call_id] = len(out)
+                tool_call_positions[tool_identity] = len(out)
                 out.append(entry)
             else:
                 previous_entry = out[previous_position]

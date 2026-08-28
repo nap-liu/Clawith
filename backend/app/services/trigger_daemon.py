@@ -1050,6 +1050,15 @@ async def _resume_origin_session_for_on_message(
                 if origin_row is not None:
                     origin_row.last_message_at = datetime.now(timezone.utc)
             await db.commit()
+            from app.services.conversation_turn_lifecycle import publish_committed_turn_terminal
+
+            await publish_committed_turn_terminal(
+                agent_id=history_agent_id,
+                conversation_id=str(origin.id),
+                turn_anchor_id=anchor_id,
+                message_id=final_id,
+                content=reply,
+            )
             return reply
 
     async def _work_and_deliver() -> str:

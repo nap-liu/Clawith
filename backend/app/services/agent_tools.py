@@ -11730,7 +11730,8 @@ async def _send_exact_session_message(
                     str(agent_id),
                     str(target_session_id),
                     {
-                        "type": "done",
+                        "type": "assistant_message_committed",
+                        "id": str(receipt_id),
                         "role": "assistant",
                         "content": message_for_history,
                         "session_id": str(target_session_id),

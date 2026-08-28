@@ -801,38 +801,21 @@ export const projectsApi = {
     items: JsonRecord[];
     hasMore: boolean;
     nextCursor: string | null;
+    turn: JsonRecord;
   }> {
     const params = new URLSearchParams({
       limit: String(Math.min(500, Math.max(1, options.limit ?? 500))),
     });
     if (options.before) params.set("before", options.before);
-    const [response, projectRuns] = await Promise.all([
-      fetchJson<JsonRecord>(
-        `/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages?${params.toString()}`,
-      ),
-      fetchJson<JsonRecord[]>(
-        `/projects/${encodeURIComponent(projectId)}/runs`,
-      ).catch(() => []),
-    ]);
-    const currentRunById = new Map<string, JsonRecord>(
-      projectRuns.map(
-        (run) =>
-          [string(run.id || run.run_id), record(run)] as [string, JsonRecord],
-      ),
+    const response = await fetchJson<JsonRecord>(
+      `/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages?${params.toString()}`,
     );
     const items = array(response.items).map((item) => {
       const message = record(item);
       const metadata = record(message.metadata || message.message_meta);
       const subagentRuns = array(metadata.subagent_runs).map((item) => {
         const subagentRun = record(item);
-        const current = currentRunById.get(string(subagentRun.project_run_id));
-        return current
-          ? {
-              ...subagentRun,
-              status: current.status || subagentRun.status,
-              error: current.error || subagentRun.error,
-            }
-          : subagentRun;
+        return subagentRun;
       });
       const liveMetadata = subagentRuns.length
         ? { ...metadata, subagent_runs: subagentRuns }
@@ -852,6 +835,7 @@ export const projectsApi = {
       items,
       hasMore: Boolean(response.has_more),
       nextCursor: string(response.next_cursor) || null,
+      turn: record(response.turn),
     };
   },
   sendGroupMessage: (
@@ -863,6 +847,7 @@ export const projectsApi = {
       mentions: string[];
       attachments: JsonRecord[];
       sender_agent_id?: string;
+      client_message_id?: string;
     },
   ) =>
     fetchJson<{
@@ -876,6 +861,7 @@ export const projectsApi = {
         status: string;
         error?: string;
       }>;
+      turn?: JsonRecord;
     }>(
       `/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages`,
       {
@@ -883,6 +869,7 @@ export const projectsApi = {
         body: JSON.stringify({
           ...payload,
           client_message_id:
+            payload.client_message_id ||
             globalThis.crypto?.randomUUID?.() ||
             `${Date.now()}-${Math.random()}`,
         }),

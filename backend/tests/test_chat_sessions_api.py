@@ -553,7 +553,10 @@ async def test_session_messages_fold_append_only_tool_events(monkeypatch):
         is_group=False,
     )
 
-    def message(role, content, offset_seconds):
+    first_anchor = uuid.uuid4()
+    second_anchor = uuid.uuid4()
+
+    def message(role, content, offset_seconds, turn_anchor_id=None):
         return SimpleNamespace(
             id=uuid.uuid4(),
             role=role,
@@ -562,6 +565,11 @@ async def test_session_messages_fold_append_only_tool_events(monkeypatch):
             created_at=started_at + timedelta(seconds=offset_seconds),
             participant_id=None,
             user_id=user_id,
+            message_meta=(
+                {"turn_anchor_id": str(turn_anchor_id)}
+                if turn_anchor_id is not None
+                else {}
+            ),
         )
 
     rows = [
@@ -572,29 +580,37 @@ async def test_session_messages_fold_append_only_tool_events(monkeypatch):
             "args": {"query": "胡云"},
             "status": "running",
             "result": "",
-        }), 1),
+        }), 1, first_anchor),
         message("tool_call", json.dumps({
             "name": "search_contacts",
             "call_id": search_call_id,
             "args": {"query": "胡云"},
             "status": "done",
             "result": "found",
-        }), 2),
+        }), 2, first_anchor),
         message("tool_call", json.dumps({
             "name": "remove_contact",
             "call_id": remove_call_id,
             "args": {"target_id": "human-1"},
             "status": "running",
             "result": "",
-        }), 3),
+        }), 3, first_anchor),
         message("tool_call", json.dumps({
             "name": "remove_contact",
             "call_id": remove_call_id,
             "args": {"target_id": "human-1"},
             "status": "done",
             "result": "removed",
-        }), 4),
+        }), 4, first_anchor),
         message("assistant", "已完成", 5),
+        message("user", "再查一次", 6),
+        message("tool_call", json.dumps({
+            "name": "search_contacts",
+            "call_id": search_call_id,
+            "args": {"query": "胡云"},
+            "status": "running",
+            "result": "",
+        }), 7, second_anchor),
     ]
     # The SQL query returns newest-first; the handler reverses it before rendering.
     db = RecordingDB(responses=[DummyResult([session]), DummyResult(reversed(rows))])
@@ -614,15 +630,25 @@ async def test_session_messages_fold_append_only_tool_events(monkeypatch):
     )
 
     tool_messages = [item for item in messages if item["role"] == "tool_call"]
-    assert len(tool_messages) == 2
+    assert len(tool_messages) == 3
     assert [(item["toolName"], item["toolStatus"]) for item in tool_messages] == [
         ("search_contacts", "done"),
         ("remove_contact", "done"),
+        ("search_contacts", "running"),
     ]
-    assert [item["toolCallId"] for item in tool_messages] == [search_call_id, remove_call_id]
+    assert [item["toolCallId"] for item in tool_messages] == [
+        search_call_id,
+        remove_call_id,
+        search_call_id,
+    ]
+    assert [item["turnAnchorId"] for item in tool_messages] == [
+        str(first_anchor),
+        str(first_anchor),
+        str(second_anchor),
+    ]
     assert tool_messages[0]["toolResult"] == "found"
     assert tool_messages[0]["created_at"] == (started_at + timedelta(seconds=1)).isoformat()
-    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["role"] == "tool_call"
 
 
 @pytest.mark.asyncio

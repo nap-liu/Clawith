@@ -351,7 +351,10 @@ async def deliver_persisted_message(
     **delivery_kwargs,
 ) -> IMDeliveryResult:
     """Deliver one already-pending ChatMessage and durably finalize its receipt."""
-    from app.services.turn_runtime import deliver_message_with_receipt
+    from app.services.turn_runtime import (
+        HISTORY_ONLY_CHANNELS,
+        deliver_message_with_receipt,
+    )
 
     message = sanitize_user_visible_text(message or "")
     if not message.strip():
@@ -420,19 +423,31 @@ async def deliver_persisted_message(
         row.message_meta = meta
         if row.role == "assistant" and row.content != message:
             row.content = message
+        lifecycle_owns_live_terminal = bool(
+            meta.get("turn_terminal_published_by_lifecycle")
+            and str(getattr(runtime, "source_channel", "") or "")
+            in {"web", "miniprogram", "wechat_miniprogram", "mcp", *HISTORY_ONLY_CHANNELS}
+        )
         await db.commit()
 
     async def _record_part(part: IMDeliveryPart) -> None:
         await append_delivery_part(message_id, part)
 
     try:
-        result = await deliver_message_with_receipt(
-            agent_id=agent_id,
-            runtime=runtime,
-            message=message,
-            on_part=_record_part,
-            **delivery_kwargs,
-        )
+        if lifecycle_owns_live_terminal:
+            result = IMDeliveryResult.unsupported_delivery(
+                str(getattr(runtime, "source_channel", "") or "web"),
+                "websocket",
+                conversation_ref=str(getattr(runtime, "conversation_id", "") or ""),
+            )
+        else:
+            result = await deliver_message_with_receipt(
+                agent_id=agent_id,
+                runtime=runtime,
+                message=message,
+                on_part=_record_part,
+                **delivery_kwargs,
+            )
     except asyncio.CancelledError:
         await register_delivery(
             message_id,
@@ -519,6 +534,7 @@ async def update_delivery_message_content(
     sanitized_thinking = (
         sanitize_user_visible_text(thinking) if thinking and thinking.strip() else None
     )
+    turn_snapshot = None
     async with async_session() as db:
         row = (
             await db.execute(
@@ -537,8 +553,38 @@ async def update_delivery_message_content(
             meta = dict(row.message_meta or {})
             if meta.get("turn_anchor_id"):
                 meta["turn_status"] = "completed"
+                try:
+                    turn_anchor_id = uuid.UUID(str(meta["turn_anchor_id"]))
+                except (TypeError, ValueError):
+                    turn_anchor_id = None
+                if turn_anchor_id is not None:
+                    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+                    turn_snapshot = await transition_conversation_turn(
+                        db,
+                        agent_id=agent_id,
+                        conversation_id=row.conversation_id,
+                        turn_anchor_id=turn_anchor_id,
+                        status="completed",
+                    )
             row.message_meta = meta
         await db.commit()
+        conversation_id = row.conversation_id
+    if turn_snapshot is not None:
+        from app.services.conversation_turn_lifecycle import publish_conversation_turn_event
+
+        await publish_conversation_turn_event(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            payload={
+                "type": "done",
+                "role": "assistant",
+                "content": content,
+                "message_id": str(local_id),
+            },
+            snapshot=turn_snapshot,
+            event_kind="turn_terminal",
+        )
     return True
 
 
