@@ -1369,6 +1369,16 @@ export function normalizeChatTimelineMessages<T extends Record<string, any>>(
   return normalized;
 }
 
+function hasConversationMessagePayload(message: ConversationMessage): boolean {
+  return Boolean(
+    String(message.display_content ?? message.content ?? "").trim() ||
+      message.fileName ||
+      message.imageUrl ||
+      message.attachments?.length ||
+      message.previewImages?.length,
+  );
+}
+
 /**
  * Project the single ephemeral progress row from lifecycle state.
  *
@@ -1384,13 +1394,7 @@ export function projectConversationTurnProgress<
     if (message.role !== "assistant" || !(message.streaming || message._streaming)) {
       return [message];
     }
-    const hasRenderablePayload = Boolean(
-      String(message.content || "").trim() ||
-        message.fileName ||
-        message.imageUrl ||
-        message.attachments?.length ||
-        message.previewImages?.length,
-    );
+    const hasRenderablePayload = hasConversationMessagePayload(message);
     if (hasRenderablePayload) return [message];
     // Preserve reasoning for the analysis group, but strip its transport-only
     // streaming marker so it cannot render a second progress bubble.
@@ -1415,9 +1419,9 @@ export function projectConversationTurnProgress<
 }
 
 /**
- * Keep the turn progress row visible for the whole active lifecycle unless
- * the latest reasoning/tool group in the active turn is already exposing that
- * activity. Expanded groups from older turns never suppress new-turn progress.
+ * Keep the turn progress row visible until the active turn starts rendering
+ * its answer. The latest expanded reasoning/tool group also exposes current
+ * activity, while expanded groups from older turns never suppress progress.
  */
 export function shouldProjectConversationTurnProgress(
   entries: ConversationEntry[],
@@ -1425,14 +1429,25 @@ export function shouldProjectConversationTurnProgress(
   expandedAnalysis: Readonly<Record<string, boolean>>,
 ): boolean {
   if (!running) return false;
+  let latestAnalysisKey: string | undefined;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (entry.type === "analysis_group") {
-      return !expandedAnalysis[entry.key];
+      latestAnalysisKey ||= entry.key;
+      continue;
     }
-    if (entry.type === "message" && entry.msg.role === "user") return true;
+    if (
+      entry.type === "message" &&
+      entry.msg.role === "assistant" &&
+      hasConversationMessagePayload(entry.msg)
+    ) {
+      return false;
+    }
+    if (entry.type === "message" && entry.msg.role === "user") {
+      return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
+    }
   }
-  return true;
+  return latestAnalysisKey ? !expandedAnalysis[latestAnalysisKey] : true;
 }
 
 export function toolCallMessageFromEvent(

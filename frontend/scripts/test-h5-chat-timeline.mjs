@@ -1286,6 +1286,27 @@ const {
         true,
         'an expanded analysis group from an older turn cannot hide new-turn progress',
     );
+
+    const answeringEntries = buildH5ConversationEntries(projectConversationTurnProgress([
+        ...messages,
+        { id: 'answer-1', role: 'assistant', content: '正式答复已经开始', streaming: true, _streaming: true },
+    ], false));
+    assert.equal(
+        shouldProjectConversationTurnProgress(answeringEntries, true, {}),
+        false,
+        'the progress row disappears as soon as the active turn starts rendering its answer',
+    );
+
+    const answeringThenToolEntries = buildH5ConversationEntries(projectConversationTurnProgress([
+        ...messages,
+        { id: 'answer-1', role: 'assistant', content: '先给出阶段性正式答复' },
+        { id: 'tool-2', role: 'tool_call', toolName: 'read_file', toolCallId: 'tool-2', toolStatus: 'running' },
+    ], false));
+    assert.equal(
+        shouldProjectConversationTurnProgress(answeringThenToolEntries, true, {}),
+        false,
+        'later tool activity cannot restore progress after the answer has started',
+    );
 }
 
 {
