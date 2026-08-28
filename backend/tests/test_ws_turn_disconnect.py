@@ -276,8 +276,9 @@ async def test_capacity_rejection_never_admits_durable_turn(monkeypatch):
 async def test_pre_admission_rejection_is_not_a_turn_terminal(monkeypatch):
     from app.services.quota_guard import QuotaExceeded
 
+    send_json = AsyncMock()
     handler = WebSocketChatHandler(
-        websocket=SimpleNamespace(),
+        websocket=SimpleNamespace(send_json=send_json),
         agent_id=uuid.uuid4(),
         token="test",
         session_id=str(uuid.uuid4()),
@@ -292,7 +293,6 @@ async def test_pre_admission_rejection_is_not_a_turn_terminal(monkeypatch):
         status="running",
     )
     handler._load_turn_snapshot = AsyncMock(return_value=current_snapshot)
-    handler._safe_send = AsyncMock()
 
     async def reject_quota(_user_id):
         raise QuotaExceeded("quota reached")
@@ -300,7 +300,7 @@ async def test_pre_admission_rejection_is_not_a_turn_terminal(monkeypatch):
     monkeypatch.setattr("app.api.websocket.check_conversation_quota", reject_quota)
 
     assert await handler._check_quotas() is False
-    handler._safe_send.assert_awaited_once_with(
+    send_json.assert_awaited_once_with(
         {
             "type": "error",
             "content": "⚠️ quota reached",
