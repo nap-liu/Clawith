@@ -30,7 +30,11 @@ _DELIVER_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances/deliver"
 _CREATE_AND_DELIVER_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances/createAndDeliver"
 _UPDATE_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances"  # PUT
 
-_SUMMARY_LIMIT = 120
+_SUMMARY_LIMIT = 100
+_AUTO_LAYOUT_CARD_CONFIG = json.dumps(
+    {"config": {"autoLayout": True}},
+    separators=(",", ":"),
+)
 _MARKDOWN_LINK_RE = re.compile(r"!?\[([^]]*)\]\([^)]+\)")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MARKDOWN_MARKER_RE = re.compile(r"(?:^|\s)[#>*+-]+\s*|[`*_~]+")
@@ -170,7 +174,12 @@ async def send_message_card(
         app_secret=app_secret,
         card_template_id=card_template_id,
         out_track_id=out_track_id,
-        card_data={"content": rendered_content},
+        card_data={
+            "content": rendered_content,
+            # DingTalk cardParamMap values must be strings. This built-in field
+            # carries non-string public card data and enables responsive width.
+            "sys_full_json_obj": _AUTO_LAYOUT_CARD_CONFIG,
+        },
         external_conv_id=external_conv_id,
         at_user_ids=at_user_ids,
         summary=summary,
