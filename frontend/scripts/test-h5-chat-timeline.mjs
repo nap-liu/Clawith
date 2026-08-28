@@ -1630,6 +1630,60 @@ const {
 }
 
 {
+    const localDone = {
+        id: 'live-tool', role: 'tool_call', content: '', toolName: 'toolscall',
+        toolCallId: 'batch-1', _toolCallIdExplicit: true, turnAnchorId: 'turn-1',
+        toolStatus: 'done', toolResult: 'created', toolArgs: { table_id: 18 },
+    };
+    const staleHistoryRunning = {
+        ...localDone,
+        id: 'history-tool',
+        toolStatus: 'running',
+        toolResult: '',
+    };
+
+    const merged = mergeHistoryMessages([localDone], [staleHistoryRunning]);
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].id, 'history-tool', 'history keeps the durable row identity');
+    assert.equal(merged[0].toolStatus, 'done', 'stale history cannot regress a live terminal tool');
+    assert.equal(merged[0].toolResult, 'created');
+
+    const reconciled = reconcileLatestHistoryWindow(
+        [{ id: 'turn-1', role: 'user', content: 'run' }, localDone],
+        [{ id: 'turn-1', role: 'user', content: 'run' }, staleHistoryRunning],
+    );
+    assert.equal(reconciled[1].toolStatus, 'done');
+    assert.equal(reconciled[1].toolResult, 'created');
+
+    const lateLiveRunning = upsertToolCallMessage([localDone], {
+        ...staleHistoryRunning,
+        id: 'late-live-tool',
+        streaming: true,
+        _streaming: true,
+    });
+    assert.equal(lateLiveRunning[0].toolStatus, 'done');
+    assert.equal(lateLiveRunning[0].toolResult, 'created');
+    assert.equal(lateLiveRunning[0].streaming, false);
+    assert.equal(lateLiveRunning[0]._streaming, false);
+
+    const rawDone = {
+        ...localDone,
+        id: 'raw-done-tool',
+        content: JSON.stringify({ status: 'done', result: 'raw-created' }),
+        toolStatus: undefined,
+        toolResult: undefined,
+    };
+    const rawLateRunning = upsertToolCallMessage([rawDone], {
+        ...staleHistoryRunning,
+        id: 'raw-late-live-tool',
+        streaming: true,
+    });
+    assert.equal(rawLateRunning[0].toolStatus, 'done');
+    assert.equal(rawLateRunning[0].toolResult, 'raw-created');
+    assert.equal(rawLateRunning[0].streaming, false);
+}
+
+{
     const liveResult = JSON.stringify({
         type: 'platform_file_delivery',
         path: 'workspace/reports/report.pdf',

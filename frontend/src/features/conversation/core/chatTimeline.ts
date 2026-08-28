@@ -788,6 +788,58 @@ function hasExplicitToolCallId(message: ConversationMessage): boolean {
   );
 }
 
+function mergeToolCallProjection(
+  previous: ConversationMessage,
+  incoming: ConversationMessage,
+  identitySource: "previous" | "incoming",
+): ConversationMessage {
+  const previousParsed = parseStoredToolPayload(previous.content);
+  const incomingParsed = parseStoredToolPayload(incoming.content);
+  const previousStatus = normalizeToolStatus(
+    previous.toolStatus || previousParsed.status,
+  );
+  const incomingStatus = normalizeToolStatus(
+    incoming.toolStatus || incomingParsed.status,
+  );
+  const incomingIsStale =
+    previousStatus === "done" && incomingStatus !== "done";
+  const primary = incomingIsStale ? previous : incoming;
+  const secondary = incomingIsStale ? incoming : previous;
+  const identity = identitySource === "incoming" ? incoming : previous;
+  const fallbackIdentity = identity === incoming ? previous : incoming;
+  const primaryParsed = primary === incoming ? incomingParsed : previousParsed;
+  const secondaryParsed = primary === incoming ? previousParsed : incomingParsed;
+  const primaryArgs = primary.toolArgs ?? primaryParsed.args;
+  const secondaryArgs = secondary.toolArgs ?? secondaryParsed.args;
+  const primaryResult = normalizeToolResult(
+    primary.toolResult || primaryParsed.result,
+  );
+  const secondaryResult = normalizeToolResult(
+    secondary.toolResult || secondaryParsed.result,
+  );
+  const selectedStatus = incomingIsStale ? previousStatus : incomingStatus;
+
+  return {
+    ...secondary,
+    ...primary,
+    id: identity.id || fallbackIdentity.id,
+    created_at: identity.created_at || fallbackIdentity.created_at,
+    timestamp: identity.timestamp || fallbackIdentity.timestamp,
+    toolArgs:
+      Object.keys(parseToolArgs(primaryArgs)).length > 0
+        ? primaryArgs
+        : secondaryArgs,
+    toolStatus: selectedStatus,
+    toolResult: primaryResult || secondaryResult || "",
+    streaming:
+      selectedStatus === "running" &&
+      Boolean(primary.streaming || secondary.streaming),
+    _streaming:
+      selectedStatus === "running" &&
+      Boolean(primary._streaming || secondary._streaming),
+  };
+}
+
 export function isSameMessage(a: ConversationMessage, b: ConversationMessage) {
   if (a.role === "tool_call" || b.role === "tool_call") {
     if (a.role !== b.role) return false;
@@ -814,6 +866,7 @@ export function mergeHistoryMessages(
   history: ConversationMessage[],
 ) {
   if (history.length === 0) return prev;
+  const projectedHistory = [...history];
 
   const mergeKeys = (message: ConversationMessage) => {
     if (message.role === "tool_call") {
@@ -880,6 +933,16 @@ export function mergeHistoryMessages(
       }
     }
     if (matchedHistoryIndex >= 0) {
+      if (
+        local.role === "tool_call" &&
+        projectedHistory[matchedHistoryIndex]?.role === "tool_call"
+      ) {
+        projectedHistory[matchedHistoryIndex] = mergeToolCallProjection(
+          local,
+          projectedHistory[matchedHistoryIndex],
+          "incoming",
+        );
+      }
       usedHistoryIndexes.add(matchedHistoryIndex);
       matchedHistoryByLocalIndex.set(localIndex, matchedHistoryIndex);
       previousHistoryIndex = matchedHistoryIndex;
@@ -898,7 +961,7 @@ export function mergeHistoryMessages(
     localOnly.push({ message: local, localIndex, previousHistoryIndex });
   }
 
-  if (localOnly.length === 0) return history;
+  if (localOnly.length === 0) return projectedHistory;
 
   const messageTime = (message: ConversationMessage) => {
     const value = message.created_at || message.timestamp;
@@ -918,7 +981,7 @@ export function mergeHistoryMessages(
 
     const lowerBound = Math.max(0, local.previousHistoryIndex + 1);
     const upperBound =
-      nextHistoryIndex >= 0 ? nextHistoryIndex : history.length;
+      nextHistoryIndex >= 0 ? nextHistoryIndex : projectedHistory.length;
     const localTime = messageTime(local.message);
     // A transient without a server timestamp was already visible before
     // this history request began. Durable rows that appear only in the new
@@ -931,7 +994,7 @@ export function mergeHistoryMessages(
         : upperBound;
     if (localTime != null) {
       for (let index = lowerBound; index < upperBound; index += 1) {
-        const historyTime = messageTime(history[index]);
+        const historyTime = messageTime(projectedHistory[index]);
         if (historyTime != null && historyTime > localTime) {
           insertionIndex = index;
           break;
@@ -944,10 +1007,10 @@ export function mergeHistoryMessages(
   }
 
   const merged: ConversationMessage[] = [];
-  for (let index = 0; index <= history.length; index += 1) {
+  for (let index = 0; index <= projectedHistory.length; index += 1) {
     const localBucket = buckets.get(index);
     if (localBucket) merged.push(...localBucket);
-    if (index < history.length) merged.push(history[index]);
+    if (index < projectedHistory.length) merged.push(projectedHistory[index]);
   }
   return merged;
 }
@@ -1069,20 +1132,14 @@ export function upsertToolCallMessage(
 
   const idx = messages.length - 1 - runningIdx;
   const previous = messages[idx];
-  if (previous.toolStatus === "done" && toolMsg.toolStatus !== "done") {
-    return messages;
-  }
   const nextToolArgs =
     Object.keys(parseToolArgs(toolMsg.toolArgs)).length > 0
       ? toolMsg.toolArgs
       : previous.toolArgs;
-  const merged = {
-    ...previous,
+  const merged = mergeToolCallProjection(previous, {
     ...toolMsg,
     toolArgs: nextToolArgs,
-    id: previous.id || toolMsg.id,
-    created_at: previous.created_at || toolMsg.created_at,
-  };
+  }, "previous");
   return [...messages.slice(0, idx), merged, ...messages.slice(idx + 1)];
 }
 
@@ -1345,25 +1402,14 @@ export function normalizeChatTimelineMessages<T extends Record<string, any>>(
 
     const index = toolIndexByCallId.get(identity)!;
     const previous = normalized[index];
-    const previousParsed = parseStoredToolPayload(previous.content);
-    const previousStatus = normalizeToolStatus(
-      previous.toolStatus || previousParsed.status,
-    );
-    const incomingStatus = normalizeToolStatus(
-      message.toolStatus || parsed.status,
-    );
-    if (previousStatus === "done" && incomingStatus !== "done") continue;
-
-    normalized[index] = {
-      ...previous,
-      ...message,
-      id: previous.id || message.id,
-      created_at: previous.created_at || message.created_at,
-      toolArgs:
-        Object.keys(parseToolArgs(message.toolArgs ?? parsed.args)).length > 0
-          ? (message.toolArgs ?? parsed.args)
-          : (previous.toolArgs ?? previousParsed.args),
-    };
+    normalized[index] = mergeToolCallProjection(
+      previous as unknown as ConversationMessage,
+      {
+        ...message,
+        toolArgs: message.toolArgs ?? parsed.args,
+      } as unknown as ConversationMessage,
+      "previous",
+    ) as unknown as T;
   }
 
   return normalized;
