@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { IconX } from '@tabler/icons-react';
+import { IconTool, IconX } from '@tabler/icons-react';
 import { Modal } from '../Dialog/DialogProvider';
 import Button from '../ui/Button';
 import type { CliTool } from './types';
@@ -79,7 +79,9 @@ export function CliToolWizard({
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
           <div>
-            <h3 id="cli-tool-wizard-title" style={{ margin: 0 }}>🛠️ {title}</h3>
+            <h3 id="cli-tool-wizard-title" style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <IconTool size={20} /> {title}
+            </h3>
             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
               {t('enterprise.cliTools.wizard.subtitle', 'Upload a binary, configure env, run a test')}
             </div>

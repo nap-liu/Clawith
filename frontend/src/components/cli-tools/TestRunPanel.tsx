@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { IconFlask, IconPlayerPlay } from '@tabler/icons-react';
 import { cliToolsApi } from './api';
 import type { CliTool, TestRunResponse } from './types';
 
@@ -9,7 +10,7 @@ const labelStyle: React.CSSProperties = {
 
 export function TestRunPanel({ tool }: { tool: CliTool }) {
   const { t } = useTranslation();
-  const [command, setCommand] = useState('');
+  const [command, setCommand] = useState(`${tool.name} --version`);
   const [result, setResult] = useState<TestRunResponse | null>(null);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -33,13 +34,16 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
   return (
     <div className="card" style={{ padding: '12px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <strong style={{ fontSize: '13px' }}>🧪 {k('title', 'Test Run')}</strong>
+        <strong style={{ fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+          <IconFlask size={16} /> {k('title', 'Test Run')}
+        </strong>
         <button
           className="btn btn-primary"
           style={{ padding: '4px 12px', fontSize: '12px' }}
           disabled={running || !tool.config.binary.sha256 || !command.trim()}
           onClick={run}
         >
+          {!running && <IconPlayerPlay size={14} style={{ marginRight: '4px', verticalAlign: '-2px' }} />}
           {running ? k('running', 'Running…') : k('run', 'Run')}
         </button>
       </div>
@@ -50,7 +54,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
           className="form-input"
           value={command}
           onChange={(e) => setCommand(e.target.value)}
-          placeholder={t('enterprise.cliTools.testRun.commandPlaceholder', { defaultValue: '{{name}} --version', name: tool.name })}
+          placeholder={k('commandPlaceholder', 'Enter a complete test command')}
           style={{ fontFamily: 'monospace' }}
         />
       </div>

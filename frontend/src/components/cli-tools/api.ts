@@ -26,9 +26,48 @@ export interface CliToolUpdateBody {
   is_active?: boolean;
 }
 
+export interface BinaryUploadProgress {
+  loaded: number;
+  total: number;
+  percent: number;
+  bytesPerSecond: number;
+  etaSeconds: number | null;
+  phase: 'uploading' | 'finalizing';
+  resumed: boolean;
+}
+
+export interface BinaryUploadTask {
+  promise: Promise<CliTool>;
+  pause: () => void;
+}
+
+interface UploadStatus {
+  upload_id: string;
+  received: number;
+  total: number;
+  original_name: string;
+}
+
+const BINARY_CHUNK_BYTES = 8 * 1024 * 1024;
+
 function authHeader(): HeadersInit {
   const token = localStorage.getItem('token') || '';
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function uploadStorageKey(toolId: string, file: File): string {
+  return `cli-binary-upload:${toolId}:${file.name}:${file.size}:${file.lastModified}`;
+}
+
+async function readUploadStatus(toolId: string, uploadId: string): Promise<UploadStatus | null> {
+  const res = await fetch(`/api/tools/cli/${toolId}/binary/uploads/${uploadId}`, {
+    headers: authHeader(),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`upload status failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json() as Promise<UploadStatus>;
 }
 
 async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
@@ -94,5 +133,106 @@ export const cliToolsApi = {
       throw new Error(`upload failed: ${res.status} ${text}`);
     }
     return res.json();
+  },
+
+  uploadBinaryResumable: (
+    toolId: string,
+    file: File,
+    onProgress: (progress: BinaryUploadProgress) => void,
+  ): BinaryUploadTask => {
+    let activeRequest: XMLHttpRequest | null = null;
+    let paused = false;
+
+    const pause = () => {
+      paused = true;
+      activeRequest?.abort();
+    };
+
+    const promise = (async (): Promise<CliTool> => {
+      const storageKey = uploadStorageKey(toolId, file);
+      let uploadId = localStorage.getItem(storageKey) || crypto.randomUUID();
+      let status = await readUploadStatus(toolId, uploadId);
+      if (status && (status.total !== file.size || status.original_name !== file.name)) {
+        status = null;
+        uploadId = crypto.randomUUID();
+      }
+      if (!status) localStorage.setItem(storageKey, uploadId);
+
+      let offset = status?.received ?? 0;
+      if (offset > file.size) {
+        uploadId = crypto.randomUUID();
+        localStorage.setItem(storageKey, uploadId);
+        offset = 0;
+      }
+      const resumed = offset > 0;
+      const measuredFrom = offset;
+      const startedAt = performance.now();
+
+      const report = (loaded: number, phase: BinaryUploadProgress['phase']) => {
+        const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
+        const bytesPerSecond = Math.max(0, loaded - measuredFrom) / elapsedSeconds;
+        onProgress({
+          loaded,
+          total: file.size,
+          percent: file.size === 0 ? 0 : Math.min(100, (loaded / file.size) * 100),
+          bytesPerSecond,
+          etaSeconds: bytesPerSecond > 0 ? Math.max(0, file.size - loaded) / bytesPerSecond : null,
+          phase,
+          resumed,
+        });
+      };
+
+      report(offset, 'uploading');
+      while (offset < file.size) {
+        if (paused) throw new DOMException('Upload paused', 'AbortError');
+        const chunkStart = offset;
+        const chunk = file.slice(chunkStart, Math.min(chunkStart + BINARY_CHUNK_BYTES, file.size));
+        const params = new URLSearchParams({
+          offset: String(chunkStart),
+          total: String(file.size),
+          original_name: file.name,
+        });
+
+        const next = await new Promise<UploadStatus>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          activeRequest = xhr;
+          xhr.open('PUT', `/api/tools/cli/${toolId}/binary/uploads/${uploadId}?${params}`);
+          const token = localStorage.getItem('token');
+          if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+          xhr.upload.onprogress = (event) => report(chunkStart + event.loaded, 'uploading');
+          xhr.onload = () => {
+            activeRequest = null;
+            if (xhr.status >= 200 && xhr.status < 300) {
+              resolve(JSON.parse(xhr.responseText) as UploadStatus);
+            } else {
+              reject(new Error(`upload failed: ${xhr.status} ${xhr.responseText}`));
+            }
+          };
+          xhr.onerror = () => {
+            activeRequest = null;
+            reject(new Error('upload failed: network error'));
+          };
+          xhr.onabort = () => {
+            activeRequest = null;
+            reject(new DOMException('Upload paused', 'AbortError'));
+          };
+          xhr.send(chunk);
+        });
+        offset = next.received;
+        report(offset, 'uploading');
+      }
+
+      if (paused) throw new DOMException('Upload paused', 'AbortError');
+      report(file.size, 'finalizing');
+      const updated = await request<CliTool>(
+        `/api/tools/cli/${toolId}/binary/uploads/${uploadId}/complete`,
+        { method: 'POST' },
+      );
+      localStorage.removeItem(storageKey);
+      return updated;
+    })();
+
+    return { promise, pause };
   },
 };

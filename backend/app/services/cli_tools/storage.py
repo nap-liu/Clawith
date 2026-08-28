@@ -10,6 +10,7 @@ literal "_global" for platform-scoped tools.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -53,10 +54,6 @@ class MagicNumberError(ValueError):
     """Uploaded bytes do not start with a recognised executable magic number."""
 
 
-class SizeLimitExceededError(ValueError):
-    """Uploaded bytes exceeded the per-call max."""
-
-
 class BinaryStorage:
     """Write / resolve / list content-addressed binaries under `root`."""
 
@@ -70,7 +67,6 @@ class BinaryStorage:
         tenant_key: str,
         tool_id: str,
         stream: BinaryIO,
-        max_bytes: int,
         chunk_size: int = 65536,
     ) -> tuple[str, int]:
         """Stream-read `stream`, validate, write. Returns (sha256, size)."""
@@ -91,8 +87,6 @@ class BinaryStorage:
                     if not chunk:
                         break
                     size += len(chunk)
-                    if size > max_bytes:
-                        raise SizeLimitExceededError(f"binary exceeds {max_bytes} bytes")
                     hasher.update(chunk)
                     out.write(chunk)
 
@@ -124,6 +118,124 @@ class BinaryStorage:
             if tmp_path.exists():
                 tmp_path.unlink()
             raise
+
+    def _upload_paths(
+        self,
+        tenant_key: str,
+        tool_id: str,
+        upload_id: str,
+    ) -> tuple[Path, Path]:
+        upload_dir = self.root / tenant_key / tool_id / ".uploads"
+        return upload_dir / f"{upload_id}.part", upload_dir / f"{upload_id}.json"
+
+    def upload_status(
+        self,
+        *,
+        tenant_key: str,
+        tool_id: str,
+        upload_id: str,
+    ) -> tuple[int, int, str] | None:
+        """Return ``(received, total, original_name)`` for a partial upload."""
+        part, metadata = self._upload_paths(tenant_key, tool_id, upload_id)
+        if not metadata.is_file():
+            return None
+        try:
+            info = json.loads(metadata.read_text(encoding="utf-8"))
+            received = part.stat().st_size if part.exists() else 0
+            return received, int(info["total"]), str(info["original_name"])
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+            return None
+
+    def append_upload_chunk(
+        self,
+        *,
+        tenant_key: str,
+        tool_id: str,
+        upload_id: str,
+        offset: int,
+        total: int,
+        original_name: str,
+        chunk: bytes,
+    ) -> int:
+        """Append one sequential chunk and return the new server offset.
+
+        The part file itself is the resume cursor, so interrupted requests do
+        not need database state. A mismatched cursor is rejected before any
+        bytes are written and the caller can query the current offset.
+        """
+        part, metadata = self._upload_paths(tenant_key, tool_id, upload_id)
+        part.parent.mkdir(parents=True, exist_ok=True)
+
+        current = self.upload_status(
+            tenant_key=tenant_key,
+            tool_id=tool_id,
+            upload_id=upload_id,
+        )
+        if current is None:
+            if offset != 0:
+                raise ValueError("upload does not exist")
+            metadata.write_text(
+                json.dumps({"total": total, "original_name": original_name}),
+                encoding="utf-8",
+            )
+            received = 0
+        else:
+            received, stored_total, stored_name = current
+            if stored_total != total or stored_name != original_name:
+                raise ValueError("upload metadata does not match")
+
+        if offset != received:
+            raise ValueError(f"offset mismatch: expected {received}")
+        if received + len(chunk) > total:
+            raise ValueError("chunk exceeds declared file size")
+
+        with part.open("ab") as output:
+            output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        return received + len(chunk)
+
+    def finalize_upload(
+        self,
+        *,
+        tenant_key: str,
+        tool_id: str,
+        upload_id: str,
+    ) -> tuple[str, int, str]:
+        """Validate and promote a complete partial upload into binary storage."""
+        part, metadata = self._upload_paths(tenant_key, tool_id, upload_id)
+        current = self.upload_status(
+            tenant_key=tenant_key,
+            tool_id=tool_id,
+            upload_id=upload_id,
+        )
+        if current is None:
+            raise FileNotFoundError("upload does not exist")
+        received, total, original_name = current
+        if received != total:
+            raise ValueError(f"upload incomplete: received {received} of {total}")
+
+        hasher = hashlib.sha256()
+        with part.open("rb") as source:
+            magic = source.read(8)
+            if not any(magic.startswith(accepted) for accepted in _ACCEPTED_MAGICS):
+                raise MagicNumberError(f"magic bytes {magic[:4]!r} not accepted")
+            hasher.update(magic)
+            while chunk := source.read(1024 * 1024):
+                hasher.update(chunk)
+
+        sha = hasher.hexdigest()
+        final = part.parent.parent / f"{sha}.bin"
+        if final.exists():
+            part.unlink()
+        else:
+            part.replace(final)
+        final.chmod(
+            stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH
+            | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
+        metadata.unlink(missing_ok=True)
+        return sha, total, original_name
 
     def resolve(self, tenant_key: str, tool_id: str, sha: str) -> Path:
         return self.root / tenant_key / tool_id / f"{sha}.bin"

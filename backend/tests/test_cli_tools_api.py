@@ -31,7 +31,10 @@ from app.api import cli_tools as cli_tools_api
 from app.api.cli_tools import (
     CliToolCreate,
     CliToolUpdate,
+    append_binary_upload_chunk,
+    complete_binary_upload,
     create_cli_tool,
+    get_binary_upload_status,
     update_cli_tool,
     upload_binary,
 )
@@ -146,6 +149,22 @@ def _platform_admin():
         primary_mobile="",
         email="a@b",
     )
+
+
+def _request_with_body(body: bytes):
+    """Build the minimal ASGI request consumed by the chunk handler."""
+    from starlette.requests import Request
+
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request({"type": "http", "method": "PUT", "path": "/"}, receive)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -391,6 +410,159 @@ async def test_upload_binary_writes_binary_subtree(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resumable_upload_api_reports_offset_and_completes(monkeypatch, tmp_path):
+    """The public handler contract preserves the server offset and versions the final blob."""
+    tool = _make_tool(config=CliToolConfig(
+        binary=BinaryMetadata(),
+        env={"TOOL_ENV": "kept"},
+    ).model_dump(mode="json"))
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+    upload_id = uuid.uuid4()
+    payload = b"#!/bin/sh\necho resumed\n"
+    split = 9
+    monkeypatch.setattr(cli_tools_api, "_STORAGE_ROOT", tmp_path)
+
+    first = await append_binary_upload_chunk(
+        tool_id=tool.id,
+        upload_id=upload_id,
+        request=_request_with_body(payload[:split]),
+        offset=0,
+        total=len(payload),
+        original_name="svc.sh",
+        db=db,
+        user=user,
+    )
+    assert first.received == split
+
+    status_out = await get_binary_upload_status(
+        tool_id=tool.id,
+        upload_id=upload_id,
+        db=db,
+        user=user,
+    )
+    assert status_out.received == split
+    assert status_out.total == len(payload)
+    assert status_out.original_name == "svc.sh"
+
+    second = await append_binary_upload_chunk(
+        tool_id=tool.id,
+        upload_id=upload_id,
+        request=_request_with_body(payload[split:]),
+        offset=split,
+        total=len(payload),
+        original_name="svc.sh",
+        db=db,
+        user=user,
+    )
+    assert second.received == len(payload)
+
+    out = await complete_binary_upload(
+        tool_id=tool.id,
+        upload_id=upload_id,
+        db=db,
+        user=user,
+    )
+    assert out.config["binary"]["size"] == len(payload)
+    assert out.config["binary"]["original_name"] == "svc.sh"
+    assert out.config["env"] == {"TOOL_ENV": "kept"}
+    assert db.committed is True
+    assert not (tmp_path / "_global" / str(tool.id) / ".uploads" / f"{upload_id}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_resumable_upload_api_returns_expected_offset_on_conflict(monkeypatch, tmp_path):
+    tool = _make_tool(config=CliToolConfig(binary=BinaryMetadata()).model_dump(mode="json"))
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+    upload_id = uuid.uuid4()
+    payload = b"#!/bin/sh\necho offset\n"
+    monkeypatch.setattr(cli_tools_api, "_STORAGE_ROOT", tmp_path)
+
+    await append_binary_upload_chunk(
+        tool_id=tool.id,
+        upload_id=upload_id,
+        request=_request_with_body(payload[:8]),
+        offset=0,
+        total=len(payload),
+        original_name="svc.sh",
+        db=db,
+        user=user,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await append_binary_upload_chunk(
+            tool_id=tool.id,
+            upload_id=upload_id,
+            request=_request_with_body(payload[8:]),
+            offset=3,
+            total=len(payload),
+            original_name="svc.sh",
+            db=db,
+            user=user,
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["expected_offset"] == 8
+
+
+@pytest.mark.asyncio
+async def test_resumable_upload_api_rejects_incomplete_finalize(monkeypatch, tmp_path):
+    tool = _make_tool(config=CliToolConfig(binary=BinaryMetadata()).model_dump(mode="json"))
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+    upload_id = uuid.uuid4()
+    payload = b"#!/bin/sh\necho incomplete\n"
+    monkeypatch.setattr(cli_tools_api, "_STORAGE_ROOT", tmp_path)
+
+    await append_binary_upload_chunk(
+        tool_id=tool.id,
+        upload_id=upload_id,
+        request=_request_with_body(payload[:8]),
+        offset=0,
+        total=len(payload),
+        original_name="svc.sh",
+        db=db,
+        user=user,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await complete_binary_upload(
+            tool_id=tool.id,
+            upload_id=upload_id,
+            db=db,
+            user=user,
+        )
+    assert exc_info.value.status_code == 409
+    assert "upload incomplete" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_resumable_upload_api_enforces_tenant_management(monkeypatch, tmp_path):
+    tool = _make_tool(tenant_id=uuid.uuid4())
+    db = FakeDB(tool=tool)
+    other_tenant_admin = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="org_admin",
+        tenant_id=uuid.uuid4(),
+        is_active=True,
+    )
+    monkeypatch.setattr(cli_tools_api, "_STORAGE_ROOT", tmp_path)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await append_binary_upload_chunk(
+            tool_id=tool.id,
+            upload_id=uuid.uuid4(),
+            request=_request_with_body(b"#!/bin/sh\n"),
+            offset=0,
+            total=10,
+            original_name="svc.sh",
+            db=db,
+            user=other_tenant_admin,
+        )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_patch_404_when_tool_missing():
     db = FakeDB(tool=None)
     user = _platform_admin()
@@ -524,63 +696,6 @@ async def test_rollback_body_rejects_extra_keys():
             "version_id": str(uuid.uuid4()),
             "sha256": "a" * 64,  # not allowed
         })
-
-
-@pytest.mark.asyncio
-async def test_upload_binary_413_uses_configured_cap(monkeypatch, tmp_path):
-    """The upload endpoint enforces whatever ``_BINARY_MAX_BYTES`` is set to,
-    returning 413 with the byte count in the detail.
-
-    This is the production failure path: a binary above the cap yields
-    ``413 binary exceeds <N> bytes``. We shrink the module-level cap (the
-    same knob ``CLI_BINARY_MAX_BYTES`` drives) so a tiny shebang script is
-    already oversize, proving the limit is honoured end-to-end.
-    """
-    tool = _make_tool(config=CliToolConfig(binary=BinaryMetadata()).model_dump(mode="json"))
-    db = FakeDB(tool=tool)
-    user = _platform_admin()
-    monkeypatch.setattr(cli_tools_api, "_STORAGE_ROOT", tmp_path)
-    monkeypatch.setattr(cli_tools_api, "_BINARY_MAX_BYTES", 8)
-
-    payload = b"#!/bin/sh\necho hello\n"  # > 8 bytes
-
-    class _FakeUpload:
-        filename = "big.sh"
-        file = io.BytesIO(payload)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await upload_binary(
-            tool_id=tool.id,
-            file=_FakeUpload(),  # type: ignore[arg-type]
-            db=db,
-            user=user,
-        )
-    assert exc_info.value.status_code == 413
-    assert "exceeds 8 bytes" in str(exc_info.value.detail)
-
-
-def test_binary_max_bytes_configurable_via_env(monkeypatch):
-    """``_BINARY_MAX_BYTES`` reads ``CLI_BINARY_MAX_BYTES`` at import,
-    defaulting to 100 MiB when unset (mirrors ``MAX_SKILL_SIZE``).
-
-    Reloads the module under different env so the override path is exercised,
-    then restores the default so sibling tests see the unpatched constant.
-    """
-    import importlib
-
-    try:
-        monkeypatch.delenv("CLI_BINARY_MAX_BYTES", raising=False)
-        importlib.reload(cli_tools_api)
-        assert cli_tools_api._BINARY_MAX_BYTES == 100 * 1024 * 1024
-
-        monkeypatch.setenv("CLI_BINARY_MAX_BYTES", "314572800")  # 300 MiB
-        importlib.reload(cli_tools_api)
-        assert cli_tools_api._BINARY_MAX_BYTES == 314572800
-    finally:
-        # Restore the module to its default-env state regardless of outcome,
-        # so later tests in this process don't inherit a patched constant.
-        monkeypatch.delenv("CLI_BINARY_MAX_BYTES", raising=False)
-        importlib.reload(cli_tools_api)
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -304,7 +304,6 @@ async def test_max_retained_hard_deletes_oldest_binary_on_disk(session, tmp_path
             tenant_key=tenant_key,
             tool_id=str(tool.id),
             stream=io.BytesIO(payload),
-            max_bytes=1_000_000,
         )
         shas.append(sha)
 
