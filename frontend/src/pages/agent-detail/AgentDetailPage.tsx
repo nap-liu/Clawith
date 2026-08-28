@@ -3532,7 +3532,10 @@ export default function AgentDetailPage() {
                         collapseSidebarsForLivePanel();
                     }
                 }
-            } else {
+            } else if (
+                ['user', 'assistant', 'system'].includes(String(d.role || ''))
+                && typeof d.content === 'string'
+            ) {
                 setChatMessages(prev => [...prev, parseChatMsg({ role: d.role, content: d.content })]);
             }
         };

@@ -1583,7 +1583,7 @@ function messageAnchor(msg: ConversationMessage) {
     msg.role,
     msg.id,
     msg.streaming ? "streaming" : "done",
-    msg.content.length,
+    (msg.content || "").length,
     (msg.thinking || "").length,
     msg.toolStatus || "",
     msg.toolResult?.length || 0,
