@@ -811,6 +811,10 @@ async def test_standard_subagent_claim_does_not_enter_project_query_path(monkeyp
 
 
 async def test_round_boundary_drains_append_and_stop_wins():
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
+
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
         agent_id=agent_id,
@@ -870,8 +874,16 @@ async def test_round_boundary_drains_append_and_stop_wins():
                 )
             )
         ).scalar_one_or_none()
+        current_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
     assert fresh.status == "cancelled"
     assert stale_final is None
+    assert current_turn.anchor_id == anchor.id
+    assert current_turn.status == "cancelled"
+    assert current_turn.revision >= 2
 
 
 async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
@@ -881,6 +893,9 @@ async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
         ensure_active_turn,
         list_active_turns,
         reset_active_turns_for_testing,
+    )
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
     )
 
     await reset_active_turns_for_testing()
@@ -931,14 +946,26 @@ async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
             .scalars()
             .all()
         )
+        current_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
     assert fresh.status == runtime.RUN_CANCELLED
     assert all(row.message_meta["subagent_input_state"] == runtime.INPUT_CANCELLED for row in input_rows)
+    assert current_turn.anchor_id == input_rows[0].id
+    assert current_turn.status == "cancelled"
+    assert current_turn.revision >= 2
     await reset_active_turns_for_testing()
 
 
 async def test_fresh_turn_uses_exact_prefix_when_later_input_is_already_queued(
     monkeypatch,
 ):
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
+
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
         agent_id=agent_id,
@@ -995,11 +1022,19 @@ async def test_fresh_turn_uses_exact_prefix_when_later_input_is_already_queued(
             .scalars()
             .all()
         )
+        current_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
     assert fresh.status == runtime.RUN_COMPLETED
     assert [row.message_meta["subagent_input_state"] for row in inputs] == [
         runtime.INPUT_DONE,
         runtime.INPUT_DONE,
     ]
+    assert current_turn.anchor_id == inputs[0].id
+    assert current_turn.status == "completed"
+    assert current_turn.revision >= 2
 
 
 async def test_provider_round_releases_preflight_database_transaction(
@@ -1126,6 +1161,10 @@ async def test_project_capacity_wait_does_not_retain_database_session(
 
 
 async def test_project_capacity_timeout_requeues_claimed_turn(monkeypatch):
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
+
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
         agent_id=agent_id,
@@ -1162,15 +1201,33 @@ async def test_project_capacity_timeout_requeues_claimed_turn(monkeypatch):
                 ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_INPUT,
             )
         )
+        current_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
+        exact_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+            turn_anchor_id=input_row.id,
+        )
     assert fresh.status == runtime.RUN_QUEUED
     assert fresh.lease_owner is None
     assert input_row.message_meta["subagent_input_state"] == runtime.INPUT_PENDING
+    assert current_turn == exact_turn
+    assert current_turn.anchor_id == input_row.id
+    assert current_turn.status == "running"
     snapshot = await capacity.snapshot()
     assert snapshot.categories[WorkloadKind.PROJECT.value].rejected_total == 1
     assert snapshot.tenants[str(tenant_id)].rejected_total == 1
 
 
 async def test_failed_turn_continues_when_parent_input_is_pending():
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
+
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
         agent_id=agent_id,
@@ -1210,9 +1267,17 @@ async def test_failed_turn_continues_when_parent_input_is_pending():
     async with async_session() as db:
         fresh = await db.get(SubagentRun, run.id)
         first = await db.get(ChatMessage, first_anchor.id)
+        current_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
     assert fresh.status == "running"
     assert first.message_meta["subagent_input_state"] == "done"
     assert first.message_meta["turn_status"] == "failed"
+    assert current_turn.anchor_id == next_anchor.id
+    assert current_turn.status == "running"
+    assert current_turn.generation > int(first.message_meta["turn_generation"])
 
 
 async def test_subagent_finish_waits_for_reserved_stop_before_mutating_anchor():
@@ -2601,6 +2666,9 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
 
 async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypatch):
     from app.services import confirmation_service
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
 
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
@@ -2668,6 +2736,19 @@ async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypat
         ).scalar_one()
         assert parked.status == runtime.RUN_WAITING
         assert processing.message_meta["subagent_input_state"] == runtime.INPUT_PROCESSING
+        parked_current = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
+        parked_exact = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+            turn_anchor_id=processing.id,
+        )
+        assert parked_current == parked_exact
+        assert parked_current.status == "suspended"
 
     resolved = await confirmation_service.resolve_confirmation(
         agent_id=agent_id,
@@ -2691,10 +2772,23 @@ async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypat
                 .limit(1)
             )
         ).scalar_one()
+        completed_current = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+        )
+        completed_exact = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(run.id),
+            turn_anchor_id=processing.id,
+        )
     assert completed.status == runtime.RUN_COMPLETED
     assert json.loads(confirmation.content)["status"] == "done"
     assert final.content == "confirmed child result"
     assert final.thinking == "resumed hidden reasoning"
+    assert completed_current == completed_exact
+    assert completed_current.status == "completed"
 
 
 async def test_revoked_execution_user_fails_before_llm_or_tool_side_effect(monkeypatch):
@@ -3090,30 +3184,62 @@ async def test_a2a_parent_wake_distinguishes_execution_and_storage_agent(monkeyp
 
 
 async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypatch):
-    agent_id, user_id, parent_id, _anchor_id = await _make_context()
+    from app.services.conversation_turn_lifecycle import (
+        get_conversation_turn_snapshot,
+    )
+
+    first_agent_id, user_id, _parent_id, _anchor_id = await _make_context()
+    second_agent_id = uuid.uuid4()
+    storage_agent_id, execution_agent_id = sorted(
+        [first_agent_id, second_agent_id],
+        key=str,
+    )
+    async with async_session() as db:
+        first_agent = await db.get(Agent, first_agent_id)
+        db.add(
+            Agent(
+                id=second_agent_id,
+                name="Revoked wake peer",
+                creator_id=user_id,
+                tenant_id=first_agent.tenant_id,
+                primary_model_id=first_agent.primary_model_id,
+                status="idle",
+            )
+        )
+        parent = ChatSession(
+            agent_id=storage_agent_id,
+            peer_agent_id=execution_agent_id,
+            user_id=None,
+            title="Revoked A2A parent",
+            source_channel="agent",
+            is_primary=False,
+            is_group=False,
+        )
+        db.add(parent)
+        await db.flush()
+        db.add(
+            ChatMessage(
+                agent_id=storage_agent_id,
+                user_id=user_id,
+                sender_agent_id=execution_agent_id,
+                role="assistant",
+                content="parent turn completed",
+                conversation_id=str(parent.id),
+                message_meta={"attachments": []},
+            )
+        )
+        await db.commit()
+        parent_id = parent.id
     run, _ = await runtime.create_subagent(
-        agent_id=agent_id,
+        agent_id=execution_agent_id,
         execution_user_id=user_id,
         parent_session_id=str(parent_id),
         origin_tool_call_id="call-revoked-parent-wake",
         task="revoked wake",
         mode="async",
     )
-    async with async_session() as db:
-        db.add(
-            ChatMessage(
-                agent_id=agent_id,
-                user_id=user_id,
-                sender_agent_id=agent_id,
-                role="assistant",
-                content="parent turn completed",
-                conversation_id=str(parent_id),
-                message_meta={"attachments": []},
-            )
-        )
-        await db.commit()
     await runtime.send_subagent_message_to_parent(
-        agent_id=agent_id,
+        agent_id=execution_agent_id,
         execution_user_id=user_id,
         origin_tool_call_id="revoked-parent-message",
         subagent_session_id=str(run.id),
@@ -3135,7 +3261,13 @@ async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypat
     async def fail_resume(_anchor):
         raise AssertionError("revoked execution identity must not resume parent LLM")
 
+    broadcasts: list[tuple[str, str, dict]] = []
+
+    async def capture_broadcast(owner_agent_id, conversation_id, payload):
+        broadcasts.append((str(owner_agent_id), str(conversation_id), payload))
+
     monkeypatch.setattr("app.services.turn_recovery.resume_turn", fail_resume)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", capture_broadcast)
     assert await runtime._dispatch_parent_event(event.id)
 
     async with async_session() as db:
@@ -3151,5 +3283,18 @@ async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypat
             )
             .limit(1)
         )
+        current_turn = await get_conversation_turn_snapshot(
+            db,
+            agent_id=storage_agent_id,
+            conversation_id=str(parent_id),
+        )
     assert anchor.message_meta["turn_status"] == "failed"
     assert "执行身份已失效" in final.content
+    assert final.agent_id == storage_agent_id
+    assert final.sender_agent_id == execution_agent_id
+    assert current_turn.anchor_id == anchor.id
+    assert current_turn.status == "failed"
+    assert current_turn.revision >= 1
+    assert broadcasts
+    assert {row[0] for row in broadcasts} == {str(storage_agent_id)}
+    assert {row[1] for row in broadcasts} == {str(parent_id)}

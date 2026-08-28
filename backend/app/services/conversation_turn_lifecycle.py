@@ -313,6 +313,43 @@ async def get_conversation_turn_snapshot(
     return _snapshot(anchor) if anchor is not None else IDLE_TURN_SNAPSHOT
 
 
+async def cancel_current_conversation_turn(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> ConversationTurnSnapshot:
+    """Cancel the one current active/suspended owner in the caller transaction."""
+
+    try:
+        session_id = uuid.UUID(conversation_id)
+    except (TypeError, ValueError):
+        return IDLE_TURN_SNAPSHOT
+    session = (
+        await db.execute(
+            select(ChatSession)
+            .where(
+                ChatSession.id == session_id,
+                ChatSession.agent_id == agent_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        return IDLE_TURN_SNAPSHOT
+    snapshot = _session_snapshot(session) or IDLE_TURN_SNAPSHOT
+    if snapshot.phase not in {"active", "suspended"} or snapshot.anchor_id is None:
+        return snapshot
+    return await transition_conversation_turn(
+        db,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        turn_anchor_id=snapshot.anchor_id,
+        status="cancelled",
+    )
+
+
 def with_turn_envelope(
     payload: dict[str, Any],
     snapshot: ConversationTurnSnapshot | None,

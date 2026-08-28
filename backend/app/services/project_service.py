@@ -564,7 +564,18 @@ async def deactivate_project_member(
 
     if child_ids:
         sessions = (await db.execute(select(ChatSession).where(ChatSession.id.in_(child_ids)))).scalars().all()
+        from app.services.conversation_turn_lifecycle import (
+            cancel_current_conversation_turn,
+        )
+
+        live_child_ids = set(cancelled_child_ids)
         for session in sessions:
+            if session.id in live_child_ids:
+                await cancel_current_conversation_turn(
+                    db,
+                    agent_id=session.agent_id,
+                    conversation_id=str(session.id),
+                )
             session.im_config = {
                 **dict(session.im_config or {}),
                 "membership_revoked": True,
@@ -587,7 +598,6 @@ async def deactivate_project_member(
         for row in inputs:
             metadata = dict(row.message_meta or {})
             metadata["subagent_input_state"] = "cancelled"
-            metadata["turn_status"] = "cancelled"
             metadata["cancel_reason"] = "project_member_departed"
             row.message_meta = metadata
 
