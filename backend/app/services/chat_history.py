@@ -50,13 +50,20 @@ if TYPE_CHECKING:
     from app.services.confirmation_service import PendingConfirmation
 
 HIDDEN_ONBOARDING_ANCHOR_KIND = "onboarding_turn_anchor"
+HIDDEN_PROJECT_CONTINUATION_ANCHOR_KIND = "project_subagent_external_continuation"
+HIDDEN_RUNTIME_ANCHOR_KINDS = frozenset(
+    {
+        HIDDEN_ONBOARDING_ANCHOR_KIND,
+        HIDDEN_PROJECT_CONTINUATION_ANCHOR_KIND,
+    }
+)
 
 
 def _is_hidden_runtime_anchor(row: Any) -> bool:
     metadata = getattr(row, "message_meta", None)
     return bool(
         isinstance(metadata, dict)
-        and metadata.get("kind") == HIDDEN_ONBOARDING_ANCHOR_KIND
+        and metadata.get("kind") in HIDDEN_RUNTIME_ANCHOR_KINDS
     )
 
 
@@ -214,6 +221,8 @@ async def load_messages_for_session(
                 row.message_meta.get("consumed_by_onmessage")
                 or row.message_meta.get("delivery_claim")
                 or row.message_meta.get("kind") == "subagent_parent_message"
+                or row.message_meta.get("turn_inbox_state")
+                in {"pending", "processing", "cancelled"}
             )
         )
     ]
@@ -274,6 +283,8 @@ async def load_recoverable_messages_for_turn(
                 and (
                     row.message_meta.get("consumed_by_onmessage")
                     or row.message_meta.get("kind") == "subagent_parent_message"
+                    or row.message_meta.get("turn_inbox_state")
+                    in {"pending", "processing", "cancelled"}
                 )
             )
         )
@@ -301,9 +312,15 @@ async def load_recoverable_messages_for_turn(
                 if isinstance(getattr(row, "message_meta", None), dict)
                 else {}
             )
-            if str(meta.get("subagent_turn_anchor_id") or "") != str(
-                turn_anchor_id
-            ):
+            injected_anchor_id = (
+                meta.get("subagent_turn_anchor_id")
+                or (
+                    meta.get("turn_inbox_anchor_id")
+                    if meta.get("turn_inbox_state") == "delivered"
+                    else None
+                )
+            )
+            if str(injected_anchor_id or "") != str(turn_anchor_id):
                 break
         tail.append(row)
     # Startup recovery must not invent a row boundary either. It cannot safely
@@ -647,16 +664,31 @@ async def mark_latest_incomplete_turn_cancelled(
     startup recovery infers interrupted turns from durable chat rows. Marking
     the latest unanswered user anchor keeps those two views consistent.
     """
+    from app.services.conversation_turn_lifecycle import TURN_LIFECYCLE_KEY
+
     try:
         session_id = uuid.UUID(conversation_id)
     except (TypeError, ValueError):
         session_id = None
     if session_id is not None:
-        await db.execute(
-            select(ChatSession.id)
-            .where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
-            .with_for_update()
+        session = (
+            await db.execute(
+                select(ChatSession)
+                .where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if session is None:
+            return None
+        from app.services.conversation_turn_lifecycle import (
+            conversation_turn_snapshot_for_session,
         )
+
+        # This helper exists only for pre-lifecycle recovery rows. Once a
+        # canonical pointer exists, active and terminal generations are owned
+        # exclusively by the normalized STOP transaction.
+        if conversation_turn_snapshot_for_session(session).status != "idle":
+            return None
     latest = (
         await db.execute(
             select(ChatMessage)
@@ -696,6 +728,9 @@ async def mark_latest_incomplete_turn_cancelled(
         )
     ).scalar_one_or_none()
     if anchor is None:
+        return None
+    anchor_meta = dict(anchor.message_meta or {})
+    if anchor_meta.get(TURN_LIFECYCLE_KEY) is True:
         return None
 
     latest_anchor_tool = (
@@ -953,6 +988,16 @@ class IncomingMessageIngestResult:
     pending_confirmation: PendingConfirmation | None = None
     ignored_confirmation: PendingConfirmation | None = None
     ignored_confirmation_result: str | None = None
+    queued_to_running_turn: bool = False
+
+
+def _turn_inbox_state(meta: dict[str, Any]) -> bool:
+    return str(meta.get("turn_inbox_state") or "") in {
+        "pending",
+        "processing",
+        "delivered",
+        "cancelled",
+    }
 
 
 async def finish_blocked_confirmation_ingest(
@@ -1047,6 +1092,7 @@ async def ingest_incoming_chat_message(
                 created=False,
                 consumed_by_onmessage=True,
                 execution_ids=tuple(execution_ids),
+                queued_to_running_turn=_turn_inbox_state(existing_meta),
             )
 
     # Use the normal ChatSession row as the cross-process ordering boundary.  The
@@ -1184,18 +1230,82 @@ async def ingest_incoming_chat_message(
             # whether or not the first delivery matched a subscription.
             consumed_by_onmessage=True,
             execution_ids=tuple(execution_ids),
+            queued_to_running_turn=_turn_inbox_state(existing_meta),
         )
 
     from app.services.trigger_runtime.evaluator import match_incoming_chat_message
 
     matched = await match_incoming_chat_message(db, row, session)
+    queued_to_running_turn = False
+    from app.services.turn_inbox import is_turn_inbox_channel
+
+    if not matched.consumed and is_turn_inbox_channel(source_channel):
+        from app.services.conversation_turn_lifecycle import (
+            ACTIVE_TURN_STATUS,
+            conversation_turn_snapshot_for_session,
+            transition_conversation_turn,
+        )
+
+        snapshot = conversation_turn_snapshot_for_session(locked_session)
+        if snapshot.status == ACTIVE_TURN_STATUS and snapshot.anchor_id is not None:
+            active_anchor = await db.get(ChatMessage, snapshot.anchor_id)
+            same_execution_user = bool(
+                active_anchor is not None
+                and active_anchor.user_id == row.user_id
+            )
+            row.message_meta = {
+                **dict(row.message_meta or {}),
+                "turn_inbox_state": "pending",
+                "turn_inbox_anchor_id": str(snapshot.anchor_id),
+                "turn_inbox_generation": snapshot.generation,
+                # A different group sender must not inherit the active human's
+                # execution identity. It remains durable and is promoted only
+                # after the current generation terminates.
+                "turn_inbox_mode": (
+                    "current_turn" if same_execution_user else "next_turn"
+                ),
+            }
+            await db.flush()
+            queued_to_running_turn = True
+            from app.services.channel_dispatch import mark_channel_turn_admitted
+
+            await mark_channel_turn_admitted()
+        else:
+            await transition_conversation_turn(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(locked_session.id),
+                turn_anchor_id=row.id,
+                status="running",
+            )
+            from app.services.channel_dispatch import (
+                is_channel_turn_interjection,
+                mark_channel_promoted_turn,
+                mark_channel_turn_admitted,
+            )
+
+            await mark_channel_turn_admitted()
+            if is_channel_turn_interjection():
+                row.message_meta = {
+                    **dict(row.message_meta or {}),
+                    "turn_inbox_state": "promoted",
+                    "turn_inbox_anchor_id": str(row.id),
+                    "turn_inbox_generation": conversation_turn_snapshot_for_session(
+                        locked_session
+                    ).generation,
+                    "turn_inbox_mode": "current_turn",
+                }
+                await db.flush()
+                queued_to_running_turn = True
+                mark_channel_promoted_turn(agent_id, str(locked_session.id))
     return IncomingMessageIngestResult(
         message=row,
         created=True,
-        consumed_by_onmessage=matched.consumed,
+        consumed_by_onmessage=matched.consumed or queued_to_running_turn,
         execution_ids=matched.execution_ids,
         ignored_confirmation=ignored_confirmation,
         ignored_confirmation_result=ignored_confirmation_result,
+        queued_to_running_turn=queued_to_running_turn,
     )
 
 
@@ -1253,6 +1363,7 @@ async def persist_tool_call_row(
     conversation_id: str,
     evt: dict[str, Any],
     turn_anchor_id: uuid.UUID | None = None,
+    turn_fence_locked: bool = False,
 ) -> uuid.UUID | None:
     """Persist one tool-call marker in the caller's transaction.
 
@@ -1263,6 +1374,17 @@ async def persist_tool_call_row(
     status = (evt or {}).get("status")
     if status not in {"running", "done"}:
         return None
+    if turn_anchor_id is not None and not turn_fence_locked:
+        from app.services.conversation_turn_lifecycle import (
+            lock_conversation_turn_running,
+        )
+
+        await lock_conversation_turn_running(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=turn_anchor_id,
+        )
 
     content = json.dumps(
         {
@@ -1291,6 +1413,62 @@ async def persist_tool_call_row(
     db.add(row)
     await db.flush()
     return row.id
+
+
+async def close_running_tool_calls_for_stop(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+) -> int:
+    """Append one durable stopped result for each unclosed exact-turn tool."""
+
+    rows = list(
+        (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == conversation_id,
+                    ChatMessage.role == "tool_call",
+                    ChatMessage.message_meta["turn_anchor_id"].as_string()
+                    == str(turn_anchor_id),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    open_calls: dict[str, tuple[ChatMessage, dict[str, Any]]] = {}
+    for row in rows:
+        payload = _parse_tool_call_payload(row.content)
+        if payload is None:
+            continue
+        call_id = str(payload.get("call_id") or row.id)
+        if payload.get("status") == "running":
+            open_calls[call_id] = (row, payload)
+        elif payload.get("status") == "done":
+            open_calls.pop(call_id, None)
+
+    for call_id, (row, payload) in open_calls.items():
+        await persist_tool_call_row(
+            db,
+            agent_id=agent_id,
+            user_id=row.user_id,
+            conversation_id=conversation_id,
+            evt={
+                "name": payload.get("name") or "unknown",
+                "call_id": call_id,
+                "args": payload.get("args"),
+                "status": "done",
+                "result": "[Generation stopped]",
+                "reasoning_content": payload.get("reasoning_content"),
+            },
+            turn_anchor_id=turn_anchor_id,
+            turn_fence_locked=True,
+        )
+    return len(open_calls)
 
 
 def _pending_confirmation_payload(
@@ -1562,6 +1740,23 @@ async def persist_assistant_reply_row(
                 turn_anchor_id=turn_anchor_id,
                 status=turn_terminal_status,
             )
+            if turn_terminal_status in {"completed", "failed"}:
+                from app.services.turn_inbox import promote_next_turn_inbox
+
+                try:
+                    durable_session_id = uuid.UUID(str(conversation_id))
+                except (TypeError, ValueError):
+                    durable_session_id = None
+                session = (
+                    await db.get(ChatSession, durable_session_id)
+                    if durable_session_id is not None
+                    else None
+                )
+                if session is not None:
+                    await promote_next_turn_inbox(
+                        db,
+                        session=session,
+                    )
             msg.message_meta = {
                 **dict(msg.message_meta or {}),
                 "turn_terminal_published_by_lifecycle": True,

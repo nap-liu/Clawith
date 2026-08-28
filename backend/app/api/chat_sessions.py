@@ -921,6 +921,9 @@ async def _get_session_messages_page(
             ChatMessage.message_meta["kind"].as_string().is_distinct_from(
                 "onboarding_turn_anchor"
             ),
+            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
+                "project_subagent_external_continuation"
+            ),
             or_(
                 ChatMessage.role != "assistant",
                 ChatMessage.message_meta["media_kind"].as_string().is_(None),

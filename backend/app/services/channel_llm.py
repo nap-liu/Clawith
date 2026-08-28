@@ -437,12 +437,16 @@ async def _call_agent_llm(
         and parent_event_execution_user_id is not None
     ):
         from app.services.subagent_runtime import build_parent_subagent_before_round
+        from app.services.turn_inbox import is_turn_inbox_channel
 
         before_round = build_parent_subagent_before_round(
             parent_session_id=session_id,
             active_turn_anchor_id=turn_anchor_id,
             execution_agent_id=agent_id,
             execution_user_id=parent_event_execution_user_id,
+            include_turn_inbox=is_turn_inbox_channel(
+                runtime_session.source_channel
+            ),
             upstream=before_round,
         )
 

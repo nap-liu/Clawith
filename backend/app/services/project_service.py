@@ -706,35 +706,18 @@ async def project_session_access_mode(
     user: User,
     session: ChatSession,
 ) -> str | None:
-    """Return ``read``/``edit`` for an auditable project Subagent session.
+    """Return ``read``/``edit`` for an auditable project session.
 
-    Historical sessions remain readable after departure. Writing additionally
-    requires an owner/editor ACL and the exact durable member snapshot to still
-    be enabled.
+    Group sessions use the project ACL directly. Historical Subagent sessions
+    remain readable after departure; writing them additionally requires the
+    exact durable member snapshot to still be enabled.
     """
 
-    if session.source_channel != "subagent" or session.project_id is None or user.tenant_id is None:
+    if session.project_id is None or user.tenant_id is None:
         return None
     project = await db.get(Project, session.project_id)
-    run = await db.get(SubagentRun, session.id)
-    if (
-        project is None
-        or project.tenant_id != user.tenant_id
-        or run is None
-        or run.project_id != project.id
-        or run.project_member_id is None
-        or session.agent_id is None
-    ):
+    if project is None or project.tenant_id != user.tenant_id:
         return None
-    member = await db.get(ProjectMemberSnapshot, run.project_member_id)
-    if (
-        member is None
-        or member.project_id != project.id
-        or member.tenant_id != project.tenant_id
-        or member.agent_id != session.agent_id
-    ):
-        return None
-    member_is_writable = member.is_enabled and not bool(dict(session.im_config or {}).get("membership_revoked"))
     if project.owner_user_id == user.id:
         human_role = "edit"
     else:
@@ -750,6 +733,29 @@ async def project_session_access_mode(
         if grant is None:
             return None
         human_role = "edit" if grant.role == "edit" else "read"
+
+    if session.source_channel == "project" and session.is_group:
+        return human_role
+    if session.source_channel != "subagent":
+        return None
+
+    run = await db.get(SubagentRun, session.id)
+    if (
+        run is None
+        or run.project_id != project.id
+        or run.project_member_id is None
+        or session.agent_id is None
+    ):
+        return None
+    member = await db.get(ProjectMemberSnapshot, run.project_member_id)
+    if (
+        member is None
+        or member.project_id != project.id
+        or member.tenant_id != project.tenant_id
+        or member.agent_id != session.agent_id
+    ):
+        return None
+    member_is_writable = member.is_enabled and not bool(dict(session.im_config or {}).get("membership_revoked"))
     return "edit" if human_role == "edit" and member_is_writable else "read"
 
 

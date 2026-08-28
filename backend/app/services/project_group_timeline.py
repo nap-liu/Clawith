@@ -21,8 +21,12 @@ from app.services.chat_message_serializer import (
     serialize_chat_message_for_client,
     serialize_tool_call_for_client,
 )
+from app.services.project_group_turn_lifecycle import (
+    GROUP_RUN_TRIGGERS,
+    project_run_group_anchor_id,
+)
 
-_GROUP_RUN_TRIGGERS = {"group_leader_message", "group_mention", "leader_reply_batch"}
+_GROUP_RUN_TRIGGERS = {*GROUP_RUN_TRIGGERS, "leader_reply_batch"}
 _HIDDEN_CHILD_KINDS = {"subagent_fork_context", "subagent_input"}
 
 
@@ -105,12 +109,8 @@ def _run_child_id(run: ProjectRun) -> str | None:
 
 
 def _group_anchor_id(run: ProjectRun) -> str | None:
-    data = run.input if isinstance(run.input, dict) else {}
-    value = data.get("group_message_id")
-    try:
-        return str(uuid.UUID(str(value))) if value else None
-    except (TypeError, ValueError):
-        return None
+    anchor_id = project_run_group_anchor_id(run)
+    return str(anchor_id) if anchor_id is not None else None
 
 
 async def build_project_group_timeline(
@@ -144,8 +144,11 @@ async def build_project_group_timeline(
                 referenced_run_ids.add(uuid.UUID(str(raw_run_id)))
             except (TypeError, ValueError):
                 continue
-    run_scope = ProjectRun.input["group_message_id"].as_string().in_(
-        group_message_ids
+    run_scope = or_(
+        ProjectRun.input["group_message_id"].as_string().in_(group_message_ids),
+        ProjectRun.input["dispatch"]["turn_anchor_id"]
+        .as_string()
+        .in_(group_message_ids),
     )
     if referenced_run_ids:
         run_scope = or_(run_scope, ProjectRun.id.in_(referenced_run_ids))

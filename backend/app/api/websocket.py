@@ -242,7 +242,13 @@ async def maybe_mark_session_read_for_active_viewer(
     return True
 
 
-async def _await_turn_with_abort(llm_task, recv_json, partial_chunks: list[str]):
+async def _await_turn_with_abort(
+    llm_task,
+    recv_json,
+    partial_chunks: list[str],
+    *,
+    on_abort=None,
+):
     """Drive a running web turn while listening for abort / disconnect on the socket.
 
     Returns ``(assistant_response, outcome)`` where ``outcome`` is one of
@@ -268,8 +274,18 @@ async def _await_turn_with_abort(llm_task, recv_json, partial_chunks: list[str])
         try:
             msg = await _aio.wait_for(recv_json(), timeout=0.5)
             if isinstance(msg, dict) and msg.get("type") == "abort":
-                logger.info("[WS] Abort received, cancelling LLM task")
-                llm_task.cancel()
+                logger.info("[WS] Abort received, stopping durable turn tree")
+                accepted = True
+                if on_abort is not None:
+                    accepted = bool(await on_abort(msg))
+                if not accepted:
+                    logger.info("[WS] Ignoring stale abort for a different turn")
+                    continue
+                if not llm_task.done():
+                    # Fallback interruption after the durable control-plane
+                    # commit.  The shared STOP normally cancels this task via
+                    # the active-turn reservation.
+                    llm_task.cancel()
                 aborted = True
                 break
             # Non-abort messages during generation are ignored; the client should
@@ -835,6 +851,7 @@ class WebSocketChatHandler:
                     "file_name": file_name or None,
                     "attachments": list(attachments or []),
                 },
+                allow_parent_continuation=True,
             )
         except SubagentError as exc:
             # Membership/confirmation may have changed after the per-turn ACL
@@ -1047,6 +1064,55 @@ class WebSocketChatHandler:
         while True:
             data = await self.websocket.receive_json()
 
+            project_writable = False
+            if getattr(self, "project_session_access", None) is not None:
+                project_writable = await self._project_session_still_writable()
+            if (
+                getattr(self, "project_session_access", None) is not None
+                and not project_writable
+            ):
+                self.read_only = True
+
+            # Project group turns are executed by detached durable workers, so
+            # their viewer socket has no local llm_task for _await_turn_with_abort
+            # to cancel. Accept the same abort command here, but require the UI's
+            # exact lifecycle anchor so a delayed/stale tab cannot stop a newer
+            # generation.
+            if data.get("type") == "abort":
+                if self.read_only and not project_writable:
+                    await self._send_current_turn_event(
+                        {"type": "error", "content": "只读监看会话,无法终止消息。"}
+                    )
+                    continue
+                try:
+                    expected_anchor_id = uuid.UUID(str(data["turn_anchor_id"]))
+                    expected_generation = int(data["generation"])
+                except (KeyError, TypeError, ValueError):
+                    await self._send_current_turn_event(
+                        {
+                            "type": "error",
+                            "code": "stale_abort",
+                            "content": "终止请求缺少当前轮次标识，请刷新会话后重试。",
+                        }
+                    )
+                    continue
+                from app.services.turn_control import stop_session_turn_tree
+
+                await stop_session_turn_tree(
+                    agent_id=self.agent_id,
+                    session_id=self.conv_id,
+                    reason=f"Web abort by user {self.user_id}",
+                    expected_anchor_id=expected_anchor_id,
+                    expected_generation=expected_generation,
+                )
+                continue
+
+            if self.read_only:
+                await self._send_current_turn_event(
+                    {"type": "error", "content": "只读监看会话,无法在此发送消息。"}
+                )
+                continue
+
             # Set a unique trace ID for this specific message processing.
             trace_id = str(uuid.uuid4())[:12]
             set_trace_id(trace_id)
@@ -1066,22 +1132,6 @@ class WebSocketChatHandler:
             logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
 
             if not content and not is_onboarding_trigger:
-                continue
-
-            if (
-                getattr(self, "project_session_access", None) is not None
-                and not await self._project_session_still_writable()
-            ):
-                self.read_only = True
-
-            # Read-only monitor: this viewer is watching a session they do not
-            # own (admin/creator with view rights). They receive live broadcasts
-            # but must never drive a turn or post as the session owner. The UI
-            # also disables the composer, but THIS is the authoritative guard.
-            if self.read_only:
-                await self._send_current_turn_event(
-                    {"type": "error", "content": "只读监看会话,无法在此发送消息。"}
-                )
                 continue
 
             validated_attachments = None
@@ -2262,12 +2312,16 @@ class WebSocketChatHandler:
                     from app.services.subagent_runtime import (
                         build_parent_subagent_before_round,
                     )
+                    from app.services.turn_inbox import is_turn_inbox_channel
 
                     parent_events_before_round = build_parent_subagent_before_round(
                         parent_session_id=self.conv_id,
                         active_turn_anchor_id=turn_anchor_id,
                         execution_agent_id=self.agent_id,
                         execution_user_id=self.user_id,
+                        include_turn_inbox=is_turn_inbox_channel(
+                            self.source_channel
+                        ),
                     )
 
                 return await call_llm_with_failover(
@@ -2302,9 +2356,38 @@ class WebSocketChatHandler:
             # channels). Only an explicit user abort cancels.
             queued_messages: list[dict] = []
             set_active_turn_cancel_task(llm_task)
+
+            async def _stop_web_turn_tree(abort_message: dict) -> bool:
+                from app.services.turn_control import stop_session_turn_tree
+
+                expected_anchor = turn_anchor_id
+                expected_generation = (
+                    turn_snapshot.generation if turn_snapshot is not None else None
+                )
+                raw_anchor = abort_message.get("turn_anchor_id")
+                raw_generation = abort_message.get("generation")
+                if raw_anchor is None or raw_generation is None:
+                    return False
+                try:
+                    expected_anchor = uuid.UUID(str(raw_anchor))
+                    expected_generation = int(raw_generation)
+                except (TypeError, ValueError):
+                    return False
+                stopped = await stop_session_turn_tree(
+                    agent_id=self.agent_id,
+                    session_id=self.conv_id,
+                    reason=f"Web abort by user {self.user_id}",
+                    expected_anchor_id=expected_anchor,
+                    expected_generation=expected_generation,
+                )
+                return stopped.stopped
+
             try:
                 assistant_response, _turn_outcome = await _await_turn_with_abort(
-                    llm_task, self.websocket.receive_json, partial_chunks
+                    llm_task,
+                    self.websocket.receive_json,
+                    partial_chunks,
+                    on_abort=_stop_web_turn_tree,
                 )
             finally:
                 set_active_turn_cancel_task(None)
@@ -2578,6 +2661,15 @@ class WebSocketChatHandler:
                     turn_anchor_id=turn_anchor_id,
                     status=turn_status,
                 )
+                if turn_status in {"completed", "failed"}:
+                    from app.services.turn_inbox import promote_next_turn_inbox
+
+                    session = await db.get(ChatSession, uuid.UUID(self.conv_id))
+                    if session is not None:
+                        await promote_next_turn_inbox(
+                            db,
+                            session=session,
+                        )
             if complete_onboarding:
                 completed = await db.execute(
                     update(AgentUserOnboarding)
@@ -2597,5 +2689,12 @@ class WebSocketChatHandler:
                 user_id=self.user_id,
             )
             await db.commit()
+        if turn_anchor_id is not None:
+            from app.services.turn_inbox import kick_promoted_turn_inbox
+
+            await kick_promoted_turn_inbox(
+                agent_id=self.agent_id,
+                session_id=self.conv_id,
+            )
         logger.info("[WS] Assistant message saved")
         return True

@@ -344,6 +344,10 @@ async def lifespan(fastapi_app: FastAPI):
         # deploy doesn't run every loop on every instance. Our cli_tools GC is a
         # worker-side maintenance loop, so it rides with the worker role.
         task_specs = []
+        if _role_enabled("all", "api", "worker", "connector"):
+            from app.services.turn_control_bus import turn_control_subscriber_loop
+
+            task_specs.append(("turn_control_subscriber", turn_control_subscriber_loop()))
         fastapi_app.state.turn_recovery_task = None
         if _turn_recovery_enabled():
             turn_recovery_task = asyncio.create_task(

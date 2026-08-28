@@ -3179,6 +3179,13 @@ async def create_project_run(
     db.add_all([anchor, run])
     group_session.last_message_at = func.now()
     await db.flush()
+    from app.services.project_group_turn_lifecycle import reconcile_project_group_turn
+
+    await reconcile_project_group_turn(
+        db,
+        project_id=project.id,
+        session=group_session,
+    )
     await freeze_run_members(db, project, run)
     add_event(
         db,
@@ -3754,6 +3761,17 @@ async def confirm_project_kickoff(
         },
     }
     await db.flush()
+    from app.services.conversation_turn_lifecycle import (
+        transition_conversation_turn,
+    )
+
+    await transition_conversation_turn(
+        db,
+        agent_id=group_session.agent_id,
+        conversation_id=str(group_session.id),
+        turn_anchor_id=kickoff_message.id,
+        status="running",
+    )
     await freeze_run_members(db, project, run)
     await db.commit()
     try:
@@ -3832,7 +3850,12 @@ async def list_project_group_messages(
         raise HTTPException(status_code=404, detail="Project group session not found")
     messages_query = (
         select(ChatMessage)
-        .where(ChatMessage.conversation_id == str(session.id))
+        .where(
+            ChatMessage.conversation_id == str(session.id),
+            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
+                "project_subagent_external_continuation"
+            ),
+        )
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
     )
     if before:
