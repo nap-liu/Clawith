@@ -71,11 +71,6 @@ def _patch_call_llm_collaborators(monkeypatch, client):
         AsyncMock(return_value=None),
         raising=False,
     )
-    monkeypatch.setattr(
-        "app.services.llm.caller._sleep_before_timeout_retry",
-        AsyncMock(return_value=None),
-        raising=False,
-    )
 
 
 @pytest.mark.asyncio
@@ -109,7 +104,7 @@ async def test_provider_throttle_is_retried_before_returning_success(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_provider_round_has_wall_clock_timeout(monkeypatch):
+async def test_provider_round_has_no_platform_timeout_and_cancel_closes_client(monkeypatch):
     class _HeartbeatForeverClient:
         closed = False
 
@@ -123,37 +118,42 @@ async def test_provider_round_has_wall_clock_timeout(monkeypatch):
     _patch_call_llm_collaborators(monkeypatch, client)
     model = _FakeModel(request_timeout=0.01)
 
-    result = await call_llm(
-        model=model,
-        messages=[{"role": "user", "content": "hello"}],
-        agent_name="测试助手",
-        role_description="",
-        agent_id="agent-x",
-        user_id="user-x",
-        session_id="",
+    task = asyncio.create_task(
+        call_llm(
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            agent_name="测试助手",
+            role_description="",
+            agent_id="agent-x",
+            user_id="user-x",
+            session_id="",
+        )
     )
 
-    assert result == "[LLM Error] Request timed out after 0.01s"
+    await asyncio.sleep(0.03)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert client.closed is True
 
 
 @pytest.mark.asyncio
-async def test_provider_ttft_timeout_retries_once_before_success(monkeypatch):
-    class _TimeoutThenSuccessClient:
+async def test_provider_ttft_is_not_limited_or_retried_by_platform(monkeypatch):
+    class _SlowThenSuccessClient:
         def __init__(self):
             self.calls = 0
             self.closed = False
 
         async def stream(self, **_kwargs):
             self.calls += 1
-            if self.calls == 1:
-                await asyncio.Event().wait()
-            return _stop_response("retry-ok")
+            await asyncio.sleep(0.03)
+            return _stop_response("slow-ok")
 
         async def close(self):
             self.closed = True
 
-    client = _TimeoutThenSuccessClient()
+    client = _SlowThenSuccessClient()
     _patch_call_llm_collaborators(monkeypatch, client)
 
     result = await call_llm(
@@ -166,13 +166,13 @@ async def test_provider_ttft_timeout_retries_once_before_success(monkeypatch):
         session_id="",
     )
 
-    assert result == "retry-ok"
-    assert client.calls == 2
+    assert result == "slow-ok"
+    assert client.calls == 1
     assert client.closed is True
 
 
 @pytest.mark.asyncio
-async def test_meaningful_stream_progress_renews_inactivity_timeout(monkeypatch):
+async def test_meaningful_stream_progress_is_not_time_limited(monkeypatch):
     class _ProgressClient:
         closed = False
 

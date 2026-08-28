@@ -107,7 +107,6 @@ def _join_visible_response_segments(*segments: str | None) -> str:
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 PROVIDER_THROTTLE_RETRY_DELAYS = (1.0, 2.0)
-PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS = (2.0,)
 # DashScope compatible endpoints can silently queue requests when several
 # project Agents wake at once.  Bound provider I/O separately from the
 # Subagent worker pool so waiting for a slot does not consume the model's
@@ -115,12 +114,6 @@ PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS = (2.0,)
 # without changing the durable project queue semantics.
 PROVIDER_MAX_IN_FLIGHT_ENV = "CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT"
 PROVIDER_MAX_IN_FLIGHT_DEFAULT = 2
-# A request that is making meaningful streaming progress gets a sliding
-# inactivity lease, but never an unbounded lifetime.  This is deliberately
-# distinct from increasing ``request_timeout``: a silent request still fails
-# at the configured timeout, while active reasoning/tool JSON is allowed to
-# finish within a bounded absolute budget.
-PROVIDER_PROGRESS_HARD_TIMEOUT_MULTIPLIER = 3.0
 PROVIDER_THROTTLE_USER_MESSAGE = "⚠️ 模型服务当前繁忙或被限流，已自动重试仍未成功，请稍后再试。"
 
 # Claude Code's exact prompt text for the resume nudge. Keep verbatim so we
@@ -195,8 +188,23 @@ async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
 
 
-async def _sleep_before_timeout_retry(delay_seconds: float) -> None:
-    await asyncio.sleep(delay_seconds)
+async def _close_cancelled_provider_client(client) -> None:
+    """Best-effort close without allowing cleanup to replace cancellation."""
+    close_task = asyncio.create_task(client.close())
+
+    def _consume_close_result(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except BaseException as exc:  # cleanup must never mask cancellation
+            logger.warning(f"[LLM] cancelled provider client close failed (ignored): {exc}")
+
+    close_task.add_done_callback(_consume_close_result)
+    try:
+        await asyncio.shield(close_task)
+    except BaseException:
+        # A repeated cancel must still propagate the original cancellation;
+        # the shielded close task continues and its callback consumes errors.
+        pass
 
 
 _provider_slots: dict[tuple[int, str, str, int, int], asyncio.Semaphore] = {}
@@ -224,9 +232,7 @@ def _provider_slot(model) -> asyncio.Semaphore:
 
 
 async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
-    request_timeout = _get_model_timeout(model)
     throttle_attempt_idx = 0
-    timeout_attempt_idx = 0
     provider_slot = _provider_slot(model)
 
     while True:
@@ -235,38 +241,26 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
         dispatch_started_at = _t0
         attempt_kwargs = dict(stream_kwargs)
         try:
-            # Queue outside the timeout budget.  Provider saturation should
-            # delay dispatch, not turn a healthy queued request into a false
-            # model timeout.
+            # Queueing is admission control only. It does not impose a
+            # response lifetime on an accepted production turn.
             async with provider_slot:
                 dispatch_started_at = perf_counter()
-                hard_deadline = dispatch_started_at + request_timeout * PROVIDER_PROGRESS_HARD_TIMEOUT_MULTIPLIER
-                async with asyncio.timeout(request_timeout) as progress_timeout:
 
-                    def _wrap_progress(
-                        cb,
-                        *,
-                        progress_marks=first_progress_at,
-                        absolute_deadline=hard_deadline,
-                        timeout_scope=progress_timeout,
-                    ):
-                        async def _marked(*args, **kwargs):
-                            now = perf_counter()
-                            if not progress_marks:
-                                progress_marks.append(now)
-                            timeout_scope.reschedule(min(absolute_deadline, now + request_timeout))
-                            if cb is not None:
-                                return await cb(*args, **kwargs)
+                def _wrap_progress(cb, *, progress_marks=first_progress_at):
+                    async def _marked(*args, **kwargs):
+                        if not progress_marks:
+                            progress_marks.append(perf_counter())
+                        if cb is not None:
+                            return await cb(*args, **kwargs)
 
-                        return _marked
+                    return _marked
 
-                    # Only meaningful model deltas renew the inactivity lease;
-                    # transport heartbeat lines never reach these callbacks.
-                    for callback_key in ("on_chunk", "on_thinking"):
-                        attempt_kwargs[callback_key] = _wrap_progress(attempt_kwargs.get(callback_key))
-                    if attempt_kwargs.get("on_tool_delta") is not None:
-                        attempt_kwargs["on_tool_delta"] = _wrap_progress(attempt_kwargs["on_tool_delta"])
-                    response = await client.stream(**attempt_kwargs)
+                # Always observe meaningful model deltas, even when the
+                # transport adapter has no UI callback. This gates retries and
+                # prevents duplicate text/tool state after streaming starts.
+                for callback_key in ("on_chunk", "on_thinking", "on_tool_delta"):
+                    attempt_kwargs[callback_key] = _wrap_progress(attempt_kwargs.get(callback_key))
+                response = await client.stream(**attempt_kwargs)
             _elapsed = perf_counter() - _t0
             _ttft = f"{first_progress_at[0] - dispatch_started_at:.2f}s" if first_progress_at else "n/a"
             _usage = getattr(response, "usage", None)
@@ -277,32 +271,11 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
                 f"llm_call={_elapsed:.2f}s ttft={_ttft} output_tokens={_out_tokens}{_rate}"
             )
             return response
-        except TimeoutError as e:
-            phase = "stream" if first_progress_at else "ttft"
-            # A TTFT timeout has emitted no content, thinking, tool arguments,
-            # or side effects for this provider round. One bounded retry is
-            # therefore safe even when earlier tool rounds exist in history.
-            if phase == "ttft" and timeout_attempt_idx < len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS):
-                delay = PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS[timeout_attempt_idx]
-                timeout_attempt_idx += 1
-                logger.warning(
-                    f"[LLM] Provider TTFT timeout; retrying after {delay:.1f}s "
-                    f"(attempt {timeout_attempt_idx + 1}/"
-                    f"{len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS) + 1}, "
-                    f"round {round_i}, provider={getattr(model, 'provider', '?')} "
-                    f"model={getattr(model, 'model', '?')})"
-                )
-                await _sleep_before_timeout_retry(delay)
-                continue
-            logger.error(
-                f"[LLM Timing] timeout phase={phase} round={round_i} "
-                f"elapsed={perf_counter() - _t0:.2f}s "
-                f"provider={getattr(model, 'provider', '?')} "
-                f"model={getattr(model, 'model', '?')}"
-            )
-            raise LLMError(f"Request timed out after {request_timeout:g}s") from e
+        except asyncio.CancelledError:
+            await _close_cancelled_provider_client(client)
+            raise
         except LLMError as e:
-            if not _is_provider_throttle_error(e):
+            if first_progress_at or not _is_provider_throttle_error(e):
                 raise
             if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
                 raise ProviderThrottleExhausted(str(e)) from e
@@ -324,13 +297,11 @@ async def _complete_with_throttle_retry(client, *, model, round_i: int, **comple
     Background, scheduled, and project turns use ``complete`` while Web Chat
     uses ``stream``. Both paths must share the same provider-account limit;
     otherwise a project burst can bypass admission and starve interactive
-    conversations. Waiting for a provider slot is intentionally outside the
-    request timeout and does not hold a database transaction.
+    conversations. Waiting for a provider slot does not hold a database
+    transaction or impose a response lifetime.
     """
 
-    request_timeout = _get_model_timeout(model)
     throttle_attempt_idx = 0
-    timeout_attempt_idx = 0
     provider_slot = _provider_slot(model)
 
     while True:
@@ -339,28 +310,16 @@ async def _complete_with_throttle_retry(client, *, model, round_i: int, **comple
         try:
             async with provider_slot:
                 dispatch_started_at = perf_counter()
-                async with asyncio.timeout(request_timeout):
-                    response = await client.complete(**complete_kwargs)
+                response = await client.complete(**complete_kwargs)
             elapsed = perf_counter() - dispatch_started_at
             logger.info(
                 f"[LLM Timing] round={round_i} model={getattr(model, 'model', '?')} "
                 f"queue={dispatch_started_at - queued_at:.2f}s llm_call={elapsed:.2f}s (complete)"
             )
             return response
-        except TimeoutError as exc:
-            if timeout_attempt_idx < len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS):
-                delay = PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS[timeout_attempt_idx]
-                timeout_attempt_idx += 1
-                logger.warning(
-                    f"[LLM] Provider complete timeout; retrying after {delay:.1f}s "
-                    f"(attempt {timeout_attempt_idx + 1}/"
-                    f"{len(PROVIDER_TTFT_TIMEOUT_RETRY_DELAYS) + 1}, "
-                    f"round {round_i}, provider={getattr(model, 'provider', '?')} "
-                    f"model={getattr(model, 'model', '?')})"
-                )
-                await _sleep_before_timeout_retry(delay)
-                continue
-            raise LLMError(f"Request timed out after {request_timeout:g}s") from exc
+        except asyncio.CancelledError:
+            await _close_cancelled_provider_client(client)
+            raise
         except LLMError as exc:
             if not _is_provider_throttle_error(exc):
                 raise
@@ -1480,6 +1439,7 @@ async def call_llm(
             model=model.model,
             base_url=model.base_url,
             timeout=_get_model_timeout(model),
+            provider_managed_timeout=True,
         )
         client_guard = LLMClientCloseGuard(client)
     except Exception as e:
@@ -2483,6 +2443,7 @@ async def call_agent_llm_with_tools(
                 model=model.model,
                 base_url=model.base_url,
                 timeout=_get_model_timeout(model),
+                provider_managed_timeout=True,
             )
             client_guard = LLMClientCloseGuard(client)
 

@@ -246,11 +246,13 @@ class LLMClient(ABC):
         base_url: str | None = None,
         model: str | None = None,
         timeout: float = 120.0,
+        provider_managed_timeout: bool = False,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        self.provider_managed_timeout = provider_managed_timeout
 
     @abstractmethod
     async def complete(
@@ -288,6 +290,21 @@ class LLMClient(ABC):
 # ============================================================================
 # OpenAI-Compatible Client
 # ============================================================================
+
+
+def _httpx_timeout(timeout: float, *, provider_managed_timeout: bool) -> httpx.Timeout:
+    """Keep connection setup bounded without limiting provider response time.
+
+    Production turns let the provider, an explicit cancellation, or a real
+    transport failure end response reads. Auxiliary calls retain the legacy
+    bounded read timeout by leaving ``provider_managed_timeout`` disabled.
+    """
+    return httpx.Timeout(
+        connect=timeout,
+        read=None if provider_managed_timeout else timeout,
+        write=timeout,
+        pool=timeout,
+    )
 
 
 def _is_markable_payload_msg(msg: dict) -> bool:
@@ -394,8 +411,15 @@ class OpenAICompatibleClient(LLMClient):
         timeout: float = 120.0,
         supports_tool_choice: bool = True,
         supports_cache_control: bool = False,
+        provider_managed_timeout: bool = False,
     ):
-        super().__init__(api_key, base_url or self.DEFAULT_BASE_URL, model, timeout)
+        super().__init__(
+            api_key,
+            base_url or self.DEFAULT_BASE_URL,
+            model,
+            timeout,
+            provider_managed_timeout,
+        )
         self.supports_tool_choice = supports_tool_choice
         self.supports_cache_control = supports_cache_control
         self._client: httpx.AsyncClient | None = None
@@ -403,7 +427,14 @@ class OpenAICompatibleClient(LLMClient):
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=None)
+            self._client = httpx.AsyncClient(
+                timeout=_httpx_timeout(
+                    self.timeout,
+                    provider_managed_timeout=self.provider_managed_timeout,
+                ),
+                follow_redirects=True,
+                proxy=None,
+            )
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
@@ -782,6 +813,7 @@ class OpenAICompatibleClient(LLMClient):
 
         max_retries = 3
         client = await self._get_client()
+        meaningful_progress = False
 
         for attempt in range(max_retries):
             try:
@@ -801,16 +833,19 @@ class OpenAICompatibleClient(LLMClient):
                             break
 
                         if chunk.content:
+                            meaningful_progress = True
                             full_content += chunk.content
                             if on_chunk:
                                 await on_chunk(chunk.content)
 
                         if chunk.reasoning_content:
+                            meaningful_progress = True
                             full_reasoning += chunk.reasoning_content
                             if on_thinking:
                                 await on_thinking(chunk.reasoning_content)
 
                         if chunk.tool_call:
+                            meaningful_progress = True
                             idx = chunk.tool_call.get("index", 0)
                             while len(tool_calls_data) <= idx:
                                 tool_calls_data.append({"id": "", "function": {"name": "", "arguments": ""}})
@@ -848,6 +883,8 @@ class OpenAICompatibleClient(LLMClient):
                 break  # Success
 
             except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
+                if meaningful_progress:
+                    raise LLMError(f"Connection interrupted after streaming started: {e}") from e
                 if attempt < max_retries - 1:
                     wait = (attempt + 1) * 1
                     logger.warning(f"Stream attempt {attempt + 1} failed ({type(e).__name__}), retrying in {wait}s...")
@@ -895,15 +932,29 @@ class OpenAIResponsesClient(LLMClient):
         model: str | None = None,
         timeout: float = 120.0,
         supports_tool_choice: bool = True,
+        provider_managed_timeout: bool = False,
     ):
-        super().__init__(api_key, base_url or self.DEFAULT_BASE_URL, model, timeout)
+        super().__init__(
+            api_key,
+            base_url or self.DEFAULT_BASE_URL,
+            model,
+            timeout,
+            provider_managed_timeout,
+        )
         self.supports_tool_choice = supports_tool_choice
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=None)
+            self._client = httpx.AsyncClient(
+                timeout=_httpx_timeout(
+                    self.timeout,
+                    provider_managed_timeout=self.provider_managed_timeout,
+                ),
+                follow_redirects=True,
+                proxy=None,
+            )
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
@@ -1261,8 +1312,15 @@ class GeminiClient(LLMClient):
         model: str | None = None,
         timeout: float = 120.0,
         supports_tool_choice: bool = True,
+        provider_managed_timeout: bool = False,
     ):
-        super().__init__(api_key, base_url or self.DEFAULT_BASE_URL, model, timeout)
+        super().__init__(
+            api_key,
+            base_url or self.DEFAULT_BASE_URL,
+            model,
+            timeout,
+            provider_managed_timeout,
+        )
         self.supports_tool_choice = supports_tool_choice
         self._client: httpx.AsyncClient | None = None
         self._openai_fallback_client: OpenAICompatibleClient | None = None
@@ -1270,7 +1328,14 @@ class GeminiClient(LLMClient):
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=None)
+            self._client = httpx.AsyncClient(
+                timeout=_httpx_timeout(
+                    self.timeout,
+                    provider_managed_timeout=self.provider_managed_timeout,
+                ),
+                follow_redirects=True,
+                proxy=None,
+            )
         return self._client
 
     async def _get_openai_fallback_client(self) -> OpenAICompatibleClient:
@@ -1283,6 +1348,7 @@ class GeminiClient(LLMClient):
                 timeout=self.timeout,
                 supports_tool_choice=self.supports_tool_choice,
                 supports_cache_control=False,
+                provider_managed_timeout=self.provider_managed_timeout,
             )
         return self._openai_fallback_client
 
@@ -1759,14 +1825,28 @@ class AnthropicClient(LLMClient):
         base_url: str | None = None,
         model: str | None = None,
         timeout: float = 120.0,
+        provider_managed_timeout: bool = False,
     ):
-        super().__init__(api_key, base_url or self.DEFAULT_BASE_URL, model, timeout)
+        super().__init__(
+            api_key,
+            base_url or self.DEFAULT_BASE_URL,
+            model,
+            timeout,
+            provider_managed_timeout,
+        )
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=None)
+            self._client = httpx.AsyncClient(
+                timeout=_httpx_timeout(
+                    self.timeout,
+                    provider_managed_timeout=self.provider_managed_timeout,
+                ),
+                follow_redirects=True,
+                proxy=None,
+            )
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
@@ -2364,6 +2444,8 @@ def create_llm_client(
     model: str,
     base_url: str | None = None,
     timeout: float = 120.0,
+    *,
+    provider_managed_timeout: bool = False,
 ) -> LLMClient:
     """Create an LLM client for the given provider.
 
@@ -2372,7 +2454,10 @@ def create_llm_client(
         api_key: API key for authentication
         model: Model name
         base_url: Optional custom base URL
-        timeout: Request timeout in seconds
+        timeout: Connection and auxiliary-call timeout in seconds
+        provider_managed_timeout: For production turns, keep response reads
+            unbounded so only the provider, transport, or explicit cancellation
+            ends the call.
 
     Returns:
         An instance of the appropriate LLMClient subclass
@@ -2393,6 +2478,7 @@ def create_llm_client(
             base_url=final_base_url,
             model=model,
             timeout=timeout,
+            provider_managed_timeout=provider_managed_timeout,
         )
     elif spec and spec.protocol == "openai_responses":
         return OpenAIResponsesClient(
@@ -2401,6 +2487,7 @@ def create_llm_client(
             model=model,
             timeout=timeout,
             supports_tool_choice=spec.supports_tool_choice,
+            provider_managed_timeout=provider_managed_timeout,
         )
     elif spec and spec.protocol == "gemini":
         return GeminiClient(
@@ -2409,6 +2496,7 @@ def create_llm_client(
             model=model,
             timeout=timeout,
             supports_tool_choice=spec.supports_tool_choice,
+            provider_managed_timeout=provider_managed_timeout,
         )
     elif normalized_provider in PROVIDER_CLIENTS:
         supports_tool_choice = normalized_provider in TOOL_CHOICE_PROVIDERS
@@ -2419,6 +2507,7 @@ def create_llm_client(
             timeout=timeout,
             supports_tool_choice=supports_tool_choice,
             supports_cache_control=normalized_provider == "qwen",
+            provider_managed_timeout=provider_managed_timeout,
         )
     else:
         # Default to OpenAI-compatible for unknown providers
@@ -2429,6 +2518,7 @@ def create_llm_client(
             timeout=timeout,
             supports_tool_choice=True,
             supports_cache_control=False,
+            provider_managed_timeout=provider_managed_timeout,
         )
 
 
