@@ -1314,6 +1314,18 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
         .all()
     )
     durable_child = await env.db.get(SubagentRun, first_child_id)
+    canonical_turn_anchor_id = await env.db.scalar(
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.conversation_id == str(first_child_id),
+            ChatMessage.message_meta["kind"].as_string() == "subagent_input",
+            ChatMessage.message_meta["subagent_input_state"]
+            .as_string()
+            .in_(["pending", "processing"]),
+        )
+        .order_by(ChatMessage.created_at, ChatMessage.id)
+        .limit(1)
+    )
     assert len(drawer_inputs) == 1
     assert drawer_inputs[0].message_meta["kind"] == "subagent_input"
     assert drawer_inputs[0].message_meta["subagent_input_state"] == "pending"
@@ -1326,8 +1338,11 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     assert len(committed) == 2
     assert {row["message_id"] for row in committed} == {str(drawer_inputs[0].id)}
     assert all(row["turn"]["phase"] == "active" for row in committed)
+    # The receipt identifies the newly committed row separately, while its
+    # lifecycle projection truthfully keeps the oldest queued input as the one
+    # session owner. A later drawer append cannot jump the queue.
     assert {row["turn"]["turn_anchor_id"] for row in committed} == {
-        str(drawer_inputs[0].id)
+        str(canonical_turn_anchor_id)
     }
 
     removed = await env.client.post(

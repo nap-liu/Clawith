@@ -904,21 +904,35 @@ async def append_subagent_message(
         )
         db.add(input_row)
         await db.flush()
-        # Admission owns the durable lifecycle. The worker may be delayed by
-        # capacity, but every viewer immediately sees one active turn. If an
-        # older queued input already owns the session, keep this row pending;
-        # the worker begins it after the current generation closes.
+        # Admission owns the durable lifecycle. Always admit the oldest live
+        # input, never merely the row appended by this call: a queued or
+        # processing predecessor remains the single session owner until it
+        # reaches a terminal state.
         from app.services.conversation_turn_lifecycle import (
             ConversationTurnConflict,
             transition_conversation_turn,
         )
 
+        lifecycle_anchor = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(child.id),
+                    ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+                    ChatMessage.message_meta["subagent_input_state"]
+                    .as_string()
+                    .in_([INPUT_PENDING, INPUT_PROCESSING]),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+                .limit(1)
+            )
+        ).scalar_one()
         try:
             await transition_conversation_turn(
                 db,
                 agent_id=child.agent_id,
                 conversation_id=str(child.id),
-                turn_anchor_id=input_row.id,
+                turn_anchor_id=lifecycle_anchor.id,
                 status="running",
             )
         except ConversationTurnConflict:
@@ -3057,20 +3071,29 @@ async def _finish_parent_events_for_root(
     root_id: uuid.UUID,
     candidate_ids: list[uuid.UUID],
 ) -> None:
-    """Close only source events durably projected onto one accepted turn."""
+    """Close every source event durably projected onto one accepted turn."""
 
-    if not candidate_ids:
-        return
     keys = {
         _parent_event_external_key(message_id): message_id
         for message_id in candidate_ids
     }
     async with async_session() as db:
+        root = await db.get(ChatMessage, root_id)
+        if root is None:
+            return
         projections = (
             (
                 await db.execute(
                     select(ChatMessage).where(
-                        ChatMessage.external_event_key.in_(list(keys)),
+                        ChatMessage.conversation_id == root.conversation_id,
+                        or_(
+                            ChatMessage.id == root_id,
+                            ChatMessage.message_meta["subagent_turn_anchor_id"]
+                            .as_string()
+                            == str(root_id),
+                        ),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == SUBAGENT_PARENT_EVENT,
                     )
                 )
             )
@@ -3082,10 +3105,13 @@ async def _finish_parent_events_for_root(
             raw_root_id = _message_meta(projection).get("subagent_turn_anchor_id")
             if str(raw_root_id or projection.id) != str(root_id):
                 continue
+            raw_source_id = _message_meta(projection).get("child_message_id")
             try:
-                source_ids.append(keys[str(projection.external_event_key)])
-            except KeyError:
-                pass
+                source_ids.append(uuid.UUID(str(raw_source_id)))
+            except (TypeError, ValueError):
+                source_id = keys.get(str(projection.external_event_key))
+                if source_id is not None:
+                    source_ids.append(source_id)
         if not source_ids:
             return
         events = (
@@ -3845,6 +3871,7 @@ async def _persist_parent_batch_identity_failure(
                 "attachments": [],
             },
             turn_anchor_id=stored_anchor.id,
+            turn_terminal_status="failed",
         )
         stored_parent = await db.get(ChatSession, parent.id)
         if stored_parent is not None:
