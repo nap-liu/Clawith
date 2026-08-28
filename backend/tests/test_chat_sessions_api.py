@@ -647,6 +647,8 @@ async def test_session_messages_fold_append_only_tool_events(monkeypatch):
         str(second_anchor),
     ]
     assert tool_messages[0]["toolResult"] == "found"
+    assert all(item["content"] == "" for item in tool_messages)
+    assert all(item["display_content"] == "" for item in tool_messages)
     assert tool_messages[0]["created_at"] == (started_at + timedelta(seconds=1)).isoformat()
     assert messages[-1]["role"] == "tool_call"
 

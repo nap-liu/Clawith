@@ -16,8 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.project import ProjectRun
-from app.services.chat_history import parse_tool_call_for_display
-from app.services.chat_message_serializer import serialize_chat_message_for_client
+from app.services.chat_message_serializer import (
+    merge_tool_call_update_for_client,
+    serialize_chat_message_for_client,
+    serialize_tool_call_for_client,
+)
 
 _GROUP_RUN_TRIGGERS = {"group_leader_message", "group_mention", "leader_reply_batch"}
 _HIDDEN_CHILD_KINDS = {"subagent_fork_context", "subagent_input"}
@@ -32,7 +35,12 @@ def serialize_project_group_message(message: ChatMessage) -> dict[str, Any]:
     """Serialize a stored group row through the standard client serializer."""
 
     metadata = _metadata(message)
-    entry = serialize_chat_message_for_client(
+    serializer = (
+        serialize_tool_call_for_client
+        if message.role == "tool_call"
+        else serialize_chat_message_for_client
+    )
+    entry = serializer(
         message,
         source_channel="project",
         sender_user_id=message.sender_user_id,
@@ -59,24 +67,18 @@ def _serialize_child_message(message: ChatMessage) -> dict[str, Any]:
     """Apply the same serializer/parser contract as the Web Chat history API."""
 
     sender_agent_id = message.sender_agent_id or message.agent_id
-    entry = serialize_chat_message_for_client(
-        message,
-        source_channel="subagent",
-        sender_agent_id=sender_agent_id,
-    )
     if message.role == "tool_call":
-        # Pending confirmations intentionally use the row id as their resolve
-        # handle. Canonical running/done tool rows use their persisted call id.
-        entry["toolCallId"] = str(message.id)
-        parsed = parse_tool_call_for_display(message.content)
-        explicit_tool_call_id = bool(parsed.get("toolCallId"))
-        if parsed:
-            entry["content"] = ""
-            entry.update(parsed)
-        if entry.get("toolName") == "request_confirmation":
-            entry["toolCallId"] = str(message.id)
-            explicit_tool_call_id = True
-        entry["toolCallIdExplicit"] = explicit_tool_call_id
+        entry = serialize_tool_call_for_client(
+            message,
+            source_channel="subagent",
+            sender_agent_id=sender_agent_id,
+        )
+    else:
+        entry = serialize_chat_message_for_client(
+            message,
+            source_channel="subagent",
+            sender_agent_id=sender_agent_id,
+        )
     metadata = _metadata(message)
     entry.update(
         {
@@ -292,6 +294,7 @@ async def build_project_group_timeline(
             visible_child_rows.append(row)
 
     projected: list[tuple[Any, str, dict[str, Any]]] = []
+    group_tool_positions: dict[tuple[str, str, str], int] = {}
     consumed_child_ids: set[str] = set(globally_materialized_child_ids)
     for message in group_messages:
         entry = serialize_project_group_message(message)
@@ -325,7 +328,24 @@ async def build_project_group_timeline(
             entry["producer_scope"] = producer_scope
             entry["canonicalDone"] = True
             consumed_child_ids.add(child_message_id)
-        projected.append((message.created_at, str(message.id), entry))
+        item = (message.created_at, str(message.id), entry)
+        if message.role != "tool_call":
+            projected.append(item)
+            continue
+        metadata = _metadata(message)
+        tool_key = (
+            message.conversation_id,
+            str(metadata.get("turn_anchor_id") or "legacy"),
+            str(entry.get("toolCallId") or message.id),
+        )
+        previous_position = group_tool_positions.get(tool_key)
+        if previous_position is None:
+            group_tool_positions[tool_key] = len(projected)
+            projected.append(item)
+            continue
+        previous = projected[previous_position]
+        merged = merge_tool_call_update_for_client(previous[2], entry)
+        projected[previous_position] = (previous[0], previous[1], merged)
 
     tool_positions: dict[tuple[str, str, str], int] = {}
     child_projected: list[tuple[Any, str, dict[str, Any]]] = []
@@ -366,10 +386,8 @@ async def build_project_group_timeline(
             child_projected.append(item)
             continue
         previous = child_projected[previous_position]
-        if previous[2].get("toolStatus") == "done" and entry.get("toolStatus") == "running":
-            continue
-        entry["created_at"] = previous[2].get("created_at") or entry.get("created_at")
-        child_projected[previous_position] = (previous[0], previous[1], entry)
+        merged = merge_tool_call_update_for_client(previous[2], entry)
+        child_projected[previous_position] = (previous[0], previous[1], merged)
 
     projected.extend(child_projected)
     projected.sort(key=lambda item: (item[0], item[1]))

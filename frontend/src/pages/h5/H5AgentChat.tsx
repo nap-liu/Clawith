@@ -28,6 +28,7 @@ import MarkdownRenderer from '../../components/MarkdownRenderer';
 import ConversationScrollToBottomButton from '../../features/conversation/ConversationScrollToBottomButton';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import {
+    CONVERSATION_HISTORY_RECONCILE_TURN_PAGE_SIZE,
     createConversationHistoryPageParams,
     resolveConversationHistoryHasMore,
 } from '../../features/conversation/historyPagination';
@@ -1087,7 +1088,12 @@ export default function H5AgentChat() {
                 let before: string | null = null;
 
                 do {
-                    const params = createConversationHistoryPageParams(before);
+                    const params = createConversationHistoryPageParams(
+                        before,
+                        !startsNewPagination && !before
+                            ? CONVERSATION_HISTORY_RECONCILE_TURN_PAGE_SIZE
+                            : undefined,
+                    );
                     const response = await fetch(`/api/agents/${agentId}/sessions/${nextSessionId}/message-turns?${params}`, {
                         headers: { Authorization: `Bearer ${token}` },
                         signal: controller.signal,

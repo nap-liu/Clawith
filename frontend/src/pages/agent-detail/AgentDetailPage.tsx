@@ -45,6 +45,7 @@ import {
 } from '../../features/conversation/core/conversationTurnLifecycle';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import {
+    CONVERSATION_HISTORY_RECONCILE_TURN_PAGE_SIZE,
     createConversationHistoryPageParams,
     resolveConversationHistoryHasMore,
 } from '../../features/conversation/historyPagination';
@@ -2304,7 +2305,12 @@ export default function AgentDetailPage() {
             let before: string | null = null;
 
             do {
-                const params = createConversationHistoryPageParams(before);
+                const params = createConversationHistoryPageParams(
+                    before,
+                    preserveLoadedHistory && !before
+                        ? CONVERSATION_HISTORY_RECONCILE_TURN_PAGE_SIZE
+                        : undefined,
+                );
                 const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/message-turns?${params}`, {
                     headers: { Authorization: `Bearer ${tkn}` },
                     signal: controller.signal,

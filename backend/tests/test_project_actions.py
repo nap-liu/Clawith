@@ -4756,6 +4756,8 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     assert read_tools[0]["toolCallId"] == "worker-read-1"
     assert read_tools[0]["toolStatus"] == "done"
     assert read_tools[0]["toolResult"] == "# Project evidence"
+    assert read_tools[0]["content"] == ""
+    assert read_tools[0]["display_content"] == ""
     assert read_tools[0]["sender_agent_id"] == str(env.worker_id)
     group_anchor_id = next(
         item["id"]
@@ -4821,6 +4823,62 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     later_human_index = item_ids.index(str(later_human.id))
     assert item_ids.index(str(materialized.id)) < later_human_index
     assert item_ids.index(str(confirmation.id)) < later_human_index
+
+
+async def test_project_group_history_uses_shared_tool_projection(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    project = await _create_project(env, name="Shared tool projection")
+    group = (await env.client.get(f"/api/projects/{project['id']}/group-session")).json()
+    anchor = ChatMessage(
+        agent_id=env.leader_id,
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Run the batch",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_group_message", "visible_to_group": True},
+    )
+    env.db.add(anchor)
+    await env.db.flush()
+    tool_base = {
+        "name": "toolscall",
+        "call_id": "project-batch-1",
+        "args": {"table_id": 18, "rows": [{"name": "A"}]},
+        "result": "",
+    }
+    running = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.leader_id,
+        role="tool_call",
+        content=json.dumps({**tool_base, "status": "running"}),
+        conversation_id=group["id"],
+        message_meta={"turn_anchor_id": str(anchor.id)},
+    )
+    done = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.leader_id,
+        role="tool_call",
+        content=json.dumps({**tool_base, "status": "done", "result": "created"}),
+        conversation_id=group["id"],
+        message_meta={"turn_anchor_id": str(anchor.id)},
+    )
+    env.db.add_all([running, done])
+    await env.db.commit()
+
+    response = await env.client.get(
+        f"/api/projects/{project['id']}/group-sessions/{group['id']}/messages"
+    )
+    assert response.status_code == 200, response.text
+    tools = [item for item in response.json()["items"] if item["role"] == "tool_call"]
+    assert len(tools) == 1
+    assert tools[0]["toolCallId"] == "project-batch-1"
+    assert tools[0]["toolStatus"] == "done"
+    assert tools[0]["toolResult"] == "created"
+    assert tools[0]["toolArgs"] == {"table_id": 18, "rows": [{"name": "A"}]}
+    assert tools[0]["content"] == ""
+    assert tools[0]["display_content"] == ""
 
 
 async def test_project_group_timeline_page_does_not_materialize_unrelated_history(
