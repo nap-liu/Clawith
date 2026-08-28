@@ -109,6 +109,7 @@ const {
     normalizeChatTimelineMessages,
     projectConversationTurnProgress,
     reconcileLatestHistoryWindow,
+    shouldProjectConversationTurnProgress,
     toolCallMessageFromEvent,
     upsertToolCallMessage,
 } = module.exports;
@@ -1253,6 +1254,41 @@ const {
 }
 
 {
+    const messages = [
+        { id: 'u1', role: 'user', content: '继续执行' },
+        { id: 'thinking-1', role: 'assistant', content: '', thinking: '正在规划', streaming: true, _streaming: true },
+        { id: 'tool-1', role: 'tool_call', toolName: 'knowledge_search', toolCallId: 'tool-1', toolStatus: 'running' },
+    ];
+    const entries = buildH5ConversationEntries(projectConversationTurnProgress(messages, false));
+    const latestAnalysis = entries.findLast((entry) => entry.type === 'analysis_group');
+    assert.ok(latestAnalysis);
+    assert.equal(
+        shouldProjectConversationTurnProgress(entries, true, {}),
+        true,
+        'an active turn keeps its trailing progress row after thinking or tool events',
+    );
+    assert.equal(
+        shouldProjectConversationTurnProgress(entries, true, { [latestAnalysis.key]: true }),
+        false,
+        'expanding the latest reasoning/tool group hides the redundant progress row',
+    );
+    assert.equal(
+        shouldProjectConversationTurnProgress(entries, false, {}),
+        false,
+        'a completed or suspended turn does not project progress',
+    );
+    const nextTurnEntries = buildH5ConversationEntries([
+        ...messages,
+        { id: 'u2', role: 'user', content: '开始下一轮' },
+    ]);
+    assert.equal(
+        shouldProjectConversationTurnProgress(nextTurnEntries, true, { [latestAnalysis.key]: true }),
+        true,
+        'an expanded analysis group from an older turn cannot hide new-turn progress',
+    );
+}
+
+{
     const messageId = 'initial-assistant:session-1';
     let messages = applyAssistantStreamMessage([], {
         type: 'done',
@@ -1274,10 +1310,15 @@ const {
 
 {
     let messages = [
-        { id: 'body', role: 'assistant', content: '这段正文必须保留', streaming: true },
-        { id: 'card', role: 'tool_call', toolCallId: 'card', toolName: 'request_confirmation', toolStatus: 'running' },
+        { id: 'body', role: 'assistant', content: '这段正文必须保留', streaming: true, turnAnchorId: 'u1' },
+        { id: 'terminal', role: 'tool_call', toolCallId: 'terminal', toolName: 'wait_for_external_input', toolStatus: 'running', turnAnchorId: 'u1' },
     ];
-    messages = applyAssistantDoneMessage(messages, { type: 'done', content: '' });
+    messages = applyAssistantDoneMessage(messages, {
+        type: 'done',
+        content: '',
+        turnAnchorId: 'u1',
+        turnSuspended: true,
+    });
     assert.equal(messages.length, 2);
     assert.equal(messages[0].content, '这段正文必须保留');
     assert.equal(messages[0].streaming, false);
@@ -1369,20 +1410,95 @@ const {
 {
     let messages = [
         { id: 'u1', role: 'user', content: '需要确认' },
-        { id: 'a1', role: 'assistant', content: '知识库正文 A', streaming: true, _streaming: true },
-        { id: 'media', role: 'tool_call', toolName: 'send_media', toolCallId: 'media', toolStatus: 'done' },
+        { id: 'a1', role: 'assistant', content: '知识库正文 A', streaming: true, _streaming: true, turnAnchorId: 'u1' },
+        { id: 'media', role: 'tool_call', toolName: 'send_media', toolCallId: 'media', toolStatus: 'done', turnAnchorId: 'u1' },
         { id: 'caption', role: 'assistant', content: '视频说明' },
-        { id: 'a2', role: 'assistant', content: '补充正文 B', streaming: true, _streaming: true },
-        { id: 'confirm', role: 'tool_call', toolName: 'request_confirmation', toolCallId: 'confirm', toolStatus: 'running' },
+        { id: 'a2', role: 'assistant', content: '补充正文 B', streaming: true, _streaming: true, turnAnchorId: 'u1' },
+        { id: 'terminal', role: 'tool_call', toolName: 'wait_for_external_input', toolCallId: 'terminal', toolStatus: 'running', turnAnchorId: 'u1' },
     ];
 
-    messages = applyAssistantDoneMessage(messages, { type: 'done', content: '' });
+    messages = applyAssistantDoneMessage(messages, {
+        type: 'done',
+        content: '',
+        turnAnchorId: 'u1',
+        turnSuspended: true,
+    });
 
     assert.equal(messages.filter((message) => message.streaming || message._streaming).length, 0);
-    assert.equal(messages.filter((message) => message.content === '知识库正文 A\n\n补充正文 B').length, 1);
+    assert.equal(messages.filter((message) => message.content === '知识库正文 A').length, 1);
+    assert.equal(messages.filter((message) => message.content === '补充正文 B').length, 1);
     assert.equal(messages.filter((message) => message.content === '视频说明').length, 1);
-    assert.equal(messages.at(-2).content, '知识库正文 A\n\n补充正文 B');
-    assert.equal(messages.at(-1).toolName, 'request_confirmation');
+    assert.equal(
+        messages.map((message) => message.id).join(','),
+        'u1,a1,media,caption,a2,terminal',
+        'suspension finalizes every stream without collapsing across tool boundaries',
+    );
+    assert.equal(messages.at(-1).toolName, 'wait_for_external_input');
+}
+
+{
+    const turn = {
+        turn_anchor_id: 'anchored-confirmation-user',
+        generation: 3,
+        revision: 7,
+        status: 'suspended',
+        phase: 'suspended',
+    };
+    let messages = [
+        { id: 'anchored-confirmation-user', role: 'user', content: '先查询知识库再让我确认' },
+    ];
+    messages = foldConversationTimelineEvent(messages, {
+        type: 'tool_call',
+        name: 'knowledge_search',
+        call_id: 'knowledge-search',
+        status: 'done',
+        result: '知识库结果',
+        turn,
+    }).messages;
+    messages = foldConversationTimelineEvent(messages, {
+        type: 'chunk',
+        content: '这是知识库回答，确认后继续。',
+        message_id: 'confirmation-intro-stream',
+        turn,
+    }).messages;
+    messages = foldConversationTimelineEvent(messages, {
+        type: 'tool_call',
+        name: 'wait_for_external_input',
+        call_id: 'anchored-terminal-tool',
+        args: { title: '确认继续', summary: '是否继续？' },
+        status: 'running',
+        turn,
+    }).messages;
+
+    assert.equal(
+        messages.map((message) => message.id).join(','),
+        [
+            'anchored-confirmation-user',
+            'tool:anchored-confirmation-user:default:knowledge-search',
+            'confirmation-intro-stream',
+            'tool:anchored-confirmation-user:default:anchored-terminal-tool',
+        ].join(','),
+        'a turn-ending tool initially renders after the streamed knowledge answer',
+    );
+
+    messages = foldConversationTimelineEvent(messages, {
+        type: 'done',
+        content: '',
+        turn,
+    }).messages;
+
+    assert.equal(
+        messages.map((message) => message.id).join(','),
+        [
+            'anchored-confirmation-user',
+            'tool:anchored-confirmation-user:default:knowledge-search',
+            'confirmation-intro-stream',
+            'tool:anchored-confirmation-user:default:anchored-terminal-tool',
+        ].join(','),
+        'suspending the turn must not move the answer after its terminal tool',
+    );
+    assert.equal(messages[2].streaming, false);
+    assert.equal(messages[2]._canonicalDone, undefined);
 }
 
 {

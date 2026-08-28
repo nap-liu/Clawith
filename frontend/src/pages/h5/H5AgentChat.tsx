@@ -52,7 +52,6 @@ import {
     reduceConversationTurnEvent,
     type ConversationTurnRuntime,
 } from '../../features/conversation/core/conversationTurnLifecycle';
-import { projectConversationTurnProgress } from '../../features/conversation/core/chatTimeline';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
 import {
@@ -103,7 +102,9 @@ import {
     mapHistoryMessage,
     mergeHistoryMessages,
     normalizeChatTimelineMessages,
+    projectConversationTurnProgress,
     reconcileLatestHistoryWindow,
+    shouldProjectConversationTurnProgress,
     toolCallMessageFromEvent,
     upsertToolCallMessage,
     type H5AnalysisItem,
@@ -2291,18 +2292,31 @@ export default function H5AgentChat() {
         }
     };
 
+    const generationActive = isWaiting || isStreaming || isStopping;
+    const baseConversationEntries = useMemo(
+        () => buildH5ConversationEntries(projectConversationTurnProgress(messages, false)),
+        [messages],
+    );
+    const showTurnProgress = shouldProjectConversationTurnProgress(
+        baseConversationEntries,
+        generationActive,
+        analysisExpanded,
+    );
     const projectedMessages = useMemo(
-        () => projectConversationTurnProgress(messages, isWaiting, {
+        () => projectConversationTurnProgress(messages, showTurnProgress, {
             id: `conversation-turn-progress:${sessionId || 'new'}:${turnRuntimeBySessionRef.current[String(sessionId || '')]?.snapshot.generation || 0}`,
         }),
-        [isWaiting, messages, sessionId],
+        [messages, sessionId, showTurnProgress],
     );
     const conversationEntries = useMemo(
         () => buildH5ConversationEntries(projectedMessages),
         [projectedMessages],
     );
     const attachedImagePreviews = useMemo(() => buildPreviewImagesFromAttachments(attachedFiles), [attachedFiles]);
-    const scrollAnchor = useMemo(() => getH5ScrollAnchor(conversationEntries, isWaiting), [conversationEntries, isWaiting]);
+    const scrollAnchor = useMemo(
+        () => getH5ScrollAnchor(conversationEntries, generationActive),
+        [conversationEntries, generationActive],
+    );
     const virtualizeMessages = conversationEntries.length > VIRTUALIZE_ENTRY_THRESHOLD;
     const virtualItemCount = conversationEntries.length;
     const rowVirtualizer = useVirtualizer({
@@ -2707,7 +2721,6 @@ export default function H5AgentChat() {
 
     const showBlockingError = authStatus === 'error' || !!agentError;
     const isBusy = authStatus === 'checking' || authStatus === 'exchanging' || (authStatus === 'ready' && !agent && !agentError);
-    const generationActive = isWaiting || isStreaming || isStopping;
     messageRuntimeBlockedRef.current = generationActive
         || isReadOnly
         || confirmationPending

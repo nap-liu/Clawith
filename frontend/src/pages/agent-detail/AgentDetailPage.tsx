@@ -92,7 +92,6 @@ import {
     foldConversationTimelineEvent,
     latestHistoryWindowOverlaps,
     normalizeChatTimelineMessages,
-    projectConversationTurnProgress,
     reconcileLatestHistoryWindow,
     toolCallMessageFromEvent,
     upsertToolCallMessage as mergeToolCallMessage,
@@ -3875,24 +3874,20 @@ export default function AgentDetailPage() {
     const [chatScrollBtnBottom, setChatScrollBtnBottom] = useState(96);
     const historyContainerRef = useRef<HTMLDivElement>(null);
     const historyAutoLoadCursorRef = useRef<string | null>(null);
+    const generationActive = isWaiting || isStreaming || isStopping;
     const liveScrollAnchor = useMemo(() => getConversationScrollAnchor(
         buildConversationEntries(chatMessages as any),
-        isWaiting,
-    ), [chatMessages, isWaiting]);
-    const projectedHistoryMessages = useMemo(
-        () => projectConversationTurnProgress(
-            historyMsgs as any,
-            Boolean(activeSession && !isWritableSession(activeSession) && isWaiting),
-            {
-                id: `conversation-turn-progress:${activeSession?.id || 'history'}:${sessionTurnRuntimeRef.current[`${id}:${activeSession?.id}`]?.snapshot.generation || 0}`,
-            },
-        ),
-        [activeSession, historyMsgs, isWaiting],
+        generationActive,
+    ), [chatMessages, generationActive]);
+    const readonlyGenerationActive = Boolean(
+        activeSession
+        && !isWritableSession(activeSession)
+        && generationActive
     );
     const historyScrollAnchor = useMemo(() => getConversationScrollAnchor(
-        buildConversationEntries(projectedHistoryMessages as any),
-        Boolean(activeSession && !isWritableSession(activeSession) && isWaiting),
-    ), [activeSession, isWaiting, projectedHistoryMessages]);
+        buildConversationEntries(historyMsgs as any),
+        readonlyGenerationActive,
+    ), [historyMsgs, readonlyGenerationActive]);
     const {
         showScrollToBottom: showScrollBtn,
         resumeAutoFollow: scrollToBottom,
@@ -6462,10 +6457,14 @@ export default function AgentDetailPage() {
                                                 return <ConversationTimeline
                                                     agentId={id!}
                                                     agentName={(agent as any)?.name || 'Agent'}
-                                                    messages={projectedHistoryMessages as any}
+                                                    messages={historyMsgs as any}
                                                     scrollerRef={historyContainerRef}
                                                     resumeMeasurementKey={pcResumeMeasurementKey}
                                                     provenance={activeSessionExecution}
+                                                    isRunning={readonlyGenerationActive}
+                                                    progressMessage={{
+                                                        id: `conversation-turn-progress:${activeSession?.id || 'history'}:${sessionTurnRuntimeRef.current[`${id}:${activeSession?.id}`]?.snapshot.generation || 0}`,
+                                                    }}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
                                                     onAttachmentDownload={handleAttachmentDownload}
                                                     onAttachmentUnavailable={markAttachmentUnavailable}
@@ -6552,21 +6551,17 @@ export default function AgentDetailPage() {
                                                         return !(msg?.role === 'assistant' && (content.includes('no LLM model') || content.includes('No model')));
                                                     })
                                                     : chatMessages;
-                                                const projectedChatMessages = projectConversationTurnProgress(
-                                                    visibleChatMessages as any,
-                                                    isWaiting,
-                                                    {
-                                                        id: `conversation-turn-progress:${activeSession?.id || 'new'}:${sessionTurnRuntimeRef.current[`${id}:${activeSession?.id}`]?.snapshot.generation || 0}`,
-                                                    },
-                                                );
                                                 return <ConversationTimeline
                                                     agentId={id!}
                                                     agentName={(agent as any)?.name || 'Agent'}
-                                                    messages={projectedChatMessages as any}
+                                                    messages={visibleChatMessages as any}
                                                     scrollerRef={chatContainerRef}
                                                     resumeMeasurementKey={pcResumeMeasurementKey}
                                                     provenance={activeSessionExecution}
-                                                    isRunning={isWaiting || isStreaming || isStopping}
+                                                    isRunning={generationActive}
+                                                    progressMessage={{
+                                                        id: `conversation-turn-progress:${activeSession?.id || 'new'}:${sessionTurnRuntimeRef.current[`${id}:${activeSession?.id}`]?.snapshot.generation || 0}`,
+                                                    }}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
                                                     onAttachmentDownload={handleAttachmentDownload}
                                                     onAttachmentUnavailable={markAttachmentUnavailable}
