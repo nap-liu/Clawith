@@ -381,7 +381,7 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
         )
     assert before == []
 
-    first_user_id, consumed, greeting, pending_confirmation, ignored_confirmation = await handler._save_user_message(
+    first_user_id, consumed, greeting, pending_confirmation, ignored_confirmation, turn_snapshot = await handler._save_user_message(
         "我要报修",
         "我要报修",
         "photo.png",
@@ -395,6 +395,10 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
     )
     assert pending_confirmation is None
     assert ignored_confirmation is False
+    assert turn_snapshot.anchor_id == first_user_id
+    assert turn_snapshot.generation == 1
+    assert turn_snapshot.revision == 1
+    assert turn_snapshot.status == "running"
 
     async with async_session() as db:
         rows = list(

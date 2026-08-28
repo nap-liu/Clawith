@@ -606,7 +606,11 @@ class WebSocketChatHandler:
             normalized_payload.setdefault(
                 "rejected_message_id", self.current_client_message_id
             )
-        await self._safe_send(
+        # A rejected send belongs only to the socket that attempted it.  The
+        # canonical snapshot is still attached so this client can reconcile,
+        # but broadcasting the rejection would surface another viewer's local
+        # error in every tab watching the same session.
+        await self.websocket.send_json(
             with_turn_envelope(normalized_payload, snapshot, event_kind=event_kind)
         )
 

@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api.websocket import WebSocketChatHandler
 from app.core.permissions import can_view_all_agent_chat_sessions
+from app.services.conversation_turn_lifecycle import ConversationTurnSnapshot
 
 # asyncio_mode = "auto" (pyproject) runs the async tests without an explicit
 # marker; the pure permission tests below stay synchronous.
@@ -260,10 +261,30 @@ async def test_resolve_honors_session_level_read_only_for_owner():
 
 async def test_read_only_monitor_send_is_refused():
     h = _handler()
+    h.agent_id = uuid.uuid4()
+    h.conv_id = str(uuid.uuid4())
+    h.current_client_message_id = "readonly-attempt"
     h.read_only = True
     h.welcome_message = ""
     h.history_messages = [object()]  # non-empty → skip welcome push
-    h.websocket = _FakeWS(incoming=[{"content": "试图以别人身份发送"}])
+    h.websocket = _FakeWS(incoming=[{
+        "content": "试图以别人身份发送",
+        "message_id": "readonly-attempt",
+    }])
+
+    async def _current_snapshot(*_args, **_kwargs):
+        return ConversationTurnSnapshot(
+            anchor_id=uuid.uuid4(),
+            generation=7,
+            revision=11,
+            status="active",
+        )
+
+    async def _must_not_broadcast(_payload):
+        raise AssertionError("a local rejection must not be broadcast to other viewers")
+
+    h._load_turn_snapshot = _current_snapshot
+    h._safe_send = _must_not_broadcast
 
     with pytest.raises(WebSocketDisconnect):
         await h.message_loop()
@@ -271,3 +292,8 @@ async def test_read_only_monitor_send_is_refused():
     assert any(m.get("type") == "error" and "只读" in (m.get("content") or "") for m in h.websocket.sent), (
         "a read-only monitor that tries to send must get refused, never drive a turn"
     )
+    rejection = next(m for m in h.websocket.sent if m.get("type") == "error")
+    assert rejection["rejected_message_id"] == "readonly-attempt"
+    assert rejection["turn"]["generation"] == 7
+    assert rejection["turn"]["revision"] == 11
+    assert rejection["turn"]["status"] == "active"
