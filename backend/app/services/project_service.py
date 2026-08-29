@@ -842,11 +842,11 @@ async def project_session_access_mode(
     user: User,
     session: ChatSession,
 ) -> str | None:
-    """Return ``read``/``edit`` for a project-owned conversation.
+    """Return ``read``/``edit`` for an auditable project session.
 
-    The project group uses the project's Human ACL directly. Subagent history
-    additionally requires its durable member snapshot to remain enabled before
-    it can accept new turns.
+    Group sessions use the project ACL directly. Historical Subagent sessions
+    remain readable after departure; writing them additionally requires the
+    exact durable member snapshot to still be enabled.
     """
 
     if session.project_id is None:

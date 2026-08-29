@@ -2082,7 +2082,15 @@ export default function H5AgentChat() {
     const stopGeneration = useCallback(() => {
         const ws = wsRef.current;
         if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'abort' }));
+            const runtimeSessionId = String(sessionIdRef.current || '');
+            const snapshot = (
+                turnRuntimeBySessionRef.current[runtimeSessionId] || IDLE_CONVERSATION_TURN
+            ).snapshot;
+            ws.send(JSON.stringify({
+                type: 'abort',
+                turn_anchor_id: snapshot.turnAnchorId,
+                generation: snapshot.generation,
+            }));
             generationActiveRef.current = true;
             setIsStopping(true);
             return;

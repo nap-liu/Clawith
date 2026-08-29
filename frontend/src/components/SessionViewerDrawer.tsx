@@ -329,7 +329,10 @@ export default function SessionViewerDrawer({
   const accessAgentId = target?.agentId || agentId;
   const targetReadOnly = target?.readOnly === true;
   const groupMode = Boolean(groupConfig);
-  const canCompose = interactive && !targetReadOnly && !serverReadOnly;
+  // Project group writes use the authorized REST adapter; its WebSocket is a
+  // read-only event subscription and must not disable that separate composer.
+  const canCompose =
+    interactive && !targetReadOnly && (!serverReadOnly || groupMode);
   const mentionLimit = Math.max(0, groupConfig?.maxMentions ?? 8);
   const mentionOptions = useMemo(
     () =>
@@ -620,7 +623,7 @@ export default function SessionViewerDrawer({
         if (payload.type === "connected") {
           setConnected(true);
           setServerReadOnly(payload.read_only === true);
-          if (payload.read_only === true) {
+          if (payload.read_only === true && !groupMode) {
             setComposerError(t("agent.sessionViewer.readOnlySession"));
           }
           return;
@@ -1018,10 +1021,18 @@ export default function SessionViewerDrawer({
   };
 
   const abortTurn = () => {
-    if (groupConfig) return;
     const socket = socketRef.current;
-    if (socket?.readyState === WebSocket.OPEN)
-      socket.send(JSON.stringify({ type: "abort" }));
+    if (socket?.readyState !== WebSocket.OPEN || !sessionId) return;
+    const snapshot = (
+      turnRuntimeBySessionRef.current[sessionId] || IDLE_CONVERSATION_TURN
+    ).snapshot;
+    socket.send(
+      JSON.stringify({
+        type: "abort",
+        turn_anchor_id: snapshot.turnAnchorId,
+        generation: snapshot.generation,
+      }),
+    );
   };
 
   const effectiveUnavailableAttachments =
@@ -1379,7 +1390,7 @@ export default function SessionViewerDrawer({
                   maxMentions={mentionLimit}
                   disabled={!canCompose || sending || confirmationPending}
                   placeholder={
-                    targetReadOnly || serverReadOnly
+                    targetReadOnly || (serverReadOnly && !groupMode)
                       ? t("agent.sessionViewer.readOnlySession")
                       : connected
                         ? t("chat.placeholder")
@@ -1419,7 +1430,7 @@ export default function SessionViewerDrawer({
                   rows={1}
                   disabled={!canCompose || sending || confirmationPending}
                   placeholder={
-                    targetReadOnly || serverReadOnly
+                    targetReadOnly || (serverReadOnly && !groupMode)
                       ? t("agent.sessionViewer.readOnlySession")
                       : connected
                         ? t("chat.placeholder")
@@ -1427,7 +1438,7 @@ export default function SessionViewerDrawer({
                   }
                 />
               )}
-              {sending && !groupConfig ? (
+              {sending ? (
                 <button
                   type="button"
                   className="session-viewer-drawer__composer-send session-viewer-drawer__composer-send--stop"
@@ -1435,15 +1446,6 @@ export default function SessionViewerDrawer({
                   title={t("chat.stop")}
                 >
                   <IconPlayerStopFilled size={16} />
-                </button>
-              ) : sending ? (
-                <button
-                  type="button"
-                  className="session-viewer-drawer__composer-send"
-                  disabled
-                  title={t("chat.sending")}
-                >
-                  <IconRefresh className="subagent-run-card__spin" size={16} />
                 </button>
               ) : (
                 <button
@@ -1466,9 +1468,9 @@ export default function SessionViewerDrawer({
                 </button>
               )}
             </div>
-            {targetReadOnly || serverReadOnly || !connected || groupConfig ? (
+            {targetReadOnly || (serverReadOnly && !groupMode) || !connected || groupConfig ? (
               <small className="session-viewer-drawer__composer-status">
-                {targetReadOnly || serverReadOnly
+                {targetReadOnly || (serverReadOnly && !groupMode)
                   ? t("agent.sessionViewer.readOnly")
                   : connected
                     ? groupTurn?.phase === "expired"

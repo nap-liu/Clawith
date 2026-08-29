@@ -8,6 +8,7 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
@@ -41,6 +42,12 @@ INPUT_PROCESSING = "processing"
 INPUT_DONE = "done"
 INPUT_CANCELLED = "cancelled"
 
+CAUSAL_ROOT_SESSION_ID = "causal_root_session_id"
+CAUSAL_ROOT_ANCHOR_ID = "causal_root_anchor_id"
+CAUSAL_ROOT_GENERATION = "causal_root_generation"
+CAUSAL_PARENT_SESSION_ID = "causal_parent_session_id"
+CAUSAL_PARENT_ANCHOR_ID = "causal_parent_anchor_id"
+
 RUN_QUEUED = "queued"
 RUN_RUNNING = "running"
 RUN_WAITING = "waiting_confirmation"
@@ -66,9 +73,26 @@ SUBAGENT_DISPATCH_DISCARDED = "discarded"
 
 settings = get_settings()
 _running_tasks: dict[uuid.UUID, asyncio.Task] = {}
+_running_task_lease_owners: dict[uuid.UUID, str] = {}
 _running_tasks_guard = asyncio.Lock()
 _dispatch_wakeup = asyncio.Event()
 _project_dispatch_wakeup = asyncio.Event()
+_current_subagent_lease_owner: ContextVar[str | None] = ContextVar(
+    "current_subagent_lease_owner",
+    default=None,
+)
+
+
+def _expected_subagent_lease_owner() -> str:
+    return _current_subagent_lease_owner.get() or settings.INSTANCE_ID
+
+
+def _owns_subagent_lease(run: SubagentRun | None) -> bool:
+    return bool(
+        run is not None
+        and run.status == RUN_RUNNING
+        and run.lease_owner == _expected_subagent_lease_owner()
+    )
 
 
 def _signal_dispatch_work() -> None:
@@ -102,6 +126,57 @@ async def _finish_parent_event_dispatch(
 
 class SubagentError(ValueError):
     """A safe, user-facing Subagent contract error."""
+
+
+async def _subagent_input_causality(
+    db,
+    *,
+    parent: ChatSession,
+    explicit_parent_anchor_id: uuid.UUID | None = None,
+) -> dict[str, str | int]:
+    """Snapshot the exact parent generation that admitted one child input."""
+
+    from app.services.conversation_turn_lifecycle import (
+        ACTIVE_TURN_STATUS,
+        conversation_turn_snapshot_for_session,
+    )
+
+    snapshot = conversation_turn_snapshot_for_session(parent)
+    # Preserve legacy/internal callers that have not admitted lifecycle state.
+    # Once a session has durable lifecycle metadata, only its running owner may
+    # admit a child input.
+    if snapshot.status == "idle":
+        return {}
+    if snapshot.status != ACTIVE_TURN_STATUS:
+        raise SubagentError("当前父 Turn 已停止，不能再启动或投递 Subagent。")
+    if snapshot.anchor_id is None or snapshot.generation < 1:
+        raise SubagentError("当前父 Turn 状态无效，不能投递 Subagent。")
+    parent_anchor_id = explicit_parent_anchor_id or snapshot.anchor_id
+    parent_anchor = await db.get(ChatMessage, parent_anchor_id)
+    root_anchor = await db.get(ChatMessage, snapshot.anchor_id)
+    if (
+        parent_anchor is None
+        or root_anchor is None
+        or parent_anchor.conversation_id != str(parent.id)
+        or parent_anchor.agent_id != parent.agent_id
+        or root_anchor.conversation_id != str(parent.id)
+        or root_anchor.agent_id != parent.agent_id
+    ):
+        return {}
+    root_meta = _message_meta(root_anchor)
+    return {
+        CAUSAL_ROOT_SESSION_ID: str(
+            root_meta.get(CAUSAL_ROOT_SESSION_ID) or parent.id
+        ),
+        CAUSAL_ROOT_ANCHOR_ID: str(
+            root_meta.get(CAUSAL_ROOT_ANCHOR_ID) or root_anchor.id
+        ),
+        CAUSAL_ROOT_GENERATION: int(
+            root_meta.get(CAUSAL_ROOT_GENERATION) or snapshot.generation
+        ),
+        CAUSAL_PARENT_SESSION_ID: str(parent.id),
+        CAUSAL_PARENT_ANCHOR_ID: str(parent_anchor.id),
+    }
 
 
 def _project_member_origin_tool_call_id(
@@ -341,7 +416,7 @@ async def _requeue_capacity_blocked_subagent(
     async with async_session() as db:
         run = await db.get(SubagentRun, run_id, with_for_update=True)
         anchor = await db.get(ChatMessage, anchor_id, with_for_update=True)
-        if run is None or anchor is None or run.status != RUN_RUNNING or run.lease_owner != settings.INSTANCE_ID:
+        if anchor is None or not _owns_subagent_lease(run):
             return
         meta = _message_meta(anchor)
         if meta.get("subagent_input_state") == INPUT_PROCESSING:
@@ -587,7 +662,7 @@ async def create_subagent(
 
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
-        parent = await db.get(ChatSession, parent_id)
+        parent = await db.get(ChatSession, parent_id, with_for_update=True)
         if agent is None or parent is None or not await _agent_participates(db, parent, agent_id):
             raise SubagentError("当前 Agent 无权从这个 Session 创建 Subagent。")
         if parent.source_channel == SUBAGENT_CHANNEL:
@@ -763,6 +838,11 @@ async def create_subagent(
             )
 
         message_time += timedelta(microseconds=1)
+        causality = await _subagent_input_causality(
+            db,
+            parent=parent,
+            explicit_parent_anchor_id=turn_anchor_id,
+        )
         task_row = ChatMessage(
             agent_id=agent_id,
             user_id=resolved_user_id,
@@ -772,6 +852,7 @@ async def create_subagent(
             conversation_id=str(child_id),
             message_meta={
                 **task_metadata,
+                **causality,
                 "kind": SUBAGENT_INPUT,
                 "subagent_input_state": INPUT_PENDING,
                 "attachments": [],
@@ -803,6 +884,7 @@ async def append_subagent_message(
     origin_tool_call_id: str,
     project_run_id: uuid.UUID | None = None,
     input_metadata: dict | None = None,
+    allow_parent_continuation: bool = False,
 ) -> str:
     content = str(message or "").strip()
     if not content:
@@ -818,14 +900,50 @@ async def append_subagent_message(
     event_key = f"subagent-parent-input:{child_id}:{call_id}"
 
     async with async_session() as db:
+        # Parent Session is the admission fence shared with STOP. If STOP wins,
+        # causality validation below rejects this late child input; if this
+        # transaction wins, STOP sees and cancels it.
+        parent = await db.get(ChatSession, parent_id, with_for_update=True)
+        if parent is None:
+            raise SubagentError("当前 Session 不存在。")
+        if allow_parent_continuation:
+            from app.services.conversation_turn_lifecycle import (
+                ACTIVE_TURN_STATUS,
+                SUSPENDED_TURN_STATUS,
+                conversation_turn_snapshot_for_session,
+                transition_conversation_turn,
+            )
+
+            parent_snapshot = conversation_turn_snapshot_for_session(parent)
+            if parent_snapshot.status == SUSPENDED_TURN_STATUS:
+                raise SubagentError("父 Turn 正在等待确认，暂时不能继续 Subagent。")
+            if parent_snapshot.status != ACTIVE_TURN_STATUS:
+                continuation_anchor = ChatMessage(
+                    agent_id=parent.agent_id,
+                    user_id=execution_user_id,
+                    role="system",
+                    content="",
+                    conversation_id=str(parent.id),
+                    message_meta={
+                        "kind": "project_subagent_external_continuation",
+                        "consumed_by_onmessage": True,
+                        "attachments": [],
+                    },
+                )
+                db.add(continuation_anchor)
+                await db.flush()
+                await transition_conversation_turn(
+                    db,
+                    agent_id=parent.agent_id,
+                    conversation_id=str(parent.id),
+                    turn_anchor_id=continuation_anchor.id,
+                    status=ACTIVE_TURN_STATUS,
+                )
         run = await db.get(SubagentRun, child_id, with_for_update=True)
         if run is None or not _run_owned_by_parent(run, parent_id):
             raise SubagentError("Subagent 不存在，或不属于当前 Session。")
         if run.execution_user_id != execution_user_id:
             raise SubagentError("当前执行身份无权操作这个 Subagent。")
-        if run.status == RUN_CANCELLED:
-            raise SubagentError("Subagent 已停止，不能恢复。")
-
         child = await db.get(ChatSession, child_id)
         if child is None or child.agent_id != agent_id:
             raise SubagentError("当前 Agent 无权操作这个 Subagent。")
@@ -901,6 +1019,7 @@ async def append_subagent_message(
                     ),
                 }
         supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
+        causality = await _subagent_input_causality(db, parent=parent)
         input_row = ChatMessage(
             agent_id=child.agent_id,
             user_id=run.execution_user_id,
@@ -911,6 +1030,7 @@ async def append_subagent_message(
             external_event_key=event_key,
             message_meta={
                 **supplied_metadata,
+                **causality,
                 "kind": SUBAGENT_INPUT,
                 "subagent_input_state": INPUT_PENDING,
                 "attachments": supplied_attachments,
@@ -954,7 +1074,7 @@ async def append_subagent_message(
         except ConversationTurnConflict:
             pass
         child.last_message_at = now
-        if run.status in {RUN_COMPLETED, RUN_FAILED, RUN_WAITING}:
+        if run.status in {RUN_COMPLETED, RUN_FAILED, RUN_WAITING, RUN_CANCELLED}:
             run.status = RUN_QUEUED
             run.mode = "async"
             run.lease_owner = None
@@ -1067,78 +1187,23 @@ async def stop_subagent(
             raise SubagentError("当前 Agent 无权操作这个 Subagent。")
         if run.status in TERMINAL_STATUSES:
             return run.status
+        await db.rollback()
 
-        from app.services.conversation_turn_lifecycle import (
-            cancel_current_conversation_turn,
-        )
+    from app.services.turn_control import stop_session_turn_tree
 
-        await cancel_current_conversation_turn(
-            db,
-            agent_id=child.agent_id,
-            conversation_id=str(child.id),
-        )
-        run.status = RUN_CANCELLED
-        run.lease_owner = None
-        run.lease_expires_at = None
-        rows = (
-            (
-                await db.execute(
-                    select(ChatMessage).where(
-                        ChatMessage.conversation_id == str(child_id),
-                        ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
-                        ChatMessage.message_meta["subagent_input_state"]
-                        .as_string()
-                        .in_([INPUT_PENDING, INPUT_PROCESSING]),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for row in rows:
-            meta = _message_meta(row)
-            meta["subagent_input_state"] = INPUT_CANCELLED
-            row.message_meta = meta
-        project_id = run.project_id
-        project_run_ids = {
-            uuid.UUID(str(raw_id))
-            for row in rows
-            for raw_id in [_message_meta(row).get("project_run_id")]
-            if raw_id
-        }
-        if project_run_ids:
-            from app.models.project import ProjectRun
-            from app.services.project_service import TERMINAL_PROJECT_RUN_STATUSES
-
-            project_runs = list(
-                (
-                    await db.execute(
-                        select(ProjectRun).where(
-                            ProjectRun.id.in_(project_run_ids),
-                            ProjectRun.status.not_in(TERMINAL_PROJECT_RUN_STATUSES),
-                        )
-                    )
-                ).scalars()
-            )
-            now = datetime.now(UTC)
-            for project_run in project_runs:
-                project_run.status = "cancelled"
-                project_run.finished_at = now
-                project_run.error = "Project subagent was stopped"
-        await db.commit()
-
-    await publish_cancelled_subagent_turns(
-        [child_id],
-        project_id=project_id,
+    await stop_session_turn_tree(
+        agent_id=agent_id,
+        session_id=child_id,
+        reason=f"Subagent stop requested by user {execution_user_id}",
     )
-    async with _running_tasks_guard:
-        task = _running_tasks.get(child_id)
-        if task is not None and not task.done():
-            task.cancel()
     return RUN_CANCELLED
 
 
-async def cancel_local_subagent_tasks(run_ids: list[uuid.UUID]) -> None:
+async def cancel_local_subagent_tasks(
+    run_ids: list[uuid.UUID],
+    *,
+    expected_lease_owners: dict[uuid.UUID, str | None] | None = None,
+) -> None:
     """Interrupt local workers after their durable runs were revoked.
 
     Cross-instance workers observe the cancelled status on their next lease,
@@ -1148,7 +1213,16 @@ async def cancel_local_subagent_tasks(run_ids: list[uuid.UUID]) -> None:
     if not run_ids:
         return
     async with _running_tasks_guard:
-        tasks = [_running_tasks.get(run_id) for run_id in run_ids if _running_tasks.get(run_id) is not None]
+        tasks = [
+            _running_tasks.get(run_id)
+            for run_id in run_ids
+            if _running_tasks.get(run_id) is not None
+            and (
+                expected_lease_owners is None
+                or _running_task_lease_owners.get(run_id)
+                == expected_lease_owners.get(run_id)
+            )
+        ]
     for task in tasks:
         if task is not None and not task.done():
             task.cancel()
@@ -1390,7 +1464,11 @@ async def prepare_subagent_tools(
     return child_tools
 
 
-async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
+async def _claim_subagent(
+    run_id: uuid.UUID | None = None,
+    *,
+    with_token: bool = False,
+) -> uuid.UUID | tuple[uuid.UUID, str] | None:
     now = datetime.now(UTC)
     async with async_session() as db:
         lease_conditions = [
@@ -1415,11 +1493,16 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
             )
         ).scalar_one_or_none()
         if standard_run is not None:
+            lease_owner = (
+                f"{settings.INSTANCE_ID}:{uuid.uuid4()}"
+                if with_token
+                else settings.INSTANCE_ID
+            )
             standard_run.status = RUN_RUNNING
-            standard_run.lease_owner = settings.INSTANCE_ID
+            standard_run.lease_owner = lease_owner
             standard_run.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
             await db.commit()
-            return standard_run.id
+            return (standard_run.id, lease_owner) if with_token else standard_run.id
 
         from app.models.project import Project, ProjectRun
 
@@ -1514,11 +1597,16 @@ async def _claim_subagent(run_id: uuid.UUID | None = None) -> uuid.UUID | None:
                     )
                     capacity_available = bool(allowed)
                 if capacity_available:
+                    lease_owner = (
+                        f"{settings.INSTANCE_ID}:{uuid.uuid4()}"
+                        if with_token
+                        else settings.INSTANCE_ID
+                    )
                     run.status = RUN_RUNNING
-                    run.lease_owner = settings.INSTANCE_ID
+                    run.lease_owner = lease_owner
                     run.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
                     await db.commit()
-                    return run.id
+                    return (run.id, lease_owner) if with_token else run.id
                 if run.project_id is not None:
                     saturated_project_ids.add(run.project_id)
             if run_id is not None:
@@ -1710,7 +1798,7 @@ async def _load_or_start_input(
 ) -> tuple[ChatMessage, bool] | None:
     async with async_session() as db:
         run = await db.get(SubagentRun, run_id, with_for_update=True)
-        if run is None or run.status != RUN_RUNNING or run.lease_owner != settings.INSTANCE_ID:
+        if not _owns_subagent_lease(run):
             return None
         processing = (
             await db.execute(
@@ -1819,7 +1907,7 @@ async def _assert_subagent_running(run_id: uuid.UUID) -> None:
         run = await db.get(SubagentRun, run_id)
         if run is None or run.status == RUN_CANCELLED:
             raise asyncio.CancelledError
-        if run.status != RUN_RUNNING or run.lease_owner != settings.INSTANCE_ID:
+        if not _owns_subagent_lease(run):
             raise RuntimeError("Subagent lease lost")
         child = await db.get(ChatSession, run_id)
         if child is None:
@@ -1836,7 +1924,7 @@ async def _drain_subagent_inbox(
         run = await db.get(SubagentRun, run_id, with_for_update=True)
         if run is None or run.status == RUN_CANCELLED:
             raise asyncio.CancelledError
-        if run.status != RUN_RUNNING or run.lease_owner != settings.INSTANCE_ID:
+        if not _owns_subagent_lease(run):
             raise RuntimeError("Subagent lease lost")
         pending = (
             (
@@ -2079,9 +2167,10 @@ async def resume_subagent_after_confirmation(
         return True
     # Confirmation resolution is durable even while the project is paused.
     # The canonical claim boundary leaves it queued until runtime resumes.
-    claimed = await _claim_subagent(run_id)
+    claimed = await _claim_subagent(run_id, with_token=True)
     if claimed is not None:
-        await execute_claimed_subagent(claimed)
+        claimed_run_id, lease_owner = claimed
+        await execute_claimed_subagent(claimed_run_id, lease_owner=lease_owner)
     return True
 
 
@@ -2105,7 +2194,7 @@ async def _finish_subagent_turn(
 
     async with async_session() as db:
         run = await db.get(SubagentRun, run_id, with_for_update=True)
-        if run is None or run.status != RUN_RUNNING or run.lease_owner != settings.INSTANCE_ID:
+        if not _owns_subagent_lease(run):
             return False
         child = await db.get(ChatSession, run_id)
         if child is None:
@@ -2386,13 +2475,20 @@ async def _finish_subagent_turn(
         return terminal
 
 
-async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
+async def execute_claimed_subagent(
+    run_id: uuid.UUID,
+    *,
+    lease_owner: str | None = None,
+) -> None:
     """Run one claimed child until its inbox is empty or ownership is lost."""
     from app.services.channel_llm import _call_agent_llm
     from app.services.chat_history import load_history_prefix_before_anchor
     from app.services.llm.caller import is_error_result
 
     current = asyncio.current_task()
+    lease_context_token = _current_subagent_lease_owner.set(
+        lease_owner or settings.INSTANCE_ID
+    )
 
     async def _lease_heartbeat() -> None:
         failures = 0
@@ -2405,7 +2501,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                         run_id,
                         with_for_update=True,
                     )
-                    if owned is None or owned.status != RUN_RUNNING or owned.lease_owner != settings.INSTANCE_ID:
+                    if not _owns_subagent_lease(owned):
                         if current is not None and not current.done():
                             current.cancel()
                         return
@@ -2429,6 +2525,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
     if current is not None:
         async with _running_tasks_guard:
             _running_tasks[run_id] = current
+            _running_task_lease_owners[run_id] = _expected_subagent_lease_owner()
     current_anchor_id: uuid.UUID | None = None
     active_turn_capacity: AsyncExitStack | None = None
     try:
@@ -2771,7 +2868,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
             control_plane_cancelled = is_current_turn_cancel_requested()
             async with async_session() as cancel_db:
                 owned = await cancel_db.get(SubagentRun, run_id, with_for_update=True)
-                if owned is not None and owned.status == RUN_RUNNING and owned.lease_owner == settings.INSTANCE_ID:
+                if _owns_subagent_lease(owned):
                     if control_plane_cancelled:
                         from app.services.conversation_turn_lifecycle import (
                             cancel_current_conversation_turn,
@@ -2845,9 +2942,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                         ).scalar_one_or_none()
                     )
                     if (
-                        owned is not None
-                        and owned.status == RUN_RUNNING
-                        and owned.lease_owner == settings.INSTANCE_ID
+                        _owns_subagent_lease(owned)
                         and pending_exists
                     ):
                         owned.status = RUN_QUEUED
@@ -2862,6 +2957,8 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
         async with _running_tasks_guard:
             if _running_tasks.get(run_id) is current:
                 _running_tasks.pop(run_id, None)
+                _running_task_lease_owners.pop(run_id, None)
+        _current_subagent_lease_owner.reset(lease_context_token)
 
 
 async def _latest_subagent_result(run_id: uuid.UUID) -> tuple[str, str, list[str]]:
@@ -2907,9 +3004,10 @@ async def run_subagent_sync(run_id: uuid.UUID) -> tuple[str, str, list[str]]:
         status, result, parent_messages = await _latest_subagent_result(run_id)
         if status in TERMINAL_STATUSES:
             return status, result, parent_messages
-        claimed = await _claim_subagent(run_id)
+        claimed = await _claim_subagent(run_id, with_token=True)
         if claimed is not None:
-            await execute_claimed_subagent(claimed)
+            claimed_run_id, lease_owner = claimed
+            await execute_claimed_subagent(claimed_run_id, lease_owner=lease_owner)
         else:
             await asyncio.sleep(0.25)
 
@@ -2918,9 +3016,9 @@ async def _subagent_worker_loop() -> None:
     semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
     active: set[asyncio.Task] = set()
 
-    async def _execute(run_id: uuid.UUID) -> None:
+    async def _execute(run_id: uuid.UUID, lease_owner: str) -> None:
         async with semaphore:
-            await execute_claimed_subagent(run_id)
+            await execute_claimed_subagent(run_id, lease_owner=lease_owner)
 
     while True:
         active = {task for task in active if not task.done()}
@@ -2928,7 +3026,7 @@ async def _subagent_worker_loop() -> None:
             await asyncio.sleep(0.1)
             continue
         try:
-            claimed = await _claim_subagent()
+            claimed = await _claim_subagent(with_token=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - daemon must survive transient DB faults
@@ -2938,7 +3036,11 @@ async def _subagent_worker_loop() -> None:
         if claimed is None:
             await asyncio.sleep(0.5)
             continue
-        task = asyncio.create_task(_execute(claimed), name=f"subagent:{claimed}")
+        claimed_run_id, lease_owner = claimed
+        task = asyncio.create_task(
+            _execute(claimed_run_id, lease_owner),
+            name=f"subagent:{claimed_run_id}",
+        )
         active.add(task)
 
 
@@ -3354,12 +3456,24 @@ def build_parent_subagent_before_round(
     active_turn_anchor_id: uuid.UUID,
     execution_agent_id: uuid.UUID,
     execution_user_id: uuid.UUID,
+    include_turn_inbox: bool = False,
     upstream: Callable[[int], Awaitable[list[dict]]] | None = None,
 ) -> Callable[[int], Awaitable[list[dict]]]:
     """Compose one shared parent-event round hook for Web and channel turns."""
 
     async def _before_round(round_i: int) -> list[dict]:
         injected = list(await upstream(round_i)) if upstream is not None else []
+        if include_turn_inbox:
+            from app.services.turn_inbox import drain_turn_inbox
+
+            injected.extend(
+                await drain_turn_inbox(
+                    session_id=parent_session_id,
+                    active_turn_anchor_id=active_turn_anchor_id,
+                    execution_agent_id=execution_agent_id,
+                    execution_user_id=execution_user_id,
+                )
+            )
         injected.extend(
             await drain_parent_subagent_events(
                 parent_session_id=parent_session_id,

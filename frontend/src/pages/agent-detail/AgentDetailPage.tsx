@@ -6760,7 +6760,14 @@ export default function AgentDetailPage() {
                                                             const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
                                                             const activeSocket = wsMapRef.current[activeRuntimeKey];
                                                             if (activeSocket?.readyState === WebSocket.OPEN) {
-                                                                activeSocket.send(JSON.stringify({ type: 'abort' }));
+                                                                const snapshot = (
+                                                                    sessionTurnRuntimeRef.current[activeRuntimeKey] || IDLE_CONVERSATION_TURN
+                                                                ).snapshot;
+                                                                activeSocket.send(JSON.stringify({
+                                                                    type: 'abort',
+                                                                    turn_anchor_id: snapshot.turnAnchorId,
+                                                                    generation: snapshot.generation,
+                                                                }));
                                                                 setIsStopping(true);
                                                                 setSessionUiState(activeRuntimeKey, { isStopping: true });
                                                             } else {

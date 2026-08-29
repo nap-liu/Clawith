@@ -20,7 +20,6 @@ from app.services.channel_dispatch import (
     chat_session_lock_key,
     has_running_turn,
 )
-from app.services.chat_history import mark_latest_incomplete_turn_cancelled
 from app.services.im_thinking_output import (
     THINKING_OFF,
     THINKING_ON,
@@ -192,16 +191,26 @@ async def handle_channel_command(
             source_channel=source_channel,
             external_conv_id=external_conv_id,
         )
-        cancelled = await cancel_running_turn(lock_key)
-        cancelled_anchor_id = None
+        stop_result = None
         if session is not None:
-            cancelled_anchor_id = await mark_latest_incomplete_turn_cancelled(
-                db,
-                agent_id=agent_id,
-                conversation_id=str(session.id),
-                reason="stop",
-            )
-        stopped = cancelled or cancelled_anchor_id is not None
+            from app.services.turn_control import stop_session_turn_tree
+
+            try:
+                stop_result = await stop_session_turn_tree(
+                    agent_id=agent_id,
+                    session_id=session.id,
+                    reason=f"IM /stop by user {user_id}",
+                    allow_legacy_recovery=True,
+                )
+            except LookupError:
+                # The route can disappear between lookup and STOP. The legacy
+                # marker below remains the bounded recovery compatibility path.
+                stop_result = None
+        cancelled = await cancel_running_turn(lock_key)
+        stopped = (
+            cancelled
+            or bool(stop_result and stop_result.stopped)
+        )
         return {
             "action": "stop_turn",
             "message": "已请求停止当前工作。" if stopped else "当前没有正在执行的工作。",
@@ -609,7 +618,6 @@ async def handle_channel_command(
             agent_id=agent_id,
             external_conv_id=external_conv_id,
             source_channel=source_channel,
-            for_update=True,
         )
 
         lock_key = _channel_turn_lock_key(
@@ -618,19 +626,33 @@ async def handle_channel_command(
             source_channel=source_channel,
             external_conv_id=external_conv_id,
         )
+        if old_session:
+            from app.services.turn_control import stop_session_turn_tree
+
+            try:
+                stop_result = await stop_session_turn_tree(
+                    agent_id=agent_id,
+                    session_id=old_session.id,
+                    reason=f"IM /new by user {user_id}",
+                    allow_legacy_recovery=True,
+                )
+            except LookupError:
+                stop_result = None
         await cancel_running_turn(lock_key)
 
         cleared_scene_key = ""
         if old_session:
+            old_session = await _load_channel_session(
+                db,
+                agent_id=agent_id,
+                external_conv_id=external_conv_id,
+                source_channel=source_channel,
+                for_update=True,
+            )
+        if old_session:
             from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
 
             cleared_scene_key = str((getattr(old_session, "im_config", None) or {}).get(SCENE_SESSION_CONFIG_KEY) or "")
-            await mark_latest_incomplete_turn_cancelled(
-                db,
-                agent_id=agent_id,
-                conversation_id=str(old_session.id),
-                reason="new",
-            )
             # Rename old external_conv_id so find_or_create will make a new one
             now = datetime.now(UTC)
             old_session.external_conv_id = f"{external_conv_id}__archived_{now.strftime('%Y%m%d_%H%M%S')}"

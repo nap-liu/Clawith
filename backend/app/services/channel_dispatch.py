@@ -16,6 +16,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -62,6 +63,19 @@ _session_locks: dict[str, asyncio.Lock] = {}
 _session_locks_guard = asyncio.Lock()
 _running_turns: dict[str, set[asyncio.Task]] = {}
 _running_turns_guard = asyncio.Lock()
+_turn_owner_admission: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
+_channel_interjection: ContextVar[bool] = ContextVar(
+    "channel_interjection",
+    default=False,
+)
+_channel_interjection_lock_key: ContextVar[str | None] = ContextVar(
+    "channel_interjection_lock_key",
+    default=None,
+)
+_promoted_turn: ContextVar[tuple[UUID, str] | None] = ContextVar(
+    "channel_promoted_turn",
+    default=None,
+)
 _send_locks: dict[str, asyncio.Lock] = {}
 _send_locks_guard = asyncio.Lock()
 
@@ -144,6 +158,30 @@ async def _clear_running_turn(lock_key: str, task: asyncio.Task) -> None:
             _running_turns.pop(lock_key, None)
 
 
+def is_channel_turn_interjection() -> bool:
+    """Return whether this IM work arrived while another local owner runs."""
+
+    return _channel_interjection.get()
+
+
+def mark_channel_promoted_turn(agent_id: UUID, session_id: str) -> None:
+    """Record an inbox promotion for the dispatcher to start after commit."""
+
+    _promoted_turn.set((agent_id, session_id))
+
+
+async def mark_channel_turn_admitted() -> None:
+    """Release local follow-up ingestion once the first owner has a DB anchor."""
+
+    lock_key = _channel_interjection_lock_key.get()
+    if lock_key is None:
+        return
+    async with _running_turns_guard:
+        current = _turn_owner_admission.get(lock_key)
+        if current is not None:
+            current[1].set()
+
+
 async def cancel_running_turn(lock_key: str) -> bool:
     """Cancel all running or queued non-command IM turns for this lock key."""
     async with _running_turns_guard:
@@ -197,37 +235,84 @@ async def run_channel_message(
     current_task = asyncio.current_task()
     if current_task is not None:
         await _register_running_turn(lock_key, current_task)
+    interjection = False
+    owner_admitted_event: asyncio.Event | None = None
+    if current_task is not None:
+        async with _running_turns_guard:
+            current = _turn_owner_admission.get(lock_key)
+            if current is not None and not current[0].done():
+                interjection = current_task is not current[0]
+                owner_admitted_event = current[1]
+            else:
+                owner_admitted_event = asyncio.Event()
+                _turn_owner_admission[lock_key] = (
+                    current_task,
+                    owner_admitted_event,
+                )
     try:
-        capacity = get_workload_capacity()
-        async with (
-            capacity.slot(
-                workload_kind,
-                tenant_id or "unscoped",
-            ),
-            active_turn_boundary(),
-        ):
-            lock = await _get_session_lock(lock_key)
-            async with lock:
+        if interjection:
+            if owner_admitted_event is not None:
+                await owner_admitted_event.wait()
+            interjection_token = _channel_interjection.set(True)
+            lock_key_token = _channel_interjection_lock_key.set(lock_key)
+            promoted_token = _promoted_turn.set(None)
+            try:
+                # This path is ingestion-only. If the old owner has already
+                # terminated, ingestion promotes a durable inbox row and still
+                # returns without running an LLM outside normal governance.
+                reply = await work()
+                promoted = _promoted_turn.get()
+                if promoted is not None:
+                    from app.services.turn_inbox import kick_promoted_turn_inbox
 
-                async def _run_locked() -> str:
-                    await _safe(reactions.on_consume)
-                    try:
-                        reply = await work()
-                    except BaseException as exc:
-                        await _safe(reactions.on_error, exc)
-                        raise
-                    await _safe(reactions.on_complete, reply)
-                    return reply
+                    await kick_promoted_turn_inbox(
+                        agent_id=promoted[0],
+                        session_id=promoted[1],
+                    )
+                return reply
+            finally:
+                _promoted_turn.reset(promoted_token)
+                _channel_interjection_lock_key.reset(lock_key_token)
+                _channel_interjection.reset(interjection_token)
+        lock_key_token = _channel_interjection_lock_key.set(lock_key)
+        try:
+            capacity = get_workload_capacity()
+            async with (
+                capacity.slot(
+                    workload_kind,
+                    tenant_id or "unscoped",
+                ),
+                active_turn_boundary(),
+            ):
+                lock = await _get_session_lock(lock_key)
+                async with lock:
 
-                if distributed:
-                    async with redis_lease_lock(
-                        lock_key,
-                        namespace="channel-session-turn",
-                    ):
-                        return await _run_locked()
-                return await _run_locked()
+                    async def _run_locked() -> str:
+                        await _safe(reactions.on_consume)
+                        try:
+                            reply = await work()
+                        except BaseException as exc:
+                            await _safe(reactions.on_error, exc)
+                            raise
+                        await _safe(reactions.on_complete, reply)
+                        return reply
+
+                    if distributed:
+                        async with redis_lease_lock(
+                            lock_key,
+                            namespace="channel-session-turn",
+                        ):
+                            return await _run_locked()
+                    return await _run_locked()
+        finally:
+            _channel_interjection_lock_key.reset(lock_key_token)
     finally:
         if current_task is not None:
+            async with _running_turns_guard:
+                current = _turn_owner_admission.get(lock_key)
+                if current is not None and current[0] is current_task:
+                    _turn_owner_admission.pop(lock_key, None)
+                    current[1].set()
             await _clear_running_turn(lock_key, current_task)
 
 

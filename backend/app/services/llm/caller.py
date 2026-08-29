@@ -753,8 +753,17 @@ async def _persist_tool_call_events_strict(
         return False
 
     from app.services.chat_history import persist_tool_call_row
+    from app.services.conversation_turn_lifecycle import (
+        lock_conversation_turn_running,
+    )
 
     async with async_session() as db:
+        await lock_conversation_turn_running(
+            db,
+            agent_id=agent_uuid,
+            conversation_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        )
         for evt in events:
             await persist_tool_call_row(
                 db,
@@ -763,6 +772,7 @@ async def _persist_tool_call_events_strict(
                 conversation_id=session_id,
                 evt=evt,
                 turn_anchor_id=turn_anchor_id,
+                turn_fence_locked=True,
             )
         await db.commit()
     return True
@@ -1122,6 +1132,7 @@ async def _process_tool_call(
     on_code_output=None,
     emit_running: bool = True,
     turn_anchor_id: uuid.UUID | None = None,
+    before_execute=None,
 ) -> str:
     """Process a single tool call and return result."""
     args = _canonicalize_tc_arguments(tc, session_id)
@@ -1188,6 +1199,8 @@ async def _process_tool_call(
             pass
 
     # Execute tool — pass on_output for execute_code streaming
+    if before_execute is not None:
+        await before_execute()
     _on_output = on_code_output if tool_name in ("execute_code", "execute_code_e2b") else None
     _tool_t0 = perf_counter()
     result = await execute_tool(
@@ -1313,6 +1326,43 @@ async def call_llm(
     # missing execution user to the creator before calling this shared layer.
     agent_uuid = _coerce_uuid(agent_id)
     viewer_uuid = _coerce_uuid(user_id)
+
+    async def _assert_durable_turn_running() -> None:
+        durable_agent_id = turn_anchor_agent_id or agent_uuid
+        if durable_agent_id is None or not session_id or turn_anchor_id is None:
+            return
+        from app.services.conversation_turn_lifecycle import (
+            assert_conversation_turn_running,
+        )
+
+        await assert_conversation_turn_running(
+            agent_id=durable_agent_id,
+            conversation_id=str(session_id),
+            turn_anchor_id=turn_anchor_id,
+        )
+
+    async def _before_tool_execution_guard() -> None:
+        # This is an exact indexed point lookup at a tool boundary, not a
+        # timer/poll. It is intentionally repeated between tools so STOP that
+        # lands while a previous tool is running fences the next side effect.
+        await _assert_durable_turn_running()
+        if before_tool_execution is not None:
+            await before_tool_execution()
+
+    async def _admit_tool_execution() -> None:
+        durable_agent_id = turn_anchor_agent_id or agent_uuid
+        if durable_agent_id is not None and session_id and turn_anchor_id is not None:
+            from app.services.conversation_turn_lifecycle import (
+                admit_conversation_turn_side_effect,
+            )
+
+            await admit_conversation_turn_side_effect(
+                agent_id=durable_agent_id,
+                conversation_id=str(session_id),
+                turn_anchor_id=turn_anchor_id,
+            )
+        if before_tool_execution is not None:
+            await before_tool_execution()
     if agent_uuid is not None and viewer_uuid == agent_uuid:
         from app.models.agent import Agent as AgentModel
 
@@ -1493,6 +1543,7 @@ async def call_llm(
     # messages for the next round.
     skip_before_round_once = False
     for round_i in range(_max_tool_rounds):
+        await _assert_durable_turn_running()
         if skip_before_round_once:
             skip_before_round_once = False
         elif before_round is not None:
@@ -1875,8 +1926,7 @@ async def call_llm(
         # A durable background owner may have been cancelled while the provider
         # request was in flight.  Revalidate immediately before persisting tool
         # markers or starting any external side effect.
-        if before_tool_execution is not None:
-            await before_tool_execution()
+        await _before_tool_execution_guard()
 
         # Remember where this round's appended entries begin. The message-level
         # budget enforcer operates only on items at or beyond this index —
@@ -1900,53 +1950,8 @@ async def call_llm(
 
         full_reasoning_content = response.reasoning_content or ""
 
-        running_events: list[dict] = []
         for tc in sanitized_tool_calls or []:
-            args = _canonicalize_tc_arguments(tc, session_id)
-            tool_name = tc["function"]["name"]
-            should_execute, _error_msg = _check_tool_requires_args(tool_name, args)
-            if not should_execute or tool_name not in allowed_tool_names:
-                continue
-            running_events.append(
-                {
-                    "name": tool_name,
-                    "call_id": tc.get("id", ""),
-                    "args": args,
-                    "status": "running",
-                    "reasoning_content": full_reasoning_content,
-                }
-            )
-
-        try:
-            running_persisted = await _persist_tool_call_events_strict(
-                running_events,
-                agent_id=agent_id,
-                user_id=user_id,
-                session_id=session_id,
-                turn_anchor_id=turn_anchor_id,
-            )
-        except Exception as e:
-            logger.exception(f"[LLM] Failed to persist running tool markers before execution: {e}")
-            if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
-            await client_guard.close()
-            _log_turn_timing("tool_marker_persist_error", round_i + 1)
-            return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
-
-        if running_persisted:
-            for evt in running_events:
-                evt["_durable_persisted"] = True
-
-        for evt in running_events:
-            if on_tool_call:
-                try:
-                    await on_tool_call(evt)
-                except Exception:
-                    pass
-
-        for tc in sanitized_tool_calls or []:
-            if before_tool_execution is not None:
-                await before_tool_execution()
+            await _before_tool_execution_guard()
             try:
                 tool_error = await _process_tool_call(
                     tc=tc,
@@ -1960,8 +1965,9 @@ async def call_llm(
                     full_reasoning_content=full_reasoning_content,
                     allowed_tool_names=allowed_tool_names,
                     tools_for_llm=tools_for_llm,
-                    emit_running=False,
+                    emit_running=True,
                     turn_anchor_id=turn_anchor_id,
+                    before_execute=_admit_tool_execution,
                 )
             except Exception as e:
                 logger.exception(f"[LLM] Tool execution or durable result persistence failed: {e}")

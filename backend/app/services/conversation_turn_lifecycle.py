@@ -8,6 +8,7 @@ messages.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -106,6 +107,14 @@ def _session_snapshot(session: ChatSession) -> ConversationTurnSnapshot | None:
     if generation < 1 or revision < 1 or status not in TURN_STATUSES:
         return None
     return ConversationTurnSnapshot(anchor_id, generation, revision, status)
+
+
+def conversation_turn_snapshot_for_session(
+    session: ChatSession,
+) -> ConversationTurnSnapshot:
+    """Return the validated durable owner pointer already loaded on a Session."""
+
+    return _session_snapshot(session) or IDLE_TURN_SNAPSHOT
 
 
 def _validate_transition(previous: str, target: str) -> None:
@@ -313,6 +322,92 @@ async def get_conversation_turn_snapshot(
     return _snapshot(anchor) if anchor is not None else IDLE_TURN_SNAPSHOT
 
 
+async def assert_conversation_turn_running(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> None:
+    """Fence provider rounds and tool side effects behind durable STOP state."""
+
+    if turn_anchor_id is None:
+        return
+    from app.database import async_session
+
+    async with async_session() as db:
+        snapshot = await get_conversation_turn_snapshot(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+    # Legacy callers without lifecycle metadata remain compatible. Once an
+    # anchor is admitted, only its active state may start more provider/tool IO.
+    if snapshot.status != "idle" and snapshot.status != ACTIVE_TURN_STATUS:
+        raise asyncio.CancelledError
+
+
+async def admit_conversation_turn_side_effect(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> None:
+    """Linearize one tool-side-effect admission against exact STOP."""
+
+    if turn_anchor_id is None:
+        return
+    from app.database import async_session
+
+    async with async_session() as db:
+        await lock_conversation_turn_running(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+        # Releasing this short transaction is the admission linearization
+        # point. No database lock is held across external tool I/O.
+        await db.commit()
+
+
+async def lock_conversation_turn_running(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> None:
+    """Lock the shared session fence and require its exact running owner."""
+
+    if turn_anchor_id is None:
+        return
+    try:
+        session_id = uuid.UUID(conversation_id)
+    except (TypeError, ValueError):
+        return
+    session = (
+        await db.execute(
+            select(ChatSession)
+            .where(
+                ChatSession.id == session_id,
+                ChatSession.agent_id == agent_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        raise asyncio.CancelledError
+    snapshot = conversation_turn_snapshot_for_session(session)
+    if snapshot.status == "idle":
+        return
+    if (
+        snapshot.status != ACTIVE_TURN_STATUS
+        or snapshot.anchor_id != turn_anchor_id
+    ):
+        raise asyncio.CancelledError
+
+
 async def cancel_current_conversation_turn(
     db: AsyncSession,
     *,
@@ -429,3 +524,15 @@ async def publish_committed_turn_terminal(
         snapshot=snapshot,
         event_kind="turn_terminal",
     )
+    try:
+        from app.services.turn_inbox import kick_promoted_turn_inbox
+
+        await kick_promoted_turn_inbox(
+            agent_id=agent_id,
+            session_id=conversation_id,
+        )
+    except Exception:
+        # The promoted user row is already a running durable lifecycle anchor;
+        # startup recovery remains the fallback if this best-effort local kick
+        # cannot be scheduled.
+        return

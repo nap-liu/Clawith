@@ -1121,6 +1121,50 @@ IGNORED_CONFIRMATION_RESULT = (
     "不得将其视为同意，也不得执行确认卡中描述的待确认操作。请根据用户随后发送的新消息继续处理。"
 )
 
+STOPPED_CONFIRMATION_RESULT = (
+    "当前 turn 已被用户终止；本确认请求已取消，迟到的卡片点击不得执行任何操作。"
+)
+
+
+async def cancel_pending_confirmation_for_stop(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Close the exact pending card inside the caller's STOP transaction."""
+
+    from app.models.audit import ChatMessage
+
+    pending = await find_pending_confirmation(
+        db,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+    )
+    if (
+        pending is None
+        or pending.turn_anchor_id != turn_anchor_id
+    ):
+        return None
+    row = await db.get(ChatMessage, pending.row_id, with_for_update=True)
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row.content or "{}")
+    except (TypeError, ValueError):
+        return None
+    if (
+        payload.get("name") != REQUEST_CONFIRMATION_TOOL_NAME
+        or payload.get("status") != "pending"
+    ):
+        return None
+    payload["status"] = "done"
+    payload["result"] = STOPPED_CONFIRMATION_RESULT
+    row.content = json.dumps(payload, ensure_ascii=False, default=str)
+    await db.flush()
+    return row.id
+
 
 async def ignore_pending_confirmation_for_new_input(
     db: AsyncSession,

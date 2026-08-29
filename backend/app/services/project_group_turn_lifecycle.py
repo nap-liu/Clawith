@@ -12,9 +12,11 @@ from app.database import async_session
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.project import ProjectRun
+from app.models.subagent_run import SubagentRun
 from app.services.confirmation_service import find_pending_confirmation
 from app.services.conversation_turn_lifecycle import (
     ConversationTurnSnapshot,
+    conversation_turn_snapshot_for_session,
     get_conversation_turn_snapshot,
     publish_conversation_turn_event,
     transition_conversation_turn,
@@ -25,7 +27,35 @@ GROUP_RUN_TRIGGERS = (
     "group_leader_message",
     "group_mention",
     "leader_reply_batch",
+    "leader_kickoff",
+    "manual",
+    "leader",
+    "schedule",
+    "retry",
 )
+EXTERNAL_CONTINUATION_KIND = "project_subagent_external_continuation"
+GROUP_ANCHOR_KINDS = (
+    "project_group_message",
+    "project_kickoff_confirmation",
+    "project_run_request",
+    EXTERNAL_CONTINUATION_KIND,
+)
+
+
+def project_run_group_anchor_id(run: ProjectRun) -> uuid.UUID | None:
+    """Return the exact visible group anchor that caused one ProjectRun."""
+
+    run_input = run.input if isinstance(run.input, dict) else {}
+    dispatch = run_input.get("dispatch")
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    raw_anchor_id = run_input.get("group_message_id") or dispatch.get(
+        "turn_anchor_id"
+    )
+    try:
+        return uuid.UUID(str(raw_anchor_id))
+    except (TypeError, ValueError):
+        return None
+
 
 ACTIVE_LEADER_REPLY_STATES = ("pending", "claimed")
 
@@ -57,6 +87,169 @@ class ProjectGroupTurnProjection:
             "active_agent_ids": [str(value) for value in self.active_agent_ids],
             "run_count": self.run_count,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _CausalChildCohort:
+    child_ids: frozenset[uuid.UUID]
+    active_child_ids: frozenset[uuid.UUID]
+    suspended_child_ids: frozenset[uuid.UUID]
+    succeeded_child_ids: frozenset[uuid.UUID]
+    active_agent_ids: tuple[uuid.UUID, ...]
+    children: tuple[ChatSession, ...]
+    all_active_suspended: bool
+    all_succeeded: bool
+    state_tokens: tuple[str, ...]
+
+
+async def _load_causal_child_cohort(
+    db: AsyncSession,
+    *,
+    session: ChatSession,
+    anchor_id: uuid.UUID | None,
+    generation: int,
+) -> _CausalChildCohort:
+    """Load exact direct-child ownership for one parent generation."""
+
+    if anchor_id is None or generation < 1:
+        return _CausalChildCohort(
+            frozenset(),
+            frozenset(),
+            frozenset(),
+            frozenset(),
+            (),
+            (),
+            False,
+            False,
+            (),
+        )
+
+    from app.services.subagent_runtime import (
+        CAUSAL_ROOT_ANCHOR_ID,
+        CAUSAL_ROOT_GENERATION,
+        CAUSAL_ROOT_SESSION_ID,
+        INPUT_DONE,
+        INPUT_PENDING,
+        INPUT_PROCESSING,
+        RUN_COMPLETED,
+        RUN_QUEUED,
+        RUN_RUNNING,
+        RUN_WAITING,
+        SUBAGENT_INPUT,
+    )
+
+    parent_runs = list(
+        (
+            await db.execute(
+                select(SubagentRun).where(SubagentRun.parent_session_id == session.id)
+            )
+        ).scalars()
+    )
+    candidate_child_ids = {run.id for run in parent_runs}
+    inputs = (
+        list(
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id.in_(
+                            [str(child_id) for child_id in candidate_child_ids]
+                        ),
+                        ChatMessage.message_meta["kind"].as_string() == SUBAGENT_INPUT,
+                        ChatMessage.message_meta[CAUSAL_ROOT_SESSION_ID].as_string()
+                        == str(session.id),
+                        ChatMessage.message_meta[CAUSAL_ROOT_ANCHOR_ID].as_string()
+                        == str(anchor_id),
+                        ChatMessage.message_meta[CAUSAL_ROOT_GENERATION].as_integer()
+                        == generation,
+                    )
+                )
+            ).scalars()
+        )
+        if candidate_child_ids
+        else []
+    )
+    child_ids = frozenset(uuid.UUID(row.conversation_id) for row in inputs)
+    run_by_id = {run.id: run for run in parent_runs if run.id in child_ids}
+    children = (
+        tuple(
+            (
+                await db.execute(select(ChatSession).where(ChatSession.id.in_(child_ids)))
+            ).scalars()
+        )
+        if child_ids
+        else ()
+    )
+    child_by_id = {child.id: child for child in children}
+    input_states_by_child: dict[uuid.UUID, list[str]] = {}
+    state_tokens: list[str] = []
+    for row in inputs:
+        child_id = uuid.UUID(row.conversation_id)
+        state = str(dict(row.message_meta or {}).get("subagent_input_state") or "")
+        input_states_by_child.setdefault(child_id, []).append(state)
+        state_tokens.append(f"input:{row.id}:{state}")
+
+    active_child_ids = frozenset(
+        child_id
+        for child_id in child_ids
+        if any(
+            state in {INPUT_PENDING, INPUT_PROCESSING}
+            for state in input_states_by_child.get(child_id, ())
+        )
+        or getattr(run_by_id.get(child_id), "status", None)
+        in {RUN_QUEUED, RUN_RUNNING, RUN_WAITING}
+        or (
+            child_id in child_by_id
+            and conversation_turn_snapshot_for_session(child_by_id[child_id]).phase
+            in {"active", "suspended"}
+        )
+    )
+    suspended_child_ids = frozenset(
+        child_id
+        for child_id in active_child_ids
+        if (
+            getattr(run_by_id.get(child_id), "status", None) == RUN_WAITING
+            and child_id in child_by_id
+            and conversation_turn_snapshot_for_session(child_by_id[child_id]).status
+            == "suspended"
+        )
+    )
+    succeeded_child_ids = frozenset(
+        child_id
+        for child_id in child_ids
+        if (
+            all(state == INPUT_DONE for state in input_states_by_child.get(child_id, ()))
+            and getattr(run_by_id.get(child_id), "status", None) == RUN_COMPLETED
+            and child_id in child_by_id
+            and conversation_turn_snapshot_for_session(child_by_id[child_id]).status
+            == "completed"
+        )
+    )
+    all_active_suspended = bool(active_child_ids) and suspended_child_ids == active_child_ids
+    all_succeeded = bool(child_ids) and succeeded_child_ids == child_ids
+    for child_id in child_ids:
+        child = child_by_id.get(child_id)
+        state_tokens.append(
+            f"child:{child_id}:{getattr(run_by_id.get(child_id), 'status', None)}:"
+            f"{conversation_turn_snapshot_for_session(child).status if child else None}"
+        )
+
+    return _CausalChildCohort(
+        child_ids=child_ids,
+        active_child_ids=active_child_ids,
+        suspended_child_ids=suspended_child_ids,
+        succeeded_child_ids=succeeded_child_ids,
+        active_agent_ids=tuple(
+            dict.fromkeys(
+                child_by_id[child_id].agent_id
+                for child_id in sorted(active_child_ids, key=str)
+                if child_id in child_by_id
+            )
+        ),
+        children=children,
+        all_active_suspended=all_active_suspended,
+        all_succeeded=all_succeeded,
+        state_tokens=tuple(sorted(state_tokens)),
+    )
 
 
 async def project_group_timeline_anchor_for_child_turn(
@@ -96,11 +289,7 @@ async def project_group_timeline_anchor_for_child_turn(
         or project_run.trigger_type not in GROUP_RUN_TRIGGERS
     ):
         return None
-    run_input = project_run.input if isinstance(project_run.input, dict) else {}
-    try:
-        return uuid.UUID(str(run_input.get("group_message_id")))
-    except (TypeError, ValueError):
-        return None
+    return project_run_group_anchor_id(project_run)
 
 
 async def find_project_group_blocking_confirmation(
@@ -123,6 +312,7 @@ async def find_project_group_blocking_confirmation(
             )
         ).scalars()
     )
+    candidate_children: dict[uuid.UUID, ChatSession] = {}
     for run in runs:
         output = run.output if isinstance(run.output, dict) else {}
         raw_child_id = (
@@ -137,6 +327,21 @@ async def find_project_group_blocking_confirmation(
         child = await db.get(ChatSession, child_id)
         if child is None or child.project_id != project_id:
             continue
+        candidate_children[child.id] = child
+
+    session = await db.get(ChatSession, session_id)
+    if session is not None and session.project_id == project_id:
+        snapshot = conversation_turn_snapshot_for_session(session)
+        if snapshot.phase in {"active", "suspended"}:
+            causal = await _load_causal_child_cohort(
+                db,
+                session=session,
+                anchor_id=snapshot.anchor_id,
+                generation=snapshot.generation,
+            )
+            candidate_children.update({child.id: child for child in causal.children})
+
+    for child in candidate_children.values():
         pending = await find_pending_confirmation(
             db,
             agent_id=child.agent_id,
@@ -338,8 +543,7 @@ async def reconcile_project_group_turn(
             select(ChatMessage)
             .where(
                 ChatMessage.conversation_id == str(session.id),
-                ChatMessage.role == "user",
-                ChatMessage.message_meta["kind"].as_string() == "project_group_message",
+                ChatMessage.message_meta["kind"].as_string().in_(GROUP_ANCHOR_KINDS),
             )
             .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
             .limit(1)
@@ -376,6 +580,12 @@ async def reconcile_project_group_turn(
         ).scalars()
     )
     cohort_anchor_ids = tuple(str(row.id) for row in cohort_anchors)
+    causal = await _load_causal_child_cohort(
+        db,
+        session=session,
+        anchor_id=anchor.id,
+        generation=snapshot.generation,
+    )
 
     runs = list(
         (
@@ -411,7 +621,38 @@ async def reconcile_project_group_turn(
         else []
     )
     nonterminal = [run for run in runs if run.status not in TERMINAL_PROJECT_RUN_STATUSES]
-    deferred_owner_runs = [run for run in runs if _is_deferred_owner_run(run)]
+    project_child_ids: set[uuid.UUID] = set()
+    for run in runs:
+        output = run.output if isinstance(run.output, dict) else {}
+        raw_child_id = (
+            output.get("session_id")
+            or output.get("subagent_session_id")
+            or output.get("subagent_run_id")
+        )
+        try:
+            project_child_ids.add(uuid.UUID(str(raw_child_id)))
+        except (TypeError, ValueError):
+            pass
+
+    # ProjectRun is authoritative for its own child. The causal cohort only
+    # supplements direct/external continuations that do not have a ProjectRun;
+    # counting both sources would duplicate active work and retain stale agents.
+    direct_child_ids = causal.child_ids - project_child_ids
+    active_direct_child_ids = causal.active_child_ids & direct_child_ids
+    direct_active_suspended = bool(active_direct_child_ids) and (
+        active_direct_child_ids <= causal.suspended_child_ids
+    )
+    direct_children_succeeded = not direct_child_ids or (
+        direct_child_ids <= causal.succeeded_child_ids
+    )
+    child_by_id = {child.id: child for child in causal.children}
+    direct_active_agent_ids = tuple(
+        dict.fromkeys(
+            child_by_id[child_id].agent_id
+            for child_id in sorted(active_direct_child_ids, key=str)
+            if child_id in child_by_id
+        )
+    )
     reply_owner_ids: list[uuid.UUID] = []
     for row in active_reply_rows:
         raw_owner_id = dict(row.message_meta or {}).get("default_leader_agent_id")
@@ -426,41 +667,52 @@ async def reconcile_project_group_turn(
         )
     )
 
-    if nonterminal or active_reply_rows:
-        suspended = True
-        if active_reply_rows:
-            suspended = False
-        else:
-            for run in nonterminal:
-                if run.status != "waiting" or run.agent_id is None:
-                    suspended = False
-                    break
-                output = run.output if isinstance(run.output, dict) else {}
-                child_session_id = (
-                    output.get("session_id")
-                    or output.get("subagent_session_id")
-                    or output.get("subagent_run_id")
-                )
-                if not child_session_id:
-                    suspended = False
-                    break
-                pending = await find_pending_confirmation(
-                    db,
-                    agent_id=run.agent_id,
-                    conversation_id=str(child_session_id),
-                )
-                if pending is None:
-                    suspended = False
-                    break
+    project_runs_suspended = bool(nonterminal)
+    if nonterminal:
+        for run in nonterminal:
+            if run.status != "waiting" or run.agent_id is None:
+                project_runs_suspended = False
+                break
+            output = run.output if isinstance(run.output, dict) else {}
+            child_session_id = (
+                output.get("session_id")
+                or output.get("subagent_session_id")
+                or output.get("subagent_run_id")
+            )
+            if not child_session_id:
+                project_runs_suspended = False
+                break
+            pending = await find_pending_confirmation(
+                db,
+                agent_id=run.agent_id,
+                conversation_id=str(child_session_id),
+            )
+            if pending is None:
+                project_runs_suspended = False
+                break
+
+    if nonterminal or active_reply_rows or active_direct_child_ids:
+        suspended = (
+            not active_reply_rows
+            and (not nonterminal or project_runs_suspended)
+            and (not active_direct_child_ids or direct_active_suspended)
+        )
         target_status = "suspended" if suspended else "running"
     else:
         terminal_runs = [run for run in runs if not _is_deferred_owner_run(run)]
+        cohort_exists = bool(terminal_runs or direct_child_ids)
+        project_runs_succeeded = not terminal_runs or all(
+            run.status == "succeeded" for run in terminal_runs
+        )
         target_status = (
             "completed"
-            if terminal_runs
-            and all(run.status == "succeeded" for run in terminal_runs)
+            if cohort_exists and project_runs_succeeded and direct_children_succeeded
             else "failed"
         )
+
+    active_agent_ids = tuple(
+        dict.fromkeys((*active_agent_ids, *direct_active_agent_ids))
+    )
 
     snapshot = await transition_conversation_turn(
         db,
@@ -474,13 +726,14 @@ async def reconcile_project_group_turn(
                 target_status,
                 *sorted(
                     f"run:{run.id}:{run.agent_id}:{run.status}"
-                    for run in nonterminal
+                    for run in runs
                 ),
                 *sorted(
                     "reply:"
                     f"{row.id}:{dict(row.message_meta or {}).get('leader_batch_state')}"
                     for row in active_reply_rows
                 ),
+                *causal.state_tokens,
             ]
         ),
     )
@@ -491,5 +744,6 @@ async def reconcile_project_group_turn(
         run_count=(
             len(nonterminal)
             + len(active_reply_rows)
+            + len(active_direct_child_ids)
         ),
     )
