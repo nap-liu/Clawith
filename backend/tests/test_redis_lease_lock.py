@@ -5,6 +5,7 @@ import uuid
 
 import pytest
 
+import app.services.conversation_execution_lock as conversation_lock_module
 import app.services.redis_lease_lock as lease_module
 from app import database
 from app.core.events import get_redis
@@ -15,6 +16,73 @@ from app.services.redis_lease_lock import (
     RedisLeaseLostError,
     RedisLeaseUnavailableError,
 )
+
+
+async def test_conversation_execution_lock_is_reentrant_in_one_task(monkeypatch) -> None:
+    redis = FakeRedis()
+
+    async def get_fake_redis():
+        return redis
+
+    monkeypatch.setattr(lease_module, "get_redis", get_fake_redis)
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+
+    async with conversation_lock_module.conversation_execution_lock(
+        agent_id=agent_id,
+        session_id=session_id,
+    ):
+        assert len(redis.values) == 1
+        async with conversation_lock_module.conversation_execution_lock(
+            agent_id=agent_id,
+            session_id=session_id,
+        ):
+            assert len(redis.values) == 1
+
+    assert redis.values == {}
+
+
+async def test_conversation_execution_lock_serializes_distinct_tasks(monkeypatch) -> None:
+    redis = FakeRedis()
+
+    async def get_fake_redis():
+        return redis
+
+    monkeypatch.setattr(lease_module, "get_redis", get_fake_redis)
+    agent_id = uuid.uuid4()
+    other_agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    owner_entered = asyncio.Event()
+    release_owner = asyncio.Event()
+    order: list[str] = []
+
+    async def owner() -> None:
+        async with conversation_lock_module.conversation_execution_lock(
+            agent_id=agent_id,
+            session_id=session_id,
+        ):
+            order.append("owner")
+            owner_entered.set()
+            await release_owner.wait()
+
+    async def contender() -> None:
+        await owner_entered.wait()
+        async with conversation_lock_module.conversation_execution_lock(
+            agent_id=other_agent_id,
+            session_id=session_id,
+        ):
+            order.append("contender")
+
+    owner_task = asyncio.create_task(owner())
+    contender_task = asyncio.create_task(contender())
+    await owner_entered.wait()
+    await asyncio.sleep(0.02)
+    assert order == ["owner"]
+    release_owner.set()
+    await asyncio.gather(owner_task, contender_task)
+
+    assert order == ["owner", "contender"]
+    assert redis.values == {}
 
 
 class FakeRedis:

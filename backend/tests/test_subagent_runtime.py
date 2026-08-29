@@ -1858,6 +1858,269 @@ async def test_parent_event_retries_without_duplicate_projection_when_resume_is_
     assert resume_calls == 2
 
 
+async def test_idle_dispatch_repairs_legacy_projection_without_durable_owner():
+    from app.services.conversation_turn_lifecycle import (
+        conversation_turn_snapshot_for_session,
+    )
+
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-repair-unowned-projection",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    for index in range(2):
+        await runtime.send_subagent_message_to_parent(
+            agent_id=agent_id,
+            execution_user_id=user_id,
+            origin_tool_call_id=f"repair-unowned-projection-result-{index}",
+            subagent_session_id=str(run.id),
+            message=f"repair me {index}",
+        )
+    async with async_session() as db:
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="assistant",
+                content="parent idle",
+                conversation_id=str(parent_id),
+                message_meta={"attachments": []},
+            )
+        )
+        await db.flush()
+        events = list(
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                    ChatMessage.conversation_id == str(run.id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == runtime.SUBAGENT_PARENT_MESSAGE,
+                )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            ).scalars()
+        )
+        stale_root = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            sender_agent_id=agent_id,
+            role="user",
+            content="legacy projection without admission",
+            conversation_id=str(parent_id),
+            external_event_key=f"subagent-parent:{events[0].id}",
+            message_meta={
+                "kind": runtime.SUBAGENT_PARENT_EVENT,
+                "execution_agent_id": str(agent_id),
+                "subagent_id": str(run.id),
+                "child_message_id": str(events[0].id),
+                "turn_status": "running",
+                "subagent_event_batch": True,
+                "attachments": [],
+            },
+        )
+        db.add(stale_root)
+        await db.flush()
+        stale_child = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            sender_agent_id=agent_id,
+            role="user",
+            content="legacy child projection without admission",
+            conversation_id=str(parent_id),
+            external_event_key=f"subagent-parent:{events[1].id}",
+            message_meta={
+                "kind": runtime.SUBAGENT_PARENT_EVENT,
+                "execution_agent_id": str(agent_id),
+                "subagent_id": str(run.id),
+                "child_message_id": str(events[1].id),
+                "subagent_turn_anchor_id": str(stale_root.id),
+                "attachments": [],
+            },
+        )
+        db.add(stale_child)
+        await db.commit()
+        stale_root_id = stale_root.id
+        stale_child_id = stale_child.id
+
+    repaired_root, injected, status = await runtime._materialize_parent_event_batch(
+        parent_session_id=parent_id,
+        execution_agent_id=agent_id,
+        execution_user_id=user_id,
+        candidate_ids=[events[0].id],
+    )
+
+    assert status == "materialized"
+    assert repaired_root is not None and repaired_root.id != stale_root_id
+    assert len(injected) == 1 and "repair me 0" in injected[0]["content"]
+    async with async_session() as db:
+        assert await db.get(ChatMessage, stale_root_id) is None
+        assert await db.get(ChatMessage, stale_child_id) is None
+        projections = list(
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.external_event_key
+                        == f"subagent-parent:{events[0].id}"
+                    )
+                )
+            ).scalars()
+        )
+        parent = await db.get(ChatSession, parent_id)
+    assert [row.id for row in projections] == [repaired_root.id]
+    snapshot = conversation_turn_snapshot_for_session(parent)
+    assert snapshot.anchor_id == repaired_root.id
+    assert snapshot.status == "running"
+    await runtime._finish_parent_events_for_root(repaired_root.id, [events[0].id])
+    async with async_session() as db:
+        from app.services.conversation_turn_lifecycle import (
+            transition_conversation_turn,
+        )
+
+        await transition_conversation_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(parent_id),
+            turn_anchor_id=repaired_root.id,
+            status="completed",
+        )
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="assistant",
+                content="first repaired batch complete",
+                conversation_id=str(parent_id),
+                message_meta={
+                    "turn_anchor_id": str(repaired_root.id),
+                    "turn_status": "completed",
+                    "attachments": [],
+                },
+            )
+        )
+        await db.commit()
+
+    second_root, second_injected, second_status = (
+        await runtime._materialize_parent_event_batch(
+            parent_session_id=parent_id,
+            execution_agent_id=agent_id,
+            execution_user_id=user_id,
+            candidate_ids=[events[1].id],
+        )
+    )
+    assert second_status == "materialized"
+    assert second_root is not None and second_root.id != repaired_root.id
+    assert len(second_injected) == 1 and "repair me 1" in second_injected[0]["content"]
+    await runtime._finish_parent_events_for_root(second_root.id, [events[1].id])
+    async with async_session() as db:
+        from app.services.conversation_turn_lifecycle import (
+            transition_conversation_turn,
+        )
+
+        await transition_conversation_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(parent_id),
+            turn_anchor_id=second_root.id,
+            status="completed",
+        )
+        await db.commit()
+
+
+async def test_idle_dispatch_repairs_projection_whose_root_is_missing():
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        parent_session_id=str(parent_id),
+        origin_tool_call_id="call-repair-missing-root",
+        task="child",
+        mode="async",
+        turn_anchor_id=anchor_id,
+    )
+    await runtime.send_subagent_message_to_parent(
+        agent_id=agent_id,
+        execution_user_id=user_id,
+        origin_tool_call_id="repair-missing-root-result",
+        subagent_session_id=str(run.id),
+        message="repair missing root",
+    )
+    missing_root_id = uuid.uuid4()
+    async with async_session() as db:
+        event = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(run.id),
+                    ChatMessage.message_meta["kind"].as_string()
+                    == runtime.SUBAGENT_PARENT_MESSAGE,
+                )
+            )
+        ).scalar_one()
+        broken_projection = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            sender_agent_id=agent_id,
+            role="user",
+            content="projection with missing root",
+            conversation_id=str(parent_id),
+            external_event_key=f"subagent-parent:{event.id}",
+            message_meta={
+                "kind": runtime.SUBAGENT_PARENT_EVENT,
+                "execution_agent_id": str(agent_id),
+                "subagent_id": str(run.id),
+                "child_message_id": str(event.id),
+                "subagent_turn_anchor_id": str(missing_root_id),
+                "attachments": [],
+            },
+        )
+        db.add_all(
+            [
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content="parent idle",
+                    conversation_id=str(parent_id),
+                    message_meta={"attachments": []},
+                ),
+                broken_projection,
+            ]
+        )
+        await db.commit()
+        broken_projection_id = broken_projection.id
+
+    repaired_root, injected, status = await runtime._materialize_parent_event_batch(
+        parent_session_id=parent_id,
+        execution_agent_id=agent_id,
+        execution_user_id=user_id,
+        candidate_ids=[event.id],
+    )
+    assert status == "materialized"
+    assert repaired_root is not None and repaired_root.id != missing_root_id
+    assert injected and "repair missing root" in injected[0]["content"]
+    async with async_session() as db:
+        assert await db.get(ChatMessage, broken_projection_id) is None
+    await runtime._finish_parent_events_for_root(repaired_root.id, [event.id])
+    async with async_session() as db:
+        from app.services.conversation_turn_lifecycle import (
+            transition_conversation_turn,
+        )
+
+        await transition_conversation_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(parent_id),
+            turn_anchor_id=repaired_root.id,
+            status="completed",
+        )
+        await db.commit()
+
+
 async def test_parent_event_terminal_crash_window_converges_without_second_resume(monkeypatch):
     agent_id, user_id, parent_id, anchor_id = await _make_context()
     run, _ = await runtime.create_subagent(
