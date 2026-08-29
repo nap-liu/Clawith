@@ -31,6 +31,7 @@ def _allow(path: str, line: str, reason: str) -> InternalCompatibilityAllowance:
 
 
 _legacy = re.escape(LEGACY_KEYWORD)
+_compat_token = rf"(?:[A-Za-z0-9_./:-]+{_legacy}[A-Za-z0-9_./:-]*|{_legacy}[A-Za-z0-9_./:-]+)"
 ALLOWANCES = (
     _allow(
         r"README(?:_[A-Za-z-]+)?\.md",
@@ -49,7 +50,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"\.env\.example",
-        rf"{_legacy}",
+        rf"(?:postgresql\+asyncpg://{_legacy}:{_legacy}@[^\s]+/{_legacy}|~/\.{_legacy}|MINIO_ROOT_USER={_legacy}\b|MINIO_ROOT_PASSWORD={_legacy}-[A-Za-z0-9-]+|MINIO_BUCKET={_legacy}\b|{_legacy}_[A-Z0-9_]+)",
         "Example environment variables, persisted paths, storage credentials, and database identifiers are operator contracts.",
     ),
     _allow(
@@ -64,7 +65,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"helm/(?:QUICKSTART(?:_EN)?\.md|clawith/.*)",
-        rf"{_legacy}",
+        rf"(?:{_compat_token}|(?:-n|install|upgrade|history|rollback|uninstall|status|values|manifest|template|namespace)\s+{_legacy}\b|(?:database|name|namespace)\s*:\s*\"?{_legacy}\b|^\s*-\s+{_legacy}\b|(?:psql|pg_dump)\s+-U\s+postgres\s+{_legacy}\b)",
         "Helm examples and templates retain chart/release/namespace, image, service, PVC, secret, database, and repository identifiers.",
     ),
     _allow(
@@ -74,7 +75,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"frontend/src/utils/(?:themeMode|theme|h5AuthSession)\.ts",
-        rf"{_legacy}",
+        rf"(?:{_legacy}[:_-][A-Za-z0-9:-]+|{_legacy}ThemeBridge)",
         "Browser event, bridge, and storage keys retain existing-client state compatibility.",
     ),
     _allow(
@@ -109,7 +110,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"backend/app/config\.py",
-        rf"(?:\.{_legacy}|postgresql\+asyncpg://{_legacy}|{_legacy}_network)",
+        rf"(?:\.{_legacy}|postgresql\+asyncpg://{_legacy}:{_legacy}@[^\"]+/{_legacy}|{_legacy}_network)",
         "Filesystem, database credential defaults, and Docker network names are deployment identifiers.",
     ),
     _allow(
@@ -134,22 +135,22 @@ ALLOWANCES = (
     ),
     _allow(
         r"backend/app/services/(?:wecom_stream|wechat_channel|resource_discovery|sandbox_mcp_host|mcp_client|media_playback)\.py",
-        rf"{_legacy}",
+        rf"(?:__{_legacy}_no_proxy_patch__|{_legacy}-wechat:|{_legacy}-mcp-admin|\"name\"\s*:\s*\"{_legacy}\"|{_legacy}_media_playback)",
         "Provider patch markers, client/session IDs, discovery identity, and playback cookie names are protocol state.",
     ),
     _allow(
         r"backend/app/services/(?:media_url_source|dingtalk_stream|document_conversion/(?:chrome_renderer|html_to_pdf))\.py",
-        rf"{_legacy}",
+        rf"(?:{_legacy}-(?:html-pdf|html-pptx|dingtalk-video|media-delivery|bg-capture-style|item-bg-capture-style)-?|data-{_legacy}-(?:item-id|slide-root)|{_legacy}(?:Chatbot|CardCallback)Handler)",
         "Temporary file prefixes, renderer DOM markers, and legacy handler class names are internal runtime identifiers.",
     ),
     _allow(
         r"backend/app/services/(?:agent_manager|media_tool_contract)\.py",
-        rf"{_legacy}",
+        rf"(?:{_legacy}-agent-|{_legacy}\.agent_(?:id|name)|x-{_legacy}-?)",
         "Container labels/names and stripped transport-header names are operational compatibility contracts.",
     ),
     _allow(
         r"backend/app/services/project_git_service\.py",
-        rf"(?:{_legacy}(?: project)?|\.{_legacy}-(?:clone|write)-|{_legacy}-project-sandboxes|{_legacy}-Milestone-Operation)",
+        rf"(?:frozenset\(\{{\"{_legacy}\", \"{_legacy} project\"\}}\)|\.{_legacy}-(?:clone|write)-|{_legacy}-project-sandboxes|{_legacy}-Milestone-Operation)",
         "Project repositories retain historical author aliases, trailers, and internal staging-path prefixes.",
     ),
     _allow(
@@ -174,7 +175,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"backend/app/(?:core/logging_config\.py|api/upload\.py|services/cli_tools/state_storage\.py)",
-        rf"{_legacy}",
+        rf"(?:{_legacy}\.log|/tmp/{_legacy}_uploads|(?:runs as|! -user|chown)\s+{_legacy}\b|{_legacy}\s*==\s*gem)",
         "Log, upload, and runtime-user paths preserve existing deployment ownership and storage.",
     ),
     _allow(
@@ -199,7 +200,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"frontend/src/features/projects/ProjectWorkspacePage\.tsx",
-        rf"{_legacy}(?: project)?",
+        rf"normalizedAuthor\s*!==\s*\"{_legacy}(?: project)?\"",
         "Historical Git author aliases are normalized before rendering.",
     ),
     _allow(
@@ -209,7 +210,7 @@ ALLOWANCES = (
     ),
     _allow(
         r"frontend/src/features/projects/projectUserFacingCopy\.ts",
-        rf"{_legacy}",
+        rf"replace\(/\\b{_legacy}\\b/gi",
         "The dynamic-copy sanitizer matches and replaces the legacy keyword before rendering.",
     ),
 )
@@ -248,20 +249,49 @@ def _source_files() -> list[Path]:
     return sorted(set(files))
 
 
+def _matching_allowance(
+    relative: str,
+    line: str,
+    keyword_match: re.Match[str],
+) -> int | None:
+    """Return the allowance covering this exact keyword occurrence, if any."""
+    for index, allowance in enumerate(ALLOWANCES):
+        if not allowance.path_pattern.fullmatch(relative):
+            continue
+        for allowed_match in allowance.line_pattern.finditer(line):
+            if allowed_match.start() <= keyword_match.start() and keyword_match.end() <= allowed_match.end():
+                return index
+    return None
+
+
+def _verify_occurrence_scoping() -> None:
+    """Guard against accidentally restoring whole-line allowance behavior."""
+    relative = "backend/app/api/websocket.py"
+    line = 'cache_key = "clawith:project-subagent-web:id"; toast("Welcome to Clawith")'
+    matches = list(KEYWORD_RE.finditer(line))
+    if len(matches) != 2:
+        raise RuntimeError("keyword scanner self-check fixture is invalid")
+    if _matching_allowance(relative, line, matches[0]) is None:
+        raise RuntimeError("internal compatibility identifier was not recognized")
+    if _matching_allowance(relative, line, matches[1]) is not None:
+        raise RuntimeError("user-visible keyword was incorrectly covered by an internal allowance")
+
+
 def main() -> int:
+    _verify_occurrence_scoping()
     violations: list[str] = []
     allowance_counts = [0] * len(ALLOWANCES)
     for path in _source_files():
         relative = path.relative_to(REPO_ROOT).as_posix()
         for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            if not KEYWORD_RE.search(line):
-                continue
-            for index, allowance in enumerate(ALLOWANCES):
-                if allowance.path_pattern.fullmatch(relative) and allowance.line_pattern.search(line):
-                    allowance_counts[index] += 1
-                    break
-            else:
-                violations.append(f"{relative}:{line_number}: {line.strip()}")
+            for keyword_match in KEYWORD_RE.finditer(line):
+                allowance_index = _matching_allowance(relative, line, keyword_match)
+                if allowance_index is not None:
+                    allowance_counts[allowance_index] += 1
+                    continue
+                violations.append(
+                    f"{relative}:{line_number}:{keyword_match.start() + 1}: {line.strip()}"
+                )
 
     if violations:
         print("Forbidden user-visible keyword references:", file=sys.stderr)
