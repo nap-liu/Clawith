@@ -566,6 +566,16 @@ async def reconcile_project_group_turn(
             # creating a second visible progress turn.
             anchor = existing_anchor
 
+    if (
+        snapshot.anchor_id == anchor.id
+        and snapshot.status in {"completed", "failed", "cancelled"}
+    ):
+        # A specialist result can enqueue its deferred owner-summary delivery
+        # after the initiating visible turn has already reached a terminal
+        # state. Terminal turns are immutable: the late delivery remains
+        # durable project progress, but must not reopen the same UI turn.
+        return ProjectGroupTurnProjection(snapshot, anchor.id, (), 0)
+
     cohort_anchors = list(
         (
             await db.execute(

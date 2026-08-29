@@ -4348,6 +4348,86 @@ async def test_project_group_partial_completion_versions_cohort_projection(
     assert terminal["active_agent_ids"] == []
 
 
+async def test_project_group_history_keeps_terminal_turn_after_late_owner_delivery(
+    project_api: ProjectApiEnv,
+):
+    from app.models.project import ProjectRun
+
+    env = project_api
+    project = await _create_project(env, name="Late owner delivery")
+    project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, str(project_id))
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    created = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Complete before deferred owner delivery", "mentions": []},
+    )
+    assert created.status_code == 201, created.text
+    anchor_id = uuid.UUID(created.json()["message"]["id"])
+
+    runs = list(
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.input["group_message_id"].as_string() == str(anchor_id),
+                )
+            )
+        ).scalars()
+    )
+    for run in runs:
+        run.status = "succeeded"
+        run.finished_at = datetime.now(UTC)
+    await env.db.commit()
+    terminal = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+    )
+    assert terminal.status_code == 200, terminal.text
+    assert terminal.json()["turn"]["status"] == "completed"
+
+    late_reply = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.worker_id,
+        role="assistant",
+        content="Deferred specialist result",
+        conversation_id=group["id"],
+        message_meta={
+            "kind": "project_subagent_reply",
+            "timeline_anchor_id": str(anchor_id),
+            "leader_batch_state": "claimed",
+            "default_leader_agent_id": str(env.leader_id),
+        },
+    )
+    env.db.add(late_reply)
+    await env.db.flush()
+    env.db.add(
+        ProjectRun(
+            tenant_id=env.tenant_id,
+            project_id=project_id,
+            agent_id=env.leader_id,
+            initiated_by_user_id=env.owner_id,
+            execution_user_id=env.owner_id,
+            status="queued",
+            trigger_type="leader_reply_batch",
+            input={
+                "group_session_id": group["id"],
+                "group_message_id": str(anchor_id),
+                "source_group_message_ids": [str(late_reply.id)],
+            },
+            output={"group_session_id": group["id"]},
+        )
+    )
+    await env.db.commit()
+
+    history = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+    )
+    assert history.status_code == 200, history.text
+    assert history.json()["turn"]["status"] == "completed"
+    assert history.json()["turn"]["phase"] == "idle"
+    assert history.json()["turn"]["run_count"] == 0
+
+
 async def test_explicit_mention_cohort_waits_for_leader_reply_batch_terminal(
     project_api: ProjectApiEnv,
 ):
