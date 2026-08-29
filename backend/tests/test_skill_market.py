@@ -449,6 +449,16 @@ async def test_agent_market_install_is_direct_for_managers_and_remains_idempoten
             await db.commit()
             return str(session.id), anchor.id
 
+    background = await execute_tool(
+        "install_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent_b.id,
+        owner_b.id,
+        session_id="",
+        tool_call_id=f"background-{tool_call_id}",
+    )
+    assert "current human conversation is required" in background
+
     guest_session_id, guest_anchor_id = await conversation_turn(guest_b.id)
     mismatched = await execute_tool(
         "install_skill_from_market",
