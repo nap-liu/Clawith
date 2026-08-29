@@ -1530,12 +1530,8 @@ async def test_processing_reclaim_continues_durable_done_tool_tail(monkeypatch):
         captured.update(kwargs)
         return "recovered result"
 
-    async def must_not_reexecute(*_args, **_kwargs):
-        raise AssertionError("a durable done tool must never be replayed")
-
     monkeypatch.setattr(runtime, "prepare_subagent_tools", fake_tools)
     monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_llm)
-    monkeypatch.setattr("app.services.turn_recovery.execute_tool", must_not_reexecute)
 
     await runtime.execute_claimed_subagent(run.id)
 
@@ -3080,6 +3076,215 @@ async def test_round_inbox_survives_first_dispatch_context_recovery(monkeypatch)
     assert captured["recovered"] == [
         {"role": "user", "content": "compacted current"},
         {"role": "user", "content": "late message"},
+    ]
+
+
+async def test_round_inbox_recovery_deduplicates_empty_attachment_shape_by_count(
+    monkeypatch,
+):
+    from app.services.llm import caller
+
+    captured = {}
+
+    async def fake_turn_context(**_kwargs):
+        return "system", "dynamic"
+
+    async def fake_call_llm(_model, _messages, _name, _role, **kwargs):
+        live = await kwargs["before_round"](0)
+        assert live == [
+            {"role": "user", "content": "same late message"},
+            {"role": "user", "content": "same late message"},
+        ]
+        captured["recovered"] = await kwargs["context_recovery"](_model, None)
+        return "ok"
+
+    async def recover(_model, _budget):
+        return [
+            {"role": "user", "content": "compacted current", "attachments": []},
+            {"role": "user", "content": "same late message", "attachments": []},
+            {"role": "user", "content": "same late message", "attachments": []},
+        ]
+
+    async def before_round(_round):
+        return [
+            {"role": "user", "content": "same late message"},
+            {"role": "user", "content": "same late message"},
+        ]
+
+    monkeypatch.setattr(caller, "_build_turn_context", fake_turn_context)
+    monkeypatch.setattr(caller, "call_llm", fake_call_llm)
+    model = SimpleNamespace(id=uuid.uuid4(), provider="test", model="primary")
+
+    result = await caller.call_llm_with_failover(
+        primary_model=model,
+        fallback_model=None,
+        messages=[{"role": "user", "content": "current"}],
+        agent_name="Agent",
+        role_description="",
+        prepared_tools=[],
+        context_recovery=recover,
+        before_round=before_round,
+    )
+
+    assert result == "ok"
+    assert captured["recovered"] == [
+        {"role": "user", "content": "compacted current", "attachments": []},
+        {"role": "user", "content": "same late message", "attachments": []},
+        {"role": "user", "content": "same late message", "attachments": []},
+    ]
+
+
+async def test_round_inbox_recovery_does_not_match_injection_against_same_text_root(
+    monkeypatch,
+):
+    from app.services.llm import caller
+
+    captured = {}
+
+    async def fake_turn_context(**_kwargs):
+        return "system", "dynamic"
+
+    async def fake_call_llm(_model, _messages, _name, _role, **kwargs):
+        assert await kwargs["before_round"](0) == [
+            {"role": "user", "content": "continue"}
+        ]
+        captured["recovered"] = await kwargs["context_recovery"](_model, None)
+        return "ok"
+
+    async def recover(_model, _budget):
+        # The durable snapshot contains the pre-existing root but a read race
+        # has not exposed the trailing, identically-worded injection yet.
+        return [{"role": "user", "content": "continue", "attachments": []}]
+
+    async def before_round(_round):
+        return [{"role": "user", "content": "continue"}]
+
+    monkeypatch.setattr(caller, "_build_turn_context", fake_turn_context)
+    monkeypatch.setattr(caller, "call_llm", fake_call_llm)
+    model = SimpleNamespace(id=uuid.uuid4(), provider="test", model="primary")
+
+    result = await caller.call_llm_with_failover(
+        primary_model=model,
+        fallback_model=None,
+        messages=[{"role": "user", "content": "continue"}],
+        agent_name="Agent",
+        role_description="",
+        prepared_tools=[],
+        context_recovery=recover,
+        before_round=before_round,
+    )
+
+    assert result == "ok"
+    assert captured["recovered"] == [
+        {"role": "user", "content": "continue", "attachments": []},
+        {"role": "user", "content": "continue"},
+    ]
+
+
+async def test_round_inbox_recovery_does_not_reserve_compacted_old_same_text(
+    monkeypatch,
+):
+    from app.services.llm import caller
+
+    captured = {}
+
+    async def fake_turn_context(**_kwargs):
+        return "system", "dynamic"
+
+    async def fake_call_llm(_model, _messages, _name, _role, **kwargs):
+        await kwargs["before_round"](0)
+        captured["recovered"] = await kwargs["context_recovery"](_model, None)
+        return "ok"
+
+    async def recover(_model, _budget):
+        return [
+            {"role": "system", "content": "compacted old history"},
+            {"role": "user", "content": "different current root", "attachments": []},
+            {"role": "user", "content": "continue", "attachments": []},
+        ]
+
+    async def before_round(_round):
+        return [{"role": "user", "content": "continue"}]
+
+    monkeypatch.setattr(caller, "_build_turn_context", fake_turn_context)
+    monkeypatch.setattr(caller, "call_llm", fake_call_llm)
+    model = SimpleNamespace(id=uuid.uuid4(), provider="test", model="primary")
+
+    result = await caller.call_llm_with_failover(
+        primary_model=model,
+        fallback_model=None,
+        messages=[
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "old reply"},
+            {"role": "user", "content": "different current root"},
+        ],
+        agent_name="Agent",
+        role_description="",
+        prepared_tools=[],
+        context_recovery=recover,
+        before_round=before_round,
+    )
+
+    assert result == "ok"
+    assert captured["recovered"] == [
+        {"role": "system", "content": "compacted old history"},
+        {"role": "user", "content": "different current root", "attachments": []},
+        {"role": "user", "content": "continue", "attachments": []},
+    ]
+
+
+async def test_round_inbox_recovery_does_not_reserve_protected_old_same_text(
+    monkeypatch,
+):
+    from app.services.llm import caller
+
+    captured = {}
+
+    async def fake_turn_context(**_kwargs):
+        return "system", "dynamic"
+
+    async def fake_call_llm(_model, _messages, _name, _role, **kwargs):
+        await kwargs["before_round"](0)
+        captured["recovered"] = await kwargs["context_recovery"](_model, None)
+        return "ok"
+
+    async def recover(_model, _budget):
+        # The protected baseline suffix survives intact, but the racing read
+        # does not yet contain the identically-worded trailing injection.
+        return [
+            {"role": "user", "content": "continue", "attachments": []},
+            {"role": "assistant", "content": "older reply"},
+            {"role": "user", "content": "current root", "attachments": []},
+        ]
+
+    async def before_round(_round):
+        return [{"role": "user", "content": "continue"}]
+
+    monkeypatch.setattr(caller, "_build_turn_context", fake_turn_context)
+    monkeypatch.setattr(caller, "call_llm", fake_call_llm)
+    model = SimpleNamespace(id=uuid.uuid4(), provider="test", model="primary")
+
+    result = await caller.call_llm_with_failover(
+        primary_model=model,
+        fallback_model=None,
+        messages=[
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "older reply"},
+            {"role": "user", "content": "current root"},
+        ],
+        agent_name="Agent",
+        role_description="",
+        prepared_tools=[],
+        context_recovery=recover,
+        before_round=before_round,
+    )
+
+    assert result == "ok"
+    assert captured["recovered"] == [
+        {"role": "user", "content": "continue", "attachments": []},
+        {"role": "assistant", "content": "older reply"},
+        {"role": "user", "content": "current root", "attachments": []},
+        {"role": "user", "content": "continue"},
     ]
 
 

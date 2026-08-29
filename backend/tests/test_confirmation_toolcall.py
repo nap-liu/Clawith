@@ -933,6 +933,74 @@ async def test_confirmation_result_without_intro_replays_as_standard_tool_pair()
     assert history[-1]["content"].startswith("用户点了")
 
 
+async def test_confirmation_resume_replays_exact_typed_prefix_without_intro_duplicate():
+    """A confirmation suspend keeps length-recovery provenance byte-for-byte.
+
+    The intro remains visible in the transcript, while provider history uses
+    only the typed prefix and raw assistant tool-call content.
+    """
+    from app.services import confirmation_service as cs
+    from app.services.chat_history import load_history_for_llm
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    conv = str(session.id)
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+    prefix = [
+        {"role": "assistant", "content": "partial before output limit"},
+        {"role": "user", "content": "Continue exactly where you left off."},
+    ]
+
+    with patch.object(cs, "_broadcast", new=AsyncMock()):
+        row_id = await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=conv,
+            chat_session_id=session.id,
+            source_channel="web",
+            user_id=user_id,
+            intro_text="此前可见片段\n\n现在需要确认",
+            title="确认执行",
+            summary="验证恢复前缀",
+            action=None,
+            risk_level="high",
+            buttons=[{"text": "确认", "value": "confirm"}],
+            turn_anchor_id=anchor_id,
+            assistant_content="现在需要确认",
+            recovery_prefix_messages=prefix,
+            reasoning_content="typed reasoning",
+            round_id="typed-confirmation-round",
+        )
+
+    async with async_session() as db:
+        row = await db.get(ChatMessage, row_id)
+        payload = json.loads(row.content)
+        payload["status"] = "done"
+        payload["result"] = "用户点了确认"
+        row.content = json.dumps(payload, ensure_ascii=False)
+        await db.commit()
+
+    async with async_session() as db:
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+            ctx_size=100,
+        )
+
+    assert [message["role"] for message in history] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert history[1:3] == prefix
+    assert history[3]["content"] == "现在需要确认"
+    assert history[3]["reasoning_content"] == "typed reasoning"
+    assert history[3]["tool_calls"][0]["function"]["name"] == "request_confirmation"
+    assert all("此前可见片段" not in str(message.get("content")) for message in history)
+
+
 async def test_suspend_confirmation_persists_intro_before_pending_card():
     """Intro and pending card are persisted in order as ordinary append-only messages."""
     from app.services import confirmation_service as cs

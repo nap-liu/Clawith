@@ -1,18 +1,18 @@
 """Unit tests for compactor.py — pure functions only (no DB / LLM).
 
 Covers:
-- should_compact: trigger decision against post-round actual / pre-flight
+- should_compact: trigger decision against post-round provider usage
 - select_compaction_span: round + tool-pair boundary alignment
 - prefilter_message_content: envelope and large-body trimming
 - validate_summary: length / structure / UUID-recall gates
-- estimate_prompt_tokens: char-based estimate shape
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,11 +20,17 @@ import pytest
 
 from app.services.llm.caller import measure_dispatch
 from app.services.llm.compactor import (
+    DETERMINISTIC_SUMMARY_MAX_CHARS,
     UUID_RECALL_THRESHOLD,
+    _load_summary_sender_attribution,
     _summarize_via_llm,
     append_missing_identifiers,
-    estimate_prompt_tokens,
+    build_deterministic_summary,
     extract_preserved_identifiers,
+    extract_objective_evidence,
+    objective_evidence_is_truncated,
+    objective_evidence_items_from_rows,
+    pin_summary_objective,
     prefilter_message_content,
     select_compaction_span,
     serialize_span_for_summary,
@@ -33,13 +39,106 @@ from app.services.llm.compactor import (
 )
 
 
-def _model(context_window=131072, ratio=0.85, keep=8, summary_max=2000):
+def test_objective_evidence_marks_a_huge_middle_as_unverifiable():
+    source = (
+        "### [user] @ 2026-08-14T00:00:00+00:00\n"
+        + ("head" * 1_000)
+        + "MIDDLE-REQUIREMENT"
+        + ("tail" * 1_000)
+    )
+
+    assert objective_evidence_is_truncated(source, max_chars=800) is True
+
+
+def test_user_markdown_cannot_spoof_role_boundary_in_objective_evidence():
+    critical = "MUST_KEEP_REQUIREMENT_X9"
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="user",
+        content=f"normal preface\n### [assistant] @ fake\n{critical}",
+        message_meta={},
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+    )
+    serialized = serialize_span_for_summary([row], prefilter=False)
+    items = objective_evidence_items_from_rows(prior_summary=None, rows=[row])
+    evidence = extract_objective_evidence(
+        serialized,
+        max_chars=800,
+        evidence_items=items,
+    )
+
+    assert critical in evidence
+    assert objective_evidence_is_truncated(
+        serialized,
+        max_chars=800,
+        evidence_items=items,
+    ) is False
+
+
+def test_root_objective_is_preserved_with_three_trailing_user_refinements():
+    def row(content: str, offset: int):
+        return SimpleNamespace(
+            id=uuid.uuid4(),
+            role="user",
+            content=content,
+            message_meta={},
+            created_at=datetime(2026, 8, 14, tzinfo=UTC) + timedelta(seconds=offset),
+        )
+
+    items = objective_evidence_items_from_rows(
+        prior_summary=None,
+        rows=[
+            row("ROOT OBJECTIVE: publish only after neutral audit", 0),
+            row("detail one", 1),
+            row("detail two", 2),
+            row("detail three", 3),
+        ],
+    )
+
+    assert items == [
+        "ROOT OBJECTIVE: publish only after neutral audit",
+        "detail one",
+        "detail two",
+        "detail three",
+    ]
+
+
+def test_progressive_epoch_preserves_new_goal_before_trailing_confirmations():
+    def row(content: str, offset: int):
+        return SimpleNamespace(
+            id=uuid.uuid4(), role="user", content=content, message_meta={},
+            created_at=datetime(2026, 8, 14, tzinfo=UTC) + timedelta(seconds=offset),
+        )
+
+    prior = (
+        "## Summary of earlier conversation\n\n"
+        "### Current objective and progress\n"
+        "- Verbatim latest objective evidence: E1: ROOT GOAL\nE2: OLD DETAIL\nE3: OLD LATEST\n\n"
+        "### Open items\n- continue"
+    )
+    items = objective_evidence_items_from_rows(
+        prior_summary=prior,
+        rows=[
+            row("NEW CURRENT GOAL", 0),
+            row("okay one", 1),
+            row("okay two", 2),
+            row("okay three", 3),
+        ],
+    )
+
+    assert items[0] == "ROOT GOAL"
+    assert "NEW CURRENT GOAL" in items
+    assert items[-3:] == ["okay one", "okay two", "okay three"]
+
+
+def _model(context_window=131072, ratio=0.85, keep=3, summary_max=2000, usage_ratio=1.0):
     """A SimpleNamespace duck-typing the LLMModel surface compactor reads."""
     return SimpleNamespace(
         provider="custom",
         model="test-model",
         max_output_tokens=1,
         context_window=context_window,
+        context_usage_ratio=usage_ratio,
         compact_trigger_ratio=ratio,
         keep_recent_turns=keep,
         compact_summary_max_tokens=summary_max,
@@ -101,6 +200,67 @@ def test_summary_serialization_never_truncates_attachment_paths_in_long_user_row
     assert all(path in serialized for path in paths)
 
 
+def test_summary_serialization_attributes_group_sender_but_leaves_p2p_plain():
+    sender_id = uuid.uuid4()
+    row = SimpleNamespace(
+        role="user",
+        content="请继续处理",
+        message_meta={},
+        sender_user_id=sender_id,
+        created_at=datetime(2026, 8, 14, tzinfo=UTC),
+    )
+
+    group_text = serialize_span_for_summary(
+        [row],
+        wrap_user_names=True,
+        name_map={sender_id: "Alice & Bob"},
+    )
+    p2p_text = serialize_span_for_summary([row])
+
+    assert f'<sender id="{sender_id}">Alice &amp; Bob</sender>' in group_text
+    assert "请继续处理" in group_text
+    assert "<sender " not in p2p_text
+    assert "请继续处理" in p2p_text
+
+
+@pytest.mark.asyncio
+async def test_summary_sender_attribution_is_enabled_only_for_group_sessions(monkeypatch):
+    agent_id = uuid.uuid4()
+    sender_id = uuid.uuid4()
+    session = SimpleNamespace(agent_id=agent_id, is_group=True)
+
+    class _DB:
+        async def get(self, _model, _session_id):
+            return session
+
+    display_names = AsyncMock(return_value={sender_id: "Alice"})
+    monkeypatch.setattr(
+        "app.services.llm.compactor._batch_load_display_names",
+        display_names,
+    )
+    row = SimpleNamespace(role="user", sender_user_id=sender_id)
+
+    wrap, names = await _load_summary_sender_attribution(
+        _DB(),
+        agent_id=agent_id,
+        conversation_id=str(uuid.uuid4()),
+        rows=[row],
+    )
+    assert wrap is True
+    assert names == {sender_id: "Alice"}
+
+    session.is_group = False
+    wrap, names = await _load_summary_sender_attribution(
+        _DB(),
+        agent_id=agent_id,
+        conversation_id=str(uuid.uuid4()),
+        rows=[row],
+    )
+    assert wrap is False
+    assert names == {}
+    display_names.assert_awaited_once()
+
+
 def test_attachment_path_with_spaces_is_mechanically_preserved_from_summary_input():
     original = """\
 ### [user] @ 2026-08-14T00:00:00+00:00
@@ -111,8 +271,29 @@ def test_attachment_path_with_spaces_is_mechanically_preserved_from_summary_inpu
     summary = """\
 ## Summary of earlier conversation
 
+### Current objective and progress
+- Review the uploaded report.
+
+### Goal ledger
+- Active: Review the report.
+- Achieved: The report was uploaded.
+- Not achieved / blocked: Review remains incomplete.
+
+### Related task handoff
+- Task/project/focus item: report review.
+- Owner: current agent.
+- Status: active.
+- Completed evidence: report upload is present.
+- Remaining steps: inspect the report.
+- Blockers: none evidenced.
+- Next action: inspect the uploaded report.
+- Archive/file paths: none evidenced.
+
 ### Key facts
 - The user uploaded a report for review.
+### Open items
+- Complete the review.
+
 """ + ("Additional context. " * 20)
 
     repaired, missing = append_missing_identifiers(
@@ -123,7 +304,7 @@ def test_attachment_path_with_spaces_is_mechanically_preserved_from_summary_inpu
     assert "workspace/uploads/my report.pdf" in missing
     assert "- workspace/uploads/my report.pdf" in repaired
     passed, reason, recall = validate_summary(
-        summary=repaired,
+        summary=pin_summary_objective(summary=repaired, original_text=original),
         original_text=original,
         max_tokens=2000,
     )
@@ -137,34 +318,43 @@ def test_attachment_path_with_spaces_is_mechanically_preserved_from_summary_inpu
 class TestShouldCompact:
     def test_post_round_above_threshold_triggers(self):
         m = _model(context_window=100_000, ratio=0.85)
-        fire, ratio, reason = should_compact(model=m, last_prompt_tokens=86_000, pre_flight_estimate=None)
+        fire, ratio, reason = should_compact(model=m, last_prompt_tokens=99_999, pre_flight_estimate=None)
         assert fire is True
         assert reason == "post_round"
-        assert ratio == pytest.approx(0.86)
+        assert ratio == pytest.approx(1.0)
 
     def test_post_round_below_threshold_does_not_trigger(self):
         m = _model(context_window=100_000, ratio=0.85)
-        fire, ratio, reason = should_compact(model=m, last_prompt_tokens=84_999, pre_flight_estimate=None)
+        fire, ratio, reason = should_compact(model=m, last_prompt_tokens=84_998, pre_flight_estimate=None)
         assert fire is False
         assert reason == "below_threshold"
 
-    def test_pre_flight_safety_net_at_95_percent(self):
+    def test_pre_flight_uses_same_compaction_boundary(self):
         m = _model(context_window=100_000, ratio=0.85)
-        # pre_flight at 95% — fires even though no post_round info
-        fire, ratio, reason = should_compact(model=m, last_prompt_tokens=None, pre_flight_estimate=95_000)
-        assert fire is True
-        assert reason == "pre_flight"
-
-    def test_pre_flight_at_94_percent_does_not_fire(self):
-        m = _model(context_window=100_000, ratio=0.85)
-        # 94% < PRE_FLIGHT_TRIGGER_RATIO (0.95), and post-round not given
-        fire, _, reason = should_compact(model=m, last_prompt_tokens=None, pre_flight_estimate=94_000)
+        fire, ratio, reason = should_compact(model=m, last_prompt_tokens=None, pre_flight_estimate=100_000)
         assert fire is False
+        assert reason == "below_threshold"
+
+    def test_pre_flight_below_compaction_boundary_does_not_fire(self):
+        m = _model(context_window=100_000, ratio=0.85)
+        fire, _, reason = should_compact(model=m, last_prompt_tokens=None, pre_flight_estimate=84_998)
+        assert fire is False
+
+    def test_model_usage_ratio_reduces_trigger_window(self):
+        m = _model(context_window=100_000, usage_ratio=0.5)
+        fire, ratio, reason = should_compact(
+            model=m,
+            last_prompt_tokens=49_999,
+            pre_flight_estimate=None,
+        )
+        assert fire is True
+        assert reason == "post_round"
+        assert ratio == pytest.approx(1.0)
 
     def test_post_round_takes_precedence_when_both_given(self):
         m = _model(context_window=100_000, ratio=0.85)
         # post 90% triggers; pre-flight 80% would not
-        fire, _, reason = should_compact(model=m, last_prompt_tokens=90_000, pre_flight_estimate=80_000)
+        fire, _, reason = should_compact(model=m, last_prompt_tokens=99_999, pre_flight_estimate=200_000)
         assert fire is True
         assert reason == "post_round"
 
@@ -190,10 +380,13 @@ class _Row:
     role: str
     id: uuid.UUID = None
     created_at: datetime = None
+    content: str = ""
 
     def __post_init__(self):
         self.id = self.id or uuid.uuid4()
         self.created_at = self.created_at or datetime.now(timezone.utc)
+        if self.role == "tool_call" and not self.content:
+            self.content = json.dumps({"status": "done", "call_id": str(self.id)})
 
 
 def _conversation(turns):
@@ -201,7 +394,11 @@ def _conversation(turns):
     is one role: 'u'=user, 'a'=assistant, 't'=tool_call.
     """
     role_map = {"u": "user", "a": "assistant", "t": "tool_call"}
-    return [_Row(role=role_map[c]) for c in turns]
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        _Row(role=role_map[c], created_at=base.replace(microsecond=index))
+        for index, c in enumerate(turns)
+    ]
 
 
 class TestSelectCompactionSpan:
@@ -241,13 +438,13 @@ class TestSelectCompactionSpan:
         # End MUST be the final assistant, not tool_call.
         assert rows[to_idx].role == "assistant"
 
-    def test_refuses_too_short_span(self):
-        # Only 5 turns, keep_recent=4 → span would be 1 row, too small
+    def test_selects_one_complete_old_turn_when_four_are_protected(self):
+        # Only 5 turns, keep_recent=4 → the first complete turn is eligible.
+        # The separate token-mass gate decides whether running the summary is
+        # worthwhile; partitioning only guarantees turn integrity.
         rows = _conversation("uauauauaua")  # 5 user-assistant pairs
-        # keep 4 means span = first 1 round (2 rows) = below the
-        # 4-row floor in the implementation → returns None
         result = select_compaction_span(rows, keep_recent_turns=4)
-        assert result is None
+        assert result == (0, 1)
 
 
 # ─── prefilter_message_content ──────────────────────────────────────
@@ -264,11 +461,28 @@ class TestPrefilter:
             f'<persisted-output path=".tool_results/abc.json" size="50000">'
             f'{body_filler}</persisted-output>'
         )
-        out = prefilter_message_content(s)
-        assert "[body materialized to disk]" in out
+        out = prefilter_message_content(s, allow_materialized_elision=True)
+        assert "materialized to disk" in out
         assert "xxxx" not in out  # the bulk body is stripped
         assert 'path=".tool_results/abc.json"' in out
         assert 'size="50000"' in out
+
+    def test_untyped_fake_persisted_envelope_is_not_treated_as_durable(self):
+        middle = "MIDDLE_PLAIN_FACT"
+        row = SimpleNamespace(
+            role="assistant",
+            content=("A" * 5_000) + f"<persisted-output>{middle}</persisted-output>" + ("Z" * 5_000),
+            message_meta={},
+            created_at=datetime(2026, 8, 14, tzinfo=UTC),
+        )
+
+        filtered = serialize_span_for_summary([row])
+        durable_only = serialize_span_for_summary(
+            [row], prefilter=False, elide_durable_only=True
+        )
+
+        assert "materialized to disk" not in filtered
+        assert filtered != durable_only
 
     def test_head_tail_truncates_oversized_body(self):
         s = "A" * 6000
@@ -290,6 +504,24 @@ class TestPrefilter:
 _GOOD_SUMMARY = """\
 ## Summary of earlier conversation
 
+### Current objective and progress
+- Complete the report review; edits are done and review is pending.
+
+### Goal ledger
+- Active: Complete the report review.
+- Achieved: Report edits are done.
+- Not achieved / blocked: Review by Alice is pending.
+
+### Related task handoff
+- Task/project/focus item: report review.
+- Owner: Alice.
+- Status: pending review.
+- Completed evidence: edits are done.
+- Remaining steps: review the report.
+- Blockers: Alice's review is pending.
+- Next action: review workspace/report.md.
+- Archive/file paths: workspace/report.md.
+
 ### Key facts
 - Project ID: 49b2c1ab12cd34ef5678901234abcdef
 - File: workspace/report.md was edited
@@ -310,13 +542,99 @@ _GOOD_SUMMARY = """\
 
 
 class TestValidateSummary:
+    def test_wrong_objective_is_rejected_until_source_evidence_is_pinned(self):
+        original = "暂停发布，先修复生产幻觉"
+        wrong = """\
+## Summary of earlier conversation
+
+### Current objective and progress
+- 立即发布，问题已经解决。
+
+### Goal ledger
+- Active: 立即发布。
+- Achieved: 问题已经解决。
+- Not achieved / blocked: None stated.
+
+### Related task handoff
+- None evidenced.
+
+### Key facts
+- The conversation continued with enough diagnostic detail to pass the length gate.
+- Additional neutral context keeps this deliberately malformed summary above the minimum size.
+
+### Open items
+- Publish now.
+"""
+        passed, reason, _ = validate_summary(
+            summary=wrong,
+            original_text=original,
+            max_tokens=500,
+        )
+        assert passed is False
+        assert reason == "objective_evidence_missing"
+
+    def test_recent_user_evidence_is_content_agnostic_and_keeps_ack_predecessors(self):
+        source = """\
+### [user] @ 2026-08-29T00:00:00+00:00
+暂停发布，先修复幻觉，不得触碰生产。
+
+### [user] @ 2026-08-29T00:01:00+00:00
+补充验证 3.5 到 3.8。
+
+### [user] @ 2026-08-29T00:02:00+00:00
+好的
+"""
+        pinned = pin_summary_objective(
+            summary=_GOOD_SUMMARY,
+            original_text=source,
+            max_tokens=500,
+        )
+        assert "暂停发布，先修复幻觉，不得触碰生产。" in pinned
+        assert "补充验证 3.5 到 3.8。" in pinned
+        assert "好的" in pinned
+
+    def test_progressive_objective_evidence_is_stable_for_forty_epochs(self):
+        source = """\
+### [user] @ 2026-08-29T00:00:00+00:00
+CRITICAL_GOAL: pause release, fix hallucinations, never touch production.
+
+### [user] @ 2026-08-29T00:01:00+00:00
+continue
+
+### [user] @ 2026-08-29T00:02:00+00:00
+okay
+"""
+        summary = pin_summary_objective(
+            summary=_GOOD_SUMMARY,
+            original_text=source,
+            max_tokens=200,
+        )
+        for epoch in range(40):
+            new_span = f"""\
+### [user] @ 2026-08-30T00:00:00+00:00
+continue-{epoch}
+
+### [user] @ 2026-08-30T00:01:00+00:00
+status-{epoch}
+
+### [user] @ 2026-08-30T00:02:00+00:00
+okay-{epoch}
+"""
+            summary = pin_summary_objective(
+                summary=_GOOD_SUMMARY,
+                original_text=summary + "\n\n" + new_span,
+                max_tokens=200,
+            )
+            assert "CRITICAL_GOAL" in summary
+            assert "P: P:" not in summary
+
     def test_passes_well_formed_summary_with_full_recall(self):
         original = (
             "User uploaded workspace/report.md and workspace/draft.md, "
             "project id 49b2c1ab12cd34ef5678901234abcdef"
         )
         passed, fail_reason, recall = validate_summary(
-            summary=_GOOD_SUMMARY,
+            summary=pin_summary_objective(summary=_GOOD_SUMMARY, original_text=original),
             original_text=original,
             max_tokens=2000,
         )
@@ -343,6 +661,24 @@ class TestValidateSummary:
         )
         summary = """\
 ## Summary of earlier conversation
+
+### Current objective and progress
+- Continue editing the remaining files.
+
+### Goal ledger
+- Active: Continue editing.
+- Achieved: workspace/a.md was edited.
+- Not achieved / blocked: Remaining files are incomplete.
+
+### Related task handoff
+- Task/project/focus item: edit remaining files.
+- Owner: current agent.
+- Status: active.
+- Completed evidence: workspace/a.md was edited.
+- Remaining steps: edit the other four files.
+- Blockers: none evidenced.
+- Next action: read the remaining files.
+- Archive/file paths: workspace/a.md.
 
 ### Key facts
 - A single file was edited during the segment: workspace/a.md
@@ -385,7 +721,7 @@ class TestValidateSummary:
         # Original is just pleasantries — no UUIDs or paths to recall
         original = "Hello there, how are you doing today?"
         passed, _, recall = validate_summary(
-            summary=_GOOD_SUMMARY,
+            summary=pin_summary_objective(summary=_GOOD_SUMMARY, original_text=original),
             original_text=original,
             max_tokens=2000,
         )
@@ -402,12 +738,33 @@ class TestValidateSummary:
         summary = """\
 ## Summary of earlier conversation
 
+### Current objective and progress
+- Complete the report workflow and retain the recovery procedure.
+
+### Goal ledger
+- Active: Complete the report workflow.
+- Achieved: Recovery procedure captured.
+- Not achieved / blocked: Report workflow remains incomplete.
+
+### Related task handoff
+- Task/project/focus item: report workflow.
+- Owner: current agent.
+- Status: active.
+- Completed evidence: recovery procedure captured.
+- Remaining steps: finish the report workflow.
+- Blockers: none evidenced.
+- Next action: continue with the preserved IDs.
+- Archive/file paths: workspace/report.md.
+
 ### Key facts
 - The report workflow and recovery procedure were discussed.
 
 ### Files / paths / IDs referenced
 - workspace/report.md
 - https://example.test/report/42
+
+### Open items
+- Continue the report workflow.
 """
 
         repaired, missing = append_missing_identifiers(
@@ -415,7 +772,7 @@ class TestValidateSummary:
             original_text=original,
         )
         passed, reason, recall = validate_summary(
-            summary=repaired,
+            summary=pin_summary_objective(summary=repaired, original_text=original),
             original_text=original,
             max_tokens=2000,
         )
@@ -436,73 +793,110 @@ class TestValidateSummary:
         assert "/" not in identifiers
         assert not any(identifier.startswith("/\\") for identifier in identifiers)
 
+    def test_persisted_output_path_survives_prefilter_and_identifier_recall(self):
+        original = (
+            "<persisted-output>\n"
+            "TRUNCATED: original output contains 180,000 characters.\n"
+            "Full output saved to: .tool_results/session/report_call.txt\n\n"
+            + ("bulk body\n" * 1000)
+            + "</persisted-output>"
+        )
 
-# ─── estimate_prompt_tokens ─────────────────────────────────────────
+        filtered = prefilter_message_content(original, allow_materialized_elision=True)
+        identifiers = extract_preserved_identifiers(filtered)
 
+        assert ".tool_results/session/report_call.txt" in filtered
+        assert ".tool_results/session/report_call.txt" in identifiers
+        assert len(filtered) < len(original)
 
-class TestEstimatePromptTokens:
-    def test_simple_string_content(self):
-        msgs = [
-            {"role": "system", "content": "x" * 100},
-            {"role": "user", "content": "y" * 250},
-        ]
-        assert estimate_prompt_tokens(msgs) == 117
+    def test_identifier_heavy_summary_cannot_exceed_configured_token_budget(self):
+        identifiers = " ".join(str(uuid.uuid4()) for _ in range(1_000))
+        summary = f"{_GOOD_SUMMARY}\n\n### Preserved identifiers\n{identifiers}"
 
-    def test_list_content_with_text_blocks(self):
-        msgs = [
-            {"role": "user", "content": [
-                {"type": "text", "text": "a" * 50},
-                {"type": "text", "text": "b" * 50},
-            ]}
-        ]
-        assert estimate_prompt_tokens(msgs) == 34
+        passed, reason, _ = validate_summary(
+            summary=summary,
+            original_text=identifiers,
+            max_tokens=2_000,
+        )
 
-    def test_image_blocks_get_fixed_cost(self):
-        msgs = [
-            {"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "data": "..."}},
-            ]}
-        ]
-        # 1024 placeholder chars per image, estimated at three ASCII chars/token.
-        assert estimate_prompt_tokens(msgs) == 342
+        assert passed is False
+        assert reason is not None
+        assert reason.startswith("too_long")
 
-    def test_legacy_base64_image_markers_get_fixed_cost(self):
-        small = "[image_data:data:image/jpeg;base64," + "A" * 40 + "]"
-        large = "[image_data:data:image/jpeg;base64," + "A" * 400_000 + "]"
+    def test_deterministic_fallback_preserves_goal_sections_and_identifiers(self):
+        original = (
+            "User objective: finish workspace/report.md before Friday.\n"
+            "Open item: validate dataset 5baa7373-b5c5-9eb4-8d10-d81aef980b1c.\n"
+            + "Evidence line.\n" * 100
+        )
+        summary = build_deterministic_summary(source_text=original, max_tokens=500)
+        passed, reason, recall = validate_summary(
+            summary=summary,
+            original_text=original,
+            max_tokens=500,
+        )
+        assert passed is True, reason
+        assert "### Current objective and progress" in summary
+        assert "### Open items" in summary
+        assert "workspace/report.md" in summary
+        assert recall == 1.0
 
-        small_estimate = estimate_prompt_tokens([{"role": "user", "content": small}])
-        large_estimate = estimate_prompt_tokens([{"role": "user", "content": large}])
+    def test_deterministic_fallback_is_bounded_with_unbounded_identifier_input(self):
+        source = "\n".join(
+            f"Open item {index}: workspace/reports/{index}/result.json "
+            f"{uuid.uuid4()}"
+            for index in range(5_000)
+        )
+        archive = (
+            "<persisted-output>\n"
+            "Full output saved to: .tool_results/session/compaction-archive.txt\n"
+            "</persisted-output>"
+        )
+        max_tokens = 200
 
-        assert small_estimate == 342
-        assert large_estimate == small_estimate
+        summary = build_deterministic_summary(
+            source_text=source,
+            max_tokens=max_tokens,
+            archive_envelope=archive,
+        )
 
-    def test_tool_call_arguments_counted(self):
-        msgs = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"function": {"name": "x", "arguments": '{"q":"' + "y" * 100 + '"}'}}
-                ],
-            }
-        ]
-        assert estimate_prompt_tokens(msgs) >= 35
-
-    def test_cjk_characters_are_counted_conservatively(self):
-        msgs = [{"role": "user", "content": "数" * 901}]
-        assert estimate_prompt_tokens(msgs) == 901
+        assert len(summary) <= DETERMINISTIC_SUMMARY_MAX_CHARS
+        assert "### Current objective and progress" in summary
+        assert "### Open items" in summary
+        assert ".tool_results/session/compaction-archive.txt" in summary
+        passed, reason, recall = validate_summary(
+            summary=summary,
+            original_text=prefilter_message_content(archive),
+            max_tokens=max_tokens,
+            objective_text=source,
+            objective_evidence_max_chars=800,
+            objective_archived=True,
+        )
+        assert passed is True, reason
+        assert recall == 1.0
 
 
 @pytest.mark.asyncio
-async def test_summary_provider_request_is_bounded_before_dispatch(monkeypatch):
+async def test_summary_provider_request_uses_no_local_input_estimator(monkeypatch):
     captured = {}
+    bounded_events: list[bool] = []
 
     class _Client:
+        closed = False
+
         async def complete(self, messages, **_kwargs):
             captured["messages"] = messages
             return SimpleNamespace(content="summary", usage={"completion_tokens": 1})
 
-    monkeypatch.setattr("app.services.llm.create_llm_client", lambda **_kwargs: _Client())
+        async def close(self):
+            self.closed = True
+
+    def _client_factory(**kwargs):
+        captured["client_kwargs"] = kwargs
+        captured["client"] = _Client()
+        return captured["client"]
+
+    monkeypatch.setattr("app.services.llm.create_llm_client", _client_factory)
     monkeypatch.setattr("app.services.llm.get_model_api_key", lambda _model: "key")
     model = _model(context_window=8_000, summary_max=500)
 
@@ -510,6 +904,7 @@ async def test_summary_provider_request_is_bounded_before_dispatch(monkeypatch):
         span_text="历史" * 50_000,
         prior_summary=None,
         model=model,
+        on_input_bounded=bounded_events.append,
     )
 
     assert measure_dispatch(
@@ -518,6 +913,35 @@ async def test_summary_provider_request_is_bounded_before_dispatch(monkeypatch):
         tools=None,
         max_output_tokens=model.compact_summary_max_tokens,
     ).fits
+    assert captured["client_kwargs"]["timeout"] == 120.0
+    assert captured["client_kwargs"]["provider_managed_timeout"] is True
+    assert captured["client"].closed is True
+    assert bounded_events == [False]
+
+
+@pytest.mark.asyncio
+async def test_summary_provider_client_closes_when_request_raises(monkeypatch):
+    class _Client:
+        closed = False
+
+        async def complete(self, *_args, **_kwargs):
+            raise RuntimeError("summary provider failed")
+
+        async def close(self):
+            self.closed = True
+
+    client = _Client()
+    monkeypatch.setattr("app.services.llm.create_llm_client", lambda **_kwargs: client)
+    monkeypatch.setattr("app.services.llm.get_model_api_key", lambda _model: "key")
+
+    with pytest.raises(RuntimeError, match="summary provider failed"):
+        await _summarize_via_llm(
+            span_text="history " * 500,
+            prior_summary=None,
+            model=_model(context_window=8_000, summary_max=500),
+        )
+
+    assert client.closed is True
 
 
 @pytest.mark.asyncio

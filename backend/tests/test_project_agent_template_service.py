@@ -138,6 +138,7 @@ async def test_project_template_round_trip_creates_fresh_project_agents(
         status="idle",
         access_mode="private",
     )
+    source_agent.daily_memory_load_days = 0
     db.add(source_agent)
     await db.flush()
     db.add(Participant(type="agent", ref_id=source_agent.id, display_name=source_agent.name))
@@ -159,6 +160,7 @@ async def test_project_template_round_trip_creates_fresh_project_agents(
     (source_layout.workspace / "brief.md").write_text("safe brief\n", encoding="utf-8")
 
     definition_agents = await export_project_agents_for_template(db, source_project)
+    assert definition_agents[0]["runtime"]["daily_memory_load_days"] == 0
     assert str(source_project.id) not in str(definition_agents)
     created = await instantiate_project_agents_from_template(db, target_project, owner, definition_agents)
 
@@ -168,6 +170,7 @@ async def test_project_template_round_trip_creates_fresh_project_agents(
     assert created_agent.scope == "project"
     assert created_agent.project_id == target_project.id
     assert created_agent.primary_model_id is not None
+    assert created_agent.daily_memory_load_days == 0
     assert member.is_leader is True
     target_layout = project_agent_workspace(roots[target_project.id], created_agent.id)
     assert target_layout.memory.read_text(encoding="utf-8") == "durable product context\n"

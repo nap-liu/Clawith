@@ -24,7 +24,7 @@ class _Result:
         return self.value
 
 
-async def test_background_context_guard_is_truthful_and_never_persists_fake_session(
+async def test_background_context_uses_provider_usage_not_local_text_size(
     monkeypatch,
 ):
     agent_id = uuid.uuid4()
@@ -59,14 +59,27 @@ async def test_background_context_guard_is_truthful_and_never_persists_fake_sess
     async def _execute(*_args, **_kwargs):
         return query_results.pop(0)
 
-    class _NeverCalledClient:
+    class _ProviderMeasuredClient:
+        def __init__(self):
+            self.calls = 0
+
         async def complete(self, **_kwargs):
-            raise AssertionError("oversized request reached provider")
+            self.calls += 1
+            return LLMResponse(
+                content="provider accepted",
+                usage={
+                    "prompt_tokens": 321,
+                    "completion_tokens": 5,
+                    "total_tokens": 326,
+                },
+            )
 
         async def close(self):
             return None
 
     terminate = AsyncMock(return_value="must not persist")
+    record_usage = AsyncMock(return_value=None)
+    client = _ProviderMeasuredClient()
     monkeypatch.setattr(
         "app.services.llm.session_context_guard.get_session_context_termination",
         AsyncMock(return_value=None),
@@ -77,12 +90,16 @@ async def test_background_context_guard_is_truthful_and_never_persists_fake_sess
     )
     monkeypatch.setattr(
         "app.services.llm.caller.create_llm_client",
-        lambda **_kwargs: _NeverCalledClient(),
+        lambda **_kwargs: client,
     )
     monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "key")
     monkeypatch.setattr(
         "app.services.llm.caller.get_agent_tools_for_llm",
         AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller.record_token_usage",
+        record_usage,
     )
 
     db = SimpleNamespace(execute=_execute, commit=AsyncMock())
@@ -94,9 +111,13 @@ async def test_background_context_guard_is_truthful_and_never_persists_fake_sess
         session_id=str(uuid.uuid4()),
     )
 
-    assert reply == "上下文过长，请新开会话。"
+    assert reply == "provider accepted"
+    assert client.calls == 1
     db.commit.assert_awaited_once()
     terminate.assert_not_awaited()
+    recorded = record_usage.await_args.args[1]
+    assert recorded.context_input_tokens == 321
+    assert recorded.output_tokens == 5
 
 
 async def test_large_read_file_result_is_materialized_before_second_model_round(
@@ -319,3 +340,87 @@ async def test_background_tool_round_content_becomes_confirmation_intro(monkeypa
     assert reply == ""
     db.commit.assert_awaited_once()
     assert suspend.await_args.kwargs["intro_text"] == "background answer"
+
+
+async def test_background_confirmation_round_id_is_unique_per_execution(monkeypatch):
+    agent_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    execution_user_id = uuid.uuid4()
+    session_id = str(uuid.uuid4())
+    agent = SimpleNamespace(
+        id=agent_id,
+        name="background-agent",
+        creator_id=execution_user_id,
+        primary_model_id=model_id,
+        fallback_model_id=None,
+    )
+    model = SimpleNamespace(
+        id=model_id,
+        provider="qwen",
+        model="qwen-test",
+        base_url=None,
+        temperature=0.2,
+        max_output_tokens=1_000,
+        request_timeout=30,
+        context_window=1_000_000,
+    )
+
+    class _Client:
+        async def complete(self, **_kwargs):
+            return LLMResponse(
+                content="confirm this run",
+                tool_calls=[
+                    {
+                        "id": str(uuid.uuid4()),
+                        "type": "function",
+                        "function": {
+                            "name": "request_confirmation",
+                            "arguments": '{"title":"Confirm","summary":"Continue?"}',
+                        },
+                    }
+                ],
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.llm.session_context_guard.get_session_context_termination",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: _Client())
+    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "test-key")
+    monkeypatch.setattr(
+        "app.services.llm.caller.get_agent_tools_for_llm",
+        AsyncMock(
+            return_value=[
+                {"type": "function", "function": {"name": "request_confirmation", "description": "confirm"}}
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller.record_token_usage",
+        AsyncMock(return_value=None),
+    )
+    suspend = AsyncMock(return_value="confirmation-row")
+    monkeypatch.setattr("app.services.confirmation_service.suspend_for_confirmation", suspend)
+
+    for _ in range(2):
+        query_results = [_Result(agent), _Result(model)]
+
+        async def _execute_query(*_args, **_kwargs):
+            return query_results.pop(0)
+
+        db = SimpleNamespace(execute=_execute_query, commit=AsyncMock())
+        assert await call_agent_llm_with_tools(
+            db,
+            agent_id,
+            "system",
+            "prompt",
+            session_id=session_id,
+        ) == ""
+
+    round_ids = [call.kwargs["round_id"] for call in suspend.await_args_list]
+    assert len(round_ids) == 2
+    assert round_ids[0] != round_ids[1]
+    assert all(round_id.startswith(f"{session_id}:background:") for round_id in round_ids)

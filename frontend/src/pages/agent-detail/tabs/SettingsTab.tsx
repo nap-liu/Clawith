@@ -13,6 +13,7 @@ type SettingsFormState = {
     primary_model_id: string;
     fallback_model_id: string;
     context_window_size: number;
+    daily_memory_load_days: number;
     max_tool_rounds: number;
     max_tokens_per_day: string | number;
     max_tokens_per_month: string | number;
@@ -234,7 +235,8 @@ export default function SettingsTab(props: Props) {
 
             <div className="card" style={{ marginBottom: '12px' }}>
                 <h4 style={{ marginBottom: '12px' }}>{t('agent.settings.conversationContext')}</h4>
-                <div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px' }}>
+                    <div>
                     <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.maxRounds')}</label>
                     <input
                         className="input"
@@ -246,6 +248,20 @@ export default function SettingsTab(props: Props) {
                         style={{ width: '120px' }}
                     />
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.roundsDesc')}</div>
+                    </div>
+                    <div>
+                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.dailyMemoryLoadDays')}</label>
+                        <input
+                            className="input"
+                            type="number"
+                            min={0}
+                            max={30}
+                            value={settingsForm.daily_memory_load_days}
+                            onChange={(e) => setSettingsForm((form) => ({ ...form, daily_memory_load_days: Math.max(0, Math.min(30, Number(e.target.value))) }))}
+                            style={{ width: '120px' }}
+                        />
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.dailyMemoryLoadDaysDesc')}</div>
+                    </div>
                 </div>
             </div>
 

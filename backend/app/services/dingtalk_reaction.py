@@ -20,9 +20,21 @@ TEXT_EMOTION_BACKGROUND_ID = "im_bg_1"
 DEFAULT_THINKING_REACTION = "🤔思考中"
 HEARTBEAT_REACTION = "⏳"
 DEFAULT_TOOL_REACTION = "🛠️"
+DURABLE_PROGRESS_REACTIONS = (
+    DEFAULT_THINKING_REACTION,
+    HEARTBEAT_REACTION,
+    DEFAULT_TOOL_REACTION,
+    "🔍",
+    "📦",
+    "📂",
+    "✍️",
+    "🌐",
+    "🔗",
+)
+DURABLE_REACTION_CLEANUP_TIMEOUT_SECONDS = 2.0
 
 AttachReaction = Callable[[str], Awaitable[bool]]
-RecallReaction = Callable[[str], Awaitable[None]]
+RecallReaction = Callable[[str], Awaitable[bool | None]]
 
 _PACKAGE_COMMAND_RE = re.compile(
     r"\b("
@@ -140,7 +152,7 @@ async def recall_reaction(
     message_id: str,
     conversation_id: str,
     reaction_name: str,
-) -> None:
+) -> bool:
     """Recall a DingTalk text-emotion reaction with delayed retries."""
     for delay in (0.0, 1.5, 5.0):
         if delay:
@@ -155,13 +167,14 @@ async def recall_reaction(
                 url=REACTION_RECALL_URL,
                 action="recall",
             ):
-                return
+                return True
         except Exception as exc:  # noqa: BLE001 - IM reaction is best-effort
             logger.warning(f"[DingTalk Reaction] Recall error reaction={reaction_name}: {exc}")
     logger.warning(
         f"[DingTalk Reaction] All recall attempts failed "
         f"reaction={reaction_name} msg={message_id[:16]}"
     )
+    return False
 
 
 async def add_thinking_reaction(
@@ -194,6 +207,59 @@ async def recall_thinking_reaction(
         conversation_id,
         DEFAULT_THINKING_REACTION,
     )
+
+
+async def cleanup_durable_progress_reactions(
+    app_key: str,
+    app_secret: str,
+    message_id: str,
+    conversation_id: str,
+) -> bool:
+    """Best-effort cleanup when the process-local reaction controller is gone.
+
+    The controller's current emotion cannot be reconstructed after a crash.
+    DingTalk's progress vocabulary is deliberately finite, so recovery recalls
+    each possible value once in parallel and never runs the normal delayed retry
+    loop. ``True`` requires DingTalk to accept every candidate recall; accepting
+    a non-current emotion must never hide failure to recall the real one.
+    """
+
+    tasks = {
+        asyncio.create_task(
+            _post_reaction(
+                app_key=app_key,
+                app_secret=app_secret,
+                message_id=message_id,
+                conversation_id=conversation_id,
+                reaction_name=reaction,
+                url=REACTION_RECALL_URL,
+                action="recovery-recall",
+            )
+        )
+        for reaction in DURABLE_PROGRESS_REACTIONS
+    }
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=DURABLE_REACTION_CLEANUP_TIMEOUT_SECONDS,
+    )
+    for task in pending:
+        task.cancel()
+    accepted = not pending and bool(done)
+    for task in done:
+        try:
+            accepted = bool(task.result()) and accepted
+        except Exception as exc:  # noqa: BLE001 - durable cleanup is best-effort
+            accepted = False
+            logger.warning(
+                "[DingTalk Reaction] durable cleanup request failed "
+                f"msg={message_id[:16]}: {type(exc).__name__}"
+            )
+    if pending:
+        logger.warning(
+            "[DingTalk Reaction] durable cleanup timed out "
+            f"msg={message_id[:16]} pending={len(pending)}"
+        )
+    return accepted
 
 
 def _extract_command(args: object) -> str:
@@ -293,27 +359,30 @@ class DingTalkReactionController:
         self._last_activity_at = time.monotonic()
         await self._switch(DEFAULT_THINKING_REACTION)
 
-    async def on_complete(self, _reply: str) -> None:
-        await self.dispose()
+    async def on_complete(self, _reply: str) -> bool:
+        return await self.dispose()
 
-    async def on_error(self, _exc: BaseException) -> None:
-        await self.dispose()
+    async def on_error(self, _exc: BaseException) -> bool:
+        return await self.dispose()
 
-    async def dispose(self) -> None:
+    async def dispose(self) -> bool:
         heartbeat_task: asyncio.Task | None = None
+        cleanup_completed = True
         async with self._lock:
             if self._disposed:
-                return
+                return True
             self._disposed = True
             heartbeat_task = self._heartbeat_task
             self._heartbeat_task = None
             if self._attached:
-                await self._recall_reaction(self._current)
+                cleanup_result = await self._recall_reaction(self._current)
+                cleanup_completed = cleanup_result is not False
                 self._attached = False
         if heartbeat_task is not None and heartbeat_task is not asyncio.current_task():
             heartbeat_task.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat_task
+        return cleanup_completed
 
     async def _switch(self, next_reaction: str, *, force: bool = False) -> None:
         async with self._lock:

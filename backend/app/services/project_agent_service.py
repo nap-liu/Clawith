@@ -106,6 +106,7 @@ def _new_project_agent(
         fallback_model_id=source.fallback_model_id if source else None,
         context_window_size=source.context_window_size if source else 100,
         max_tool_rounds=source.max_tool_rounds if source else 50,
+        daily_memory_load_days=source.daily_memory_load_days if source else 2,
         access_mode="private",
         company_access_level="use",
         heartbeat_enabled=False,
@@ -469,6 +470,7 @@ async def promote_project_agent(
         autonomy_policy=dict(project_agent.autonomy_policy or {}),
         context_window_size=project_agent.context_window_size,
         max_tool_rounds=project_agent.max_tool_rounds,
+        daily_memory_load_days=project_agent.daily_memory_load_days,
         access_mode="private",
         company_access_level="use",
     )

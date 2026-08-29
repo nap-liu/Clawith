@@ -53,6 +53,35 @@ def _is_platform_admin_user(user: User) -> bool:
     return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
 
 
+def _assert_tenant_scope(user: User, tenant_id: uuid.UUID | None) -> None:
+    """Reject cross-tenant model access for every non-platform admin."""
+    if _is_platform_admin_user(user):
+        return
+    if user.tenant_id is None or tenant_id != user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access another tenant's model")
+
+
+def _validate_model_context_budget(model: LLMModel) -> None:
+    """Reject a model configuration that leaves no practical input window."""
+    from app.services.llm.client import get_max_tokens
+    from app.services.llm.context_budget import resolve_context_budget
+
+    max_output_tokens = get_max_tokens(
+        model.provider,
+        model.model,
+        model.max_output_tokens,
+    )
+    budget = resolve_context_budget(model, max_output_tokens=max_output_tokens)
+    if not budget.configured or budget.input_capacity < 1024:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Usable context must leave at least 1024 input tokens after "
+                "the model output reservation"
+            ),
+        )
+
+
 # ─── Public: Check Email Exists ────────────────────────
 
 class CheckEmailRequest(BaseModel):
@@ -94,7 +123,7 @@ class LLMTestRequest(BaseModel):
     model_id: str | None = None  # existing model ID to use stored API key
 
 
-async def _load_llm_test_api_key(model_id: str | None) -> str | None:
+async def _load_llm_test_api_key(model_id: str | None, current_user: User) -> str | None:
     """Load the stored API key for llm-test using a short-lived independent session."""
     if not model_id:
         return None
@@ -102,6 +131,9 @@ async def _load_llm_test_api_key(model_id: str | None) -> str | None:
     async with async_session() as session:
         result = await session.execute(select(LLMModel).where(LLMModel.id == model_id))
         existing = result.scalar_one_or_none()
+        if existing is None:
+            return None
+        _assert_tenant_scope(current_user, existing.tenant_id)
         return get_model_api_key(existing) if existing else None
 
 
@@ -116,7 +148,7 @@ async def test_llm_model(
     # Resolve API key: use provided key, or look up from stored model
     api_key = data.api_key if data.api_key and not data.api_key.startswith('****') else None
     if not api_key and data.model_id:
-        api_key = await _load_llm_test_api_key(data.model_id)
+        api_key = await _load_llm_test_api_key(data.model_id, current_user)
     if not api_key:
         return {"success": False, "latency_ms": 0, "error": "API Key is required"}
 
@@ -129,10 +161,15 @@ async def test_llm_model(
             base_url=data.base_url or None,
         )
         # Simple test: ask model to say "ok"
-        response = await client.complete(
-            messages=[LLMMessage(role="user", content="Say 'ok' and nothing else.")],
-            max_tokens=16,
-        )
+        try:
+            response = await client.complete(
+                messages=[LLMMessage(role="user", content="Say 'ok' and nothing else.")],
+                max_tokens=16,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                await close()
         latency_ms = int((time.time() - start) * 1000)
         reply = (response.content or "")[:100] if response else ""
         return {"success": True, "latency_ms": latency_ms, "reply": reply}
@@ -150,11 +187,13 @@ async def list_llm_models(
 ):
     """List LLM models scoped to the selected tenant."""
     # Authorization: non-platform admins can only see their own tenant's models
-    if tenant_id and current_user.role != "platform_admin":
+    if tenant_id and not _is_platform_admin_user(current_user):
         if str(current_user.tenant_id) != tenant_id:
             raise HTTPException(status_code=403, detail="Cannot access other tenant's models")
+    if not _is_platform_admin_user(current_user) and current_user.tenant_id is None:
+        raise HTTPException(status_code=403, detail="Tenant scope is required")
 
-    tid = tenant_id or str(current_user.tenant_id) if current_user.tenant_id else None
+    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
     query = select(LLMModel).order_by(LLMModel.created_at.desc())
     if tid:
         query = query.where(LLMModel.tenant_id == uuid.UUID(tid))
@@ -178,6 +217,8 @@ async def add_llm_model(
 ):
     """Add a new LLM model to the tenant's pool (admin)."""
     tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    target_tenant_id = uuid.UUID(tid) if tid else None
+    _assert_tenant_scope(current_user, target_tenant_id)
     model = LLMModel(
         provider=data.provider,
         model=data.model,
@@ -190,8 +231,12 @@ async def add_llm_model(
         supports_vision=data.supports_vision,
         max_output_tokens=data.max_output_tokens,
         request_timeout=data.request_timeout,
-        tenant_id=uuid.UUID(tid) if tid else None,
+        context_window=data.context_window,
+        context_usage_ratio=data.context_usage_ratio,
+        keep_recent_turns=data.keep_recent_turns,
+        tenant_id=target_tenant_id,
     )
+    _validate_model_context_budget(model)
     db.add(model)
     await db.flush()
 
@@ -253,6 +298,7 @@ async def set_default_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _assert_tenant_scope(current_user, model.tenant_id)
     if not model.tenant_id:
         raise HTTPException(status_code=400, detail="Model is not tenant-scoped")
     if not model.enabled:
@@ -303,6 +349,7 @@ async def remove_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _assert_tenant_scope(current_user, model.tenant_id)
 
     # Check if any agents reference this model
     from sqlalchemy import or_
@@ -346,6 +393,7 @@ async def update_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _assert_tenant_scope(current_user, model.tenant_id)
 
     try:
         if data.provider:
@@ -370,6 +418,14 @@ async def update_llm_model(
             model.max_output_tokens = data.max_output_tokens
         if hasattr(data, 'request_timeout') and data.request_timeout is not None:
             model.request_timeout = data.request_timeout
+        if data.context_window is not None:
+            model.context_window = data.context_window
+        if data.context_usage_ratio is not None:
+            model.context_usage_ratio = data.context_usage_ratio
+        if data.keep_recent_turns is not None:
+            model.keep_recent_turns = data.keep_recent_turns
+
+        _validate_model_context_budget(model)
 
         await db.commit()
         await db.refresh(model)

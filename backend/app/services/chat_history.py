@@ -57,6 +57,7 @@ HIDDEN_RUNTIME_ANCHOR_KINDS = frozenset(
         HIDDEN_PROJECT_CONTINUATION_ANCHOR_KIND,
     }
 )
+INTERMEDIATE_ASSISTANT_ARTIFACT_ROLE = "intermediate_assistant"
 
 
 def _is_hidden_runtime_anchor(row: Any) -> bool:
@@ -103,9 +104,13 @@ def _build_summary_message(
     agent_id: uuid.UUID,
     conversation_id: str,
 ) -> _SyntheticSummaryMessage:
+    token_attribute = (
+        f' tokens="{marker.summary_tokens}"'
+        if marker.summary_tokens is not None
+        else ""
+    )
     body = (
-        f'<conversation-summary epoch="{marker.epoch}" '
-        f'tokens="{marker.summary_tokens}" '
+        f'<conversation-summary epoch="{marker.epoch}"{token_attribute} '
         f'generated_at="{marker.created_at.isoformat()}">\n'
         f"{_SUMMARY_WRAPPER_HEADER}\n\n"
         f"{marker.summary_text}\n"
@@ -443,7 +448,11 @@ def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
         "status": data.get("status"),
         "result": data.get("result"),
         "reasoning_content": data.get("reasoning_content"),
+        "assistant_content": data.get("assistant_content"),
+        "recovery_prefix_messages": data.get("recovery_prefix_messages"),
         "call_id": data.get("call_id") or data.get("tool_call_id"),
+        "round_id": data.get("round_id"),
+        "round_tool_index": data.get("round_tool_index"),
     }
 
 
@@ -456,6 +465,21 @@ def _is_confirmation_tool_call_row(row: Any) -> bool:
         and payload.get("name") == "request_confirmation"
         and payload.get("status") in {"pending", "done"}
     )
+
+
+def _validated_recovery_prefix(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    prefix: list[dict[str, Any]] = []
+    raw_prefix = payload.get("recovery_prefix_messages")
+    if not isinstance(raw_prefix, list):
+        return prefix
+    for item in raw_prefix:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"assistant", "user"} and isinstance(content, str):
+            prefix.append({"role": role, "content": content})
+    return prefix
 
 
 def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
@@ -481,7 +505,7 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
 
     asst: dict[str, Any] = {
         "role": "assistant",
-        "content": None,
+        "content": payload.get("assistant_content") or None,
         "tool_calls": [
             {
                 "id": tc_id,
@@ -499,19 +523,86 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     # Lazy import: vision_inject pulls in optional deps; only needed here.
     from app.services.vision_inject import sanitize_history_tool_result
 
+    prefix_messages = _validated_recovery_prefix(payload)
+
     if status == "pending":
         # A confirmation suspends the turn with an intentionally unpaired tool call.
         # No provider request is allowed while it remains pending; the real tool result
         # is created only by a button click or by an explicitly non-blocking card being
         # ignored through a later user message.
-        return [asst]
+        return [*prefix_messages, asst]
 
     tool_msg = {
         "role": "tool",
         "tool_call_id": tc_id,
         "content": sanitize_history_tool_result(str(result)),
     }
-    return [asst, tool_msg]
+    return [*prefix_messages, asst, tool_msg]
+
+
+def expand_tool_call_round(messages: list[Any]) -> list[dict[str, Any]]:
+    """Rebuild one model-issued multi-tool response without splitting it.
+
+    The live provider sequence is one assistant message containing every tool
+    call, followed by the matching tool results in order. Persisted rows stay
+    independently crash-recoverable, while this mapper restores that exact
+    provider shape for future turns.
+    """
+    parsed: list[tuple[Any, dict[str, Any]]] = []
+    for message in messages:
+        payload = _parse_tool_call_payload(getattr(message, "content", ""))
+        if payload is not None and payload.get("status") in {"done", "pending"}:
+            parsed.append((message, payload))
+    if not parsed:
+        return []
+
+    source_payload = next(
+        (
+            payload
+            for _, payload in parsed
+            if payload.get("assistant_content") is not None
+            or payload.get("reasoning_content")
+            or payload.get("recovery_prefix_messages")
+        ),
+        parsed[0][1],
+    )
+    assistant: dict[str, Any] = {
+        "role": "assistant",
+        "content": source_payload.get("assistant_content") or None,
+        "tool_calls": [],
+    }
+    if source_payload.get("reasoning_content"):
+        assistant["reasoning_content"] = source_payload["reasoning_content"]
+
+    for message, payload in parsed:
+        args = payload.get("args") if payload.get("args") is not None else {}
+        assistant["tool_calls"].append(
+            {
+                "id": str(payload.get("call_id") or f"call_{message.id}"),
+                "type": "function",
+                "function": {
+                    "name": payload.get("name") or "unknown",
+                    "arguments": (
+                        json.dumps(args, ensure_ascii=False)
+                        if isinstance(args, dict)
+                        else str(args)
+                    ),
+                },
+            }
+        )
+
+    from app.services.vision_inject import sanitize_history_tool_result
+
+    results = [
+        {
+            "role": "tool",
+            "tool_call_id": str(payload.get("call_id") or f"call_{message.id}"),
+            "content": sanitize_history_tool_result(str(payload.get("result") or "")),
+        }
+        for message, payload in parsed
+        if payload.get("status") == "done"
+    ]
+    return [*_validated_recovery_prefix(source_payload), assistant, *results]
 
 
 def build_llm_message_from_row(
@@ -592,15 +683,77 @@ def build_llm_messages_from_rows(
     - model ``thinking`` is carried only when ``include_thinking`` is set (the
       web client replays it into context; IM history intentionally does not).
     """
+    # A tool-owned delivery (for example send_media) may promote its original
+    # ``running`` row to ``done`` in place, while sibling results are appended
+    # later. Group each typed round at its first physical row and replay the
+    # model-issued order, independent of equal timestamps or random UUIDs.
+    round_rows: dict[str, list[tuple[int, Any, dict[str, Any]]]] = {}
+    for position, row in enumerate(rows):
+        if getattr(row, "role", None) != "tool_call":
+            continue
+        payload = _parse_tool_call_payload(getattr(row, "content", ""))
+        round_id = str((payload or {}).get("round_id") or "")
+        if round_id and (payload or {}).get("status") in {"done", "pending"}:
+            round_rows.setdefault(round_id, []).append((position, row, payload or {}))
+
     out: list[dict[str, Any]] = []
+    emitted_rounds: set[str] = set()
     for m in rows:
         meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
+        # This visible row mirrors assistant_content on the confirmation tool
+        # row. Keep it for UI rendering, but avoid replaying both copies.
+        if m.role == "assistant" and meta.get("artifact_role") == "confirmation_intro":
+            continue
         delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
         recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
         if m.role == "tool_call" and recall.get("status") == "recalled":
             out.append({"role": "assistant", "content": "[该消息已撤回，不应视为仍对用户可见]"})
             continue
         if m.role == "tool_call":
+            payload = _parse_tool_call_payload(getattr(m, "content", ""))
+            round_id = str((payload or {}).get("round_id") or "")
+            if round_id:
+                if round_id in emitted_rounds:
+                    continue
+                emitted_rounds.add(round_id)
+                ordered = sorted(
+                    round_rows.get(round_id, []),
+                    key=lambda item: (
+                        item[2].get("round_tool_index")
+                        if isinstance(item[2].get("round_tool_index"), int)
+                        else 2**31,
+                        item[0],
+                    ),
+                )
+                recalled = False
+                ordered_rows: list[Any] = []
+                for _, round_row, _ in ordered:
+                    round_meta = (
+                        round_row.message_meta
+                        if isinstance(getattr(round_row, "message_meta", None), dict)
+                        else {}
+                    )
+                    round_delivery = (
+                        round_meta.get("delivery")
+                        if isinstance(round_meta.get("delivery"), dict)
+                        else {}
+                    )
+                    round_recall = (
+                        round_delivery.get("recall")
+                        if isinstance(round_delivery.get("recall"), dict)
+                        else {}
+                    )
+                    if round_recall.get("status") == "recalled":
+                        recalled = True
+                        out.append({"role": "assistant", "content": "[该消息已撤回，不应视为仍对用户可见]"})
+                    else:
+                        ordered_rows.append(round_row)
+                if not recalled:
+                    out.extend(expand_tool_call_round(ordered_rows))
+                else:
+                    for round_row in ordered_rows:
+                        out.extend(expand_tool_call_row(round_row))
+                continue
             out.extend(expand_tool_call_row(m))
             continue
         out.append(
@@ -611,6 +764,21 @@ def build_llm_messages_from_rows(
                 include_thinking=include_thinking,
             )
         )
+        if (
+            m.role == "assistant"
+            and meta.get("artifact_role") == INTERMEDIATE_ASSISTANT_ARTIFACT_ROLE
+            and isinstance(meta.get("max_output_resume_prompt"), str)
+            and meta["max_output_resume_prompt"]
+        ):
+            # A max-output continuation prompt is provider control state, not a
+            # human-authored ChatMessage.  Keep it on the durable intermediate
+            # row and restore the exact assistant/user pair only for LLM replay.
+            out.append(
+                {
+                    "role": "user",
+                    "content": meta["max_output_resume_prompt"],
+                }
+            )
     return out
 
 
@@ -1267,9 +1435,14 @@ async def ingest_incoming_chat_message(
             }
             await db.flush()
             queued_to_running_turn = True
-            from app.services.channel_dispatch import mark_channel_turn_admitted
+            from app.services.channel_dispatch import (
+                mark_channel_turn_admitted,
+                register_channel_receipt_anchor,
+            )
 
             await mark_channel_turn_admitted()
+            if same_execution_user:
+                await register_channel_receipt_anchor(row.id)
         else:
             await transition_conversation_turn(
                 db,
@@ -1394,6 +1567,10 @@ async def persist_tool_call_row(
             "status": status,
             "result": evt.get("result") or "",
             "reasoning_content": evt.get("reasoning_content"),
+            "assistant_content": evt.get("assistant_content"),
+            "recovery_prefix_messages": evt.get("recovery_prefix_messages") or [],
+            "round_id": evt.get("round_id"),
+            "round_tool_index": evt.get("round_tool_index"),
         },
         ensure_ascii=False,
         default=str,
@@ -1464,6 +1641,10 @@ async def close_running_tool_calls_for_stop(
                 "status": "done",
                 "result": "[Generation stopped]",
                 "reasoning_content": payload.get("reasoning_content"),
+                "assistant_content": payload.get("assistant_content"),
+                "recovery_prefix_messages": payload.get("recovery_prefix_messages") or [],
+                "round_id": payload.get("round_id"),
+                "round_tool_index": payload.get("round_tool_index"),
             },
             turn_anchor_id=turn_anchor_id,
             turn_fence_locked=True,
@@ -1471,13 +1652,102 @@ async def close_running_tool_calls_for_stop(
     return len(open_calls)
 
 
+async def rewrite_tool_call_done_results(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    replacements: dict[uuid.UUID, tuple[str, str]],
+    turn_anchor_id: uuid.UUID | None = None,
+    expected_results: dict[uuid.UUID, str] | None = None,
+) -> None:
+    """Atomically replace results on exact durable ``done`` tool rows.
+
+    A round-level output budget is applied after individual tool results have
+    already been committed for crash recovery. This helper reconciles those
+    exact rows before the shaped transcript is sent to the provider. It never
+    appends correction rows because replay would interpret each additional
+    ``done`` row as another assistant/tool pair.
+    """
+    if not replacements:
+        return
+
+    row_ids = list(replacements)
+    result = await db.execute(
+        select(ChatMessage)
+        .where(
+            ChatMessage.id.in_(row_ids),
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.user_id == user_id,
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.role == "tool_call",
+        )
+        .with_for_update()
+    )
+    rows_by_id = {row.id: row for row in result.scalars().all()}
+    missing = set(row_ids) - set(rows_by_id)
+    if missing:
+        raise RuntimeError(
+            "tool result reconciliation could not find owned durable rows: "
+            + ",".join(sorted(str(row_id) for row_id in missing))
+        )
+
+    for row_id, (expected_call_id, final_result) in replacements.items():
+        row = rows_by_id[row_id]
+        try:
+            payload = json.loads(row.content or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"durable tool row {row_id} has invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"durable tool row {row_id} has a non-object payload")
+        if payload.get("status") != "done":
+            raise RuntimeError(f"durable tool row {row_id} is not done")
+        stored_call_id = str(payload.get("call_id") or payload.get("tool_call_id") or "")
+        if stored_call_id != expected_call_id:
+            raise RuntimeError(
+                f"durable tool row {row_id} call_id mismatch: "
+                f"expected={expected_call_id!r} stored={stored_call_id!r}"
+            )
+        if expected_results is not None and str(payload.get("result") or "") != expected_results.get(row_id):
+            raise RuntimeError(
+                f"durable tool row {row_id} changed during out-of-transaction materialization"
+            )
+        if turn_anchor_id is not None:
+            stored_anchor = str((row.message_meta or {}).get("turn_anchor_id") or "")
+            if stored_anchor != str(turn_anchor_id):
+                raise RuntimeError(
+                    f"durable tool row {row_id} turn anchor mismatch: "
+                    f"expected={turn_anchor_id} stored={stored_anchor or '<missing>'}"
+                )
+
+        payload["result"] = final_result
+        row.content = json.dumps(payload, ensure_ascii=False, default=str)
+
+    await db.flush()
+
+
 def _pending_confirmation_payload(
     *,
     name: str,
     args: dict | None,
     turn_anchor_id: uuid.UUID | None,
+    assistant_content: str | None = None,
+    recovery_prefix_messages: list[dict[str, str]] | None = None,
+    reasoning_content: str | None = None,
+    round_id: str | None = None,
 ) -> str:
-    payload = {"name": name, "args": args, "status": "pending", "result": ""}
+    payload = {
+        "name": name,
+        "args": args,
+        "status": "pending",
+        "result": "",
+        "assistant_content": assistant_content,
+        "recovery_prefix_messages": recovery_prefix_messages or [],
+        "reasoning_content": reasoning_content,
+        "round_id": round_id,
+        "round_tool_index": 0,
+    }
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
@@ -1491,8 +1761,20 @@ async def persist_pending_confirmation_row(
     args: dict | None,
     turn_anchor_id: uuid.UUID | None = None,
     created_at: datetime | None = None,
+    assistant_content: str | None = None,
+    recovery_prefix_messages: list[dict[str, str]] | None = None,
+    reasoning_content: str | None = None,
+    round_id: str | None = None,
 ) -> uuid.UUID:
-    content = _pending_confirmation_payload(name=name, args=args, turn_anchor_id=turn_anchor_id)
+    content = _pending_confirmation_payload(
+        name=name,
+        args=args,
+        turn_anchor_id=turn_anchor_id,
+        assistant_content=assistant_content,
+        recovery_prefix_messages=recovery_prefix_messages,
+        reasoning_content=reasoning_content,
+        round_id=round_id,
+    )
     row = ChatMessage(
         agent_id=agent_id,
         user_id=user_id,
@@ -1526,6 +1808,10 @@ async def persist_pending_confirmation(
     name: str,
     args: dict | None,
     turn_anchor_id: uuid.UUID | None = None,
+    assistant_content: str | None = None,
+    recovery_prefix_messages: list[dict[str, str]] | None = None,
+    reasoning_content: str | None = None,
+    round_id: str | None = None,
 ) -> uuid.UUID:
     """Persist a SUSPENDED confirmation tool_call and return its row id.
 
@@ -1545,6 +1831,10 @@ async def persist_pending_confirmation(
             name=name,
             args=args,
             turn_anchor_id=turn_anchor_id,
+            assistant_content=assistant_content,
+            recovery_prefix_messages=recovery_prefix_messages,
+            reasoning_content=reasoning_content,
+            round_id=round_id,
         )
         await db.commit()
         return row_id
@@ -1678,6 +1968,134 @@ async def persist_assistant_reply(
     return message_id
 
 
+async def persist_intermediate_assistant_reply(
+    db_session_factory,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    turn_anchor_id: uuid.UUID,
+    thinking: str | None = None,
+    visible_joiner_before: str = "",
+    max_output_resume_prompt: str | None = None,
+    created_at: datetime | None = None,
+) -> uuid.UUID:
+    """Commit one provider-emitted assistant segment without ending the turn.
+
+    The row is written in an independent short transaction so an inbox drain
+    can commit it before claiming a later IM/Subagent injection.  It carries the
+    root anchor for recovery, but deliberately does not transition the durable
+    turn lifecycle.
+    """
+
+    content = sanitize_user_visible_text(content or "")
+    if not content.strip():
+        raise ValueError("intermediate assistant reply content must be non-empty")
+    async with db_session_factory() as db:
+        anchor = await db.get(ChatMessage, turn_anchor_id)
+        if (
+            anchor is None
+            or anchor.agent_id != agent_id
+            or anchor.conversation_id != conversation_id
+            or anchor.role not in {"user", "system"}
+        ):
+            raise LookupError("intermediate assistant turn anchor not found")
+        anchor_meta = dict(anchor.message_meta or {})
+        if anchor_meta.get("turn_status") != "running":
+            raise asyncio.CancelledError
+        row = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            role="assistant",
+            content=content,
+            conversation_id=conversation_id,
+            thinking=(
+                cap_thinking(sanitize_user_visible_text(thinking))
+                if thinking
+                else None
+            ),
+            message_meta={
+                "artifact_role": INTERMEDIATE_ASSISTANT_ARTIFACT_ROLE,
+                "turn_anchor_id": str(turn_anchor_id),
+                "turn_status": "running",
+                "visible_joiner_before": visible_joiner_before,
+                **(
+                    {"max_output_resume_prompt": max_output_resume_prompt}
+                    if max_output_resume_prompt
+                    else {}
+                ),
+            },
+            **({"created_at": created_at} if created_at is not None else {}),
+        )
+        db.add(row)
+        await db.commit()
+        return row.id
+
+
+async def terminal_assistant_tail(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+    content: str,
+) -> tuple[str, list[uuid.UUID]]:
+    """Remove already-durable intermediate segments from a terminal reply.
+
+    ``call_llm`` still returns the complete visible A1+A2 value for transport.
+    The final writer calls this helper so the terminal row stores only A2 and
+    the durable transcript remains root,A1,injection,A2.
+    """
+
+    rows = list(
+        (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == conversation_id,
+                    ChatMessage.role == "assistant",
+                    ChatMessage.message_meta["turn_anchor_id"].as_string()
+                    == str(turn_anchor_id),
+                    ChatMessage.message_meta["artifact_role"].as_string()
+                    == INTERMEDIATE_ASSISTANT_ARTIFACT_ROLE,
+                    ChatMessage.message_meta["turn_status"].as_string()
+                    == "running",
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
+        ).scalars()
+    )
+    if not rows:
+        return content, []
+
+    prefix_parts: list[str] = []
+    for row in rows:
+        meta = dict(row.message_meta or {})
+        prefix_parts.append(str(meta.get("visible_joiner_before") or ""))
+        prefix_parts.append(str(row.content or ""))
+    prefix = "".join(prefix_parts)
+    if not content.startswith(prefix):
+        logger.error(
+            "[chat_history] terminal reply does not match durable intermediate "
+            f"prefix anchor={turn_anchor_id}; refusing to split"
+        )
+        return content, []
+
+    tail = content[len(prefix) :]
+    # Separate provider rounds are joined for external presentation only.  The
+    # durable row boundary already represents that separation.  A max-output
+    # partial is different: its continuation is concatenated byte-for-byte, so
+    # leading newlines in that continuation belong to the provider response.
+    last_meta = dict(rows[-1].message_meta or {})
+    if not last_meta.get("max_output_resume_prompt") and tail.startswith("\n\n"):
+        tail = tail[2:]
+    if not tail.strip():
+        raise ValueError("terminal assistant tail must be non-empty")
+    return tail, [row.id for row in rows]
+
+
 async def persist_assistant_reply_row(
     db: AsyncSession,
     *,
@@ -1709,10 +2127,26 @@ async def persist_assistant_reply_row(
     if turn_anchor_id is not None:
         if turn_terminal_status not in {"completed", "failed", "cancelled"}:
             raise ValueError("assistant reply turn status must be terminal")
+        content, intermediate_ids = await terminal_assistant_tail(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            turn_anchor_id=turn_anchor_id,
+            content=content,
+        )
         final_meta.update(
             {
                 "turn_anchor_id": str(turn_anchor_id),
                 "turn_status": turn_terminal_status,
+                **(
+                    {
+                        "intermediate_assistant_ids": [
+                            str(message_id) for message_id in intermediate_ids
+                        ]
+                    }
+                    if intermediate_ids
+                    else {}
+                ),
             }
         )
     msg = ChatMessage(
@@ -2018,6 +2452,7 @@ async def load_recoverable_history_for_turn(
     turn_anchor_id: uuid.UUID,
     ctx_size: int,
     is_group: bool = False,
+    include_thinking: bool = False,
 ) -> list[dict[str, Any]]:
     """Return LLM-ready history for startup recovery of an interrupted turn."""
     rows = await load_recoverable_messages_for_turn(
@@ -2044,6 +2479,11 @@ async def load_recoverable_history_for_turn(
             logger.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
             wrap_users = False
 
-    history = build_llm_messages_from_rows(rows, wrap_user_names=wrap_users, name_map=name_map)
+    history = build_llm_messages_from_rows(
+        rows,
+        wrap_user_names=wrap_users,
+        name_map=name_map,
+        include_thinking=include_thinking,
+    )
 
     return history

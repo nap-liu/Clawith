@@ -1918,6 +1918,8 @@ async def _assert_subagent_running(run_id: uuid.UUID) -> None:
 async def _drain_subagent_inbox(
     run_id: uuid.UUID,
     anchor_id: uuid.UUID,
+    *,
+    before_injection=None,
 ) -> list[dict]:
     """Atomically inject appended parent messages at an LLM round boundary."""
     async with async_session() as db:
@@ -1947,6 +1949,12 @@ async def _drain_subagent_inbox(
             run=run,
             input_rows=list(pending),
         )
+        if allowed and before_injection is not None:
+            earliest_injection = min(row.created_at for row in allowed)
+            await before_injection(
+                created_at=earliest_injection - timedelta(microseconds=1)
+            )
+
         injected: list[dict] = []
         for row in allowed:
             meta = _message_meta(row)
@@ -2644,7 +2652,9 @@ async def execute_claimed_subagent(
                 include_memory = run.memory
                 member_runtime_config = dict(dict(child.im_config or {}).get("member_config_snapshot") or {})
                 max_tool_rounds_override = member_runtime_config.get("max_tool_rounds")
-                from app.services.agent_runtime_workspace import resolve_agent_runtime_workspace
+                from app.services.agent_runtime_workspace import (
+                    resolve_agent_runtime_workspace,
+                )
 
                 runtime_workspace = resolve_agent_runtime_workspace(
                     agent_id=agent.id,
@@ -2659,8 +2669,8 @@ async def execute_claimed_subagent(
                     parent_session = await db.get(ChatSession, run.parent_session_id)
                     if parent_session is not None and parent_session.source_channel == "project":
                         from app.services.project_group_turn_lifecycle import (
-                            publish_project_group_turn_event,
                             project_group_timeline_anchor_for_child_turn,
+                            publish_project_group_turn_event,
                             reconcile_project_group_turn,
                         )
 
@@ -2724,6 +2734,8 @@ async def execute_claimed_subagent(
 
                 async def _before_round(
                     _round: int,
+                    *,
+                    before_injection=None,
                     active_anchor_id: uuid.UUID = anchor_id,
                 ) -> list[dict]:
                     # ``_call_agent_llm`` resolves the Agent, model, scene, and
@@ -2735,7 +2747,11 @@ async def execute_claimed_subagent(
                     # ORM values remain valid for the provider call.
                     if llm_db.in_transaction():
                         await llm_db.commit()
-                    return await _drain_subagent_inbox(run_id, active_anchor_id)
+                    return await _drain_subagent_inbox(
+                        run_id,
+                        active_anchor_id,
+                        before_injection=before_injection,
+                    )
 
                 reply = await _call_agent_llm(
                     llm_db,
@@ -3168,6 +3184,11 @@ async def _parent_turn_has_terminal_reply(
                 ChatMessage.role == "assistant",
                 ChatMessage.message_meta["turn_anchor_id"].as_string()
                 == str(anchor_id),
+                or_(
+                    ChatMessage.message_meta["artifact_role"].as_string().is_(None),
+                    ChatMessage.message_meta["artifact_role"].as_string()
+                    != "intermediate_assistant",
+                ),
             )
             .limit(1)
         )
@@ -3182,6 +3203,7 @@ async def _materialize_parent_event_batch(
     active_turn_anchor_id: uuid.UUID | None = None,
     candidate_ids: list[uuid.UUID] | None = None,
     projected_event_ids: list[uuid.UUID] | None = None,
+    before_injection=None,
 ) -> tuple[ChatMessage | None, list[dict], str]:
     """Project a bounded event batch onto one ordinary parent logical turn."""
     from app.services.execution_identity import ExecutionIdentityError
@@ -3309,6 +3331,9 @@ async def _materialize_parent_event_batch(
             valid = [invalid[0]]
             materialized_status = "identity_invalid"
 
+        if valid and before_injection is not None:
+            await before_injection()
+
         now = datetime.now(UTC)
         injected: list[dict] = []
         for index, (event, run, child, content) in enumerate(valid):
@@ -3431,6 +3456,7 @@ async def drain_parent_subagent_events(
     active_turn_anchor_id: uuid.UUID,
     execution_agent_id: uuid.UUID,
     execution_user_id: uuid.UUID,
+    before_injection=None,
 ) -> list[dict]:
     """Inject newly completed child events at one parent LLM round boundary."""
     try:
@@ -3444,6 +3470,7 @@ async def drain_parent_subagent_events(
         execution_user_id=execution_user_id,
         active_turn_anchor_id=active_turn_anchor_id,
         projected_event_ids=projected_event_ids,
+        before_injection=before_injection,
     )
     if root is not None and injected:
         await _finish_parent_events_for_root(root.id, projected_event_ids)
@@ -3461,25 +3488,48 @@ def build_parent_subagent_before_round(
 ) -> Callable[[int], Awaitable[list[dict]]]:
     """Compose one shared parent-event round hook for Web and channel turns."""
 
-    async def _before_round(round_i: int) -> list[dict]:
+    async def _before_round(round_i: int, *, before_injection=None) -> list[dict]:
         injected = list(await upstream(round_i)) if upstream is not None else []
+        before_injection_done = False
+
+        async def _before_injection_once(**kwargs):
+            nonlocal before_injection_done
+            if before_injection is None or before_injection_done:
+                return
+            before_injection_done = True
+            await before_injection(**kwargs)
+
+        if injected:
+            await _before_injection_once()
         if include_turn_inbox:
             from app.services.turn_inbox import drain_turn_inbox
 
+            turn_inbox_kwargs = (
+                {"before_injection": _before_injection_once}
+                if before_injection is not None
+                else {}
+            )
             injected.extend(
                 await drain_turn_inbox(
                     session_id=parent_session_id,
                     active_turn_anchor_id=active_turn_anchor_id,
                     execution_agent_id=execution_agent_id,
                     execution_user_id=execution_user_id,
+                    **turn_inbox_kwargs,
                 )
             )
+        parent_event_kwargs = (
+            {"before_injection": _before_injection_once}
+            if before_injection is not None
+            else {}
+        )
         injected.extend(
             await drain_parent_subagent_events(
                 parent_session_id=parent_session_id,
                 active_turn_anchor_id=active_turn_anchor_id,
                 execution_agent_id=execution_agent_id,
                 execution_user_id=execution_user_id,
+                **parent_event_kwargs,
             )
         )
         return injected

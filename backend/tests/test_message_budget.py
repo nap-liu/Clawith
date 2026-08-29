@@ -5,7 +5,7 @@ budget. P2 covers the orthogonal case: a single round produces several
 in-budget tool results whose SUM exceeds the message-level cap.
 
 The enforcer:
-  * scans ALL tool messages for total size (global ceiling);
+  * scans only the current fresh round (independent per-round ceiling);
   * force-materializes the LARGEST FRESH inline tool message first;
   * never touches historical messages (append-only invariant);
   * skips tool messages with vision list content;
@@ -13,6 +13,7 @@ The enforcer:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from pathlib import Path
@@ -23,8 +24,13 @@ from app.services.llm import tool_output_store as tos
 from app.services.llm.client import LLMMessage
 from app.services.llm.tool_output_store import (
     PERSISTED_OPEN,
-    enforce_message_budget,
+    ToolOutputBudgetExceeded,
+    enforce_message_budget as _enforce_message_budget_async,
 )
+
+
+def enforce_message_budget(*args, **kwargs):
+    return asyncio.run(_enforce_message_budget_async(*args, **kwargs))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,8 +107,8 @@ def test_under_budget_noop(tmp_workspace, agent_id):
 
 
 def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
-    """Historical 50k stays raw; fresh 45k + 40k get materialized to fit
-    under the 120k cap while the fresh 30k stays inline."""
+    """Historical 50k stays raw; the 115k fresh round is independently
+    reduced under its 60k cap while the fresh 30k stays inline."""
     hist_assistant = _assistant([_tc("h1", "grep")])
     hist_tool = _tool("h1", "H" * 50_000)
 
@@ -128,12 +134,12 @@ def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
 
     historical_identity = id(api_messages[2])
 
-    enforce_message_budget(
+    rewrites = enforce_message_budget(
         api_messages,
         fresh_start_idx=fresh_start,
         agent_id=agent_id,
         session_id="sess-over",
-        max_chars=120_000,
+        max_chars=60_000,
     )
 
     # Historical message is byte-identical — same LLMMessage instance,
@@ -154,10 +160,17 @@ def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
 
     # Under cap now.
     total = sum(
-        len(m.content) for m in api_messages
+        len(m.content) for m in api_messages[fresh_start:]
         if m.role == "tool" and isinstance(m.content, str)
     )
-    assert total <= 120_000
+    assert total <= 60_000
+    assert {rewrite.tool_call_id for rewrite in rewrites} == {"f1", "f3"}
+    assert {
+        rewrite.tool_call_id: rewrite.final_content for rewrite in rewrites
+    } == {
+        "f1": fresh_big_after.content,
+        "f3": fresh_large_after.content,
+    }
 
     # Files actually written.
     session_dir = tmp_workspace / agent_id / ".tool_results" / "sess-over"
@@ -168,11 +181,164 @@ def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
     assert any("f3" in f for f in files)
 
 
+def test_literal_persisted_tag_in_raw_results_is_materialized_normally(
+    tmp_workspace, agent_id
+):
+    messages = [
+        _assistant([_tc(f"f{index}", "grep") for index in range(3)]),
+        *[
+            _tool(
+                f"f{index}",
+                (character * 12_000)
+                + " literal <persisted-output> log text "
+                + (character * 12_000),
+            )
+            for index, character in enumerate(("A", "B", "C"))
+        ],
+    ]
+
+    rewrites = enforce_message_budget(
+        messages,
+        fresh_start_idx=0,
+        agent_id=agent_id,
+        session_id="literal-marker",
+        max_chars=64_000,
+    )
+
+    assert rewrites
+    assert sum(len(message.content) for message in messages[1:]) <= 64_000
+    assert any("Full output saved to:" in message.content for message in messages[1:])
+
+
+def test_second_round_never_rewrites_first_round_cache_prefix(tmp_workspace, agent_id):
+    messages = [LLMMessage(role="user", content="q")]
+
+    first_start = len(messages)
+    messages.extend(
+        [
+            _assistant([_tc("r1a", "grep"), _tc("r1b", "grep"), _tc("r1c", "grep")]),
+            _tool("r1a", "A" * 30_000),
+            _tool("r1b", "B" * 30_000),
+            _tool("r1c", "C" * 30_000),
+        ]
+    )
+    enforce_message_budget(
+        messages,
+        fresh_start_idx=first_start,
+        agent_id=agent_id,
+        session_id="sess-two-rounds",
+        max_chars=64_000,
+    )
+    first_round_bytes = [message.content for message in messages]
+    first_round_ids = [id(message) for message in messages]
+
+    second_start = len(messages)
+    messages.extend(
+        [
+            _assistant([_tc("r2a", "grep"), _tc("r2b", "grep"), _tc("r2c", "grep")]),
+            _tool("r2a", "D" * 30_000),
+            _tool("r2b", "E" * 30_000),
+            _tool("r2c", "F" * 30_000),
+        ]
+    )
+    enforce_message_budget(
+        messages,
+        fresh_start_idx=second_start,
+        agent_id=agent_id,
+        session_id="sess-two-rounds",
+        max_chars=64_000,
+    )
+
+    assert [message.content for message in messages[:second_start]] == first_round_bytes
+    assert [id(message) for message in messages[:second_start]] == first_round_ids
+    assert any(PERSISTED_OPEN in message.content for message in messages[second_start + 1:])
+    total = sum(
+        len(message.content)
+        for message in messages[second_start:]
+        if message.role == "tool" and isinstance(message.content, str)
+    )
+    assert total <= 64_000
+    assert any("TRUNCATED:" in message.content for message in messages[second_start + 1:])
+
+
+def test_three_individually_materialized_results_are_rerendered_under_round_cap(
+    tmp_workspace,
+    agent_id,
+):
+    raw_results = [character * 60_000 for character in ("A", "B", "C")]
+    views = [
+        asyncio.run(
+            tos.finalize_tool_output(
+                raw,
+                tool_name="grep",
+                agent_id=agent_id,
+                session_id="sess-persisted-round",
+                tool_call_id=f"p{index}",
+            )
+        )
+        for index, raw in enumerate(raw_results, start=1)
+    ]
+    assert [len(view) for view in views] == [32_000, 32_000, 32_000]
+
+    messages = [
+        _assistant([_tc(f"p{index}", "grep") for index in range(1, 4)]),
+        *[_tool(f"p{index}", view) for index, view in enumerate(views, start=1)],
+    ]
+    rewrites = enforce_message_budget(
+        messages,
+        fresh_start_idx=0,
+        agent_id=agent_id,
+        session_id="sess-persisted-round",
+        max_chars=64_000,
+    )
+
+    total = sum(len(message.content) for message in messages[1:])
+    assert total <= 64_000
+    assert rewrites
+    for message in messages[1:]:
+        assert PERSISTED_OPEN in message.content
+        assert "Full output saved to:" in message.content
+
+    stored = tmp_workspace / agent_id / ".tool_results" / "sess-persisted-round"
+    for index, raw in enumerate(raw_results, start=1):
+        matches = list(stored.glob(f"grep_p{index}_*.txt"))
+        assert len(matches) == 1
+        assert matches[0].read_text() == raw
+
+
+def test_more_minimal_envelopes_than_cap_allows_fails_closed(
+    tmp_workspace,
+    agent_id,
+):
+    envelope = tos._render_persisted(
+        tool_name="grep",
+        rel_path=".tool_results/session/full.txt",
+        size_bytes=60_000,
+        result="x" * 60_000,
+        max_view_chars=32_000,
+    )
+    count = 70
+    messages = [
+        _assistant([_tc(f"p{index}", "grep") for index in range(count)]),
+        *[_tool(f"p{index}", envelope) for index in range(count)],
+    ]
+
+    with pytest.raises(ToolOutputBudgetExceeded, match="cannot fit"):
+        enforce_message_budget(
+            messages,
+            fresh_start_idx=0,
+            agent_id=agent_id,
+            session_id="sess-min-envelope-overflow",
+            max_chars=64_000,
+        )
+
+    assert sum(len(message.content) for message in messages[1:]) > 64_000
+
+
 def test_over_budget_but_fresh_already_all_materialized(
     tmp_workspace, agent_id, caplog
 ):
-    """When every fresh candidate is already a <persisted-output> block,
-    the enforcer logs a warning and stops without touching history."""
+    """An oversized historical prefix does not consume this fresh round's cap."""
     # Historical raw tool message of 100k — alone still under cap at this
     # size, so we add more historical to push over.
     hist_assistant = _assistant([_tc("h1", "grep"), _tc("h2", "grep")])

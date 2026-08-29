@@ -63,6 +63,40 @@ async def test_concurrent_local_file_writes_to_same_key_are_atomic(
 
 
 @pytest.mark.asyncio
+async def test_failed_write_bytes_never_replaces_target_or_leaves_partial(tmp_path, monkeypatch):
+    storage_root = tmp_path / "storage"
+    target = storage_root / "agent" / "archive.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"complete-old-value")
+    backend = local_storage.LocalStorageBackend(str(storage_root))
+
+    class _FailingWriter:
+        def __init__(self, path):
+            self.path = path
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def write(self, data):
+            self.path.write_bytes(data[:4])
+            raise OSError("injected disk failure")
+
+        async def flush(self):
+            return None
+
+    monkeypatch.setattr(local_storage.aiofiles, "open", lambda path, _mode: _FailingWriter(path))
+
+    with pytest.raises(OSError, match="injected disk failure"):
+        await backend.write_bytes("agent/archive.txt", b"new-value-must-not-partially-land")
+
+    assert target.read_bytes() == b"complete-old-value"
+    assert list(target.parent.glob(".*.writing")) == []
+
+
+@pytest.mark.asyncio
 async def test_local_storage_does_not_follow_symlinks_between_agent_roots(tmp_path):
     storage_root = tmp_path / "storage"
     first_agent = storage_root / "agent-a"

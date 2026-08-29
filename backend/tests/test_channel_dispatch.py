@@ -130,6 +130,33 @@ async def test_hook_exception_is_swallowed_and_does_not_break_turn():
     assert result == "ok"
 
 
+async def test_never_returning_boundary_hook_times_out_without_freezing_turn(monkeypatch):
+    monkeypatch.setattr(cd, "CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS", 0.01)
+    hook_started = asyncio.Event()
+    hook_cancelled = asyncio.Event()
+
+    async def on_consume():
+        hook_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            hook_cancelled.set()
+
+    result = await asyncio.wait_for(
+        cd.run_channel_message(
+            "k:hook-timeout",
+            is_command=False,
+            reactions=cd.ChannelReactions(on_consume=on_consume),
+            work=lambda: asyncio.sleep(0, result="ok"),
+        ),
+        timeout=0.5,
+    )
+
+    assert result == "ok"
+    assert hook_started.is_set()
+    await asyncio.wait_for(hook_cancelled.wait(), timeout=0.1)
+
+
 async def test_normal_message_holds_session_lock():
     """普通消息执行期间持有该 session 锁(并发同 key 不重叠)。"""
     order = []

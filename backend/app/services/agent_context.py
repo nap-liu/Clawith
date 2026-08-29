@@ -585,10 +585,17 @@ async def build_agent_context(
     # AgentRelationship / AgentAgentRelationship so it always reflects current org
     # state. Best-effort: a DB hiccup must not abort the whole context assembly.
     relationships = ""
+    # Fail closed: if the Agent setting cannot be read, do not unexpectedly
+    # re-enable Daily Memory for an Agent configured with zero days.
+    daily_memory_load_days = 0
     try:
         from app.database import async_session
+        from app.models.agent import Agent
 
         async with async_session() as _rel_db:
+            agent_row = await _rel_db.get(Agent, agent_id)
+            if agent_row is not None:
+                daily_memory_load_days = int(agent_row.daily_memory_load_days)
             relationships = await _load_relationships_from_db(_rel_db, agent_id)
     except Exception as _rel_err:
         from loguru import logger as _ctx_logger
@@ -606,6 +613,7 @@ async def build_agent_context(
         memory_snapshot = await load_agent_memory_snapshot(
             agent_id,
             today=agent_local_now.date(),
+            daily_limit=daily_memory_load_days,
         )
         memory_context = memory_snapshot.render()
     # Date granularity only. A passively-injected clock is approximate by

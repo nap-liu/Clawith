@@ -16,6 +16,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from app.models.chat_session import ChatSession
 
 Hook0 = Callable[[], Awaitable[None]]
+CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass
@@ -48,6 +50,7 @@ class ChannelReactions:
     on_consume: Hook0 | None = None
     on_complete: Callable[[str], Awaitable[None]] | None = None
     on_error: Callable[[BaseException], Awaitable[None]] | None = None
+    bind_receipt_context: Callable[[UUID, str, UUID], None] | None = None
 
     # —— 循环内钩子(由通道传给 _call_agent_llm)——
     on_tool_call: Callable[[dict], Awaitable[None]] | None = None
@@ -72,10 +75,16 @@ _channel_interjection_lock_key: ContextVar[str | None] = ContextVar(
     "channel_interjection_lock_key",
     default=None,
 )
+_channel_interjection_reactions: ContextVar[ChannelReactions | None] = ContextVar(
+    "channel_interjection_reactions",
+    default=None,
+)
 _promoted_turn: ContextVar[tuple[UUID, str] | None] = ContextVar(
     "channel_promoted_turn",
     default=None,
 )
+_active_reactions: dict[str, tuple[asyncio.Task, ChannelReactions]] = {}
+_pending_receipt_anchors: dict[UUID, tuple[str, ChannelReactions]] = {}
 _send_locks: dict[str, asyncio.Lock] = {}
 _send_locks_guard = asyncio.Lock()
 
@@ -130,17 +139,70 @@ async def _get_send_lock(lock_key: str) -> asyncio.Lock:
         return lock
 
 
-async def _safe(hook: Callable[..., Awaitable[None]] | None, *args: object) -> None:
-    """Best-effort fire a lifecycle hook: None -> no-op; exception -> logged, swallowed.
+def _consume_reaction_task_result(task: asyncio.Task) -> None:
+    """Observe a timed-out hook if it ignores cancellation and exits later."""
 
-    Reactions are side effects; a failing reaction must never break the turn.
+    if task.cancelled():
+        return
+    with suppress(asyncio.CancelledError, Exception):
+        task.exception()
+
+
+async def run_channel_reaction_hook(
+    hook: Callable[..., Awaitable[None]] | None,
+    *args: object,
+    hook_name: str | None = None,
+) -> bool:
+    """Run one reaction hook within a strict best-effort time boundary.
+
+    The hook runs in its own task so even a broken coroutine that ignores
+    cancellation cannot hold the IM turn open after the timeout. Provider
+    reaction/progress feedback is ephemeral; exceptions and timeouts are
+    observable in logs but never become turn failures.
     """
     if hook is None:
-        return
+        return True
+    label = hook_name or getattr(hook, "__name__", type(hook).__name__)
+    task = asyncio.create_task(hook(*args), name=f"channel-reaction:{label}")
     try:
-        await hook(*args)
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS,
+        )
+    except BaseException:
+        task.cancel()
+        task.add_done_callback(_consume_reaction_task_result)
+        raise
+    if task not in done:
+        task.cancel()
+        task.add_done_callback(_consume_reaction_task_result)
+        logger.warning(
+            "[channel_dispatch] reaction hook timed out (ignored): "
+            f"hook={label} timeout={CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS}s"
+        )
+        return False
+    try:
+        result = await task
+        return result is not False
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        logger.warning(
+            f"[channel_dispatch] reaction hook cancelled itself (ignored): hook={label}"
+        )
+        return False
     except Exception as exc:  # noqa: BLE001 — reactions are best-effort
-        logger.warning(f"[channel_dispatch] reaction hook failed (ignored): {exc}")
+        logger.warning(
+            f"[channel_dispatch] reaction hook failed (ignored): hook={label} error={exc}"
+        )
+        return False
+
+
+async def _safe(hook: Callable[..., Awaitable[None]] | None, *args: object) -> bool:
+    """Backward-compatible local alias for the normalized reaction runner."""
+
+    return await run_channel_reaction_hook(hook, *args)
 
 
 async def _register_running_turn(lock_key: str, task: asyncio.Task) -> None:
@@ -180,6 +242,62 @@ async def mark_channel_turn_admitted() -> None:
         current = _turn_owner_admission.get(lock_key)
         if current is not None:
             current[1].set()
+
+
+async def register_channel_receipt_anchor(message_id: UUID) -> None:
+    """Retain one interjected message's hooks until the inbox consumes it.
+
+    Admission and consumption are deliberately separate. A pending message must
+    not move the user-visible IM progress receipt before the shared turn loop has
+    actually injected it at a round boundary.
+    """
+
+    lock_key = _channel_interjection_lock_key.get()
+    reactions = _channel_interjection_reactions.get()
+    if lock_key is None or reactions is None or reactions.on_consume is None:
+        return
+    async with _running_turns_guard:
+        active = _active_reactions.get(lock_key)
+        if active is None or active[0].done():
+            return
+        _pending_receipt_anchors[message_id] = (lock_key, reactions)
+
+
+async def advance_channel_receipt_anchor(message_ids: list[UUID]) -> bool:
+    """Move one running IM turn's progress receipt to its last consumed input."""
+
+    if not message_ids:
+        return True
+    active_reactions: ChannelReactions | None = None
+    next_reactions: ChannelReactions | None = None
+    async with _running_turns_guard:
+        for message_id in message_ids:
+            candidate = _pending_receipt_anchors.pop(message_id, None)
+            if candidate is None:
+                continue
+            lock_key, reactions = candidate
+            active = _active_reactions.get(lock_key)
+            if active is None or active[0].done():
+                continue
+            active_reactions = active[1]
+            next_reactions = reactions
+
+    if active_reactions is None or next_reactions is None:
+        return False
+
+    # The stable bundle is already threaded through every loop callback. Replace
+    # its hooks in place so later thinking/tool events and terminal cleanup all
+    # target the newly consumed provider message without changing the lifecycle
+    # root turn anchor.
+    previous_cleanup_completed = await _safe(active_reactions.on_complete, "")
+    active_reactions.on_consume = next_reactions.on_consume
+    active_reactions.on_complete = next_reactions.on_complete
+    active_reactions.on_error = next_reactions.on_error
+    active_reactions.on_tool_call = next_reactions.on_tool_call
+    active_reactions.on_thinking = next_reactions.on_thinking
+    active_reactions.on_chunk = next_reactions.on_chunk
+    await _safe(active_reactions.on_consume)
+    return previous_cleanup_completed
 
 
 async def cancel_running_turn(lock_key: str) -> bool:
@@ -255,6 +373,7 @@ async def run_channel_message(
                 await owner_admitted_event.wait()
             interjection_token = _channel_interjection.set(True)
             lock_key_token = _channel_interjection_lock_key.set(lock_key)
+            reactions_token = _channel_interjection_reactions.set(reactions)
             promoted_token = _promoted_turn.set(None)
             try:
                 # This path is ingestion-only. If the old owner has already
@@ -272,6 +391,7 @@ async def run_channel_message(
                 return reply
             finally:
                 _promoted_turn.reset(promoted_token)
+                _channel_interjection_reactions.reset(reactions_token)
                 _channel_interjection_lock_key.reset(lock_key_token)
                 _channel_interjection.reset(interjection_token)
         lock_key_token = _channel_interjection_lock_key.set(lock_key)
@@ -288,6 +408,12 @@ async def run_channel_message(
                 async with lock:
 
                     async def _run_locked() -> str:
+                        if current_task is not None:
+                            async with _running_turns_guard:
+                                _active_reactions[lock_key] = (
+                                    current_task,
+                                    reactions,
+                                )
                         await _safe(reactions.on_consume)
                         try:
                             reply = await work()
@@ -313,6 +439,16 @@ async def run_channel_message(
                 if current is not None and current[0] is current_task:
                     _turn_owner_admission.pop(lock_key, None)
                     current[1].set()
+                active = _active_reactions.get(lock_key)
+                if active is not None and active[0] is current_task:
+                    _active_reactions.pop(lock_key, None)
+                    stale_ids = [
+                        message_id
+                        for message_id, candidate in _pending_receipt_anchors.items()
+                        if candidate[0] == lock_key
+                    ]
+                    for message_id in stale_ids:
+                        _pending_receipt_anchors.pop(message_id, None)
             await _clear_running_turn(lock_key, current_task)
 
 

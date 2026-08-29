@@ -208,7 +208,7 @@ class LLMResponse:
     reasoning_content: str | None = None
     reasoning_signature: str | None = None
     finish_reason: str | None = None
-    usage: dict[str, int] | None = None
+    usage: dict[str, Any] | None = None
     model: str | None = None
 
 
@@ -293,15 +293,16 @@ class LLMClient(ABC):
 
 
 def _httpx_timeout(timeout: float, *, provider_managed_timeout: bool) -> httpx.Timeout:
-    """Keep connection setup bounded without limiting provider response time.
+    """Bound transport setup only; never time-limit model generation/reads.
 
-    Production turns let the provider, an explicit cancellation, or a real
-    transport failure end response reads. Auxiliary calls retain the legacy
-    bounded read timeout by leaving ``provider_managed_timeout`` disabled.
+    ``provider_managed_timeout`` remains in the public constructor for backward
+    compatibility but no longer changes read behavior. Every LLM call — normal
+    turns, compaction, model checks and background runs — ends only when the
+    provider/transport ends it or the caller explicitly cancels it.
     """
     return httpx.Timeout(
         connect=timeout,
-        read=None if provider_managed_timeout else timeout,
+        read=None,
         write=timeout,
         pool=timeout,
     )
@@ -769,7 +770,7 @@ class OpenAICompatibleClient(LLMClient):
 
         if response.status_code >= 400:
             error_text = response.text[:500]
-            raise LLMError(f"HTTP {response.status_code}: {error_text}")
+            raise LLMError.from_http(response.status_code, error_text)
 
         data = response.json()
 
@@ -822,7 +823,7 @@ class OpenAICompatibleClient(LLMClient):
                         error_body = ""
                         async for chunk in resp.aiter_bytes():
                             error_body += chunk.decode(errors="replace")
-                        raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
+                        raise LLMError.from_http(resp.status_code, error_body[:500])
 
                     async for line in resp.aiter_lines():
                         chunk, in_think, tag_buffer, json_buffer = self._parse_stream_line(
@@ -1247,7 +1248,7 @@ class OpenAIResponsesClient(LLMClient):
 
         if response.status_code >= 400:
             error_text = response.text[:500]
-            raise LLMError(f"HTTP {response.status_code}: {error_text}")
+            raise LLMError.from_http(response.status_code, error_text)
 
         data = response.json()
         api_error = self._extract_api_error(data)
@@ -1571,18 +1572,33 @@ class GeminiClient(LLMClient):
         payload.update(kwargs)
         return payload
 
-    def _normalize_usage(self, usage: dict[str, Any] | None) -> dict[str, int] | None:
-        """Normalize Gemini usage metadata to unified usage dict."""
+    def _normalize_usage(self, usage: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Normalize Gemini usage without discarding cache/modality details."""
         if not isinstance(usage, dict):
             return None
         input_tokens = int(usage.get("promptTokenCount", 0) or 0)
         output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
         total_tokens = int(usage.get("totalTokenCount", input_tokens + output_tokens) or 0)
-        return {
+        normalized: dict[str, Any] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
         }
+        input_details: dict[str, Any] = {}
+        cached_tokens = int(usage.get("cachedContentTokenCount", 0) or 0)
+        if cached_tokens:
+            input_details["cached_tokens"] = cached_tokens
+        prompt_details = usage.get("promptTokensDetails")
+        if isinstance(prompt_details, list):
+            input_details["modality_token_counts"] = prompt_details
+        output_details = usage.get("candidatesTokensDetails")
+        if isinstance(output_details, list):
+            normalized["output_tokens_details"] = {
+                "modality_token_counts": output_details
+            }
+        if input_details:
+            normalized["input_tokens_details"] = input_details
+        return normalized
 
     def _normalize_finish_reason(self, finish_reason: str | None, tool_calls: list[dict]) -> str | None:
         """Normalize Gemini finish reason to OpenAI-style labels."""
@@ -1674,7 +1690,7 @@ class GeminiClient(LLMClient):
 
         if response.status_code >= 400:
             error_text = response.text[:500]
-            raise LLMError(f"HTTP {response.status_code}: {error_text}")
+            raise LLMError.from_http(response.status_code, error_text)
 
         data = response.json()
         if isinstance(data, dict) and data.get("error"):
@@ -1731,7 +1747,7 @@ class GeminiClient(LLMClient):
                     error_body = ""
                     async for chunk in resp.aiter_bytes():
                         error_body += chunk.decode(errors="replace")
-                    raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
+                    raise LLMError.from_http(resp.status_code, error_body[:500])
 
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -1977,7 +1993,7 @@ class AnthropicClient(LLMClient):
 
         if response.status_code >= 400:
             error_text = response.text[:500]
-            raise LLMError(f"HTTP {response.status_code}: {error_text}")
+            raise LLMError.from_http(response.status_code, error_text)
 
         data = response.json()
         if data.get("type") == "error":
@@ -2055,7 +2071,7 @@ class AnthropicClient(LLMClient):
                     error_body = ""
                     async for chunk in resp.aiter_bytes():
                         error_body += chunk.decode(errors="replace")
-                    raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
+                    raise LLMError.from_http(resp.status_code, error_body[:500])
 
                 current_event = None
 
@@ -2146,8 +2162,14 @@ class AnthropicClient(LLMClient):
                         if delta.get("stop_reason"):
                             last_finish_reason = delta["stop_reason"]
                         if data.get("usage"):
-                            # message_delta usage is cumulative
-                            final_usage = data["usage"]
+                            # Anthropic's message_delta commonly contains only
+                            # cumulative output_tokens. Merge it with the
+                            # message_start input/cache counters instead of
+                            # erasing the authoritative context size.
+                            final_usage = {
+                                **(final_usage or {}),
+                                **data["usage"],
+                            }
 
                     elif current_event == "error":
                         error_info = data.get("error", {})
@@ -2395,8 +2417,48 @@ MAX_TOKENS_BY_MODEL: dict[str, int] = {
 
 
 class LLMError(Exception):
-    """Base exception for LLM client errors."""
-    pass
+    """Base provider error with structured HTTP/code evidence when available."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        error_type: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.error_type = error_type
+
+    @classmethod
+    def from_http(cls, status_code: int, body: str) -> "LLMError":
+        """Parse common provider envelopes without relying on display text."""
+        error_code: str | None = None
+        error_type: str | None = None
+        provider_message = ""
+        try:
+            payload = json.loads(body)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            sources = [error, payload] if isinstance(error, dict) else [payload]
+            for source in sources:
+                if error_code is None and source.get("code") is not None:
+                    error_code = str(source["code"])
+                if error_type is None and source.get("type") is not None:
+                    error_type = str(source["type"])
+                if not provider_message and source.get("message") is not None:
+                    provider_message = str(source["message"])
+        rendered = provider_message or str(body or "")[:500]
+        return cls(
+            f"HTTP {status_code}: {rendered}",
+            status_code=status_code,
+            error_code=error_code,
+            error_type=error_type,
+        )
 
 
 def get_provider_base_url(provider: str, custom_base_url: str | None = None) -> str | None:
@@ -2455,9 +2517,8 @@ def create_llm_client(
         model: Model name
         base_url: Optional custom base URL
         timeout: Connection and auxiliary-call timeout in seconds
-        provider_managed_timeout: For production turns, keep response reads
-            unbounded so only the provider, transport, or explicit cancellation
-            ends the call.
+        provider_managed_timeout: Deprecated compatibility flag. Provider
+            response reads are always unbounded.
 
     Returns:
         An instance of the appropriate LLMClient subclass

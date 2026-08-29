@@ -20,6 +20,9 @@ interface LLMModel {
     max_output_tokens?: number;
     request_timeout?: number;
     temperature?: number;
+    context_window: number;
+    context_usage_ratio: number;
+    keep_recent_turns: number;
     created_at: string;
 }
 
@@ -72,6 +75,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
         max_output_tokens: '' as string,
         request_timeout: '' as string,
         temperature: '' as string,
+        context_window: '32000' as string,
+        context_usage_percent: '70' as string,
+        keep_recent_turns: '3' as string,
     });
 
     const invalidateModelCaches = () => {
@@ -177,6 +183,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
             max_output_tokens: defaultSpec ? String(defaultSpec.default_max_tokens) : '4096',
             request_timeout: '',
             temperature: '',
+            context_window: '32000',
+            context_usage_percent: '70',
+            keep_recent_turns: '3',
         });
         setShowAddModel(true);
     };
@@ -284,9 +293,26 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.maxOutputTokensDesc', 'Limits generation length')}</div>
                         </div>
                         <div className="form-group">
-                            <label className="form-label">{t('enterprise.llm.requestTimeout', 'Request Timeout (s)')}</label>
-                            <input className="form-input" type="number" min="1" placeholder={t('enterprise.llm.requestTimeoutPlaceholder', 'e.g. 120 (Leave empty for default)')} value={modelForm.request_timeout} onChange={e => setModelForm({ ...modelForm, request_timeout: e.target.value })} />
-                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Increase for slow local models.')}</div>
+                            <label className="form-label">{t('enterprise.llm.contextWindow')}</label>
+                            <input className="form-input" type="number" min="1024" max="2000000" value={modelForm.context_window} onChange={e => setModelForm({ ...modelForm, context_window: e.target.value })} />
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.contextWindowDesc')}</div>
+                        </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.llm.contextUsagePercent')}</label>
+                            <input className="form-input" type="number" min="10" max="100" value={modelForm.context_usage_percent} onChange={e => setModelForm({ ...modelForm, context_usage_percent: e.target.value })} />
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                                {t('enterprise.llm.effectiveContext')}: {Math.floor((Number(modelForm.context_window) || 0) * (Number(modelForm.context_usage_percent) || 0) / 100).toLocaleString()} tokens
+                            </div>
+                        </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.llm.keepRecentTurns')}</label>
+                            <input className="form-input" type="number" min="3" max="50" value={modelForm.keep_recent_turns} onChange={e => setModelForm({ ...modelForm, keep_recent_turns: e.target.value })} />
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.keepRecentTurnsDesc')}</div>
+                        </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.llm.requestTimeout', 'Connection Setup Timeout (s)')}</label>
+                            <input className="form-input" type="number" min="1" placeholder={t('enterprise.llm.requestTimeoutPlaceholder', 'Leave empty for the default')} value={modelForm.request_timeout} onChange={e => setModelForm({ ...modelForm, request_timeout: e.target.value })} />
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Model generation and response reads have no platform timeout.')}</div>
                         </div>
                         <div className="form-group">
                             <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
@@ -303,6 +329,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                 max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
                                 request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                 temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null,
+                                context_window: Number(modelForm.context_window),
+                                context_usage_ratio: Number(modelForm.context_usage_percent) / 100,
+                                keep_recent_turns: Number(modelForm.keep_recent_turns),
                             });
                         }} disabled={!modelForm.model || !modelForm.api_key}>
                             {t('common.save')}
@@ -360,8 +389,25 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                         <input className="form-input" type="number" placeholder={t('enterprise.llm.maxOutputTokensPlaceholder', 'e.g. 4096')} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
                                     </div>
                                     <div className="form-group">
-                                        <label className="form-label">{t('enterprise.llm.requestTimeout', 'Request Timeout (s)')}</label>
-                                        <input className="form-input" type="number" min="1" placeholder={t('enterprise.llm.requestTimeoutPlaceholder', 'e.g. 120 (Leave empty for default)')} value={modelForm.request_timeout} onChange={e => setModelForm({ ...modelForm, request_timeout: e.target.value })} />
+                                        <label className="form-label">{t('enterprise.llm.contextWindow')}</label>
+                                        <input className="form-input" type="number" min="1024" max="2000000" value={modelForm.context_window} onChange={e => setModelForm({ ...modelForm, context_window: e.target.value })} />
+                                    </div>
+                                    <div className="form-group">
+                                        <label className="form-label">{t('enterprise.llm.contextUsagePercent')}</label>
+                                        <input className="form-input" type="number" min="10" max="100" value={modelForm.context_usage_percent} onChange={e => setModelForm({ ...modelForm, context_usage_percent: e.target.value })} />
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                                            {t('enterprise.llm.effectiveContext')}: {Math.floor((Number(modelForm.context_window) || 0) * (Number(modelForm.context_usage_percent) || 0) / 100).toLocaleString()} tokens
+                                        </div>
+                                    </div>
+                                    <div className="form-group">
+                                        <label className="form-label">{t('enterprise.llm.keepRecentTurns')}</label>
+                                        <input className="form-input" type="number" min="3" max="50" value={modelForm.keep_recent_turns} onChange={e => setModelForm({ ...modelForm, keep_recent_turns: e.target.value })} />
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.keepRecentTurnsDesc')}</div>
+                                    </div>
+                                    <div className="form-group">
+                                        <label className="form-label">{t('enterprise.llm.requestTimeout', 'Connection Setup Timeout (s)')}</label>
+                                        <input className="form-input" type="number" min="1" placeholder={t('enterprise.llm.requestTimeoutPlaceholder', 'Leave empty for the default')} value={modelForm.request_timeout} onChange={e => setModelForm({ ...modelForm, request_timeout: e.target.value })} />
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Model generation and response reads have no platform timeout.')}</div>
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
@@ -379,6 +425,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                                 max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
                                                 request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                                 temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null,
+                                                context_window: Number(modelForm.context_window),
+                                                context_usage_ratio: Number(modelForm.context_usage_percent) / 100,
+                                                keep_recent_turns: Number(modelForm.keep_recent_turns),
                                             },
                                         });
                                     }} disabled={!modelForm.model}>
@@ -393,6 +442,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
                                         {m.provider}/{m.model}
                                         {m.base_url && <span> · {m.base_url}</span>}
+                                        <span> · {t('enterprise.llm.effectiveContext')}: {Math.floor(m.context_window * m.context_usage_ratio).toLocaleString()}/{m.context_window.toLocaleString()}</span>
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
@@ -456,6 +506,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                             max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '',
                                             request_timeout: m.request_timeout ? String(m.request_timeout) : '',
                                             temperature: m.temperature !== null && m.temperature !== undefined ? String(m.temperature) : '',
+                                            context_window: String(m.context_window || 32000),
+                                            context_usage_percent: String(Math.round((m.context_usage_ratio ?? 0.7) * 100)),
+                                            keep_recent_turns: String(m.keep_recent_turns ?? 3),
                                         });
                                         setShowAddModel(true);
                                     }} style={{ fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>

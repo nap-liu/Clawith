@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import delete, select
@@ -198,6 +199,97 @@ async def _make_user_anchor(agent_id, user_id, *, conv: str, content: str = "mes
         )
         await db.commit()
         return row.id
+
+
+@pytest.mark.parametrize("injection_kind", ["subagent", "im"])
+async def test_recovery_anchor_allows_different_sender_inside_same_execution_scope(
+    monkeypatch,
+    injection_kind,
+):
+    from app.services import conversation_turn_lifecycle
+    from app.services.turn_recovery import _find_turn_anchor_for_latest
+
+    root_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    root = SimpleNamespace(
+        id=root_id,
+        role="user",
+        agent_id=agent_id,
+        conversation_id=str(session_id),
+        user_id=uuid.uuid4(),
+    )
+    meta = (
+        {"subagent_turn_anchor_id": str(root_id)}
+        if injection_kind == "subagent"
+        else {
+            "turn_inbox_state": "delivered",
+            "turn_inbox_anchor_id": str(root_id),
+            "turn_inbox_generation": 7,
+        }
+    )
+    projection = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="user",
+        agent_id=agent_id,
+        conversation_id=str(session_id),
+        user_id=uuid.uuid4(),
+        message_meta=meta,
+    )
+    session = SimpleNamespace(id=session_id, agent_id=agent_id)
+
+    class _DB:
+        async def get(self, model, key):
+            if model is ChatSession:
+                return session
+            if model is ChatMessage and key == root_id:
+                return root
+            return None
+
+    monkeypatch.setattr(
+        conversation_turn_lifecycle,
+        "conversation_turn_snapshot_for_session",
+        lambda _session: SimpleNamespace(anchor_id=root_id, generation=7),
+    )
+
+    selected = await _find_turn_anchor_for_latest(_DB(), projection)
+
+    assert selected is root
+
+
+@pytest.mark.parametrize("changed_attr", ["agent_id", "conversation_id"])
+async def test_recovery_anchor_rejects_cross_execution_scope(changed_attr):
+    from app.services.turn_recovery import _find_turn_anchor_for_latest
+
+    root_id = uuid.uuid4()
+    root = SimpleNamespace(
+        id=root_id,
+        role="user",
+        agent_id=uuid.uuid4(),
+        conversation_id=str(uuid.uuid4()),
+        user_id=uuid.uuid4(),
+    )
+    projection = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="user",
+        agent_id=root.agent_id,
+        conversation_id=root.conversation_id,
+        user_id=uuid.uuid4(),
+        message_meta={"subagent_turn_anchor_id": str(root_id)},
+    )
+    setattr(
+        projection,
+        changed_attr,
+        uuid.uuid4() if changed_attr == "agent_id" else str(uuid.uuid4()),
+    )
+
+    class _DB:
+        async def get(self, model, key):
+            if model is ChatMessage and key == root_id:
+                return root
+            return None
+
+    assert await _find_turn_anchor_for_latest(_DB(), projection) is None
 
 
 async def test_startup_recovery_scans_recent_incomplete_message_tails(monkeypatch):
@@ -1014,7 +1106,7 @@ async def test_resume_turn_continues_from_recoverable_history_and_marks_complete
 
 async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch):
     """Recovered IM turns must be delivered through their original channel runtime."""
-    from app.services import turn_recovery
+    from app.services import turn_inbox, turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
     agent_id, user_id = await _make_agent_with_model(context_window_size=1)
@@ -1043,13 +1135,24 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
         return "dingtalk resumed reply"
 
     delivered = []
+    lifecycle_events: list[str] = []
 
     async def fake_deliver(**kwargs):
+        lifecycle_events.append("terminal-delivered")
         delivered.append(kwargs)
         return True
 
+    async def failing_reaction_cleanup(**_kwargs):
+        lifecycle_events.append("reaction-cleanup")
+        raise RuntimeError("provider cleanup unavailable")
+
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
     monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver, raising=False)
+    monkeypatch.setattr(
+        turn_inbox,
+        "cleanup_durable_channel_receipt_anchor",
+        failing_reaction_cleanup,
+    )
 
     async with async_session() as db:
         anchor = (await db.execute(select(ChatMessage).where(ChatMessage.id == anchor_id))).scalar_one()
@@ -1057,6 +1160,7 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
+    assert lifecycle_events == ["terminal-delivered", "reaction-cleanup"]
     assert len(delivered) == 1
     delivered_message_id = delivered[0].pop("message_id")
     assert isinstance(delivered_message_id, uuid.UUID)
@@ -1403,8 +1507,8 @@ async def test_resume_turn_continues_after_completed_tool_call_tail(monkeypatch)
     assert len(replies) == 1
 
 
-async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(monkeypatch):
-    """Recovery runs code but cannot widen its original, unavailable tool scope."""
+async def test_resume_turn_does_not_reexecute_unfinished_code(monkeypatch):
+    """Recovery never repeats arbitrary code after an ambiguous crash window."""
     from app.services import turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
@@ -1437,6 +1541,11 @@ async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(mo
                         },
                         "status": "running",
                         "result": "",
+                        "assistant_content": "I am running the requested code.",
+                        "recovery_prefix_messages": [
+                            {"role": "assistant", "content": "partial before limit"},
+                            {"role": "user", "content": "continue exactly"},
+                        ],
                         "turn_anchor_id": str(anchor_id),
                     },
                     ensure_ascii=False,
@@ -1472,28 +1581,16 @@ async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(mo
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
-    assert executed == [
-        (
-            "execute_code_aio",
-            {
-                "language": "bash",
-                "code": "echo recovered",
-                "execution_mode": "foreground",
-            },
-            {
-                "agent_id": agent_id,
-                "user_id": user_id,
-                "session_id": conv,
-                "tool_call_id": call_id,
-                "turn_anchor_id": anchor_id,
-                "on_output": None,
-            },
-        )
+    assert executed == []
+    assert [msg["role"] for msg in captured["history"]] == [
+        "user", "assistant", "user", "assistant", "tool"
     ]
-    assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
-    assert captured["history"][1]["tool_calls"][0]["function"]["name"] == "execute_code_aio"
-    assert captured["history"][1]["tool_calls"][0]["id"] == call_id
-    assert captured["history"][2]["content"] == "recovered\n"
+    assert captured["history"][1]["content"] == "partial before limit"
+    assert captured["history"][2]["content"] == "continue exactly"
+    assert captured["history"][3]["content"] == "I am running the requested code."
+    assert captured["history"][3]["tool_calls"][0]["function"]["name"] == "execute_code_aio"
+    assert captured["history"][3]["tool_calls"][0]["id"] == call_id
+    assert "Recovery blocked automatic replay" in captured["history"][4]["content"]
 
     async with async_session() as db:
         payloads = [
@@ -1510,7 +1607,9 @@ async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(mo
         ]
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
-    assert payloads[1]["result"] == "recovered\n"
+    assert "Recovery blocked automatic replay" in payloads[1]["result"]
+    assert payloads[1]["assistant_content"] == "I am running the requested code."
+    assert payloads[1]["recovery_prefix_messages"][0]["content"] == "partial before limit"
     async with async_session() as db:
         replies = (
             (
@@ -1614,7 +1713,7 @@ async def test_resume_turn_replays_only_tools_after_current_anchor(monkeypatch):
         anchor = await db.get(ChatMessage, current_anchor_id)
 
     assert await turn_recovery.resume_turn(anchor) is True
-    assert executed == ["current.txt"]
+    assert executed == []
 
     async with async_session() as db:
         tool_rows = (
@@ -1634,8 +1733,8 @@ async def test_resume_turn_replays_only_tools_after_current_anchor(monkeypatch):
     assert done_rows[0].message_meta["turn_anchor_id"] == str(current_anchor_id)
 
 
-async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_message(monkeypatch):
-    """Crash recovery should resume the original tool call and replay its real result."""
+async def test_resume_turn_never_reexecutes_ambiguous_external_send(monkeypatch):
+    """Crash recovery fails closed instead of duplicating an external send."""
     from app.services import turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
@@ -1698,24 +1797,11 @@ async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_me
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
-    assert executed == [
-        (
-            "send_feishu_message",
-            {"open_id": "ou_x", "text": "hello"},
-            {
-                "agent_id": agent_id,
-                "user_id": user_id,
-                "session_id": conv,
-                "tool_call_id": call_id,
-                "turn_anchor_id": anchor_id,
-                "on_output": None,
-            },
-        )
-    ]
+    assert executed == []
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
     assert captured["history"][1]["tool_calls"][0]["function"]["name"] == "send_feishu_message"
     assert captured["history"][1]["tool_calls"][0]["id"] == call_id
-    assert captured["history"][2]["content"] == "sent ok"
+    assert "Recovery blocked automatic replay" in captured["history"][2]["content"]
 
     async with async_session() as db:
         payloads = [
@@ -1732,11 +1818,11 @@ async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_me
         ]
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
-    assert payloads[1]["result"] == "sent ok"
+    assert "Recovery blocked automatic replay" in payloads[1]["result"]
 
 
 async def test_resume_turn_does_not_continue_when_recovered_tool_result_persist_fails(monkeypatch):
-    """After re-executing a running tool, durable done persistence is mandatory."""
+    """A fail-closed recovery result must be durable before LLM continuation."""
     from app.services import turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 

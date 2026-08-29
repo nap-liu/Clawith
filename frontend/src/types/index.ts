@@ -47,6 +47,7 @@ export interface Agent {
     timezone?: string;
     im_thinking_output_enabled?: boolean;
     context_window_size?: number;
+    daily_memory_load_days?: number;
     agent_type?: 'native' | 'openclaw';
     openclaw_last_seen?: string;
     access_mode?: 'company' | 'private' | 'custom';

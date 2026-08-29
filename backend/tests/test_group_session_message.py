@@ -1419,6 +1419,13 @@ async def test_managed_url_pending_receipt_converges_unknown_before_network_or_p
                 "args": args,
                 "status": "running",
                 "result": "",
+                "reasoning_content": "typed reasoning",
+                "assistant_content": "I will send the requested video.",
+                "recovery_prefix_messages": [
+                    {"role": "assistant", "content": "partial media plan"},
+                    {"role": "user", "content": "continue exactly"},
+                ],
+                "round_id": "round-media-1",
             }),
             conversation_id=str(target.id),
             external_event_key=operation_key,
@@ -1731,6 +1738,14 @@ async def test_send_media_reuses_current_running_tool_row_and_orders_caption_aft
                 "args": {"media_type": "video", "file_path": "workspace/current.mp4"},
                 "status": "running",
                 "result": "",
+                "reasoning_content": "typed reasoning",
+                "assistant_content": "I will send the requested video.",
+                "recovery_prefix_messages": [
+                    {"role": "assistant", "content": "partial media plan"},
+                    {"role": "user", "content": "Please continue."},
+                ],
+                "round_id": "round-media-1",
+                "round_tool_index": 0,
             }),
             conversation_id=str(target.id),
             message_meta={"turn_anchor_id": str(anchor_id)},
@@ -1772,7 +1787,12 @@ async def test_send_media_reuses_current_running_tool_row_and_orders_caption_aft
         )).scalars().all())
     assert [row.role for row in rows] == ["tool_call", "assistant"]
     assert rows[0].id == running_id
-    assert json.loads(rows[0].content)["status"] == "done"
+    stored_tool = json.loads(rows[0].content)
+    assert stored_tool["status"] == "done"
+    assert stored_tool["reasoning_content"] == "typed reasoning"
+    assert stored_tool["assistant_content"] == "I will send the requested video."
+    assert stored_tool["recovery_prefix_messages"][0]["content"] == "partial media plan"
+    assert stored_tool["round_id"] == "round-media-1"
     assert rows[0].message_meta["delivery_claim"] is False
     assert rows[1].message_meta["media_caption_for"] == str(running_id)
     assert "delivery_claim" not in rows[1].message_meta

@@ -360,7 +360,7 @@ async def test_channel_does_not_consult_or_write_persistent_context_termination(
     terminate.assert_not_awaited()
 
 
-async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current(monkeypatch):
+async def test_channel_turn_recovery_reloads_prefix_and_complete_durable_current_tail(monkeypatch):
     from app.services.llm.compactor import CompactionResult
 
     agent, model = _make_agent_and_model()
@@ -370,13 +370,22 @@ async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current
     agent.fallback_model_id = fallback_model.id
     anchor = uuid.uuid4()
     compact = AsyncMock(return_value=CompactionResult(triggered=True, required=True))
-    load_prefix = AsyncMock(
-        return_value=[{"role": "user", "content": "<conversation-summary>old</conversation-summary>"}]
+    load_recoverable = AsyncMock(
+        return_value=[
+            {"role": "user", "content": "<conversation-summary>old</conversation-summary>"},
+            {"role": "user", "content": "当前问题原文"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "done-1", "type": "function", "function": {"name": "grep", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "done-1", "content": "durable-result"},
+        ]
     )
     monkeypatch.setattr("app.services.llm.compactor.maybe_compact", compact)
     monkeypatch.setattr(
-        "app.services.chat_history.load_history_prefix_before_anchor",
-        load_prefix,
+        "app.services.chat_history.load_recoverable_history_for_turn",
+        load_recoverable,
     )
 
     class _SessionContext:
@@ -394,7 +403,12 @@ async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current
         recovered.extend(
                 await context_recovery(
                     primary_model,
-                    SimpleNamespace(estimated_tokens=999, char_overflow=True),
+                    SimpleNamespace(
+                            authoritative_prompt_tokens=None,
+                            provider_overflow=True,
+                            keep_recent_turns_override=12,
+                            fits=False,
+                    ),
                 )
         )
         return "恢复成功"
@@ -415,6 +429,12 @@ async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current
     assert recovered == [
         {"role": "user", "content": "<conversation-summary>old</conversation-summary>"},
         {"role": "user", "content": "当前问题原文"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "done-1", "type": "function", "function": {"name": "grep", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "done-1", "content": "durable-result"},
     ]
     assert compact.await_args.kwargs["force_required"] is True
     assert compact.await_args.kwargs["current_anchor_id"] == anchor
@@ -566,3 +586,52 @@ async def test_im_turn_without_session_does_not_broadcast(monkeypatch):
     )
     assert reply == "ok"
     assert sent == [], "no session → no broadcast"
+
+
+async def test_all_loop_reaction_hooks_time_out_without_freezing_turn(monkeypatch):
+    """Chunk/thinking/tool reaction callbacks share one strict time boundary."""
+
+    agent, model = _make_agent_and_model()
+    from app.services import channel_dispatch
+
+    monkeypatch.setattr(channel_dispatch, "CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS", 0.01)
+    started: list[str] = []
+    cancelled: list[str] = []
+
+    def never_returning(tag: str):
+        async def _hook(_value):
+            started.append(tag)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(tag)
+
+        return _hook
+
+    async def fake_llm(*_args, **kwargs):
+        await kwargs["on_chunk"]("chunk")
+        await kwargs["on_thinking"]("thinking")
+        await kwargs["on_tool_call"](
+            {"name": "read_file", "call_id": "1", "args": {}, "status": "done", "result": "ok"}
+        )
+        return "turn-completed"
+
+    _patch_llm(monkeypatch, fake_llm)
+    reply = await asyncio.wait_for(
+        channel_llm._call_agent_llm(
+            _make_db(agent, model),
+            agent.id,
+            "test",
+            session_id="",
+            user_id=agent.id,
+            on_chunk=never_returning("chunk"),
+            on_thinking=never_returning("thinking"),
+            on_tool_call=never_returning("tool"),
+        ),
+        timeout=0.5,
+    )
+
+    assert reply == "turn-completed"
+    await asyncio.sleep(0)
+    assert set(started) == {"chunk", "thinking", "tool"}
+    assert set(cancelled) == {"chunk", "thinking", "tool"}

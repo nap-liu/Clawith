@@ -6530,6 +6530,7 @@ async def _replay_terminal_media_delivery_under_slot(
                 stored_args = {"media_type": media_kind}
             existing.content = json.dumps(
                 {
+                    **stored_call,
                     "name": str(stored_call.get("name") or "send_media"),
                     "call_id": str(stored_call.get("call_id") or intent_id),
                     "args": stored_args,
@@ -6957,6 +6958,7 @@ async def _publish_external_media_to_session(
             )
 
         receipt: ChatMessage | None = None
+        receipt_tool_payload: dict = {}
         if str(origin_session_id or "") == str(session.id) and origin_turn_anchor_id:
             running_rows = (
                 (
@@ -6987,6 +6989,7 @@ async def _publish_external_media_to_session(
                     and str(candidate_payload.get("call_id") or "") == intent_id
                 ):
                     receipt = candidate
+                    receipt_tool_payload = dict(candidate_payload)
                     break
 
         claim_meta = {
@@ -7044,12 +7047,13 @@ async def _publish_external_media_to_session(
         }
         receipt.content = json.dumps(
             {
+                **receipt_tool_payload,
                 "name": "send_media",
                 "call_id": intent_id,
                 "args": dict(tool_args),
                 "status": "done",
                 "result": json.dumps(result_payload, ensure_ascii=False),
-                "reasoning_content": None,
+                "reasoning_content": receipt_tool_payload.get("reasoning_content"),
             },
             ensure_ascii=False,
         )
@@ -7713,6 +7717,12 @@ async def _send_media_to_session_under_lifecycle_lock(
                 ensure_ascii=False,
             )
         final_meta = dict(final_receipt.message_meta or {})
+        try:
+            final_tool_payload = json.loads(final_receipt.content or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            final_tool_payload = {}
+        if not isinstance(final_tool_payload, dict):
+            final_tool_payload = {}
         if str(final_meta.get("delivery_status") or "") != "pending":
             try:
                 terminal_call = json.loads(final_receipt.content or "")
@@ -7777,12 +7787,13 @@ async def _send_media_to_session_under_lifecycle_lock(
             )
         final_receipt.content = json.dumps(
             {
+                **final_tool_payload,
                 "name": "send_media",
                 "call_id": intent_id,
                 "args": persisted_args,
                 "status": "done",
                 "result": json.dumps(result_payload, ensure_ascii=False),
-                "reasoning_content": None,
+                "reasoning_content": final_tool_payload.get("reasoning_content"),
             },
             ensure_ascii=False,
         )
@@ -13757,7 +13768,6 @@ async def _send_message_to_agent(
             else:
                 messages.append({"role": "user", "content": turn_text})
 
-            frozen_current_suffix = [dict(messages[-1])]
             from app.services.llm.turn_partition import effective_keep_recent_turns
 
             protected_keep_recent_turns = effective_keep_recent_turns(
@@ -13766,35 +13776,52 @@ async def _send_message_to_agent(
             )
 
             async def _a2a_context_recovery(_recovery_model, dispatch_budget):
-                from app.services.chat_history import load_history_prefix_before_anchor
-                from app.services.llm.compactor import maybe_compact
+                from app.services.chat_history import load_recoverable_history_for_turn
+                from app.services.llm.compactor import (
+                    COMPACTION_NOT_APPLICABLE_REASONS,
+                    ContextRecoveryMessages,
+                    maybe_compact,
+                )
 
                 compacted = await maybe_compact(
                     agent_id=session_agent_id,
                     conversation_id=session_id,
                     model=_recovery_model,
-                    pre_flight_estimate=dispatch_budget.estimated_tokens,
+                    last_prompt_tokens=getattr(dispatch_budget, "authoritative_prompt_tokens", None),
                     current_anchor_id=outbound_a2a_message.id,
-                    force_required=dispatch_budget.char_overflow,
-                    keep_recent_turns_override=protected_keep_recent_turns,
+                    force_required=getattr(dispatch_budget, "provider_overflow", False),
+                    keep_recent_turns_override=(
+                        getattr(dispatch_budget, "keep_recent_turns_override", None)
+                        if getattr(dispatch_budget, "provider_overflow", False)
+                        else protected_keep_recent_turns
+                    ),
                 )
-                if not compacted.triggered:
+                preflight_not_applicable = (
+                    not compacted.triggered
+                    and compacted.skipped_reason
+                    in COMPACTION_NOT_APPLICABLE_REASONS
+                    and dispatch_budget.fits
+                )
+                if not compacted.triggered and not preflight_not_applicable:
                     logger.warning(
                         f"[A2A] context recovery could not compact session={session_id}: {compacted.skipped_reason}"
                     )
                     return None
                 async with async_session() as recovery_db:
-                    prefix = await load_history_prefix_before_anchor(
+                    recovered = await load_recoverable_history_for_turn(
                         recovery_db,
                         agent_id=session_agent_id,
                         conversation_id=session_id,
                         turn_anchor_id=outbound_a2a_message.id,
                         ctx_size=ctx_size,
                     )
-                if prefix is None:
+                if not recovered:
                     logger.warning(f"[A2A] context recovery lost latest-anchor race session={session_id}")
                     return None
-                return prefix + frozen_current_suffix
+                return ContextRecoveryMessages(
+                    recovered,
+                    preflight_not_applicable=preflight_not_applicable,
+                )
 
             # 3) persist callback stores tool calls under session_agent_id, RAW
             async def _a2a_persist(evt: dict):

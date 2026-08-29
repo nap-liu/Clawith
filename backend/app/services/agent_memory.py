@@ -6,8 +6,9 @@ The memory contract deliberately stays small:
 * ``memory/MEMORY_INDEX.md`` documents the directory layout.
 * ``memory/<YYYY-MM-DD>/memory.md`` stores detailed daily records.
 
-The platform loads core memory, the structure guide, and at most the two most
-recent existing daily records.  Semantic curation remains the agent's job.
+The platform always loads core memory and can load a configurable number of
+recent daily records. Zero disables Daily Memory injection. Semantic curation
+remains the agent's job.
 """
 
 from __future__ import annotations
@@ -43,9 +44,8 @@ execution turn and keeps it available throughout the complete tool loop.
 Path pattern: `memory/<YYYY-MM-DD>/memory.md`
 
 Each date directory contains the detailed work record for that date. The
-platform automatically loads at most the two most recent existing Daily Memory
-files into every execution turn and keeps them available throughout the
-complete tool loop.
+platform loads the configured number of most recent existing Daily Memory files
+into every execution turn. This can be disabled in Agent settings.
 
 Older Daily Memory files remain under `memory/` but are not automatically
 loaded. When older information is needed:
@@ -78,8 +78,8 @@ content.
 
 `memory/<YYYY-MM-DD>/memory.md` is the detailed record of meaningful work for
 that date. Use your configured timezone to select the date and keep one file
-per date. The platform automatically loads at most the two most recent existing
-Daily Memory files. Older records remain available through the lookup procedure
+per date. The platform loads the configured number of most recent existing
+Daily Memory files; loading can be disabled. Older records remain available through the lookup procedure
 documented in `memory/MEMORY_INDEX.md`.
 
 Maintaining Daily Memory is part of completing meaningful work. When an
@@ -190,15 +190,17 @@ async def load_agent_memory_snapshot(
     core_key = runtime_workspace.storage_key("memory/memory.md")
     index_key = runtime_workspace.storage_key("memory/MEMORY_INDEX.md")
 
+    limit = max(daily_limit, 0)
     core_memory = await _read_optional_text(core_key, agent_id=agent_id, kind="core")
     structure_guide = (
         await _read_optional_text(index_key, agent_id=agent_id, kind="index")
-        if runtime_workspace.supports_daily_memory
+        if runtime_workspace.supports_daily_memory and limit
         else ""
     )
 
+    daily_records: list[DailyMemoryRecord] = []
     candidates: list[tuple[date, str]] = []
-    if runtime_workspace.supports_daily_memory:
+    if runtime_workspace.supports_daily_memory and limit:
         try:
             for entry in await storage.list_dir(memory_prefix):
                 if not entry.is_dir:
@@ -218,8 +220,6 @@ async def load_agent_memory_snapshot(
                 exc,
             )
 
-    daily_records: list[DailyMemoryRecord] = []
-    limit = max(daily_limit, 0)
     if limit:
         for record_date, path in sorted(candidates, key=lambda item: item[0], reverse=True):
             content = await _read_optional_text(path, agent_id=agent_id, kind="daily")

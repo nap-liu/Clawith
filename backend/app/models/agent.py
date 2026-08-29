@@ -43,6 +43,10 @@ class Agent(Base):
             "(scope = 'project' AND project_id IS NOT NULL AND agent_dir IS NOT NULL)",
             name="ck_agents_project_scope",
         ),
+        CheckConstraint(
+            "daily_memory_load_days >= 0 AND daily_memory_load_days <= 30",
+            name="ck_agents_daily_memory_load_days",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -123,6 +127,14 @@ class Agent(Base):
     cache_creation_tokens_month: Mapped[int] = mapped_column(BigInteger, default=0)
     cache_creation_tokens_total: Mapped[int] = mapped_column(BigInteger, default=0)
     context_window_size: Mapped[int] = mapped_column(Integer, default=100)
+    # Number of recent Daily Memory files injected into every turn. Zero
+    # disables Daily Memory loading while retaining Core Memory.
+    daily_memory_load_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=2,
+        server_default="2",
+    )
     max_tool_rounds: Mapped[int] = mapped_column(Integer, default=50)
 
     # Trigger limits (per-agent, configurable from Settings UI)

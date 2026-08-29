@@ -6,13 +6,14 @@ Covers the contract that downstream code relies on:
   - Empty output is normalized.
   - String > budget is materialized: file written, llm_view has
     <persisted-output> marker + preview + file ref.
-  - Per-tool budget takes precedence over default.
-  - Env override changes the default.
+  - One normalized budget applies to every tool.
+  - Env override changes that budget globally.
   - Missing agent_id / unwritable path falls back to inline shape
     (never silently drops data).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -41,13 +42,19 @@ def tmp_workspace(tmp_path, monkeypatch):
 
 
 def _finalize(result, *, tool_name="grep", agent_id=None, session_id="sess1", tool_call_id="call_1"):
-    return tos.finalize_tool_output(
-        result,
-        tool_name=tool_name,
-        agent_id=agent_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
+    return asyncio.run(
+        tos.finalize_tool_output(
+            result,
+            tool_name=tool_name,
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
     )
+
+
+def _saved_path(view: str) -> str:
+    return view.split("Full output saved to: ", 1)[1].splitlines()[0]
 
 
 def test_short_string_inline(tmp_workspace, agent_id):
@@ -72,10 +79,15 @@ def test_large_string_materialized(tmp_workspace, agent_id):
 
     assert tos.PERSISTED_OPEN in view
     assert tos.PERSISTED_CLOSE in view
-    assert ".tool_results/s1/grep_call_abc.txt" in view
+    assert ".tool_results/s1/grep_call_abc_" in view
     assert "60,000" in view.replace(",", ",") or "58.6 KB" in view
+    assert len(view) <= tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
+    assert len(view) > 31_000
+    assert "TRUNCATED:" in view
+    assert "within the 32,000-character limit" in view
+    assert big[30_000:30_100] in view
 
-    written = tmp_workspace / agent_id / ".tool_results" / "s1" / "grep_call_abc.txt"
+    written = tmp_workspace / agent_id / _saved_path(view)
     assert written.exists()
     assert written.read_text() == big
 
@@ -86,17 +98,15 @@ def test_json_output_detected_and_suffixed(tmp_workspace, agent_id):
     assert len(result) > 20_000
 
     view = _finalize(result, tool_name="grep", agent_id=agent_id, session_id="s1", tool_call_id="call_j")
-    assert "grep_call_j.json" in view
+    assert "grep_call_j_" in view
+    assert ".json" in view
 
-    written = tmp_workspace / agent_id / ".tool_results" / "s1" / "grep_call_j.json"
+    written = tmp_workspace / agent_id / _saved_path(view)
     assert written.exists()
     assert json.loads(written.read_text()) == payload
 
 
-def test_per_tool_budget_beats_default(tmp_workspace, agent_id):
-    # grep has budget 40_000; default is 100_000. A 50k string exceeds grep's
-    # budget → materialized. Same string under a tool that uses default →
-    # inline.
+def test_all_tools_share_normalized_budget(tmp_workspace, agent_id):
     size = 50_000
     s = "y" * size
 
@@ -104,7 +114,7 @@ def test_per_tool_budget_beats_default(tmp_workspace, agent_id):
     assert tos.PERSISTED_OPEN in view_grep
 
     view_default = _finalize(s, tool_name="some_mcp_tool", agent_id=agent_id, tool_call_id="c2")
-    assert view_default == s
+    assert tos.PERSISTED_OPEN in view_default
 
 
 def test_read_file_large_single_line_is_materialized(tmp_workspace, agent_id):
@@ -115,48 +125,118 @@ def test_read_file_large_single_line_is_materialized(tmp_workspace, agent_id):
     view = _finalize(huge, tool_name="read_file", agent_id=agent_id, tool_call_id="c")
     assert tos.PERSISTED_OPEN in view
     assert len(view) < len(huge)
-    written = tmp_workspace / agent_id / ".tool_results" / "sess1" / "read_file_c.txt"
+    written = tmp_workspace / agent_id / _saved_path(view)
     assert written.read_text() == huge
     assert "execute_code_aio" in view
 
 
 def test_env_override_changes_default(tmp_workspace, agent_id, monkeypatch):
-    monkeypatch.setenv(tos.ENV_OVERRIDE, "1000")
-    s = "w" * 2_000  # Under default (50k) but over override (1k)
+    monkeypatch.setenv(tos.ENV_OVERRIDE, "4096")
+    s = "w" * 5_000  # Under the default but over the global override.
     view = _finalize(s, tool_name="some_mcp_tool", agent_id=agent_id, tool_call_id="c")
     assert tos.PERSISTED_OPEN in view
+    assert len(view) <= 4096
 
 
-def test_env_override_does_not_affect_per_tool(tmp_workspace, agent_id, monkeypatch):
-    # Per-tool budget is hardcoded; env override only kicks in for the
-    # default bucket. A tool listed in the registry keeps its own budget.
-    monkeypatch.setenv(tos.ENV_OVERRIDE, "10")
+def test_env_override_affects_known_tools_too(tmp_workspace, agent_id, monkeypatch):
+    monkeypatch.setenv(tos.ENV_OVERRIDE, "1024")
     s = "q" * 15_000  # under grep (20k) but over env override
     view = _finalize(s, tool_name="grep", agent_id=agent_id, tool_call_id="c")
-    assert view == s  # inline, grep's 20k still applies
+    assert tos.PERSISTED_OPEN in view
+    assert len(view) <= 1024
 
 
-def test_missing_agent_falls_back_to_inline_shape(tmp_workspace):
-    # No agent_id → cannot materialize → must shape inline, not drop.
+def test_missing_agent_fails_without_replacing_full_output(tmp_workspace):
+    # No agent_id means no readable path; an unrecoverable truncation must not
+    # be persisted or dispatched as if it were the full result.
     big = "a" * 60_000
-    view = _finalize(big, tool_name="grep", agent_id=None, tool_call_id="c")
-    assert tos.PERSISTED_OPEN not in view  # not materialized
-    assert "truncated" in view  # shape_tool_result marker
-    assert "a" in view
+    with pytest.raises(tos.ToolOutputMaterializationError, match="missing agent_id"):
+        _finalize(big, tool_name="grep", agent_id=None, tool_call_id="c")
 
 
-def test_materialize_failure_falls_back_to_inline_shape(tmp_workspace, agent_id, monkeypatch):
-    # Force mkdir to raise — ensures we fall back to inline shape instead
-    # of silently losing the tool result.
-    def _boom(self, *a, **kw):
-        raise OSError("disk full")
+def test_materialize_failure_is_strict(tmp_workspace, agent_id, monkeypatch):
+    class BrokenStorage:
+        def __init__(self):
+            self.deleted = []
 
-    monkeypatch.setattr(Path, "mkdir", _boom)
+        async def exists(self, _key):
+            return False
+
+        async def write_text(self, *_args, **_kwargs):
+            raise OSError("disk full")
+
+        async def delete(self, key):
+            self.deleted.append(key)
+
+    storage = BrokenStorage()
+    monkeypatch.setattr(tos, "get_storage_backend", lambda: storage)
 
     big = "b" * 60_000
-    view = _finalize(big, tool_name="grep", agent_id=agent_id, tool_call_id="c")
-    assert tos.PERSISTED_OPEN not in view
-    assert "truncated" in view
+    with pytest.raises(tos.ToolOutputMaterializationError, match="disk full"):
+        _finalize(big, tool_name="grep", agent_id=agent_id, tool_call_id="c")
+    assert storage.deleted == []
+
+
+def test_retry_reuses_preexisting_content_addressed_object_without_rewrite_or_delete(
+    tmp_workspace, agent_id, monkeypatch
+):
+    big = "stable" * 10_000
+    initial = _finalize(big, tool_name="grep", agent_id=agent_id, tool_call_id="same")
+    key = f"{agent_id}/{_saved_path(initial)}"
+
+    class ExistingStorage:
+        def __init__(self):
+            self.writes = 0
+            self.deletes = 0
+
+        async def exists(self, candidate):
+            return candidate == key
+
+        async def read_text(self, candidate, **_kwargs):
+            assert candidate == key
+            return big
+
+        async def write_text(self, *_args, **_kwargs):
+            self.writes += 1
+            raise OSError("must not rewrite stable object")
+
+        async def delete(self, _key):
+            self.deletes += 1
+
+    storage = ExistingStorage()
+    monkeypatch.setattr(tos, "get_storage_backend", lambda: storage)
+
+    retried = _finalize(big, tool_name="grep", agent_id=agent_id, tool_call_id="same")
+
+    assert _saved_path(retried) == _saved_path(initial)
+    assert storage.writes == 0
+    assert storage.deletes == 0
+
+
+def test_reused_provider_call_id_never_overwrites_prior_full_output(
+    tmp_workspace,
+    agent_id,
+):
+    first = _finalize(
+        "A" * 40_000,
+        tool_name="grep",
+        agent_id=agent_id,
+        session_id="same-session",
+        tool_call_id="same-call",
+    )
+    second = _finalize(
+        "B" * 40_000,
+        tool_name="grep",
+        agent_id=agent_id,
+        session_id="same-session",
+        tool_call_id="same-call",
+    )
+
+    first_path = tmp_workspace / agent_id / _saved_path(first)
+    second_path = tmp_workspace / agent_id / _saved_path(second)
+    assert first_path != second_path
+    assert first_path.read_text() == "A" * 40_000
+    assert second_path.read_text() == "B" * 40_000
 
 
 def test_materialization_uses_configured_local_storage_root(tmp_workspace, tmp_path, agent_id, monkeypatch):
@@ -173,28 +253,36 @@ def test_materialization_uses_configured_local_storage_root(tmp_workspace, tmp_p
         get_settings.cache_clear()
 
     assert tos.PERSISTED_OPEN in view
-    written = storage_root / agent_id / ".tool_results" / "sess1" / "grep_root.txt"
+    written = storage_root / agent_id / _saved_path(view)
     assert written.read_text() == big
 
 
-def test_pure_s3_materialization_never_claims_an_unreadable_saved_path(
+def test_remote_storage_materialization_uses_readable_agent_key(
     tmp_workspace,
     agent_id,
     monkeypatch,
 ):
-    monkeypatch.setenv("STORAGE_BACKEND", "s3")
-    monkeypatch.setenv("STORAGE_LOCAL_FALLBACK_ENABLED", "false")
-    from app.config import get_settings
+    writes: list[tuple[str, str]] = []
 
-    get_settings.cache_clear()
-    try:
-        view = _finalize("s" * 60_000, tool_name="grep", agent_id=agent_id, tool_call_id="s3")
-    finally:
-        get_settings.cache_clear()
+    class RemoteStorage:
+        async def exists(self, _key):
+            return False
 
-    assert tos.PERSISTED_OPEN not in view
-    assert "Full output saved to" not in view
-    assert "truncated" in view
+        async def write_text(self, key, content, **_kwargs):
+            writes.append((key, content))
+
+        async def delete(self, _key):
+            return None
+
+    monkeypatch.setattr(tos, "get_storage_backend", lambda: RemoteStorage())
+    view = _finalize("s" * 60_000, tool_name="grep", agent_id=agent_id, tool_call_id="s3")
+
+    assert tos.PERSISTED_OPEN in view
+    saved_path = _saved_path(view)
+    assert saved_path.startswith(".tool_results/sess1/grep_s3_")
+    assert len(writes) == 1
+    assert writes[0][0].endswith(f"{agent_id}/{saved_path}")
+    assert writes[0][1] == "s" * 60_000
 
 
 def test_filename_sanitizes_unsafe_tool_call_id(tmp_workspace, agent_id):
@@ -226,16 +314,16 @@ def test_materialization_sanitizes_unsafe_session_id(tmp_workspace, agent_id):
         tool_call_id="safe-call",
     )
 
-    expected = ".tool_results/unsafe_session/grep_safe-call.txt"
-    assert expected in view
+    expected = _saved_path(view)
+    assert expected.startswith(".tool_results/unsafe_session/grep_safe-call_")
     assert (tmp_workspace / agent_id / expected).read_text() == big
 
 
 def test_budget_for_unknown_tool_uses_default():
-    assert tos.budget_for("nonexistent_tool_xyz") == tos.TOOL_OUTPUT_MAX_CHARS["_default"]
+    assert tos.budget_for("nonexistent_tool_xyz") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
 
 
-def test_budget_for_known_tool_uses_registry():
-    assert tos.budget_for("grep") == 40_000
-    assert tos.budget_for("execute_code") == 60_000
-    assert tos.budget_for("read_file") == 60_000
+def test_budget_for_known_tools_uses_same_default():
+    assert tos.budget_for("grep") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
+    assert tos.budget_for("execute_code") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
+    assert tos.budget_for("read_file") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS

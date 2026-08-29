@@ -320,7 +320,7 @@ async def test_provider_throttle_exhaustion_returns_later_user_message(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_call_llm_persists_all_running_tool_markers_before_any_execution(monkeypatch):
+async def test_call_llm_persists_complete_running_plan_before_first_execution(monkeypatch):
     client = _ThrottleScriptClient(
         [
             _tool_response(
@@ -362,9 +362,18 @@ async def test_call_llm_persists_all_running_tool_markers_before_any_execution(m
 
     async def fake_execute_tool(name, args, **_kwargs):
         if not executed:
-            assert persist_batches[0] == [
+            assert persist_batches == [[
                 ("read_file", "running"),
                 ("list_sessions", "running"),
+            ]]
+            assert [(e["name"], e["status"]) for e in events] == [
+                ("read_file", "running"),
+                ("list_sessions", "running"),
+            ]
+        else:
+            assert persist_batches == [
+                [("read_file", "running"), ("list_sessions", "running")],
+                [("read_file", "done")],
             ]
             assert [(e["name"], e["status"]) for e in events] == [
                 ("read_file", "running"),

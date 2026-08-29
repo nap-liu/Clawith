@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
-from sqlalchemy import String, cast, exists, select, update
+from sqlalchemy import String, cast, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -117,6 +117,11 @@ async def _has_active_subagent_event_turn(
             final.conversation_id == anchor.conversation_id,
             final.role == "assistant",
             final.message_meta["turn_anchor_id"].as_string() == cast(anchor.id, String),
+            or_(
+                final.message_meta["artifact_role"].as_string().is_(None),
+                final.message_meta["artifact_role"].as_string()
+                != "intermediate_assistant",
+            ),
         )
     )
     active = (
@@ -2236,33 +2241,46 @@ class WebSocketChatHandler:
                 if turn_anchor_id is not None and persisted_view:
                     from app.services.llm.turn_partition import effective_keep_recent_turns
 
-                    frozen_current_suffix = [dict(persisted_view[-1])]
                     protected_keep_recent_turns = effective_keep_recent_turns(
                         effective_llm_model,
                         self.fallback_llm_model,
                     )
 
                     async def _recover_context(_recovery_model, dispatch_budget):
-                        from app.services.chat_history import load_history_prefix_before_anchor
-                        from app.services.llm.compactor import maybe_compact
+                        from app.services.chat_history import load_recoverable_history_for_turn
+                        from app.services.llm.compactor import (
+                            COMPACTION_NOT_APPLICABLE_REASONS,
+                            ContextRecoveryMessages,
+                            maybe_compact,
+                        )
 
                         compacted = await maybe_compact(
                             agent_id=self.agent_id,
                             conversation_id=self.conv_id,
                             model=_recovery_model,
-                            pre_flight_estimate=dispatch_budget.estimated_tokens,
+                            last_prompt_tokens=getattr(dispatch_budget, "authoritative_prompt_tokens", None),
                             current_anchor_id=turn_anchor_id,
-                            force_required=dispatch_budget.char_overflow,
-                            keep_recent_turns_override=protected_keep_recent_turns,
+                            force_required=getattr(dispatch_budget, "provider_overflow", False),
+                            keep_recent_turns_override=(
+                                getattr(dispatch_budget, "keep_recent_turns_override", None)
+                                if getattr(dispatch_budget, "provider_overflow", False)
+                                else protected_keep_recent_turns
+                            ),
                         )
-                        if not compacted.triggered:
+                        preflight_not_applicable = (
+                            not compacted.triggered
+                            and compacted.skipped_reason
+                            in COMPACTION_NOT_APPLICABLE_REASONS
+                            and dispatch_budget.fits
+                        )
+                        if not compacted.triggered and not preflight_not_applicable:
                             logger.warning(
                                 "[WS] context recovery could not compact session="
                                 f"{self.conv_id}: {compacted.skipped_reason}"
                             )
                             return None
                         async with async_session() as recovery_db:
-                            prefix = await load_history_prefix_before_anchor(
+                            recovered = await load_recoverable_history_for_turn(
                                 recovery_db,
                                 agent_id=self.agent_id,
                                 conversation_id=self.conv_id,
@@ -2270,13 +2288,16 @@ class WebSocketChatHandler:
                                 ctx_size=self.ctx_size,
                                 include_thinking=True,
                             )
-                        if prefix is None:
+                        if not recovered:
                             logger.warning(f"[WS] context recovery lost latest-anchor race session={self.conv_id}")
                             return None
                         # Keep only the persisted projection on the long-lived WS
                         # state. Onboarding/dynamic overlays remain turn-local.
-                        self.conversation = prefix + frozen_current_suffix
-                        return ephemeral_overlays + self.conversation
+                        self.conversation = recovered
+                        return ContextRecoveryMessages(
+                            ephemeral_overlays + self.conversation,
+                            preflight_not_applicable=preflight_not_applicable,
+                        )
 
                     context_recovery = _recover_context
 
@@ -2638,11 +2659,25 @@ class WebSocketChatHandler:
                         ChatMessage.conversation_id == self.conv_id,
                         ChatMessage.role == "assistant",
                         ChatMessage.message_meta["turn_anchor_id"].as_string() == str(turn_anchor_id),
+                        ChatMessage.message_meta["turn_status"].as_string().in_(
+                            ("completed", "failed", "cancelled")
+                        ),
                     )
                     .limit(1)
                 )
                 if existing_terminal is not None:
                     return False
+                from app.services.chat_history import terminal_assistant_tail
+
+                assistant_response, intermediate_ids = await terminal_assistant_tail(
+                    db,
+                    agent_id=self.agent_id,
+                    conversation_id=self.conv_id,
+                    turn_anchor_id=turn_anchor_id,
+                    content=assistant_response,
+                )
+            else:
+                intermediate_ids = []
             assistant_msg = ChatMessage(
                 id=message_id or uuid.uuid4(),
                 agent_id=self.agent_id,
@@ -2655,6 +2690,15 @@ class WebSocketChatHandler:
                     {
                         "turn_anchor_id": str(turn_anchor_id),
                         "turn_status": turn_status,
+                        **(
+                            {
+                                "intermediate_assistant_ids": [
+                                    str(value) for value in intermediate_ids
+                                ]
+                            }
+                            if intermediate_ids
+                            else {}
+                        ),
                         **self._scene_message_meta(),
                     }
                     if turn_anchor_id is not None

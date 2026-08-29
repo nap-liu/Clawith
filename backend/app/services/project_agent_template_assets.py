@@ -51,6 +51,7 @@ _RUNTIME_KEYS = {
     "autonomy_policy",
     "context_window_size",
     "max_tool_rounds",
+    "daily_memory_load_days",
     "max_tokens_per_day",
     "max_tokens_per_month",
 }
@@ -391,6 +392,7 @@ def _validate_runtime(value: object) -> dict:
     for key, default, minimum, maximum in (
         ("context_window_size", 100, 1, 10_000),
         ("max_tool_rounds", 50, 1, 500),
+        ("daily_memory_load_days", 2, 0, 30),
     ):
         raw = value.get(key, default)
         if not isinstance(raw, int) or isinstance(raw, bool) or not minimum <= raw <= maximum:

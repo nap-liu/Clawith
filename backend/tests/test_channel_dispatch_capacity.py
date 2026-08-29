@@ -32,10 +32,10 @@ def _capacity(*, global_limit: int, tenant_limit: int) -> WorkloadCapacity:
 
 
 @pytest.mark.asyncio
-async def test_five_hundred_turns_across_three_hundred_sessions_are_bounded_and_serial(
+async def test_five_hundred_messages_use_capacity_only_for_three_hundred_turn_owners(
     monkeypatch,
 ) -> None:
-    capacity = _capacity(global_limit=500, tenant_limit=500)
+    capacity = _capacity(global_limit=300, tenant_limit=300)
     monkeypatch.setattr(channel_dispatch, "get_workload_capacity", lambda: capacity)
 
     def database_session_must_not_be_opened():
@@ -48,16 +48,20 @@ async def test_five_hundred_turns_across_three_hundred_sessions_are_bounded_and_
     active_by_session: Counter[str] = Counter()
     max_active_by_session: Counter[str] = Counter()
     started_sessions: set[str] = set()
+    started_count = 0
 
     def work_for(lock_key: str):
         async def work() -> str:
+            nonlocal started_count
+            await channel_dispatch.mark_channel_turn_admitted()
             active_by_session[lock_key] += 1
             max_active_by_session[lock_key] = max(
                 max_active_by_session[lock_key],
                 active_by_session[lock_key],
             )
             started_sessions.add(lock_key)
-            if len(started_sessions) == 300:
+            started_count += 1
+            if started_count == 500:
                 all_sessions_started.set()
             try:
                 await release_work.wait()
@@ -83,11 +87,11 @@ async def test_five_hundred_turns_across_three_hundred_sessions_are_bounded_and_
 
     for _ in range(100):
         snapshot = await capacity.snapshot()
-        if snapshot.global_capacity.active == 500:
+        if snapshot.global_capacity.active == 300:
             break
         await asyncio.sleep(0)
-    assert snapshot.global_capacity.active == 500
-    assert snapshot.global_capacity.high_watermark == 500
+    assert snapshot.global_capacity.active == 300
+    assert snapshot.global_capacity.high_watermark == 300
 
     with pytest.raises(WorkloadOverloadedError) as exc_info:
         await channel_dispatch.run_channel_message(
@@ -104,10 +108,13 @@ async def test_five_hundred_turns_across_three_hundred_sessions_are_bounded_and_
 
     assert len(results) == 500
     assert len(started_sessions) == 300
-    assert set(max_active_by_session.values()) == {1}
+    # One durable owner per session uses a workload slot. The 200 same-session
+    # interjections run only their ingestion path and therefore neither queue
+    # behind the owner nor consume turn-execution capacity.
+    assert set(max_active_by_session.values()) == {1, 2}
     snapshot = await capacity.snapshot()
     assert snapshot.global_capacity.active == 0
-    assert snapshot.global_capacity.completed_total == 500
+    assert snapshot.global_capacity.completed_total == 300
     assert snapshot.global_capacity.rejected_total == 1
 
 
