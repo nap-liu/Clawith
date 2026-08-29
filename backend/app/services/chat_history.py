@@ -1267,9 +1267,14 @@ async def ingest_incoming_chat_message(
             }
             await db.flush()
             queued_to_running_turn = True
-            from app.services.channel_dispatch import mark_channel_turn_admitted
+            from app.services.channel_dispatch import (
+                mark_channel_turn_admitted,
+                register_channel_receipt_anchor,
+            )
 
             await mark_channel_turn_admitted()
+            if same_execution_user:
+                await register_channel_receipt_anchor(row.id)
         else:
             await transition_conversation_turn(
                 db,

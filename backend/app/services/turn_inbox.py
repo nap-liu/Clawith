@@ -294,4 +294,7 @@ async def drain_turn_inbox(
             row.message_meta = {**meta, "turn_inbox_state": "delivered"}
         if selected:
             await db.commit()
+            from app.services.channel_dispatch import advance_channel_receipt_anchor
+
+            await advance_channel_receipt_anchor([row.id for row in selected])
         return injected
