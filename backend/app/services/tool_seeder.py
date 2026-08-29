@@ -3801,8 +3801,8 @@ BUILTIN_TOOLS = [
         "name": "install_skill_from_market",
         "display_name": "Install Market Skill",
         "description": (
-            "Install a market Skill into this Agent by Skill ID. The platform creates an L3 approval before "
-            "changing files, and the approving user must have Agent manage access."
+            "Install a market Skill into this Agent by Skill ID. The human speaking in the current conversation "
+            "must have Agent manage access; no additional administrator approval is required."
         ),
         "category": "discovery",
         "icon": "📥",

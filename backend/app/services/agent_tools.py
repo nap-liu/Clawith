@@ -2373,7 +2373,8 @@ AGENT_TOOLS = [
             "name": "install_skill_from_market",
             "description": (
                 "Install one market Skill into this Agent by Skill ID. This changes the shared Agent workspace. "
-                "The platform always requires L3 approval before any files are changed."
+                "The human speaking in the current conversation must have Agent manage access; no additional "
+                "administrator approval is required."
             ),
             "parameters": {
                 "type": "object",
@@ -3494,10 +3495,12 @@ _TOOL_AUTONOMY_MAP = {
     "withdraw_skill_from_market": "withdraw_skill_from_market",
 }
 
-_FORCED_L3_TOOLS = {
-    "install_skill_from_market",
-    "publish_skill_to_market",
-    "withdraw_skill_from_market",
+_FORCED_AUTONOMY_LEVELS = {
+    # Installing an already-published, visible Skill is a reversible Agent-local
+    # action. The executor still requires a confirmed human with manage access.
+    "install_skill_from_market": "L1",
+    "publish_skill_to_market": "L3",
+    "withdraw_skill_from_market": "L3",
 }
 
 
@@ -3820,7 +3823,11 @@ async def _execute_tool_direct(
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
         elif tool_name == "install_skill_from_market":
-            return await _install_skill_from_market(agent_id, user_id, arguments)
+            return await _install_skill_from_market(
+                agent_id,
+                user_id,
+                arguments,
+            )
         elif tool_name == "publish_skill_to_market":
             return await _publish_skill_to_market(agent_id, user_id, arguments)
         elif tool_name == "withdraw_skill_from_market":
@@ -4112,7 +4119,10 @@ async def execute_tool(
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
     if action_type and (
         not skip_autonomy
-        or (tool_name in _FORCED_L3_TOOLS and not approved_by_human)
+        or (
+            _FORCED_AUTONOMY_LEVELS.get(tool_name) == "L3"
+            and not approved_by_human
+        )
     ):
         try:
             from app.services.autonomy_service import autonomy_service
@@ -4126,7 +4136,7 @@ async def execute_tool(
 
                     _sanitized_args = _sanitize_tool_args(arguments) or {}
                     approval_key = None
-                    if tool_name in _FORCED_L3_TOOLS and tool_call_id:
+                    if _FORCED_AUTONOMY_LEVELS.get(tool_name) == "L3" and tool_call_id:
                         approval_key = ":".join(
                             [
                                 "market-tool",
@@ -4149,7 +4159,7 @@ async def execute_tool(
                             "turn_anchor_id": str(turn_anchor_id or ""),
                             "tool_call_id": str(tool_call_id or ""),
                         },
-                        forced_level="L3" if tool_name in _FORCED_L3_TOOLS else None,
+                        forced_level=_FORCED_AUTONOMY_LEVELS.get(tool_name),
                         idempotency_key=approval_key,
                     )
                     pending_im_notifications = result_check.pop(
@@ -5053,7 +5063,13 @@ async def execute_tool(
         elif tool_name == "search_skill_market":
             result = await _search_skill_market(agent_id, arguments)
         elif tool_name == "install_skill_from_market":
-            result = await _install_skill_from_market(agent_id, user_id, arguments)
+            result = await _install_skill_from_market(
+                agent_id,
+                user_id,
+                arguments,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
         elif tool_name == "publish_skill_to_market":
             result = await _publish_skill_to_market(agent_id, user_id, arguments)
         elif tool_name == "withdraw_skill_from_market":
@@ -19879,10 +19895,54 @@ async def _market_tool_actor(db, agent_id: uuid.UUID, user_id: uuid.UUID | None)
     return actor, agent, None
 
 
+async def _market_install_actor(
+    db,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    session_id: str | None,
+    turn_anchor_id: uuid.UUID | None,
+):
+    """Resolve the real human speaking in the current conversation turn."""
+    if not session_id or not turn_anchor_id:
+        return None, None, "Permission denied: a current human conversation is required"
+
+    try:
+        conversation_id = uuid.UUID(str(session_id))
+        anchor_id = uuid.UUID(str(turn_anchor_id))
+    except (TypeError, ValueError, AttributeError):
+        return None, None, "Permission denied: invalid conversation context"
+
+    session = await db.scalar(
+        select(ChatSession).where(
+            ChatSession.id == conversation_id,
+            ChatSession.agent_id == agent_id,
+        )
+    )
+    if not session or session.source_channel in {"agent", "trigger", "subagent", "project"}:
+        return None, None, "Permission denied: a current human conversation is required"
+
+    sender_user_id = await db.scalar(
+        select(ChatMessage.sender_user_id).where(
+            ChatMessage.id == anchor_id,
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == str(conversation_id),
+            ChatMessage.role == "user",
+        )
+    )
+    if sender_user_id is None or sender_user_id != user_id:
+        return None, None, "Permission denied: current conversation participant mismatch"
+
+    return await _market_tool_actor(db, agent_id, sender_user_id)
+
+
 async def _install_skill_from_market(
     agent_id: uuid.UUID,
     user_id: uuid.UUID | None,
     arguments: dict,
+    *,
+    session_id: str | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     raw_skill_id = str(arguments.get("skill_id") or "").strip()
     try:
@@ -19894,7 +19954,13 @@ async def _install_skill_from_market(
 
     try:
         async with async_session() as db:
-            actor, agent, error = await _market_tool_actor(db, agent_id, user_id)
+            actor, agent, error = await _market_install_actor(
+                db,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
             if error:
                 return error
             result = await install_market_skill(

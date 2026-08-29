@@ -10,7 +10,8 @@ from app.api.skill_market import PublishAgentSkillIn, publish_from_agent
 from app.api.skills import SkillUpdateIn, _save_skill_to_db, delete_skill, update_skill
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.audit import ApprovalRequest
+from app.models.audit import ApprovalRequest, ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
@@ -392,11 +393,11 @@ async def test_legacy_preset_install_delegates_to_market_accounting():
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_agent_market_install_waits_for_l3_approval_then_executes_once():
-    tenant_a, owner_a, _guest_a, agent_a = await _create_tenant_team("approval-source")
-    _tenant_b, owner_b, _guest_b, agent_b = await _create_tenant_team("approval-target")
-    folder = f"approved-skill-{uuid.uuid4().hex[:8]}"
-    await _write_skill(agent_a.id, folder, "Approval behavior")
+async def test_agent_market_install_is_direct_for_managers_and_remains_idempotent():
+    tenant_a, owner_a, _guest_a, agent_a = await _create_tenant_team("direct-install-source")
+    _tenant_b, owner_b, guest_b, agent_b = await _create_tenant_team("direct-install-target")
+    folder = f"direct-install-skill-{uuid.uuid4().hex[:8]}"
+    await _write_skill(agent_a.id, folder, "Direct install behavior")
 
     async with async_session() as db:
         skill = await publish_agent_skill(
@@ -404,26 +405,83 @@ async def test_agent_market_install_waits_for_l3_approval_then_executes_once():
             agent=await db.get(Agent, agent_a.id),
             actor=await db.get(User, owner_a.id),
             path=f"skills/{folder}",
-            name="Approved Skill",
-            description="Approval behavior",
+            name="Direct Install Skill",
+            description="Direct install behavior",
             category="general",
             visibility="public",
         )
         skill_id = skill.id
         await db.commit()
 
-    # Agent policy cannot downgrade market mutations below L3.
+    # Existing Agents may still carry the historical L3 value. Installation of
+    # an already-published Skill is now always L1, while publish/withdraw remain L3.
     async with async_session() as db:
         target_agent = await db.get(Agent, agent_b.id)
         target_agent.autonomy_policy = {
-            "install_skill_from_market": "L1",
+            "install_skill_from_market": "L3",
             "publish_skill_to_market": "L1",
             "withdraw_skill_from_market": "L1",
         }
         await db.commit()
 
-    session_id = f"skill-market-{uuid.uuid4()}"
     tool_call_id = f"call-{uuid.uuid4()}"
+
+    async def conversation_turn(actor_id: uuid.UUID) -> tuple[str, uuid.UUID]:
+        async with async_session() as db:
+            session = ChatSession(
+                agent_id=agent_b.id,
+                user_id=actor_id,
+                title="Skill install authorization",
+                source_channel="web",
+                external_conv_id=f"skill-install-{uuid.uuid4()}",
+            )
+            db.add(session)
+            await db.flush()
+            anchor = ChatMessage(
+                agent_id=agent_b.id,
+                user_id=actor_id,
+                sender_user_id=actor_id,
+                role="user",
+                content="Install this Skill",
+                conversation_id=str(session.id),
+            )
+            db.add(anchor)
+            await db.commit()
+            return str(session.id), anchor.id
+
+    background = await execute_tool(
+        "install_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent_b.id,
+        owner_b.id,
+        session_id="",
+        tool_call_id=f"background-{tool_call_id}",
+    )
+    assert "current human conversation is required" in background
+
+    guest_session_id, guest_anchor_id = await conversation_turn(guest_b.id)
+    mismatched = await execute_tool(
+        "install_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent_b.id,
+        owner_b.id,
+        session_id=guest_session_id,
+        tool_call_id=f"mismatch-{tool_call_id}",
+        turn_anchor_id=guest_anchor_id,
+    )
+    assert "current conversation participant mismatch" in mismatched
+    denied = await execute_tool(
+        "install_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent_b.id,
+        guest_b.id,
+        session_id=guest_session_id,
+        tool_call_id=f"guest-{tool_call_id}",
+        turn_anchor_id=guest_anchor_id,
+    )
+    assert "Agent manage access required" in denied
+
+    session_id, turn_anchor_id = await conversation_turn(owner_b.id)
     result = await execute_tool(
         "install_skill_from_market",
         {"skill_id": str(skill_id)},
@@ -431,9 +489,10 @@ async def test_agent_market_install_waits_for_l3_approval_then_executes_once():
         owner_b.id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+        turn_anchor_id=turn_anchor_id,
         skip_autonomy=True,
     )
-    assert "requires approval" in result
+    assert "Installed market Skill" in result
     duplicate = await execute_tool(
         "install_skill_from_market",
         {"skill_id": str(skill_id)},
@@ -441,24 +500,13 @@ async def test_agent_market_install_waits_for_l3_approval_then_executes_once():
         owner_b.id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+        turn_anchor_id=turn_anchor_id,
     )
-    assert "requires approval" in duplicate
+    assert "Installed market Skill" in duplicate
     target_key = normalize_storage_key(f"{agent_b.id}/skills/{folder}/SKILL.md")
-    assert not await get_storage_backend().exists(target_key)
+    assert await get_storage_backend().is_file(target_key)
 
     async with async_session() as db:
-        approval = await db.scalar(
-            select(ApprovalRequest)
-            .where(
-                ApprovalRequest.agent_id == agent_b.id,
-                ApprovalRequest.action_type == "install_skill_from_market",
-                ApprovalRequest.status == "pending",
-            )
-            .order_by(ApprovalRequest.created_at.desc())
-        )
-        assert approval is not None
-        assert approval.details["args"] == {"skill_id": str(skill_id)}
-        assert approval.details["tool_call_id"] == tool_call_id
         assert (
             await db.scalar(
                 select(func.count(ApprovalRequest.id)).where(
@@ -466,27 +514,8 @@ async def test_agent_market_install_waits_for_l3_approval_then_executes_once():
                     ApprovalRequest.action_type == "install_skill_from_market",
                 )
             )
-            == 1
+            == 0
         )
-        await autonomy_service.resolve_approval(
-            db,
-            approval.id,
-            await db.get(User, owner_b.id),
-            "approve",
-        )
-        await db.commit()
-
-    assert await get_storage_backend().is_file(target_key)
-    replay = await execute_tool(
-        "install_skill_from_market",
-        {"skill_id": str(skill_id)},
-        agent_b.id,
-        owner_b.id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-    )
-    assert "already been executed" in replay
-    async with async_session() as db:
         assert (
             await db.scalar(
                 select(func.count(SkillInstall.id)).where(
