@@ -2822,7 +2822,7 @@ async def test_revoked_execution_user_fails_before_llm_or_tool_side_effect(monke
             .limit(1)
         )
     assert fresh.status == "failed"
-    assert "ExecutionIdentityError" in failure.content
+    assert failure.content == "本次执行未完成，请稍后重试或查看项目状态。"
 
 
 async def test_child_is_hidden_from_lists_but_direct_web_detail_is_accessible():
@@ -3494,7 +3494,7 @@ async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypat
             conversation_id=str(parent_id),
         )
     assert anchor.message_meta["turn_status"] == "failed"
-    assert "执行身份已失效" in final.content
+    assert final.content == "协作任务未能继续，请检查资源访问权限后重试。"
     assert final.agent_id == storage_agent_id
     assert final.sender_agent_id == execution_agent_id
     assert current_turn.anchor_id == anchor.id

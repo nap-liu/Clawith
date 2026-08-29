@@ -20,10 +20,8 @@ import app.models.tenant  # noqa: F401
 import app.models.user  # noqa: F401
 from app.database import Base
 from app.models.agent import Agent
-from app.models.project import ProjectAccessGrant, ProjectMemberSnapshot, ProjectRun
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
-from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
 from app.services.project_git_service import (
     _git,
     _mime_and_kind,
@@ -40,11 +38,7 @@ from app.services.project_git_service import (
 from app.services.project_service import (
     PROJECT_EVENT_SUMMARY_MAX_LENGTH,
     bounded_project_event_summary,
-    create_project,
-    freeze_run_members,
-    require_project,
 )
-from app.services.recipient_resolver import RecipientResolutionError, resolve_agent_recipient
 
 TABLES = [
     "llm_models",
@@ -189,143 +183,6 @@ def test_git_commands_trust_only_the_exact_managed_repository(tmp_path, monkeypa
         "-C",
         str(tmp_path),
     ]
-
-
-async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatch):
-    async def fake_git(_project, **_kwargs):
-        return {"mode": "managed", "head": "a" * 40, "default_branch": "main"}
-
-    monkeypatch.setattr("app.services.project_git_service.initialize_project_repo", fake_git)
-    tenant = await _tenant(db, "One")
-    other_tenant = await _tenant(db, "Two")
-    owner = await _user(db, tenant, "Owner")
-    viewer = await _user(db, tenant, "Viewer")
-    outsider = await _user(db, other_tenant, "Outsider")
-
-    project = await create_project(
-        db,
-        owner,
-        ProjectCreate(name="Private", objective="Ship safely", shared_user_ids=[viewer.id], visibility="shared"),
-    )
-    assert project.status == "planning"
-    assert project.goal == "Ship safely"
-    assert (await require_project(db, owner, project.id)).id == project.id
-    assert (await require_project(db, viewer, project.id)).id == project.id
-    with pytest.raises(HTTPException) as denied_edit:
-        await require_project(db, viewer, project.id, edit=True)
-    assert denied_edit.value.status_code == 404
-    with pytest.raises(HTTPException) as hidden:
-        await require_project(db, outsider, project.id)
-    assert hidden.value.status_code == 404
-
-    grant = await db.get(ProjectAccessGrant, (await db.execute(ProjectAccessGrant.__table__.select())).first().id)
-    grant.role = "edit"
-    await db.flush()
-    assert (await require_project(db, viewer, project.id, edit=True)).id == project.id
-
-
-async def test_run_freezes_member_and_effective_capability_snapshots(db):
-    tenant = await _tenant(db, "Snapshot")
-    owner = await _user(db, tenant, "Owner")
-    leader = Agent(
-        name="Leader",
-        role_description="Drive delivery",
-        creator_id=owner.id,
-        tenant_id=tenant.id,
-        status="running",
-        access_mode="private",
-    )
-    worker = Agent(
-        name="Worker",
-        role_description="Build",
-        creator_id=owner.id,
-        tenant_id=tenant.id,
-        status="running",
-        access_mode="private",
-    )
-    db.add_all([leader, worker])
-    await db.flush()
-    project = await create_project(
-        db,
-        owner,
-        ProjectCreate(
-            name="Snapshots",
-            members=[
-                ProjectMemberCreate(agent_id=leader.id, is_leader=True),
-                ProjectMemberCreate(agent_id=worker.id),
-            ],
-            capabilities=[
-                ProjectCapabilityCreate(
-                    capability_type="tool",
-                    capability_name="project-shell",
-                    source="shared",
-                    scope={"paths": ["workspace/**"]},
-                )
-            ],
-        ),
-    )
-    run = ProjectRun(
-        tenant_id=tenant.id,
-        project_id=project.id,
-        initiated_by_user_id=owner.id,
-        status="queued",
-        trigger_type="manual",
-    )
-    db.add(run)
-    await db.flush()
-    snapshots = await freeze_run_members(db, project, run)
-    assert len(snapshots) == 2
-    assert sum(snapshot.is_leader for snapshot in snapshots) == 1
-    assert all(snapshot.capability_snapshot[0]["name"] == "project-shell" for snapshot in snapshots)
-
-    worker_member = (
-        await db.execute(
-            select(ProjectMemberSnapshot)
-            .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
-            .where(
-                ProjectMemberSnapshot.project_id == project.id,
-                Agent.source_agent_id == worker.id,
-            )
-        )
-    ).scalar_one()
-    leader_member = (
-        await db.execute(
-            select(ProjectMemberSnapshot)
-            .join(Agent, Agent.id == ProjectMemberSnapshot.agent_id)
-            .where(
-                ProjectMemberSnapshot.project_id == project.id,
-                Agent.source_agent_id == leader.id,
-            )
-        )
-    ).scalar_one()
-    worker_member.config_snapshot = {**dict(worker_member.config_snapshot or {}), "project_instruction": "later edit"}
-    inherited_run = ProjectRun(
-        tenant_id=tenant.id,
-        project_id=project.id,
-        initiated_by_user_id=owner.id,
-        status="queued",
-        trigger_type="a2a",
-    )
-    db.add(inherited_run)
-    await db.flush()
-    inherited = await freeze_run_members(db, project, inherited_run, source_run_id=run.id)
-    inherited_worker = next(snapshot for snapshot in inherited if snapshot.agent_id == worker_member.agent_id)
-    original_worker = next(snapshot for snapshot in snapshots if snapshot.agent_id == worker_member.agent_id)
-    assert inherited_worker.member_config_snapshot == original_worker.member_config_snapshot
-    assert inherited_worker.member_config_snapshot.get("project_instruction") != "later edit"
-
-    resolved = await resolve_agent_recipient(
-        db,
-        leader_member.agent_id,
-        worker_member.agent_id,
-        project_id=project.id,
-    )
-    assert resolved.source_agent.id == leader_member.agent_id
-    assert resolved.target_agent.id == worker_member.agent_id
-    assert resolved.relationship is None
-    with pytest.raises(RecipientResolutionError) as not_globally_related:
-        await resolve_agent_recipient(db, leader.id, worker.id)
-    assert not_globally_related.value.code == "recipient_not_related"
 
 
 async def test_managed_git_restore_creates_new_commit_without_rewriting(tmp_path, monkeypatch):

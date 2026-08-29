@@ -2028,7 +2028,10 @@ async def _park_subagent_confirmation(
         if anchor is not None:
             anchor.message_meta = {
                 **_message_meta(anchor),
-                "turn_status": "waiting_confirmation" if pending else "running",
+                # The Run waits for confirmation, while the normalized
+                # conversation Turn is suspended.  Keep both current-session
+                # and exact-anchor snapshots on the shared lifecycle contract.
+                "turn_status": "suspended" if pending else "running",
             }
         from app.models.project import Project, ProjectEvent, ProjectRun, ProjectWorkItem
         from app.services.project_service import add_event

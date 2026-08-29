@@ -162,9 +162,9 @@ async def resolve_project_execution_user(
 
 
 def _is_platform_project_admin(user: User) -> bool:
-    return user.role == "platform_admin" or bool(
-        user.identity and getattr(user.identity, "is_platform_admin", False)
-    )
+    from app.core.permissions import is_platform_admin_user
+
+    return is_platform_admin_user(user)
 
 
 def _is_company_project_admin(user: User) -> bool:
