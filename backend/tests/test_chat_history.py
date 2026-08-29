@@ -20,9 +20,89 @@ from app.models.tenant import Tenant  # noqa: F401
 
 # Import the full model graph so FK references resolve at table-mapping time.
 from app.models.user import Identity, User  # noqa: F401
-from app.services.chat_history import build_llm_message_from_row, load_history_for_llm
+from app.services.chat_history import (
+    build_llm_message_from_row,
+    build_llm_messages_from_rows,
+    expand_tool_call_row,
+    load_history_for_llm,
+)
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_separate_background_executions_never_merge_same_round_number():
+    rows = []
+    for execution, call_id in (("execution-a", "first"), ("execution-b", "second")):
+        rows.append(
+            type(
+                "StoredToolRow",
+                (),
+                {
+                    "id": uuid.uuid4(),
+                    "role": "tool_call",
+                    "content": json.dumps(
+                        {
+                            "name": "request_confirmation",
+                            "call_id": call_id,
+                            "args": {"title": call_id},
+                            "status": "done",
+                            "result": f"confirmed {call_id}",
+                            "round_id": f"same-schedule:background:{execution}:round:1",
+                            "round_tool_index": 0,
+                        }
+                    ),
+                    "message_meta": {},
+                },
+            )()
+        )
+
+    history = build_llm_messages_from_rows(rows)
+
+    assert [message["role"] for message in history] == [
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
+    assert [
+        message["tool_calls"][0]["id"]
+        for message in history
+        if message["role"] == "assistant"
+    ] == ["first", "second"]
+
+
+async def test_tool_round_recovery_preserves_assistant_content_and_resume_prefix():
+    row = type(
+        "StoredToolRow",
+        (),
+        {
+            "id": uuid.uuid4(),
+            "content": json.dumps(
+                {
+                    "name": "read_file",
+                    "call_id": "call-1",
+                    "args": {"path": "brief.md"},
+                    "status": "done",
+                    "result": "file body",
+                    "assistant_content": "I will inspect the brief now.",
+                    "recovery_prefix_messages": [
+                        {"role": "assistant", "content": "partial answer"},
+                        {"role": "user", "content": "continue exactly"},
+                    ],
+                }
+            ),
+        },
+    )()
+
+    expanded = expand_tool_call_row(row)
+
+    assert [message["role"] for message in expanded] == [
+        "assistant", "user", "assistant", "tool"
+    ]
+    assert expanded[0]["content"] == "partial answer"
+    assert expanded[1]["content"] == "continue exactly"
+    assert expanded[2]["content"] == "I will inspect the brief now."
+    assert expanded[3]["content"] == "file body"
 
 
 async def test_persisted_pathless_legacy_image_reaches_model_adapter():
@@ -124,8 +204,8 @@ async def _insert_messages_bypass_fk(rows: list[dict]) -> None:
             await db.execute(
                 text(
                     "INSERT INTO chat_messages"
-                    " (id, agent_id, user_id, role, content, conversation_id, created_at)"
-                    " VALUES (:id, :agent_id, :user_id, :role, :content, :conv_id, :created_at)"
+                    " (id, agent_id, user_id, role, content, thinking, conversation_id, created_at)"
+                    " VALUES (:id, :agent_id, :user_id, :role, :content, :thinking, :conv_id, :created_at)"
                 ),
                 {
                     "id": str(row["id"]),
@@ -133,6 +213,7 @@ async def _insert_messages_bypass_fk(rows: list[dict]) -> None:
                     "user_id": str(row["user_id"]),
                     "role": row["role"],
                     "content": row["content"],
+                    "thinking": row.get("thinking"),
                     "conv_id": row["conversation_id"],
                     "created_at": created_at,
                 },
@@ -315,6 +396,7 @@ async def test_recoverable_history_preserves_processing_user_tail_that_normal_lo
                 "user_id": u_alice.id,
                 "role": "assistant",
                 "content": "old answer",
+                "thinking": "durable reasoning",
                 "conversation_id": conv_id,
                 "created_at": now - timedelta(minutes=2),
             },
@@ -338,6 +420,7 @@ async def test_recoverable_history_preserves_processing_user_tail_that_normal_lo
             conversation_id=conv_id,
             turn_anchor_id=anchor_id,
             ctx_size=1,
+            include_thinking=True,
         )
 
     assert [m["content"] for m in normal] == ["old question", "old answer"]
@@ -346,6 +429,7 @@ async def test_recoverable_history_preserves_processing_user_tail_that_normal_lo
         "old answer",
         "interrupted question",
     ]
+    assert recoverable[1]["thinking"] == "durable reasoning"
 
 
 async def test_recoverable_history_skips_when_anchor_is_not_active():

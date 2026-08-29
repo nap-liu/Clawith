@@ -23,6 +23,7 @@ class _MemoryStorage:
     def __init__(self, files: dict[str, str], directories: dict[str, list[StorageEntry]]):
         self.files = files
         self.directories = directories
+        self.list_dir_calls = 0
 
     async def exists(self, key: str) -> bool:
         return key in self.files or key in self.directories
@@ -31,6 +32,7 @@ class _MemoryStorage:
         return key in self.files
 
     async def list_dir(self, key: str) -> list[StorageEntry]:
+        self.list_dir_calls += 1
         return list(self.directories.get(key, []))
 
     async def read_text(self, key: str, encoding: str = "utf-8", errors: str = "replace") -> str:
@@ -112,7 +114,11 @@ async def test_zero_daily_limit_loads_no_daily_records():
     agent_id = uuid.uuid4()
     prefix = f"{agent_id}/memory"
     storage = _MemoryStorage(
-        {f"{prefix}/2026-07-17/memory.md": "DAY-17"},
+        {
+            f"{prefix}/memory.md": "CORE",
+            f"{prefix}/MEMORY_INDEX.md": "STRUCTURE-GUIDE",
+            f"{prefix}/2026-07-17/memory.md": "DAY-17",
+        },
         {prefix: [_dir(agent_id, "2026-07-17")]},
     )
 
@@ -123,7 +129,10 @@ async def test_zero_daily_limit_loads_no_daily_records():
             daily_limit=0,
         )
 
+    assert snapshot.core_memory == "CORE"
+    assert snapshot.structure_guide == ""
     assert snapshot.daily_records == ()
+    assert storage.list_dir_calls == 0
 
 
 def test_memory_index_template_matches_seed_file_and_contains_no_dynamic_dates():

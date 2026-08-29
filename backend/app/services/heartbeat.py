@@ -128,6 +128,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
     """
     new_trace_id()
     await _HEARTBEAT_SEMAPHORE.acquire()
+    client_guard = None
     try:
         from app.database import async_session
         from app.models.agent import Agent
@@ -146,6 +147,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         model_base_url = None
         model_temperature = None
         model_max_output_tokens = None
+        model_context_window = 0
+        model_context_usage_ratio = 0.7
         heartbeat_instruction = DEFAULT_HEARTBEAT_INSTRUCTION
 
         async with async_session() as db:
@@ -180,6 +183,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             model_temperature = model.temperature
             model_max_output_tokens = getattr(model, 'max_output_tokens', None)
             model_request_timeout = getattr(model, 'request_timeout', None)
+            model_context_window = getattr(model, "context_window", 0)
+            model_context_usage_ratio = getattr(model, "context_usage_ratio", 0.7)
 
             # Read HEARTBEAT.md if it exists, otherwise use default
             storage = get_storage_backend()
@@ -280,7 +285,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             get_model_api_key,
         )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
-        from app.services.llm.caller import _complete_with_throttle_retry
+        from app.services.llm.caller import _complete_with_throttle_retry, _guard_provider_dispatch
+        from app.services.llm.tool_output_store import enforce_message_budget, finalize_tool_output
 
         try:
             client = create_llm_client(
@@ -303,6 +309,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             base_url=model_base_url,
             api_key_encrypted=model_api_key_encrypted,
             request_timeout=model_request_timeout,
+            context_window=model_context_window,
+            context_usage_ratio=model_context_usage_ratio,
         )
 
         reply = ""
@@ -314,7 +322,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             TokenUsage,
             record_token_usage,
             extract_token_usage,
-            estimate_token_usage_from_chars,
         )
         _hb_accumulated_usage = TokenUsage()
         _hb_unsaved_usage = TokenUsage()
@@ -343,6 +350,17 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
 
             try:
                 _round_t0 = perf_counter()
+                round_max_tokens = get_max_tokens(model_provider, model_model, model_max_output_tokens)
+                context_stop = await _guard_provider_dispatch(
+                    model=runtime_model,
+                    messages=llm_messages,
+                    tools=tools_for_llm,
+                    max_output_tokens=round_max_tokens,
+                    session_id=f"heartbeat:{agent_id}",
+                )
+                if context_stop:
+                    reply = context_stop
+                    break
                 response = await _complete_with_throttle_retry(
                     client,
                     model=runtime_model,
@@ -350,7 +368,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
-                    max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
+                    max_tokens=round_max_tokens,
                 )
                 logger.info(
                     f"[LLM Timing] round={round_i + 1} model={model_model} "
@@ -368,12 +386,12 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             # Track tokens for this round
             usage = extract_token_usage(response.usage)
             if not usage:
-                round_chars = sum(len(m.content or '') for m in llm_messages) + len(response.content or '')
-                usage = estimate_token_usage_from_chars(round_chars)
+                usage = TokenUsage()
             _hb_accumulated_usage.add(usage)
             _hb_unsaved_usage.add(usage)
 
             if response.tool_calls:
+                fresh_start = len(llm_messages)
                 # Add assistant message with tool calls
                 llm_messages.append(LLMMessage(
                     role="assistant",
@@ -421,12 +439,25 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         tool_call_id=tc["id"],
                         tools_for_llm=tools_for_llm,
                     )
+                    llm_view = await finalize_tool_output(
+                        tool_result,
+                        tool_name=tool_name,
+                        agent_id=agent_id,
+                        session_id=f"heartbeat:{agent_id}",
+                        tool_call_id=tc["id"],
+                    )
 
                     llm_messages.append(LLMMessage(
                         role="tool",
                         tool_call_id=tc["id"],
-                        content=str(tool_result),
+                        content=llm_view,
                     ))
+                await enforce_message_budget(
+                    llm_messages,
+                    fresh_start_idx=fresh_start,
+                    agent_id=agent_id,
+                    session_id=f"heartbeat:{agent_id}",
+                )
             else:
                 # No more tool calls — agent has finished
                 reply = response.content or ""
@@ -456,6 +487,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
     except Exception as e:
         logger.exception(f"Heartbeat error for agent {agent_id}: {e}")
     finally:
+        if client_guard is not None:
+            await client_guard.close()
         _HEARTBEAT_SEMAPHORE.release()
 
 
@@ -606,6 +639,7 @@ async def run_agent_oneshot(
     Returns the final reply string (for logging purposes).
     """
     new_trace_id()
+    client_guard = None
     try:
         from app.database import async_session
         from app.models.agent import Agent
@@ -624,6 +658,8 @@ async def run_agent_oneshot(
         model_temperature = None
         model_max_output_tokens = None
         model_request_timeout = None
+        model_context_window = 0
+        model_context_usage_ratio = 0.7
 
         async with async_session() as db:
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -670,6 +706,8 @@ async def run_agent_oneshot(
             model_temperature = model.temperature
             model_max_output_tokens = getattr(model, "max_output_tokens", None)
             model_request_timeout = getattr(model, "request_timeout", None)
+            model_context_window = getattr(model, "context_window", 0)
+            model_context_usage_ratio = getattr(model, "context_usage_ratio", 0.7)
 
             # Build agent identity context (system prompt + dynamic context)
             from app.services.agent_context import build_agent_context
@@ -697,12 +735,12 @@ async def run_agent_oneshot(
             LLMError,
         )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
-        from app.services.llm.caller import _complete_with_throttle_retry
+        from app.services.llm.caller import _complete_with_throttle_retry, _guard_provider_dispatch
+        from app.services.llm.tool_output_store import enforce_message_budget, finalize_tool_output
         from app.services.token_tracker import (
             TokenUsage,
             record_token_usage,
             extract_token_usage,
-            estimate_token_usage_from_chars,
         )
 
         try:
@@ -728,6 +766,8 @@ async def run_agent_oneshot(
             base_url=model_base_url,
             api_key_encrypted=model_api_key_encrypted,
             request_timeout=model_request_timeout,
+            context_window=model_context_window,
+            context_usage_ratio=model_context_usage_ratio,
         )
         llm_messages = [
             LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt),
@@ -757,6 +797,17 @@ async def run_agent_oneshot(
 
             try:
                 _round_t0 = perf_counter()
+                round_max_tokens = get_max_tokens(model_provider, model_model, model_max_output_tokens)
+                context_stop = await _guard_provider_dispatch(
+                    model=runtime_model,
+                    messages=llm_messages,
+                    tools=tools_for_llm,
+                    max_output_tokens=round_max_tokens,
+                    session_id=f"oneshot:{agent_id}",
+                )
+                if context_stop:
+                    reply = context_stop
+                    break
                 response = await _complete_with_throttle_retry(
                     client,
                     model=runtime_model,
@@ -764,7 +815,7 @@ async def run_agent_oneshot(
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
-                    max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
+                    max_tokens=round_max_tokens,
                 )
                 logger.info(
                     f"[LLM Timing] round={round_i + 1} model={model_model} "
@@ -788,12 +839,12 @@ async def run_agent_oneshot(
             # Track token usage
             usage = extract_token_usage(response.usage)
             if not usage:
-                round_chars = sum(len(m.content or "") for m in llm_messages) + len(response.content or "")
-                usage = estimate_token_usage_from_chars(round_chars)
+                usage = TokenUsage()
             accumulated_usage.add(usage)
             unsaved_usage.add(usage)
 
             if response.tool_calls:
+                fresh_start = len(llm_messages)
                 llm_messages.append(LLMMessage(
                     role="assistant",
                     content=response.content or None,
@@ -820,12 +871,25 @@ async def run_agent_oneshot(
                         tool_call_id=tc["id"],
                         tools_for_llm=tools_for_llm,
                     )
+                    llm_view = await finalize_tool_output(
+                        tool_result,
+                        tool_name=tool_name,
+                        agent_id=agent_id,
+                        session_id=f"oneshot:{agent_id}",
+                        tool_call_id=tc["id"],
+                    )
 
                     llm_messages.append(LLMMessage(
                         role="tool",
                         tool_call_id=tc["id"],
-                        content=str(tool_result),
+                        content=llm_view,
                     ))
+                await enforce_message_budget(
+                    llm_messages,
+                    fresh_start_idx=fresh_start,
+                    agent_id=agent_id,
+                    session_id=f"oneshot:{agent_id}",
+                )
             else:
                 # No more tool calls — agent has finished
                 reply = response.content or ""
@@ -876,3 +940,6 @@ async def run_agent_oneshot(
     except Exception as e:
         logger.exception(f"[Oneshot] Unexpected error for agent {agent_id}: {e}")
         return ""
+    finally:
+        if client_guard is not None:
+            await client_guard.close()

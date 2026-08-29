@@ -81,7 +81,7 @@ async def test_process_tool_call_materializes_oversized_result(tmp_workspace):
     agent_id = str(uuid.uuid4())
     session_id = "sess-oversized"
     tool_call_id = "call_huge"
-    # grep 的 per-tool budget 是 20_000；用 60k 字符触发 materialize
+    # 统一 inline budget 是 32_000；用 60k 字符触发 materialize
     huge_result = "A" * 60_000
 
     tc = {
@@ -135,7 +135,7 @@ async def test_process_tool_call_materializes_oversized_result(tmp_workspace):
     assert len(files) == 1
     persisted_file = files[0]
     # grep 原文是纯文本非 JSON → .txt
-    assert persisted_file.name == f"grep_{tool_call_id}.txt"
+    assert persisted_file.name.startswith(f"grep_{tool_call_id}_")
     assert persisted_file.read_text() == huge_result
     # 文件路径引用也出现在 llm_view 里，LLM 可以凭此调 read_file 取全文
     assert persisted_file.name in callback_result

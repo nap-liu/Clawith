@@ -31,13 +31,18 @@ from app.services.chat_history import (
     load_recoverable_messages_for_turn,
 )
 from app.services.llm.compactor import select_compaction_span
+from app.services.session_token_usage import (
+    SESSION_CONTEXT_META_KEY,
+    load_latest_round_context_usage,
+    persist_round_context_usage,
+)
 
 
 pytestmark = pytest.mark.asyncio
 
 
 async def test_compaction_span_preserves_recent_turns_by_message_boundary():
-    """The hard floor keeps eight full turns even when config asks for one."""
+    """The hard floor keeps three full turns even when config asks for one."""
     rows = []
     for _ in range(9):
         rows.extend(
@@ -47,7 +52,7 @@ async def test_compaction_span_preserves_recent_turns_by_message_boundary():
             ]
         )
 
-    assert select_compaction_span(rows, keep_recent_turns=1) == (0, 1)
+    assert select_compaction_span(rows, keep_recent_turns=1) == (0, 11)
 
 
 @pytest.fixture(autouse=True)
@@ -219,6 +224,71 @@ async def test_no_compaction_returns_active_rows_in_order():
             )
         assert [r.id for r in rows] == [m.id for m in inserted]
         assert all(not isinstance(r, _SyntheticSummaryMessage) for r in rows)
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_round_context_usage_uses_latest_exact_provider_observation():
+    conv_id, agent_id, inserted, _ = await _setup([
+        ("user", "first", 400),
+        ("assistant", "first answer", 300),
+        ("user", "second", 200),
+        ("assistant", "second answer", 100),
+    ])
+    model_id = str(uuid.uuid4())
+    try:
+        await persist_round_context_usage(
+            agent_id=agent_id,
+            session_id=conv_id,
+            turn_anchor_id=inserted[0].id,
+            input_tokens=900,
+            output_tokens=30,
+            provider="qwen",
+            model="qwen3.8-plus",
+            model_record_id=model_id,
+            endpoint="https://example.test/v1",
+            usage_details={"input_tokens_details": {"cached_tokens": 700}},
+        )
+        await persist_round_context_usage(
+            agent_id=agent_id,
+            session_id=conv_id,
+            turn_anchor_id=inserted[2].id,
+            input_tokens=640,
+            output_tokens=20,
+            provider="qwen",
+            model="qwen3.8-plus",
+            model_record_id=model_id,
+            endpoint="https://example.test/v1",
+            usage_details={"input_tokens_details": {"cached_tokens": 500}},
+        )
+
+        observed = await load_latest_round_context_usage(
+            agent_id=agent_id,
+            session_id=conv_id,
+            provider="qwen",
+            model="qwen3.8-plus",
+            model_record_id=model_id,
+            endpoint="https://example.test/v1",
+        )
+        assert observed == 640
+        assert await load_latest_round_context_usage(
+            agent_id=agent_id,
+            session_id=conv_id,
+            provider="qwen",
+            model="different-model",
+            model_record_id=model_id,
+            endpoint="https://example.test/v1",
+        ) is None
+
+        async with async_session() as db:
+            refreshed = await db.get(ChatMessage, inserted[2].id)
+            payload = refreshed.message_meta[SESSION_CONTEXT_META_KEY]
+        assert payload["source"] == "provider_usage"
+        assert payload["last_input_tokens"] == 640
+        assert payload["last_output_tokens"] == 20
+        assert payload["measured_rounds"] == 1
+        assert "peak_input_tokens" not in payload
+        assert payload["provider_usage_details"]["input_tokens_details"]["cached_tokens"] == 500
     finally:
         await _cleanup(conv_id)
 
@@ -533,6 +603,7 @@ async def test_load_history_for_llm_compaction_and_tool_call_coexist():
         assert roles == ["user", "assistant", "tool", "assistant"]
         assert "tool_call" not in roles  # surviving tool_call expanded, not raw
         assert "<conversation-summary" in history[0]["content"]
+        assert len(history) < 50  # 211 stored rows collapse to summary + 3 raw turns.
         assert history[1]["tool_calls"][0]["function"]["name"] == "get_weather"
         assert history[2]["content"] == "sunny"
         assert history[3]["content"] == "今天上海晴"
@@ -545,7 +616,11 @@ def _precompact_model(context_window, ratio=0.85, keep=8, summary_max=2000):
     from types import SimpleNamespace
 
     return SimpleNamespace(
+        provider="custom",
+        model="test-model",
+        max_output_tokens=1,
         context_window=context_window,
+        context_usage_ratio=1.0,
         compact_trigger_ratio=ratio,
         keep_recent_turns=keep,
         compact_summary_max_tokens=summary_max,
@@ -594,8 +669,8 @@ async def test_precompact_noop_when_history_too_small():
             prompt_messages=[{"role": "user", "content": "x" * 4000}],
         )
         assert result.triggered is False  # select_compaction_span returns None (too few rows)
-        assert result.required is True
-        assert result.skipped_reason == "span_too_small_to_be_worth_compacting"
+        assert result.required is False
+        assert result.skipped_reason == "official_preflight_counter_unavailable"
         assert await _markers_for(conv_id) == []
     finally:
         await _cleanup(conv_id)
@@ -615,7 +690,7 @@ async def test_precompact_noop_without_conversation_id():
     assert result.required is False
 
 
-async def test_compaction_never_marks_recent_eight_or_current_turn(monkeypatch):
+async def test_compaction_never_marks_recent_three_or_current_turn(monkeypatch):
     from sqlalchemy import select as _select
     from unittest.mock import AsyncMock
 
@@ -633,6 +708,15 @@ async def test_compaction_never_marks_recent_eight_or_current_turn(monkeypatch):
 
     conv_id, agent_id, inserted, _ = await _setup(rows_spec)
     current_anchor = inserted[-1].id
+    await persist_round_context_usage(
+        agent_id=agent_id,
+        session_id=conv_id,
+        turn_anchor_id=current_anchor,
+        input_tokens=10_000,
+        output_tokens=10,
+        provider="qwen",
+        model="qwen-test",
+    )
     summary = (
         "## Work summary\n\n"
         "### Decisions\n"
@@ -649,7 +733,7 @@ async def test_compaction_never_marks_recent_eight_or_current_turn(monkeypatch):
             agent_id=agent_id,
             conversation_id=conv_id,
             model=_precompact_model(context_window=100, keep=2),
-            pre_flight_estimate=10_000,
+            last_prompt_tokens=10_000,
             current_anchor_id=current_anchor,
         )
         assert result.triggered is True
@@ -663,10 +747,110 @@ async def test_compaction_never_marks_recent_eight_or_current_turn(monkeypatch):
                 )
             ).scalars().all()
 
-        assert rows[0].compacted_into is not None
-        assert rows[1].compacted_into == rows[0].compacted_into
-        assert all(row.compacted_into is None for row in rows[2:])
-        assert [row.content for row in rows[2:]] == [row.content for row in inserted[2:]]
+        marker_id = rows[0].compacted_into
+        assert marker_id is not None
+        assert all(row.compacted_into == marker_id for row in rows[:12])
+        assert all(row.compacted_into is None for row in rows[12:])
+        assert [row.content for row in rows[12:]] == [row.content for row in inserted[12:]]
+        current = next(row for row in rows if row.id == current_anchor)
+        observation = current.message_meta[SESSION_CONTEXT_META_KEY]
+        assert observation["last_input_tokens"] == 0
+        assert observation["consumed_by_compaction_epoch"] == 1
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_large_tool_heavy_history_replay_compacts_and_keeps_three_raw_turns(monkeypatch):
+    """Production-shaped replay: many tool loops shrink to one stable summary.
+
+    The current turn and the latest three completed user turns remain byte-for-
+    byte raw, regardless of how many tool calls each protected turn contains.
+    """
+    import json as _json
+    from sqlalchemy import select as _select
+    from unittest.mock import AsyncMock
+
+    import app.services.llm.compactor as compactor
+
+    rows_spec = []
+    age = 100_000
+    for turn in range(30):
+        rows_spec.append(("user", f"目标-{turn}: " + "历史上下文" * 400, age))
+        age -= 1
+        for tool_index in range(5):
+            rows_spec.append((
+                "tool_call",
+                _json.dumps({
+                    "name": "read_file",
+                    "args": {"path": f"workspace/{turn}-{tool_index}.md"},
+                    "status": "done",
+                    "result": "bounded tool result",
+                }),
+                age,
+            ))
+            age -= 1
+        rows_spec.append(("assistant", f"完成阶段-{turn}", age))
+        age -= 1
+    rows_spec.append(("user", "当前目标：继续推进，不得丢失", age))
+
+    conv_id, agent_id, inserted, _ = await _setup(rows_spec)
+    current_anchor = inserted[-1].id
+    valid_summary = (
+        "## Summary of earlier conversation\n\n"
+        "### Current objective and progress\n"
+        "- Continue the active objective using the protected recent turns.\n\n"
+        "### Key facts\n"
+        "- Earlier completed stages and tool evidence were compacted.\n"
+        + ("- Historical progress remains available through this summary.\n" * 5)
+        + "\n### Open items\n"
+        "- Continue from the current uncompacted user request.\n"
+    )
+    summarize = AsyncMock(return_value=(valid_summary, {"completion_tokens": 120}))
+    monkeypatch.setattr(compactor, "_summarize_via_llm", summarize)
+
+    try:
+        result = await compactor.maybe_compact(
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            model=_precompact_model(context_window=20_000, keep=3),
+            last_prompt_tokens=50_000,
+            current_anchor_id=current_anchor,
+        )
+        assert result.triggered is True
+        # The identifier-heavy model draft exceeds the unified conservative
+        # budget, so one bounded repair is attempted before lossless fallback.
+        assert summarize.await_count == 2
+
+        async with async_session() as db:
+            rows = (
+                await db.execute(
+                    _select(ChatMessage)
+                    .where(ChatMessage.conversation_id == conv_id)
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
+            ).scalars().all()
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                ctx_size=1000,
+            )
+
+        compacted_count = 27 * 7
+        marker_id = rows[0].compacted_into
+        assert marker_id is not None
+        assert all(row.compacted_into == marker_id for row in rows[:compacted_count])
+        assert all(row.compacted_into is None for row in rows[compacted_count:])
+        assert [row.content for row in rows[compacted_count:]] == [
+            row.content for row in inserted[compacted_count:]
+        ]
+        assert "<conversation-summary" in history[0]["content"]
+        # The generic history loader intentionally omits an incomplete current
+        # user tail; the caller reattaches its durable anchor separately. The
+        # database row itself must remain raw and unmarked for that reassembly.
+        assert rows[-1].content == "当前目标：继续推进，不得丢失"
+        assert rows[-1].compacted_into is None
+        assert history[-1]["content"] == "完成阶段-29"
     finally:
         await _cleanup(conv_id)
 
@@ -713,7 +897,7 @@ async def test_consumed_onmessage_event_does_not_block_compaction(monkeypatch):
             agent_id=agent_id,
             conversation_id=conv_id,
             model=_precompact_model(context_window=100, keep=8),
-            pre_flight_estimate=10_000,
+            last_prompt_tokens=10_000,
             current_anchor_id=current_anchor,
         )
         assert result.triggered is True
@@ -765,7 +949,7 @@ async def test_concurrent_compaction_rechecks_persisted_state_after_lock(monkeyp
         agent_id=uuid.uuid4(),
         conversation_id=str(uuid.uuid4()),
         model=_precompact_model(context_window=100),
-        pre_flight_estimate=500,
+        last_prompt_tokens=500,
     )
 
     assert result.triggered is True
@@ -783,7 +967,7 @@ async def test_preflight_threshold_reserves_configured_output_tokens():
     model.model = "test"
     model.max_output_tokens = 250
 
-    assert prompt_exceeds_preflight_limit(
+    assert not prompt_exceeds_preflight_limit(
         model=model,
         prompt_messages=[{"role": "user", "content": "数" * 1_800}],
     )

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +14,16 @@ class LLMModel(Base):
     """LLM model in the platform model pool."""
 
     __tablename__ = "llm_models"
+    __table_args__ = (
+        CheckConstraint(
+            "context_usage_ratio >= 0.1 AND context_usage_ratio <= 1.0",
+            name="ck_llm_models_context_usage_ratio",
+        ),
+        CheckConstraint(
+            "keep_recent_turns >= 3 AND keep_recent_turns <= 50",
+            name="ck_llm_models_keep_recent_turns",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True, index=True)
@@ -26,19 +36,35 @@ class LLMModel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     supports_vision: Mapped[bool] = mapped_column(Boolean, default=False)
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
-    request_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Request timeout in seconds, default 120
+    # Transport connection/pool timeout only. Model generation/read duration is
+    # never capped by the platform.
+    request_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Per-model output token limit override
     # Total prompt-token capacity of this model (used by auto-compaction trigger).
     # Backfilled with 32_000 by the migration; admins should adjust per model
     # (qwen-plus / qwen3.5-plus = 131_072, claude-opus = 200_000, …).
     context_window: Mapped[int] = mapped_column(Integer, nullable=False, default=32000)
+    # Administratively usable share of the advertised context window. Runtime
+    # budgeting always uses floor(context_window * context_usage_ratio).
+    context_usage_ratio: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.7,
+        server_default="0.7",
+    )
     # Auto-compaction tunables — see app/services/llm/compactor.py.
-    # `compact_trigger_ratio` is the fraction of `context_window` at which
-    # post-round compaction fires; `keep_recent_turns` keeps that many
-    # trailing rounds intact; `compact_summary_max_tokens` caps the
-    # compaction LLM's output.
+    # `compact_trigger_ratio` is retained for schema compatibility; normalized
+    # runtime budgeting uses `context_usage_ratio` as the sole threshold.
+    # `keep_recent_turns` is the preferred raw-history suffix (minimum three
+    # complete runs) and may degrade to the current turn during required
+    # provider-overflow recovery.
     compact_trigger_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=0.85)
-    keep_recent_turns: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    keep_recent_turns: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=3,
+        server_default="3",
+    )
     compact_summary_max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

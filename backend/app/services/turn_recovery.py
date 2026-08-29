@@ -23,6 +23,7 @@ from app.services.chat_history import (
     load_recoverable_messages_for_turn,
     persist_assistant_reply_row,
     persist_tool_call_row,
+    rewrite_tool_call_done_results,
 )
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
@@ -33,6 +34,7 @@ from app.services.workload_capacity import WorkloadKind, get_workload_capacity
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
 STARTUP_RECOVERY_LEASE_RESOURCE = "startup-turn-recovery"
 RECOVERY_CONCURRENCY = 8
+RECOVERY_TOOL_MATERIALIZE_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass
@@ -120,12 +122,6 @@ def _recovery_max_age_hours() -> float:
     return max(value, 0.0)
 
 
-async def execute_tool(*args, **kwargs):
-    from app.services.agent_tools import execute_tool as _execute_tool
-
-    return await _execute_tool(*args, **kwargs)
-
-
 def _tool_payload(row: ChatMessage) -> dict | None:
     try:
         payload = json.loads(row.content or "{}")
@@ -172,7 +168,32 @@ def _unfinished_tool_call_rows(
         if payload.get("name") == REQUEST_CONFIRMATION_TOOL_NAME:
             continue
         candidates.append((row, payload, key))
-    return [(row, payload, key) for row, payload, key in candidates if key not in done_keys]
+    unfinished = [(row, payload, key) for row, payload, key in candidates if key not in done_keys]
+    # Transaction-level ``now()`` gives all rows prewritten for one planned
+    # round the same timestamp. The provider-issued index is authoritative
+    # within that round; UUID ordering is random.
+    grouped: dict[str, list[tuple[ChatMessage, dict, str]]] = {}
+    group_order: list[str] = []
+    for item in unfinished:
+        round_id = str(item[1].get("round_id") or f"legacy:{item[0].id}")
+        if round_id not in grouped:
+            grouped[round_id] = []
+            group_order.append(round_id)
+        grouped[round_id].append(item)
+    ordered: list[tuple[ChatMessage, dict, str]] = []
+    for round_id in group_order:
+        ordered.extend(
+            sorted(
+                grouped[round_id],
+                key=lambda item: (
+                    item[1].get("round_tool_index")
+                    if isinstance(item[1].get("round_tool_index"), int)
+                    else 2**31,
+                    str(item[0].id),
+                ),
+            )
+        )
+    return ordered
 
 
 async def _complete_unfinished_tool_calls(
@@ -214,18 +235,17 @@ async def _complete_unfinished_tool_calls(
         # new list: that could grant an old code block tools enabled only after
         # its turn began. Without the exact snapshot, execute_code_aio runs but
         # receives no toolscall launcher.
-        raw_result = await execute_tool(
-            name,
-            args,
-            agent_id=execution_agent_id,
-            user_id=anchor.user_id,
-            session_id=anchor.conversation_id,
-            tool_call_id=key,
-            turn_anchor_id=anchor.id,
-            on_output=None,
+        # A running marker proves only admission, not whether execution began,
+        # completed, or committed an external effect. Never guess by tool name:
+        # close every ambiguous call with an explicit provider-visible result
+        # and let the next model round inspect state or issue a deliberate retry.
+        result_text = (
+            "[Recovery blocked automatic replay] The previous execution was "
+            "interrupted before its durable result was committed. The platform "
+            "did not execute it again. Inspect the target state before choosing "
+            "a safe next action."
         )
-        result_text = str(raw_result)
-        llm_view = finalize_tool_output(
+        llm_view = await finalize_tool_output(
             result_text,
             tool_name=name,
             agent_id=execution_agent_id,
@@ -245,12 +265,136 @@ async def _complete_unfinished_tool_calls(
                     "status": "done",
                     "result": llm_view,
                     "reasoning_content": payload.get("reasoning_content"),
+                    "assistant_content": payload.get("assistant_content"),
+                    "recovery_prefix_messages": payload.get("recovery_prefix_messages") or [],
+                    "round_id": payload.get("round_id"),
+                    "round_tool_index": payload.get("round_tool_index"),
                 },
                 turn_anchor_id=anchor.id,
             )
             await done_db.commit()
         completed += 1
     return completed
+
+
+async def _normalize_completed_tool_rounds_for_recovery(
+    anchor: ChatMessage,
+    *,
+    execution_agent_id: uuid.UUID,
+) -> None:
+    """Apply the live 64K round budget to crash-interrupted durable rows.
+
+    Done rows are committed after each tool so recovery never repeats a side
+    effect. A crash can therefore occur before the live loop's end-of-round
+    rewrite. ``round_id`` makes that window recoverable without guessing from
+    timestamps or adjacent rows.
+    """
+    from app.services.llm.client import LLMMessage
+    from app.services.llm.tool_output_store import enforce_message_budget
+
+    # Snapshot under a short read transaction, then release the connection
+    # before any local/S3 materialization. Exact row state is revalidated under
+    # lock immediately before the transactional rewrite.
+    async with async_session() as read_db:
+        rows = list(
+            (
+                await read_db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.agent_id == anchor.agent_id,
+                        ChatMessage.conversation_id == anchor.conversation_id,
+                        ChatMessage.role == "tool_call",
+                        ChatMessage.message_meta["turn_anchor_id"].as_string()
+                        == str(anchor.id),
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                )
+            ).scalars()
+        )
+        await read_db.commit()
+
+    grouped: dict[str, list[tuple[uuid.UUID, dict]]] = {}
+    for row in rows:
+        payload = _tool_payload(row)
+        if not payload or payload.get("status") != "done":
+            continue
+        round_id = str(payload.get("round_id") or "")
+        if round_id:
+            grouped.setdefault(round_id, []).append((row.id, dict(payload)))
+
+    replacements: dict[uuid.UUID, tuple[str, str]] = {}
+    expected_results: dict[uuid.UUID, str] = {}
+    for round_rows in grouped.values():
+        round_rows.sort(
+            key=lambda item: (
+                item[1].get("round_tool_index")
+                if isinstance(item[1].get("round_tool_index"), int)
+                else 2**31,
+                str(item[0]),
+            )
+        )
+        tool_calls: list[dict] = []
+        messages: list[LLMMessage] = []
+        for row_id, payload in round_rows:
+            call_id = str(payload.get("call_id") or payload.get("tool_call_id") or row_id)
+            args = payload.get("args")
+            if args is None:
+                args = payload.get("arguments") or {}
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": str(payload.get("name") or payload.get("tool_name") or "unknown"),
+                        "arguments": json.dumps(args, ensure_ascii=False, default=str),
+                    },
+                }
+            )
+        messages.append(LLMMessage(role="assistant", content=None, tool_calls=tool_calls))
+        for row_id, payload in round_rows:
+            call_id = str(payload.get("call_id") or payload.get("tool_call_id") or row_id)
+            messages.append(
+                LLMMessage(
+                    role="tool",
+                    tool_call_id=call_id,
+                    content=str(payload.get("result") or ""),
+                )
+            )
+        rewrites = await asyncio.wait_for(
+            enforce_message_budget(
+                messages,
+                fresh_start_idx=0,
+                agent_id=execution_agent_id,
+                session_id=anchor.conversation_id,
+            ),
+            timeout=RECOVERY_TOOL_MATERIALIZE_TIMEOUT_SECONDS,
+        )
+        row_by_call_id = {
+            str(payload.get("call_id") or payload.get("tool_call_id") or row_id): (row_id, payload)
+            for row_id, payload in round_rows
+        }
+        for rewrite in rewrites:
+            matched = row_by_call_id.get(rewrite.tool_call_id)
+            if matched is None:
+                raise RuntimeError(
+                    f"recovery tool rewrite missing row call_id={rewrite.tool_call_id!r}"
+                )
+            row_id, payload = matched
+            replacements[row_id] = (rewrite.tool_call_id, rewrite.final_content)
+            expected_results[row_id] = str(payload.get("result") or "")
+
+    if replacements:
+        async with async_session() as write_db:
+            await rewrite_tool_call_done_results(
+                write_db,
+                agent_id=anchor.agent_id,
+                user_id=anchor.user_id,
+                conversation_id=anchor.conversation_id,
+                replacements=replacements,
+                turn_anchor_id=anchor.id,
+                expected_results=expected_results,
+            )
+            await write_db.commit()
 
 
 def _turn_status(row: ChatMessage) -> str:
@@ -323,6 +467,10 @@ async def prepare_recoverable_turn_history(
         expected_origin=expected_origin,
         execution_agent_id=execution_agent_id,
     )
+    await _normalize_completed_tool_rounds_for_recovery(
+        anchor,
+        execution_agent_id=execution_agent_id,
+    )
     if not await _recovery_origin_matches(anchor, expected_origin):
         return []
     return await load_recoverable_history_for_turn(
@@ -366,7 +514,26 @@ async def _deliver_recovered_reply(
                     "validate_external_conv_id": True,
                 }
             )
-        return await deliver_recovered_reply_to_origin(**delivery_kwargs)
+        delivered = await deliver_recovered_reply_to_origin(**delivery_kwargs)
+    # Release the origin row lock before the cleanup transaction locks the same
+    # ChatSession. Terminal delivery is already durable and remains authoritative.
+    if expected_origin.source_channel == "dingtalk":
+        from app.services.turn_inbox import (
+            cleanup_durable_channel_receipt_anchor,
+        )
+
+        try:
+            await cleanup_durable_channel_receipt_anchor(
+                session_id=anchor.conversation_id,
+                agent_id=anchor.agent_id,
+            )
+        except Exception:  # noqa: BLE001 - terminal delivery is authoritative
+            logger.opt(exception=True).warning(
+                "[turn_recovery] durable reaction cleanup failed after delivery "
+                "anchor={}",
+                anchor.id,
+            )
+    return delivered
 
 
 async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
@@ -423,6 +590,8 @@ async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
         # LLM invocation for the same event.
         return False
     if row.role == "assistant":
+        if meta.get("artifact_role") == "intermediate_assistant":
+            return True
         if is_incomplete_delivery_progress(row):
             return True
         # Persisted assistant output is the durable completion boundary. Without a
@@ -463,6 +632,26 @@ async def _find_turn_anchor_for_latest(db, latest_row: ChatMessage) -> ChatMessa
 
     meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
     injected_root_id = meta.get("subagent_turn_anchor_id")
+    if not injected_root_id and meta.get("turn_inbox_state") == "delivered":
+        injected_root_id = meta.get("turn_inbox_anchor_id")
+        try:
+            session_id = uuid.UUID(str(candidate.conversation_id))
+            inbox_generation = int(meta.get("turn_inbox_generation") or 0)
+        except (TypeError, ValueError):
+            return None
+        session = await db.get(ChatSession, session_id)
+        if session is None or session.agent_id != candidate.agent_id:
+            return None
+        from app.services.conversation_turn_lifecycle import (
+            conversation_turn_snapshot_for_session,
+        )
+
+        snapshot = conversation_turn_snapshot_for_session(session)
+        if (
+            str(snapshot.anchor_id or "") != str(injected_root_id or "")
+            or snapshot.generation != inbox_generation
+        ):
+            return None
     if not injected_root_id:
         return candidate
     try:
@@ -475,7 +664,6 @@ async def _find_turn_anchor_for_latest(db, latest_row: ChatMessage) -> ChatMessa
         or root.role != "user"
         or root.agent_id != candidate.agent_id
         or root.conversation_id != candidate.conversation_id
-        or root.user_id != candidate.user_id
     ):
         return None
     return root
@@ -544,6 +732,19 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
             STARTUP_RECOVERY_LEASE_RESOURCE,
             namespace="turn-recovery",
         ):
+            # Reaction callback closures cannot survive process restart. Consume
+            # their durable provider markers independently from LLM resumption,
+            # including sessions whose terminal assistant row was already saved.
+            from app.services.turn_inbox import (
+                cleanup_stale_channel_receipt_anchors,
+            )
+
+            try:
+                await cleanup_stale_channel_receipt_anchors(limit=limit)
+            except Exception:  # noqa: BLE001 - reaction cleanup cannot block recovery
+                logger.opt(exception=True).warning(
+                    "[turn_recovery] startup durable reaction cleanup failed"
+                )
             # Scanning is a short read transaction. Close it before admission,
             # model execution, tool execution, or inter-turn waits.
             async with async_session() as db:
@@ -610,6 +811,10 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 execution_agent_id=execution_agent_id,
                 release_db_before_execution=True,
             )
+            await _normalize_completed_tool_rounds_for_recovery(
+                anchor,
+                execution_agent_id=execution_agent_id,
+            )
 
         if not await _recovery_origin_matches(anchor, expected_origin):
             return False
@@ -624,11 +829,36 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             )
             if not history:
                 return False
-            last_role = history[-1].get("role")
-            if last_role == "assistant":
-                # Defensive guard for direct callers and races after anchor selection:
-                # a persisted assistant means this turn is already complete.
-                return False
+            if history[-1].get("role") == "assistant":
+                latest_assistant = (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.agent_id == anchor.agent_id,
+                            ChatMessage.conversation_id == anchor.conversation_id,
+                            ChatMessage.role == "assistant",
+                            ChatMessage.compacted_into.is_(None),
+                        )
+                        .order_by(
+                            ChatMessage.created_at.desc(),
+                            ChatMessage.id.desc(),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                latest_meta = (
+                    dict(latest_assistant.message_meta or {})
+                    if latest_assistant is not None
+                    else {}
+                )
+                if latest_meta.get("artifact_role") == "intermediate_assistant":
+                    latest_assistant = None
+                if latest_assistant is not None:
+                    # Defensive guard for direct callers and races after anchor
+                    # selection: only a terminal assistant means this turn is
+                    # complete. A nonterminal intermediate is the recovery
+                    # continuation point.
+                    return False
 
             reply = await _call_agent_llm(
                 db,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -86,6 +87,21 @@ async def test_p2p_includes_current_conversation():
     # static_parts even for P2P (regression guard against someone making
     # the rules-block injection conditional on is_group).
     assert "## Message Sender Tag (Group Chat)" in static_p
+
+
+async def test_agent_daily_memory_zero_reaches_unified_memory_loader():
+    agent_id = await _seed_basic_agent()
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        agent.daily_memory_load_days = 0
+        await db.commit()
+
+    loader = AsyncMock(return_value=SimpleNamespace(render=lambda: ""))
+    with patch("app.services.agent_context.load_agent_memory_snapshot", loader):
+        await build_agent_context(agent_id, "Test Agent", "role")
+
+    assert loader.await_count == 1
+    assert loader.await_args.kwargs["daily_limit"] == 0
 
 
 async def test_group_excludes_current_conversation():

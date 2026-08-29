@@ -19,6 +19,32 @@ from app.services.project_agent_workspace import create_project_agent_workspace,
 
 
 @pytest.mark.asyncio
+async def test_runtime_daily_memory_zero_round_trips_and_out_of_range_is_rejected(tmp_path: Path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    payload = {
+        "name": "Memory-controlled agent",
+        "workspace_files": [],
+        "runtime": {"daily_memory_load_days": 0},
+    }
+
+    instances = await instantiate_project_agent_template_assets(
+        project_root,
+        [payload],
+        agent_ids=[uuid.uuid4()],
+    )
+    assert instances[0].runtime["daily_memory_load_days"] == 0
+
+    payload["runtime"] = {"daily_memory_load_days": 31}
+    with pytest.raises(ProjectAgentTemplateAssetError, match="daily_memory_load_days"):
+        await instantiate_project_agent_template_assets(
+            project_root,
+            [payload],
+            agent_ids=[uuid.uuid4()],
+        )
+
+
+@pytest.mark.asyncio
 async def test_project_agent_template_round_trip_uses_fresh_ids_and_sanitized_assets(tmp_path: Path):
     source_project_id = uuid.uuid4()
     source_tenant_id = uuid.uuid4()

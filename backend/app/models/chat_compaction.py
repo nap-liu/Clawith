@@ -44,7 +44,10 @@ class ChatCompaction(Base):
     )
 
     summary_text: Mapped[str] = mapped_column(Text, nullable=False)
-    summary_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Unknown until an authoritative provider count observes this exact
+    # persisted summary in a later full request.  Never store a local text
+    # estimate as if it were an exact model token count.
+    summary_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Trigger metadata — what we observed when deciding to compact.
     trigger_prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -56,10 +59,11 @@ class ChatCompaction(Base):
         UUID(as_uuid=True), ForeignKey("chat_compactions.id", ondelete="SET NULL"), nullable=True
     )
 
-    # Validation gate result — see compactor's gate (length, structure,
-    # UUID recall ≥ 0.7). Records that failed validation are kept for
-    # audit but the system falls back to ctx_size truncation that round.
+    # Validation gate result after recovery. The compactor records the first
+    # failure reason even when deterministic recovery produces the summary
+    # that is ultimately applied.
     summary_validation_passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    validation_failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

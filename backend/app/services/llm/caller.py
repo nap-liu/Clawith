@@ -13,10 +13,11 @@ All paths now support:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +25,6 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.database import async_session
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
@@ -46,7 +46,6 @@ async def execute_tool(*args, **kwargs):
 from app.services.active_turns import ensure_active_turn
 from app.services.token_tracker import (
     TokenUsage,
-    estimate_token_usage_from_chars,
     extract_token_usage,
     record_token_usage,
 )
@@ -55,7 +54,7 @@ from .client import LLMClientCloseGuard, LLMError
 from .confirmation_tool import find_request_confirmation_call
 from .failover import FailoverErrorType, classify_error
 from .json_recovery import canonicalize_tool_arguments
-from .tool_output_store import enforce_message_budget, finalize_tool_output
+from .tool_output_store import ToolOutputRewrite, enforce_message_budget, finalize_tool_output
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -94,6 +93,47 @@ TOOLS_REQUIRING_ARGS = frozenset(
 def _join_visible_response_segments(*segments: str | None) -> str:
     """Join model text emitted across the tool rounds of one logical turn."""
     return "\n\n".join(segment for segment in segments if segment and segment.strip())
+
+
+async def _invoke_before_round(
+    before_round,
+    round_i: int,
+    *,
+    before_injection=None,
+) -> list[dict]:
+    """Invoke a round hook with an optional durable pre-claim callback.
+
+    Production IM/Subagent drains accept ``before_injection`` and call it only
+    after they find work but before committing the injected state. Legacy test
+    and extension hooks keep their one-argument contract; for those, persist as
+    soon as a non-empty result is observed, still before provider continuation.
+    """
+
+    if before_round is None:
+        return []
+    supports_callback = False
+    if before_injection is not None:
+        try:
+            parameters = inspect.signature(before_round).parameters.values()
+            supports_callback = any(
+                parameter.name == "before_injection"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_callback = False
+    if supports_callback:
+        return list(
+            await before_round(
+                round_i,
+                before_injection=before_injection,
+            )
+            or []
+        )
+    injected = list(await before_round(round_i) or [])
+    if injected and before_injection is not None:
+        await before_injection()
+    return injected
 
 
 # ─── P4: max_output_tokens recovery (Claude-Code-aligned) ─────────────────────
@@ -368,79 +408,38 @@ REPEAT_TOOL_CALL_BREAK_MESSAGE = (
     "你可以换个问法、缩小范围，或稍后再试。"
 )
 
-# Provider requests are stopped before dispatch when the final assembled
-# prompt cannot fit.  DashScope additionally enforces an input-character limit
-# below one million characters; keep a safety margin for JSON protocol
-# overhead that is not represented by the message bodies themselves.
-QWEN_INPUT_CHAR_HARD_LIMIT = 900_000
-DISPATCH_INPUT_SAFETY_RATIO = 0.95
 PROVIDER_CONTEXT_BLOCKED_MESSAGE = "上下文过长，请新开会话。"
 
 
 @dataclass(frozen=True)
 class DispatchBudget:
-    chars: int
-    estimated_tokens: int
-    physical_input_capacity: int
+    physical_context_window: int
+    context_usage_ratio: float
+    effective_context_window: int
+    input_capacity: int
     safe_input_limit: int
     token_overflow: bool
-    char_overflow: bool
+    authoritative_prompt_tokens: int | None = None
+    count_source: str = "unavailable"
+    provider_overflow: bool = False
+    keep_recent_turns_override: int | None = None
 
     @property
     def fits(self) -> bool:
-        return not self.token_overflow and not self.char_overflow
+        return not self.token_overflow
+
+    @property
+    def physical_input_capacity(self) -> int:
+        """Compatibility alias for older logs and callers."""
+        return self.input_capacity
 
     @property
     def reason(self) -> str:
-        if self.token_overflow and self.char_overflow:
-            return "token_and_qwen_char_limit"
+        if self.provider_overflow:
+            return "provider_context_rejection"
         if self.token_overflow:
             return "token_limit"
-        if self.char_overflow:
-            return "qwen_char_limit"
         return "fits"
-
-
-def _dispatch_context_size(messages: list, tools: list[dict] | None) -> tuple[int, int]:
-    """Return conservative ``(characters, estimated_tokens)`` for one request."""
-    chunks: list[str] = []
-    for msg in messages:
-        content = getattr(msg, "content", None)
-        if isinstance(content, str):
-            chunks.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    text = block.get("text")
-                    if isinstance(text, str):
-                        chunks.append(text)
-                    elif "image_url" in block or block.get("type") == "image":
-                        chunks.append("x" * 1024)
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        if tool_calls:
-            chunks.append(json.dumps(tool_calls, ensure_ascii=False, default=str))
-        tool_call_id = getattr(msg, "tool_call_id", None)
-        if isinstance(tool_call_id, str):
-            chunks.append(tool_call_id)
-        reasoning = getattr(msg, "reasoning_content", None)
-        if isinstance(reasoning, str):
-            chunks.append(reasoning)
-        reasoning_signature = getattr(msg, "reasoning_signature", None)
-        if isinstance(reasoning_signature, str):
-            chunks.append(reasoning_signature)
-        dynamic_content = getattr(msg, "dynamic_content", None)
-        if isinstance(dynamic_content, str):
-            chunks.append(dynamic_content)
-    if tools:
-        chunks.append(json.dumps(tools, ensure_ascii=False, default=str))
-
-    combined = "".join(chunks)
-    chars = len(combined)
-    # CJK is commonly close to one token per character.  ASCII-heavy JSON and
-    # prose are conservatively estimated at three characters per token.
-    cjk = sum(1 for ch in combined if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff")
-    estimated_tokens = cjk + (chars - cjk + 2) // 3
-    return chars, estimated_tokens
 
 
 def measure_dispatch(
@@ -449,27 +448,32 @@ def measure_dispatch(
     messages: list,
     tools: list[dict] | None,
     max_output_tokens: int,
+    authoritative_prompt_tokens: int | None = None,
+    count_source: str = "unavailable",
 ) -> DispatchBudget:
-    """Measure the exact request shape used by every provider dispatch."""
-    chars, estimated_tokens = _dispatch_context_size(messages, tools)
-    context_window = int(getattr(model, "context_window", 0) or 0)
-    physical_input_capacity = max(
-        1,
-        context_window - max(0, int(max_output_tokens or 0)),
+    """Measure request shape without pretending text size is model tokens.
+
+    ``authoritative_prompt_tokens`` may only come from an official counter or
+    from the provider usage for the same/previous completed request.  The local
+    estimate is observability/internal-summary data and never a token hard gate.
+    """
+    from app.services.llm.context_budget import resolve_context_budget
+
+    context = resolve_context_budget(model, max_output_tokens=max_output_tokens)
+    safe_input_limit = context.hard_input_limit
+    token_overflow = context.configured and (
+        authoritative_prompt_tokens is not None
+        and (safe_input_limit <= 0 or authoritative_prompt_tokens > safe_input_limit)
     )
-    safe_input_limit = max(
-        1,
-        int(physical_input_capacity * DISPATCH_INPUT_SAFETY_RATIO),
-    )
-    token_overflow = context_window > 0 and estimated_tokens >= safe_input_limit
-    char_overflow = str(getattr(model, "provider", "")).lower() == "qwen" and chars >= QWEN_INPUT_CHAR_HARD_LIMIT
     return DispatchBudget(
-        chars=chars,
-        estimated_tokens=estimated_tokens,
-        physical_input_capacity=physical_input_capacity,
+        physical_context_window=context.physical_context_window,
+        context_usage_ratio=context.context_usage_ratio,
+        effective_context_window=context.effective_context_window,
+        input_capacity=context.input_capacity,
         safe_input_limit=safe_input_limit,
         token_overflow=token_overflow,
-        char_overflow=char_overflow,
+        authoritative_prompt_tokens=authoritative_prompt_tokens,
+        count_source=count_source,
     )
 
 
@@ -498,9 +502,10 @@ async def _guard_provider_dispatch(
         return None
 
     reason = (
-        f"provider_dispatch_oversized:chars={budget.chars},"
-        f"estimated_tokens={budget.estimated_tokens},"
-        f"physical_input_capacity={budget.physical_input_capacity},"
+        f"provider_dispatch_oversized:physical_context_window={budget.physical_context_window},"
+        f"context_usage_ratio={budget.context_usage_ratio},"
+        f"effective_context_window={budget.effective_context_window},"
+        f"input_capacity={budget.input_capacity},"
         f"safe_input_limit={budget.safe_input_limit},reason={budget.reason},"
         f"provider={getattr(model, 'provider', '?')},"
         f"model={getattr(model, 'model', '?')}"
@@ -620,13 +625,71 @@ def _get_model_timeout(model: "LLMModel") -> float:
     return float(getattr(model, "request_timeout", None) or 120.0)
 
 
-def _usage_from_response_or_estimate(response, api_messages: list[LLMMessage]) -> TokenUsage:
+def _usage_from_response(response) -> TokenUsage:
     usage = extract_token_usage(response.usage)
     if usage:
         return usage
-    round_chars = sum(len(m.content or "") if isinstance(m.content, str) else 0 for m in api_messages)
-    round_chars += len(response.content or "")
-    return estimate_token_usage_from_chars(round_chars)
+    # Missing provider usage is unknown. Never synthesize input tokens from
+    # text length, bytes, image placeholders, or a local tokenizer.
+    return TokenUsage()
+
+
+def _authoritative_usage_details(raw_usage: dict | None) -> dict:
+    """Return provider modality/cache detail fields without inventing values."""
+    if not isinstance(raw_usage, dict):
+        return {}
+    details: dict = {}
+    for key in (
+        "prompt_tokens_details",
+        "input_tokens_details",
+        "completion_tokens_details",
+        "output_tokens_details",
+        "usageMetadata",
+    ):
+        value = raw_usage.get(key)
+        if isinstance(value, dict):
+            details[key] = value
+    return details
+
+
+def _is_provider_context_overflow(error: Exception) -> bool:
+    """Recognize explicit provider context-limit rejections only.
+
+    This intentionally excludes generic HTTP 400 responses.  Retrying an
+    authentication/schema/safety error after compaction would be both wasteful
+    and capable of masking the real failure.
+    """
+    structured = " ".join(
+        str(value or "").lower()
+        for value in (
+            getattr(error, "error_code", None),
+            getattr(error, "error_type", None),
+        )
+    )
+    structured_markers = (
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "max_tokens_exceeded",
+        "request_too_large",
+    )
+    if any(marker in structured for marker in structured_markers):
+        return True
+    if getattr(error, "status_code", None) == 413:
+        return True
+
+    value = str(error).lower()
+    markers = (
+        "context_length_exceeded",
+        "maximum context length",
+        "max context length",
+        "context window",
+        "input length exceeds",
+        "input is too long",
+        "too many tokens",
+        "reduce the length of the messages",
+        "prompt is too long",
+    )
+    return any(marker in value for marker in markers)
 
 
 def _coerce_uuid(value) -> uuid.UUID | None:
@@ -731,6 +794,23 @@ def _send_media_result_is_durable_in_current_session(tool_name: str, result: str
     )
 
 
+def _durable_tool_result_row_id(tool_name: str, result: str, session_id: str) -> uuid.UUID | None:
+    """Resolve a tool-owned durable result row when the tool persisted it itself."""
+    if not _send_media_result_is_durable_in_current_session(tool_name, result, session_id):
+        return None
+    try:
+        payload = json.loads(result)
+        return uuid.UUID(str(payload.get("message_id") or ""))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+@dataclass
+class _RoundDoneToolCall:
+    event: dict[str, Any]
+    row_id: uuid.UUID | None
+
+
 async def _persist_tool_call_events_strict(
     events: list[dict],
     *,
@@ -738,25 +818,26 @@ async def _persist_tool_call_events_strict(
     user_id,
     session_id: str,
     turn_anchor_id: uuid.UUID | None,
-) -> bool:
+) -> dict[str, uuid.UUID]:
     """Durably append tool-call markers before the loop relies on them.
 
-    Returns False for non-persistable test/background calls without UUID ids.
+    Returns an empty mapping for non-persistable test/background calls without UUID ids.
     For real chat turns, DB errors propagate and stop execution before side
     effects can happen without a recovery marker.
     """
     if not events or not session_id:
-        return False
+        return {}
     agent_uuid = _coerce_uuid(agent_id)
     user_uuid = _coerce_uuid(user_id)
     if agent_uuid is None or user_uuid is None:
-        return False
+        return {}
 
     from app.services.chat_history import persist_tool_call_row
     from app.services.conversation_turn_lifecycle import (
         lock_conversation_turn_running,
     )
 
+    persisted: dict[str, uuid.UUID] = {}
     async with async_session() as db:
         await lock_conversation_turn_running(
             db,
@@ -765,7 +846,7 @@ async def _persist_tool_call_events_strict(
             turn_anchor_id=turn_anchor_id,
         )
         for evt in events:
-            await persist_tool_call_row(
+            row_id = await persist_tool_call_row(
                 db,
                 agent_id=agent_uuid,
                 user_id=user_uuid,
@@ -774,8 +855,81 @@ async def _persist_tool_call_events_strict(
                 turn_anchor_id=turn_anchor_id,
                 turn_fence_locked=True,
             )
+            if row_id is not None:
+                persisted[str(evt.get("call_id") or "")] = row_id
         await db.commit()
-    return True
+    return persisted
+
+
+async def _reconcile_round_tool_outputs(
+    rewrites: list[ToolOutputRewrite],
+    done_records: list[_RoundDoneToolCall],
+    *,
+    agent_id,
+    user_id,
+    session_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> None:
+    """Make durable done rows match the fresh provider transcript exactly."""
+    if not rewrites:
+        return
+
+    records_by_call_id: dict[str, _RoundDoneToolCall] = {}
+    for record in done_records:
+        call_id = str(record.event.get("call_id") or "")
+        if not call_id or call_id in records_by_call_id:
+            raise RuntimeError(f"ambiguous durable tool result call_id: {call_id!r}")
+        records_by_call_id[call_id] = record
+
+    final_by_call_id: dict[str, str] = {}
+    for rewrite in rewrites:
+        if not rewrite.tool_call_id or rewrite.tool_call_id in final_by_call_id:
+            raise RuntimeError(f"ambiguous tool output rewrite call_id: {rewrite.tool_call_id!r}")
+        if rewrite.tool_call_id not in records_by_call_id:
+            raise RuntimeError(f"tool output rewrite has no done result: {rewrite.tool_call_id!r}")
+        final_by_call_id[rewrite.tool_call_id] = rewrite.final_content
+
+    agent_uuid = _coerce_uuid(agent_id)
+    user_uuid = _coerce_uuid(user_id)
+    durable_turn = bool(session_id and agent_uuid is not None and user_uuid is not None)
+    if durable_turn:
+        replacements: dict[uuid.UUID, tuple[str, str]] = {}
+        for call_id, final_content in final_by_call_id.items():
+            row_id = records_by_call_id[call_id].row_id
+            if row_id is None:
+                raise RuntimeError(f"durable tool result row is missing for call_id={call_id!r}")
+            replacements[row_id] = (call_id, final_content)
+
+        from app.services.chat_history import rewrite_tool_call_done_results
+
+        async with async_session() as db:
+            await rewrite_tool_call_done_results(
+                db,
+                agent_id=agent_uuid,
+                user_id=user_uuid,
+                conversation_id=session_id,
+                replacements=replacements,
+                turn_anchor_id=turn_anchor_id,
+            )
+            await db.commit()
+
+    # Mutate callback payloads only after the durable transaction commits. On
+    # failure they retain the original values that are still authoritative in DB.
+    for call_id, final_content in final_by_call_id.items():
+        records_by_call_id[call_id].event["result"] = final_content
+
+
+async def _emit_round_done_events(
+    done_records: list[_RoundDoneToolCall],
+    on_tool_call,
+) -> None:
+    if on_tool_call is None:
+        return
+    for record in done_records:
+        try:
+            await on_tool_call(record.event)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1133,6 +1287,11 @@ async def _process_tool_call(
     emit_running: bool = True,
     turn_anchor_id: uuid.UUID | None = None,
     before_execute=None,
+    round_done_records: list[_RoundDoneToolCall] | None = None,
+    round_id: str | None = None,
+    round_tool_index: int | None = None,
+    assistant_content: str | None = None,
+    recovery_prefix_messages: list[dict[str, str]] | None = None,
 ) -> str:
     """Process a single tool call and return result."""
     args = _canonicalize_tc_arguments(tc, session_id)
@@ -1142,25 +1301,65 @@ async def _process_tool_call(
     # Guard: check if tool requires arguments
     should_execute, error_msg = _check_tool_requires_args(tool_name, args)
     if not should_execute:
+        done_evt = {
+            "name": tool_name,
+            "call_id": tc.get("id", ""),
+            "args": args,
+            "status": "done",
+            "round_id": round_id,
+            "round_tool_index": round_tool_index,
+            "result": error_msg,
+            "reasoning_content": full_reasoning_content,
+            "assistant_content": assistant_content,
+            "recovery_prefix_messages": recovery_prefix_messages or [],
+        }
+        persisted = await _persist_tool_call_events_strict(
+            [done_evt],
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+        row_id = persisted.get(str(done_evt.get("call_id") or "")) if persisted else None
+        if persisted:
+            done_evt["_durable_persisted"] = True
+        record = _RoundDoneToolCall(event=done_evt, row_id=row_id)
+        if round_done_records is not None:
+            round_done_records.append(record)
+        else:
+            await _emit_round_done_events([record], on_tool_call)
         return error_msg
 
     if tool_name not in allowed_tool_names:
         result = _tool_not_enabled_message(tool_name)
         logger.warning(f"[LLM] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
-        if on_tool_call:
-            try:
-                await on_tool_call(
-                    {
-                        "name": tool_name,
-                        "call_id": tc.get("id", ""),
-                        "args": args,
-                        "status": "done",
-                        "result": result,
-                        "reasoning_content": full_reasoning_content,
-                    }
-                )
-            except Exception:
-                pass
+        done_evt = {
+            "name": tool_name,
+            "call_id": tc.get("id", ""),
+            "args": args,
+            "status": "done",
+            "round_id": round_id,
+            "round_tool_index": round_tool_index,
+            "result": result,
+            "reasoning_content": full_reasoning_content,
+            "assistant_content": assistant_content,
+            "recovery_prefix_messages": recovery_prefix_messages or [],
+        }
+        persisted = await _persist_tool_call_events_strict(
+            [done_evt],
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+        row_id = persisted.get(str(done_evt.get("call_id") or "")) if persisted else None
+        if persisted:
+            done_evt["_durable_persisted"] = True
+        record = _RoundDoneToolCall(event=done_evt, row_id=row_id)
+        if round_done_records is not None:
+            round_done_records.append(record)
+        else:
+            await _emit_round_done_events([record], on_tool_call)
         api_messages.append(
             LLMMessage(
                 role="tool",
@@ -1179,7 +1378,11 @@ async def _process_tool_call(
             "call_id": tc.get("id", ""),
             "args": args,
             "status": "running",
+            "round_id": round_id,
+            "round_tool_index": round_tool_index,
             "reasoning_content": full_reasoning_content,
+            "assistant_content": assistant_content,
+            "recovery_prefix_messages": recovery_prefix_messages or [],
         }
         if await _persist_tool_call_events_strict(
             [running_evt],
@@ -1221,7 +1424,7 @@ async def _process_tool_call(
     # Materialize oversize output and produce the canonical llm_view string.
     # This is the single shape point — DB, WS live stream, historical replay
     # all consume this string, keeping the messages sequence append-only.
-    llm_view = finalize_tool_output(
+    llm_view = await finalize_tool_output(
         result,
         tool_name=tool_name,
         agent_id=agent_id,
@@ -1235,9 +1438,8 @@ async def _process_tool_call(
     tool_content: str | list = llm_view
     if supports_vision and agent_id:
         try:
-            from app.services.vision_inject import try_inject_screenshot_vision
-
             from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+            from app.services.vision_inject import try_inject_screenshot_vision
 
             ws_path = current_agent_runtime_workspace(agent_id).local_root
             vision_content = try_inject_screenshot_vision(tool_name, str(result), ws_path)
@@ -1255,25 +1457,34 @@ async def _process_tool_call(
         "call_id": tc.get("id", ""),
         "args": args,
         "status": "done",
+        "round_id": round_id,
+        "round_tool_index": round_tool_index,
         "result": llm_view,
         "reasoning_content": full_reasoning_content,
+        "assistant_content": assistant_content,
+        "recovery_prefix_messages": recovery_prefix_messages or [],
     }
-    if _send_media_result_is_durable_in_current_session(tool_name, str(llm_view), session_id):
+    done_row_id = _durable_tool_result_row_id(tool_name, str(llm_view), session_id)
+    if done_row_id is not None:
         done_evt["_durable_persisted"] = True
-    elif await _persist_tool_call_events_strict(
-        [done_evt],
-        agent_id=agent_id,
-        user_id=user_id,
-        session_id=session_id,
-        turn_anchor_id=turn_anchor_id,
-    ):
-        done_evt["_durable_persisted"] = True
+    else:
+        persisted_done_rows = await _persist_tool_call_events_strict(
+            [done_evt],
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+        if persisted_done_rows:
+            done_evt["_durable_persisted"] = True
+            if isinstance(persisted_done_rows, dict):
+                done_row_id = persisted_done_rows.get(str(done_evt.get("call_id") or ""))
 
-    if on_tool_call:
-        try:
-            await on_tool_call(done_evt)
-        except Exception:
-            pass
+    done_record = _RoundDoneToolCall(event=done_evt, row_id=done_row_id)
+    if round_done_records is not None:
+        round_done_records.append(done_record)
+    else:
+        await _emit_round_done_events([done_record], on_tool_call)
 
     api_messages.append(
         LLMMessage(
@@ -1497,9 +1708,28 @@ async def call_llm(
 
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, "max_output_tokens", None))
     _unsaved_usage = TokenUsage()
+    last_authoritative_prompt_tokens: int | None = None
+    anchor_agent_id = _coerce_uuid(turn_anchor_agent_id) or _coerce_uuid(agent_id)
+    if anchor_agent_id is not None and session_id:
+        from app.services.session_token_usage import load_latest_round_context_usage
+
+        try:
+            last_authoritative_prompt_tokens = await load_latest_round_context_usage(
+                agent_id=anchor_agent_id,
+                session_id=session_id,
+                provider=str(getattr(model, "provider", "") or ""),
+                model=str(getattr(model, "model", "") or ""),
+                model_record_id=str(getattr(model, "id", "") or ""),
+                endpoint=str(getattr(model, "base_url", "") or ""),
+            )
+        except Exception as exc:
+            logger.error(
+                f"[context_usage] latest usage load failed session={session_id}: {exc}"
+            )
 
     async def _track_response_usage(response, usage_messages: list[LLMMessage], round_number: int) -> None:
-        usage = _usage_from_response_or_estimate(response, usage_messages)
+        nonlocal last_authoritative_prompt_tokens
+        usage = _usage_from_response(response)
         _unsaved_usage.add(usage)
         if on_usage is not None:
             try:
@@ -1508,6 +1738,33 @@ async def call_llm(
                 logger.warning(f"[LLM] usage callback failed (ignored): {exc}")
 
         raw_usage = getattr(response, "usage", None)
+        authoritative = extract_token_usage(raw_usage)
+        if authoritative is not None and authoritative.context_input_tokens > 0:
+            last_authoritative_prompt_tokens = authoritative.context_input_tokens
+            if anchor_agent_id is not None and turn_anchor_id is not None and session_id:
+                from app.services.session_token_usage import persist_round_context_usage
+
+                try:
+                    await persist_round_context_usage(
+                        agent_id=anchor_agent_id,
+                        session_id=session_id,
+                        turn_anchor_id=turn_anchor_id,
+                        input_tokens=authoritative.context_input_tokens,
+                        output_tokens=authoritative.output_tokens,
+                        provider=str(getattr(model, "provider", "") or ""),
+                        model=str(getattr(model, "model", "") or ""),
+                        model_record_id=str(getattr(model, "id", "") or ""),
+                        endpoint=str(getattr(model, "base_url", "") or ""),
+                        usage_details=_authoritative_usage_details(raw_usage),
+                    )
+                except Exception as exc:
+                    # Accounting persistence must not erase an otherwise valid
+                    # model response; the context guard still uses the exact
+                    # in-memory value for this running turn.
+                    logger.error(
+                        "[context_usage] round usage backfill failed "
+                        f"session={session_id} round={round_number}: {exc}"
+                    )
         ratio = _cache_hit_ratio(raw_usage)
         if ratio is not None and isinstance(raw_usage, dict):
             prompt_tokens = raw_usage.get("prompt_tokens")
@@ -1537,17 +1794,129 @@ async def call_llm(
     # Non-empty model content is user-visible even when the same response also
     # carries tool calls. Keep it until this logical turn finishes or suspends.
     visible_response_segments: list[str] = []
+    turn_execution_id = uuid.uuid4().hex
+    durable_user_id = _coerce_uuid(user_id)
+
+    async def _persist_intermediate_segment(
+        content: str,
+        *,
+        visible_joiner_before: str,
+        max_output_resume_prompt: str | None = None,
+        thinking: str | None = None,
+        created_at=None,
+    ) -> bool:
+        """Persist provider output that must survive another model dispatch."""
+
+        if not (content or "").strip():
+            return False
+        if (
+            anchor_agent_id is None
+            or durable_user_id is None
+            or turn_anchor_id is None
+            or not session_id
+        ):
+            return False
+        from app.services.chat_history import persist_intermediate_assistant_reply
+
+        await persist_intermediate_assistant_reply(
+            async_session,
+            agent_id=anchor_agent_id,
+            user_id=durable_user_id,
+            conversation_id=session_id,
+            content=content,
+            thinking=thinking,
+            turn_anchor_id=turn_anchor_id,
+            visible_joiner_before=visible_joiner_before,
+            max_output_resume_prompt=max_output_resume_prompt,
+            created_at=created_at,
+        )
+        return True
+
     # Tool-calling loop. A subagent may receive parent messages while a model
     # request is in flight. ``skip_before_round_once`` avoids draining the same
     # round twice when the final-reply gate below has already prefetched those
     # messages for the next round.
     skip_before_round_once = False
+    preflight_compaction_not_applicable = False
+    async def _dispatch_round_with_context_recovery(
+        current_messages: list[LLMMessage],
+        current_budget: DispatchBudget,
+        round_number: int,
+    ):
+        """Dispatch one logical model round; overflow retry does not consume it."""
+        nonlocal api_messages, last_authoritative_prompt_tokens
+        while True:
+            meaningful_progress = False
+
+            async def _chunk(text: str):
+                nonlocal meaningful_progress
+                meaningful_progress = meaningful_progress or bool(text)
+                if on_chunk is not None:
+                    await on_chunk(text)
+
+            async def _thinking(text: str):
+                nonlocal meaningful_progress
+                meaningful_progress = meaningful_progress or bool(text)
+                if on_thinking is not None:
+                    await on_thinking(text)
+
+            async def _tool_delta(data: dict):
+                nonlocal meaningful_progress
+                meaningful_progress = meaningful_progress or bool(data)
+                if on_tool_delta is not None:
+                    await on_tool_delta(data)
+
+            try:
+                response = await _stream_with_throttle_retry(
+                    client,
+                    model=model,
+                    round_i=round_number,
+                    messages=current_messages,
+                    tools=tools_for_llm if tools_for_llm else None,
+                    temperature=model.temperature,
+                    max_tokens=max_tokens,
+                    on_chunk=_chunk,
+                    on_tool_delta=_tool_delta,
+                    on_thinking=_thinking,
+                )
+                return response, current_messages, current_budget
+            except LLMError as exc:
+                if (
+                    meaningful_progress
+                    or not _is_provider_context_overflow(exc)
+                    or context_recovery is None
+                ):
+                    raise
+                overflow_budget = replace(
+                    current_budget,
+                    provider_overflow=True,
+                    token_overflow=True,
+                    count_source="provider_context_rejection",
+                )
+                recovered_messages = await context_recovery(model, overflow_budget)
+                if recovered_messages is None:
+                    raise
+                api_messages = await _assemble_api_messages(recovered_messages)
+                current_messages = list(api_messages)
+                last_authoritative_prompt_tokens = None
+                current_budget = measure_dispatch(
+                    model=model,
+                    messages=current_messages,
+                    tools=tools_for_llm if tools_for_llm else None,
+                    max_output_tokens=max_tokens,
+                )
+                logger.warning(
+                    "[context_guard] provider rejected context; compacted "
+                    f"and retrying the same round session={session_id} "
+                    f"model={getattr(model, 'model', '?')}"
+                )
+
     for round_i in range(_max_tool_rounds):
         await _assert_durable_turn_running()
         if skip_before_round_once:
             skip_before_round_once = False
         elif before_round is not None:
-            injected = await before_round(round_i)
+            injected = await _invoke_before_round(before_round, round_i)
             if injected:
                 from app.services.image_context import prepare_messages_for_model
 
@@ -1614,38 +1983,62 @@ async def call_llm(
             messages=dispatch_messages,
             tools=tools_for_llm if tools_for_llm else None,
             max_output_tokens=max_tokens,
+            authoritative_prompt_tokens=last_authoritative_prompt_tokens,
+            count_source=(
+                "previous_provider_usage"
+                if last_authoritative_prompt_tokens is not None
+                else "unavailable"
+            ),
         )
-        # All persisted conversation surfaces (Web Chat, project group leader
-        # children, project A2A children, and ordinary IM sessions) share the
-        # same first-dispatch compaction boundary.  Previously recovery only
-        # ran after the prompt no longer fit, even though the canonical
-        # compactor exposes a conservative pre-flight threshold specifically
-        # to avoid reaching that cliff.  Keep recovery single-shot and anchored
-        # to a durable fresh turn, but invoke it when either the hard guard or
-        # the standard pre-flight policy says the session should compact.
+        # Qwen does not expose an official preflight token counter.  Drive
+        # compaction from the exact provider usage returned by the preceding
+        # round; never reinterpret local text/byte size as model tokens.
         from app.services.llm.compactor import should_compact
 
         preflight_compaction_required, _, _ = should_compact(
             model=model,
-            last_prompt_tokens=None,
-            pre_flight_estimate=dispatch_budget.estimated_tokens,
+            last_prompt_tokens=last_authoritative_prompt_tokens,
+            pre_flight_estimate=None,
         )
         if (
             (not dispatch_budget.fits or preflight_compaction_required)
-            and round_i == 0
             and turn_anchor_id is not None
             and context_recovery is not None
         ):
             recovered_messages = await context_recovery(model, dispatch_budget)
             if recovered_messages is not None:
+                preflight_compaction_not_applicable = bool(
+                    getattr(recovered_messages, "preflight_not_applicable", False)
+                )
                 api_messages = await _assemble_api_messages(recovered_messages)
                 dispatch_messages = list(api_messages)
+                # The observed count belongs to the pre-compaction request.
+                # The rebuilt request will receive its own authoritative count
+                # from the provider response.
+                last_authoritative_prompt_tokens = None
                 dispatch_budget = measure_dispatch(
                     model=model,
                     messages=dispatch_messages,
                     tools=tools_for_llm if tools_for_llm else None,
                     max_output_tokens=max_tokens,
                 )
+
+        # A threshold hit based on real usage must lead to a successful
+        # compaction/reload before another model round.  Local estimates do not
+        # participate in this decision.
+        if preflight_compaction_required and not (
+            last_authoritative_prompt_tokens is None
+            or (preflight_compaction_not_applicable and dispatch_budget.fits)
+        ):
+            logger.error(
+                "[context_guard] required compaction did not produce a safe prompt "
+                f"session={session_id} provider_tokens={last_authoritative_prompt_tokens}"
+            )
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client_guard.close()
+            _log_turn_timing("required_compaction_failed", round_i + 1)
+            return PROVIDER_CONTEXT_BLOCKED_MESSAGE
 
         context_stop = None
         if not dispatch_budget.fits:
@@ -1665,17 +2058,12 @@ async def call_llm(
 
         try:
             # Use streaming API for real-time responses
-            response = await _stream_with_throttle_retry(
-                client,
-                model=model,
-                round_i=round_i + 1,
-                messages=dispatch_messages,
-                tools=tools_for_llm if tools_for_llm else None,
-                temperature=model.temperature,
-                max_tokens=max_tokens,
-                on_chunk=on_chunk,
-                on_tool_delta=on_tool_delta,
-                on_thinking=on_thinking,
+            response, dispatch_messages, dispatch_budget = (
+                await _dispatch_round_with_context_recovery(
+                    dispatch_messages,
+                    dispatch_budget,
+                    round_i + 1,
+                )
             )
             await _track_response_usage(response, dispatch_messages, round_i + 1)
 
@@ -1688,14 +2076,39 @@ async def call_llm(
             # once bytes have been dispatched, later tool rounds may only
             # append to them.
             accumulated_partials: list[str] = []
+            recovery_prefix_messages: list[dict[str, str]] = []
             recovery_count_this_round = 0
+            durable_partial_count = 0
+            round_visible_joiner = "\n\n" if visible_response_segments else ""
             while (
                 _response_was_truncated_by_length(response) and max_output_recoveries < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
             ):
                 max_output_recoveries += 1
                 recovery_count_this_round += 1
                 partial_text = response.content or ""
+                partial_persisted = await _persist_intermediate_segment(
+                    partial_text,
+                    visible_joiner_before=(
+                        round_visible_joiner
+                        if recovery_count_this_round == 1
+                        else ""
+                    ),
+                    max_output_resume_prompt=RESUME_PROMPT,
+                    thinking=response.reasoning_content,
+                )
                 accumulated_partials.append(partial_text)
+                if not partial_persisted:
+                    # Non-durable/internal callers retain the historical tool
+                    # row fallback. Durable turns replay the committed
+                    # intermediate row instead, avoiding a duplicate prefix.
+                    recovery_prefix_messages.extend(
+                        [
+                            {"role": "assistant", "content": partial_text},
+                            {"role": "user", "content": RESUME_PROMPT},
+                        ]
+                    )
+                else:
+                    durable_partial_count += 1
                 # Durable in-turn recovery transcript.  Do not remove these
                 # messages after dispatch: a later tool round must retain this
                 # request as an exact prefix.
@@ -1733,16 +2146,18 @@ async def call_llm(
                     await client_guard.close()
                     _log_turn_timing("context_blocked", round_i + 1)
                     return context_stop
-                response = await _stream_with_throttle_retry(
-                    client,
+                resume_budget = measure_dispatch(
                     model=model,
-                    round_i=round_i + 1,
                     messages=dispatch_messages,
                     tools=tools_for_llm if tools_for_llm else None,
-                    temperature=model.temperature,
-                    max_tokens=max_tokens,
-                    on_chunk=on_chunk,
-                    on_thinking=on_thinking,
+                    max_output_tokens=max_tokens,
+                )
+                response, dispatch_messages, resume_budget = (
+                    await _dispatch_round_with_context_recovery(
+                        dispatch_messages,
+                        resume_budget,
+                        round_i + 1,
+                    )
                 )
                 await _track_response_usage(response, dispatch_messages, round_i + 1)
 
@@ -1806,9 +2221,60 @@ async def call_llm(
             # allowed round, claiming here would mark the message processing and
             # then fall out of the loop without ever showing it to the model.
             has_next_round = round_i + 1 < _max_tool_rounds
-            late_injected = await before_round(round_i + 1) if before_round is not None and has_next_round else []
+            intermediate_persisted = bool(
+                accumulated_partials
+                and durable_partial_count == len(accumulated_partials)
+                and not (response.content or "").strip()
+            )
+
+            async def _persist_before_late_injection(
+                *,
+                created_at=None,
+                _response_content=response.content or "",
+                _has_accumulated_partials=bool(accumulated_partials),
+                _complete_response_content=complete_response_content,
+                _visible_joiner=round_visible_joiner,
+                _thinking=response.reasoning_content,
+            ):
+                nonlocal intermediate_persisted
+                if intermediate_persisted:
+                    return
+                late_segment = (
+                    _response_content
+                    if _has_accumulated_partials
+                    else _complete_response_content
+                )
+                intermediate_persisted = await _persist_intermediate_segment(
+                    late_segment,
+                    visible_joiner_before=(
+                        "" if _has_accumulated_partials else _visible_joiner
+                    ),
+                    thinking=_thinking,
+                    created_at=created_at,
+                )
+
+            late_injected = (
+                await _invoke_before_round(
+                    before_round,
+                    round_i + 1,
+                    before_injection=_persist_before_late_injection,
+                )
+                if before_round is not None and has_next_round
+                else []
+            )
             if late_injected:
                 from app.services.image_context import prepare_messages_for_model
+
+                if (
+                    turn_anchor_id is not None
+                    and anchor_agent_id is not None
+                    and durable_user_id is not None
+                    and session_id
+                    and not intermediate_persisted
+                ):
+                    raise RuntimeError(
+                        "late injection claimed before intermediate assistant persistence"
+                    )
 
                 api_messages.append(
                     LLMMessage(
@@ -1833,6 +2299,34 @@ async def call_llm(
                 )
                 skip_before_round_once = True
                 continue
+            # No next tool round will naturally hit the top-of-loop recovery
+            # gate. Compact now from this round's authoritative provider usage
+            # so the following user turn starts from the reduced durable
+            # history. The already-generated reply remains valid and is not
+            # sent to the model a second time.
+            if (
+                last_authoritative_prompt_tokens is not None
+                and context_recovery is not None
+            ):
+                post_round_required, _, _ = should_compact(
+                    model=model,
+                    last_prompt_tokens=last_authoritative_prompt_tokens,
+                    pre_flight_estimate=None,
+                )
+                if post_round_required:
+                    post_round_budget = replace(
+                        dispatch_budget,
+                        authoritative_prompt_tokens=last_authoritative_prompt_tokens,
+                        count_source="provider_usage",
+                        token_overflow=True,
+                    )
+                    recovered = await context_recovery(model, post_round_budget)
+                    if recovered is None:
+                        logger.error(
+                            "[context_guard] post-round compaction exhausted "
+                            f"session={session_id} provider_tokens="
+                            f"{last_authoritative_prompt_tokens}"
+                        )
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client_guard.close()
@@ -1870,6 +2364,14 @@ async def call_llm(
                     buttons=conf_call.buttons,
                     force_confirmation=conf_call.force_confirmation,
                     turn_anchor_id=turn_anchor_id,
+                    assistant_content=response.content or None,
+                    recovery_prefix_messages=recovery_prefix_messages,
+                    reasoning_content=response.reasoning_content,
+                    round_id=(
+                        f"{turn_anchor_id or session_id}:{turn_execution_id}:round:{round_i + 1}"
+                        if turn_anchor_id or session_id
+                        else f"round:{round_i + 1}"
+                    ),
                 )
                 if agent_id and _unsaved_usage.total_tokens > 0:
                     await record_token_usage(agent_id, _unsaved_usage)
@@ -1950,7 +2452,61 @@ async def call_llm(
 
         full_reasoning_content = response.reasoning_content or ""
 
-        for tc in sanitized_tool_calls or []:
+        round_done_records: list[_RoundDoneToolCall] = []
+        durable_round_id = (
+            f"{turn_anchor_id or session_id}:{turn_execution_id}:round:{round_i + 1}"
+            if turn_anchor_id or session_id
+            else f"round:{round_i + 1}"
+        )
+        # Persist the complete planned round before executing its first tool.
+        # A crash after A but before B must not erase B/C from the model's
+        # already-issued assistant response. Only the first row carries the
+        # shared assistant/resume prefix so replay does not duplicate it.
+        running_events: list[dict[str, Any]] = []
+        for tool_index, tc in enumerate(sanitized_tool_calls or []):
+            args = _canonicalize_tc_arguments(tc, session_id)
+            running_events.append(
+                {
+                    "name": tc["function"]["name"],
+                    "call_id": tc.get("id", ""),
+                    "args": args,
+                    "status": "running",
+                    "round_id": durable_round_id,
+                    "round_tool_index": tool_index,
+                    "reasoning_content": full_reasoning_content,
+                    "assistant_content": (
+                        response.content or None
+                    ) if tool_index == 0 else None,
+                    "recovery_prefix_messages": (
+                        recovery_prefix_messages if tool_index == 0 else []
+                    ),
+                }
+            )
+        try:
+            persisted_running = await _persist_tool_call_events_strict(
+                running_events,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+        except Exception as e:
+            logger.exception(f"[LLM] Failed to persist complete planned tool round: {e}")
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client_guard.close()
+            _log_turn_timing("tool_round_persist_error", round_i + 1)
+            return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
+        for event in running_events:
+            if persisted_running:
+                event["_durable_persisted"] = True
+            if on_tool_call is not None:
+                try:
+                    await on_tool_call(event)
+                except Exception:
+                    pass
+
+        for tool_index, tc in enumerate(sanitized_tool_calls or []):
             await _before_tool_execution_guard()
             try:
                 tool_error = await _process_tool_call(
@@ -1965,12 +2521,20 @@ async def call_llm(
                     full_reasoning_content=full_reasoning_content,
                     allowed_tool_names=allowed_tool_names,
                     tools_for_llm=tools_for_llm,
-                    emit_running=True,
+                    emit_running=False,
                     turn_anchor_id=turn_anchor_id,
                     before_execute=_admit_tool_execution,
+                    round_done_records=round_done_records,
+                    round_id=durable_round_id,
+                    round_tool_index=tool_index,
+                    assistant_content=(response.content or None) if tool_index == 0 else None,
+                    recovery_prefix_messages=(
+                        recovery_prefix_messages if tool_index == 0 else None
+                    ),
                 )
             except Exception as e:
                 logger.exception(f"[LLM] Tool execution or durable result persistence failed: {e}")
+                await _emit_round_done_events(round_done_records, on_tool_call)
                 if agent_id and _unsaved_usage.total_tokens > 0:
                     await record_token_usage(agent_id, _unsaved_usage)
                 await client_guard.close()
@@ -1989,12 +2553,43 @@ async def call_llm(
         # sum blows past the message-level cap (e.g. 3 × 30 KB RAGFlow
         # queries). Enforce the ceiling now, after every tool message for
         # this round is appended but before the next client.stream call.
-        enforce_message_budget(
-            api_messages,
-            fresh_start_idx=fresh_start,
-            agent_id=agent_id,
-            session_id=session_id,
-        )
+        try:
+            rewrites = await enforce_message_budget(
+                api_messages,
+                fresh_start_idx=fresh_start,
+                agent_id=agent_id,
+                session_id=session_id,
+            )
+        except Exception as e:
+            logger.exception(f"[LLM] Fresh tool round exceeds the hard message budget: {e}")
+            await _emit_round_done_events(round_done_records, on_tool_call)
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client_guard.close()
+            _log_turn_timing("tool_result_budget_error", round_i + 1)
+            return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
+        try:
+            await _reconcile_round_tool_outputs(
+                rewrites,
+                round_done_records,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+        except Exception as e:
+            logger.exception(f"[LLM] Failed to reconcile durable tool results: {e}")
+            # The old per-tool values remain authoritative because the rewrite
+            # transaction failed. Surface those completed results, but never
+            # dispatch the divergent in-memory transcript to the provider.
+            await _emit_round_done_events(round_done_records, on_tool_call)
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client_guard.close()
+            _log_turn_timing("tool_result_reconcile_error", round_i + 1)
+            return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
+
+        await _emit_round_done_events(round_done_records, on_tool_call)
 
         # Repeated tool-call nudge. On the 2nd identical-call round, append one
         # corrective message (append-only → prefix cache stays intact) so the
@@ -2060,20 +2655,143 @@ async def call_llm_with_failover(
 
     turn_messages = list(messages)
     injected_turn_messages: list[dict] = []
-    recovery_used = False
+    from app.services.llm.turn_partition import effective_keep_recent_turns
+
+    initial_provider_overflow_keep = effective_keep_recent_turns(
+        primary_model,
+        fallback_model,
+    )
+
+    def _recovery_message_key(message: dict) -> str:
+        """Canonical equality for one live-vs-durable injected message.
+
+        Durable history includes ``attachments=[]`` when the row metadata owns
+        that key; live IM/subagent injection omits it when there are no files.
+        Normalize only that representational difference. A counted comparison
+        below preserves two legitimate identical messages instead of treating
+        membership as a set.
+        """
+        normalized = dict(message)
+        if normalized.get("attachments") == []:
+            normalized.pop("attachments", None)
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _surviving_baseline_suffix_keys(recovered: list[dict]) -> list[str]:
+        """Return the longest contiguous baseline suffix present in recovery.
+
+        Compaction can replace an arbitrary old prefix, but the uncompressed
+        current-turn baseline survives as a contiguous suffix.  Reserving only
+        that observed suffix prevents an older identical message from being
+        mistaken for a newly injected message that is absent from a racing
+        recovery read.
+        """
+        baseline_keys = [_recovery_message_key(message) for message in messages]
+        recovered_keys = [_recovery_message_key(message) for message in recovered]
+        if not baseline_keys or not recovered_keys:
+            return []
+
+        longest = 0
+        last_baseline_key = baseline_keys[-1]
+        for recovered_end, key in enumerate(recovered_keys):
+            if key != last_baseline_key:
+                continue
+            matched = 1
+            max_match = min(len(baseline_keys), recovered_end + 1)
+            while (
+                matched < max_match
+                and baseline_keys[-1 - matched] == recovered_keys[recovered_end - matched]
+            ):
+                matched += 1
+            longest = max(longest, matched)
+            if longest == len(baseline_keys):
+                break
+        return baseline_keys[-longest:] if longest else []
+
+    next_provider_overflow_keep = initial_provider_overflow_keep
+    provider_overflow_exhausted = False
 
     async def _recover_once(model, budget):
-        nonlocal recovery_used, turn_messages
-        if recovery_used or context_recovery is None:
+        nonlocal turn_messages, next_provider_overflow_keep, provider_overflow_exhausted
+        if context_recovery is None:
             return None
-        recovery_used = True
-        try:
-            recovered = await context_recovery(model, budget)
-        except Exception as exc:
-            logger.error(f"[context_guard] safe context recovery failed: {type(exc).__name__}: {exc}")
+
+        provider_overflow = bool(getattr(budget, "provider_overflow", False))
+        if provider_overflow and provider_overflow_exhausted:
             return None
+        recovered = None
+        while True:
+            attempt_budget = budget
+            attempted_keep: int | None = None
+            if provider_overflow:
+                attempted_keep = max(0, next_provider_overflow_keep)
+                attempt_budget = replace(
+                    budget,
+                    keep_recent_turns_override=attempted_keep,
+                )
+            try:
+                recovered = await context_recovery(model, attempt_budget)
+            except Exception as exc:
+                logger.error(
+                    "[context_guard] safe context recovery failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return None
+
+            if provider_overflow:
+                # A provider rejection permits one explicit protection level.
+                # If that level has no expired turn, step down locally until
+                # useful work is possible. A second provider rejection resumes
+                # at N-1, eventually reaching current-turn-only (zero history).
+                if attempted_keep == 0:
+                    provider_overflow_exhausted = True
+                else:
+                    next_provider_overflow_keep = attempted_keep - 1
+            if recovered is not None or not provider_overflow or attempted_keep == 0:
+                break
         if recovered is not None:
-            turn_messages = list(recovered) + list(injected_turn_messages)
+            preflight_not_applicable = bool(
+                getattr(recovered, "preflight_not_applicable", False)
+            )
+            # Recovery normally reloads the complete durable current-turn tail,
+            # including already-delivered round-boundary injections. Preserve
+            # any injection that is not present in that snapshot as well: a
+            # read immediately following the standard ordered commits must not
+            # drop a trailing user message that this logical turn consumed.
+            # Canonical occurrence counts keep duplicate texts and the normal
+            # durable path both correct.
+            turn_messages = list(recovered)
+            recovered_counts: dict[str, int] = {}
+            for message in turn_messages:
+                key = _recovery_message_key(message)
+                recovered_counts[key] = recovered_counts.get(key, 0) + 1
+            # Only recovered occurrences beyond the actually surviving
+            # pre-injection suffix can satisfy live injections. This remains
+            # correct when an older protected message has the same text as a
+            # trailing injection and when compaction has replaced older rows.
+            for baseline_key in _surviving_baseline_suffix_keys(turn_messages):
+                recovered_counts[baseline_key] = max(
+                    0,
+                    recovered_counts.get(baseline_key, 0) - 1,
+                )
+            for injected in injected_turn_messages:
+                key = _recovery_message_key(injected)
+                if recovered_counts.get(key, 0) > 0:
+                    recovered_counts[key] -= 1
+                    continue
+                turn_messages.append(injected)
+            if preflight_not_applicable:
+                from app.services.llm.compactor import ContextRecoveryMessages
+
+                return ContextRecoveryMessages(
+                    turn_messages,
+                    preflight_not_applicable=True,
+                )
             return turn_messages
         return None
 
@@ -2108,10 +2826,14 @@ async def call_llm_with_failover(
             key=lambda tool: tool.get("function", {}).get("name", ""),
         )
 
-    async def _wrapped_before_round(round_i: int):
+    async def _wrapped_before_round(round_i: int, *, before_injection=None):
         if before_round is None:
             return []
-        injected = await before_round(round_i)
+        injected = await _invoke_before_round(
+            before_round,
+            round_i,
+            before_injection=before_injection,
+        )
         if injected:
             normalized = [dict(message) for message in injected]
             injected_turn_messages.extend(normalized)
@@ -2429,6 +3151,10 @@ async def call_agent_llm_with_tools(
 
     tools_for_llm = await get_agent_tools_for_llm(agent_id)
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
+    # ``session_id`` is stable for schedulers and heartbeats. A fresh execution
+    # id prevents separate runs at the same round number from being grouped as
+    # one historical multi-tool response.
+    background_execution_id = uuid.uuid4()
 
     # Everything needed by the provider/tool loop is now an immutable snapshot.
     # End the read transaction before waiting for provider capacity or remote
@@ -2442,6 +3168,7 @@ async def call_agent_llm_with_tools(
         _unsaved_usage = TokenUsage()
         tool_executed = False
         visible_response_segments: list[str] = []
+        client_guard: LLMClientCloseGuard | None = None
         try:
             client = create_llm_client(
                 provider=model.provider,
@@ -2504,7 +3231,7 @@ async def call_agent_llm_with_tools(
                     raise
 
                 # Track tokens for this round
-                _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
+                _usage_this_round = _usage_from_response(response)
                 _accumulated_usage.add(_usage_this_round)
                 _unsaved_usage.add(_usage_this_round)
 
@@ -2554,6 +3281,12 @@ async def call_agent_llm_with_tools(
                             buttons=conf_call.buttons,
                             force_confirmation=conf_call.force_confirmation,
                             turn_anchor_id=None,
+                            assistant_content=response.content or None,
+                            recovery_prefix_messages=[],
+                            reasoning_content=response.reasoning_content,
+                            round_id=(
+                                f"{session_id}:background:{background_execution_id}:round:{round_i + 1}"
+                            ),
                         )
                         if agent_id and _unsaved_usage.total_tokens > 0:
                             await record_token_usage(agent_id, _unsaved_usage)
@@ -2569,6 +3302,7 @@ async def call_agent_llm_with_tools(
                         # A role="tool" reply must be preceded by the assistant
                         # message carrying its tool_calls, or strict providers
                         # reject the orphaned tool message.
+                        fresh_start = len(api_messages)
                         api_messages.append(
                             LLMMessage(
                                 role="assistant",
@@ -2583,6 +3317,12 @@ async def call_agent_llm_with_tools(
                                 content=f"❌ {_conf_reason}",
                                 tool_call_id=conf_call.call_id,
                             )
+                        )
+                        await enforce_message_budget(
+                            api_messages,
+                            fresh_start_idx=fresh_start,
+                            agent_id=agent_id,
+                            session_id=session_id,
                         )
                         continue
 
@@ -2606,6 +3346,11 @@ async def call_agent_llm_with_tools(
                         True,
                         tool_executed,
                     )
+
+                # Only this newly appended round may be materialized. Earlier
+                # rounds were already dispatched and are an immutable cache
+                # prefix.
+                fresh_start = len(api_messages)
 
                 # Add assistant message with tool calls.
                 # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
@@ -2644,7 +3389,7 @@ async def call_agent_llm_with_tools(
                         logger.info(
                             f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}"
                         )
-                    llm_view = finalize_tool_output(
+                    llm_view = await finalize_tool_output(
                         result,
                         tool_name=tool_name,
                         agent_id=agent_id,
@@ -2658,6 +3403,13 @@ async def call_agent_llm_with_tools(
                             content=llm_view,
                         )
                     )
+
+                await enforce_message_budget(
+                    api_messages,
+                    fresh_start_idx=fresh_start,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                )
 
                 # Repeated tool-call nudge (2nd identical round): one corrective
                 # message so the model can change approach or answer before the
@@ -2673,6 +3425,8 @@ async def call_agent_llm_with_tools(
         except Exception as e:
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
+            if client_guard is not None:
+                await client_guard.close()
             return f"[Error] {e}", False, tool_executed
 
     # Try primary model

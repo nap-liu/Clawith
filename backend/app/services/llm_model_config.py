@@ -76,6 +76,7 @@ async def clone_tenant_llm_model(
         request_timeout=source.request_timeout,
         max_output_tokens=source.max_output_tokens,
         context_window=source.context_window,
+        context_usage_ratio=float(source.context_usage_ratio or 0.7),
         compact_trigger_ratio=source.compact_trigger_ratio,
         keep_recent_turns=source.keep_recent_turns,
         compact_summary_max_tokens=source.compact_summary_max_tokens,

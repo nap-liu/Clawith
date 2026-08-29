@@ -168,8 +168,14 @@ class LocalStorageBackend(StorageBackend):
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         path = self._full_path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiofiles.open(path, "wb") as f:
-            await f.write(data)
+        partial = path.with_name(f".{path.name}.{uuid.uuid4().hex}.writing")
+        try:
+            async with aiofiles.open(partial, "wb") as f:
+                await f.write(data)
+                await f.flush()
+            await asyncio.to_thread(os.replace, partial, path)
+        finally:
+            partial.unlink(missing_ok=True)
 
     async def write_local_file(
         self,

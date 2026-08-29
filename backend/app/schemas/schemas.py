@@ -285,6 +285,7 @@ class AgentOut(BaseModel):
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
     context_window_size: int = 100
+    daily_memory_load_days: int = 2
     max_tool_rounds: int = 50
     max_triggers: int = 20
     min_poll_interval_min: int = 5
@@ -355,6 +356,7 @@ class AgentUpdate(BaseModel):
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
     context_window_size: int | None = Field(default=None, ge=1, le=500)
+    daily_memory_load_days: int | None = Field(default=None, ge=0, le=30)
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
     max_tool_rounds: int | None = None
@@ -487,6 +489,9 @@ class LLMModelCreate(BaseModel):
     supports_vision: bool = False
     max_output_tokens: int | None = None
     request_timeout: int | None = None
+    context_window: int = Field(32000, ge=1024, le=2_000_000)
+    context_usage_ratio: float = Field(0.7, ge=0.1, le=1.0)
+    keep_recent_turns: int = Field(3, ge=3, le=50)
 
 class LLMModelUpdate(BaseModel):
     provider: str | None = None
@@ -500,6 +505,9 @@ class LLMModelUpdate(BaseModel):
     supports_vision: bool | None = None
     max_output_tokens: int | None = None
     request_timeout: int | None = None
+    context_window: int | None = Field(None, ge=1024, le=2_000_000)
+    context_usage_ratio: float | None = Field(None, ge=0.1, le=1.0)
+    keep_recent_turns: int | None = Field(None, ge=3, le=50)
 
 
 class LLMModelClone(BaseModel):
@@ -520,6 +528,9 @@ class LLMModelOut(BaseModel):
     supports_vision: bool = False
     max_output_tokens: int | None = None
     request_timeout: int | None = None
+    context_window: int = 32000
+    context_usage_ratio: float = 0.7
+    keep_recent_turns: int = 3
     created_at: datetime
 
     model_config = {"from_attributes": True}

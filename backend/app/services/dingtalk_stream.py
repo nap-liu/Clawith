@@ -572,17 +572,68 @@ def _make_dingtalk_reactions(app_key: str, app_secret: str, message_id: str, con
     async def _attach(reaction: str, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id) -> bool:
         return await add_reaction(_ak, _as, _mid, _cid, reaction)
 
-    async def _recall(reaction: str, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id) -> None:
-        await recall_reaction(_ak, _as, _mid, _cid, reaction)
+    async def _recall(reaction: str, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id) -> bool:
+        return await recall_reaction(_ak, _as, _mid, _cid, reaction)
 
     controller = DingTalkReactionController(
         attach_reaction=_attach,
         recall_reaction=_recall,
     )
+    receipt_agent_id: uuid.UUID | None = None
+    receipt_session_id = ""
+    receipt_message_id: uuid.UUID | None = None
+
+    def _bind_receipt_context(
+        agent_id: uuid.UUID,
+        session_id: str,
+        local_message_id: uuid.UUID,
+    ) -> None:
+        nonlocal receipt_agent_id, receipt_session_id, receipt_message_id
+        receipt_agent_id = agent_id
+        receipt_session_id = session_id
+        receipt_message_id = local_message_id
+
+    async def _dispose_and_ack(value: object) -> bool:
+        cleanup_completed = (
+            await controller.on_error(value)
+            if isinstance(value, BaseException)
+            else await controller.on_complete(str(value or ""))
+        )
+        if (
+            receipt_agent_id is not None
+            and receipt_session_id
+            and receipt_message_id is not None
+        ):
+            from app.services.turn_inbox import (
+                acknowledge_durable_channel_receipt_cleanup,
+                cleanup_durable_channel_receipt_anchor,
+            )
+
+            has_durable_leftovers = not cleanup_completed
+            if cleanup_completed:
+                has_durable_leftovers = (
+                    await acknowledge_durable_channel_receipt_cleanup(
+                        session_id=receipt_session_id,
+                        agent_id=receipt_agent_id,
+                        message_id=receipt_message_id,
+                    )
+                )
+            if has_durable_leftovers:
+                # A terminal turn with failed prior handoffs gets the bounded
+                # durable sweep; running handoffs are rejected by the lifecycle
+                # check without touching provider state.
+                await cleanup_durable_channel_receipt_anchor(
+                    session_id=receipt_session_id,
+                    agent_id=receipt_agent_id,
+                    require_terminal=True,
+                )
+        return cleanup_completed
+
     return ChannelReactions(
         on_consume=controller.on_consume,
-        on_complete=controller.on_complete,
-        on_error=controller.on_error,
+        on_complete=_dispose_and_ack,
+        on_error=_dispose_and_ack,
+        bind_receipt_context=_bind_receipt_context,
         on_tool_call=controller.on_tool_call,
         on_thinking=controller.on_thinking,
     )

@@ -30,6 +30,7 @@ class RuntimeLLMModel:
     request_timeout: int | None
     max_output_tokens: int | None
     context_window: int
+    context_usage_ratio: float
     compact_trigger_ratio: float
     keep_recent_turns: int
     compact_summary_max_tokens: int
@@ -51,6 +52,7 @@ class RuntimeLLMModel:
             request_timeout=model.request_timeout,
             max_output_tokens=model.max_output_tokens,
             context_window=model.context_window,
+            context_usage_ratio=float(getattr(model, "context_usage_ratio", None) or 0.7),
             compact_trigger_ratio=model.compact_trigger_ratio,
             keep_recent_turns=model.keep_recent_turns,
             compact_summary_max_tokens=model.compact_summary_max_tokens,

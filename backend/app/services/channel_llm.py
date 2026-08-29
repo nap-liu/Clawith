@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import is_agent_expired
 from app.database import async_session
+from app.services.channel_dispatch import run_channel_reaction_hook
 
 if TYPE_CHECKING:
     from app.models.chat_session import ChatSession
@@ -373,29 +374,41 @@ async def _call_agent_llm(
     if session_id and turn_anchor_id is not None and not continue_turn and not recovery_mode:
         from app.services.llm.turn_partition import effective_keep_recent_turns
 
-        frozen_current_suffix = [dict(messages[-1])]
         protected_keep_recent_turns = effective_keep_recent_turns(model, fallback_model)
 
         async def _recover_context(_recovery_model, dispatch_budget):
-            from app.services.chat_history import load_history_prefix_before_anchor
-            from app.services.llm.compactor import maybe_compact
+            from app.services.chat_history import load_recoverable_history_for_turn
+            from app.services.llm.compactor import (
+                COMPACTION_NOT_APPLICABLE_REASONS,
+                ContextRecoveryMessages,
+                maybe_compact,
+            )
 
             compacted = await maybe_compact(
                 agent_id=history_agent_id,
                 conversation_id=session_id,
                 model=_recovery_model,
-                pre_flight_estimate=dispatch_budget.estimated_tokens,
+                last_prompt_tokens=getattr(dispatch_budget, "authoritative_prompt_tokens", None),
                 current_anchor_id=turn_anchor_id,
-                force_required=dispatch_budget.char_overflow,
-                keep_recent_turns_override=protected_keep_recent_turns,
+                force_required=getattr(dispatch_budget, "provider_overflow", False),
+                keep_recent_turns_override=(
+                    getattr(dispatch_budget, "keep_recent_turns_override", None)
+                    if getattr(dispatch_budget, "provider_overflow", False)
+                    else protected_keep_recent_turns
+                ),
             )
-            if not compacted.triggered:
+            preflight_not_applicable = (
+                not compacted.triggered
+                and compacted.skipped_reason in COMPACTION_NOT_APPLICABLE_REASONS
+                and dispatch_budget.fits
+            )
+            if not compacted.triggered and not preflight_not_applicable:
                 logger.warning(
                     f"[Channel] context recovery could not compact session={session_id}: {compacted.skipped_reason}"
                 )
                 return None
             async with async_session() as recovery_db:
-                prefix = await load_history_prefix_before_anchor(
+                recovered = await load_recoverable_history_for_turn(
                     recovery_db,
                     agent_id=history_agent_id,
                     conversation_id=session_id,
@@ -403,10 +416,13 @@ async def _call_agent_llm(
                     ctx_size=ctx_size,
                     is_group=is_group,
                 )
-            if prefix is None:
+            if not recovered:
                 logger.warning(f"[Channel] context recovery lost latest-anchor race session={session_id}")
                 return None
-            return _normalize_history_messages(prefix) + frozen_current_suffix
+            return ContextRecoveryMessages(
+                _normalize_history_messages(recovered),
+                preflight_not_applicable=preflight_not_applicable,
+            )
 
         context_recovery = _recover_context
 
@@ -503,15 +519,21 @@ async def _call_agent_llm(
         if not text:
             return
         await _web_broadcast({"type": "chunk", "content": text})
-        if on_chunk is not None:
-            await on_chunk(text)
+        await run_channel_reaction_hook(
+            on_chunk,
+            text,
+            hook_name="on_chunk",
+        )
 
     async def _emit_thinking(text: str) -> None:
         if not text:
             return
         await _web_broadcast({"type": "thinking", "content": text})
-        if on_thinking is not None:
-            await on_thinking(text)
+        await run_channel_reaction_hook(
+            on_thinking,
+            text,
+            hook_name="on_thinking",
+        )
 
     async def _on_chunk_bridged(text: str):
         await _emit_chunk(chunk_guard.feed(text))
@@ -540,8 +562,11 @@ async def _call_agent_llm(
             {**public_evt, "args": sanitize_tool_args(public_evt.get("args"))} if "args" in public_evt else public_evt
         )
         await _web_broadcast({"type": "tool_call", **_evt})
-        if on_tool_call is not None:
-            await on_tool_call(public_evt)
+        await run_channel_reaction_hook(
+            on_tool_call,
+            public_evt,
+            hook_name="on_tool_call",
+        )
 
     # Reuse the unified, failover-aware caller — the SAME path as the WebSocket
     # chat endpoint, so every provider behaves identically on both surfaces.

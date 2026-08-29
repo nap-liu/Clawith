@@ -136,6 +136,9 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
     async def fake_history(*_args, **_kwargs):
         return [{"role": "user", "content": "recover"}]
 
+    async def fake_normalize(*_args, **_kwargs):
+        return None
+
     async def fake_llm(db, *_args, **kwargs):
         assert capacity_active is True
         assert kwargs["release_db_before_dispatch"] is True
@@ -148,6 +151,15 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
 
     async def fake_deliver(*_args, **_kwargs):
         return True
+
+    async def fake_runtime(**_kwargs):
+        return SimpleNamespace(source_channel="web")
+
+    async def fake_snapshot(*_args, **_kwargs):
+        return SimpleNamespace()
+
+    async def fake_publish(*_args, **_kwargs):
+        return None
 
     class _Capacity:
         @asynccontextmanager
@@ -166,10 +178,24 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
     monkeypatch.setattr(turn_recovery, "_recovery_origin_matches", fake_origin_matches)
     monkeypatch.setattr(turn_recovery, "_tail_has_pending_confirmation", fake_pending)
     monkeypatch.setattr(turn_recovery, "_complete_unfinished_tool_calls", fake_complete)
+    monkeypatch.setattr(
+        turn_recovery,
+        "_normalize_completed_tool_rounds_for_recovery",
+        fake_normalize,
+    )
     monkeypatch.setattr(turn_recovery, "load_recoverable_history_for_turn", fake_history)
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_llm)
     monkeypatch.setattr(turn_recovery, "persist_assistant_reply_row", fake_persist)
     monkeypatch.setattr(turn_recovery, "_deliver_recovered_reply", fake_deliver)
+    monkeypatch.setattr(turn_recovery, "load_turn_runtime", fake_runtime)
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.get_conversation_turn_snapshot",
+        fake_snapshot,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.publish_conversation_turn_event",
+        fake_publish,
+    )
     monkeypatch.setattr(turn_recovery, "get_workload_capacity", _Capacity)
 
     assert await turn_recovery.resume_turn(anchor) is True

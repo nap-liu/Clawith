@@ -21,68 +21,58 @@ Everything else (caching, budgets, message layout) is layered above it.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
-import uuid
-from pathlib import Path
+import re
+from dataclasses import dataclass
 
 from loguru import logger
 
-from app.config import get_settings
+from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+from app.services.storage import get_storage_backend
 from app.services.tool_result_paths import (
     sanitize_tool_result_component,
     tool_result_session_dir,
 )
 
-from .tool_result_shaping import shape_tool_result
-
 PERSISTED_OPEN = "<persisted-output>"
 PERSISTED_CLOSE = "</persisted-output>"
-PREVIEW_CHARS = 2_000
+MIN_PERSISTED_VIEW_CHARS = 1_024
 
-TOOL_OUTPUT_MAX_CHARS: dict[str, int | float] = {
-    # Sized for ~128K-token models (qwen3.5-plus, qwen-max-latest). Common
-    # report payloads (svc report query, search results, JSON dumps) sit
-    # in the 60–95 KB range; the previous 50 KB / 30 KB buckets pushed
-    # them through persisted-output → read_file → re-persisted loops.
-    # Doubled across the board so the typical query lands inline in one
-    # tool call. Truly oversized output (the long tail) still gets
-    # materialized to disk.
-    "execute_code": 60_000,
-    "run_command": 60_000,
-    "bash": 60_000,
-    "grep": 40_000,
-    "search_files": 40_000,
-    # read_document returns full extracted text (no tool-layer truncation); a
-    # modest budget makes large documents overflow to a .tool_results/ file early
-    # so the agent pages through them via read_file instead of flooding context.
-    "read_document": 40_000,
-    # read_file itself remains format-agnostic and exact-path.  Its line-based
-    # pagination cannot bound context size when a minified HTML/JSON payload is
-    # stored on one very long line, so the platform output layer must still
-    # materialize oversized results before they enter or re-enter LLM history.
-    "read_file": 60_000,
-    "list_files": 100_000,
-    "_default": 100_000,
-}
+# One platform-wide inline ceiling keeps tool behavior predictable and leaves
+# room for the system prompt, recent turns, and model output. 32K characters
+# covers ordinary command/search/read results; larger payloads remain lossless
+# through persisted-output and targeted follow-up reads.
+DEFAULT_TOOL_OUTPUT_MAX_CHARS = 32_000
 
 ENV_OVERRIDE = "CLAWITH_TOOL_OUTPUT_MAX_CHARS"
+_SAVED_PATH_RE = re.compile(r"Full output saved to:\s*([^\s<>]+)", re.IGNORECASE)
+_TRUNCATION_LINE_RE = re.compile(r"^TRUNCATED:[^\n]*", re.MULTILINE)
+_INLINE_PREVIEW_RE = re.compile(
+    r"Inline preview:\n(?P<preview>.*?)\n\.\.\.\[truncated; read the saved file for the remainder\]\.\.\.",
+    re.DOTALL,
+)
 
 def _default_budget() -> int:
     override = os.environ.get(ENV_OVERRIDE)
     if override:
         try:
-            return int(override)
+            value = int(override)
+            if value >= MIN_PERSISTED_VIEW_CHARS:
+                return value
+            logger.warning(
+                f"[tool_output_store] {ENV_OVERRIDE}={value} is too small to include "
+                f"truncation metadata and a readable path; ignoring"
+            )
         except ValueError:
             logger.warning(f"[tool_output_store] invalid {ENV_OVERRIDE}={override!r}, ignoring")
-    fallback = TOOL_OUTPUT_MAX_CHARS["_default"]
-    return int(fallback) if fallback != float("inf") else 50_000
+    return DEFAULT_TOOL_OUTPUT_MAX_CHARS
 
 
 def budget_for(tool_name: str) -> int | float:
-    """Return the char budget for a tool, honoring env override on the default bucket."""
-    if tool_name in TOOL_OUTPUT_MAX_CHARS:
-        return TOOL_OUTPUT_MAX_CHARS[tool_name]
+    """Return the normalized tool-output budget, honoring one env override."""
     return _default_budget()
 
 
@@ -91,19 +81,19 @@ def _sanitize(name: str) -> str:
     return sanitize_tool_result_component(name)
 
 
-def _store_dir(agent_id, session_id: str) -> Path:
-    settings = get_settings()
-    storage_backend = (settings.STORAGE_BACKEND or "local").strip().lower()
-    if storage_backend == "s3" and not settings.STORAGE_LOCAL_FALLBACK_ENABLED:
-        # This materializer is synchronous and cannot truthfully claim that a
-        # file was saved into an async-only remote backend.  The public caller
-        # will return a bounded inline result instead of an unreadable path.
-        raise RuntimeError("tool-output materialization requires local-readable storage")
-    return (
-        Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR)
-        / str(agent_id)
-        / Path(tool_result_session_dir(session_id))
-    )
+class ToolOutputMaterializationError(RuntimeError):
+    """The full result could not be saved to a path readable by agent tools."""
+
+
+class ToolOutputBudgetExceeded(RuntimeError):
+    """A fresh tool round cannot fit beneath the configured hard ceiling."""
+
+
+@dataclass(frozen=True)
+class MaterializedToolOutput:
+    llm_view: str
+    relative_path: str
+    storage_key: str
 
 
 def _format_size(n: int) -> str:
@@ -136,71 +126,172 @@ def _render_persisted(
     tool_name: str,
     rel_path: str,
     size_bytes: int,
-    preview: str,
+    result: str,
+    max_view_chars: int,
 ) -> str:
     bounded_read_hint = (
         "For ordinary multi-line text, use read_file with a small line range. "
         if tool_name != "read_file"
         else ""
     )
-    return (
-        f"{PERSISTED_OPEN}\n"
-        f"Output too large ({_format_size(size_bytes)}). "
-        f"Full output saved to: {rel_path}\n\n"
-        f"Preview (first {PREVIEW_CHARS:,} chars):\n"
-        f"{preview}\n"
-        f"{'...' if size_bytes > len(preview.encode('utf-8')) else ''}\n\n"
-        f"{bounded_read_hint}Use grep/search_files for targeted lookup, or execute_code_aio to "
-        f"process the referenced output or original source file directly. "
-        f"Keep code output bounded to summaries, validation results, and file paths; "
-        f"do not read the full bulk output back into chat.\n"
-        f"{PERSISTED_CLOSE}"
-    )
+    limit = max(MIN_PERSISTED_VIEW_CHARS, int(max_view_chars))
+
+    def _compose(preview_chars: int) -> str:
+        preview = result[:preview_chars]
+        return (
+            f"{PERSISTED_OPEN}\n"
+            f"TRUNCATED: original output contains {len(result):,} characters "
+            f"({_format_size(size_bytes)}). The inline view retains the first "
+            f"{len(preview):,} characters within the {limit:,}-character limit.\n"
+            f"Full output saved to: {rel_path}\n\n"
+            f"Inline preview:\n{preview}\n...[truncated; read the saved file for the remainder]...\n\n"
+            f"{bounded_read_hint}Use grep/search_files for targeted lookup, or execute_code_aio to "
+            f"process the referenced output or original source file directly. "
+            f"Keep code output bounded to summaries, validation results, and file paths; "
+            f"do not read the full bulk output back into chat.\n"
+            f"{PERSISTED_CLOSE}"
+        )
+
+    # Metadata/path length varies, so calculate the largest preview that keeps
+    # the complete LLM view within the configured ceiling.
+    preview_chars = min(len(result), limit)
+    for _ in range(4):
+        rendered = _compose(preview_chars)
+        overflow = len(rendered) - limit
+        if overflow <= 0:
+            return rendered
+        preview_chars = max(0, preview_chars - overflow)
+    rendered = _compose(preview_chars)
+    if len(rendered) > limit:
+        raise ValueError(f"persisted output metadata exceeds view limit ({len(rendered)} > {limit})")
+    return rendered
 
 
-def _materialize_to_file(
+def _shrink_persisted_view(view: str, *, max_view_chars: int) -> str | None:
+    """Shrink an existing envelope without touching its full-output object."""
+    if not view.startswith(PERSISTED_OPEN) or PERSISTED_CLOSE not in view:
+        return None
+    path_match = _SAVED_PATH_RE.search(view)
+    truncation_match = _TRUNCATION_LINE_RE.search(view)
+    if path_match is None or truncation_match is None:
+        return None
+    preview_match = _INLINE_PREVIEW_RE.search(view)
+    preview_source = preview_match.group("preview") if preview_match else ""
+    limit = max(MIN_PERSISTED_VIEW_CHARS, int(max_view_chars))
+    original_descriptor = truncation_match.group(0).split(". The inline view", 1)[0].rstrip(".")
+
+    def _compose(preview_chars: int) -> str:
+        return (
+            f"{PERSISTED_OPEN}\n"
+            f"{original_descriptor}. This re-rendered inline view retains the first "
+            f"{preview_chars:,} characters within the {limit:,}-character limit.\n"
+            f"Full output saved to: {path_match.group(1)}\n\n"
+            f"Inline preview:\n{preview_source[:preview_chars]}\n"
+            "...[truncated; read the saved file for the remainder]...\n\n"
+            "Use read_file with a small line range or grep/search_files on the saved path. "
+            "Do not load the full bulk output back into chat.\n"
+            f"{PERSISTED_CLOSE}"
+        )
+
+    preview_chars = min(len(preview_source), limit)
+    for _ in range(4):
+        rendered = _compose(preview_chars)
+        overflow = len(rendered) - limit
+        if overflow <= 0:
+            return rendered
+        preview_chars = max(0, preview_chars - overflow)
+    rendered = _compose(preview_chars)
+    return rendered if len(rendered) <= limit else None
+
+
+async def materialize_tool_output_strict(
     result: str,
     *,
     tool_name: str,
     agent_id,
     session_id: str,
     tool_call_id: str,
-) -> str:
-    """Write ``result`` to the agent workspace and return the llm_view.
+    max_view_chars: int,
+) -> MaterializedToolOutput:
+    """Persist every byte through the configured storage backend.
 
-    Shared internal helper. Raises on any failure (missing agent_id,
-    unwritable filesystem, …); the two public entrypoints
-    (:func:`finalize_tool_output`, :func:`force_materialize_tool_output`)
-    decide how to recover.
+    The returned path is the same agent-relative path accepted by ``read_file``.
+    Failure is explicit: callers must never replace a durable result with an
+    inline truncation that has no readable recovery path.
     """
     if not agent_id:
-        raise ValueError("missing agent_id")
-    store_dir = _store_dir(agent_id, session_id)
-    store_dir.mkdir(parents=True, exist_ok=True)
+        raise ToolOutputMaterializationError("missing agent_id")
 
     ext = "json" if _looks_like_json(result) else "txt"
-    tc_id = _sanitize(tool_call_id) or uuid.uuid4().hex[:12]
-    filename = f"{_sanitize(tool_name)}_{tc_id}.{ext}"
-    full_path = store_dir / filename
-
-    full_path.write_text(result, encoding="utf-8")
-
+    tc_id = (_sanitize(tool_call_id) or "call")[:60]
+    # Provider call IDs are not guaranteed unique across rounds. Content-
+    # addressed identity prevents cross-round overwrite while making retries
+    # idempotent instead of leaving a new random orphan after every attempt.
+    materialization_id = hashlib.sha256(result.encode("utf-8")).hexdigest()[:12]
+    filename = f"{_sanitize(tool_name)}_{tc_id}_{materialization_id}.{ext}"
     rel_path = (tool_result_session_dir(session_id) / filename).as_posix()
-    preview = result[:PREVIEW_CHARS]
+    storage_key = current_agent_runtime_workspace(agent_id).storage_key(rel_path)
+    # Render first.  A malformed/oversized metadata envelope must fail before
+    # the durable write, otherwise the caller sees an exception while an
+    # unreferenced object is left behind in local/S3 storage.
     view = _render_persisted(
         tool_name=tool_name,
         rel_path=rel_path,
         size_bytes=len(result.encode("utf-8")),
-        preview=preview,
+        result=result,
+        max_view_chars=max_view_chars,
     )
+    storage = get_storage_backend()
+    try:
+        if await storage.exists(storage_key):
+            existing = await storage.read_text(
+                storage_key,
+                encoding="utf-8",
+                errors="strict",
+            )
+            if existing != result:
+                raise ToolOutputMaterializationError(
+                    "content-addressed tool output path contains different bytes"
+                )
+            logger.info(
+                f"[tool_output_store] reused materialized tool={tool_name} "
+                f"size={len(result)} path={rel_path}"
+            )
+            return MaterializedToolOutput(
+                llm_view=view,
+                relative_path=rel_path,
+                storage_key=storage_key,
+            )
+    except ToolOutputMaterializationError:
+        raise
+    except Exception as exc:
+        raise ToolOutputMaterializationError(
+            f"failed to verify existing tool output: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        await storage.write_text(storage_key, result, encoding="utf-8")
+    except BaseException as exc:
+        # Never delete a content-addressed target here. Another retry/process
+        # may already have committed the same stable object and an unconditional
+        # cleanup would destroy an older history row's recovery path. Failed
+        # writes are never referenced; a later retry verifies exact bytes.
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise ToolOutputMaterializationError(
+            f"failed to persist full tool output: {type(exc).__name__}: {exc}"
+        ) from exc
     logger.info(
         f"[tool_output_store] materialized tool={tool_name} "
         f"size={len(result)} path={rel_path}"
     )
-    return view
+    return MaterializedToolOutput(
+        llm_view=view,
+        relative_path=rel_path,
+        storage_key=storage_key,
+    )
 
 
-def finalize_tool_output(
+async def finalize_tool_output(
     result,
     *,
     tool_name: str,
@@ -216,10 +307,9 @@ def finalize_tool_output(
 
     Empty output is normalized so the LLM never sees a blank tool result.
 
-    Writes to the agent workspace when the result exceeds the per-tool
-    budget. If the write fails (missing agent/session, disk error), falls
-    back to a bounded head+tail shape so the caller always gets a usable
-    string — we never silently drop a tool result.
+    Writes to the configured agent workspace when the result exceeds the
+    per-tool budget. Persistence failure raises instead of manufacturing an
+    unrecoverable truncation without a readable path.
     """
     if not isinstance(result, str):
         return result
@@ -231,42 +321,35 @@ def finalize_tool_output(
     if budget == float("inf") or len(result) <= budget:
         return result
 
-    try:
-        return _materialize_to_file(
-            result,
-            tool_name=tool_name,
-            agent_id=agent_id,
-            session_id=session_id,
-            tool_call_id=tool_call_id,
-        )
-    except Exception as exc:
-        logger.warning(
-            f"[tool_output_store] materialize failed tool={tool_name} "
-            f"err={type(exc).__name__}: {exc}; falling back to inline shape"
-        )
-        shaped, _ = shape_tool_result(result, int(budget))
-        return shaped
+    materialized = await materialize_tool_output_strict(
+        result,
+        tool_name=tool_name,
+        agent_id=agent_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        max_view_chars=int(budget),
+    )
+    return materialized.llm_view
 
 
-def force_materialize_tool_output(
+async def force_materialize_tool_output(
     result: str,
     *,
     tool_name: str,
     agent_id,
     session_id: str,
     tool_call_id: str,
+    max_view_chars: int | None = None,
 ) -> str:
     """Always materialize to disk regardless of tool budget.
 
-    Unlike :func:`finalize_tool_output` which checks per-tool budget
+    Unlike :func:`finalize_tool_output` which checks the normalized budget
     first, this is the escape hatch used by the message-level enforcer
     when the sum of multiple in-budget results blows past the message
     cap.
 
-    Same storage layout, same ``<persisted-output>`` render format. On
-    failure (disk error, missing agent_id), falls back to inline
-    :func:`shape_tool_result` bounded at the per-tool budget — we never
-    silently drop a tool result.
+    Same storage layout and ``<persisted-output>`` format. Failure is strict so
+    a caller cannot mistake an old nested envelope for this write's success.
     """
     if not isinstance(result, str):
         return result
@@ -274,31 +357,35 @@ def force_materialize_tool_output(
     if not result:
         return _render_empty(tool_name)
 
-    try:
-        return _materialize_to_file(
-            result,
-            tool_name=tool_name,
-            agent_id=agent_id,
-            session_id=session_id,
-            tool_call_id=tool_call_id,
-        )
-    except Exception as exc:
-        logger.warning(
-            f"[tool_output_store] force_materialize failed tool={tool_name} "
-            f"err={type(exc).__name__}: {exc}; falling back to inline shape"
-        )
-        budget = budget_for(tool_name)
-        bound = int(budget) if budget != float("inf") else 50_000
-        shaped, _ = shape_tool_result(result, bound)
-        return shaped
+    budget = budget_for(tool_name)
+    bound = int(budget) if budget != float("inf") else DEFAULT_TOOL_OUTPUT_MAX_CHARS
+    view_limit = max_view_chars if max_view_chars is not None else bound
+
+    materialized = await materialize_tool_output_strict(
+        result,
+        tool_name=tool_name,
+        agent_id=agent_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        max_view_chars=view_limit,
+    )
+    return materialized.llm_view
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Message-level (cross-tool) budget enforcement
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 240_000
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 64_000
 MSG_BUDGET_ENV_OVERRIDE = "CLAWITH_MSG_TOOL_BUDGET"
+
+
+@dataclass(frozen=True)
+class ToolOutputRewrite:
+    """One fresh tool result changed by the round-level budget enforcer."""
+
+    tool_call_id: str
+    final_content: str
 
 
 def _message_budget(default: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) -> int:
@@ -306,7 +393,13 @@ def _message_budget(default: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) -> int:
     override = os.environ.get(MSG_BUDGET_ENV_OVERRIDE)
     if override:
         try:
-            return int(override)
+            value = int(override)
+            if value >= MIN_PERSISTED_VIEW_CHARS:
+                return value
+            logger.warning(
+                f"[tool_output_store] {MSG_BUDGET_ENV_OVERRIDE}={value} is too small "
+                f"for a recoverable persisted-output envelope; ignoring"
+            )
         except ValueError:
             logger.warning(
                 f"[tool_output_store] invalid {MSG_BUDGET_ENV_OVERRIDE}={override!r}, ignoring"
@@ -356,57 +449,63 @@ def _tool_name_for_call_id(api_messages, tool_idx: int, tool_call_id: str) -> st
     return "unknown"
 
 
-def enforce_message_budget(
+async def enforce_message_budget(
     api_messages: list,
     *,
     fresh_start_idx: int,
     agent_id,
     session_id: str,
     max_chars: int | None = None,
-) -> None:
-    """Keep the total tool-message char count across ``api_messages`` under
+) -> list[ToolOutputRewrite]:
+    """Keep this fresh round's total tool-message characters under
     ``max_chars`` by force-materializing the largest fresh inline tool
     messages until we are within budget.
 
     Strategy:
-      1. Sum ``len(content)`` across *all* tool messages with string
-         content (budget is a global ceiling on the current dispatch).
+      1. Sum ``len(content)`` across fresh tool messages with string
+         content (the ceiling is independent for every tool-call round).
       2. While over budget, pick the LARGEST fresh (index >=
          ``fresh_start_idx``) tool message whose content is a plain
          string AND does not already contain a ``<persisted-output>``
          block, force-materialize it, and replace the ``LLMMessage`` in
          place (new instance — no in-place attribute mutation).
-      3. Stop when we are under budget OR no more candidates exist.
+      3. Stop only when the hard postcondition is satisfied. If even minimal
+         recoverable envelopes cannot fit, raise before provider dispatch.
 
     Append-only invariant: ``api_messages[:fresh_start_idx]`` is NEVER
     mutated. Those are historical messages — changing them would
     invalidate the prefix cache. If we run out of fresh candidates while
-    still over budget, we log a warning and return.
+    still over budget, fail closed rather than treating the ceiling as advice.
 
     Vision list-content tool messages are excluded from both the size
-    calculation and the materialization candidate pool.
+    calculation and the materialization candidate pool. The returned rewrite
+    records let the caller reconcile the already-durable done rows before the
+    next provider dispatch.
     """
     if max_chars is None:
         max_chars = _message_budget()
 
     def _total() -> int:
-        return sum(_tool_message_size(m) for m in api_messages)
+        return sum(_tool_message_size(m) for m in api_messages[fresh_start_idx:])
 
     total = _total()
     if total <= max_chars:
-        return
+        return []
+
+    rewrites: list[ToolOutputRewrite] = []
+    rewritten_indices: set[int] = set()
 
     # Build (size, index) list over fresh inline tool candidates.
     def _fresh_candidates() -> list[tuple[int, int]]:
         out: list[tuple[int, int]] = []
         for i in range(fresh_start_idx, len(api_messages)):
+            if i in rewritten_indices:
+                continue
             m = api_messages[i]
             if getattr(m, "role", None) != "tool":
                 continue
             c = getattr(m, "content", None)
             if not isinstance(c, str):
-                continue
-            if PERSISTED_OPEN in c:
                 continue
             out.append((len(c), i))
         # Largest first.
@@ -419,12 +518,11 @@ def enforce_message_budget(
     while total > max_chars:
         candidates = _fresh_candidates()
         if not candidates:
-            logger.warning(
-                f"[tool_output_store] message budget still exceeded after "
-                f"exhausting fresh candidates: total={total} cap={max_chars} "
+            raise ToolOutputBudgetExceeded(
+                "fresh tool results cannot fit the message budget after "
+                f"lossless materialization: total={total} cap={max_chars} "
                 f"fresh_start_idx={fresh_start_idx}"
             )
-            return
 
         _, idx = candidates[0]
         orig = api_messages[idx]
@@ -432,13 +530,30 @@ def enforce_message_budget(
         tool_call_id = getattr(orig, "tool_call_id", "") or ""
         tool_name = _tool_name_for_call_id(api_messages, idx, tool_call_id)
 
-        new_content = force_materialize_tool_output(
-            content_str,
-            tool_name=tool_name,
-            agent_id=agent_id,
-            session_id=session_id,
-            tool_call_id=tool_call_id,
+        # Retain as much of this result as the remaining cumulative capacity
+        # permits. The rendered envelope, explicit truncation notice, path and
+        # preview together stay within this target.
+        remaining_without_candidate = total - len(content_str)
+        target_view_chars = max(
+            MIN_PERSISTED_VIEW_CHARS,
+            min(
+                int(budget_for(tool_name)),
+                max_chars - remaining_without_candidate,
+            ),
         )
+        new_content = _shrink_persisted_view(
+            content_str,
+            max_view_chars=target_view_chars,
+        )
+        if new_content is None:
+            new_content = await force_materialize_tool_output(
+                content_str,
+                tool_name=tool_name,
+                agent_id=agent_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                max_view_chars=target_view_chars,
+            )
 
         # Replace with a fresh LLMMessage — never mutate the existing
         # instance. Even though this entry is "fresh" for this round,
@@ -452,6 +567,13 @@ def enforce_message_budget(
             reasoning_content=orig.reasoning_content,
             reasoning_signature=orig.reasoning_signature,
         )
+        rewrites.append(
+            ToolOutputRewrite(
+                tool_call_id=tool_call_id,
+                final_content=new_content,
+            )
+        )
+        rewritten_indices.add(idx)
 
         new_total = _total()
         logger.info(
@@ -462,9 +584,14 @@ def enforce_message_budget(
         # Forward progress guard: if total did not decrease, bail to
         # avoid a tight loop on a pathological materialize output.
         if new_total >= total:
-            logger.warning(
-                f"[tool_output_store] message budget: no progress after "
-                f"materialize idx={idx}; stopping"
+            raise ToolOutputBudgetExceeded(
+                "tool-result materialization made no budget progress: "
+                f"idx={idx} total={total} cap={max_chars}"
             )
-            return
         total = new_total
+
+    if total > max_chars:  # defensive assertion for future loop changes
+        raise ToolOutputBudgetExceeded(
+            f"fresh tool results exceed hard budget: total={total} cap={max_chars}"
+        )
+    return rewrites

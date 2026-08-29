@@ -2663,6 +2663,7 @@ export default function AgentDetailPage() {
         primary_model_id: '',
         fallback_model_id: '',
         context_window_size: 100,
+        daily_memory_load_days: 2,
         max_tool_rounds: 50,
         max_tokens_per_day: '' as string | number,
         max_tokens_per_month: '' as string | number,
@@ -2683,6 +2684,7 @@ export default function AgentDetailPage() {
                 primary_model_id: agent.primary_model_id || '',
                 fallback_model_id: agent.fallback_model_id || '',
                 context_window_size: agent.context_window_size ?? 100,
+                daily_memory_load_days: (agent as any).daily_memory_load_days ?? 2,
                 max_tool_rounds: (agent as any).max_tool_rounds ?? 50,
                 max_tokens_per_day: agent.max_tokens_per_day || '',
                 max_tokens_per_month: agent.max_tokens_per_month || '',
@@ -2704,6 +2706,7 @@ export default function AgentDetailPage() {
         settingsForm.primary_model_id !== (agent?.primary_model_id || '') ||
         settingsForm.fallback_model_id !== (agent?.fallback_model_id || '') ||
         settingsForm.context_window_size !== (agent?.context_window_size ?? 100) ||
+        settingsForm.daily_memory_load_days !== ((agent as any)?.daily_memory_load_days ?? 2) ||
         settingsForm.max_tool_rounds !== ((agent as any)?.max_tool_rounds ?? 50) ||
         String(settingsForm.max_tokens_per_day) !== String(agent?.max_tokens_per_day || '') ||
         String(settingsForm.max_tokens_per_month) !== String(agent?.max_tokens_per_month || '') ||
@@ -2721,6 +2724,7 @@ export default function AgentDetailPage() {
                 primary_model_id: settingsForm.primary_model_id || null,
                 fallback_model_id: settingsForm.fallback_model_id || null,
                 context_window_size: settingsForm.context_window_size,
+                daily_memory_load_days: settingsForm.daily_memory_load_days,
                 max_tool_rounds: settingsForm.max_tool_rounds,
                 max_tokens_per_day: settingsForm.max_tokens_per_day ? Number(settingsForm.max_tokens_per_day) : null,
                 max_tokens_per_month: settingsForm.max_tokens_per_month ? Number(settingsForm.max_tokens_per_month) : null,

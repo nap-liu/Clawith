@@ -17,9 +17,8 @@ execution turn and keeps it available throughout the complete tool loop.
 Path pattern: `memory/<YYYY-MM-DD>/memory.md`
 
 Each date directory contains the detailed work record for that date. The
-platform automatically loads at most the two most recent existing Daily Memory
-files into every execution turn and keeps them available throughout the
-complete tool loop.
+platform loads the configured number of most recent existing Daily Memory files
+into every execution turn. This can be disabled in Agent settings.
 
 Older Daily Memory files remain under `memory/` but are not automatically
 loaded. When older information is needed:

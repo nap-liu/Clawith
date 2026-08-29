@@ -24,18 +24,21 @@ E. If the re-streamed (resumed) response carries ``tool_calls``, the outer
 from __future__ import annotations
 
 import json
+import uuid
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from app.services.chat_history import build_llm_messages_from_rows
 from app.services.llm.caller import (
     MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
     RESUME_PROMPT,
     _response_was_truncated_by_length,
     call_llm,
 )
-from app.services.llm.client import LLMMessage, LLMResponse
+from app.services.llm.client import LLMError, LLMMessage, LLMResponse
 
 
 def _stop_response(content: str) -> LLMResponse:
@@ -72,7 +75,10 @@ class _ScriptedClient:
         })
         if not self._script:
             raise AssertionError("ScriptedClient ran out of responses")
-        return self._script.pop(0)
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     async def close(self):
         self.closed = True
@@ -129,6 +135,14 @@ def _patch_caller_collaborators(monkeypatch, client, tools=None):
         "app.services.llm.caller._persist_tool_call_events_strict",
         AsyncMock(return_value=True),
     )
+    monkeypatch.setattr(
+        "app.services.session_token_usage.load_latest_round_context_usage",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.assert_conversation_turn_running",
+        AsyncMock(return_value=None),
+    )
 
 
 # ─── Helper predicate tests ───────────────────────────────────────────────────
@@ -140,6 +154,26 @@ def test_predicate_recognises_all_three_provider_spellings():
     assert _response_was_truncated_by_length(
         LLMResponse(content="x", finish_reason="length")
     ) is True
+
+
+def test_durable_max_output_partial_replays_resume_prompt():
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="assistant",
+        content="partial-",
+        thinking=None,
+        message_meta={
+            "artifact_role": "intermediate_assistant",
+            "turn_status": "running",
+            "max_output_resume_prompt": RESUME_PROMPT,
+            "attachments": [],
+        },
+    )
+
+    assert build_llm_messages_from_rows([row]) == [
+        {"role": "assistant", "content": "partial-"},
+        {"role": "user", "content": RESUME_PROMPT},
+    ]
     assert _response_was_truncated_by_length(
         LLMResponse(content="x", finish_reason="max_tokens")
     ) is True
@@ -318,11 +352,17 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
         _fake_tool,
     )
 
+    tool_events = []
+
+    async def capture_tool_event(event):
+        tool_events.append(dict(event))
+
     result = await call_llm(
         model=_FakeModel(),
         messages=[{"role": "user", "content": "please check a.txt"}],
         agent_name="T", role_description="",
         agent_id="agent-x", user_id="user-x", session_id="s",
+        on_tool_call=capture_tool_event,
     )
 
     # The recovered tool-call round was streamed to the user, so it remains
@@ -353,6 +393,12 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
     # And the tool result follows right after the tool-calls assistant turn.
     assert round_1_msgs[tool_turn_idx + 1].role == "tool"
     assert round_1_msgs[tool_turn_idx + 1].content == "file-contents"
+    done_event = next(event for event in tool_events if event.get("status") == "done")
+    assert done_event["assistant_content"] == "going to call a tool"
+    assert done_event["recovery_prefix_messages"] == [
+        {"role": "assistant", "content": "thinking... "},
+        {"role": "user", "content": RESUME_PROMPT},
+    ]
 
 
 @pytest.mark.asyncio
@@ -422,3 +468,135 @@ async def test_changing_file_failures_remain_visible_to_model_until_it_replies(m
         "stat: cannot statx 'workspace/uploads/６　月稽核月报.xlsx': No such file or directory",
     ]
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_late_injection_persists_a1_before_claim_and_overflow_recovery_keeps_it(
+    monkeypatch,
+):
+    client = _ScriptedClient(
+        [
+            _stop_response("A1"),
+            LLMError("context_length_exceeded"),
+            _stop_response("A2"),
+        ]
+    )
+    _patch_caller_collaborators(monkeypatch, client)
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    anchor_id = uuid.uuid4()
+    events: list[str] = []
+    persisted: list[dict[str, Any]] = []
+
+    async def persist_intermediate(_factory, **kwargs):
+        events.append("persist:A1")
+        persisted.append(dict(kwargs))
+        return uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.services.chat_history.persist_intermediate_assistant_reply",
+        persist_intermediate,
+    )
+    delivered = False
+
+    async def before_round(_round, *, before_injection=None):
+        nonlocal delivered
+        if delivered or before_injection is None:
+            return []
+        await before_injection()
+        events.append("claim:injection")
+        delivered = True
+        return [{"role": "user", "content": "injection"}]
+
+    async def recover(_model, _budget):
+        events.append("recover")
+        return [
+            {"role": "user", "content": "root"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "injection"},
+        ]
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "root"}],
+        agent_name="T",
+        role_description="",
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        turn_anchor_id=anchor_id,
+        turn_anchor_agent_id=agent_id,
+        context_recovery=recover,
+        before_round=before_round,
+    )
+
+    assert result == "A1\n\nA2"
+    assert events[:2] == ["persist:A1", "claim:injection"]
+    assert events.count("persist:A1") == 1
+    assert persisted[0]["content"] == "A1"
+    assert len(client.stream_calls) == 3
+    recovered_messages = client.stream_calls[-1]["messages"]
+    assert [message.role for message in recovered_messages][-3:] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert recovered_messages[-2].content == "A1"
+    assert "injection" in recovered_messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_max_output_partial_is_durable_before_resume_overflow_recovery(
+    monkeypatch,
+):
+    client = _ScriptedClient(
+        [
+            LLMResponse(content="partial-", finish_reason="length"),
+            LLMError("maximum context length exceeded"),
+            _stop_response("tail"),
+        ]
+    )
+    _patch_caller_collaborators(monkeypatch, client)
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    persisted: list[dict[str, Any]] = []
+
+    async def persist_intermediate(_factory, **kwargs):
+        persisted.append(dict(kwargs))
+        return uuid.uuid4()
+
+    monkeypatch.setattr(
+        "app.services.chat_history.persist_intermediate_assistant_reply",
+        persist_intermediate,
+    )
+
+    async def recover(_model, _budget):
+        return [
+            {"role": "user", "content": "root"},
+            {"role": "assistant", "content": "partial-"},
+            {"role": "user", "content": RESUME_PROMPT},
+        ]
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "root"}],
+        agent_name="T",
+        role_description="",
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        turn_anchor_id=uuid.uuid4(),
+        turn_anchor_agent_id=agent_id,
+        context_recovery=recover,
+    )
+
+    assert result == "partial-tail"
+    assert len(persisted) == 1
+    assert persisted[0]["content"] == "partial-"
+    assert persisted[0]["max_output_resume_prompt"] == RESUME_PROMPT
+    assert len(client.stream_calls) == 3
+    recovered_messages = client.stream_calls[-1]["messages"]
+    assert recovered_messages[-2].role == "assistant"
+    assert recovered_messages[-2].content == "partial-"
+    assert recovered_messages[-1].role == "user"
+    assert recovered_messages[-1].content.endswith(RESUME_PROMPT)

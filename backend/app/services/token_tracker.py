@@ -23,6 +23,11 @@ class TokenUsage:
     cache_eligible_input_tokens: int = 0
     estimated_tokens: int = 0
 
+    @property
+    def context_input_tokens(self) -> int:
+        """Provider-authoritative full context input, including cached input."""
+        return max(self.input_tokens, self.cache_eligible_input_tokens)
+
     def add(self, other: "TokenUsage") -> None:
         self.total_tokens += other.total_tokens
         self.input_tokens += other.input_tokens
@@ -31,16 +36,6 @@ class TokenUsage:
         self.cache_creation_tokens += other.cache_creation_tokens
         self.cache_eligible_input_tokens += other.cache_eligible_input_tokens
         self.estimated_tokens += other.estimated_tokens
-
-
-def estimate_tokens_from_chars(total_chars: int) -> int:
-    """Rough token estimate when real usage is unavailable. ~3 chars per token."""
-    return max(total_chars // 3, 1)
-
-
-def estimate_token_usage_from_chars(total_chars: int) -> TokenUsage:
-    tokens = estimate_tokens_from_chars(total_chars)
-    return TokenUsage(total_tokens=tokens, estimated_tokens=tokens)
 
 
 def _int_token(value) -> int:
@@ -125,13 +120,14 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             logger.info(f"[Token Cache] Anthropic Native Hit -> Created: {cache_creation}, Read: {cache_read} tokens")
         input_tokens = _int_token(usage.get("input_tokens", 0))
         output_tokens = _int_token(usage.get("output_tokens", 0))
+        context_input_tokens = input_tokens + cache_read + cache_creation
         return TokenUsage(
-            total_tokens=input_tokens + output_tokens,
+            total_tokens=context_input_tokens + output_tokens,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read,
             cache_creation_tokens=cache_creation,
-            cache_eligible_input_tokens=input_tokens + cache_read + cache_creation,
+            cache_eligible_input_tokens=context_input_tokens,
         )
 
     # Gemini usage metadata can be normalized by the client, but keep a direct

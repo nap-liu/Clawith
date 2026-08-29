@@ -905,6 +905,14 @@ async def process_dingtalk_message(
             "sender_nickname": sender_nick or None,
             "attachments": [*own_attachments, *quoted_attachments],
         }
+        if message_id and conversation_id:
+            # Reaction callbacks capture these values only in process memory.
+            # Persist the minimum provider coordinates needed for bounded stale
+            # progress cleanup after a backend restart; never persist secrets.
+            inbound_meta["channel_receipt"] = {
+                "provider_message_id": message_id,
+                "provider_conversation_id": conversation_id,
+            }
         if normalized_quote is not None:
             inbound_meta["quoted_message"] = normalized_quote
 
@@ -945,6 +953,15 @@ async def process_dingtalk_message(
         if not ingested.created:
             await _delete_unconsumed_uploads()
         turn_anchor_id = ingested.message.id
+        from app.services.turn_inbox import bind_durable_channel_receipt_anchor
+
+        bind_durable_channel_receipt_anchor(sess, ingested.message.id)
+        if channel_reactions and channel_reactions.bind_receipt_context:
+            channel_reactions.bind_receipt_context(
+                agent_id,
+                session_conv_id,
+                ingested.message.id,
+            )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
         if ingested.ignored_confirmation is not None:
@@ -1105,7 +1122,6 @@ async def process_dingtalk_message(
                     assistant_message_id,
                     IMDeliveryResult.from_exception("dingtalk", e),
                 )
-
         # Log activity
         from app.services.activity_logger import log_activity
         await log_activity(

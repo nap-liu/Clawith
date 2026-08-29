@@ -200,6 +200,7 @@ async def test_project_agent_blank_copy_update_and_read_are_project_owned(
         access_mode="company",
         agent_type="native",
     )
+    source.daily_memory_load_days = 0
     db.add(source)
     await db.flush()
 
@@ -239,6 +240,7 @@ async def test_project_agent_blank_copy_update_and_read_are_project_owned(
     assert agent.agent_dir == f".agents/{agent.id}"
     assert member.agent_id == agent.id
     assert member.is_enabled is True
+    assert agent.daily_memory_load_days == 0
     assert (project_repo / agent.agent_dir / "soul.md").read_text() == "# Fixed soul\n"
     assert (project_repo / agent.agent_dir / "memory.md").read_text() == "# Fixed memory\n"
     assert (project_repo / agent.agent_dir / "workspace").is_dir()
@@ -406,6 +408,7 @@ async def test_project_agent_lifecycle_retains_assets_and_promotion_copies_ident
         )
 
     monkeypatch.setattr(project_agent_service, "promote_project_agent_workspace", fake_promote)
+    agent.daily_memory_load_days = 0
     promoted = await promote_project_agent(db, project, owner, agent, name="Independent QA")
 
     assert promoted.scope == "standard"
@@ -413,6 +416,7 @@ async def test_project_agent_lifecycle_retains_assets_and_promotion_copies_ident
     assert promoted.agent_dir is None
     assert promoted.source_agent_id == agent.id
     assert promoted.name == "Independent QA"
+    assert promoted.daily_memory_load_days == 0
     assert copied == {
         "project_root": project_repo,
         "project_agent_id": agent.id,

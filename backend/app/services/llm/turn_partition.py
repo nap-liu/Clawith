@@ -8,11 +8,15 @@ window was reached.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-MIN_PROTECTED_RECENT_TURNS = 8
+MIN_PROTECTED_RECENT_TURNS = 3
+TERMINAL_TURN_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_TOOL_STATUSES = {"done", "failed", "cancelled", "error"}
+OPEN_TOOL_STATUSES = {"pending", "running"}
 
 
 def effective_keep_recent_turns(*models: Any) -> int:
@@ -41,16 +45,40 @@ def _row_id(row: Any) -> str:
     return str(getattr(row, "id", "") or "")
 
 
-def _tool_status(row: Any) -> str:
-    if _role(row) != "tool_call":
-        return ""
-    try:
-        import json
+def _tool_work_state(rows: tuple[Any, ...]) -> tuple[bool, bool]:
+    """Return ``(has_open_work, has_unknown_work)`` for persisted tool rows.
 
-        payload = json.loads(getattr(row, "content", "") or "{}")
-        return str(payload.get("status") or "") if isinstance(payload, dict) else ""
-    except Exception:
-        return ""
+    Tool execution is append-only: a running row may be followed by a done row
+    with the same call id. Merely seeing an earlier ``running`` record therefore
+    does not make a cancelled historical turn incomplete, while an unmatched
+    pending/running tail must remain protected.
+    """
+
+    open_call_ids: set[str] = set()
+    unknown = False
+    for row in rows:
+        if _role(row) != "tool_call":
+            continue
+        try:
+            payload = json.loads(getattr(row, "content", "") or "{}")
+        except (TypeError, ValueError):
+            unknown = True
+            continue
+        if not isinstance(payload, dict):
+            unknown = True
+            continue
+
+        status = str(payload.get("status") or "")
+        raw_call_id = payload.get("call_id")
+        call_id = str(raw_call_id) if raw_call_id else f"row:{_row_id(row)}"
+        if status in OPEN_TOOL_STATUSES:
+            open_call_ids.add(call_id)
+        elif status in TERMINAL_TOOL_STATUSES:
+            if raw_call_id:
+                open_call_ids.discard(call_id)
+        else:
+            unknown = True
+    return bool(open_call_ids), unknown
 
 
 @dataclass(frozen=True)
@@ -97,27 +125,89 @@ def _turn_closed(rows: tuple[Any, ...], user_row: Any | None) -> tuple[bool, boo
         is_initial_assistant = len(rows) == 1 and _role(rows[0]) == "assistant"
         return is_initial_assistant, not is_initial_assistant
 
+    has_open_tool_work, has_unknown_tool_work = _tool_work_state(rows)
+    if has_open_tool_work or has_unknown_tool_work:
+        return False, has_unknown_tool_work
+
+    # The normalized /stop path commits terminal state on the durable user
+    # anchor and closes any running tools, but deliberately does not invent an
+    # assistant chat row. Once its tool work is fully closed, that cancelled
+    # generation is complete historical evidence and must not pin every later
+    # turn outside compaction forever.
+    if _meta(user_row).get("turn_status") == "cancelled":
+        return True, False
+
     last = rows[-1]
     if _role(last) != "assistant":
-        # Pending/running tool tails and interrupted user turns stay raw.
-        return False, _tool_status(last) not in {"pending", "running"}
+        # Unanswered, non-terminal user turns stay raw.
+        return False, True
 
     meta = _meta(last)
     status = meta.get("turn_status")
     anchor = str(meta.get("turn_anchor_id") or "")
     if status is not None or anchor:
-        return status == "completed" and anchor == _row_id(user_row), False
+        # A failed/cancelled run is still a complete historical turn. Keeping
+        # it forever as an "incomplete" suffix would prevent every later turn
+        # from ever becoming compactable.
+        return status in TERMINAL_TURN_STATUSES and anchor == _row_id(user_row), False
 
     # Legacy rows predate turn metadata.  Only the conservative, unambiguous
     # shape "user ... final assistant" is treated as closed.
     return True, False
 
 
+def _injected_root_id(row: Any) -> str:
+    """Return the durable root for an in-turn injected user row, if valid."""
+    meta = _meta(row)
+    subagent_root = meta.get("subagent_turn_anchor_id")
+    if subagent_root:
+        return str(subagent_root)
+    if meta.get("turn_inbox_state") == "delivered":
+        return str(meta.get("turn_inbox_anchor_id") or "")
+    return ""
+
+
+def _same_turn_identity(root: Any, injected: Any) -> bool:
+    """Reject forged/cross-scope root references when identity is available."""
+    # The sender is deliberately not part of the execution scope. A group IM
+    # participant or a child-agent projection can legitimately interject into
+    # the same root run with a different ``user_id``. The durable internal
+    # anchor remains bounded by agent + conversation, which are the actual
+    # tenant/runtime isolation keys for one history stream.
+    for attr in ("agent_id", "conversation_id"):
+        root_value = getattr(root, attr, None)
+        injected_value = getattr(injected, attr, None)
+        if root_value is not None and injected_value is not None and root_value != injected_value:
+            return False
+    return True
+
+
 def _group_turns(rows: Iterable[Any], current_anchor_id: str | None) -> list[ConversationTurn]:
     groups: list[list[Any]] = []
+    root_group_indexes: dict[str, int] = {}
     for row in rows:
+        if _role(row) == "user" and groups:
+            injected_root = _injected_root_id(row)
+            target_idx = root_group_indexes.get(injected_root)
+            # A durable delivered/subagent anchor is the historical truth even
+            # after the root is later marked terminal. At replay time every
+            # successfully completed root is terminal, so requiring it to look
+            # live would split one real execution into several fake incomplete
+            # turns. The target must still be the latest chronological group and
+            # have the same identity; stale/non-latest/cross-scope references are
+            # never merged.
+            if (
+                injected_root
+                and target_idx == len(groups) - 1
+                and _row_id(groups[target_idx][0]) == injected_root
+                and _same_turn_identity(groups[target_idx][0], row)
+            ):
+                groups[target_idx].append(row)
+                continue
         if _role(row) == "user" or not groups:
             groups.append([row])
+            if _role(row) == "user":
+                root_group_indexes[_row_id(row)] = len(groups) - 1
         else:
             groups[-1].append(row)
 
@@ -161,39 +251,40 @@ def partition_turns(
     *,
     current_anchor_id: str | None = None,
     keep_recent_turns: int = MIN_PROTECTED_RECENT_TURNS,
+    minimum_protected_turns: int = MIN_PROTECTED_RECENT_TURNS,
 ) -> TurnPartition:
     """Split rows into a compactable prefix and an immutable recent suffix.
 
-    The current turn, every incomplete/unknown turn, and at least the latest
-    eight completed turns are protected.  Consequently ``compactable`` is
-    always a continuous prefix of complete turns.
+    The current turn, at least the latest three completed runs, and every item
+    after that suffix boundary are protected. Older interrupted/unknown runs
+    are abandoned history and remain in the continuous losslessly-archived
+    prefix; they are never resumed or re-executed.
     """
     turns = _group_turns(rows, current_anchor_id)
     current = next((turn for turn in turns if turn.current), None)
     historical = [turn for turn in turns if not turn.current]
-    protected_count = max(int(keep_recent_turns or 0), MIN_PROTECTED_RECENT_TURNS)
+    protected_count = max(
+        int(keep_recent_turns or 0),
+        max(0, int(minimum_protected_turns or 0)),
+    )
 
     closed_indexes = [idx for idx, turn in enumerate(historical) if turn.closed]
     recent_closed_start = (
-        closed_indexes[-protected_count]
+        len(historical)
+        if protected_count == 0
+        else closed_indexes[-protected_count]
         if len(closed_indexes) >= protected_count
         else 0
     )
-    unsafe_indexes = [
-        idx for idx, turn in enumerate(historical) if not turn.closed or turn.unknown
-    ]
-    unsafe_start = min(unsafe_indexes) if unsafe_indexes else len(historical)
-    protected_start = min(recent_closed_start, unsafe_start)
+    # Protect the most recent complete runs and every newer tail item. An old
+    # interrupted/ambiguous run that has at least this many later completed
+    # runs is conclusively abandoned history: it may be archived/summarized but
+    # is never re-executed. Otherwise one legacy ``running`` row would pin every
+    # later turn forever and make required compaction impossible.
+    protected_start = recent_closed_start
 
     compactable = tuple(historical[:protected_start])
     protected = tuple(historical[protected_start:])
-    # Defense in depth: no ambiguous turn may ever enter the summary input.
-    if any(not turn.closed or turn.unknown for turn in compactable):
-        first_unsafe = next(
-            idx for idx, turn in enumerate(compactable) if not turn.closed or turn.unknown
-        )
-        protected = compactable[first_unsafe:] + protected
-        compactable = compactable[:first_unsafe]
 
     return TurnPartition(compactable=compactable, protected=protected, current=current)
 

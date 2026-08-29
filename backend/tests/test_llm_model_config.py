@@ -35,6 +35,7 @@ def _source(*, tenant_id: uuid.UUID) -> LLMModel:
         request_timeout=180,
         max_output_tokens=4096,
         context_window=1_000_000,
+        context_usage_ratio=0.6,
         compact_trigger_ratio=0.85,
         keep_recent_turns=8,
         compact_summary_max_tokens=2000,
@@ -67,6 +68,7 @@ async def test_clone_model_copies_secret_and_runtime_tuning_without_decrypting()
     assert cloned.base_url == source.base_url
     assert cloned.request_timeout == source.request_timeout
     assert cloned.context_window == source.context_window
+    assert cloned.context_usage_ratio == source.context_usage_ratio
     assert cloned.max_output_tokens == source.max_output_tokens
     db.add.assert_called_once_with(cloned)
     db.flush.assert_awaited_once()

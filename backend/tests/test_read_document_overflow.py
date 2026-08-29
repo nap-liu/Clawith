@@ -15,6 +15,7 @@ oversized output to `.tool_results/` with a preview + `read_file` pointer.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -50,8 +51,8 @@ def test_read_document_returns_full_content_no_truncation(tmp_path):
         assert sql in out, "every SQL block must survive in full"
 
 
-def test_read_document_budget_is_40k():
-    assert tos.budget_for("read_document") == 40_000
+def test_read_document_uses_normalized_32k_budget():
+    assert tos.budget_for("read_document") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS == 32_000
 
 
 def test_oversized_read_document_overflows_to_file(tmp_path, monkeypatch):
@@ -62,16 +63,18 @@ def test_oversized_read_document_overflows_to_file(tmp_path, monkeypatch):
     get_settings.cache_clear()
     try:
         agent_id = str(uuid.uuid4())
-        # > 40K (read_document budget) but well under the 100K default — proves the
-        # per-tool budget, not the default, drives materialization.
+        # Above the normalized budget: every tool follows the same lossless
+        # overflow path instead of carrying a tool-specific context allowance.
         big = "数据集查询语句\n" + ("SELECT * FROM yk.activity WHERE k=1;\n" * 2000)
-        assert 40_000 < len(big) < 100_000
-        view = tos.finalize_tool_output(
-            big,
-            tool_name="read_document",
-            agent_id=agent_id,
-            session_id="s1",
-            tool_call_id="tc1",
+        assert len(big) > tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
+        view = asyncio.run(
+            tos.finalize_tool_output(
+                big,
+                tool_name="read_document",
+                agent_id=agent_id,
+                session_id="s1",
+                tool_call_id="tc1",
+            )
         )
         # The LLM sees a recoverable pointer, NOT a dead-end "[truncated]".
         assert "<persisted-output>" in view
