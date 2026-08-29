@@ -128,6 +128,49 @@ class SubagentError(ValueError):
     """A safe, user-facing Subagent contract error."""
 
 
+async def _ensure_parent_continuation(
+    db,
+    *,
+    parent: ChatSession,
+    execution_user_id: uuid.UUID,
+) -> None:
+    """Admit one new durable parent generation for deferred Project work."""
+
+    from app.services.conversation_turn_lifecycle import (
+        ACTIVE_TURN_STATUS,
+        SUSPENDED_TURN_STATUS,
+        conversation_turn_snapshot_for_session,
+        transition_conversation_turn,
+    )
+
+    snapshot = conversation_turn_snapshot_for_session(parent)
+    if snapshot.status == SUSPENDED_TURN_STATUS:
+        raise SubagentError("父 Turn 正在等待确认，暂时不能继续 Subagent。")
+    if snapshot.status == ACTIVE_TURN_STATUS:
+        return
+    continuation_anchor = ChatMessage(
+        agent_id=parent.agent_id,
+        user_id=execution_user_id,
+        role="system",
+        content="",
+        conversation_id=str(parent.id),
+        message_meta={
+            "kind": "project_subagent_external_continuation",
+            "consumed_by_onmessage": True,
+            "attachments": [],
+        },
+    )
+    db.add(continuation_anchor)
+    await db.flush()
+    await transition_conversation_turn(
+        db,
+        agent_id=parent.agent_id,
+        conversation_id=str(parent.id),
+        turn_anchor_id=continuation_anchor.id,
+        status=ACTIVE_TURN_STATUS,
+    )
+
+
 async def _subagent_input_causality(
     db,
     *,
@@ -643,6 +686,7 @@ async def create_subagent(
     turn_anchor_id: uuid.UUID | None = None,
     project_run_id: uuid.UUID | None = None,
     input_metadata: dict | None = None,
+    allow_parent_continuation: bool = False,
 ) -> tuple[SubagentRun, bool]:
     """Create one child Session and lifecycle row, idempotent per parent tool call."""
     task_text = str(task or "").strip()
@@ -715,6 +759,13 @@ async def create_subagent(
         existing = await _load_authorized_existing()
         if existing is not None:
             return existing, False
+
+        if allow_parent_continuation:
+            await _ensure_parent_continuation(
+                db,
+                parent=parent,
+                execution_user_id=resolved_user_id,
+            )
 
         canonical_model = await _resolve_model_name(db, agent, model)
         now = datetime.now(UTC)
@@ -907,38 +958,11 @@ async def append_subagent_message(
         if parent is None:
             raise SubagentError("当前 Session 不存在。")
         if allow_parent_continuation:
-            from app.services.conversation_turn_lifecycle import (
-                ACTIVE_TURN_STATUS,
-                SUSPENDED_TURN_STATUS,
-                conversation_turn_snapshot_for_session,
-                transition_conversation_turn,
+            await _ensure_parent_continuation(
+                db,
+                parent=parent,
+                execution_user_id=execution_user_id,
             )
-
-            parent_snapshot = conversation_turn_snapshot_for_session(parent)
-            if parent_snapshot.status == SUSPENDED_TURN_STATUS:
-                raise SubagentError("父 Turn 正在等待确认，暂时不能继续 Subagent。")
-            if parent_snapshot.status != ACTIVE_TURN_STATUS:
-                continuation_anchor = ChatMessage(
-                    agent_id=parent.agent_id,
-                    user_id=execution_user_id,
-                    role="system",
-                    content="",
-                    conversation_id=str(parent.id),
-                    message_meta={
-                        "kind": "project_subagent_external_continuation",
-                        "consumed_by_onmessage": True,
-                        "attachments": [],
-                    },
-                )
-                db.add(continuation_anchor)
-                await db.flush()
-                await transition_conversation_turn(
-                    db,
-                    agent_id=parent.agent_id,
-                    conversation_id=str(parent.id),
-                    turn_anchor_id=continuation_anchor.id,
-                    status=ACTIVE_TURN_STATUS,
-                )
         run = await db.get(SubagentRun, child_id, with_for_update=True)
         if run is None or not _run_owned_by_parent(run, parent_id):
             raise SubagentError("Subagent 不存在，或不属于当前 Session。")
@@ -5159,6 +5183,7 @@ async def _dispatch_project_leader_batch(
             turn_anchor_id=source_rows[-1].id,
             project_run_id=project_run.id,
             input_metadata=input_metadata,
+            allow_parent_continuation=True,
         )
         child_id = durable_run.id
         child_status = durable_run.status
@@ -5172,6 +5197,7 @@ async def _dispatch_project_leader_batch(
                 origin_tool_call_id=f"project-leader-batch:{batch_id}",
                 project_run_id=project_run.id,
                 input_metadata=input_metadata,
+                allow_parent_continuation=True,
             )
     else:
         child_id = existing_child.id
@@ -5186,6 +5212,7 @@ async def _dispatch_project_leader_batch(
                 origin_tool_call_id=f"project-leader-batch:{batch_id}",
                 project_run_id=project_run.id,
                 input_metadata=input_metadata,
+                allow_parent_continuation=True,
             )
 
     async with async_session() as db:

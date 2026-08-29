@@ -4394,29 +4394,12 @@ async def test_project_group_history_keeps_terminal_turn_after_late_owner_delive
         message_meta={
             "kind": "project_subagent_reply",
             "timeline_anchor_id": str(anchor_id),
-            "leader_batch_state": "claimed",
+            "leader_batch_state": "pending",
             "default_leader_agent_id": str(env.leader_id),
         },
+        created_at=datetime.now(UTC) - timedelta(seconds=1),
     )
     env.db.add(late_reply)
-    await env.db.flush()
-    env.db.add(
-        ProjectRun(
-            tenant_id=env.tenant_id,
-            project_id=project_id,
-            agent_id=env.leader_id,
-            initiated_by_user_id=env.owner_id,
-            execution_user_id=env.owner_id,
-            status="queued",
-            trigger_type="leader_reply_batch",
-            input={
-                "group_session_id": group["id"],
-                "group_message_id": str(anchor_id),
-                "source_group_message_ids": [str(late_reply.id)],
-            },
-            output={"group_session_id": group["id"]},
-        )
-    )
     await env.db.commit()
 
     history = await env.client.get(
@@ -4426,6 +4409,23 @@ async def test_project_group_history_keeps_terminal_turn_after_late_owner_delive
     assert history.json()["turn"]["status"] == "completed"
     assert history.json()["turn"]["phase"] == "idle"
     assert history.json()["turn"]["run_count"] == 0
+
+    from app.services import subagent_runtime
+
+    assert (
+        await subagent_runtime._dispatch_project_leader_batch(
+            uuid.UUID(group["id"]),
+            debounce_seconds=0,
+        )
+        is True
+    )
+    continued = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+    )
+    assert continued.status_code == 200, continued.text
+    assert continued.json()["turn"]["status"] == "running"
+    assert continued.json()["turn"]["phase"] == "active"
+    assert continued.json()["turn"]["generation"] == 2
 
 
 async def test_explicit_mention_cohort_waits_for_leader_reply_batch_terminal(
