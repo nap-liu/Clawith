@@ -2373,7 +2373,8 @@ AGENT_TOOLS = [
             "name": "install_skill_from_market",
             "description": (
                 "Install one market Skill into this Agent by Skill ID. This changes the shared Agent workspace. "
-                "A confirmed human with Agent manage access can install directly; no administrator approval is required."
+                "The human speaking in the current conversation must have Agent manage access; no additional "
+                "administrator approval is required."
             ),
             "parameters": {
                 "type": "object",
@@ -3822,7 +3823,11 @@ async def _execute_tool_direct(
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
         elif tool_name == "install_skill_from_market":
-            return await _install_skill_from_market(agent_id, user_id, arguments)
+            return await _install_skill_from_market(
+                agent_id,
+                user_id,
+                arguments,
+            )
         elif tool_name == "publish_skill_to_market":
             return await _publish_skill_to_market(agent_id, user_id, arguments)
         elif tool_name == "withdraw_skill_from_market":
@@ -4938,7 +4943,13 @@ async def execute_tool(
         elif tool_name == "search_skill_market":
             result = await _search_skill_market(agent_id, arguments)
         elif tool_name == "install_skill_from_market":
-            result = await _install_skill_from_market(agent_id, user_id, arguments)
+            result = await _install_skill_from_market(
+                agent_id,
+                user_id,
+                arguments,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
         elif tool_name == "publish_skill_to_market":
             result = await _publish_skill_to_market(agent_id, user_id, arguments)
         elif tool_name == "withdraw_skill_from_market":
@@ -19715,10 +19726,54 @@ async def _market_tool_actor(db, agent_id: uuid.UUID, user_id: uuid.UUID | None)
     return actor, agent, None
 
 
+async def _market_install_actor(
+    db,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    session_id: str | None,
+    turn_anchor_id: uuid.UUID | None,
+):
+    """Resolve the real human speaking in the current conversation turn."""
+    if not session_id or not turn_anchor_id:
+        return None, None, "Permission denied: a current human conversation is required"
+
+    try:
+        conversation_id = uuid.UUID(str(session_id))
+        anchor_id = uuid.UUID(str(turn_anchor_id))
+    except (TypeError, ValueError, AttributeError):
+        return None, None, "Permission denied: invalid conversation context"
+
+    session = await db.scalar(
+        select(ChatSession).where(
+            ChatSession.id == conversation_id,
+            ChatSession.agent_id == agent_id,
+        )
+    )
+    if not session or session.source_channel in {"agent", "trigger", "subagent", "project"}:
+        return None, None, "Permission denied: a current human conversation is required"
+
+    sender_user_id = await db.scalar(
+        select(ChatMessage.sender_user_id).where(
+            ChatMessage.id == anchor_id,
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == str(conversation_id),
+            ChatMessage.role == "user",
+        )
+    )
+    if sender_user_id is None or sender_user_id != user_id:
+        return None, None, "Permission denied: current conversation participant mismatch"
+
+    return await _market_tool_actor(db, agent_id, sender_user_id)
+
+
 async def _install_skill_from_market(
     agent_id: uuid.UUID,
     user_id: uuid.UUID | None,
     arguments: dict,
+    *,
+    session_id: str | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     raw_skill_id = str(arguments.get("skill_id") or "").strip()
     try:
@@ -19730,7 +19785,13 @@ async def _install_skill_from_market(
 
     try:
         async with async_session() as db:
-            actor, agent, error = await _market_tool_actor(db, agent_id, user_id)
+            actor, agent, error = await _market_install_actor(
+                db,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
             if error:
                 return error
             result = await install_market_skill(

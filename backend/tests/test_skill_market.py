@@ -10,7 +10,8 @@ from app.api.skill_market import PublishAgentSkillIn, publish_from_agent
 from app.api.skills import SkillUpdateIn, _save_skill_to_db, delete_skill, update_skill
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.audit import ApprovalRequest
+from app.models.audit import ApprovalRequest, ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
@@ -423,18 +424,54 @@ async def test_agent_market_install_is_direct_for_managers_and_remains_idempoten
         }
         await db.commit()
 
-    session_id = f"skill-market-{uuid.uuid4()}"
     tool_call_id = f"call-{uuid.uuid4()}"
+
+    async def conversation_turn(actor_id: uuid.UUID) -> tuple[str, uuid.UUID]:
+        async with async_session() as db:
+            session = ChatSession(
+                agent_id=agent_b.id,
+                user_id=actor_id,
+                title="Skill install authorization",
+                source_channel="web",
+                external_conv_id=f"skill-install-{uuid.uuid4()}",
+            )
+            db.add(session)
+            await db.flush()
+            anchor = ChatMessage(
+                agent_id=agent_b.id,
+                user_id=actor_id,
+                sender_user_id=actor_id,
+                role="user",
+                content="Install this Skill",
+                conversation_id=str(session.id),
+            )
+            db.add(anchor)
+            await db.commit()
+            return str(session.id), anchor.id
+
+    guest_session_id, guest_anchor_id = await conversation_turn(guest_b.id)
+    mismatched = await execute_tool(
+        "install_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent_b.id,
+        owner_b.id,
+        session_id=guest_session_id,
+        tool_call_id=f"mismatch-{tool_call_id}",
+        turn_anchor_id=guest_anchor_id,
+    )
+    assert "current conversation participant mismatch" in mismatched
     denied = await execute_tool(
         "install_skill_from_market",
         {"skill_id": str(skill_id)},
         agent_b.id,
         guest_b.id,
-        session_id=session_id,
+        session_id=guest_session_id,
         tool_call_id=f"guest-{tool_call_id}",
+        turn_anchor_id=guest_anchor_id,
     )
     assert "Agent manage access required" in denied
 
+    session_id, turn_anchor_id = await conversation_turn(owner_b.id)
     result = await execute_tool(
         "install_skill_from_market",
         {"skill_id": str(skill_id)},
@@ -442,6 +479,7 @@ async def test_agent_market_install_is_direct_for_managers_and_remains_idempoten
         owner_b.id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+        turn_anchor_id=turn_anchor_id,
         skip_autonomy=True,
     )
     assert "Installed market Skill" in result
@@ -452,6 +490,7 @@ async def test_agent_market_install_is_direct_for_managers_and_remains_idempoten
         owner_b.id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+        turn_anchor_id=turn_anchor_id,
     )
     assert "Installed market Skill" in duplicate
     target_key = normalize_storage_key(f"{agent_b.id}/skills/{folder}/SKILL.md")
