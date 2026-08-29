@@ -45,7 +45,7 @@ def _make_db(agent, model, fallback_model=None):
     results = [_Result(agent), _Result(model)]
     if fallback_model is not None:
         results.append(_Result(fallback_model))
-    state = {"n": 0}
+    state = {"n": 0, "in_transaction": True}
 
     async def _execute(*_args, **_kwargs):
         i = state["n"]
@@ -58,7 +58,18 @@ def _make_db(agent, model, fallback_model=None):
         # AsyncMock below, matching AsyncSession.get's current production path.
         return None
 
-    return SimpleNamespace(execute=_execute, get=_get)
+    def _in_transaction():
+        return state["in_transaction"]
+
+    async def _commit():
+        state["in_transaction"] = False
+
+    return SimpleNamespace(
+        execute=_execute,
+        get=_get,
+        in_transaction=_in_transaction,
+        commit=_commit,
+    )
 
 
 def _make_model(*, model_name="test-model", request_timeout=None):

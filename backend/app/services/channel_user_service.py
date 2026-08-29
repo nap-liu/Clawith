@@ -609,6 +609,7 @@ class ChannelUserService:
                                 member,
                                 provider,
                                 fresh_claims=fresh_claims,
+                                subject_lock_held=fresh_claims is not None,
                             )
                             if reconciled:
                                 canonical_user, _ = await self._ensure_bindings(
@@ -663,6 +664,7 @@ class ChannelUserService:
                             org_member,
                             provider,
                             fresh_claims=fresh_claims,
+                            subject_lock_held=fresh_claims is not None,
                         )
                 except Exception:
                     logger.exception(
@@ -897,6 +899,7 @@ class ChannelUserService:
         provider: IdentityProvider,
         *,
         fresh_claims: VerifiedDirectoryClaims | None = None,
+        subject_lock_held: bool = False,
     ) -> User | None:
         from app.services.contact_provisioning import contact_provisioning
 
@@ -911,6 +914,7 @@ class ChannelUserService:
                 org_member,
                 provider=provider,
                 fresh_claims=fresh_claims,
+                subject_lock_held=subject_lock_held,
             )
         except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
             raise ChannelUserResolutionError(str(exc)) from exc

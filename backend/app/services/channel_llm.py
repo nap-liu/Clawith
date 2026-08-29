@@ -135,7 +135,6 @@ async def _call_agent_llm(
     web_broadcast_targets: list[tuple[uuid.UUID | str, str, dict]] | None = None,
     include_soul: bool = True,
     include_memory: bool = True,
-    release_db_before_dispatch: bool = False,
     runtime_session: "ChatSession | None" = None,
     runtime_workspace: "AgentRuntimeWorkspace | None" = None,
     max_tool_rounds_override: int | None = None,
@@ -585,12 +584,14 @@ async def _call_agent_llm(
     async def _collect_usage(usage: TokenUsage) -> None:
         turn_usage.add(usage)
 
-    if release_db_before_dispatch:
-        # All runtime configuration has been materialized above. Recovery and
-        # other detached workers may now return the connection to the pool
-        # before the potentially long model/tool loop. Persistence callbacks
-        # already use their own short-lived sessions.
-        await db.close()
+    # Everything needed by the provider/tool loop is now materialized. End the
+    # ingress/read transaction before remote model I/O so every caller shares
+    # the same short transaction boundary and no channel can accidentally pin
+    # locks or a pool connection for the full tool loop. ``expire_on_commit`` is
+    # disabled by the shared session factory, so loaded runtime objects remain
+    # usable and callers may reuse this session for a later short transaction.
+    if db.in_transaction():
+        await db.commit()
 
     try:
         runtime_binding = nullcontext()

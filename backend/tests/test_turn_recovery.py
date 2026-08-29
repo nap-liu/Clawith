@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.database import async_session, engine
 from app.models.agent import Agent
@@ -117,35 +117,62 @@ async def test_call_agent_llm_recovery_mode_keeps_supplied_history_and_appends_n
     assert captured["messages"] == history
 
 
-async def test_call_agent_llm_releases_database_before_recovery_dispatch(monkeypatch):
-    """Detached recovery does not reserve a pool connection during provider I/O."""
+async def test_call_agent_llm_releases_database_before_provider_dispatch(monkeypatch):
+    """Provider I/O runs without the ingress transaction or its locks."""
     import app.services.llm as llm_module
     from app.services.channel_llm import _call_agent_llm
 
     agent_id, user_id = await _make_agent_with_model(context_window_size=2)
-    observed: dict[str, bool] = {}
+    observed: dict[str, object] = {}
 
-    async with async_session() as db:
+    # Pin the observer to a different pool connection before resolving the
+    # channel runtime. It can then inspect the exact ingress backend while the
+    # fake provider represents a long remote model call.
+    async with async_session() as observer_db:
+        await observer_db.execute(text("SELECT 1"))
+        async with async_session() as db:
+            ingress_pid = await db.scalar(text("SELECT pg_backend_pid()"))
 
-        async def fake_failover(**_kwargs):
-            observed["in_transaction"] = db.in_transaction()
-            return "done"
+            async def fake_failover(**_kwargs):
+                observed["session_in_transaction"] = db.in_transaction()
+                activity = (
+                    await observer_db.execute(
+                        text(
+                            "SELECT state, xact_start FROM pg_stat_activity "
+                            "WHERE pid = :pid"
+                        ),
+                        {"pid": ingress_pid},
+                    )
+                ).one()
+                observed["state"] = activity.state
+                observed["xact_start"] = activity.xact_start
+                observed["dangerous_locks"] = await observer_db.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_locks "
+                        "WHERE pid = :pid "
+                        "AND locktype IN ('transactionid', 'tuple', 'advisory')"
+                    ),
+                    {"pid": ingress_pid},
+                )
+                return "done"
 
-        monkeypatch.setattr(llm_module, "call_llm_with_failover", fake_failover)
-        reply = await _call_agent_llm(
-            db,
-            agent_id=agent_id,
-            user_text="",
-            session_id="",
-            user_id=user_id,
-            history=[{"role": "user", "content": "interrupted"}],
-            continue_turn=True,
-            recovery_mode=True,
-            release_db_before_dispatch=True,
-        )
+            monkeypatch.setattr(llm_module, "call_llm_with_failover", fake_failover)
+            reply = await _call_agent_llm(
+                db,
+                agent_id=agent_id,
+                user_text="ordinary inbound message",
+                session_id="",
+                user_id=user_id,
+                history=[{"role": "user", "content": "interrupted"}],
+            )
 
     assert reply == "done"
-    assert observed == {"in_transaction": False}
+    assert observed == {
+        "session_in_transaction": False,
+        "state": "idle",
+        "xact_start": None,
+        "dangerous_locks": 0,
+    }
 
 
 async def test_call_agent_llm_recovery_mode_never_compacts_or_reloads(monkeypatch):
