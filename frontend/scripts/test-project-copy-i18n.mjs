@@ -39,9 +39,7 @@ for (const path of checkedFiles) {
   const source = readFileSync(path, "utf8");
   for (const copy of bannedVisibleCopy) {
     assert.equal(
-      source.includes(`"${copy}`) ||
-        source.includes(`'${copy}`) ||
-        source.includes(`>${copy}`),
+      source.toLowerCase().includes(copy.toLowerCase()),
       false,
       `${path} contains internal or obsolete visible copy: ${copy}`,
     );
