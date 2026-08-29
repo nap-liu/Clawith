@@ -128,6 +128,7 @@ async def test_receipt_anchor_advances_only_after_each_interjected_message_is_co
     second_drained = asyncio.Event()
     third_pending = asyncio.Event()
     inserted_ids: list[uuid.UUID] = []
+    owner_reactions = _receipt_hooks("root", events)
 
     async def insert_pending(text: str) -> str:
         async with async_session() as db:
@@ -166,11 +167,14 @@ async def test_receipt_anchor_advances_only_after_each_interjected_message_is_co
         )
         assert [message["content"] for message in first] == ["first interjection"]
         assert events == ["attach:root", "dispose:root", "attach:first"]
+        assert owner_reactions.on_thinking is not None
+        await owner_reactions.on_thinking("first is active")
+        assert events[-1] == "thinking:first"
         first_drained.set()
 
         await second_pending.wait()
         # Durable admission alone must not steal the receipt anchor.
-        assert events == ["attach:root", "dispose:root", "attach:first"]
+        assert events[-1] == "thinking:first"
         second = await drain_turn_inbox(
             session_id=str(session_id),
             active_turn_anchor_id=root_id,
@@ -182,21 +186,25 @@ async def test_receipt_anchor_advances_only_after_each_interjected_message_is_co
             "attach:root",
             "dispose:root",
             "attach:first",
+            "thinking:first",
             "dispose:first",
             "attach:second",
         ]
+        assert owner_reactions.on_thinking is not None
+        await owner_reactions.on_thinking("second is active")
+        assert events[-1] == "thinking:second"
         second_drained.set()
 
         await third_pending.wait()
         # This one stays pending and therefore must never become the receipt anchor.
-        assert events[-1] == "attach:second"
+        assert events[-1] == "thinking:second"
         return "done"
 
     owner = asyncio.create_task(
         channel_dispatch.run_channel_message(
             lock_key,
             is_command=False,
-            reactions=_receipt_hooks("root", events),
+            reactions=owner_reactions,
             work=owner_work,
         )
     )
@@ -233,8 +241,10 @@ async def test_receipt_anchor_advances_only_after_each_interjected_message_is_co
         "attach:root",
         "dispose:root",
         "attach:first",
+        "thinking:first",
         "dispose:first",
         "attach:second",
+        "thinking:second",
         "dispose:second",
     ]
     async with async_session() as db:
