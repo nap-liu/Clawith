@@ -2373,7 +2373,7 @@ AGENT_TOOLS = [
             "name": "install_skill_from_market",
             "description": (
                 "Install one market Skill into this Agent by Skill ID. This changes the shared Agent workspace. "
-                "The platform always requires L3 approval before any files are changed."
+                "A confirmed human with Agent manage access can install directly; no administrator approval is required."
             ),
             "parameters": {
                 "type": "object",
@@ -3494,10 +3494,12 @@ _TOOL_AUTONOMY_MAP = {
     "withdraw_skill_from_market": "withdraw_skill_from_market",
 }
 
-_FORCED_L3_TOOLS = {
-    "install_skill_from_market",
-    "publish_skill_to_market",
-    "withdraw_skill_from_market",
+_FORCED_AUTONOMY_LEVELS = {
+    # Installing an already-published, visible Skill is a reversible Agent-local
+    # action. The executor still requires a confirmed human with manage access.
+    "install_skill_from_market": "L1",
+    "publish_skill_to_market": "L3",
+    "withdraw_skill_from_market": "L3",
 }
 
 
@@ -4089,7 +4091,7 @@ async def execute_tool(
     # ── Autonomy boundary check (skipped when a human already approved, e.g. a
     #    confirmation card the user confirmed) ──
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
-    if action_type and (not skip_autonomy or tool_name in _FORCED_L3_TOOLS):
+    if action_type and (not skip_autonomy or tool_name in _FORCED_AUTONOMY_LEVELS):
         try:
             from app.services.autonomy_service import autonomy_service
             from app.models.agent import Agent as AgentModel
@@ -4102,7 +4104,7 @@ async def execute_tool(
 
                     _sanitized_args = _sanitize_tool_args(arguments) or {}
                     approval_key = None
-                    if tool_name in _FORCED_L3_TOOLS and tool_call_id:
+                    if _FORCED_AUTONOMY_LEVELS.get(tool_name) == "L3" and tool_call_id:
                         approval_key = ":".join(
                             [
                                 "market-tool",
@@ -4125,7 +4127,7 @@ async def execute_tool(
                             "turn_anchor_id": str(turn_anchor_id or ""),
                             "tool_call_id": str(tool_call_id or ""),
                         },
-                        forced_level="L3" if tool_name in _FORCED_L3_TOOLS else None,
+                        forced_level=_FORCED_AUTONOMY_LEVELS.get(tool_name),
                         idempotency_key=approval_key,
                     )
                     pending_im_notifications = result_check.pop(
