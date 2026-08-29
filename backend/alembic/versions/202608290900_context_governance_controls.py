@@ -4,9 +4,9 @@ Revision ID: context_governance_controls
 Revises: turn_inbox_pending_fifo
 """
 
-from alembic import op
 import sqlalchemy as sa
 
+from alembic import op
 
 revision = "context_governance_controls"
 down_revision = "turn_inbox_pending_fifo"
