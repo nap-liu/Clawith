@@ -503,9 +503,9 @@ export default function SessionViewerDrawer({
         }
         setError("");
         return nextGroupTurn;
-      } catch (loadError: any) {
+      } catch {
         if (sequence !== requestSequenceRef.current) return;
-        setError(loadError?.message || t("agent.sessionViewer.loadError"));
+        setError(t("agent.sessionViewer.loadError"));
         return undefined;
       } finally {
         if (sequence === requestSequenceRef.current && !background)
@@ -655,14 +655,7 @@ export default function SessionViewerDrawer({
           setMessages((previous) =>
             foldConversationTimelineEvent(previous, payload).messages,
           );
-          setComposerError(
-            String(
-              payload.content ||
-                payload.detail ||
-                payload.message ||
-                t("agent.sessionViewer.sendError"),
-            ),
-          );
+          setComposerError(t("agent.sessionViewer.sendError"));
           if (turnReduction.controlsLifecycle && !turnReduction.hasSnapshot) {
             setSending(false);
           }
@@ -839,9 +832,7 @@ export default function SessionViewerDrawer({
           );
         } catch (uploadError: any) {
           if (uploadError?.message !== "Upload cancelled") {
-            setComposerError(
-              uploadError?.message || t("agent.sessionViewer.uploadError"),
-            );
+            setComposerError(t("agent.sessionViewer.uploadError"));
           }
         } finally {
           uploadAbortRef.current.delete(uploadId);
@@ -971,13 +962,11 @@ export default function SessionViewerDrawer({
         ) {
           setComposerError(t("agent.sessionViewer.groupTurnNoActiveRun"));
         }
-      } catch (sendError: any) {
+      } catch {
         setMessages((previous) =>
           previous.filter((message) => message.id !== clientMessageId),
         );
-        setComposerError(
-          sendError?.message || t("agent.sessionViewer.sendError"),
-        );
+        setComposerError(t("agent.sessionViewer.sendError"));
         const recoveredTurn = await loadSession(true);
         if (recoveredTurn !== undefined) {
           setGroupTurn(recoveredTurn);
@@ -1165,7 +1154,7 @@ export default function SessionViewerDrawer({
               {t("agent.sessionViewer.title")}
             </strong>
             <span>
-              {session?.title || target.title || `#${sessionId.slice(0, 8)}`}
+              {session?.title || target.title || t("agent.sessionViewer.untitled")}
             </span>
           </span>
           <span className="session-viewer-drawer__header-actions">
@@ -1175,7 +1164,7 @@ export default function SessionViewerDrawer({
               >
                 {active && <i />}
                 {t(`agent.sessionViewer.status.${currentStatus}`, {
-                  defaultValue: currentStatus,
+                  defaultValue: t("agent.sessionViewer.status.unknown"),
                 })}
               </span>
             )}
@@ -1206,7 +1195,6 @@ export default function SessionViewerDrawer({
               ? t("agent.sessionViewer.interactive")
               : t("agent.sessionViewer.readOnly")}
           </span>
-          <code>{sessionId}</code>
         </div>
         <div
           ref={scrollerRef}

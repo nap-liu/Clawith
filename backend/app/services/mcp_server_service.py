@@ -107,8 +107,17 @@ async def lookup_overrides(
     server_id: uuid.UUID,
     tenant_id: uuid.UUID | None,
     agent_id: uuid.UUID | None,
+    *,
+    execution_user_id: uuid.UUID | None = None,
+    allow_project_source_reference: bool = False,
 ):
-    """Fetch (tenant_override, agent_override) for given scopes; either may be None."""
+    """Fetch runtime overrides without copying credentials across scopes.
+
+    Global/server and tenant configuration remain inheritable. A project Agent
+    may reference its source Agent's private override only for a turn executed
+    by that source Agent's creator. The source override is read in place and is
+    never persisted on the project Agent.
+    """
     t_ovr = None
     a_ovr = None
     if tenant_id:
@@ -127,7 +136,125 @@ async def lookup_overrides(
                 MCPServerOverride.scope_id == agent_id,
             )
         )).scalar_one_or_none()
+    if agent_id is not None and allow_project_source_reference:
+        from app.models.agent import Agent
+        from app.models.tool import AgentTool, Tool
+
+        project_agent = await db.get(Agent, agent_id)
+        source_agent = (
+            await db.get(Agent, project_agent.source_agent_id)
+            if project_agent is not None and project_agent.source_agent_id is not None
+            else None
+        )
+        project_uses_private_tool = False
+        if project_agent is not None and project_agent.scope == "project":
+            project_uses_private_tool = (
+                await db.execute(
+                    select(AgentTool.id)
+                    .join(Tool, Tool.id == AgentTool.tool_id)
+                    .where(
+                        AgentTool.agent_id == project_agent.id,
+                        AgentTool.enabled.is_(True),
+                        Tool.mcp_server_id == server_id,
+                        Tool.type == "mcp",
+                        Tool.enabled.is_(True),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none() is not None
+        # Old project snapshots may contain a copied Agent override. Private
+        # credentials are never read from that scope: an eligible execution
+        # references the source Agent override below, and all others inherit
+        # only server/tenant configuration.
+        if project_uses_private_tool:
+            a_ovr = None
+        source_has_private_tool = False
+        if (
+            project_uses_private_tool
+            and execution_user_id is not None
+            and source_agent is not None
+            and source_agent.scope == "standard"
+            and source_agent.tenant_id == project_agent.tenant_id == tenant_id
+            and source_agent.creator_id == execution_user_id
+        ):
+            source_has_private_tool = (
+                await db.execute(
+                    select(AgentTool.id)
+                    .join(Tool, Tool.id == AgentTool.tool_id)
+                    .where(
+                        AgentTool.agent_id == source_agent.id,
+                        AgentTool.enabled.is_(True),
+                        Tool.mcp_server_id == server_id,
+                        Tool.type == "mcp",
+                        Tool.enabled.is_(True),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none() is not None
+        if source_has_private_tool:
+            a_ovr = (
+                await db.execute(
+                    select(MCPServerOverride).where(
+                        MCPServerOverride.mcp_server_id == server_id,
+                        MCPServerOverride.scope_type == "agent",
+                        MCPServerOverride.scope_id == source_agent.id,
+                    )
+                )
+            ).scalar_one_or_none()
     return t_ovr, a_ovr
+
+
+async def lookup_project_source_tool_config(
+    db,
+    *,
+    project_agent_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    execution_user_id: uuid.UUID | None,
+) -> dict:
+    """Reference an eligible source Agent's private MCP tool config in place.
+
+    Nothing is copied to the project Agent.  The reference is valid only when
+    the project Agent and source Agent share a tenant, the capability is a
+    private Agent MCP tool, and the turn executes as the source Agent creator.
+    """
+
+    if execution_user_id is None:
+        return {}
+    from app.models.agent import Agent
+    from app.models.tool import AgentTool, Tool
+
+    project_agent = await db.get(Agent, project_agent_id)
+    if (
+        project_agent is None
+        or project_agent.scope != "project"
+        or project_agent.source_agent_id is None
+    ):
+        return {}
+    source_agent = await db.get(Agent, project_agent.source_agent_id)
+    if (
+        source_agent is None
+        or source_agent.scope != "standard"
+        or source_agent.tenant_id != project_agent.tenant_id
+        or source_agent.creator_id != execution_user_id
+    ):
+        return {}
+    row = (
+        await db.execute(
+            select(AgentTool, Tool)
+            .join(Tool, Tool.id == AgentTool.tool_id)
+            .where(
+                AgentTool.agent_id == source_agent.id,
+                AgentTool.tool_id == tool_id,
+                AgentTool.enabled.is_(True),
+                Tool.type == "mcp",
+                Tool.enabled.is_(True),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return {}
+    source_assignment, _tool = row
+    return dict(source_assignment.config or {})
 
 
 async def build_placeholder_context_for_call(

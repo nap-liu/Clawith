@@ -132,7 +132,9 @@ const statusTone = (status: string): GraphTone => {
 
 const statusLabel = (status: string, t: TFunction): string =>
   status
-    ? t(`projectGraphs.status.${status}`, { defaultValue: status })
+    ? t(`projectGraphs.status.${status}`, {
+        defaultValue: t("projectGraphs.status.unknown"),
+      })
     : t("projectGraphs.status.unset");
 
 function GraphIcon({ kind }: { kind: GraphNodeData["kind"] }) {
@@ -529,7 +531,8 @@ export function A2AMeshGraph({
         target: isLatest ? target : current.target,
         count: (current?.count || 0) + 1,
         latestType: isLatest
-          ? valueText(event, "event_type", "type") || "A2A"
+          ? valueText(event, "event_type", "type") ||
+            t("projectAudit.eventFallback")
           : current.latestType,
         latestAt: Math.max(
           current?.latestAt ?? Number.NEGATIVE_INFINITY,
@@ -856,7 +859,7 @@ export function SnapshotLineageGraph({
             valueText(member, "name_snapshot", "agent_name", "name") ||
             t("projectGraphs.sourceAgent"),
           caption: t("projectGraphs.sourceCaption"),
-          meta: compactId(agentId),
+          meta: "",
           badge: t("projectGraphs.readOnlySource"),
           tone: "neutral",
           interactive: false,
@@ -874,7 +877,7 @@ export function SnapshotLineageGraph({
               t("projectGraphs.memberConfig"),
             t,
           ),
-          meta: compactId(memberId),
+          meta: "",
           badge:
             member.is_leader === true
               ? t("projectTerminology.owner")
@@ -911,13 +914,14 @@ export function SnapshotLineageGraph({
         data: {
           kind: "run",
           label:
-            valueText(runRecord, "name", "title") || `Run ${compactId(runId)}`,
+            valueText(runRecord, "name", "title") ||
+            t("projectGraphs.execution"),
           caption: `${
             status === "frozen"
               ? t("projectGraphs.frozen")
               : statusLabel(status, t)
           } · ${dateLabel(runRecord.created_at, t, i18n.resolvedLanguage || i18n.language)}`,
-          meta: compactId(runId),
+          meta: "",
           badge: t("projectGraphs.frozen"),
           tone: statusTone(status),
           interactive: true,
@@ -1059,7 +1063,7 @@ export function WorkDependencyGraph({
                 "agent_name",
                 "assignee_agent_id",
               ) || t("projectGraphs.unassigned"),
-            meta: compactId(id),
+            meta: "",
             badge:
               selectedWorkItemId === id
                 ? t("projectGraphs.selected")

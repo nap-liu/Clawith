@@ -26,6 +26,7 @@ from app.services.project_service import TERMINAL_PROJECT_RUN_STATUSES
 GROUP_RUN_TRIGGERS = (
     "group_leader_message",
     "group_mention",
+    "leader_reply_batch",
     "leader_kickoff",
     "manual",
     "leader",
@@ -56,6 +57,20 @@ def project_run_group_anchor_id(run: ProjectRun) -> uuid.UUID | None:
         return None
 
 
+ACTIVE_LEADER_REPLY_STATES = ("pending", "claimed")
+
+
+def _is_deferred_owner_run(run: ProjectRun) -> bool:
+    """Treat the intentionally skipped owner dispatch as routing, not failure."""
+
+    output = run.output if isinstance(run.output, dict) else {}
+    return (
+        run.trigger_type == "group_leader_message"
+        and run.status == "cancelled"
+        and output.get("skip_reason") == "explicit_mentions_route_to_specialists"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectGroupTurnProjection:
     snapshot: ConversationTurnSnapshot
@@ -78,6 +93,8 @@ class ProjectGroupTurnProjection:
 class _CausalChildCohort:
     child_ids: frozenset[uuid.UUID]
     active_child_ids: frozenset[uuid.UUID]
+    suspended_child_ids: frozenset[uuid.UUID]
+    succeeded_child_ids: frozenset[uuid.UUID]
     active_agent_ids: tuple[uuid.UUID, ...]
     children: tuple[ChatSession, ...]
     all_active_suspended: bool
@@ -95,7 +112,17 @@ async def _load_causal_child_cohort(
     """Load exact direct-child ownership for one parent generation."""
 
     if anchor_id is None or generation < 1:
-        return _CausalChildCohort(frozenset(), frozenset(), (), (), False, False, ())
+        return _CausalChildCohort(
+            frozenset(),
+            frozenset(),
+            frozenset(),
+            frozenset(),
+            (),
+            (),
+            False,
+            False,
+            (),
+        )
 
     from app.services.subagent_runtime import (
         CAUSAL_ROOT_ANCHOR_ID,
@@ -176,21 +203,29 @@ async def _load_causal_child_cohort(
             in {"active", "suspended"}
         )
     )
-    all_active_suspended = bool(active_child_ids) and all(
-        getattr(run_by_id.get(child_id), "status", None) == RUN_WAITING
-        and child_id in child_by_id
-        and conversation_turn_snapshot_for_session(child_by_id[child_id]).status
-        == "suspended"
+    suspended_child_ids = frozenset(
+        child_id
         for child_id in active_child_ids
+        if (
+            getattr(run_by_id.get(child_id), "status", None) == RUN_WAITING
+            and child_id in child_by_id
+            and conversation_turn_snapshot_for_session(child_by_id[child_id]).status
+            == "suspended"
+        )
     )
-    all_succeeded = bool(child_ids) and all(
-        all(state == INPUT_DONE for state in input_states_by_child.get(child_id, ()))
-        and getattr(run_by_id.get(child_id), "status", None) == RUN_COMPLETED
-        and child_id in child_by_id
-        and conversation_turn_snapshot_for_session(child_by_id[child_id]).status
-        == "completed"
+    succeeded_child_ids = frozenset(
+        child_id
         for child_id in child_ids
+        if (
+            all(state == INPUT_DONE for state in input_states_by_child.get(child_id, ()))
+            and getattr(run_by_id.get(child_id), "status", None) == RUN_COMPLETED
+            and child_id in child_by_id
+            and conversation_turn_snapshot_for_session(child_by_id[child_id]).status
+            == "completed"
+        )
     )
+    all_active_suspended = bool(active_child_ids) and suspended_child_ids == active_child_ids
+    all_succeeded = bool(child_ids) and succeeded_child_ids == child_ids
     for child_id in child_ids:
         child = child_by_id.get(child_id)
         state_tokens.append(
@@ -201,6 +236,8 @@ async def _load_causal_child_cohort(
     return _CausalChildCohort(
         child_ids=child_ids,
         active_child_ids=active_child_ids,
+        suspended_child_ids=suspended_child_ids,
+        succeeded_child_ids=succeeded_child_ids,
         active_agent_ids=tuple(
             dict.fromkeys(
                 child_by_id[child_id].agent_id
@@ -392,11 +429,37 @@ async def reconcile_and_publish_project_run_group_turn(
             or session.source_channel != "project"
         ):
             return None
-        projection = await reconcile_project_group_turn(
-            db,
-            project_id=run.project_id,
-            session=session,
-        )
+        projection = None
+        if run.trigger_type == "leader_reply_batch":
+            raw_anchor_id = run_input.get("group_message_id")
+            try:
+                batch_anchor_id = uuid.UUID(str(raw_anchor_id))
+            except (TypeError, ValueError):
+                batch_anchor_id = None
+            if batch_anchor_id is not None:
+                existing = await get_conversation_turn_snapshot(
+                    db,
+                    agent_id=session.agent_id,
+                    conversation_id=str(session.id),
+                    turn_anchor_id=batch_anchor_id,
+                )
+                if existing.status in {"completed", "failed", "cancelled"}:
+                    # A member may return after the initiating Human turn has
+                    # already completed. The durable Leader batch is background
+                    # project progress; never reopen that terminal turn merely
+                    # to deliver the later summary.
+                    projection = ProjectGroupTurnProjection(
+                        existing,
+                        batch_anchor_id,
+                        (),
+                        0,
+                    )
+        if projection is None:
+            projection = await reconcile_project_group_turn(
+                db,
+                project_id=run.project_id,
+                session=session,
+            )
         await db.commit()
     await publish_project_group_turn_event(
         session=session,
@@ -503,6 +566,30 @@ async def reconcile_project_group_turn(
             # creating a second visible progress turn.
             anchor = existing_anchor
 
+    if (
+        snapshot.anchor_id == anchor.id
+        and snapshot.status in {"completed", "failed", "cancelled"}
+    ):
+        # A specialist result can enqueue its deferred owner-summary delivery
+        # after the initiating visible turn has already reached a terminal
+        # state. Terminal turns are immutable: the late delivery remains
+        # durable project progress, but must not reopen the same UI turn.
+        return ProjectGroupTurnProjection(snapshot, anchor.id, (), 0)
+
+    cohort_anchors = list(
+        (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(session.id),
+                    ChatMessage.role == "user",
+                    ChatMessage.message_meta["kind"].as_string()
+                    == "project_group_message",
+                    ChatMessage.created_at >= anchor.created_at,
+                )
+            )
+        ).scalars()
+    )
+    cohort_anchor_ids = tuple(str(row.id) for row in cohort_anchors)
     causal = await _load_causal_child_cohort(
         db,
         session=session,
@@ -522,9 +609,72 @@ async def reconcile_project_group_turn(
             )
         ).scalars()
     )
+    active_reply_rows = (
+        list(
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == str(session.id),
+                        ChatMessage.message_meta["kind"].as_string()
+                        == "project_subagent_reply",
+                        ChatMessage.message_meta["leader_batch_state"]
+                        .as_string()
+                        .in_(ACTIVE_LEADER_REPLY_STATES),
+                        ChatMessage.message_meta["timeline_anchor_id"]
+                        .as_string()
+                        .in_(cohort_anchor_ids),
+                    )
+                )
+            ).scalars()
+        )
+        if cohort_anchor_ids
+        else []
+    )
     nonterminal = [run for run in runs if run.status not in TERMINAL_PROJECT_RUN_STATUSES]
+    project_child_ids: set[uuid.UUID] = set()
+    for run in runs:
+        output = run.output if isinstance(run.output, dict) else {}
+        raw_child_id = (
+            output.get("session_id")
+            or output.get("subagent_session_id")
+            or output.get("subagent_run_id")
+        )
+        try:
+            project_child_ids.add(uuid.UUID(str(raw_child_id)))
+        except (TypeError, ValueError):
+            pass
+
+    # ProjectRun is authoritative for its own child. The causal cohort only
+    # supplements direct/external continuations that do not have a ProjectRun;
+    # counting both sources would duplicate active work and retain stale agents.
+    direct_child_ids = causal.child_ids - project_child_ids
+    active_direct_child_ids = causal.active_child_ids & direct_child_ids
+    direct_active_suspended = bool(active_direct_child_ids) and (
+        active_direct_child_ids <= causal.suspended_child_ids
+    )
+    direct_children_succeeded = not direct_child_ids or (
+        direct_child_ids <= causal.succeeded_child_ids
+    )
+    child_by_id = {child.id: child for child in causal.children}
+    direct_active_agent_ids = tuple(
+        dict.fromkeys(
+            child_by_id[child_id].agent_id
+            for child_id in sorted(active_direct_child_ids, key=str)
+            if child_id in child_by_id
+        )
+    )
+    reply_owner_ids: list[uuid.UUID] = []
+    for row in active_reply_rows:
+        raw_owner_id = dict(row.message_meta or {}).get("default_leader_agent_id")
+        try:
+            reply_owner_ids.append(uuid.UUID(str(raw_owner_id)))
+        except (TypeError, ValueError):
+            continue
     active_agent_ids = tuple(
-        dict.fromkeys(run.agent_id for run in nonterminal if run.agent_id is not None)
+        dict.fromkeys(
+            [run.agent_id for run in nonterminal if run.agent_id is not None]
+            + reply_owner_ids
+        )
     )
 
     project_runs_suspended = bool(nonterminal)
@@ -551,45 +701,28 @@ async def reconcile_project_group_turn(
                 project_runs_suspended = False
                 break
 
-    if nonterminal or causal.active_child_ids:
+    if nonterminal or active_reply_rows or active_direct_child_ids:
         suspended = (
-            (not nonterminal or project_runs_suspended)
-            and (
-                not causal.active_child_ids
-                or causal.all_active_suspended
-            )
+            not active_reply_rows
+            and (not nonterminal or project_runs_suspended)
+            and (not active_direct_child_ids or direct_active_suspended)
         )
         target_status = "suspended" if suspended else "running"
     else:
-        cohort_exists = bool(runs or causal.child_ids)
-        project_runs_succeeded = not runs or all(
-            run.status == "succeeded" for run in runs
-        )
-        causal_children_succeeded = (
-            not causal.child_ids or causal.all_succeeded
+        terminal_runs = [run for run in runs if not _is_deferred_owner_run(run)]
+        cohort_exists = bool(terminal_runs or direct_child_ids)
+        project_runs_succeeded = not terminal_runs or all(
+            run.status == "succeeded" for run in terminal_runs
         )
         target_status = (
             "completed"
-            if cohort_exists and project_runs_succeeded and causal_children_succeeded
+            if cohort_exists and project_runs_succeeded and direct_children_succeeded
             else "failed"
         )
 
     active_agent_ids = tuple(
-        dict.fromkeys((*active_agent_ids, *causal.active_agent_ids))
+        dict.fromkeys((*active_agent_ids, *direct_active_agent_ids))
     )
-    project_child_ids: set[uuid.UUID] = set()
-    for run in nonterminal:
-        output = run.output if isinstance(run.output, dict) else {}
-        raw_child_id = (
-            output.get("session_id")
-            or output.get("subagent_session_id")
-            or output.get("subagent_run_id")
-        )
-        try:
-            project_child_ids.add(uuid.UUID(str(raw_child_id)))
-        except (TypeError, ValueError):
-            pass
-    active_direct_child_ids = causal.active_child_ids - project_child_ids
 
     snapshot = await transition_conversation_turn(
         db,
@@ -605,6 +738,11 @@ async def reconcile_project_group_turn(
                     f"run:{run.id}:{run.agent_id}:{run.status}"
                     for run in runs
                 ),
+                *sorted(
+                    "reply:"
+                    f"{row.id}:{dict(row.message_meta or {}).get('leader_batch_state')}"
+                    for row in active_reply_rows
+                ),
                 *causal.state_tokens,
             ]
         ),
@@ -613,5 +751,9 @@ async def reconcile_project_group_turn(
         snapshot=snapshot,
         anchor_message_id=anchor.id,
         active_agent_ids=active_agent_ids,
-        run_count=len(nonterminal) + len(active_direct_child_ids),
+        run_count=(
+            len(nonterminal)
+            + len(active_reply_rows)
+            + len(active_direct_child_ids)
+        ),
     )

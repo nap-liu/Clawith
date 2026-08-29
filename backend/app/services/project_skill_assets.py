@@ -182,7 +182,7 @@ async def bind_library_skill_to_project_agent(
         await db.flush()
         await commit_project_changes(
             project,
-            f"Add project Skill: {skill.name}",
+            f"添加项目技能：{skill.name}",
             [f".agents/{project_agent_id}/{target_relative}"],
             author_name=actor_display_name,
             author_email=project_user_git_email(actor_user_id),
@@ -395,7 +395,7 @@ async def apply_project_skill_backfill(
         if moved:
             await commit_project_changes(
                 project,
-                f"Normalize {len(plans)} legacy project Skills",
+                f"更新 {len(plans)} 项项目技能",
                 _skill_backfill_git_paths(project, moved),
                 author_name=actor_display_name,
                 author_email=project_user_git_email(actor_user_id),
@@ -507,7 +507,7 @@ async def rollback_project_skill_backfill(
         if moved:
             await commit_project_changes(
                 project,
-                f"Roll back {len(prepared)} project Skill normalizations",
+                f"恢复 {len(prepared)} 项项目技能设置",
                 _skill_backfill_git_paths(project, moved),
                 author_name=actor_display_name,
                 author_email=project_user_git_email(actor_user_id),
@@ -597,7 +597,7 @@ async def register_project_workspace_skill(
     await db.flush()
     await commit_project_changes(
         project,
-        f"Update project Skill: {name}",
+        f"更新项目技能：{name}",
         [f".agents/{project_agent_id}/{relative_path}"],
         author_name=actor_display_name,
         author_email=project_user_git_email(actor_user_id),
@@ -771,7 +771,7 @@ async def set_project_skill_enabled(
         await db.flush()
         await commit_project_changes(
             project,
-            f"{'Enable' if enabled else 'Disable'} project Skill: {binding.capability_name}",
+            f"{'启用' if enabled else '停用'}项目技能：{binding.capability_name}",
             [
                 f".agents/{binding.inherited_from_agent_id}/{metadata['path']}",
                 f".agents/{binding.inherited_from_agent_id}/{_disabled_asset_path(metadata)}",
@@ -864,7 +864,7 @@ async def delete_project_skill_asset(
         await db.flush()
         await commit_project_changes(
             project,
-            f"Delete project Skill: {binding.capability_name}",
+            f"删除项目技能：{binding.capability_name}",
             changed_paths,
             author_name=actor_display_name,
             author_email=project_user_git_email(actor_user_id),
@@ -956,7 +956,7 @@ async def refresh_project_skill_asset(
                 )
             await commit_project_changes(
                 project,
-                f"Refresh project Skill: {name}",
+                f"刷新项目技能：{name}",
                 changed_paths,
                 author_name=actor_display_name,
                 author_email=project_user_git_email(actor_user_id),
@@ -1128,7 +1128,7 @@ async def instantiate_project_skills_from_template(
         await db.flush()
         await commit_project_changes(
             project,
-            f"Restore {len(bindings)} project Skills from template",
+            f"从模板恢复 {len(bindings)} 项项目技能",
             changed_paths,
             author_name=owner_display_name,
             author_email=project_user_git_email(owner_user_id),

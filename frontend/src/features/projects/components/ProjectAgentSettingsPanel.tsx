@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import {
   IconBolt,
-  IconCodeDots,
   IconDeviceFloppy,
   IconLoader2,
   IconSettings,
@@ -20,7 +19,7 @@ import {
 import ProjectAgentCapabilityPanel from "./ProjectAgentCapabilityPanel";
 import "./ProjectAgentSettingsPanel.css";
 
-export type ProjectAgentSettingsSection = "config" | "tools" | "mcp" | "skill";
+export type ProjectAgentSettingsSection = "config" | "tools" | "skill";
 
 type ModelOption = { value: string; label: string };
 
@@ -35,7 +34,6 @@ export default function ProjectAgentSettingsPanel({
   modelOptions,
   counts,
   tools,
-  mcp,
   skill,
   canManage = true,
   isReadonly = false,
@@ -57,7 +55,6 @@ export default function ProjectAgentSettingsPanel({
   modelOptions: ModelOption[];
   counts: Record<ProjectAgentSettingsSection, number>;
   tools: ReactNode;
-  mcp: ReactNode;
   skill: ReactNode;
   canManage?: boolean;
   isReadonly?: boolean;
@@ -102,14 +99,6 @@ export default function ProjectAgentSettingsPanel({
             label: t("projectAgents.capabilityPackage.sections.tools"),
             count: t("projectAgents.capabilityPackage.count", {
               count: counts.tools,
-            }),
-          },
-          {
-            value: "mcp",
-            icon: <IconCodeDots size={16} />,
-            label: t("projectAgents.capabilityPackage.sections.mcp"),
-            count: t("projectAgents.capabilityPackage.count", {
-              count: counts.mcp,
             }),
           },
           {
@@ -205,8 +194,6 @@ export default function ProjectAgentSettingsPanel({
           </>
         ) : value === "tools" ? (
           tools
-        ) : value === "mcp" ? (
-          mcp
         ) : (
           skill
         )}

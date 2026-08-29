@@ -1104,9 +1104,10 @@ export default function Layout() {
     queryKey: ["agents", "directory", currentTenant],
     queryFn: () =>
       agentApi.explore({
-        tenantId: currentTenant || undefined,
-        pageSize: 500,
+        tenantId: currentTenant,
+        pageSize: 24,
       }),
+    enabled: Boolean(currentTenant),
     refetchInterval: 30000,
   });
   const agents = agentDirectory?.items || [];

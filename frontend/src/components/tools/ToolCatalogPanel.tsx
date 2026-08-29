@@ -40,6 +40,8 @@ type ToolCatalogPanelProps<T> = {
   renderItemActions?: (item: T, group: ToolCatalogPanelGroup<T>) => ReactNode;
   toolbar?: ReactNode;
   maxHeight?: number;
+  groupOrder?: readonly string[];
+  prioritizeSelected?: boolean;
 };
 
 export default function ToolCatalogPanel<T>({
@@ -67,6 +69,8 @@ export default function ToolCatalogPanel<T>({
   renderItemActions,
   toolbar,
   maxHeight,
+  groupOrder,
+  prioritizeSelected = false,
 }: ToolCatalogPanelProps<T>) {
   const normalizedSearch = searchValue.trim().toLocaleLowerCase();
   const multiple = selectedKeys !== undefined;
@@ -95,14 +99,40 @@ export default function ToolCatalogPanel<T>({
           key,
           label: presentation.groupLabel,
           description: presentation.groupDescription,
-          items: [...groupItems].sort((left, right) =>
-            getPresentation(left).name.localeCompare(getPresentation(right).name),
-          ),
+          items: [...groupItems].sort((left, right) => {
+            if (prioritizeSelected && selectedKeys) {
+              const selectedDelta =
+                Number(selectedKeys.has(getKey(right))) -
+                Number(selectedKeys.has(getKey(left)));
+              if (selectedDelta) return selectedDelta;
+            }
+            return getPresentation(left).name.localeCompare(getPresentation(right).name);
+          }),
           allItems: groupedAll.get(key) || groupItems,
         };
       })
-      .sort((left, right) => left.label.localeCompare(right.label));
-  }, [allItems, getPresentation, items, normalizedSearch]);
+      .sort((left, right) => {
+        if (groupOrder) {
+          const leftIndex = groupOrder.indexOf(left.key);
+          const rightIndex = groupOrder.indexOf(right.key);
+          if (leftIndex !== rightIndex) {
+            if (leftIndex < 0) return 1;
+            if (rightIndex < 0) return -1;
+            return leftIndex - rightIndex;
+          }
+        }
+        return left.label.localeCompare(right.label);
+      });
+  }, [
+    allItems,
+    getKey,
+    getPresentation,
+    groupOrder,
+    items,
+    normalizedSearch,
+    prioritizeSelected,
+    selectedKeys,
+  ]);
 
   const setGroupExpanded = (key: string) => {
     const next = new Set(expandedGroups);

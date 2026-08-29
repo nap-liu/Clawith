@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import async_session
 from app.models.llm import LLMModel  # module is `llm.py`, not `llm_model.py`
 from app.models.tool import AgentTool, Tool
-from app.config import get_settings
 from app.services.tools.read_image.input_loader import (
     LoadError,
     LoadedImage,
@@ -53,6 +52,15 @@ async def _load_config(
     return tool_row.config or {}, agent_cfg
 
 
+async def get_effective_read_image_max_bytes(agent_id: uuid.UUID) -> int:
+    """Return the same per-file limit used by the standard image loader."""
+
+    async with async_session() as db:
+        tool_cfg, agent_cfg = await _load_config(db, agent_id)
+    effective = merge_config(tool_cfg or {}, agent_cfg)
+    return int(effective.get("max_image_bytes_per_file", 5 * 1024 * 1024))
+
+
 async def _load_vision_model(
     db: AsyncSession, model_id: str | uuid.UUID | None
 ) -> LLMModel | None:
@@ -68,13 +76,19 @@ async def _load_vision_model(
 
 
 async def _get_workspace(agent_id: uuid.UUID) -> Path:
-    settings = get_settings()
-    return Path(settings.AGENT_DATA_DIR) / str(agent_id)
+    from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+
+    return current_agent_runtime_workspace(agent_id).local_root
 
 
 # ─── Main entry ────────────────────────────────────────────────────────────
 
-async def handle_read_image(agent_id: uuid.UUID, arguments: dict) -> str:
+async def handle_read_image(
+    agent_id: uuid.UUID,
+    arguments: dict,
+    *,
+    workspace_root: Path | None = None,
+) -> str:
     # Recursion defense: when read_image's own call_llm invocation uses
     # agent_id=None, the vision model falls back to the global AGENT_TOOLS
     # list, which includes read_image itself. A nested dispatch would land
@@ -105,7 +119,7 @@ async def handle_read_image(agent_id: uuid.UUID, arguments: dict) -> str:
     if primary_model is None and fallback_model is None:
         return "❌ read_image: 配置的模型不支持视觉"
 
-    workspace = await _get_workspace(agent_id)
+    workspace = workspace_root or await _get_workspace(agent_id)
     load_result = await load(image_paths, workspace, effective)
     if load_result.short_circuit is not None:
         return f"❌ read_image: {load_result.short_circuit.reason}"

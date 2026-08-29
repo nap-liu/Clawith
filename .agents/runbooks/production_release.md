@@ -71,7 +71,8 @@ Required gates:
 3. migrations applied to an isolated PostgreSQL database;
 4. backend compile/import checks and the full backend test suite;
 5. frontend prebuild checks, TypeScript, and production build;
-6. the repository user-visible wording scanner;
+6. the repository user-visible wording scanner (`python scripts/check_user_visible_keyword.py`)
+   and the frontend project-copy/i18n prebuild check;
 7. local 3008 health and feature-level API/IM/browser validation appropriate to
    the change;
 8. rendered frontend nginx template validation in Docker when proxy behavior,

@@ -355,10 +355,10 @@ async def _project_accepts_new_subagent_anchor(
         return False
     if project.status == "running":
         return True
-    if project.status not in {"initializing", "planning"}:
+    if project.status not in {"initializing", "planning", "paused", "waiting", "completed"}:
         return False
     project_run_id = authorized_project_run_id
-    if project_run_id is None and project.status == "planning":
+    if project_run_id is None and project.status in {"planning", "paused", "waiting", "completed"}:
         raw_project_run_id = await db.scalar(
             select(ChatMessage.message_meta["project_run_id"].as_string())
             .where(
@@ -382,7 +382,8 @@ async def _project_accepts_new_subagent_anchor(
         )
     )
     return (project.status == "initializing" and trigger_type == "leader_kickoff") or (
-        project.status == "planning" and trigger_type == "group_leader_message"
+        project.status in {"planning", "paused", "waiting", "completed"}
+        and trigger_type == "group_leader_message"
     )
 
 
@@ -795,6 +796,12 @@ async def create_subagent(
                 "member_config_snapshot": project_member_config,
                 "capability_snapshot": project_capabilities,
                 "project_run_frozen": project_run_frozen,
+                "project_execution_tools_enabled": task_metadata.get(
+                    "project_execution_tools_enabled"
+                ),
+                "project_read_only_conversation": bool(
+                    task_metadata.get("project_read_only_conversation")
+                ),
                 "agent_runtime_workspace": agent_runtime_workspace_snapshot,
             },
             created_at=now,
@@ -1001,6 +1008,16 @@ async def append_subagent_message(
                 is_leader=active_is_leader,
                 frozen=active_run_frozen,
             )
+            if supplied_metadata.get("project_dispatch"):
+                child.im_config = {
+                    **dict(child.im_config or {}),
+                    "project_execution_tools_enabled": supplied_metadata.get(
+                        "project_execution_tools_enabled"
+                    ),
+                    "project_read_only_conversation": bool(
+                        supplied_metadata.get("project_read_only_conversation")
+                    ),
+                }
         supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
         causality = await _subagent_input_causality(db, parent=parent)
         input_row = ChatMessage(
@@ -1288,6 +1305,7 @@ async def prepare_subagent_tools(
             if execution_user_id is None:
                 raise ValueError("Project Subagent tool preparation requires its execution user identity")
             from app.services.project_runtime_tools import (
+                add_project_workspace_parameter,
                 load_project_runtime_scope,
                 project_runtime_tool_schemas,
             )
@@ -1363,25 +1381,13 @@ async def prepare_subagent_tools(
                 for item in child_tools
                 if item.get("function", {}).get("name") not in project_collaboration_bypass_tools
             ]
-            # Project deliverables have one versioned workspace. Keep private
-            # Agent assets readable, but do not expose private file mutation
-            # tools during project execution: project_write_file is the sole
-            # write path and records the project version, Run and event.
-            private_file_mutation_tools = {
-                "delete_file",
-                "edit_file",
-                "move_file",
-                "write_file",
-            }
-            child_tools = [
-                item
-                for item in child_tools
-                if item.get("function", {}).get("name") not in private_file_mutation_tools
-            ]
-            if project.status == "planning":
-                # Planning is a Human-controlled conversation with the project
-                # owner.  No inherited or project mutation surface is exposed
-                # until the approved kickoff moves the project to running.
+            child_tools = add_project_workspace_parameter(child_tools)
+            if (
+                runtime_config.get("project_execution_tools_enabled") is False
+                or project.status in {"planning", "paused", "waiting", "completed"}
+            ):
+                # Conversation remains available outside active execution, but
+                # no inherited or project mutation surface is exposed.
                 child_tools = []
                 project_tools = []
             else:
@@ -1395,7 +1401,10 @@ async def prepare_subagent_tools(
                     )
                 else:
                     runtime_member = member
-                project_tools = project_runtime_tool_schemas(project, runtime_member)
+                project_tools = project_runtime_tool_schemas(
+                    project,
+                    runtime_member,
+                )
         else:
             tools = await get_agent_tools_for_llm(agent_id)
             child_tools = [tool for tool in tools if tool.get("function", {}).get("name") not in hidden]
@@ -1478,7 +1487,18 @@ async def _claim_subagent(
             await db.commit()
             return (standard_run.id, lease_owner) if with_token else standard_run.id
 
-        from app.models.project import Project
+        from app.models.project import Project, ProjectRun
+
+        advisory_project_run_exists = exists(
+            select(ProjectRun.id).where(
+                ProjectRun.project_id == SubagentRun.project_id,
+                ProjectRun.trigger_type == "group_leader_message",
+                ProjectRun.status.in_(["queued", "running"]),
+                ProjectRun.finished_at.is_(None),
+                ProjectRun.output["subagent_run_id"].as_string()
+                == cast(SubagentRun.id, String),
+            )
+        )
 
         project_conditions = [
             *lease_conditions,
@@ -1486,7 +1506,13 @@ async def _claim_subagent(
             exists(
                 select(Project.id).where(
                     Project.id == SubagentRun.project_id,
-                    Project.status.in_(["running", "planning"]),
+                    or_(
+                        Project.status.in_(["running", "planning"]),
+                        and_(
+                            Project.status.in_(["paused", "waiting", "completed"]),
+                            advisory_project_run_exists,
+                        ),
+                    ),
                 )
             ),
         ]
@@ -1981,7 +2007,16 @@ async def _park_subagent_confirmation(
         run.status = RUN_WAITING if pending else RUN_QUEUED
         run.lease_owner = None
         run.lease_expires_at = None
-        from app.models.project import Project, ProjectEvent, ProjectRun
+        anchor = await db.get(ChatMessage, anchor_id)
+        if anchor is not None:
+            anchor.message_meta = {
+                **_message_meta(anchor),
+                # The Run waits for confirmation, while the normalized
+                # conversation Turn is suspended.  Keep both current-session
+                # and exact-anchor snapshots on the shared lifecycle contract.
+                "turn_status": "suspended" if pending else "running",
+            }
+        from app.models.project import Project, ProjectEvent, ProjectRun, ProjectWorkItem
         from app.services.project_service import add_event
 
         processing = (
@@ -2032,7 +2067,7 @@ async def _park_subagent_confirmation(
                             db,
                             project,
                             "run.waiting_confirmation",
-                            "Project run is waiting for human confirmation",
+                            "本次执行正在等待人工确认",
                             actor_agent_id=project_run.agent_id,
                             work_item_id=project_run.work_item_id,
                             run_id=project_run.id,
@@ -2198,11 +2233,13 @@ async def _finish_subagent_turn(
             if terminal
             else "subagent_turn_result"
         )
-        content = (reply or "").strip() or ("Subagent 执行失败，未返回错误详情。" if failed else "Subagent 已完成。")
+        content = (reply or "").strip() or (
+            "本次执行未完成，请稍后重试或查看项目状态。" if failed else "协作任务已完成。"
+        )
         # One durable child Session may process many separately auditable
         # project mentions. Complete every ProjectRun whose exact input was
         # consumed by this turn; do not leave the Runs UI permanently queued.
-        from app.models.project import Project, ProjectEvent, ProjectRun
+        from app.models.project import Project, ProjectEvent, ProjectRun, ProjectWorkItem
         from app.services.project_service import add_event
 
         now = datetime.now(UTC)
@@ -2251,12 +2288,45 @@ async def _finish_subagent_turn(
                     )
                 ).scalar_one_or_none()
                 project = await db.get(Project, project_run.project_id)
+                if project_run.trigger_type == "a2a" and project_run.work_item_id is not None:
+                    work_item = await db.get(
+                        ProjectWorkItem,
+                        project_run.work_item_id,
+                        with_for_update=True,
+                    )
+                    if work_item is not None and work_item.project_id == project_run.project_id:
+                        before_status = work_item.status
+                        terminal_work_item_status = "blocked" if failed else "review"
+                        if before_status in {"backlog", "todo", "in_progress"}:
+                            work_item.status = terminal_work_item_status
+                            if project is not None:
+                                add_event(
+                                    db,
+                                    project,
+                                    "work_item.updated",
+                                    (
+                                        f"{child.title} blocked work item {work_item.title}"
+                                        if failed
+                                        else f"{child.title} submitted work item {work_item.title} for review"
+                                    ),
+                                    actor_agent_id=child.agent_id,
+                                    work_item_id=work_item.id,
+                                    run_id=project_run.id,
+                                    metadata={
+                                        "before": {"status": before_status},
+                                        "after": {"status": work_item.status},
+                                        "reason": "a2a_run_failed" if failed else "a2a_run_succeeded",
+                                        "progress_note": content[:600],
+                                        "project_run_id": str(project_run.id),
+                                        "subagent_run_id": str(run.id),
+                                    },
+                                )
                 if project is not None and terminal_event_exists is None:
                     add_event(
                         db,
                         project,
                         terminal_event_type,
-                        "Project run failed" if failed else "Project run succeeded",
+                        "本次执行未完成" if failed else "本次执行已完成",
                         actor_user_id=project_run.initiated_by_user_id,
                         actor_agent_id=child.agent_id,
                         work_item_id=project_run.work_item_id,
@@ -2269,6 +2339,83 @@ async def _finish_subagent_turn(
                             "status": project_run.status,
                         },
                     )
+            owner_run = next(
+                (
+                    project_run
+                    for project_run in project_runs
+                    if project_run.trigger_type
+                    in {"leader_kickoff", "leader_reply_batch", "group_leader_message"}
+                ),
+                None,
+            )
+            if owner_run is not None:
+                owner_project = await db.get(Project, owner_run.project_id, with_for_update=True)
+                if owner_project is not None and owner_project.status == "running":
+                    active_successor = (
+                        await db.execute(
+                            select(ProjectRun.id)
+                            .where(
+                                ProjectRun.project_id == owner_project.id,
+                                ProjectRun.id.notin_(project_run_ids),
+                                ProjectRun.status.in_(["queued", "running"]),
+                                ProjectRun.finished_at.is_(None),
+                            )
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    unresolved_items = (
+                        (
+                            await db.execute(
+                                select(ProjectWorkItem)
+                                .where(
+                                    ProjectWorkItem.project_id == owner_project.id,
+                                    ProjectWorkItem.status != "done",
+                                )
+                                .order_by(ProjectWorkItem.updated_at.desc(), ProjectWorkItem.id)
+                                .limit(50)
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    has_any_work_item = bool(
+                        await db.scalar(
+                            select(ProjectWorkItem.id)
+                            .where(ProjectWorkItem.project_id == owner_project.id)
+                            .limit(1)
+                        )
+                    )
+                    if active_successor is None:
+                        owner_project.status = "waiting"
+                        project_settings = dict(owner_project.settings or {})
+                        if failed:
+                            project_settings["current_signal"] = "负责人本轮执行未完成，项目正在等待处理。"
+                            project_settings["next_action"] = "查看执行记录并重新推进项目。"
+                        elif has_any_work_item and not unresolved_items:
+                            project_settings["current_signal"] = "当前任务均已完成，项目正在等待确认。"
+                            project_settings["next_action"] = "确认项目结果或继续补充新的任务。"
+                        else:
+                            project_settings["current_signal"] = "项目当前没有正在执行的工作，存在待评审、待处理或待确认事项。"
+                            project_settings["next_action"] = "处理待评审、阻塞或缺失的任务后恢复项目。"
+                        owner_project.settings = project_settings
+                        add_event(
+                            db,
+                            owner_project,
+                            "project.status.updated",
+                            "Project is waiting for the next decision",
+                            actor_agent_id=child.agent_id,
+                            run_id=owner_run.id,
+                            metadata={
+                                "before": "running",
+                                "after": "waiting",
+                                "reason": (
+                                    "owner_turn_failed_without_active_successor"
+                                    if failed
+                                    else "owner_turn_finished_without_active_successor"
+                                ),
+                                "unresolved_work_item_ids": [str(item.id) for item in unresolved_items],
+                            },
+                        )
         assistant_message_id = await persist_assistant_reply_row(
             db,
             agent_id=child.agent_id,
@@ -2410,11 +2557,21 @@ async def execute_claimed_subagent(
                 except (TypeError, ValueError):
                     active_project_run_id = None
                 if child.project_id is not None:
-                    from app.models.project import Project
+                    from app.models.project import Project, ProjectRun
 
                     active_project = await db.get(Project, child.project_id)
                     if active_project is None:
                         raise RuntimeError("Project Subagent runtime is no longer available")
+                    active_dispatch: dict = {}
+                    if active_project_run_id is not None:
+                        active_project_run = await db.get(ProjectRun, active_project_run_id)
+                        if (
+                            active_project_run is not None
+                            and active_project_run.project_id == active_project.id
+                        ):
+                            active_dispatch = dict(
+                                dict(active_project_run.input or {}).get("dispatch") or {}
+                            )
                     (
                         active_member,
                         active_member_config,
@@ -2435,6 +2592,19 @@ async def execute_claimed_subagent(
                         is_leader=active_is_leader,
                         frozen=active_run_frozen,
                     )
+                    child.im_config = {
+                        **dict(child.im_config or {}),
+                        # Freeze the execution boundary at message creation.
+                        # Resuming a project while an advisory turn is queued
+                        # must not turn that already-created turn into work.
+                        "project_execution_tools_enabled": active_dispatch.get(
+                            "execution_tools_enabled",
+                            active_project.status == "running",
+                        ),
+                        "project_read_only_conversation": bool(
+                            active_dispatch.get("read_only_conversation")
+                        ),
+                    }
                     await db.commit()
                 ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
                 if recovering:
@@ -2745,7 +2915,7 @@ async def execute_claimed_subagent(
             terminal = await _finish_subagent_turn(
                 run_id=run_id,
                 anchor_id=current_anchor_id,
-                reply=f"Subagent 执行失败: {type(exc).__name__}: {str(exc)[:400]}",
+                reply="本次执行未完成，请稍后重试或查看项目状态。",
                 failed=True,
             )
             if not terminal:
@@ -3816,22 +3986,17 @@ async def _materialize_project_a2a_turn(
         ).scalar_one_or_none()
         wake_leader = False
         if group is not None:
-            from app.models.project import ProjectMemberSnapshot
-
             group_external_key = f"project-a2a-group-reply:{event.id}"
             group_reply_exists = (
                 await db.execute(select(ChatMessage.id).where(ChatMessage.external_event_key == group_external_key))
             ).scalar_one_or_none()
             if group_reply_exists is None:
-                leader_agent_id = (
-                    await db.execute(
-                        select(ProjectMemberSnapshot.agent_id).where(
-                            ProjectMemberSnapshot.project_id == parent.project_id,
-                            ProjectMemberSnapshot.is_leader.is_(True),
-                            ProjectMemberSnapshot.is_enabled.is_(True),
-                        )
-                    )
-                ).scalar_one_or_none()
+                repaired_leader = (
+                    await _ensure_project_leader_or_none(db, project)
+                    if project is not None
+                    else None
+                )
+                leader_agent_id = repaired_leader.agent_id if repaired_leader is not None else None
                 is_leader_reply = leader_agent_id == child.agent_id
                 should_wake_leader, completion_policy = await _a2a_completion_leader_policy(
                     db,
@@ -3840,7 +4005,9 @@ async def _materialize_project_a2a_turn(
                     failed=event_meta.get("kind") == SUBAGENT_FAILURE,
                 )
                 leader_batch_state = (
-                    "ignored_leader_self"
+                    "blocked_no_leader"
+                    if leader_agent_id is None
+                    else "ignored_leader_self"
                     if is_leader_reply
                     else "pending"
                     if should_wake_leader
@@ -3867,7 +4034,9 @@ async def _materialize_project_a2a_turn(
                             "source_a2a_session_id": str(parent.id),
                             "attachments": event_meta.get("attachments", []),
                             "wake_policy": (
-                                "leader_self_no_wake"
+                                "blocked_no_leader"
+                                if leader_agent_id is None
+                                else "leader_self_no_wake"
                                 if is_leader_reply
                                 else "leader_batch_pending"
                                 if should_wake_leader
@@ -3928,7 +4097,7 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         # LLM, so completion cannot fan out into an implicit broadcast storm.
         external_key = f"project-subagent:{child_message_id}"
         async with async_session() as db:
-            from app.models.project import ProjectMemberSnapshot
+            from app.models.project import Project
 
             stored_event = await db.get(ChatMessage, child_message_id, with_for_update=True)
             if stored_event is None:
@@ -3943,15 +4112,13 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                 }
                 await db.commit()
                 return True
-            leader_agent_id = (
-                await db.execute(
-                    select(ProjectMemberSnapshot.agent_id).where(
-                        ProjectMemberSnapshot.project_id == parent.project_id,
-                        ProjectMemberSnapshot.is_leader.is_(True),
-                        ProjectMemberSnapshot.is_enabled.is_(True),
-                    )
-                )
-            ).scalar_one_or_none()
+            project = await db.get(Project, parent.project_id, with_for_update=True)
+            repaired_leader = (
+                await _ensure_project_leader_or_none(db, project)
+                if project is not None
+                else None
+            )
+            leader_agent_id = repaired_leader.agent_id if repaired_leader is not None else None
             is_leader_reply = leader_agent_id == child.agent_id
             event_meta = _message_meta(event)
             from app.services.project_group_turn_lifecycle import (
@@ -3994,8 +4161,20 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                     ),
                     "producer_scope": producer_scope,
                     "attachments": event_meta.get("attachments", []),
-                    "wake_policy": "leader_batch_pending" if not is_leader_reply else "leader_self_no_wake",
-                    "leader_batch_state": "ignored_leader_self" if is_leader_reply else "pending",
+                    "wake_policy": (
+                        "blocked_no_leader"
+                        if leader_agent_id is None
+                        else "leader_batch_pending"
+                        if not is_leader_reply
+                        else "leader_self_no_wake"
+                    ),
+                    "leader_batch_state": (
+                        "blocked_no_leader"
+                        if leader_agent_id is None
+                        else "ignored_leader_self"
+                        if is_leader_reply
+                        else "pending"
+                    ),
                     "default_leader_agent_id": str(leader_agent_id) if leader_agent_id else None,
                 },
             )
@@ -4101,6 +4280,8 @@ async def _persist_parent_batch_identity_failure(
 ) -> None:
     from app.services.chat_history import persist_assistant_reply_row
 
+    logger.warning("Subagent event execution identity is unavailable: {}", exc)
+    visible_error = "协作任务未能继续，请检查资源访问权限后重试。"
     async with async_session() as db:
         stored_anchor = await db.get(ChatMessage, anchor.id, with_for_update=True)
         if stored_anchor is None:
@@ -4122,10 +4303,7 @@ async def _persist_parent_batch_identity_failure(
             agent_id=parent.agent_id,
             user_id=run.execution_user_id,
             conversation_id=str(parent.id),
-            content=(
-                "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
-                f"Agent 访问权限。({type(exc).__name__})"
-            ),
+            content=visible_error,
             message_meta={
                 "kind": "subagent_event_failure",
                 "attachments": [],
@@ -4145,10 +4323,7 @@ async def _persist_parent_batch_identity_failure(
         conversation_id=str(parent.id),
         turn_anchor_id=stored_anchor.id,
         message_id=assistant_message_id,
-        content=(
-            "Subagent 事件未继续执行：原执行身份已失效或不再具有 "
-            f"Agent 访问权限。({type(exc).__name__})"
-        ),
+        content=visible_error,
     )
 
 
@@ -4441,6 +4616,19 @@ def _truncate_batch_content(content: str, *, limit: int = PROJECT_LEADER_BATCH_M
     return raw[: max(0, limit - len(marker_bytes))].decode("utf-8", errors="ignore") + marker
 
 
+async def _ensure_project_leader_or_none(db, project):
+    """Repair a runnable project owner at every autonomous coordination entry."""
+
+    from app.services.project_service import ensure_enabled_project_leader
+
+    try:
+        return await ensure_enabled_project_leader(db, project)
+    except HTTPException as exc:
+        if exc.status_code != 422:
+            raise
+        return None
+
+
 def _batch_attachment_refs(value) -> list[dict]:
     if not isinstance(value, list):
         return []
@@ -4659,16 +4847,40 @@ async def _dispatch_project_leader_batch(
         if group is None or group.source_channel != "project" or group.project_id is None:
             return True
         project = await db.get(Project, group.project_id, with_for_update=True)
-        leader = (
-            await db.execute(
-                select(ProjectMemberSnapshot).where(
-                    ProjectMemberSnapshot.project_id == group.project_id,
-                    ProjectMemberSnapshot.is_leader.is_(True),
-                    ProjectMemberSnapshot.is_enabled.is_(True),
+        if project is None:
+            return False
+        leader = await _ensure_project_leader_or_none(db, project)
+        if leader is None:
+            blocked_rows = (
+                (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.conversation_id == str(group.id),
+                            ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+                            ChatMessage.message_meta["leader_batch_state"].as_string() == "pending",
+                        )
+                        .with_for_update()
+                    )
                 )
+                .scalars()
+                .all()
             )
-        ).scalar_one_or_none()
-        if project is None or leader is None:
+            for row in blocked_rows:
+                row.message_meta = {
+                    **_message_meta(row),
+                    "leader_batch_state": "blocked_no_leader",
+                    "wake_policy": "blocked_no_leader",
+                }
+            if blocked_rows:
+                add_event(
+                    db,
+                    project,
+                    "leader.missing",
+                    "当前没有可用的项目负责人",
+                    metadata={"blocked_reply_ids": [str(row.id) for row in blocked_rows]},
+                )
+                await db.commit()
             return False
         if project.status != "running":
             return False
@@ -4741,6 +4953,20 @@ async def _dispatch_project_leader_batch(
                 group.id,
                 source_rows,
             )
+            cohort_anchor_id = (
+                str(original_human_request.get("message_id") or "")
+                if original_human_request is not None
+                else ""
+            )
+            if not cohort_anchor_id:
+                cohort_anchor_id = next(
+                    (
+                        str(_message_meta(row).get("timeline_anchor_id") or "")
+                        for row in source_rows
+                        if _message_meta(row).get("timeline_anchor_id")
+                    ),
+                    "",
+                )
             work_item_snapshots = await _project_work_item_snapshots(
                 db,
                 project.id,
@@ -4768,6 +4994,11 @@ async def _dispatch_project_leader_batch(
                 input={
                     "title": f"汇总 {len(source_rows)} 条成员回复并推进项目",
                     "group_session_id": str(group.id),
+                    **(
+                        {"group_message_id": cohort_anchor_id}
+                        if cohort_anchor_id
+                        else {}
+                    ),
                     "leader_agent_id": str(leader.agent_id),
                     "leader_batch_id": batch_id,
                     "source_group_message_ids": [str(row.id) for row in source_rows],
@@ -5028,8 +5259,11 @@ async def _dispatch_project_leader_batch(
                     ),
                 },
             )
+        published_project_run_id = project_run.id if project_run is not None else None
         await db.commit()
-        return True
+    if published_project_run_id is not None:
+        await _publish_project_run_group_turn(published_project_run_id)
+    return True
 
 
 PROJECT_DISPATCH_TRIGGERS = frozenset(
@@ -5409,7 +5643,10 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         runtime_ready = project is not None and (
             project.status == "running"
             or (project_run.trigger_type == "leader_kickoff" and project.status == "initializing")
-            or (project_run.trigger_type == "group_leader_message" and project.status == "planning")
+            or (
+                project_run.trigger_type == "group_leader_message"
+                and project.status in {"planning", "paused", "waiting", "completed"}
+            )
         )
         if project is not None and not runtime_ready:
             return {"status": "paused"}
@@ -5425,8 +5662,16 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
             or member.agent_id != project_run.agent_id
             or not member.is_enabled
         ):
+            if project_run.trigger_type == "leader_kickoff" and project is not None:
+                project.status = "planning"
+                settings = dict(project.settings or {})
+                planning = dict(settings.get("planning") or {})
+                planning["state"] = "discussion"
+                planning["launch_confirmed"] = False
+                settings["planning"] = planning
+                project.settings = settings
             project_run.status = "failed"
-            project_run.error = "Project dispatch identity is no longer valid"
+            project_run.error = "The selected project member is no longer available"
             project_run.finished_at = datetime.now(UTC)
             await db.commit()
             await _publish_project_run_group_turn(project_run.id)
@@ -5481,7 +5726,10 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         runtime_ready = current_project is not None and (
             current_project.status == "running"
             or (project_run.trigger_type == "leader_kickoff" and current_project.status == "initializing")
-            or (project_run.trigger_type == "group_leader_message" and current_project.status == "planning")
+            or (
+                project_run.trigger_type == "group_leader_message"
+                and current_project.status in {"planning", "paused", "waiting", "completed"}
+            )
         )
         if not runtime_ready:
             return {"status": "paused" if current_project is not None else "gone"}
@@ -5507,6 +5755,13 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                     "project_dispatch": True,
                     "project_a2a": project_run.trigger_type == "a2a",
                     "a2a_session_id": str(parent.id) if project_run.trigger_type == "a2a" else None,
+                    "project_execution_tools_enabled": dispatch.get(
+                        "execution_tools_enabled",
+                        project.status == "running",
+                    ),
+                    "project_read_only_conversation": bool(
+                        dispatch.get("read_only_conversation")
+                    ),
                 },
             )
             child_id = child.id
@@ -5527,10 +5782,16 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                     "project_dispatch": True,
                     "project_a2a": project_run.trigger_type == "a2a",
                     "a2a_session_id": str(parent.id) if project_run.trigger_type == "a2a" else None,
+                    "project_execution_tools_enabled": dispatch.get(
+                        "execution_tools_enabled",
+                        project.status == "running",
+                    ),
+                    "project_read_only_conversation": bool(
+                        dispatch.get("read_only_conversation")
+                    ),
                 },
             )
-    except SubagentError as exc:
-        failed_run_id: uuid.UUID | None = None
+    except SubagentError:
         async with async_session() as db:
             failed_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
             if (
@@ -5539,14 +5800,16 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 and failed_run.status not in TERMINAL_PROJECT_RUN_STATUSES
                 and not dict(failed_run.output or {}).get("subagent_run_id")
             ):
-                failed_run.status = "failed"
-                failed_run.finished_at = datetime.now(UTC)
-                failed_run.error = str(exc)
+                failed_run.status = "queued"
+                failed_run.started_at = None
+                failed_run.error = None
+                failed_run.output = {
+                    **dict(failed_run.output or {}),
+                    "last_dispatch_error": "Project execution is temporarily unavailable",
+                    "last_dispatch_error_at": datetime.now(UTC).isoformat(),
+                }
                 await db.commit()
-                failed_run_id = failed_run.id
-        if failed_run_id is not None:
-            await _publish_project_run_group_turn(failed_run_id)
-        return {"status": "failed", "error": str(exc)}
+        return {"status": "queued", "error": "Project execution is temporarily unavailable"}
 
     async with async_session() as db:
         project_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
@@ -5796,7 +6059,7 @@ async def _pending_project_dispatch_batch(
                         ProjectRun.trigger_type == "leader_kickoff",
                     ),
                     and_(
-                        Project.status == "planning",
+                        Project.status.in_(["planning", "paused", "waiting", "completed"]),
                         ProjectRun.trigger_type == "group_leader_message",
                     ),
                 ),
@@ -5808,6 +6071,10 @@ async def _pending_project_dispatch_batch(
                 ProjectRun.input["dispatch"]["turn_anchor_id"].as_string().is_not(None),
                 ProjectRun.input["dispatch"]["task"].as_string().is_not(None),
                 ProjectRun.output["subagent_run_id"].as_string().is_(None),
+                or_(
+                    ProjectRun.output["last_dispatch_error"].as_string().is_(None),
+                    ProjectRun.updated_at <= datetime.now(UTC) - timedelta(seconds=5),
+                ),
             )
         )
         if after is not None:

@@ -167,7 +167,7 @@ async def restore_project_template_files(
     changed_paths = await asyncio.to_thread(_write_snapshot_files, project, files)
     result = await commit_project_changes(
         project,
-        "Restore final project assets from template",
+        "从模板恢复项目文件",
         changed_paths,
         force_add=True,
         author_name=author_name,

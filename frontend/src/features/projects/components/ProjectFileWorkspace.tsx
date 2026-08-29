@@ -32,6 +32,7 @@ import {
 import { useTranslation } from "react-i18next";
 
 import ResizableSplitPane from "../../../components/ui/ResizableSplitPane";
+import MarkdownRenderer from "../../../components/MarkdownRenderer";
 import {
   projectsApi,
   type ProjectFileContent,
@@ -364,7 +365,7 @@ function MetaLine({ content }: { content: ProjectFileContent }) {
       <span>{content.mime_type || "application/octet-stream"}</span>
       <span title={content.commit}>
         {content.commit
-          ? `Commit ${content.commit.slice(0, 10)}`
+          ? `${t("projectGit.commit")} ${content.commit.slice(0, 10)}`
           : t("projectWorkspaceFiles.notCommitted")}
       </span>
     </div>
@@ -521,13 +522,9 @@ export default function ProjectFileWorkspace({
         setDraftPath(next.path);
         setDraftContent(next.content || "");
       })
-      .catch((error: unknown) => {
+      .catch(() => {
         if (disposed) return;
-        setLoadError(
-          error instanceof Error
-            ? error.message
-            : t("projectWorkspaceFiles.loadFailed"),
-        );
+        setLoadError(t("projectWorkspaceFiles.loadFailed"));
       })
       .finally(() => {
         if (!disposed) setLoading(false);
@@ -653,12 +650,8 @@ export default function ProjectFileWorkspace({
             : await projectsApi.getFileContent(projectId, node.path, 1);
         openDownload(file.download_url, file.name);
       }
-    } catch (error: unknown) {
-      setDownloadError(
-        error instanceof Error
-          ? error.message
-          : t("projectWorkspaceFiles.downloadFailed"),
-      );
+    } catch {
+      setDownloadError(t("projectWorkspaceFiles.downloadFailed"));
     } finally {
       setDownloadingPath("");
     }
@@ -671,12 +664,8 @@ export default function ProjectFileWorkspace({
     try {
       const archive = await projectsApi.getDirectoryArchive(projectId);
       openDownload(archive.download_url, archive.name);
-    } catch (error: unknown) {
-      setDownloadError(
-        error instanceof Error
-          ? error.message
-          : t("projectWorkspaceFiles.downloadFailed"),
-      );
+    } catch {
+      setDownloadError(t("projectWorkspaceFiles.downloadFailed"));
     } finally {
       setDownloadingPath("");
     }
@@ -942,26 +931,10 @@ export default function ProjectFileWorkspace({
               />
             </div>
           ) : markdownPreview ? (
-            <Suspense
-              fallback={
-                <div className="project-file-workspace__editor-loading">
-                  <IconLoader2
-                    className="project-workspace__spinner"
-                    size={20}
-                  />
-                  <span>{t("projectWorkspaceFiles.loadingEditor")}</span>
-                </div>
-              }
-            >
-              <ProjectCodeEditor
-                path={draftPath || content?.path || "README.md"}
-                value={draftContent}
-                readOnly
-                ariaLabel={t("projectWorkspaceFiles.markdownPreviewAria", {
-                  name: content?.name || draftPath,
-                })}
-              />
-            </Suspense>
+            <MarkdownRenderer
+              className="project-file-workspace__markdown-preview"
+              content={draftContent}
+            />
           ) : canEditText ? (
             <form
               id="project-file-editor-form"

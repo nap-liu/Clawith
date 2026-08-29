@@ -91,6 +91,15 @@ Project collaboration requirements:
 - If required evidence is missing, identify the exact missing input and explain how it changes the professional decision. Ask one precise unblock question; do not manufacture a progress report.
 """
 
+PROJECT_EXECUTION_CONTINUITY_CONTRACT = """\
+Running-project continuity requirements:
+- A successful execution turn must update durable project state; prose that only describes completed work or future steps is not project progress.
+- When you own an assigned work item, update that exact item before ending: use done with concrete evidence when its acceptance criteria are met, review when an independent decision is required, blocked with the exact missing input when it cannot proceed, or in_progress with the verified result and next action when work genuinely remains.
+- Creating or assigning a work item does not start it. Starting ready work requires an exact project A2A task_delegate in the same turn.
+- After processing member results, the project owner must leave exactly one coherent next state: verify and close completed work; dispatch the next dependency-ready work; or record the precise blocker and set the project to waiting. When all success criteria are verified, create the delivery checkpoint and set the project to completed.
+- Never leave a running project with unfinished work, no active handoff, no recorded blocker, and only a prose list of next steps.
+"""
+
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
@@ -232,7 +241,11 @@ def build_project_group_task(request: str, *, is_owner: bool) -> str:
         if is_owner
         else "As an explicitly mentioned participant, answer within your role and do not wake unrelated members."
     )
-    return f"{request.strip()}\n\n---\n{PROJECT_COLLABORATION_CONTRACT}{role_instruction}"
+    execution_contract = PROJECT_EXECUTION_CONTINUITY_CONTRACT if is_owner else ""
+    return (
+        f"{request.strip()}\n\n---\n{PROJECT_COLLABORATION_CONTRACT}"
+        f"{execution_contract}{role_instruction}"
+    )
 
 
 def build_project_planning_task(request: str) -> str:
@@ -245,9 +258,30 @@ def build_project_planning_task(request: str) -> str:
         "whose answers would change the plan; otherwise propose the smallest coherent delivery plan and state "
         "what the Human should approve or revise. Do not create or update work items, runs, files, milestones, "
         "members, capabilities, project status or A2A handoffs, and do not begin delivery. Reply only in the "
-        "project conversation.\n\n"
+        "project conversation. Never imitate a tool call in plain text or emit XML-like tool syntax. If the "
+        "Human asks to start execution, summarize the ready plan and direct them to the project's formal "
+        "confirmation action; execution begins only after that action succeeds.\n\n"
         f"{PROJECT_COLLABORATION_CONTRACT}\n"
         "## Human planning request\n\n"
+        f"{request.strip()}"
+    )
+
+
+def build_project_read_only_conversation_task(request: str, *, status: str) -> str:
+    """Keep non-running project conversations advisory-only."""
+
+    state = {
+        "paused": "paused",
+        "waiting": "waiting for review, clarification, or an executable next item",
+        "completed": "completed",
+    }.get(status, status)
+    return (
+        f"The project is {state}. Continue the project conversation as the responsible Digital Employee. "
+        "Answer questions, explain existing decisions and results, and help the Human assess next steps. "
+        "Do not create or update work items, runs, files, milestones, members, capabilities, project status "
+        "or A2A handoffs. Do not restart delivery. Reply only in the project conversation.\n\n"
+        f"{PROJECT_COLLABORATION_CONTRACT}\n"
+        "## Human request\n\n"
         f"{request.strip()}"
     )
 
@@ -268,6 +302,7 @@ def build_project_kickoff_task(transcript: str) -> str:
         "to project records and Git. Return to the group only with a professional decision, an artifact, a "
         "material blocker requiring Human judgment, or verified completion evidence.\n\n"
         f"{PROJECT_COLLABORATION_CONTRACT}\n"
+        f"{PROJECT_EXECUTION_CONTINUITY_CONTRACT}\n"
         "## Approved planning record\n\n"
         f"{transcript.strip()}"
     )
@@ -306,6 +341,7 @@ def build_project_a2a_task(
     )
     return (
         f"{request.strip()}\n\n---\n{peer_context}{snapshot_context}\n{PROJECT_COLLABORATION_CONTRACT}"
+        f"{PROJECT_EXECUTION_CONTINUITY_CONTRACT}"
         "This is one explicit project A2A request from another enabled member. "
         "Respond with the recipient role's independent professional judgment. "
         "Address the requester's actual decision need; do not merely acknowledge, restate, or report progress. "
@@ -352,6 +388,7 @@ def build_project_owner_batch_task(
     return (
         "Process this coalesced batch of project member replies in one project-owner turn.\n"
         f"{PROJECT_COLLABORATION_CONTRACT}"
+        f"{PROJECT_EXECUTION_CONTINUITY_CONTRACT}"
         "Attribute evidence and conclusions to their source member. Reconcile agreements, "
         "preserve material dissent, and make the next project decision. Update project records "
         "when needed. Do not narrate the inbox as a status digest. Wake a specialist only when an upstream "

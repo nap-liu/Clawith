@@ -120,7 +120,15 @@ def _is_admin(user: User) -> bool:
 
 def is_platform_admin_user(user: User) -> bool:
     """Single role/Identity interpretation for platform administrator status."""
-    return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
+    # Permission predicates are synchronous and are also used with detached or
+    # freshly-flushed ORM objects.  Reading an unloaded relationship here would
+    # attempt async lazy I/O and raise MissingGreenlet.  Authenticated users load
+    # ``identity`` with selectin; callers without that loaded relationship still
+    # retain the authoritative tenant role.
+    identity = getattr(user, "__dict__", {}).get("identity")
+    return user.role == "platform_admin" or bool(
+        identity is not None and getattr(identity, "is_platform_admin", False)
+    )
 
 
 def current_agent_tenant_matches(user: User, agent: Agent) -> bool:

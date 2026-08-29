@@ -7,6 +7,7 @@ stored in ``tenant_settings`` under ``tool_config:<tool_name>``.
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -62,6 +63,67 @@ def get_sensitive_keys(config_schema: dict | None = None) -> set[str]:
                 keys.add(field.get("key", ""))
     keys.discard("")
     return keys
+
+
+def strip_sensitive_fields(config: dict | None, config_schema: dict | None = None) -> dict:
+    """Remove credential values while preserving ordinary tool configuration.
+
+    Project and template copies use this helper when a capability may reference
+    credentials owned by another scope.  The filtering is recursive because
+    MCP headers commonly carry authorization values below a ``headers`` key.
+    """
+
+    sensitive_keys = {
+        re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+        for key in get_sensitive_keys(config_schema)
+    }
+    sensitive_keys.update(
+        {
+            "apikey",
+            "auth",
+            "api_secret",
+            "access_token",
+            "refresh_token",
+            "bearer_token",
+            "authorization",
+            "client_secret",
+            "credential",
+            "credentials",
+            "key",
+            "secret_key",
+            "access_key",
+            "token",
+            "cookie",
+        }
+    )
+
+    def is_sensitive(key: object) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+        return (
+            normalized in sensitive_keys
+            or normalized.endswith("_password")
+            or normalized.endswith("_secret")
+            or normalized.endswith("_token")
+            or normalized.endswith("_api_key")
+            or normalized.endswith("_access_key")
+        )
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            cleaned: dict[Any, Any] = {}
+            for key, item in value.items():
+                if is_sensitive(key):
+                    continue
+                cleaned_item = clean(item)
+                if isinstance(item, dict) and item and not cleaned_item:
+                    continue
+                cleaned[key] = cleaned_item
+            return cleaned
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    return clean(dict(config or {}))
 
 
 def encrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:

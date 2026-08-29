@@ -15,6 +15,7 @@ from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 from app.models.tool import AgentTool, Tool
+from app.services.tool_config import strip_sensitive_fields
 from app.services.tool_enablement import tool_is_required
 
 # Project copies start with the smallest useful local execution surface. These
@@ -24,16 +25,20 @@ from app.services.tool_enablement import tool_is_required
 PROJECT_AGENT_DEFAULT_TOOL_NAMES = frozenset(
     {
         "complete_focus_item",
-        "execute_code_aio",
+        "execute_code",
+        "edit_file",
         "find_files",
         "list_files",
         "list_focus_items",
+        "move_file",
         "read_document",
         "read_file",
         "read_image",
         "search_files",
         "send_media",
         "upsert_focus_item",
+        "write_file",
+        "delete_file",
     }
 )
 
@@ -129,6 +134,14 @@ async def apply_project_agent_tool_settings(
     for tool_id, requested_enabled, requested_config in settings:
         tool = tools_by_id[tool_id]
         enabled = True if tool_is_required(tool.name) else requested_enabled
+        # MCP credentials are never copied into a project Agent assignment.
+        # Keep ordinary per-tool options intact; shared credentials remain
+        # inherited and eligible private credentials are resolved by reference.
+        persisted_config = (
+            strip_sensitive_fields(requested_config, tool.config_schema)
+            if tool.type == "mcp"
+            else requested_config
+        )
         assignment = assignments.get(tool_id)
         if assignment is None:
             db.add(
@@ -136,13 +149,177 @@ async def apply_project_agent_tool_settings(
                     agent_id=project_agent_id,
                     tool_id=tool_id,
                     enabled=enabled,
-                    config=requested_config,
+                    config=persisted_config,
                     source="user_installed",
+                    installed_by_agent_id=(
+                        project_agent_id if tool.source == "agent" else None
+                    ),
                 )
             )
         else:
             assignment.enabled = enabled
-            assignment.config = requested_config
+            assignment.config = persisted_config
+            if tool.source == "agent":
+                assignment.source = "user_installed"
+                assignment.installed_by_agent_id = project_agent_id
+    await db.flush()
+
+
+async def sync_project_agent_mcp_bindings(
+    db: AsyncSession,
+    project: Project,
+    *,
+    project_agent_id: uuid.UUID,
+    server_ids: set[uuid.UUID],
+) -> None:
+    """Keep server lifecycle bindings aligned with per-tool MCP switches."""
+
+    if not server_ids:
+        return
+    enabled_server_ids = set(
+        (
+            await db.execute(
+                select(Tool.mcp_server_id)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(
+                    AgentTool.agent_id == project_agent_id,
+                    AgentTool.enabled.is_(True),
+                    Tool.type == "mcp",
+                    Tool.mcp_server_id.in_(server_ids),
+                )
+                .distinct()
+            )
+        ).scalars()
+    )
+    servers = {
+        server.id: server
+        for server in (
+            (
+                await db.execute(
+                    select(MCPServer).where(
+                        MCPServer.id.in_(server_ids),
+                        or_(MCPServer.tenant_id == project.tenant_id, MCPServer.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    bindings = {
+        binding.capability_id: binding
+        for binding in (
+            (
+                await db.execute(
+                    select(ProjectCapabilityBinding).where(
+                        ProjectCapabilityBinding.project_id == project.id,
+                        ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                        ProjectCapabilityBinding.capability_type == "mcp",
+                        ProjectCapabilityBinding.source == "inherited",
+                        ProjectCapabilityBinding.inherited_from_agent_id == project_agent_id,
+                        ProjectCapabilityBinding.capability_id.in_(server_ids),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    for server_id in server_ids:
+        enabled = server_id in enabled_server_ids
+        binding = bindings.get(server_id)
+        if binding is not None:
+            binding.is_enabled = enabled
+        elif enabled and (server := servers.get(server_id)) is not None:
+            db.add(
+                ProjectCapabilityBinding(
+                    tenant_id=project.tenant_id,
+                    project_id=project.id,
+                    capability_type="mcp",
+                    capability_id=server_id,
+                    capability_name=server.display_name or server.name,
+                    source="inherited",
+                    inherited_from_agent_id=project_agent_id,
+                    is_enabled=True,
+                    scope={},
+                    config={},
+                )
+            )
+    await db.flush()
+
+
+async def sync_project_agent_tool_bindings(
+    db: AsyncSession,
+    project: Project,
+    *,
+    project_agent_id: uuid.UUID,
+    tool_ids: set[uuid.UUID],
+) -> None:
+    """Keep inherited platform-tool bindings aligned with the standard tool panel."""
+
+    if not tool_ids:
+        return
+    tools = {
+        tool.id: tool
+        for tool in (
+            (
+                await db.execute(
+                    select(Tool).where(
+                        Tool.id.in_(tool_ids),
+                        Tool.type != "mcp",
+                        or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    assignments = {
+        assignment.tool_id: assignment
+        for assignment in (
+            (
+                await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == project_agent_id,
+                        AgentTool.tool_id.in_(tool_ids),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    bindings = {
+        binding.capability_id: binding
+        for binding in (
+            (
+                await db.execute(
+                    select(ProjectCapabilityBinding).where(
+                        ProjectCapabilityBinding.project_id == project.id,
+                        ProjectCapabilityBinding.tenant_id == project.tenant_id,
+                        ProjectCapabilityBinding.capability_type == "tool",
+                        ProjectCapabilityBinding.source == "inherited",
+                        ProjectCapabilityBinding.inherited_from_agent_id == project_agent_id,
+                        ProjectCapabilityBinding.capability_id.in_(tool_ids),
+                    )
+                )
+            ).scalars()
+        )
+    }
+    for tool_id, tool in tools.items():
+        assignment = assignments.get(tool_id)
+        enabled = tool_is_required(tool.name) or bool(assignment and assignment.enabled)
+        binding = bindings.get(tool_id)
+        if binding is not None:
+            binding.is_enabled = enabled
+        elif enabled:
+            db.add(
+                ProjectCapabilityBinding(
+                    tenant_id=project.tenant_id,
+                    project_id=project.id,
+                    capability_type="tool",
+                    capability_id=tool_id,
+                    capability_name=tool.display_name or tool.name,
+                    source="inherited",
+                    inherited_from_agent_id=project_agent_id,
+                    is_enabled=True,
+                    scope={},
+                    config={},
+                )
+            )
     await db.flush()
 
 

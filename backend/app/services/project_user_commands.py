@@ -317,7 +317,7 @@ async def write_text_file(
         db,
         project,
         "project.file.committed",
-        f"Wrote and committed project file {result['path']}",
+        f"项目文件已保存：{result['path']}",
         actor_user_id=actor.id,
         metadata={
             "path": result["path"],
@@ -375,7 +375,7 @@ async def create_milestone(
             db,
             project,
             "git.milestone.prepared",
-            "Prepared a delivery milestone",
+            "正在创建交付里程碑",
             actor_user_id=actor.id,
             metadata={
                 "operation_key": operation_key,
@@ -402,7 +402,7 @@ async def create_milestone(
         raise RuntimeError("Milestone operation journal is unavailable")
     _git_head(attached, result["commit"])
     event.event_type = "git.milestone.created"
-    event.summary = f"Created delivery milestone {result['commit'][:12]}"
+    event.summary = "交付里程碑已创建"
     event.event_metadata = {
         **dict(event.event_metadata or {}),
         **result,

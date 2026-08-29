@@ -320,7 +320,7 @@ class AutonomyService:
         """Execute the tool action that was approved.
 
         Reads the tool name and arguments from the approval details,
-        then directly calls the tool executor (bypassing autonomy check).
+        then resumes it through the normalized tool boundary.
         """
         tool_name = details.get("tool")
         args_raw = details.get("args", "{}")
@@ -341,14 +341,68 @@ class AutonomyService:
             else:
                 arguments = args_raw
 
-            # Import and call the tool's direct executor (no autonomy re-check)
-            from app.services.agent_tools import _execute_tool_direct
-            result = await _execute_tool_direct(
-                tool_name,
-                arguments,
-                agent_id,
-                user_id=resolved_by_user_id,
-            )
+            # Re-enter the same normalized tool boundary used by the original
+            # call.  The approval skips only the autonomy gate; project scope,
+            # authorization, sandboxing, auditing, and workspace routing still
+            # run exactly once with the original request identity.
+            from app.services.agent_tools import execute_tool
+
+            requested_by = details.get("requested_by")
+            try:
+                execution_user_id = uuid.UUID(str(requested_by))
+            except (TypeError, ValueError, AttributeError):
+                return "Execution failed: approval has no valid original requester"
+            turn_anchor_raw = details.get("turn_anchor_id")
+            try:
+                turn_anchor_id = uuid.UUID(str(turn_anchor_raw)) if turn_anchor_raw else None
+            except (TypeError, ValueError, AttributeError):
+                turn_anchor_id = None
+            session_id = str(details.get("session_id") or "")
+            from contextlib import nullcontext
+
+            runtime_binding = nullcontext()
+            from app.database import async_session
+
+            async with async_session() as runtime_db:
+                agent = await runtime_db.get(Agent, agent_id)
+                if agent is None:
+                    return "Execution failed: digital employee is no longer available"
+                if str(agent.scope or "").strip().casefold() == "project":
+                    from app.models.chat_session import ChatSession
+                    from app.services.agent_runtime_workspace import (
+                        bind_agent_runtime_workspace,
+                        resolve_agent_runtime_workspace,
+                    )
+
+                    try:
+                        session_uuid = uuid.UUID(session_id)
+                    except (TypeError, ValueError, AttributeError):
+                        return "Execution failed: project approval has no valid session"
+                    runtime_session = await runtime_db.get(ChatSession, session_uuid)
+                    if runtime_session is None or runtime_session.agent_id != agent.id:
+                        return "Execution failed: project approval session is no longer available"
+                    runtime_workspace = resolve_agent_runtime_workspace(
+                        agent_id=agent.id,
+                        agent_scope=agent.scope,
+                        agent_project_id=agent.project_id,
+                        tenant_id=agent.tenant_id,
+                        session_project_id=runtime_session.project_id,
+                        session_config=dict(runtime_session.im_config or {}),
+                    )
+                    runtime_binding = bind_agent_runtime_workspace(runtime_workspace)
+
+            with runtime_binding:
+                result = await execute_tool(
+                    tool_name,
+                    arguments,
+                    agent_id,
+                    user_id=execution_user_id,
+                    session_id=session_id,
+                    tool_call_id=str(details.get("tool_call_id") or ""),
+                    turn_anchor_id=turn_anchor_id,
+                    skip_autonomy=True,
+                    approved_by_human=True,
+                )
             return result
         except Exception as e:
             logger.error(f"Failed to execute approved action {tool_name}: {e}")

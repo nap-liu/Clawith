@@ -8,6 +8,8 @@ under the configured ``_projects`` root.
 import asyncio
 import codecs
 import fcntl
+import fnmatch
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -46,6 +48,7 @@ _SCP_REMOTE_RE = re.compile(
 )
 _REPO_LOCKS: dict[Path, threading.RLock] = {}
 _REPO_LOCKS_GUARD = threading.Lock()
+_REPO_LOCK_STATE = threading.local()
 _DEFAULT_PROJECT_AUTHOR_NAME = "项目负责人"
 _DEFAULT_PROJECT_AUTHOR_EMAIL = "project@project.local"
 _LEGACY_PROJECT_AUTHOR_NAMES = frozenset({"clawith", "clawith project"})
@@ -115,6 +118,39 @@ class ProjectRepositoryCloneOperation:
     result: dict[str, Any]
     lock_handle: BinaryIO | None = None
     active: bool = True
+
+
+@dataclass(slots=True)
+class ProjectSandboxWorkspace:
+    """Isolated public project tree mounted into one foreground sandbox call."""
+
+    temp_dir: tempfile.TemporaryDirectory
+    root: Path
+    baseline_hashes: dict[str, str]
+    max_file_bytes: int
+    max_total_bytes: int
+
+    @property
+    def venv_root(self) -> Path:
+        return Path(self.temp_dir.name) / ".venv"
+
+    @property
+    def runtime_temp_root(self) -> Path:
+        return Path(self.temp_dir.name) / ".runtime-tmp"
+
+    def cleanup(self) -> None:
+        self.temp_dir.cleanup()
+
+
+@dataclass(slots=True)
+class ProjectReadWorkspace:
+    """Exact committed project files materialized for structured readers."""
+
+    temp_dir: tempfile.TemporaryDirectory
+    root: Path
+
+    def cleanup(self) -> None:
+        self.temp_dir.cleanup()
 
 
 def _managed_root() -> Path:
@@ -265,9 +301,116 @@ def _git_stdout_prefix(repo: Path, *args: str, limit: int) -> tuple[bytes, bool]
         return bytes(output[:safe_limit]), truncated
 
 
-def _repo_lock(repo: Path) -> threading.RLock:
-    with _REPO_LOCKS_GUARD:
-        return _REPO_LOCKS.setdefault(repo, threading.RLock())
+class _RepositoryWorkspaceLock:
+    """Re-entrant process and cross-process lock for one managed repository."""
+
+    def __init__(self, repo: Path):
+        self.repo = repo
+        with _REPO_LOCKS_GUARD:
+            self.thread_lock = _REPO_LOCKS.setdefault(repo, threading.RLock())
+
+    def __enter__(self):
+        self.thread_lock.acquire()
+        key = str(self.repo)
+        depths = getattr(_REPO_LOCK_STATE, "depths", {})
+        handles = getattr(_REPO_LOCK_STATE, "handles", {})
+        try:
+            if depths.get(key, 0) == 0:
+                self.repo.parent.mkdir(parents=True, exist_ok=True)
+                handle = (self.repo.parent / f".{self.repo.name}.workspace.lock").open("a+b")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    handle.close()
+                    raise
+                handles[key] = handle
+            depths[key] = depths.get(key, 0) + 1
+            _REPO_LOCK_STATE.depths = depths
+            _REPO_LOCK_STATE.handles = handles
+            return self
+        except Exception:
+            self.thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        key = str(self.repo)
+        depths = _REPO_LOCK_STATE.depths
+        handles = _REPO_LOCK_STATE.handles
+        depths[key] -= 1
+        if depths[key] == 0:
+            depths.pop(key, None)
+            handle = handles.pop(key)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+        self.thread_lock.release()
+
+
+def _repo_lock(repo: Path) -> _RepositoryWorkspaceLock:
+    return _RepositoryWorkspaceLock(repo)
+
+
+def _reset_project_repository_head(
+    project: Project,
+    revision: str,
+    expected_head: str,
+) -> bool:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        current_head = _git(repo, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+        if current_head != expected_head:
+            return False
+        _git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}")
+        _git(repo, "reset", "--hard", revision)
+        return True
+
+
+async def reset_project_repository_head(
+    project: Project,
+    revision: str,
+    *,
+    expected_head: str,
+) -> bool:
+    """Compensate only when the failed commit is still the exact repository head."""
+
+    return await asyncio.to_thread(
+        _reset_project_repository_head,
+        project,
+        revision,
+        expected_head,
+    )
+
+
+def _project_repository_commit_is_ancestor(
+    project: Project,
+    ancestor: str,
+    descendant: str,
+) -> bool:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        result = _git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+            check=False,
+        )
+        return result.returncode == 0
+
+
+async def project_repository_commit_is_ancestor(
+    project: Project,
+    ancestor: str,
+    descendant: str,
+) -> bool:
+    return await asyncio.to_thread(
+        _project_repository_commit_is_ancestor,
+        project,
+        ancestor,
+        descendant,
+    )
 
 
 def _acquire_repository_operation_lock(repo: Path, *, blocking: bool) -> BinaryIO | None:
@@ -425,6 +568,207 @@ def _safe_relative_path(repo: Path, raw_path: str) -> tuple[str, Path]:
     return normalized, target
 
 
+def _safe_project_delivery_path(repo: Path, raw_path: str) -> tuple[str, Path]:
+    """Resolve a public project file without exposing internal Agent assets."""
+
+    normalized, target = _safe_relative_path(repo, raw_path)
+    lexical_parts = PurePosixPath(normalized).parts
+    resolved_parts = target.relative_to(repo).parts
+    if lexical_parts[0].casefold() == ".agents" or resolved_parts[0].casefold() == ".agents":
+        raise HTTPException(status_code=422, detail="Project-internal Agent files are not project deliverables")
+    candidate = repo
+    for part in lexical_parts:
+        candidate /= part
+        if candidate.is_symlink():
+            raise HTTPException(status_code=422, detail="Symbolic links are unavailable to project file tools")
+    return normalized, target
+
+
+def _safe_project_delivery_root(repo: Path, raw_path: str) -> tuple[str, Path]:
+    value = str(raw_path or "").strip()
+    if value in {"", "."}:
+        return "", repo
+    return _safe_project_delivery_path(repo, value.rstrip("/"))
+
+
+def _stream_file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _project_sandbox_parent(repo: Path) -> Path:
+    # Keep transient copies outside AGENT_DATA_DIR. Remote AIO sandboxes mount
+    # that whole tree for standard Agent workspaces, so placing a project copy
+    # beside the repository would expose it to unrelated sandbox sessions.
+    parent = Path(tempfile.gettempdir()) / "clawith-project-sandboxes"
+    parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent.chmod(0o700)
+    return parent
+
+
+def _materialize_git_blob(
+    repo: Path,
+    object_id: str,
+    target: Path,
+    *,
+    max_bytes: int | None = None,
+) -> None:
+    size_result = _git(repo, "cat-file", "-s", object_id)
+    try:
+        size = int(size_result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Git returned an invalid project blob size") from exc
+    if max_bytes is not None and size > max_bytes:
+        raise HTTPException(status_code=413, detail="Project file exceeds the tool's existing size limit")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    process: subprocess.Popen | None = None
+    try:
+        with target.open("wb") as output:
+            process = subprocess.Popen(
+                ["git", "-c", f"safe.directory={repo}", "-C", str(repo), "cat-file", "blob", object_id],
+                stdout=output,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                _stdout, stderr = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired as exc:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise RuntimeError("Project file materialization timed out") from exc
+        if process.returncode != 0:
+            raise RuntimeError(
+                (stderr or b"project file materialization failed")
+                .decode("utf-8", errors="replace")[:500]
+            )
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def _committed_project_delivery_blobs(repo: Path, revision: str) -> Iterator[tuple[str, str]]:
+    listing = _git(repo, "ls-tree", "-r", "-z", revision)
+    for record in listing.stdout.split("\x00"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise RuntimeError("Git returned an invalid project tree entry")
+        mode, object_type, object_id = fields
+        if object_type != "blob" or mode not in {"100644", "100755"}:
+            continue
+        try:
+            normalized, _target = _safe_project_delivery_path(repo, raw_path)
+        except HTTPException:
+            continue
+        yield normalized, object_id
+
+
+def _create_project_sandbox_workspace(
+    project: Project,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> ProjectSandboxWorkspace:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        temp_dir = tempfile.TemporaryDirectory(
+            prefix="project-code-",
+            dir=_project_sandbox_parent(repo),
+        )
+        root = Path(temp_dir.name) / "repository"
+        root.mkdir(mode=0o700)
+        baseline_hashes: dict[str, str] = {}
+        total_bytes = 0
+        try:
+            revision = _git(repo, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+            for relative, object_id in _committed_project_delivery_blobs(repo, revision):
+                object_size = int(_git(repo, "cat-file", "-s", object_id).stdout.strip())
+                if object_size > max_file_bytes or total_bytes + object_size > max_total_bytes:
+                    continue
+                target = root / relative
+                _materialize_git_blob(repo, object_id, target, max_bytes=max_file_bytes)
+                baseline_hashes[relative] = _stream_file_hash(target)
+                total_bytes += object_size
+        except Exception:
+            temp_dir.cleanup()
+            raise
+        return ProjectSandboxWorkspace(
+            temp_dir,
+            root,
+            baseline_hashes,
+            max_file_bytes,
+            max_total_bytes,
+        )
+
+
+async def create_project_sandbox_workspace(
+    project: Project,
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> ProjectSandboxWorkspace:
+    return await asyncio.to_thread(
+        _create_project_sandbox_workspace,
+        project,
+        max_file_bytes,
+        max_total_bytes,
+    )
+
+
+def _materialize_project_read_workspace(
+    project: Project,
+    paths: list[str],
+    max_bytes: int | None,
+) -> ProjectReadWorkspace:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        temp_dir = tempfile.TemporaryDirectory(
+            prefix="project-read-",
+            dir=_project_sandbox_parent(repo),
+        )
+        root = Path(temp_dir.name)
+        try:
+            revision = _git(repo, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+            for raw_path in paths:
+                normalized, _source = _safe_project_delivery_path(repo, raw_path)
+                entry = _git(repo, "ls-tree", "-z", revision, "--", normalized, check=False)
+                if entry.returncode != 0 or not entry.stdout:
+                    raise HTTPException(status_code=404, detail=f"Project file does not exist: {normalized}")
+                metadata, separator, recorded_path = entry.stdout.rstrip("\x00").partition("\t")
+                fields = metadata.split()
+                if (
+                    not separator
+                    or recorded_path != normalized
+                    or len(fields) != 3
+                    or fields[1] != "blob"
+                    or fields[0] not in {"100644", "100755"}
+                ):
+                    raise HTTPException(status_code=422, detail=f"Project path is not a regular file: {normalized}")
+                target = root / normalized
+                _materialize_git_blob(repo, fields[2], target, max_bytes=max_bytes)
+        except Exception:
+            temp_dir.cleanup()
+            raise
+        return ProjectReadWorkspace(temp_dir, root)
+
+
+async def materialize_project_read_workspace(
+    project: Project,
+    paths: list[str],
+    *,
+    max_bytes: int | None = None,
+) -> ProjectReadWorkspace:
+    return await asyncio.to_thread(_materialize_project_read_workspace, project, paths, max_bytes)
+
+
 def _initialize(
     project: Project,
     author_name: str | None,
@@ -459,7 +803,7 @@ def _initialize(
             _commit_with_author(
                 repo,
                 "-m",
-                "Initialize AI-native project",
+                "创建项目初始版本",
                 author_name=author_name,
                 author_email=author_email,
             )
@@ -510,7 +854,7 @@ def _restore(
             repo,
             "--allow-empty",
             "-m",
-            message or f"Restore project tree from {commit[:12]}",
+            message or "恢复项目版本",
             author_name=author_name,
             author_email=author_email,
         )
@@ -660,7 +1004,8 @@ def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
         else set()
     )
     generated_subjects_only = all(
-        subject == "Ensure project member directories" or subject.startswith("Create project Agent: ")
+        subject in {"Ensure project member directories", "创建项目成员目录"}
+        or subject.startswith(("Create project Agent: ", "创建项目数字员工："))
         for subject in generated_subjects
     )
     generated_authors_only = all(
@@ -674,7 +1019,8 @@ def _assert_replaceable_baseline(project: Project, repo: Path) -> None:
     )
     if (
         baseline_files != {"PROJECT.json", "README.md"}
-        or baseline_subject != "Initialize AI-native project"
+        or baseline_subject
+        not in {"Initialize project", "Initialize AI-native project", "创建项目初始版本"}
         or not baseline_is_ancestor
         or not generated_only
     ):
@@ -699,7 +1045,7 @@ def _copy_generated_member_baseline(repo: Path, candidate: Path) -> None:
     _commit_with_author(
         candidate,
         "-m",
-        "Ensure project member directories",
+        "创建项目成员目录",
         author_name=None,
         author_email=None,
     )
@@ -997,7 +1343,7 @@ def _commit_project_member_workspace_paths(project: Project, paths: list[str]) -
             repo,
             "--only",
             "-m",
-            "Ensure project member directories",
+            "创建项目成员目录",
             "--",
             *normalized_paths,
             author_name=None,
@@ -1391,6 +1737,225 @@ async def list_project_files(project: Project) -> list[dict]:
     return await asyncio.to_thread(_list_files, project)
 
 
+def _display_project_tool_size(size: int) -> str:
+    return f"{size}B" if size < 1024 else f"{size / 1024:.1f}KB"
+
+
+def _list_project_workspace(project: Project, path: str) -> str:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, target = _safe_project_delivery_root(repo, path)
+        if not target.exists():
+            return f"Directory not found: {path or '/'}"
+        if not target.is_dir():
+            return f"Path is not a directory: {path}"
+        items: list[str] = []
+        folder_count = 0
+        file_count = 0
+        for child in sorted(target.iterdir(), key=lambda item: item.name):
+            if child.name.startswith(".") or child.is_symlink():
+                continue
+            child_path = f"{normalized}/{child.name}" if normalized else child.name
+            if child.is_dir():
+                folder_count += 1
+                child_count = len(
+                    [
+                        entry
+                        for entry in child.iterdir()
+                        if not entry.name.startswith(".") and not entry.is_symlink()
+                    ]
+                )
+                items.append(f"  📁 {child_path}/ ({child_count} items)")
+            elif child.is_file():
+                file_count += 1
+                items.append(f"  📄 {child_path} ({_display_project_tool_size(child.stat().st_size)})")
+        label = normalized or "root"
+        if not items:
+            return f"📂 {label}: Empty directory (0 files, 0 folders)"
+        return f"📂 {label}: {folder_count} folder(s), {file_count} file(s)\n" + "\n".join(items)
+
+
+async def list_project_workspace(project: Project, path: str = "") -> str:
+    return await asyncio.to_thread(_list_project_workspace, project, path)
+
+
+def _read_project_workspace_file(project: Project, path: str, offset: int, limit: int) -> str:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, target = _safe_project_delivery_path(repo, path)
+        if not target.exists() or not target.is_file():
+            return (
+                "File not found.\n"
+                f"Requested path: {normalized}\n"
+                "The requested path was not modified. Use list_files and copy an exact returned path."
+            )
+        start = max(0, int(offset))
+        bounded_limit = max(0, int(limit))
+        selected: list[str] = []
+        total_lines = 0
+        with target.open("r", encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                total_lines = index + 1
+                if start <= index < start + bounded_limit:
+                    selected.append(line.rstrip("\r\n"))
+        if start >= total_lines and total_lines:
+            return f"Offset {offset} exceeds file length ({total_lines} lines total)"
+        end = min(total_lines, start + bounded_limit)
+        body = "\n".join(
+            f"{index + 1:6}\t{line}"
+            for index, line in enumerate(selected, start=start)
+        )
+        if end < total_lines:
+            body += f"\n\n... [{total_lines - end} more lines not shown, lines {end + 1}-{total_lines}]"
+        header = f"📄 {normalized} (lines {start + 1 if total_lines else 0}-{end} of {total_lines})\n"
+        return header + body
+
+
+async def read_project_workspace_file(
+    project: Project,
+    path: str,
+    *,
+    offset: int = 0,
+    limit: int = 2000,
+) -> str:
+    return await asyncio.to_thread(_read_project_workspace_file, project, path, offset, limit)
+
+
+def _project_workspace_search(
+    project: Project,
+    pattern: str,
+    path: str,
+    file_pattern: str,
+    ignore_case: bool,
+) -> str:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        _normalized, target = _safe_project_delivery_root(repo, path)
+        if not target.exists() or not target.is_dir():
+            return f"Directory not found: {path}"
+        flags = re.IGNORECASE if ignore_case else 0
+        try:
+            regex = re.compile(pattern, flags)
+        except re.error as exc:
+            return f"Invalid regex pattern: {exc}"
+
+        results: list[str] = []
+        total_matches = 0
+        files_searched = 0
+        binary_suffixes = {
+            ".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".png",
+            ".jpg", ".jpeg", ".gif", ".zip", ".tar", ".gz",
+        }
+        for candidate in target.rglob("*"):
+            if len(results) >= 50:
+                break
+            try:
+                matched_path, candidate = _safe_project_delivery_path(
+                    repo,
+                    candidate.relative_to(repo).as_posix(),
+                )
+            except (HTTPException, ValueError):
+                continue
+            if (
+                not candidate.is_file()
+                or any(part.startswith(".") for part in PurePosixPath(matched_path).parts)
+                or candidate.suffix.lower() in binary_suffixes
+            ):
+                continue
+            relative_match = candidate.relative_to(target).as_posix()
+            if not (
+                fnmatch.fnmatch(candidate.name, file_pattern)
+                or fnmatch.fnmatch(relative_match, file_pattern)
+                or fnmatch.fnmatch(matched_path, file_pattern)
+            ):
+                continue
+            files_searched += 1
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for line_number, line in enumerate(content.splitlines(), 1):
+                if regex.search(line):
+                    results.append(f"{matched_path}:{line_number}: {line.strip()[:100]}")
+                    total_matches += 1
+                    if len(results) >= 50:
+                        break
+        if not results:
+            return f"No matches found for pattern '{pattern}' in {files_searched} file(s)"
+        truncated = total_matches > len(results)
+        note = (
+            f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)"
+            if truncated
+            else ""
+        )
+        return (
+            f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) "
+            f"for pattern '{pattern}'{note}:\n" + "\n".join(results)
+        )
+
+
+async def search_project_workspace(
+    project: Project,
+    pattern: str,
+    *,
+    path: str = ".",
+    file_pattern: str = "*",
+    ignore_case: bool = False,
+) -> str:
+    return await asyncio.to_thread(
+        _project_workspace_search,
+        project,
+        pattern,
+        path,
+        file_pattern,
+        ignore_case,
+    )
+
+
+def _find_project_workspace_files(project: Project, pattern: str, path: str) -> str:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        _normalized, target = _safe_project_delivery_root(repo, path)
+        if not target.exists() or not target.is_dir():
+            return f"Directory not found: {path}"
+        try:
+            found: list[tuple[str, Path]] = []
+            for candidate in target.glob(pattern):
+                try:
+                    matched_path, safe_candidate = _safe_project_delivery_path(
+                        repo,
+                        candidate.relative_to(repo).as_posix(),
+                    )
+                except (HTTPException, ValueError):
+                    continue
+                if any(part.startswith(".") for part in PurePosixPath(matched_path).parts):
+                    continue
+                found.append((matched_path, safe_candidate))
+        except Exception as exc:
+            return f"Invalid glob pattern: {exc}"
+        found.sort(key=lambda item: item[1].stat().st_mtime if item[1].exists() else 0, reverse=True)
+        matches: list[str] = []
+        folder_count = 0
+        file_count = 0
+        for matched_path, candidate in found[:100]:
+            if candidate.is_dir():
+                folder_count += 1
+                matches.append(f"📁 {matched_path}/")
+            elif candidate.is_file():
+                file_count += 1
+                matches.append(f"📄 {matched_path} ({_display_project_tool_size(candidate.stat().st_size)})")
+        if not matches:
+            return f"No files matching pattern: {pattern}"
+        return (
+            f"📂 Found {len(found)} item(s) ({folder_count} dirs, {file_count} files) "
+            f"matching '{pattern}':\n" + "\n".join(matches)
+        )
+
+
+async def find_project_workspace_files(project: Project, pattern: str, *, path: str = ".") -> str:
+    return await asyncio.to_thread(_find_project_workspace_files, project, pattern, path)
+
+
 def _inspect_file(project: Project, path: str) -> dict:
     repo = _repo_for(project)
     with _repo_lock(repo):
@@ -1627,7 +2192,7 @@ def _write_file(
         _commit_with_author(
             repo,
             "-m",
-            f"Update project file: {normalized}",
+            f"更新项目文件：{normalized}",
             "--",
             normalized,
             author_name=author_name,
@@ -1658,6 +2223,426 @@ async def write_project_file(
         content,
         author_name,
         author_email,
+    )
+
+
+def _path_exists_at_head(repo: Path, path: str) -> bool:
+    return _git(repo, "cat-file", "-e", f"HEAD:{path}", check=False).returncode == 0
+
+
+def _rollback_project_delivery_paths(repo: Path, paths: list[str], existed_at_head: dict[str, bool]) -> None:
+    for path in paths:
+        _git(repo, "reset", "-q", "HEAD", "--", path, check=False)
+        _git(repo, "restore", "--source=HEAD", "--worktree", "--", path, check=False)
+    for path in paths:
+        if existed_at_head.get(path, False):
+            continue
+        try:
+            _normalized, target = _safe_project_delivery_path(repo, path)
+        except HTTPException:
+            continue
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+
+
+def _commit_project_delivery_paths(
+    repo: Path,
+    *,
+    paths: list[str],
+    message: str,
+    author_name: str | None,
+    author_email: str | None,
+) -> str:
+    # Include deleted paths too; filtering to files that still exist leaves a
+    # mixed update+delete partially staged and the repository dirty.
+    # Stage independently. ``git mv`` already removes the source from the
+    # index, so a combined add can reject that now-absent source path before it
+    # reaches the destination. Independent adds preserve updates, deletions,
+    # and renames without staging unrelated repository files.
+    for path in paths:
+        _git(repo, "add", "-A", "--", path, check=False)
+    if _git(repo, "diff", "--cached", "--quiet", "--", *paths, check=False).returncode == 0:
+        raise HTTPException(status_code=409, detail="Project files are unchanged; no commit was created")
+    _commit_with_author(
+        repo,
+        "-m",
+        message,
+        "--",
+        *paths,
+        author_name=author_name,
+        author_email=author_email,
+    )
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _write_project_workspace_file(
+    project: Project,
+    path: str,
+    content: str,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict[str, Any]:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, target = _safe_project_delivery_path(repo, path)
+        if target.exists() and target.is_dir():
+            raise HTTPException(status_code=422, detail="Project file path points to a directory")
+        existed_at_head = {normalized: _path_exists_at_head(repo, normalized)}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".project-tool-write-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+            os.replace(temporary, target)
+            commit = _commit_project_delivery_paths(
+                repo,
+                paths=[normalized],
+                message=f"更新项目文件：{normalized}",
+                author_name=author_name,
+                author_email=author_email,
+            )
+        except Exception:
+            _rollback_project_delivery_paths(repo, [normalized], existed_at_head)
+            raise
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return {
+            "status": "completed",
+            "operation": "write_file",
+            "path": normalized,
+            "commit": commit,
+            "file": _file_record(repo, normalized),
+        }
+
+
+async def write_project_workspace_file(
+    project: Project,
+    path: str,
+    content: str,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _write_project_workspace_file,
+        project,
+        path,
+        content,
+        author_name,
+        author_email,
+    )
+
+
+def _edit_project_workspace_file(
+    project: Project,
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict[str, Any]:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, target = _safe_project_delivery_path(repo, path)
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail=f"File not found: {normalized}")
+        content = target.read_text(encoding="utf-8", errors="replace")
+        if old_string not in content:
+            raise HTTPException(status_code=422, detail="old_string was not found in the project file")
+        count = content.count(old_string)
+        if count > 1 and not replace_all:
+            raise HTTPException(
+                status_code=409,
+                detail=f"old_string appears {count} times; provide more context or set replace_all",
+            )
+        updated = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+        existed_at_head = {normalized: True}
+        fd, temporary = tempfile.mkstemp(prefix=".project-tool-edit-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(updated)
+            os.replace(temporary, target)
+            commit = _commit_project_delivery_paths(
+                repo,
+                paths=[normalized],
+                message=f"编辑项目文件：{normalized}",
+                author_name=author_name,
+                author_email=author_email,
+            )
+        except Exception:
+            _rollback_project_delivery_paths(repo, [normalized], existed_at_head)
+            raise
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return {
+            "status": "completed",
+            "operation": "edit_file",
+            "path": normalized,
+            "replacements": count if replace_all else 1,
+            "commit": commit,
+            "file": _file_record(repo, normalized),
+        }
+
+
+async def edit_project_workspace_file(
+    project: Project,
+    path: str,
+    old_string: str,
+    new_string: str,
+    *,
+    replace_all: bool = False,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _edit_project_workspace_file,
+        project,
+        path,
+        old_string,
+        new_string,
+        replace_all,
+        author_name,
+        author_email,
+    )
+
+
+def _move_project_workspace_path(
+    project: Project,
+    source_path: str,
+    destination_path: str,
+    overwrite: bool,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict[str, Any]:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        source, source_target = _safe_project_delivery_path(repo, source_path)
+        if not source_target.exists() or not _path_exists_at_head(repo, source):
+            raise HTTPException(status_code=404, detail="Project source path was not found")
+        raw_destination = str(destination_path or "")
+        if raw_destination.endswith("/"):
+            raw_destination = f"{raw_destination}{PurePosixPath(source).name}"
+        destination, destination_target = _safe_project_delivery_path(repo, raw_destination)
+        if destination_target.exists() and destination_target.is_dir():
+            destination = f"{destination}/{PurePosixPath(source).name}"
+            destination, destination_target = _safe_project_delivery_path(repo, destination)
+        if source == destination:
+            raise HTTPException(status_code=409, detail="Source and destination are the same project path")
+        if source_target.is_dir() and destination.startswith(f"{source}/"):
+            raise HTTPException(status_code=409, detail="Cannot move a folder into itself")
+        if destination_target.exists() and not overwrite:
+            raise HTTPException(status_code=409, detail="Project destination already exists")
+        paths = [source, destination]
+        existed_at_head = {path: _path_exists_at_head(repo, path) for path in paths}
+        destination_target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            args = ["mv"]
+            if overwrite:
+                args.append("-f")
+            _git(repo, *args, "--", source, destination)
+            commit = _commit_project_delivery_paths(
+                repo,
+                paths=paths,
+                message=f"移动项目文件：{source} → {destination}",
+                author_name=author_name,
+                author_email=author_email,
+            )
+        except Exception:
+            _rollback_project_delivery_paths(repo, paths, existed_at_head)
+            raise
+        return {
+            "status": "completed",
+            "operation": "move_file",
+            "source_path": source,
+            "destination_path": destination,
+            "commit": commit,
+        }
+
+
+async def move_project_workspace_path(
+    project: Project,
+    source_path: str,
+    destination_path: str,
+    *,
+    overwrite: bool = False,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _move_project_workspace_path,
+        project,
+        source_path,
+        destination_path,
+        overwrite,
+        author_name,
+        author_email,
+    )
+
+
+def _delete_project_workspace_file(
+    project: Project,
+    path: str,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict[str, Any]:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, target = _safe_project_delivery_path(repo, path)
+        if not target.exists() or not _path_exists_at_head(repo, normalized):
+            raise HTTPException(status_code=404, detail=f"File not found: {normalized}")
+        existed_at_head = {normalized: True}
+        try:
+            _git(repo, "rm", "-r", "--", normalized)
+            commit = _commit_project_delivery_paths(
+                repo,
+                paths=[normalized],
+                message=f"删除项目文件：{normalized}",
+                author_name=author_name,
+                author_email=author_email,
+            )
+        except Exception:
+            _rollback_project_delivery_paths(repo, [normalized], existed_at_head)
+            raise
+        return {
+            "status": "completed",
+            "operation": "delete_file",
+            "path": normalized,
+            "commit": commit,
+        }
+
+
+async def delete_project_workspace_file(
+    project: Project,
+    path: str,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _delete_project_workspace_file,
+        project,
+        path,
+        author_name,
+        author_email,
+    )
+
+
+def _commit_project_workspace_sandbox_changes(
+    project: Project,
+    workspace: ProjectSandboxWorkspace,
+    *,
+    author_name: str | None,
+    author_email: str | None,
+) -> dict[str, Any] | None:
+    """Conflict-check and commit changes from an isolated public sandbox tree."""
+
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        sandbox_hashes: dict[str, str] = {}
+        sandbox_files: dict[str, Path] = {}
+        total_bytes = 0
+        for candidate in workspace.root.rglob("*"):
+            if candidate.is_symlink():
+                raise HTTPException(status_code=422, detail="Symbolic links are unavailable to project sandboxes")
+            if not candidate.is_file():
+                continue
+            file_size = candidate.stat().st_size
+            if file_size > workspace.max_file_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Project sandbox file exceeds the standard size limit: {candidate.name}",
+                )
+            total_bytes += file_size
+            if total_bytes > workspace.max_total_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Project sandbox files exceed the standard total size limit",
+                )
+            relative = candidate.relative_to(workspace.root).as_posix()
+            normalized, _target = _safe_project_delivery_path(repo, relative)
+            sandbox_files[normalized] = candidate
+            sandbox_hashes[normalized] = _stream_file_hash(candidate)
+
+        changed_paths = {
+            path
+            for path in set(workspace.baseline_hashes) | set(sandbox_hashes)
+            if workspace.baseline_hashes.get(path) != sandbox_hashes.get(path)
+        }
+        if not changed_paths:
+            return None
+
+        conflicts: list[str] = []
+        for path in sorted(changed_paths):
+            _normalized, target = _safe_project_delivery_path(repo, path)
+            current_hash = _stream_file_hash(target) if target.is_file() else None
+            if current_hash != workspace.baseline_hashes.get(path):
+                conflicts.append(path)
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail="Project files changed during sandbox execution: " + ", ".join(conflicts[:10]),
+            )
+
+        existed_at_head = {path: _path_exists_at_head(repo, path) for path in changed_paths}
+        temporary_paths: list[str] = []
+        try:
+            for path in sorted(changed_paths):
+                _normalized, target = _safe_project_delivery_path(repo, path)
+                source = sandbox_files.get(path)
+                if source is None:
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    elif target.exists():
+                        target.unlink()
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(prefix=".project-sandbox-", dir=target.parent)
+                os.close(fd)
+                temporary_paths.append(temporary)
+                shutil.copyfile(source, temporary)
+                os.replace(temporary, target)
+                temporary_paths.remove(temporary)
+            delivery_paths = sorted(changed_paths)
+            commit = _commit_project_delivery_paths(
+                repo,
+                paths=delivery_paths,
+                message="更新项目文件：沙箱执行结果",
+                author_name=author_name,
+                author_email=author_email,
+            )
+        except Exception:
+            _rollback_project_delivery_paths(repo, sorted(changed_paths), existed_at_head)
+            raise
+        finally:
+            for temporary in temporary_paths:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        return {
+            "status": "completed",
+            "operation": "sandbox_commit",
+            "commit": commit,
+            "paths": delivery_paths,
+        }
+
+
+async def commit_project_workspace_sandbox_changes(
+    project: Project,
+    workspace: ProjectSandboxWorkspace,
+    *,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> dict[str, Any] | None:
+    return await asyncio.to_thread(
+        _commit_project_workspace_sandbox_changes,
+        project,
+        workspace,
+        author_name=author_name,
+        author_email=author_email,
     )
 
 

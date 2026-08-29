@@ -56,12 +56,40 @@ from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
 
 
-from app.services.mcp_permissions import assert_can_edit_server as _assert_can_edit_server_sync  # noqa: E402
+from app.services.mcp_permissions import (  # noqa: E402
+    assert_can_edit_server as _assert_can_edit_server_sync,
+    can_edit_server as _can_edit_server,
+    is_platform_admin as _is_platform_admin,
+)
 
 
 async def _assert_can_edit_server(current_user: User, server: MCPServer) -> None:
     """Async wrapper around the shared sync helper so endpoint awaits don't break."""
     _assert_can_edit_server_sync(current_user, server)
+
+
+async def _assert_can_view_server_for_agent(
+    current_user: User,
+    server: MCPServer,
+    agent_id: uuid.UUID | None,
+    db: AsyncSession,
+) -> Agent:
+    """Allow an Agent-scoped editor to read masked server metadata.
+
+    Reading the effective configuration is deliberately separate from editing
+    the company MCP definition.  A same-tenant user may inspect a server while
+    configuring an Agent, but the global PATCH endpoint remains protected by
+    ``can_edit_server``.
+    """
+
+    if agent_id is None:
+        raise HTTPException(status_code=403, detail="agent_id required for Agent configuration")
+    return await _require_agent_server_access(
+        current_user,
+        agent_id,
+        server,
+        db,
+    )
 
 
 PlatformAdmin = Annotated[User, Depends(require_role("platform_admin"))]
@@ -79,18 +107,16 @@ async def list_mcp_servers(
 @router.get("/{server_id}", response_model=MCPServerOut)
 async def get_mcp_server(
     server_id: uuid.UUID,
+    agent_id: uuid.UUID | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOut:
-    """Anyone allowed to edit the server may also read it.
-
-    Same role matrix as PATCH/dry-run/test-connection: platform_admin,
-    server creator, or same-tenant org_admin / agent_admin.
-    """
+    """Read a masked MCP definition for global or Agent-scoped configuration."""
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    await _assert_can_edit_server(current_user, srv)
+    if not _can_edit_server(current_user, srv):
+        await _assert_can_view_server_for_agent(current_user, srv, agent_id, db)
     return MCPServerOut.from_orm_model(srv)
 
 
@@ -341,25 +367,58 @@ async def _require_tenant_override_access(
 
 async def _require_agent_override_access(
     current_user: User, agent_id: uuid.UUID, db: AsyncSession,
-) -> None:
-    """Allowed: platform_admin, agent creator, or same-tenant org_admin / agent_admin."""
-    is_platform = (current_user.role == "platform_admin"
-                   or (current_user.identity and current_user.identity.is_platform_admin))
-    if is_platform:
-        return
+) -> Agent:
+    """Require authority to mutate one Agent's override, including project ACL."""
     agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
+    if _is_platform_admin(current_user):
+        return agent
+    if agent.scope == "project" and agent.project_id is not None:
+        from app.services.project_service import require_project
+
+        await require_project(db, current_user, agent.project_id, edit=True)
+        return agent
     if agent.creator_id == current_user.id:
-        return
+        return agent
     # Same-tenant admin: can manage all agent overrides in their tenant
     if (
         current_user.role in ("org_admin", "agent_admin")
         and agent.tenant_id is not None
         and current_user.tenant_id == agent.tenant_id
     ):
-        return
+        return agent
     raise HTTPException(status_code=403, detail="not authorized for this agent override")
+
+
+async def _require_agent_server_access(
+    current_user: User,
+    agent_id: uuid.UUID,
+    server: MCPServer,
+    db: AsyncSession,
+) -> Agent:
+    """Authorize one Agent-scoped MCP view or override without global edit authority."""
+    agent = await _require_agent_override_access(current_user, agent_id, db)
+    if server.tenant_id is not None and server.tenant_id != agent.tenant_id:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if agent.scope != "project":
+        return agent
+
+    assigned_tool_id = await db.scalar(
+        select(AgentTool.id)
+        .join(Tool, Tool.id == AgentTool.tool_id)
+        .where(
+            AgentTool.agent_id == agent.id,
+            Tool.type == "mcp",
+            Tool.mcp_server_id == server.id,
+        )
+        .limit(1)
+    )
+    if assigned_tool_id is None:
+        # Project configuration may only override MCP servers already copied
+        # into this project's isolated Digital Employee snapshot.
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return agent
 
 
 @router.post("/{server_id}/refresh-tools", response_model=MCPToolRefreshResultOut)
@@ -379,7 +438,12 @@ async def refresh_mcp_server_tool_catalog(
     if agent_id is None:
         await _assert_can_edit_server(current_user, server)
     else:
-        await _require_agent_override_access(current_user, agent_id, db)
+        agent = await _require_agent_server_access(current_user, agent_id, server, db)
+        if agent.scope == "project":
+            raise HTTPException(
+                status_code=403,
+                detail="Project MCP configuration cannot refresh the shared tool catalog",
+            )
 
     try:
         result = await refresh_mcp_server_tools(
@@ -475,12 +539,16 @@ async def list_mcp_overrides(
     Non-admin with agent_id: returns only that agent's overrides (after creator check).
     Non-admin without agent_id: 403.
     """
-    is_platform = (current_user.role == "platform_admin"
-                   or (current_user.identity and current_user.identity.is_platform_admin))
+    is_platform = _is_platform_admin(current_user)
     if not is_platform:
         if agent_id is None:
             raise HTTPException(status_code=403, detail="agent_id required for non-admin callers")
-        await _require_agent_override_access(current_user, agent_id, db)
+        server = (
+            await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+        ).scalar_one_or_none()
+        if server is None:
+            raise HTTPException(status_code=404, detail="MCP server not found")
+        await _require_agent_server_access(current_user, agent_id, server, db)
         # Return only the specific agent's overrides — no tenant rows visible to agent admins
         rows = (await db.execute(
             select(MCPServerOverride).where(
@@ -557,9 +625,12 @@ async def put_agent_override(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOverrideOut:
-    await _require_agent_override_access(current_user, agent_id, db)
-    if (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none() is None:
+    server = (
+        await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+    ).scalar_one_or_none()
+    if server is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    await _require_agent_server_access(current_user, agent_id, server, db)
     ovr = await _upsert_override(db, server_id, "agent", agent_id, payload, current_user.id)
     await write_audit_log(
         action="MCP_SERVER_OVERRIDE_UPSERT",
@@ -576,7 +647,12 @@ async def delete_agent_override(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await _require_agent_override_access(current_user, agent_id, db)
+    server = (
+        await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+    ).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    await _require_agent_server_access(current_user, agent_id, server, db)
     rows = (await db.execute(
         select(MCPServerOverride).where(
             MCPServerOverride.mcp_server_id == server_id,
@@ -665,7 +741,10 @@ async def dry_run_mcp_server(
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    await _assert_can_edit_server(current_user, srv)
+    if not _can_edit_server(current_user, srv):
+        if payload.scope != "agent":
+            raise HTTPException(status_code=403, detail="Agent scope required for project configuration")
+        await _assert_can_view_server_for_agent(current_user, srv, payload.agent_id, db)
 
     # Determine layers + lookup overrides
     used: list[str] = ["platform"]

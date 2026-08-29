@@ -1,20 +1,35 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { IconDownload, IconFolder, IconTools } from '@tabler/icons-react';
+import { IconBolt, IconDownload, IconFolder, IconTools } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import type { FileBrowserApi } from '../../../components/FileBrowser';
 import FileBrowser from '../../../components/FileBrowser';
+import ToolCatalogPanel from '../../../components/tools/ToolCatalogPanel';
 import { useToast } from '../../../components/Toast/ToastProvider';
 import { fileApi, skillApi } from '../../../services/api';
+import type { ProjectCapabilityOption } from '../../../features/projects/types';
+import { projectUserFacingCopy } from '../../../features/projects/projectUserFacingCopy';
+import { getLocalizedToolPresentation } from '../../../utils/toolPresentation';
 
 interface Props {
     agentId: string;
     canManage: boolean;
+    scope?: 'agent' | 'project';
+    draftCapabilities?: ProjectCapabilityOption[];
+    selectedCapabilityIds?: string[];
+    onSelectedCapabilityIdsChange?: (ids: string[]) => void;
 }
 
-export default function SkillsTab({ agentId, canManage }: Props) {
+export default function SkillsTab({
+    agentId,
+    canManage,
+    scope = 'agent',
+    draftCapabilities,
+    selectedCapabilityIds = [],
+    onSelectedCapabilityIdsChange,
+}: Props) {
     const { t, i18n } = useTranslation();
     const dialog = useDialog();
     const toast = useToast();
@@ -29,11 +44,21 @@ export default function SkillsTab({ agentId, canManage }: Props) {
     const [agentUrlImporting, setAgentUrlImporting] = useState(false);
     const [showImportSkillModal, setShowImportSkillModal] = useState(false);
     const [importingSkillId, setImportingSkillId] = useState<string | null>(null);
+    const [selectionSearch, setSelectionSearch] = useState('');
+    const [selectionSelectedOnly, setSelectionSelectedOnly] = useState(false);
+    const [expandedSelectionGroups, setExpandedSelectionGroups] = useState<Set<string>>(
+        () => new Set(['skill:market', 'skill:digital_employee']),
+    );
     const { data: globalSkillsForImport } = useQuery({
         queryKey: ['global-skills-for-import'],
         queryFn: () => skillApi.list(),
         enabled: showImportSkillModal,
     });
+    useEffect(() => {
+        setSelectionSearch('');
+        setSelectionSelectedOnly(false);
+        setExpandedSelectionGroups(new Set(['skill:market', 'skill:digital_employee']));
+    }, [agentId]);
     const safeDisplayIcon = (icon?: string | null, fallback = <IconTools size={20} stroke={1.8} />) =>
         icon && !/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(icon) ? icon : fallback;
     const adapter: FileBrowserApi = {
@@ -54,6 +79,77 @@ export default function SkillsTab({ agentId, canManage }: Props) {
             })
             .catch(() => setAgentClawhubSearching(false));
     };
+
+    if (draftCapabilities) {
+        const selectedKeys = new Set(selectedCapabilityIds);
+        const visibleCapabilities = selectionSelectedOnly
+            ? draftCapabilities.filter((capability) =>
+                selectedKeys.has(capability.capability_id || capability.id),
+            )
+            : draftCapabilities;
+        const getPresentation = (capability: ProjectCapabilityOption) => {
+            const base = getLocalizedToolPresentation(t, {
+                name: projectUserFacingCopy(capability.name, t),
+                description: capability.description,
+                type: capability.kind,
+            });
+            const origin = capability.origin ||
+                (capability.source === 'agent' ? 'digital_employee' : 'market');
+            return {
+                ...base,
+                groupKey: `skill:${origin}`,
+                groupLabel: t(`projectCreate.capabilities.groups.skill.${origin}`),
+                groupDescription: '',
+            };
+        };
+        return (
+            <ToolCatalogPanel
+                className="pm-capability-catalog"
+                items={visibleCapabilities}
+                allItems={draftCapabilities}
+                getKey={(capability) => capability.capability_id || capability.id}
+                getPresentation={getPresentation}
+                searchValue={selectionSearch}
+                onSearchChange={setSelectionSearch}
+                searchPlaceholder={t('projectCreate.capabilities.searchSkills')}
+                emptyLabel={t(selectionSelectedOnly
+                    ? 'projectCreate.capabilities.noSelected'
+                    : 'projectCreate.capabilities.noSkills')}
+                ariaLabel={t('projectAgents.capabilityPackage.sections.skill')}
+                expandedGroups={expandedSelectionGroups}
+                onExpandedGroupsChange={setExpandedSelectionGroups}
+                selectedKeys={selectedKeys}
+                prioritizeSelected
+                groupOrder={['skill:market', 'skill:digital_employee']}
+                onToggle={canManage && onSelectedCapabilityIdsChange
+                    ? (capabilityId) => onSelectedCapabilityIdsChange(
+                        selectedKeys.has(capabilityId)
+                            ? selectedCapabilityIds.filter((id) => id !== capabilityId)
+                            : [...selectedCapabilityIds, capabilityId],
+                    )
+                    : undefined}
+                renderGroupIcon={() => <IconBolt size={15} />}
+                renderGroupSummary={(group) => t('projectCreate.capabilities.groupCount', {
+                    selected: group.allItems.filter((capability) =>
+                        selectedKeys.has(capability.capability_id || capability.id),
+                    ).length,
+                    total: group.allItems.length,
+                })}
+                toolbar={
+                    <button
+                        type="button"
+                        className={`btn btn-secondary tool-catalog-panel__filter${selectionSelectedOnly ? ' is-active' : ''}`}
+                        onClick={() => setSelectionSelectedOnly((current) => !current)}
+                        aria-pressed={selectionSelectedOnly}
+                    >
+                        {t(selectionSelectedOnly
+                            ? 'projectCreate.capabilities.showAll'
+                            : 'projectCreate.capabilities.selectedOnly')}
+                    </button>
+                }
+            />
+        );
+    }
 
     return (
         <div>
@@ -153,7 +249,7 @@ export default function SkillsTab({ agentId, canManage }: Props) {
                                                 toast.success(t('common.file.skillInstalled', { name: result.displayName || result.slug }));
                                                 queryClient.invalidateQueries({ queryKey: ['files', agentId, 'skills'] });
                                             } catch (err: any) {
-                                                await dialog.alert(t('common.error.installFailed'), { type: 'error', details: String(err?.message || err) });
+                                                await dialog.alert(t('common.error.installFailed'), { type: 'error', details: scope === 'project' ? undefined : String(err?.message || err) });
                                             } finally {
                                                 setAgentClawhubInstalling(null);
                                             }
@@ -205,7 +301,7 @@ export default function SkillsTab({ agentId, canManage }: Props) {
                                         queryClient.invalidateQueries({ queryKey: ['files', agentId, 'skills'] });
                                         setShowAgentUrlImport(false);
                                     } catch (err: any) {
-                                        await dialog.alert(t('common.error.importFailed'), { type: 'error', details: String(err?.message || err) });
+                                        await dialog.alert(t('common.error.importFailed'), { type: 'error', details: scope === 'project' ? undefined : String(err?.message || err) });
                                     } finally {
                                         setAgentUrlImporting(false);
                                     }
@@ -279,7 +375,7 @@ export default function SkillsTab({ agentId, canManage }: Props) {
                                                     queryClient.invalidateQueries({ queryKey: ['files', agentId, 'skills'] });
                                                     setShowImportSkillModal(false);
                                                 } catch (err: any) {
-                                                    await dialog.alert(t('common.error.importFailed'), { type: 'error', details: String(err?.message || err) });
+                                                    await dialog.alert(t('common.error.importFailed'), { type: 'error', details: scope === 'project' ? undefined : String(err?.message || err) });
                                                 } finally {
                                                     setImportingSkillId(null);
                                                 }

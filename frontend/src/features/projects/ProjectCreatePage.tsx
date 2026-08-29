@@ -7,9 +7,7 @@ import {
   IconAlertTriangle,
   IconArrowLeft,
   IconArrowRight,
-  IconBolt,
   IconCheck,
-  IconCodeDots,
   IconCrown,
   IconLock,
   IconMessageCircle,
@@ -21,9 +19,9 @@ import {
 import { projectsApi } from "../../services/projects";
 import { enterpriseApi } from "../../services/api";
 import { useDialog } from "../../components/Dialog/DialogProvider";
-import ToolCatalogPanel from "../../components/tools/ToolCatalogPanel";
+import Pagination from "../../components/Pagination";
 import ToolsTab from "../../pages/agent-detail/tabs/ToolsTab";
-import { getLocalizedToolPresentation } from "../../utils/toolPresentation";
+import SkillsTab from "../../pages/agent-detail/tabs/SkillsTab";
 import type {
   ProjectAgentOption,
   ProjectAgentSettingsDraft,
@@ -82,11 +80,10 @@ function initialDraft(t: TFunction): Draft {
 function initialAgentSettings(
   agent: ProjectAgentOption,
   tools: ProjectAgentToolOption[],
-  capabilities: ProjectCapabilityOption[],
 ): ProjectAgentSettingsDraft {
-  const owned = capabilities.filter(
-    (capability) =>
-      capability.source === "agent" && capability.owner_agent_id === agent.id,
+  const visibleTools = tools.filter(
+    (tool) =>
+      !tool.installed_by_agent_id || tool.installed_by_agent_id === agent.id,
   );
   return {
     config_snapshot: {
@@ -95,22 +92,12 @@ function initialAgentSettings(
       max_tool_rounds: agent.max_tool_rounds ?? 50,
       project_instruction: "",
     },
-    tools: tools.map((tool) => ({
+    tools: visibleTools.map((tool) => ({
       ...tool,
       agent_config: { ...(tool.agent_config || {}) },
     })),
-    mcp_capability_ids: owned
-      .filter(
-        (capability) =>
-          capability.kind === "mcp" && capability.enabled_by_default !== false,
-      )
-      .map((capability) => capability.capability_id || capability.id),
-    skill_capability_ids: owned
-      .filter(
-        (capability) =>
-          capability.kind === "skill" && capability.enabled_by_default !== false,
-      )
-      .map((capability) => capability.capability_id || capability.id),
+    mcp_server_overrides: {},
+    skill_capability_ids: [],
   };
 }
 
@@ -122,18 +109,76 @@ function toggleItem(items: string[], id: string) {
 
 function AgentAvatar({ agent }: { agent: ProjectAgentOption }) {
   const [failed, setFailed] = useState(false);
-  const token = typeof window === "undefined" ? "" : localStorage.getItem("token") || "";
-  const avatarUrl = agent.avatar_url?.startsWith("/api") && token
-    ? `${agent.avatar_url}${agent.avatar_url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`
-    : agent.avatar_url;
-  useEffect(() => setFailed(false), [avatarUrl]);
+  const [authenticatedAvatarUrl, setAuthenticatedAvatarUrl] = useState<
+    string | null
+  >(null);
+  const avatarUrl = agent.avatar_url || "";
+  const requiresAuthentication = avatarUrl.startsWith("/api");
+
+  useEffect(() => {
+    setFailed(false);
+    setAuthenticatedAvatarUrl(null);
+    if (!requiresAuthentication) return;
+
+    const token = localStorage.getItem("token") || "";
+    if (!token) {
+      setFailed(true);
+      return;
+    }
+
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    const requestUrl = new URL(avatarUrl, window.location.origin);
+    // Authentication belongs in the request header. Never preserve credentials
+    // from stored avatar URLs in a request URI where proxies can log them.
+    requestUrl.searchParams.delete("token");
+    requestUrl.searchParams.delete("access_token");
+
+    void fetch(`${requestUrl.pathname}${requestUrl.search}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      credentials: "same-origin",
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (!response.ok)
+          throw new Error(`Avatar request failed: ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl);
+          objectUrl = null;
+          return;
+        }
+        setAuthenticatedAvatarUrl(objectUrl);
+      })
+      .catch((error) => {
+        if (!cancelled && error instanceof Error && error.name !== "AbortError") {
+          setFailed(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [avatarUrl, requiresAuthentication]);
+
+  const displayUrl = requiresAuthentication ? authenticatedAvatarUrl : avatarUrl;
   return avatarUrl && !failed ? (
-    <img
-      className="pm-agent-avatar"
-      src={avatarUrl}
-      alt=""
-      onError={() => setFailed(true)}
-    />
+    displayUrl ? (
+      <img
+        className="pm-agent-avatar"
+        src={displayUrl}
+        alt=""
+        onError={() => setFailed(true)}
+      />
+    ) : (
+      <span className="pm-agent-avatar">{agent.name.slice(0, 1)}</span>
+    )
   ) : (
     <span className="pm-agent-avatar">{agent.name.slice(0, 1)}</span>
   );
@@ -146,6 +191,7 @@ export default function ProjectCreatePage() {
   const [searchParams] = useSearchParams();
   const templateId = searchParams.get("template");
   const seededTemplateId = useRef<string | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const [step, setStep] = useState(1);
   const [draft, setDraft] = useState<Draft>(() => initialDraft(t));
   const [submitError, setSubmitError] = useState("");
@@ -164,6 +210,7 @@ export default function ProjectCreatePage() {
   const bootstrapQuery = useQuery({
     queryKey: ["projects", "bootstrap-options"],
     queryFn: projectsApi.bootstrapOptions,
+    staleTime: 30_000,
   });
   const templateQuery = useQuery({
     queryKey: ["projects", "template", templateId],
@@ -197,15 +244,13 @@ export default function ProjectCreatePage() {
       }
       navigate(`/projects/${project.id}/planning`);
     },
-    onError: (error) =>
+    onError: () =>
       setSubmitError(
-        error instanceof Error
-          ? error.message
-          : t(
-              templateId
-                ? "projectCreate.templateFailed"
-                : "projectCreate.failed",
-            ),
+        t(
+          templateId
+            ? "projectCreate.templateFailed"
+            : "projectCreate.failed",
+        ),
       ),
   });
 
@@ -275,7 +320,6 @@ export default function ProjectCreatePage() {
         nextSettings[agentId] = initialAgentSettings(
           agent,
           options.tools,
-          options.capabilities,
         );
         changed = true;
       }
@@ -306,6 +350,11 @@ export default function ProjectCreatePage() {
 
   const patchDraft = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
+
+  useEffect(() => {
+    contentRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [step]);
+
   const goNext = () => {
     if (validation[step - 1]) setStep((current) => Math.min(3, current + 1));
   };
@@ -338,8 +387,13 @@ export default function ProjectCreatePage() {
               enabled: tool.can_disable === false ? true : tool.enabled,
               config: tool.agent_config || {},
             })),
-            mcp_capability_ids:
-              draft.agentSettings[agentId].mcp_capability_ids,
+            mcp_server_overrides: Object.entries(
+              draft.agentSettings[agentId].mcp_server_overrides,
+            ).map(([server_id, override]) => {
+              const { credential_state: _credentialState, ...persistedOverride } =
+                override;
+              return { server_id, ...persistedOverride };
+            }),
             skill_capability_ids:
               draft.agentSettings[agentId].skill_capability_ids,
           }
@@ -429,18 +483,13 @@ export default function ProjectCreatePage() {
     );
   }
   if ((needsBootstrap && bootstrapQuery.isError) || templateQuery.isError) {
-    const error = templateQuery.error || bootstrapQuery.error;
     return (
       <main className="pm-page">
         <ProjectEmptyState
           className="pm-state-full"
           tone="error"
           title={t("projectCreate.loadFailedTitle")}
-          description={
-            error instanceof Error
-              ? error.message
-              : t("projectCreate.loadFailedDescription")
-          }
+          description={t("projectCreate.loadFailedDescription")}
           action={
             <Button
               variant="secondary"
@@ -522,13 +571,12 @@ export default function ProjectCreatePage() {
               : t("projectCreate.minimalSetup")}
           </small>
         </header>
-        <div className="pm-create-content">
+        <div ref={contentRef} className="pm-create-content">
           {step === 1 && (
             <TeamStep
               draft={draft}
               template={template}
               agents={agents}
-              capabilities={capabilities}
               patch={patchDraft}
             />
           )}
@@ -550,8 +598,15 @@ export default function ProjectCreatePage() {
               leader={leader}
               shareTargets={options?.users ?? []}
               capabilityCount={
-                draft.sharedCapabilityIds.length +
-                draft.inheritedCapabilityIds.length
+                Object.values(draft.agentSettings).reduce(
+                  (count, settings) =>
+                    count +
+                    settings.tools.filter(
+                      (tool) => tool.type === "mcp" && tool.enabled,
+                    ).length +
+                    settings.skill_capability_ids.length,
+                  0,
+                )
               }
               template={template}
               patch={patchDraft}
@@ -651,29 +706,94 @@ function TeamStep({
   draft,
   template,
   agents,
-  capabilities,
   patch,
 }: {
   draft: Draft;
   template?: ProjectTemplate;
   agents: ProjectAgentOption[];
-  capabilities: ProjectCapabilityOption[];
   patch: PatchDraft;
 }) {
   const { t } = useTranslation();
   const [agentQuery, setAgentQuery] = useState("");
+  const [agentPage, setAgentPage] = useState(1);
+  const agentPageSize = 8;
   const restoresSnapshot = Boolean(template?.snapshot_backed);
-  const visibleAgents = useMemo(() => {
+  const selectedTeamAgents = useMemo(
+    () => agents.filter((agent) => draft.memberIds.includes(agent.id)),
+    [agents, draft.memberIds],
+  );
+  const matchingAvailableAgents = useMemo(() => {
     const query = agentQuery.trim().toLocaleLowerCase();
-    if (!query) return agents;
-    return agents.filter((agent) =>
-      [agent.name, agent.role_description]
-        .filter(Boolean)
-        .join(" ")
-        .toLocaleLowerCase()
-        .includes(query),
+    return agents.filter(
+      (agent) =>
+        !draft.memberIds.includes(agent.id) &&
+        (!query ||
+          [agent.name, agent.role_description]
+            .filter(Boolean)
+            .join(" ")
+            .toLocaleLowerCase()
+            .includes(query)),
     );
-  }, [agentQuery, agents]);
+  }, [agentQuery, agents, draft.memberIds]);
+  const agentPageCount = Math.max(
+    1,
+    Math.ceil(matchingAvailableAgents.length / agentPageSize),
+  );
+  const visibleAgents = matchingAvailableAgents.slice(
+    (agentPage - 1) * agentPageSize,
+    agentPage * agentPageSize,
+  );
+  useEffect(() => setAgentPage(1), [agentQuery]);
+  useEffect(() => {
+    if (agentPage > agentPageCount) setAgentPage(agentPageCount);
+  }, [agentPage, agentPageCount]);
+
+  const renderAgentCard = (agent: ProjectAgentOption) => {
+    const selected = draft.memberIds.includes(agent.id);
+    const isLeader = draft.leaderId === agent.id;
+    const toggleAgent = () => {
+      const next = toggleItem(draft.memberIds, agent.id);
+      patch("memberIds", next);
+      if (!next.includes(draft.leaderId)) patch("leaderId", next[0] || "");
+    };
+    return (
+      <article key={agent.id} className={selected ? "is-selected" : ""}>
+        <Button
+          variant="ghost"
+          type="button"
+          className="pm-agent-select"
+          onClick={toggleAgent}
+          aria-pressed={selected}
+        >
+          <i>{selected && <IconCheck size={13} />}</i>
+          <AgentAvatar agent={agent} />
+          <span className="pm-agent-select__copy">
+            <strong>{agent.name}</strong>
+            <small>{projectUserFacingCopy(agent.role_description, t)}</small>
+          </span>
+          <em>
+            {t("projectCreate.team.capabilityCount", {
+              count: (agent.skill_count || 0) + (agent.mcp_count || 0),
+            })}
+          </em>
+        </Button>
+        {selected && (
+          <Button
+            variant="ghost"
+            type="button"
+            className={`pm-leader-select ${isLeader ? "is-active" : ""}`}
+            onClick={() => patch("leaderId", agent.id)}
+            aria-pressed={isLeader}
+          >
+            <IconCrown size={14} />
+            {isLeader
+              ? t("projectTerminology.projectOwner")
+              : t("projectTerminology.setOwner")}
+          </Button>
+        )}
+      </article>
+    );
+  };
   return (
     <div className="pm-step-section">
       <StepTitle
@@ -752,28 +872,23 @@ function TeamStep({
               <p>{t("projectTerminology.create.planningDescription")}</p>
             </div>
           </div>
-          <div className="pm-team-summary">
-            <div className="pm-agent-stack">
-              {agents
-                .filter((agent) => draft.memberIds.includes(agent.id))
-                .slice(0, 5)
-                .map((agent) => (
-                  <AgentAvatar key={agent.id} agent={agent} />
-                ))}
-            </div>
-            <div>
-              <strong>
-                {t("projectCreate.team.selected", {
-                  count: draft.memberIds.length,
-                })}
-              </strong>
-              <small>{t("projectCreate.team.snapshotCreated")}</small>
-            </div>
-            <span>
-              <i />
-              {t("projectCreate.team.a2a")}
-            </span>
-          </div>
+          {selectedTeamAgents.length ? (
+            <section className="pm-selected-agent-section">
+              <header>
+                <strong>{t("projectCreate.team.selectedPinned")}</strong>
+                <span>
+                  <small>{t("projectCreate.team.selectedPinnedHint", {
+                    count: selectedTeamAgents.length,
+                  })}</small>
+                  <i />
+                  <small>{t("projectCreate.team.a2a")}</small>
+                </span>
+              </header>
+              <div className="pm-agent-grid pm-agent-grid--selected">
+                {selectedTeamAgents.map(renderAgentCard)}
+              </div>
+            </section>
+          ) : null}
           <SearchInput
             className="pm-agent-search"
             value={agentQuery}
@@ -783,87 +898,25 @@ function TeamStep({
           />
           {agents.length ? (
             visibleAgents.length ? (
-              <div className="pm-agent-grid">
-              {visibleAgents.map((agent) => {
-                const selected = draft.memberIds.includes(agent.id);
-                const isLeader = draft.leaderId === agent.id;
-                const toggleAgent = () => {
-                  const next = toggleItem(draft.memberIds, agent.id);
-                  patch("memberIds", next);
-                  if (!next.includes(draft.leaderId))
-                    patch("leaderId", next[0] || "");
-                  const ownedCapabilities = capabilities.filter(
-                    (capability) =>
-                      capability.source === "agent" &&
-                      capability.owner_agent_id === agent.id,
-                  );
-                  const ownedCapabilityIds = ownedCapabilities.map(
-                    (capability) => capability.id,
-                  );
-                  const ownedDefaultIds = ownedCapabilities
-                    .filter(
-                      (capability) => capability.enabled_by_default !== false,
-                    )
-                    .map((capability) => capability.id);
-                  patch(
-                    "inheritedCapabilityIds",
-                    selected
-                      ? draft.inheritedCapabilityIds.filter(
-                          (id) => !ownedCapabilityIds.includes(id),
-                        )
-                      : Array.from(
-                          new Set([
-                            ...draft.inheritedCapabilityIds,
-                            ...ownedDefaultIds,
-                          ]),
-                        ),
-                  );
-                };
-                return (
-                  <article
-                    key={agent.id}
-                    className={selected ? "is-selected" : ""}
-                  >
-                    <Button
-                      variant="ghost"
-                      type="button"
-                      className="pm-agent-select"
-                      onClick={toggleAgent}
-                      aria-pressed={selected}
-                    >
-                      <i>{selected && <IconCheck size={13} />}</i>
-                      <AgentAvatar agent={agent} />
-                      <span className="pm-agent-select__copy">
-                        <strong>{agent.name}</strong>
-                        <small>
-                          {projectUserFacingCopy(agent.role_description, t)}
-                        </small>
-                      </span>
-                      <em>
-                        {t("projectCreate.team.capabilityCount", {
-                          count:
-                            (agent.skill_count || 0) + (agent.mcp_count || 0),
-                        })}
-                      </em>
-                    </Button>
-                    {selected && (
-                      <Button
-                        variant="ghost"
-                        type="button"
-                        className={`pm-leader-select ${isLeader ? "is-active" : ""}`}
-                        onClick={() => patch("leaderId", agent.id)}
-                        aria-pressed={isLeader}
-                      >
-                        <IconCrown size={14} />
-                        {isLeader
-                          ? t("projectTerminology.projectOwner")
-                          : t("projectTerminology.setOwner")}
-                      </Button>
-                    )}
-                  </article>
-                );
-              })}
-              </div>
+              <>
+                <div className="pm-agent-results">
+                  <div className="pm-agent-grid">
+                    {visibleAgents.map(renderAgentCard)}
+                  </div>
+                </div>
+                {matchingAvailableAgents.length > agentPageSize ? (
+                  <Pagination
+                    className="pm-agent-pagination"
+                    page={agentPage}
+                    pageSize={agentPageSize}
+                    total={matchingAvailableAgents.length}
+                    onPageChange={setAgentPage}
+                    showJump={false}
+                    compact
+                    ariaLabel={t("projectCreate.team.paginationAria")}
+                  />
+                ) : null}
+              </>
             ) : (
               <ProjectEmptyState
                 title={t("projectCreate.team.noSearchResults")}
@@ -905,12 +958,9 @@ function CapabilitiesStep({
   );
   const [capabilityTab, setCapabilityTab] =
     useState<ProjectAgentSettingsSection>("config");
-  const [capabilitySearch, setCapabilitySearch] = useState("");
-  const [expandedCapabilityGroups, setExpandedCapabilityGroups] = useState<
-    Set<string>
-  >(
-    () => new Set(["general"]),
-  );
+  const [agentQuery, setAgentQuery] = useState("");
+  const [agentPage, setAgentPage] = useState(1);
+  const agentPageSize = 6;
   const modelsQuery = useQuery({
     queryKey: ["llm-models", "project-create"],
     queryFn: enterpriseApi.llmModels,
@@ -920,15 +970,11 @@ function CapabilitiesStep({
       setActiveAgentId(draft.leaderId || agents[0]?.id || "");
     }
   }, [activeAgentId, agents, draft.leaderId]);
-  useEffect(() => {
-    setCapabilitySearch("");
-    setCapabilityTab("config");
-  }, [activeAgentId]);
   const allCapabilities = [...projectCapabilities, ...inheritedCapabilities];
   const activeAgent = agents.find((agent) => agent.id === activeAgentId);
   const activeSettings = activeAgent
     ? draft.agentSettings[activeAgent.id] ||
-      initialAgentSettings(activeAgent, tools, allCapabilities)
+      initialAgentSettings(activeAgent, tools)
     : null;
   const visibleCapabilities = allCapabilities.filter(
     (capability) =>
@@ -942,15 +988,24 @@ function CapabilitiesStep({
       [activeAgent.id]: next,
     });
   };
-  const getPresentation = (capability: ProjectCapabilityOption) =>
-    getLocalizedToolPresentation(t, {
-      key: capability.internal_name,
-      name: projectUserFacingCopy(capability.name, t),
-      description: capability.description,
-      category: capability.category,
-      type: capability.kind,
-      mcp_server_name: capability.mcp_server_name,
-    });
+  const matchingAgents = agents.filter((agent) => {
+    const query = agentQuery.trim().toLocaleLowerCase();
+    return !query || [agent.name, agent.role_description]
+      .filter(Boolean)
+      .join(" ")
+      .toLocaleLowerCase()
+      .includes(query);
+  });
+  const agentPageCount = Math.max(1, Math.ceil(matchingAgents.length / agentPageSize));
+  const currentAgentPage = Math.min(agentPage, agentPageCount);
+  const visibleAgents = matchingAgents.slice(
+    (currentAgentPage - 1) * agentPageSize,
+    currentAgentPage * agentPageSize,
+  );
+  useEffect(() => setAgentPage(1), [agentQuery]);
+  useEffect(() => {
+    if (agentPage > agentPageCount) setAgentPage(agentPageCount);
+  }, [agentPage, agentPageCount]);
   const modelOptions = [
     { value: "", label: t("projectSnapshot.followSourceAgent") },
     ...((modelsQuery.data || []) as Array<{
@@ -966,62 +1021,6 @@ function CapabilitiesStep({
         label: model.label || `${model.provider} · ${model.model}`,
       })),
   ];
-  const renderCapabilityCatalog = (kind: "mcp" | "skill") => {
-    if (!activeSettings) return null;
-    const items = visibleCapabilities.filter(
-      (capability) => capability.kind === kind,
-    );
-    const key = kind === "mcp" ? "mcp_capability_ids" : "skill_capability_ids";
-    const selectedKeys = new Set(activeSettings[key]);
-    return (
-      <ToolCatalogPanel
-        className="pm-capability-catalog"
-        items={items}
-        getKey={(capability) => capability.capability_id || capability.id}
-        getPresentation={getPresentation}
-        searchValue={capabilitySearch}
-        onSearchChange={setCapabilitySearch}
-        searchPlaceholder={t(
-          kind === "mcp"
-            ? "projectCreate.capabilities.searchTools"
-            : "projectCreate.capabilities.searchSkills",
-        )}
-        emptyLabel={t(
-          kind === "mcp"
-            ? "projectCreate.capabilities.noTools"
-            : "projectCreate.capabilities.noSkills",
-        )}
-        ariaLabel={t(
-          kind === "mcp"
-            ? "projectAgents.capabilityPackage.sections.mcp"
-            : "projectAgents.capabilityPackage.sections.skill",
-        )}
-        expandedGroups={expandedCapabilityGroups}
-        onExpandedGroupsChange={setExpandedCapabilityGroups}
-        selectedKeys={selectedKeys}
-        onToggle={(capabilityId) =>
-          updateActiveSettings({
-            ...activeSettings,
-            [key]: toggleItem(activeSettings[key], capabilityId),
-          })
-        }
-        renderGroupIcon={() =>
-          kind === "mcp" ? <IconCodeDots size={15} /> : <IconBolt size={15} />
-        }
-        renderItemBadges={(capability) => (
-          <span className="tool-catalog-panel__badge">
-            {capability.source === "agent"
-              ? t("projectCreate.capabilities.fromEmployee", {
-                  name:
-                    capability.owner_agent_name ||
-                    t("projectCreate.capabilities.employeeShort"),
-                })
-              : t("projectCreate.capabilities.projectShared")}
-          </span>
-        )}
-      />
-    );
-  };
   if (template?.snapshot_backed) {
     return (
       <div className="pm-step-section">
@@ -1048,8 +1047,15 @@ function CapabilitiesStep({
         description={t("projectCreate.capabilities.description")}
       />
       <section className="pm-capability-picker">
+        <SearchInput
+          className="pm-capability-agent-search"
+          value={agentQuery}
+          onChange={(event) => setAgentQuery(event.target.value)}
+          placeholder={t("projectCreate.team.searchPlaceholder")}
+          aria-label={t("projectCreate.team.searchAria")}
+        />
         <div className="pm-selected-agent-list" role="list">
-          {agents.map((agent) => {
+          {visibleAgents.map((agent) => {
             const active = agent.id === activeAgentId;
             return (
               <Button
@@ -1070,13 +1076,27 @@ function CapabilitiesStep({
             );
           })}
         </div>
+        {matchingAgents.length > agentPageSize ? (
+          <Pagination
+            className="pm-capability-agent-pagination"
+            page={currentAgentPage}
+            pageSize={agentPageSize}
+            total={matchingAgents.length}
+            onPageChange={setAgentPage}
+            showJump={false}
+            compact
+            ariaLabel={t("projectCreate.team.paginationAria")}
+          />
+        ) : null}
         {activeAgent && activeSettings ? (
           <ProjectAgentSettingsPanel
             className="pm-capability-panel"
             title={activeAgent.name}
             eyebrow={t("projectAgents.teamPage.workSettings")}
             value={capabilityTab}
-            onChange={setCapabilityTab}
+            onChange={(nextTab) => {
+              setCapabilityTab(nextTab);
+            }}
             config={activeSettings.config_snapshot}
             onConfigChange={(key, value) =>
               updateActiveSettings({
@@ -1092,7 +1112,6 @@ function CapabilitiesStep({
               config: Object.values(activeSettings.config_snapshot).filter(Boolean)
                 .length,
               tools: activeSettings.tools.length,
-              mcp: activeSettings.mcp_capability_ids.length,
               skill: activeSettings.skill_capability_ids.length,
             }}
             tools={
@@ -1101,7 +1120,6 @@ function CapabilitiesStep({
                 agentName={activeAgent.name}
                 canManage
                 canConfigure
-                scope="project"
                 draftTools={activeSettings.tools}
                 onDraftToolsChange={(nextTools) =>
                   updateActiveSettings({
@@ -1109,10 +1127,33 @@ function CapabilitiesStep({
                     tools: nextTools,
                   })
                 }
+                draftMcpOverrides={activeSettings.mcp_server_overrides}
+                onDraftMcpOverridesChange={(mcp_server_overrides) =>
+                  updateActiveSettings({
+                    ...activeSettings,
+                    mcp_server_overrides,
+                  })
+                }
               />
             }
-            mcp={renderCapabilityCatalog("mcp")}
-            skill={renderCapabilityCatalog("skill")}
+            skill={
+              <SkillsTab
+                key={activeAgent.id}
+                agentId={activeAgent.id}
+                canManage
+                scope="project"
+                draftCapabilities={visibleCapabilities.filter(
+                  (capability) => capability.kind === "skill",
+                )}
+                selectedCapabilityIds={activeSettings.skill_capability_ids}
+                onSelectedCapabilityIdsChange={(skill_capability_ids) =>
+                  updateActiveSettings({
+                    ...activeSettings,
+                    skill_capability_ids,
+                  })
+                }
+              />
+            }
           />
         ) : null}
       </section>
@@ -1138,6 +1179,34 @@ function BoundaryStep({
   patch: PatchDraft;
 }) {
   const { t } = useTranslation();
+  const [shareSearch, setShareSearch] = useState("");
+  const [sharePage, setSharePage] = useState(1);
+  const sharePageSize = 10;
+  const normalizedShareSearch = shareSearch.trim().toLocaleLowerCase();
+  const filteredShareTargets = useMemo(
+    () =>
+      shareTargets.filter((target) =>
+        `${target.name} ${target.email || ""}`
+          .toLocaleLowerCase()
+          .includes(normalizedShareSearch),
+      ),
+    [normalizedShareSearch, shareTargets],
+  );
+  const shareTotalPages = Math.max(
+    1,
+    Math.ceil(filteredShareTargets.length / sharePageSize),
+  );
+  const currentSharePage = Math.min(sharePage, shareTotalPages);
+  const visibleShareTargets = filteredShareTargets.slice(
+    (currentSharePage - 1) * sharePageSize,
+    currentSharePage * sharePageSize,
+  );
+
+  useEffect(() => setSharePage(1), [normalizedShareSearch]);
+  useEffect(() => {
+    if (sharePage > shareTotalPages) setSharePage(shareTotalPages);
+  }, [sharePage, shareTotalPages]);
+
   return (
     <div className="pm-step-section">
       <StepTitle
@@ -1181,9 +1250,18 @@ function BoundaryStep({
             <strong>{t("projectCreate.boundary.shareMembers")}</strong>
             <small>{t("projectCreate.boundary.shareHint")}</small>
           </header>
+          <SearchInput
+            className="pm-share-search"
+            value={shareSearch}
+            onChange={(event) => setShareSearch(event.target.value)}
+            placeholder={t("projectCreate.boundary.searchMembers")}
+            aria-label={t("projectCreate.boundary.searchMembersAria")}
+          />
           {shareTargets.length ? (
-            <div className="pm-share-targets">
-              {shareTargets.map((target) => {
+            visibleShareTargets.length ? (
+              <>
+                <div className="pm-share-targets">
+              {visibleShareTargets.map((target) => {
                 const selected = draft.shareTargets.includes(target.id);
                 return (
                   <Button
@@ -1207,7 +1285,25 @@ function BoundaryStep({
                   </Button>
                 );
               })}
-            </div>
+                </div>
+                {filteredShareTargets.length > sharePageSize ? (
+                  <Pagination
+                    className="pm-share-pagination"
+                    page={currentSharePage}
+                    pageSize={sharePageSize}
+                    total={filteredShareTargets.length}
+                    onPageChange={setSharePage}
+                    showJump={false}
+                    compact
+                    ariaLabel={t("projectCreate.boundary.paginationAria")}
+                  />
+                ) : null}
+              </>
+            ) : (
+              <div className="pm-inline-empty">
+                <p>{t("projectCreate.boundary.noSearchResults")}</p>
+              </div>
+            )
           ) : (
             <div className="pm-inline-empty">
               <p>{t("projectCreate.boundary.noShareTargets")}</p>

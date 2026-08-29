@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { agentApi } from '../services/api';
+import { useAuthStore } from '../stores';
 import type { ExploreAgent } from '../types';
 import { Globe, Zap, Coffee, PauseCircle } from 'lucide-react';
 import Pagination from '../components/Pagination';
@@ -366,12 +367,13 @@ function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
 export default function Explore() {
     const { i18n } = useTranslation();
     const navigate = useNavigate();
+    const user = useAuthStore((state) => state.user);
     const isChinese = i18n.language?.startsWith('zh');
     const [search, setSearch] = useState('');
     const [debouncedSearch, setDebouncedSearch] = useState('');
     const [category, setCategory] = useState<(typeof CATEGORIES)[number]['key']>('all');
     const [page, setPage] = useState(1);
-    const tenantId = localStorage.getItem('current_tenant_id') || '';
+    const tenantId = user?.tenant_id || '';
     const pageSize = 24;
 
     useEffect(() => {
@@ -381,15 +383,19 @@ export default function Explore() {
 
     useEffect(() => setPage(1), [category, debouncedSearch]);
 
+    const isDefaultDirectory = category === 'all' && !debouncedSearch && page === 1;
     const { data, isLoading, isFetching } = useQuery({
-        queryKey: ['agents', 'explore', tenantId, category, debouncedSearch, page],
+        queryKey: isDefaultDirectory
+            ? ['agents', 'directory', tenantId]
+            : ['agents', 'explore', tenantId, category, debouncedSearch, page],
         queryFn: () => agentApi.explore({
-            tenantId: tenantId || undefined,
+            tenantId,
             search: debouncedSearch || undefined,
             status: category === 'all' ? undefined : category,
             page,
             pageSize,
         }),
+        enabled: Boolean(tenantId),
         placeholderData: previous => previous,
         staleTime: 30000,
         refetchInterval: 60000,

@@ -221,7 +221,7 @@ async def create_project_agent(
             await asyncio.to_thread(_write_text_if_changed, layout.memory, data.core_memory)
         commit = await commit_project_changes(
             project,
-            f"Create project Agent: {agent.name}",
+            f"创建项目数字员工：{agent.name}",
             [agent.agent_dir],
             author_name=owner.display_name,
             author_email=project_user_git_email(owner.id),
@@ -234,7 +234,7 @@ async def create_project_agent(
         db,
         project,
         "project_agent.created",
-        f"Created project Agent {agent.name}",
+        f"项目数字员工已创建：{agent.name}",
         actor_user_id=owner.id,
         actor_agent_id=agent.id,
         metadata={
@@ -381,7 +381,7 @@ async def update_project_agent(
     if changed_paths:
         commit = await commit_project_changes(
             project,
-            f"Update project Agent: {agent.name}",
+            f"更新项目数字员工：{agent.name}",
             changed_paths,
             author_name=owner.display_name,
             author_email=project_user_git_email(owner.id),
@@ -390,7 +390,7 @@ async def update_project_agent(
         db,
         project,
         "project_agent.updated",
-        f"Updated project Agent {agent.name}",
+        f"项目数字员工已更新：{agent.name}",
         actor_user_id=owner.id,
         actor_agent_id=agent.id,
         metadata={"agent_id": str(agent.id), "commit": commit["commit"] if commit else None},
@@ -494,7 +494,7 @@ async def promote_project_agent(
         db,
         project,
         "project_agent.promoted",
-        f"Promoted project Agent {project_agent.name}",
+        f"项目数字员工已转为独立数字员工：{project_agent.name}",
         actor_user_id=owner.id,
         actor_agent_id=project_agent.id,
         metadata={"agent_id": str(project_agent.id), "promoted_agent_id": str(promoted.id)},

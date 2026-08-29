@@ -316,13 +316,16 @@ async def test_project_agent_tool_clone_groups_mcp_server_and_excludes_credentia
     async with async_session() as db:
         parent = await db.get(ChatSession, parent_id)
         project = await db.get(Project, parent.project_id)
+        target_id = uuid.uuid4()
         target = Agent(
+            id=target_id,
             name=f"Project copy {suffix}",
             creator_id=user_id,
             tenant_id=project.tenant_id,
             scope="project",
             project_id=project.id,
-            agent_dir=f".agents/{suffix}",
+            source_agent_id=source_agent_id,
+            agent_dir=f".agents/{target_id}",
             status="idle",
         )
         server = MCPServer(
@@ -2961,7 +2964,10 @@ async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypat
                 intro_text="需要确认",
                 title="继续执行",
                 summary="确认后继续当前项目任务",
-                action={"tool": "project_write_file", "args": {"path": "ok.txt"}},
+                action={
+                    "tool": "write_file",
+                    "args": {"workspace": "project", "path": "ok.txt"},
+                },
                 risk_level="medium",
                 buttons=[{"label": "继续", "value": "continue"}],
                 force_confirmation=True,
@@ -3085,7 +3091,7 @@ async def test_revoked_execution_user_fails_before_llm_or_tool_side_effect(monke
             .limit(1)
         )
     assert fresh.status == "failed"
-    assert "ExecutionIdentityError" in failure.content
+    assert failure.content == "本次执行未完成，请稍后重试或查看项目状态。"
 
 
 async def test_child_is_hidden_from_lists_but_direct_web_detail_is_accessible():
@@ -3757,7 +3763,7 @@ async def test_parent_wake_does_not_resume_with_revoked_execution_user(monkeypat
             conversation_id=str(parent_id),
         )
     assert anchor.message_meta["turn_status"] == "failed"
-    assert "执行身份已失效" in final.content
+    assert final.content == "协作任务未能继续，请检查资源访问权限后重试。"
     assert final.agent_id == storage_agent_id
     assert final.sender_agent_id == execution_agent_id
     assert current_turn.anchor_id == anchor.id

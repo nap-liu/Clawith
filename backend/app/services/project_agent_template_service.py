@@ -15,7 +15,6 @@ from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.participant import Participant
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
-from app.models.skill import Skill
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
@@ -27,6 +26,7 @@ from app.services.project_agent_template_assets import (
     instantiate_project_agent_template_assets,
     remove_project_agent_template_instances,
 )
+from app.services.project_capability_options import load_project_capability_options
 from app.services.project_git_service import (
     commit_project_changes,
     project_repo_path,
@@ -207,7 +207,7 @@ async def instantiate_project_agents_from_template(
 
         commit = await commit_project_changes(
             project,
-            f"Create {len(created)} project digital employees from template",
+            f"从模板创建 {len(created)} 个项目数字员工",
             [".agents"],
             author_name=owner.display_name,
             author_email=project_user_git_email(owner.id),
@@ -233,9 +233,46 @@ async def instantiate_project_agents_from_template(
 async def export_project_capabilities_for_template(db: AsyncSession, project: Project) -> list[dict]:
     """Export neutral Tool/MCP dependencies; Skill files use their own package."""
 
+    capability_options = await load_project_capability_options(db, project.tenant_id, [])
     member_rows = await _template_member_rows(db, project)
     agent_ids = [agent.id for agent, _member in member_rows]
     agent_index = {agent_id: index for index, agent_id in enumerate(agent_ids)}
+    assignments = list(
+        (
+            await db.execute(
+                select(AgentTool, Tool)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id.in_(agent_ids),
+                    Tool.enabled.is_(True),
+                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
+                )
+            )
+        ).all()
+    ) if agent_ids else []
+    assignments_by_agent: dict[uuid.UUID, list[tuple[AgentTool, Tool]]] = {}
+    assignment_by_pair: dict[tuple[uuid.UUID, uuid.UUID], AgentTool] = {}
+    for assignment, tool in assignments:
+        assignments_by_agent.setdefault(assignment.agent_id, []).append((assignment, tool))
+        assignment_by_pair[(assignment.agent_id, tool.id)] = assignment
+
+    def member_tool_enabled(index: int, tool: Tool) -> bool:
+        agent, member = member_rows[index]
+        if not member.is_enabled:
+            return False
+        assignment = assignment_by_pair.get((agent.id, tool.id))
+        enabled = resolved_agent_tool_enabled(tool.name, assignment)
+        if agent.scope == "project" and agent.project_id == project.id:
+            return tool_is_required(tool.name) or enabled
+        config = dict(member.config_snapshot or {})
+        enabled_overrides = {str(name) for name in config.get("enabled_platform_tools", [])}
+        disabled_overrides = {str(name) for name in config.get("disabled_platform_tools", [])}
+        return (
+            tool_is_required(tool.name)
+            or tool.name in enabled_overrides
+            or (enabled and tool.name not in disabled_overrides)
+        )
+
     bindings = list(
         (
             await db.execute(
@@ -253,13 +290,33 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
         if binding.capability_id is None or binding.capability_type == "skill":
             continue
         if binding.capability_type == "mcp":
-            server = await db.get(MCPServer, binding.capability_id)
-            if server is None or server.tenant_id not in {None, project.tenant_id}:
+            if not capability_options.allows_shared("mcp", binding.capability_id):
                 continue
         elif binding.capability_type == "tool":
             tool = await db.get(Tool, binding.capability_id)
             if tool is None or tool.type == "mcp" or tool.tenant_id not in {None, project.tenant_id}:
                 continue
+            target_indexes = (
+                range(len(member_rows))
+                if binding.source == "shared"
+                else [agent_index.get(binding.inherited_from_agent_id)]
+            )
+            for index in target_indexes:
+                if index is None:
+                    continue
+                exported.append(
+                    {
+                        "schema_version": 1,
+                        "capability_type": "tool",
+                        "capability_id": str(binding.capability_id),
+                        "capability_name": binding.capability_name,
+                        "source": "inherited",
+                        "digital_employee_index": index,
+                        "is_enabled": member_tool_enabled(index, tool),
+                        "scope": sanitize_template_scope(binding.scope or {}),
+                    }
+                )
+            continue
         else:
             continue
         inherited_index = agent_index.get(binding.inherited_from_agent_id)
@@ -286,23 +343,6 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
     # Tool/MCP state lives on AgentTool plus the project member overrides, not
     # on ProjectCapabilityBinding. Preserve those platform dependency IDs only;
     # per-Agent configuration is intentionally never exported.
-    assignments = list(
-        (
-            await db.execute(
-                select(AgentTool, Tool)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id.in_(agent_ids),
-                    Tool.enabled.is_(True),
-                    or_(Tool.tenant_id == project.tenant_id, Tool.tenant_id.is_(None)),
-                )
-            )
-        ).all()
-    ) if agent_ids else []
-    assignments_by_agent: dict[uuid.UUID, list[tuple[AgentTool, Tool]]] = {}
-    for assignment, tool in assignments:
-        assignments_by_agent.setdefault(assignment.agent_id, []).append((assignment, tool))
-
     effective: dict[tuple[str, uuid.UUID, str], set[int]] = {}
     for index, (agent, member) in enumerate(member_rows):
         if not member.is_enabled:
@@ -325,7 +365,10 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
                 if tool.mcp_server_id is None:
                     continue
                 server = await db.get(MCPServer, tool.mcp_server_id)
-                if server is None or server.tenant_id not in {None, project.tenant_id}:
+                if (
+                    server is None
+                    or not capability_options.allows_shared("mcp", server.id)
+                ):
                     continue
                 dependency = ("mcp", server.id, server.display_name or server.name)
             else:
@@ -382,7 +425,16 @@ async def export_project_capabilities_for_template(db: AsyncSession, project: Pr
                     "scope": {},
                 }
             )
-    return exported
+    deduplicated: dict[tuple[str, str, str, int | None], dict] = {}
+    for item in exported:
+        key = (
+            str(item["capability_type"]),
+            str(item["capability_id"]),
+            str(item["source"]),
+            item["digital_employee_index"],
+        )
+        deduplicated[key] = item
+    return list(deduplicated.values())
 
 
 async def instantiate_project_capabilities_from_template(
@@ -406,6 +458,7 @@ async def instantiate_project_capabilities_from_template(
         "is_enabled",
         "scope",
     }
+    capability_options = await load_project_capability_options(db, project.tenant_id, [])
     for item in raw_capabilities:
         if not isinstance(item, dict) or set(item) != allowed_keys or item.get("schema_version") != 1:
             raise ProjectTemplateSnapshotError("Project template capability entry is invalid")
@@ -418,13 +471,13 @@ async def instantiate_project_capabilities_from_template(
         except ValueError as exc:
             raise ProjectTemplateSnapshotError("Project template capability identifier is invalid") from exc
         if capability_type == "mcp":
-            server = await db.get(MCPServer, capability_id)
-            if server is None or server.tenant_id not in {None, project.tenant_id}:
-                raise ProjectTemplateSnapshotError("Project template MCP server is unavailable")
+            if not capability_options.allows_shared("mcp", capability_id):
+                continue
         elif capability_type == "skill":
-            skill = await db.get(Skill, capability_id)
-            if skill is None or skill.tenant_id not in {None, project.tenant_id}:
-                raise ProjectTemplateSnapshotError("Project template skill is unavailable")
+            # Project Skills are restored only from explicitly selected,
+            # self-contained template assets. Registry identifiers are not
+            # portable authorization and are ignored for older templates.
+            continue
         else:
             tool = await db.get(Tool, capability_id)
             if tool is None or tool.type == "mcp" or tool.tenant_id not in {None, project.tenant_id}:

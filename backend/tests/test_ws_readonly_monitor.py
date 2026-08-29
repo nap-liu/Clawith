@@ -62,6 +62,7 @@ def _handler() -> WebSocketChatHandler:
     # Bypass __init__ — we set only the fields the code under test touches.
     handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
     handler.pending_initial_assistant = None
+    handler.project_session_access = None
     return handler
 
 

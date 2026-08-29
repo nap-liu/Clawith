@@ -9,7 +9,7 @@
     "dynamicCopy": {
       "owner": "owner",
       "projectOwner": "project owner",
-      "sourceDigitalEmployee": "source digital employee",
+      "sourceDigitalEmployee": "original digital employee",
       "projectDigitalEmployee": "project digital employee",
       "digitalEmployee": "digital employee",
       "digitalEmployees": "digital employees",
@@ -26,33 +26,33 @@
     "planningConnection": "Connecting to the project owner",
     "planningUnavailable": "Project planning is temporarily unavailable. Try again later.",
     "planningTogether": "Plan with the project owner",
-    "planningPrompt": "Share the context, constraints, and expected outcome. The project owner will help turn them into an executable plan.",
+    "planningPrompt": "Provide the project context, constraints, and expected outcome to form the project plan.",
     "ownerRole": "Project owner · Full project access",
     "confirmAndStart": "Confirm the plan and start the project owner",
-    "confirmHintReady": "Confirmation preserves the planning record and starts the project owner.",
-    "confirmHintWaiting": "Complete at least one planning exchange before starting execution.",
+    "confirmHintReady": "Confirm the plan to start project execution.",
+    "confirmHintWaiting": "Complete the project planning discussion before starting.",
     "groupProcessingFallback": "Project owner",
     "create": {
       "teamStep": "Project name, Digital Employees, and project owner",
-      "planningIntro": "Create the collaboration space, then plan with the project owner",
+      "planningIntro": "Create the project team and complete project planning",
       "createAndPlan": "Create and plan with the project owner",
-      "teamDescription": "Create the collaboration space first. Define the goal and plan with the project owner before starting execution.",
-      "planningDescription": "After creation, you and the project owner will clarify the context, goal, success criteria, and execution plan before Digital Employees begin work.",
+      "teamDescription": "Set the project name, Digital Employees, and project owner. The goal and plan can be completed after creation.",
+      "planningDescription": "After creation, use the planning stage to confirm the context, goal, success criteria, and execution plan.",
       "teamOwner": "{{count}} Digital Employees · Project owner:",
       "nextStep": "Plan the goal and approach with the project owner, then start execution",
-      "workspaceNext": "When the collaboration space is ready, the project workspace opens for planning with the project owner."
+      "workspaceNext": "After creation, use the project workspace to complete the goal, success criteria, and execution plan."
     },
     "planning": {
       "sessionTitle": "{{name}} · Project planning",
-      "loadingDescription": "Preparing the project planning conversation…",
+      "loadingDescription": "Loading project planning…",
       "unavailableTitle": "The planning conversation is temporarily unavailable",
       "reload": "Reload",
       "backToProjects": "Projects",
       "eyebrow": "Project planning",
-      "description": "Define the goal, success criteria, and execution plan through conversation without completing a form first.",
+      "description": "Use the discussion to define the project goal, success criteria, and execution plan.",
       "started": "Started",
       "planning": "Planning",
-      "ownerDescription": "Turns the discussion into an executable plan and keeps the project moving after confirmation.",
+      "ownerDescription": "Defines the execution plan and advances the project goal.",
       "messageCount": "{{count}} messages in the planning conversation",
       "startMessage": "Send a message to start planning",
       "continue": "Continue planning",
@@ -63,29 +63,29 @@
       "successTitle": "Success criteria",
       "successDescription": "Define outcomes that can be accepted and traced",
       "planTitle": "Execution plan",
-      "planDescription": "Break down stages, responsibilities, and initial work items",
+      "planDescription": "Break down stages, responsibilities, and initial tasks",
       "members": "Project members",
-      "ownerScope": "Manage work items, runs, deliverables, collaboration, and project capabilities.",
+      "ownerScope": "Manage tasks, execution records, deliverables, collaboration, and project capabilities.",
       "memberScope": "Collaborate according to assigned roles.",
-      "recordPreserved": "The confirmed plan remains available",
+      "recordPreserved": "Project planning record retained",
       "capabilitiesConfirmed": "Project capabilities follow the confirmed configuration",
       "approvalRequired": "High-risk operations still require approval",
       "startFailed": "Could not start the project. Review the planning conversation and try again.",
       "enterWorkspace": "Open project workspace"
     },
     "workspace": {
-      "planningBanner": "Continue planning the goal and approach with the project owner. Start execution once the plan is confirmed.",
+      "planningBanner": "Complete the project goal and plan, then confirm to start execution.",
       "planningStarted": "Plan confirmed. The project owner has started execution.",
-      "projectDescriptionFallback": "The project description will take shape during planning with the project owner.",
-      "workItemsAfterPlanning": "Work items appear here after the plan is confirmed with the project owner in project chat.",
+      "projectDescriptionFallback": "The project description has not been completed.",
+      "workItemsAfterPlanning": "Tasks become available after the project plan is confirmed.",
       "meshDescription": "View collaboration relationships and responsibilities across the team.",
-      "workItemsAfterBreakdown": "Work items appear here after the project owner breaks down the goal.",
-      "runByOwner": "Run by project owner",
-      "runsAfterKickoff": "Runs appear here and remain available after the goal is confirmed and the project owner starts execution.",
+      "workItemsAfterBreakdown": "Tasks become available after the project goal is broken down.",
+      "runByOwner": "Executed by project owner",
+      "runsAfterKickoff": "Execution records become available after the project starts.",
       "ownerChanged": "Execution lead updated",
       "addMemberBeforeOwner": "Add a Digital Employee before choosing an active project owner.",
       "memberOwner": "{{name}} · Project owner",
-      "ownerToolDescription": "Participants update only their own work items; the project owner can edit and assign them.",
+      "ownerToolDescription": "Participants update only their own tasks; the project owner can edit and assign them.",
       "memberLifecycleToolDescription": "Enable or disable project members other than the project owner.",
       "ownerTools": "Project owner only",
       "ownerToolScope": "Project owner only",
@@ -107,8 +107,8 @@
   "projectWorkspaceNav": {
     "groups": {
       "workspace": "Project workspace",
-      "collaboration": "Run and collaborate",
-      "governance": "Governance and traceability"
+      "collaboration": "Execution and collaboration",
+      "governance": "Settings and records"
     },
     "domains": {
       "overview": "Overview",
@@ -120,30 +120,30 @@
     },
     "secondaryAria": "{{domain}} views",
     "tabs": {
-      "cockpit": "Project cockpit",
+      "cockpit": "Project overview",
       "group": "Project chat",
       "work": "Goals and tasks",
-      "mesh": "A2A Mesh",
-      "detail": "Work items",
+      "mesh": "Collaboration map",
+      "detail": "Tasks",
       "workspace": "Workspace",
       "milestones": "Delivery milestones",
-      "runs": "Run control",
+      "runs": "Execution records",
       "projectAgents": "Digital Employees",
       "capabilities": "Capabilities",
       "matrix": "Availability",
       "policies": "Project settings",
-      "git": "Git history and recovery",
-      "audit": "Project audit"
+      "git": "Version history and recovery",
+      "audit": "Project activity log"
     }
   },
   "projectRuntime": {
-    "badge": "Project runtime",
+    "badge": "Project status",
     "pauseAction": "Pause project",
     "resumeAction": "Resume project",
-    "pauseTitle": "Pause this project?",
-    "resumeTitle": "Resume this project?",
-    "pauseDescription": "Project Digital Employees will stop accepting new messages, A2A requests, Runs, schedules, and queued work. History and traceability remain available. Work already executing is allowed to finish safely.",
-    "resumeDescription": "Project Digital Employees may accept new work again. Deferred queued work and schedules can continue.",
+    "pauseTitle": "Confirm project pause?",
+    "resumeTitle": "Confirm project resume?",
+    "pauseDescription": "Pausing stops new execution tasks. Project records and group conversations remain available.",
+    "resumeDescription": "Resuming allows execution tasks and collaboration workflows to continue.",
     "confirmPause": "Pause project",
     "confirmResume": "Resume project",
     "pauseSuccess": "Project paused",
@@ -158,30 +158,30 @@
       "retry": "Retry"
     },
     "loading": {
-      "title": "Preparing the project runtime view",
-      "description": "Loading members, capabilities, runs, and traceability…"
+      "title": "Loading project",
+      "description": "Loading members, capabilities, and execution information…"
     },
     "errors": {
       "requestFailed": "Request failed. Try again later.",
-      "missingProjectId": "A project ID is required to load the workspace.",
+      "missingProjectId": "The project could not be identified. Return to the project list and try again.",
       "loadTitle": "The project workspace could not be loaded",
       "noProjectData": "No project data is available.",
       "refreshFailed": "Background refresh is temporarily unavailable",
-      "dashboardProjectMissing": "The project dashboard did not include the project summary."
+      "dashboardProjectMissing": "The project overview is temporarily unavailable."
     },
     "planning": {
       "title": "The plan is still being prepared"
     },
     "resources": {
       "warningTitle": "Some project resources are temporarily unavailable",
-      "memberSnapshots": "Member snapshots",
-      "capabilityBindings": "Capability bindings",
-      "gitRepository": "Git repository",
-      "projectPolicies": "Project policies",
+      "memberSnapshots": "Member settings",
+      "capabilityBindings": "Member capabilities",
+      "gitRepository": "Project repository",
+      "projectPolicies": "Project settings",
       "workspace": "Workspace",
-      "runRecords": "Run records",
+      "runRecords": "Execution records",
       "projectEvents": "Project events",
-      "loadFailed": "{{resource}}: {{error}}"
+      "loadFailed": "{{resource}} is temporarily unavailable"
     },
     "session": {
       "view": "View conversation",
@@ -189,12 +189,12 @@
       "projectChat": "Project chat",
       "projectChatTitle": "{{project}} · Project chat",
       "collaborationRecord": "Collaboration record",
-      "a2a": "A2A conversation",
-      "a2aTitle": "{{name}} · A2A conversation",
-      "run": "Run conversation",
-      "noDeliveredA2A": "This record does not have a delivered A2A conversation yet",
-      "noAnchor": "This record does not have a viewable conversation anchor yet",
-      "missingEmployee": "The conversation has no owning Digital Employee and cannot be opened yet",
+      "a2a": "Member collaboration conversation",
+      "a2aTitle": "{{name}} · Member collaboration conversation",
+      "run": "Execution conversation",
+      "noDeliveredA2A": "No member collaboration conversation is available",
+      "noAnchor": "No related conversation is available",
+      "missingEmployee": "This conversation is temporarily unavailable",
       "unavailableTitle": "Project chat is temporarily unavailable",
       "unavailableDescription": "Try again later or refresh the project."
     },
@@ -213,45 +213,47 @@
       "emptyDescription": "Collaboration relationships appear after members are added."
     },
     "audit": {
-      "searchPlaceholder": "Search events, conversations, or commits",
-      "searchAria": "Search audit events",
-      "typeFilterAria": "Filter event types",
-      "allTypes": "All events",
+      "searchPlaceholder": "Search activity, conversations, or versions",
+      "searchAria": "Search project activity",
+      "typeFilterAria": "Filter activity types",
+      "allTypes": "All activity",
       "clearFilters": "Clear filters",
       "refresh": "Refresh",
       "noMatchesTitle": "No matching events",
-      "emptyTitle": "No audit events yet",
+      "emptyTitle": "No project activity yet",
       "noMatchesDescription": "Adjust or clear the filters and try again.",
-      "emptyDescription": "Project activity appears here in chronological and causal order."
+      "emptyDescription": "Project activity is shown in chronological order."
     },
     "workItems": {
+      "eyebrow": "Task management",
       "title": "Goals and tasks",
-      "description": "Break project outcomes into acceptable work items while keeping dependencies, assignments, and evidence connected.",
+      "description": "Break project outcomes into acceptable tasks while keeping dependencies, assignments, and evidence connected.",
       "noDescription": "No work description provided.",
       "noAcceptance": "Acceptance criteria not defined",
       "notReported": "Not reported",
       "statusCompleted": "Status is completed",
       "noExecutionData": "No execution data",
+      "latestExecution": "Latest execution",
       "acceptanceNotReported": "Not reported by criterion",
       "acceptanceCount": "{{count}} acceptance criteria",
       "executionAria": "Execution progress for {{title}}",
-      "listAria": "Project work-item list with {{count}} items",
+      "listAria": "Project task list with {{count}} items",
       "historicalAssigneeSuffix": " · Former member (historical assignment)",
       "views": {
         "graph": "Dependency graph",
         "board": "Board",
         "list": "List",
-        "aria": "Work-item view"
+        "aria": "Task view"
       },
       "actions": {
-        "create": "Create work item",
-        "createFirst": "Create the first work item",
-        "createRun": "Create Run",
+        "create": "Create task",
+        "createFirst": "Create the first task",
+        "createRun": "Start execution",
         "return": "Return for changes",
         "approve": "Approve"
       },
       "create": {
-        "title": "Create and assign a work item"
+        "title": "Create and assign a task"
       },
       "fields": {
         "title": "Title",
@@ -276,8 +278,8 @@
         "approved": "Task approved"
       },
       "empty": {
-        "title": "The goal has not been broken into work items",
-        "description": "Project members can begin after a work item is created."
+        "title": "The goal has not been broken into tasks",
+        "description": "Project members can begin after a task is created."
       },
       "detail": {
         "singlePage": {
@@ -294,6 +296,7 @@
           "nextStep": "Next step",
           "progressTitle": "Recent progress",
           "progressEmpty": "Work has not started",
+          "executionUnavailable": "This execution did not complete. Review the execution record or start it again.",
           "viewAllProgress": "View all progress",
           "edit": "Edit task",
           "save": "Save changes",
@@ -329,9 +332,9 @@
           }
         },
         "tabs": {
-          "aria": "Work-item detail sections",
+          "aria": "Task detail sections",
           "context": "Context and acceptance",
-          "execution": "Execution and events · {{runs}} Runs / {{events}} events",
+          "execution": "Execution records · {{runs}} executions / {{events}} records",
           "conversation": "Related conversations",
           "changes": "Code and file changes",
           "review": "Evidence and approval"
@@ -340,9 +343,9 @@
           "taskDescription": "Task description",
           "deliverable": "Deliverable",
           "inputsDependencies": "Inputs and dependencies",
-          "relatedWorkItem": "Related work item",
+          "relatedWorkItem": "Related task",
           "noDependencies": "No prerequisites; work can begin immediately.",
-          "verifyEvidence": "The work item is complete; verify the related evidence",
+          "verifyEvidence": "The task is complete; verify the related evidence",
           "awaitEvidence": "Waiting for execution or review evidence",
           "defineAcceptance": "Define the acceptance boundary before starting execution."
         },
@@ -351,43 +354,43 @@
           "title": "Assignment and status"
         },
         "execution": {
-          "runWorkItem": "Execute work item",
-          "snapshotFrozen": "The member, capability, and input snapshots for this execution are preserved.",
+          "runWorkItem": "Execute task",
+          "snapshotFrozen": "This execution uses the confirmed member, capability, and input settings.",
           "viewAll": "View all activity",
           "emptyTitle": "No execution records yet",
-          "emptyDescription": "Activity appears here when a Digital Employee accepts, runs, or updates this work item."
+          "emptyDescription": "Execution records are shown after a Digital Employee executes or updates this task."
         },
         "conversation": {
-          "preserved": "The conversation is preserved as execution evidence for this work item.",
+          "preserved": "The conversation is preserved as execution evidence for this task.",
           "viewAll": "View all related activity",
           "emptyTitle": "No related conversations yet",
-          "emptyDescription": "Conversation anchors appear after this work item triggers Digital Employee execution or A2A collaboration."
+          "emptyDescription": "Related conversations are shown after this task starts execution or member collaboration."
         },
         "changes": {
           "fileCount": "{{count}} related files",
-          "commitCount": "{{count}} commits",
-          "traced": "Traced",
-          "projectCommit": "Project commit",
+          "commitCount": "{{count}} versions",
+          "traced": "Linked",
+          "projectCommit": "Project version",
           "viewAll": "View all deliverables",
           "relatedChange": "Related change",
           "openWorkspace": "Open in workspace",
-          "viewGit": "View Git history",
-          "relatedCommit": "Related commit",
+          "viewGit": "View version history",
+          "relatedCommit": "Related version",
           "emptyTitle": "No related code or file changes yet",
-          "emptyDescription": "Changes are collected when project commits include Work-Item traceability."
+          "emptyDescription": "File changes linked to this task are shown here."
         },
         "review": {
           "coverage": "Acceptance coverage",
           "summary": "{{criteria}} criteria · {{runs}} executions · {{evidence}} evidence records",
-          "verifyResult": "A related run or version is available; verify the result.",
+          "verifyResult": "A related execution record or version is available; verify the result.",
           "noResult": "No result is available for verification yet.",
           "noEvidence": "No acceptance records",
           "noEvidenceDescription": "Acceptance records appear here.",
           "approval": "Result approval",
-          "relatedRuns": "Related Runs",
-          "sessions": "A2A / conversations",
-          "commitsFiles": "Commits / files",
-          "latestRun": "Latest Run",
+          "relatedRuns": "Related executions",
+          "sessions": "Collaboration conversations",
+          "commitsFiles": "Versions / files",
+          "latestRun": "Latest execution",
           "lastUpdated": "Last updated"
         },
         "meta": {
@@ -420,11 +423,12 @@
       }
     },
     "runs": {
+      "eyebrow": "Execution records",
       "defaultObjective": "Advance the project goal",
       "historicalMember": "Former member · Conversation is read-only",
-      "emptyTitle": "No Run records yet",
+      "emptyTitle": "No execution records yet",
       "triggers": {
-        "manual": "Manually started project Run",
+        "manual": "Manually started project execution",
         "groupMessage": "Process a project chat message",
         "collaborationBatch": "Summarize collaboration results and advance the project",
         "a2a": "Process a Digital Employee collaboration request",
@@ -437,10 +441,10 @@
         "complete": "Complete"
       },
       "feedback": {
-        "retried": "A new retry Run was created; the original record is unchanged",
-        "waiting": "Run moved to waiting",
-        "resumed": "Run resumed",
-        "completed": "Run marked complete"
+        "retried": "Execution restarted; the original record is unchanged",
+        "waiting": "Execution moved to waiting",
+        "resumed": "Execution resumed",
+        "completed": "Execution completed"
       }
     },
     "members": {
@@ -460,47 +464,47 @@
       },
       "historical": {
         "title": "Historical read-only",
-        "description": "This Digital Employee no longer receives mentions, assignments, or project tool calls. Its snapshot, Runs, and related conversations remain viewable until restored."
+        "description": "This Digital Employee no longer receives messages, assignments, or project operations. Existing settings, execution records, and related conversations remain available until restored."
       },
       "fields": {
         "primaryModel": "Primary model",
         "primaryModelHint": "Overrides the Digital Employee model only in this project.",
-        "primaryModelAria": "Project snapshot primary model",
+        "primaryModelAria": "Project primary model",
         "fallbackModel": "Fallback model",
-        "fallbackModelAria": "Project snapshot fallback model",
-        "maxToolRounds": "Maximum tool rounds",
+        "fallbackModelAria": "Project fallback model",
+        "maxToolRounds": "Maximum actions per execution",
         "instructions": "Project-specific instructions",
-        "departedHint": "The project snapshot remains unchanged after departure.",
+        "departedHint": "Project settings from the time of departure are retained.",
         "instructionsHint": "Applies only to this Digital Employee's execution in the current project."
       },
       "facts": {
-        "generation": "Snapshot generation",
+        "generation": "Settings version",
         "inheritedCapabilities": "Inherited capabilities",
         "disabledTools": "Disabled tools",
-        "updated": "Snapshot updated"
+        "updated": "Settings updated"
       }
     },
     "capabilities": {
-      "description": "Project-shared Skills and MCP are visible to members. Inherited capabilities can be disabled individually without changing the source Digital Employee.",
+      "description": "Project-shared Skills and MCP are available to members. Project capabilities can be adjusted without changing the original Digital Employee.",
       "projectShared": "Project shared",
       "inherited": "Inherited from Digital Employee",
       "filterAria": "Capability filters",
       "capability": "Capability",
       "inheritedFrom": "Inherited from {{name}}{{departed}}",
       "departedSuffix": " · Member departed",
-      "departedDescription": "The member has departed, so the inherited capability is frozen. Restore the member to configure it again.",
+      "departedDescription": "The member has left the project. Restore the member to change this capability.",
       "noDescription": "No capability description.",
       "scopeCount": "{{count}} permission scopes",
       "noScope": "No permission scope configured",
       "departedHistorical": "Departed · Historical",
-      "policyResolved": "Resolved by policy",
+      "policyResolved": "Defined by project settings",
       "actions": {
         "enable": "Enable {{name}}",
         "disable": "Disable {{name}}"
       },
       "feedback": {
         "enabled": "Capability enabled in this project",
-        "disabled": "Capability disabled in this project; the source Digital Employee is unchanged"
+        "disabled": "Capability disabled in this project; the original Digital Employee is unchanged"
       },
       "columns": {
         "capability": "Capability",
@@ -512,12 +516,12 @@
       },
       "matrixEmpty": {
         "title": "The capability matrix cannot be calculated yet",
-        "description": "At least one project member and one capability binding are required."
+        "description": "At least one project member and one available capability are required."
       }
     },
     "visibility": {
       "title": "Access scope",
-      "description": "Set project access, shared members, and the run identity.",
+      "description": "Set project access, shared members, and the resource access member.",
       "label": "Visibility",
       "shared": "Shared",
       "private": "Only me",
@@ -531,20 +535,20 @@
       "loadingMembers": "Loading organization members…",
       "selectMembers": "Select shared members",
       "selectedMembers": "{{count}} members selected",
-      "executionUser": "Run identity",
-      "executionUserHint": "Project runs use resources authorized for the selected member.",
+      "executionUser": "Resource access member",
+      "executionUserHint": "Executions use resources authorized for the selected member.",
       "executionUserOwner": "Project owner",
-      "selectExecutionUser": "Select a run identity",
-      "executionUserRequired": "Select the project run identity.",
+      "selectExecutionUser": "Select a resource access member",
+      "executionUserRequired": "Select a resource access member.",
       "executionUserRequiredShort": "Select one shared member",
       "searchMembers": "Search organization members",
       "membersUnavailable": "Organization members are temporarily unavailable",
       "noMembers": "No members are available for sharing",
       "noMatches": "No matching organization members",
       "selectMembersAria": "Select project sharing members",
-      "membersLoadFailed": "Could not load organization members: {{error}}",
+      "membersLoadFailed": "Organization members are temporarily unavailable.",
       "readOnly": "This account cannot manage project visibility.",
-      "permissionDeniedDraft": "You cannot manage this project's visibility. The draft has been preserved.",
+      "permissionDeniedDraft": "This account cannot manage project access. Unsaved changes have been preserved.",
       "save": "Save access settings",
       "feedback": {
         "shared": "Project sharing saved",
@@ -553,22 +557,22 @@
     },
     "policies": {
       "eyebrow": "Project settings",
-      "runtimeTitle": "Run settings",
-      "runtimeDescription": "Set the project model, parallel work limit, and collaboration boundary.",
-      "defaultTenantModel": "Use tenant default model",
+      "runtimeTitle": "Execution settings",
+      "runtimeDescription": "Set the project model, concurrent task limit, and member collaboration scope.",
+      "defaultTenantModel": "Use organization default model",
       "loadingModels": "Loading models…",
       "selectModel": "Select a model",
-      "modelsLoadFailed": "Could not load models: {{error}}",
+      "modelsLoadFailed": "Models are temporarily unavailable.",
       "actions": {
-        "save": "Save run settings"
+        "save": "Save execution settings"
       },
       "feedback": {
         "saved": "Project settings saved"
       },
       "fields": {
         "defaultModel": "Default model",
-        "defaultModelHint": "Uses a model enabled for the current tenant.",
-        "maxParallelRuns": "Parallel work limit",
+        "defaultModelHint": "Uses a model enabled for the current organization.",
+        "maxParallelRuns": "Concurrent task limit",
         "maxA2AWakes": "Collaboration limit",
         "loopGuard": "Prevent repeated collaboration",
         "loopGuardHint": "Limits repeated collaboration requests between members.",
@@ -585,20 +589,23 @@
       "projectSourceHint": "Current content was created by the project",
       "defaultBranch": "Default branch",
       "remoteCount": "Remote count",
-      "standardGitHint": "Supports standard Git repository URLs",
+      "standardGitHint": "Supports common code repository URLs",
+      "remoteSection": "Remote management",
       "remoteList": "Remote list",
       "notPlanning": "The project has left planning, so the repository can no longer be replaced.",
-      "hasDeliverables": "The repository already contains project deliverables and cannot be initialized by cloning.",
+      "hasDeliverables": "The project already contains deliverables, so the initial repository content cannot be replaced.",
       "loadingRemotes": "Loading remotes",
       "noRemotes": "No remotes configured",
       "noRemotesDescription": "Add a remote to synchronize code.",
-      "memberHistoryHint": "Shared members can view commit history.",
-      "initializeRemote": "Initialize from remote",
-      "cloneAvailable": "Clone available",
-      "cloneUnavailable": "Clone unavailable",
-      "confirmAria": "Confirm initialization from a remote repository",
+      "memberHistoryHint": "Shared members can view version history.",
+      "initialSourceSection": "Initial repository",
+      "initializeRemote": "Import from remote repository",
+      "cloneAvailable": "Ready to import",
+      "cloneUnavailable": "Not ready to import",
+      "confirmAria": "Confirm import from a remote repository",
       "importTitle": "Import remote repository",
-      "importDescription": "This repository will initialize the project. Confirm the repository URL and branch.",
+      "importEyebrow": "Repository import",
+      "importDescription": "This repository will provide the initial project content. Confirm the repository URL and branch.",
       "remote": "Remote",
       "branch": "Branch",
       "remoteDefaultBranch": "Remote default branch",
@@ -633,7 +640,7 @@
     }
   },
   "projectCockpit": {
-    "title": "Project cockpit",
+    "title": "Project overview",
     "description": "A concise view of project goals, members, and execution signals.",
     "openGroupChat": "Open project chat",
     "objective": "Project objective",
@@ -645,30 +652,31 @@
     "criteriaCount": "{{count}} criteria",
     "criteriaMaintainedWithPlan": "Maintained with the plan",
     "projectProgress": "Project progress",
-    "workItems": "Work items",
+    "workItems": "Tasks",
     "workItemSummary": "{{running}} running · {{completed}} completed",
     "risks": "Risks and issues",
     "needsFollowUp": "Needs follow-up",
     "noKnownIssues": "No known issues",
     "activeMemberMetric": "Active members",
-    "runCount": "{{count}} runs",
+    "runCount": "{{count}} executions",
     "collaborationEvents": "Collaboration events",
-    "collaborationEventsHint": "A2A and system events",
+    "collaborationEventsHint": "Member collaboration and project activity",
     "executionOverview": "Execution overview",
-    "workItemProgress": "Work item progress",
+    "workItemProgress": "Task progress",
     "viewAll": "View all",
-    "noWorkItems": "No work items yet",
+    "noWorkItems": "No tasks yet",
     "attentionNeeded": "Needs attention",
     "noKnownRisks": "No known risks or issues",
     "noKnownRisksHint": "Failed, blocked, and risk events are summarized from project records.",
     "unnamedMember": "Unnamed Digital Employee",
     "unassigned": "Unassigned",
-    "blockedWorkItem": "Work item blocked",
-    "blockedWorkItemHint": "This work item has stopped progressing. Open its execution history for details.",
-    "viewBlockedWorkItems": "View blocked work items",
+    "blockedWorkItem": "Task blocked",
+    "blockedWorkItemHint": "This task has stopped progressing. Open its execution history for details.",
+    "viewBlockedWorkItems": "View blocked tasks",
     "viewRiskEvents": "View risk events"
   },
   "projectMesh": {
+    "eyebrow": "Member collaboration",
     "viewEvents": "View collaboration history",
     "recentIssue": "Latest collaboration issue"
   },
@@ -687,12 +695,12 @@
     "newFile": "New file",
     "empty": "The workspace has no files",
     "metadataAria": "File metadata",
-    "notCommitted": "Not committed",
+    "notCommitted": "Not saved",
     "unavailableTitle": "This file cannot be previewed online",
-    "unavailableDescription": "The file is stored unchanged in the project Git repository. Download it and open it with a compatible application.",
+    "unavailableDescription": "This file cannot be previewed online. Download it and open it with a compatible application.",
     "downloadFile": "Download file",
     "loadFailed": "Failed to load file",
-    "saved": "File saved and committed to Git",
+    "saved": "File saved as a new version",
     "downloadFailed": "Failed to prepare download",
     "newFileBadge": "New file",
     "htmlPreviewBadge": "HTML preview",
@@ -707,13 +715,13 @@
     "editorAria": "Workspace file editor",
     "diffAria": "Workspace file diff",
     "markdownPreviewAria": "Markdown preview for {{name}}",
-    "save": "Save and commit",
+    "save": "Save new version",
     "loadingHead": "Reading the current file version…",
     "retry": "Retry",
     "htmlPreviewTitle": "{{name}} HTML preview",
     "truncatedTitle": "Only the beginning of this file is shown",
     "readOnlyTitle": "This file is read-only online",
-    "readOnlyDescription": "To avoid overwriting the original file with truncated content, modify it in the Digital Employee workspace and commit the change.",
+    "readOnlyDescription": "This content is not fully loaded. Modify it in the Digital Employee workspace and save a new version.",
     "loadingEditor": "Loading code editor…",
     "loadingPreview": "Rendering Markdown preview…",
     "loadingDiff": "Loading code diff…",
@@ -732,24 +740,25 @@
     "collaborationEntry": "Collaboration entry",
     "times": "{{count}} times",
     "meshAria": "Digital Employee collaboration graph with {{members}} members and {{edges}} relationships",
-    "sourceAgent": "Source Digital Employee",
-    "sourceCaption": "Platform capabilities and base configuration",
+    "sourceAgent": "Original Digital Employee",
+    "sourceCaption": "Original capabilities and base settings",
     "readOnlySource": "Read-only source",
-    "isolatedSnapshot": "Project-isolated snapshot",
+    "isolatedSnapshot": "Independent project settings",
     "memberConfig": "Member configuration",
     "active": "Active",
-    "snapshotCreated": "Snapshot created",
-    "frozen": "Frozen",
-    "runtimeFrozen": "Execution snapshot",
-    "snapshotAria": "Member snapshot graph for {{name}}, with {{runs}} runs",
-    "snapshotSummary": "Latest {{shown}} of {{total}} runs",
-    "unnamedWorkItem": "Unnamed work item",
+    "snapshotCreated": "Settings created",
+    "frozen": "Confirmed",
+    "runtimeFrozen": "Execution settings",
+    "snapshotAria": "Member settings graph for {{name}}, with {{runs}} executions",
+    "snapshotSummary": "Latest {{shown}} of {{total}} executions",
+    "unnamedWorkItem": "Unnamed task",
     "unassigned": "Unassigned",
     "dependency": "Depends on",
-    "workAria": "Work dependency graph with {{nodes}} work items and {{edges}} dependencies",
-    "commitNoMessage": "No commit message",
-    "projectSystem": "Project system",
-    "gitAria": "Git history graph with {{count}} commits",
+    "workAria": "Work dependency graph with {{nodes}} tasks and {{edges}} dependencies",
+    "commitNoMessage": "No version description",
+    "projectSystem": "System",
+    "gitAria": "Version history graph with {{count}} versions",
+    "execution": "Project execution",
     "legendAria": "Relationship graph legend",
     "legendInfo": "Current or running",
     "legendSuccess": "Healthy or completed",
@@ -760,6 +769,8 @@
       "backlog": "Backlog",
       "todo": "To do",
       "queued": "Queued",
+      "planning": "Planning",
+      "initializing": "Preparing",
       "running": "Running",
       "doing": "In progress",
       "in_progress": "In progress",
@@ -769,10 +780,12 @@
       "blocked": "Blocked",
       "done": "Completed",
       "completed": "Completed",
+      "archived": "Archived",
       "success": "Completed",
       "succeeded": "Completed",
       "failed": "Failed",
-      "error": "Error"
+      "error": "Error",
+      "unknown": "Status unknown"
     }
   },
   "projectAgents": {
@@ -802,7 +815,7 @@
       "activeEmptyTitle": "No active Digital Employees",
       "activeEmptyDescription": "Restore a former Digital Employee or create a new one.",
       "departedEmptyTitle": "No former Digital Employees",
-      "departedEmptyDescription": "Digital Employees who leave the project remain here for historical reference.",
+      "departedEmptyDescription": "Historical records are retained for Digital Employees who leave the project.",
       "noMembersTitle": "No Digital Employees in this project",
       "noMembersDescription": "Create the first Digital Employee and make ownership clear.",
       "noMatchesTitle": "No matching Digital Employees",
@@ -811,8 +824,8 @@
       "capabilitiesEmptyTitle": "No capabilities available",
       "capabilitiesEmptyDescription": "Add project capabilities to manage where they are available.",
       "matrixEmptyTitle": "No availability to compare",
-      "matrixEmptyDescription": "Add Digital Employees and capabilities to compare what each employee can do.",
-      "readOnly": "You can view team settings but cannot change them."
+      "matrixEmptyDescription": "Add Digital Employees and capabilities to view member capability coverage.",
+      "readOnly": "The current account has read-only access to team settings."
     },
     "capabilityPackage": {
       "title": "Member capability package",
@@ -866,7 +879,7 @@
       "blank": "Create blank",
       "source": "Choose an existing Digital Employee",
       "loading": "Loading Digital Employees",
-      "loadingDescription": "Please wait.",
+      "loadingDescription": "Loading available Digital Employees.",
       "noSource": "No Digital Employee is available to copy",
       "noSourceDescription": "Switch to blank creation to continue."
     },
@@ -880,13 +893,13 @@
     },
     "workspaceDescription": "Member settings and files belong to this project.",
     "sectionTitle": "Project Digital Employees and members",
-    "sectionDescription": "Freeze an existing Digital Employee into the project or create a dedicated Project Digital Employee. The project owner maintains its identity and core memory and can promote it to a Standard Digital Employee when needed.",
+    "sectionDescription": "Create a project-specific member from an existing Digital Employee or create a new one. Project settings apply independently.",
     "summary": "Project Digital Employees",
-    "summaryDescription": "Identity, memory, and files are versioned with the project",
+    "summaryDescription": "Identity, memory, and files are maintained with the project",
     "activeMembers": "Active members",
     "activeMembersDescription": "Available for mentions, assignments, and project capabilities",
     "departedMembers": "Former members",
-    "departedMembersDescription": "Identity, snapshots, and history remain available",
+    "departedMembersDescription": "Identity, project settings, and history remain available",
     "viewActivity": "View full activity",
     "assetLocation": "Member files",
     "status": {
@@ -894,15 +907,15 @@
       "departed": "Former"
     },
     "snapshot": {
-      "currentDescription": "Current project snapshot · Applies only to this project",
-      "historicalDescription": "Historical snapshot · No longer receives messages or tasks",
-      "currentLabel": "Project snapshot",
-      "historicalLabel": "Historical snapshot",
-      "editTitle": "Edit {{name}}'s project snapshot",
-      "viewTitle": "View {{name}}'s historical snapshot",
-      "runHistory": "Run history",
+      "currentDescription": "Current project settings · Apply only to this project",
+      "historicalDescription": "Historical settings · No longer receives messages or tasks",
+      "currentLabel": "Project settings",
+      "historicalLabel": "Historical settings",
+      "editTitle": "Edit {{name}}'s project settings",
+      "viewTitle": "View {{name}}'s historical settings",
+      "runHistory": "Execution history",
       "recentCollaboration": "Recent collaboration",
-      "sessionUnavailable": "This snapshot does not have a linked project run conversation"
+      "sessionUnavailable": "No related project execution conversation is available"
     },
     "promotion": {
       "badge": "Digital Employee upgrade",
@@ -962,7 +975,7 @@
       "available": "Available",
       "unavailable": "Unavailable",
       "restricted": "Restricted",
-      "policyBlocked": "Disabled by project policy",
+      "policyBlocked": "Disabled in project settings",
       "snapshotBlocked": "Limited by project settings",
       "memberDisabled": "Disabled for member",
       "memberDeparted": "Former member"
@@ -973,24 +986,12 @@
         "description": "Review the project goal, plan, status, and current version."
       },
       "project_list_work_items": {
-        "label": "View work items",
-        "description": "Review project work items or work assigned to the current member."
-      },
-      "project_list_files": {
-        "label": "View workspace",
-        "description": "Review project deliverables and their versions."
-      },
-      "project_read_file": {
-        "label": "Read workspace file",
-        "description": "Read a specified project text file. The file must already exist."
+        "label": "View tasks",
+        "description": "Review project tasks or work assigned to the current member."
       },
       "project_update_work_item": {
-        "label": "Update work item",
-        "description": "Update the status, progress, or evidence of an existing work item."
-      },
-      "project_write_file": {
-        "label": "Write workspace file",
-        "description": "Save a file at a specified location in the project workspace."
+        "label": "Update task",
+        "description": "Update the status, progress, or evidence of an existing task."
       },
       "project_message_agent": {
         "label": "Contact Digital Employee",
@@ -1001,8 +1002,8 @@
         "description": "Update the goal, success criteria, and current progress. Available to the execution lead."
       },
       "project_create_work_item": {
-        "label": "Create work item",
-        "description": "Create and assign a work item. Available to the execution lead."
+        "label": "Create task",
+        "description": "Create and assign a task. Available to the execution lead."
       },
       "project_set_member_enabled": {
         "label": "Manage project members",
@@ -1028,9 +1029,13 @@
   },
   "projectPortfolio": {
     "eyebrow": "Project portfolio",
-    "title": "Project library",
-    "description": "Manage goals, runs, and project outcomes shared across Digital Employees.",
+    "title": "Projects",
+    "description": "Manage project goals, execution records, members, and outcomes.",
     "templateMarket": "Template market",
+    "manageTemplates": "Manage templates",
+    "ownerUnspecified": "Not specified",
+    "completedSignal": "Project completed",
+    "completedAction": "Review outcomes or continue the conversation",
     "createProject": "Create project",
     "overviewAria": "Project overview",
     "runningProjects_one": "{{count}} project is running",
@@ -1042,6 +1047,7 @@
     "averageProgress": "Average progress",
     "scopeAria": "Project scope",
     "scope": {
+      "all": "All projects",
       "mine": "My projects",
       "shared": "Shared with me",
       "running": "Running",
@@ -1052,31 +1058,35 @@
     "status": {
       "all": "All statuses",
       "planning": "Planning",
-      "initializing": "Initializing",
+      "initializing": "Creating",
       "running": "Running",
       "waiting": "Waiting for confirmation",
       "paused": "Paused",
       "completed": "Completed",
       "archived": "Archived",
-      "failed": "Run issue"
+      "failed": "Execution issue"
     },
     "viewAria": "Change view",
     "listView": "List view",
     "gridView": "Grid view",
     "loadingTitle": "Loading projects",
-    "loadingDescription": "Syncing project status and Digital Employee run signals…",
+    "loadingDescription": "Loading project status and Digital Employee execution information…",
     "errorTitle": "Could not load projects",
     "serviceError": "Could not connect to the project service",
     "reload": "Reload",
     "emptyTitle": "No projects yet",
-    "filteredEmptyDescription": "No projects match the current filters. Adjust the filters and try again.",
+    "filteredEmptyDescription": "No projects match the current filters.",
     "emptyDescription": "Create your first project so Digital Employees can collaborate around one goal.",
     "clearFilters": "Clear filters",
+    "deleteProject": "Delete project",
+    "deleteAction": "Delete",
+    "deleteNamedProject": "Delete project {{name}}",
+    "deleteConfirm": "Delete “{{name}}”? This action cannot be undone.",
     "private": "Only me",
     "shared": "Shared",
     "digitalEmployeeCount_one": "{{count}} Digital Employee",
     "digitalEmployeeCount_other": "{{count}} Digital Employees",
-    "noRunEvents": "No run events yet",
+    "noRunEvents": "No execution records yet",
     "nameSeparator": ", ",
     "relative": {
       "justNow": "Just now",
@@ -1087,42 +1097,43 @@
     }
   },
   "projectGit": {
-    "title": "Git history and recovery",
-    "historyAria": "Git commit history",
-    "history": "Commit history",
-    "commit": "Commit",
+    "title": "Version history and recovery",
+    "historyAria": "Project version history",
+    "history": "Version history",
+    "commit": "Version",
     "message": "Message",
     "author": "Author",
     "time": "Time",
     "references": "References",
     "projectMember": "Project member",
-    "unnamedCommit": "Untitled commit",
+    "unnamedCommit": "Untitled version",
     "milestone": "Milestone",
-    "detail": "Commit details",
+    "detail": "Version details",
     "recoverable": "Version can be recovered",
-    "relatedRun": "Related run",
-    "workItem": "Work item",
+    "relatedRun": "Related execution",
+    "workItem": "Task",
     "conversation": "Conversation",
     "changedFiles": "Changed files",
-    "createBranch": "Create branch from here",
+    "linked": "Linked",
+    "createBranch": "Create branch from this version",
     "restoreVersion": "Restore this version",
-    "emptyTitle": "No commit history yet",
-    "emptyDescription": "Saved workspace files will appear here as version history.",
+    "emptyTitle": "No version history yet",
+    "emptyDescription": "Saving workspace files creates version records.",
     "diff": {
       "emptyTree": "Empty tree",
-      "loadFallback": "Could not load Git changes",
+      "loadFallback": "Could not load version changes",
       "noCommitTitle": "No linked version",
       "noCommitDescription": "This file is not linked to a version yet.",
-      "loadFailed": "Could not load Git changes",
+      "loadFailed": "Could not load version changes",
       "retry": "Retry",
       "loading": "Loading file changes",
-      "noFileChange": "This commit did not change the file",
+      "noFileChange": "This version did not change the file",
       "status": {
         "added": "Added",
         "deleted": "Deleted",
         "modified": "Modified"
       },
-      "rootCommit": "Root commit",
+      "rootCommit": "Initial version",
       "binaryTitle": "Binary file changed",
       "binaryDescription": "Binary files cannot be compared here.",
       "loadingEditor": "Loading diff viewer…",
@@ -1141,7 +1152,7 @@
       "cancel": "Cancel",
       "restoreSubmit": "Restore this version",
       "branchSubmit": "Create branch",
-      "restoreSuccess": "Restore commit created; existing history is unchanged",
+      "restoreSuccess": "A recovery version was created; existing history is unchanged",
       "branchSuccess": "Branch created"
     }
   },
@@ -1149,7 +1160,7 @@
     "action": "Publish as project template",
     "eyebrow": "Project template",
     "title": "Publish as project template",
-    "description": "The template keeps committed project results, team settings, and the Skill files selected below.",
+    "description": "The template includes saved project results, team settings, and the Skill files selected below.",
     "name": "Template name",
     "namePlaceholder": "Enter a template name",
     "close": "Close",
@@ -1167,13 +1178,13 @@
       "skills": "Skills",
       "sharedConnections": "Shared MCP",
       "capabilities": "Shared capabilities",
-      "platformDependencies": "Platform dependencies",
+      "platformDependencies": "Required capabilities",
       "none": "None",
-      "capabilityListTitle": "Capabilities and dependencies",
-      "capabilityListHint": "Skill files are excluded by default. Tool and MCP entries retain dependency declarations and are checked again in the new project.",
+      "capabilityListTitle": "Required capabilities",
+      "capabilityListHint": "Capability availability is confirmed when the project is created.",
       "selectSkill": "Include {{name}} in the template",
       "unnamedCapability": "Unnamed capability",
-      "platformDependency": "Platform dependency",
+      "platformDependency": "Required capability",
       "included": "Included",
       "notIncluded": "Not included",
       "affectedMembers": "Affects {{count}}: {{names}}",
@@ -1196,8 +1207,8 @@
       "selectedCount": "{{count}} selected",
       "projectShared": "Project shared",
       "filesAndSize": "{{count}} files · {{size}}",
-      "carriedImpact": "New projects receive these files",
-      "notCarriedImpact": "New projects do not receive these files",
+      "carriedImpact": "Included in the template",
+      "notCarriedImpact": "Not included in the template",
       "noSkillFiles": "No Skill files are available",
       "exclusions": "Skill files that are not selected are not published with the template."
     }
@@ -1205,24 +1216,24 @@
   "projectTemplates": {
     "back": "Project library",
     "eyebrow": "Project templates",
-    "title": "Project template market",
-    "description": "Reuse proven project structures, Digital Employee configurations, capability boundaries, operating policies, and delivery standards.",
+    "title": "Project templates",
+    "description": "Create projects from reusable team, capability, and delivery settings.",
     "createBlank": "Create from scratch",
     "featuredLabel": "Featured template / {{category}}",
-    "heroTitleFirst": "More than a starting prompt,",
-    "heroTitleSecond": "a restorable collaboration system",
-    "heroDescription": "{{description}} Snapshot templates restore committed project deliverables and sanitized Digital Employee configurations. You can review visibility before creation.",
+    "heroTitleFirst": "Project templates",
+    "heroTitleSecond": "",
+    "heroDescription": "{{description}} The template includes project results, team settings, and reusable configuration.",
     "viewFeatured": "View featured template",
     "blueprintAria": "Project template contents",
     "blueprint": {
       "goal": "Goal",
       "success": "Success criteria",
       "team": "Team",
-      "employees": "Digital Employee snapshots",
+      "employees": "Digital Employee settings",
       "capabilities": "Capabilities",
       "skillMcp": "Skill / MCP",
       "delivery": "Delivery",
-      "gitOutputs": "Committed outputs"
+      "gitOutputs": "Saved outputs"
     },
     "searchPlaceholder": "Search scenarios, roles, Skills, or MCP",
     "searchAria": "Search project templates",
@@ -1248,7 +1259,7 @@
     "detailAria": "{{name}} template details",
     "author": "Template author",
     "used": "Usage",
-    "snapshotVersion": "Snapshot version",
+    "snapshotVersion": "Template version",
     "teamRoles": "Team roles",
     "roleFallback": "Restored as a Project Digital Employee",
     "roleFallbackLegacy": "Choose a corresponding Digital Employee during creation",
@@ -1258,9 +1269,9 @@
     "sharedMcp": "Shared MCP",
     "noMcp": "No shared MCP is preset",
     "configuration": "Template contents",
-    "restoreFiles": "Restore {{count}} committed project files",
-    "restoreEmployees": "Restore {{count}} Project Digital Employees and their sanitized workspace settings",
-    "restoreSettings": "Restore portable capability and project policy settings",
+    "restoreFiles": "Restore {{count}} saved project files",
+    "restoreEmployees": "Restore {{count}} Project Digital Employees and their shareable workspace settings",
+    "restoreSettings": "Restore project capabilities and settings",
     "legacyConfiguration": "Use the template's project configuration as a starting point",
     "membersAdjustable": "Project members can be adjusted during creation",
     "versionRecovery": "Project deliverables support version recovery",
@@ -1268,6 +1279,25 @@
     "useThis": "Use this template",
     "fileCount": "{{count}} files",
     "employeeCount": "{{count}} Digital Employees",
+    "management": {
+      "eyebrow": "Template management",
+      "title": "Manage project templates",
+      "description": "View available templates and manage the templates you can modify.",
+      "edit": "Edit",
+      "delete": "Delete",
+      "editFailed": "This template cannot be edited right now",
+      "deleteTitle": "Delete template",
+      "deleteDescription": "“{{name}}” will be removed from project templates.",
+      "deleteSuccess": "Template deleted",
+      "deleteFailed": "Could not delete the template",
+      "save": "Save template",
+      "saveSuccess": "Template saved",
+      "saveFailed": "Could not save the template",
+      "cancelEdit": "Cancel editing",
+      "cancelTitle": "Cancel template editing",
+      "cancelDescription": "Current changes will not be saved.",
+      "cancelFailed": "Could not cancel editing"
+    },
     "builtin": {
       "productSprint": {
         "name": "Product development sprint",
@@ -1275,7 +1305,7 @@
       },
       "marketResearch": {
         "name": "Market insight research",
-        "description": "Collect evidence in parallel, cross-check findings, and produce a traceable research report."
+        "description": "Collect and cross-check evidence, then produce a research report with supporting sources."
       },
       "contentPipeline": {
         "name": "Content publishing pipeline",
@@ -1317,19 +1347,19 @@
     "templateRestoring": "Restoring project from template",
     "useTemplate": "Use template and start planning",
     "templateProjectName": "{{name}} Project",
-    "templateSnapshotHint": "{{version}} · Restore committed deliverables, Project Digital Employees, and portable project settings without adding external members",
+    "templateSnapshotHint": "{{version}} · Restore saved deliverables, Project Digital Employees, and available settings without adding other members",
     "templateLegacyHint": "{{version}} · Use this template as a starting point and confirm members and capabilities",
     "defaultName": "New project · {{date}}",
     "loadingTitle": "Preparing the project workspace",
     "loadingDescription": "Loading available Digital Employees, Skills, MCP, and template versions…",
     "loadFailedTitle": "Could not load project creation options",
-    "loadFailedDescription": "Project initialization options are unavailable",
+    "loadFailedDescription": "Project creation options are unavailable",
     "reload": "Reload",
     "exit": "Exit creation",
-    "brand": "Create an AI-native project",
+    "brand": "Create a collaborative project",
     "progress": "Setup {{step}} / 3",
     "basedOn": "Based on {{name}} · {{version}}",
-    "minimalSetup": "Minimal setup · Plan after creation",
+    "minimalSetup": "Plan after creation",
     "templateSetup": {
       "title": "Project ready",
       "message": "The project assets and team configuration from the template have been restored.",
@@ -1348,24 +1378,27 @@
       "boundaryDescription": "Visibility and the next planning step"
     },
     "team": {
-      "title": "Build the project team",
+      "title": "Project team",
       "snapshotTitle": "Confirm the project template",
       "projectName": "Project name",
-      "projectNameHint": "A default name is provided and can be changed.",
+      "projectNameHint": "The project name can be changed later.",
       "startingTemplate": "Starting template",
       "planningTitle": "Shape the goal together in the project",
       "selected": "{{count}} Digital Employees selected",
-      "snapshotCreated": "A project-specific snapshot is created for each employee",
-      "a2a": "Direct A2A collaboration between members",
+      "snapshotCreated": "Independent project member settings",
+      "selectedPinned": "Project team",
+      "selectedPinnedHint": "{{count}} Digital Employees selected",
+      "a2a": "Member collaboration enabled",
       "capabilityCount": "{{count}} capabilities",
       "searchPlaceholder": "Search Digital Employees",
       "searchAria": "Search Digital Employees",
+      "paginationAria": "Digital Employee search result pages",
       "noSearchResults": "No matching Digital Employees",
       "noSearchResultsHint": "Adjust the search terms.",
       "emptyTitle": "No Digital Employees are available",
       "emptyDescription": "Create or enable at least one Digital Employee first.",
-      "snapshotDescription": "This snapshot template already contains the project team. The restored project will use fresh Project Digital Employees created from the template and will not add standard Digital Employees.",
-      "snapshotFiles": "{{count}} committed files",
+      "snapshotDescription": "This template includes a project team and creates the corresponding Project Digital Employees.",
+      "snapshotFiles": "{{count}} saved files",
       "snapshotEmployees": "{{count}} Project Digital Employees"
     },
     "capabilities": {
@@ -1375,19 +1408,36 @@
       "toolsTab": "Tools",
       "skillsTab": "Skills",
       "searchTools": "Search tools",
+      "searchMcp": "Search MCP",
       "searchSkills": "Search Skills",
       "noTools": "This member has no configurable tools.",
+      "noMcp": "No MCP service is available.",
       "noSkills": "This project has no configurable Skills.",
+      "noSelected": "Nothing is selected yet.",
+      "selectedOnly": "Selected only",
+      "showAll": "Show all",
+      "groupCount": "{{selected}} / {{total}}",
+      "mcpToolCount": "{{count}} tools",
+    "groups": {
+      "mcp": {
+        "company": "Shared MCP",
+        "digital_employee": "Current Digital Employee MCP"
+      },
+      "skill": {
+        "market": "Marketplace Skills",
+        "digital_employee": "Current Digital Employee Skills"
+      }
+      },
       "toolsAria": "Project tools",
       "skillsAria": "Project Skills",
       "projectShared": "Project shared",
       "employeeShort": "Current member",
       "fromEmployee": "From {{name}}",
       "snapshotTitle": "Restore the template's capabilities",
-      "snapshotDescription": "Portable project capabilities and Project Digital Employee capability settings are restored from the template. Private connections and credentials are never copied.",
-      "snapshotDetail": "Committed project files and sanitized Digital Employee identity, memory, and workspace settings remain part of the restored project.",
+      "snapshotDescription": "Project capabilities and Digital Employee settings from the template are applied to the new project. Private connections and credentials are not included.",
+      "snapshotDetail": "The template includes saved project files, Digital Employee identity, memory, and workspace settings.",
       "shared": "Shared Skills / MCP",
-      "sharedHint": "Shared by project members with versions and access fixed for the project",
+      "sharedHint": "Available to project members and limited to this project",
       "employee": "Digital Employee capabilities",
       "employeeHint": "Choose capabilities available in this project",
       "count": "{{count}} enabled",
@@ -1402,15 +1452,19 @@
     },
     "boundary": {
       "title": "Confirm project access",
-      "description": "Projects are private by default and can be shared with selected organization members.",
+      "description": "Set the project access scope.",
       "private": "Only me",
-      "privateHint": "Only you can view and manage the project",
+      "privateHint": "Only the project owner can access the project",
       "shared": "Share with selected members",
       "sharedHint": "Selected organization members can view project progress and deliverables",
       "shareMembers": "Members with access",
       "shareHint": "Project access can be adjusted after creation",
+      "searchMembers": "Search members",
+      "searchMembersAria": "Search shared members",
+      "paginationAria": "Shared member search result pages",
+      "noSearchResults": "No matching members",
       "noShareTargets": "No other organization members are available. Keep the project private.",
-      "review": "Setup summary",
+      "review": "Creation summary",
       "reviewHint": "Create the project after reviewing these settings",
       "project": "Project",
       "team": "Team",
@@ -1422,25 +1476,25 @@
       "visibility": "Visibility",
       "sharedCount": "Shared with {{count}} members",
       "next": "Next",
-      "planningTitle": "Plan first; execution does not start automatically"
+      "planningTitle": "Project planning opens after creation"
     },
     "capabilityKind": {
       "tool": "Tool"
     }
   },
   "projectRuns": {
-    "clearMemberFilter": "Runs by {{name}} · Clear filter"
+    "clearMemberFilter": "Executions by {{name}} · Clear filter"
   },
   "projectSnapshot": {
     "followSourceAgent": "Use project default model",
-    "sourceLayerTitle": "Source Digital Employee",
-    "sourceLayerDescription": "Stable platform configuration; project changes never modify it.",
-    "projectLayerTitle": "Project member snapshot",
-    "projectLayerDescription": "Copied when joining and independently configurable inside this project.",
-    "runLayerTitle": "Frozen Run snapshot",
-    "runLayerDescription": "Each execution permanently records its member and capability configuration.",
+    "sourceLayerTitle": "Original Digital Employee settings",
+    "sourceLayerDescription": "Original settings remain unchanged.",
+    "projectLayerTitle": "Project member settings",
+    "projectLayerDescription": "Model, instructions, and permissions can be adjusted independently in this project.",
+    "runLayerTitle": "Execution settings",
+    "runLayerDescription": "The member and capability settings used for each execution are retained.",
     "memberStatus": "Project member status",
-    "sourceStatus": "Source Digital Employee status when joined",
+    "sourceStatus": "Original status when added to the project",
     "unknown": "Not recorded",
     "lifecycle": {
       "active": "Active and available to the project",
@@ -1465,21 +1519,21 @@
     "allActors": "All actors",
     "projectAgent": "Project Digital Employee",
     "projectUser": "Project user",
-    "projectSystem": "Project system",
-    "eventFallback": "Project event",
+    "projectSystem": "System",
+    "eventFallback": "Project activity",
     "noDetails": "This event has no additional details.",
     "expandDetails": "Show full content",
-    "riskEventHint": "The failure remains traceable in the project audit log with its full context.",
-    "relatedWorkItem": "Related work item",
-    "relatedRun": "Related run",
+    "riskEventHint": "Failure details are available in the project activity log.",
+    "relatedWorkItem": "Related task",
+    "relatedRun": "Related execution",
     "relatedCodeChange": "Related code change",
     "projectScope": "Project scope",
     "viewSession": "View session",
-    "internalReferenceHidden": "Internal reference hidden",
+    "internalReferenceHidden": "Related information unavailable",
     "events": {
       "project": {
         "created": "Project created",
-        "initialized": "Project initialized",
+        "initialized": "Project created",
         "updated": "Project updated",
         "paused": "Project paused",
         "resumed": "Project resumed",
@@ -1487,13 +1541,18 @@
         "shared": "Project shared",
         "unshared": "Project unshared",
         "settings": { "updated": "Project settings updated" },
-        "file": { "committed": "Project file committed" },
+        "file": { "committed": "Project file saved" },
         "plan": { "updated": "Project plan updated" },
         "status": { "updated": "Project status updated" },
         "management": {
-          "action": { "completed": "Project collaboration action completed" }
+          "action": { "completed": "Project work updated" }
         },
-        "trace": { "repaired": "Project trace links repaired" },
+        "trace": { "repaired": "Project relations updated" },
+        "template": {
+          "restored": "Template content restored",
+          "published": "Template published",
+          "updated": "Template updated"
+        },
         "agent": {
           "message": { "sent": "Project Digital Employee message sent" }
         },
@@ -1502,18 +1561,23 @@
           "failed": "Project kickoff failed"
         },
         "agent_reply_batch": {
-          "dispatched": "Digital Employee reply batch dispatched"
+          "dispatched": "Digital Employee replies collected"
         }
       },
       "member": {
         "snapshot": {
-          "created": "Member snapshot created",
-          "updated": "Member snapshot updated"
+          "created": "Member settings created",
+          "updated": "Member settings updated"
         },
+        "tools": { "updated": "Member tools updated" },
         "departed": "Project member departed",
         "restored": "Project member restored"
       },
-      "leader": { "changed": "Project owner changed" },
+      "leader": {
+        "changed": "Project owner changed",
+        "repaired": "Project owner restored",
+        "missing": "Project owner unavailable"
+      },
       "project_agent": {
         "created": "Project Digital Employee created",
         "updated": "Project Digital Employee updated",
@@ -1522,47 +1586,54 @@
       },
       "capability": {
         "bound": "Project capability bound",
-        "updated": "Project capability updated"
+        "updated": "Project capability updated",
+        "deleted": "Skill removed",
+        "refreshed": "Skill updated",
+        "skill_backfill": {
+          "applied": "Skill settings organized",
+          "rolled_back": "Skill settings restore reverted"
+        }
       },
       "work_item": {
-        "created": "Work item created",
-        "updated": "Work item updated"
+        "created": "Task created",
+        "updated": "Task updated"
       },
       "run": {
-        "queued": "Run queued",
-        "running": "Run started",
-        "waiting": "Run waiting",
-        "succeeded": "Run succeeded",
-        "failed": "Run failed",
-        "cancelled": "Run cancelled"
+        "queued": "Execution waiting",
+        "running": "Execution started",
+        "waiting": "Execution awaiting input",
+        "waiting_confirmation": "Execution awaiting confirmation",
+        "succeeded": "Execution completed",
+        "failed": "Execution failed",
+        "cancelled": "Execution cancelled"
       },
       "a2a": {
-        "queued": "A2A request queued",
-        "delivered": "A2A message delivered",
-        "completed": "A2A collaboration completed",
-        "cancelled": "A2A collaboration cancelled",
-        "delivery_failed": "A2A delivery failed"
+        "queued": "Member collaboration requested",
+        "delivered": "Member collaboration message delivered",
+        "completed": "Member collaboration completed",
+        "cancelled": "Member collaboration cancelled",
+        "delivery_failed": "Member collaboration message failed"
       },
       "group": { "message": { "created": "Project group message created" } },
       "git": {
-        "commit": { "created": "Git commit created" },
+        "commit": { "created": "Project version created" },
         "milestone": {
           "prepared": "Delivery milestone prepared",
           "created": "Delivery milestone created"
         },
-        "branch": { "created": "Git branch created" },
-        "restore_commit": { "created": "Restore commit created" },
-        "restored": "Git version restored",
+        "branch": { "created": "Project branch created" },
+        "restore_commit": { "created": "Recovery version created" },
+        "restored": "Project version restored",
         "remote": {
-          "configured": "Git remote configured",
-          "deleted": "Git remote deleted"
+          "configured": "Remote repository configured",
+          "deleted": "Remote repository removed"
         },
-        "repository": { "cloned": "Project repository cloned from remote" }
+        "repository": { "cloned": "Remote repository imported" }
       }
     },
     "details": {
       "project": {
-        "created": "The project and its isolated workspace were created.",
+        "created": "The project was created.",
         "initialized": "The project workspace is ready.",
         "updated": "The project details were updated.",
         "paused": "The project stopped accepting new Digital Employee work while preserving all history.",
@@ -1574,7 +1645,7 @@
           "updated": "Project settings were updated."
         },
         "file": {
-          "committed": "The project file was committed to its traceable Git history."
+          "committed": "The project file was saved as a new version."
         },
         "plan": { "updated": "The project plan was updated." },
         "status": { "updated": "The project status was updated." },
@@ -1582,7 +1653,12 @@
           "action": { "completed": "Project work was reviewed or updated." }
         },
         "trace": {
-          "repaired": "Trace links between runs, sessions, and artifacts were repaired."
+          "repaired": "Relations between project executions, conversations, and results were updated."
+        },
+        "template": {
+          "restored": "The template content was restored.",
+          "published": "The template was published.",
+          "updated": "The template content was updated."
         },
         "agent": {
           "message": {
@@ -1590,8 +1666,8 @@
           }
         },
         "kickoff": {
-          "confirmed": "The plan was confirmed and the project owner started autonomous execution.",
-          "failed": "Project kickoff failed and its context remains traceable."
+          "confirmed": "The plan was confirmed and project execution started.",
+          "failed": "Project start failed."
         },
         "agent_reply_batch": {
           "dispatched": "The project owner received the Digital Employee replies."
@@ -1599,13 +1675,18 @@
       },
       "member": {
         "snapshot": {
-          "created": "The project member snapshot was created.",
-          "updated": "The project member snapshot was updated."
+          "created": "The project member settings were created.",
+          "updated": "The project member settings were updated."
         },
+        "tools": { "updated": "The member tool settings were updated." },
         "departed": "The member left the project; their history remains visible and read-only.",
         "restored": "The member rejoined; future work uses the current configuration."
       },
-      "leader": { "changed": "The project owner was changed." },
+      "leader": {
+        "changed": "The project owner was changed.",
+        "repaired": "The project owner was restored.",
+        "missing": "No project owner is currently available."
+      },
       "project_agent": {
         "created": "The Project Digital Employee was created and added to the project.",
         "updated": "The Project Digital Employee identity or core memory was updated.",
@@ -1614,26 +1695,33 @@
       },
       "capability": {
         "bound": "A shared project capability was bound.",
-        "updated": "Project capability availability was updated."
+        "updated": "Project capability availability was updated.",
+        "deleted": "The Skill was removed from the project.",
+        "refreshed": "The project Skill was updated.",
+        "skill_backfill": {
+          "applied": "Project Skill settings were organized.",
+          "rolled_back": "Project Skill organization was reverted."
+        }
       },
       "work_item": {
-        "created": "The work item was created.",
-        "updated": "The work item content, progress, or evidence was updated."
+        "created": "The task was created.",
+        "updated": "The task content, progress, or evidence was updated."
       },
       "run": {
-        "queued": "The run entered the queue for an available Digital Employee.",
-        "running": "The Digital Employee started processing this run.",
-        "waiting": "The run is waiting for follow-up input or confirmation.",
-        "succeeded": "The run completed.",
-        "failed": "The run failed.",
-        "cancelled": "The run was cancelled."
+        "queued": "The execution is waiting for an available Digital Employee.",
+        "running": "The Digital Employee started this execution.",
+        "waiting": "The execution is waiting for input or confirmation.",
+        "waiting_confirmation": "The execution is waiting for human confirmation.",
+        "succeeded": "The execution completed.",
+        "failed": "The execution failed.",
+        "cancelled": "The execution was cancelled."
       },
       "a2a": {
-        "queued": "A direct A2A request entered the target Digital Employee queue.",
-        "delivered": "The A2A message was delivered to the selected Digital Employee.",
-        "completed": "The target Digital Employee completed this A2A turn.",
-        "cancelled": "This A2A turn was cancelled.",
-        "delivery_failed": "The A2A message could not be delivered; failure context was preserved."
+        "queued": "A member collaboration request was submitted.",
+        "delivered": "The member collaboration message was delivered.",
+        "completed": "The member collaboration completed.",
+        "cancelled": "The member collaboration was cancelled.",
+        "delivery_failed": "The member collaboration message could not be delivered."
       },
       "group": {
         "message": {
@@ -1642,20 +1730,20 @@
       },
       "git": {
         "commit": {
-          "created": "Project changes were recorded in a Git commit."
+          "created": "Project changes were recorded as a new version."
         },
         "milestone": {
           "prepared": "The delivery milestone is being prepared.",
           "created": "The delivery milestone was created."
         },
-        "branch": { "created": "The Git branch was created." },
+        "branch": { "created": "The project branch was created." },
         "restore_commit": {
-          "created": "The restore operation created a new commit and preserved existing history."
+          "created": "A recovery version was created and existing history was preserved."
         },
-        "restored": "The selected Git version was restored through a new commit.",
+        "restored": "The selected project version was restored.",
         "remote": {
-          "configured": "The Git remote was configured.",
-          "deleted": "The Git remote was removed."
+          "configured": "The remote repository was configured.",
+          "deleted": "The remote repository was removed."
         },
         "repository": {
           "cloned": "The remote repository was imported."
@@ -2253,19 +2341,19 @@
       "confirmCancelled": "Cancelled"
     },
     "subagentRun": {
-      "title": "Subagent",
+      "title": "Delegated task",
       "taskFallback": "Delegated task",
       "viewSession": "View session",
-      "sessionPending": "The child session will appear once it has been created.",
+      "sessionPending": "The related conversation will appear once it has been created.",
       "mode": {
-        "sync": "Synchronous",
-        "async": "Asynchronous"
+        "sync": "Immediate",
+        "async": "Background"
       },
-      "forked": "Forked current context",
-      "soulOff": "Soul disabled",
-      "memoryOff": "Memory disabled",
+      "forked": "Current conversation information retained",
+      "soulOff": "Identity settings not used",
+      "memoryOff": "Previous information not used",
       "model": "Model",
-      "sessionId": "Session ID",
+      "sessionId": "Related conversation",
       "status": {
         "queued": "Queued",
         "running": "Running",
@@ -2275,14 +2363,14 @@
         "stopped": "Stopped",
         "unknown": "Unknown"
       },
-      "drawerTitle": "Subagent session",
+      "drawerTitle": "Delegated task conversation",
       "readOnly": "Read-only execution record",
-      "loading": "Loading Subagent session...",
-      "loadError": "Could not load this Subagent session.",
+      "loading": "Loading delegated task conversation...",
+      "loadError": "Could not load this delegated task conversation.",
       "retry": "Retry",
       "empty": "No execution messages yet.",
       "close": "Close",
-      "liveRefresh": "Updates automatically while the Subagent is running",
+      "liveRefresh": "Updates automatically while the delegated task is running",
       "openFullSession": "Open full session"
     },
     "sessionViewer": {
@@ -2308,15 +2396,16 @@
       "projectUser": "Project member",
       "mentionLimit": "You can invite up to {{count}} members in each message.",
       "unresolvedMention": "Some members could not be identified. Remove the red mention or select the member again from the suggestions.",
-      "sendError": "Message could not be sent.",
-      "uploadError": "Attachment upload failed.",
+      "sendError": "The message could not be sent. Try again later.",
+      "uploadError": "The attachment could not be uploaded. Try again later.",
       "attachmentOnlyMessage": "See attachment",
       "reconnecting": "Reconnecting. Your draft and attachments are preserved.",
       "interactive": "Conversation available",
+      "untitled": "Untitled conversation",
       "groupProcessing": "{{name}} is handling this turn",
-      "groupProcessingQueued": "{{name}} is handling this turn with {{count}} additional Digital Employee(s) in its explicit queue",
-      "groupTurnExpired": "The previous turn exceeded 45 minutes. Waiting stopped; check Run Control for details.",
-      "groupTurnNoActiveRun": "No Digital Employee run can continue this turn. Check Run Control for the failure reason.",
+      "groupProcessingQueued": "{{name}} is handling this turn; {{count}} additional Digital Employee(s) are waiting",
+      "groupTurnExpired": "The previous turn ended. View the execution record for details.",
+      "groupTurnNoActiveRun": "This turn could not continue. View the execution record for details.",
       "status": {
         "queued": "Queued",
         "pending": "Pending",
@@ -2325,7 +2414,9 @@
         "completed": "Completed",
         "failed": "Failed",
         "cancelled": "Cancelled",
-        "canceled": "Cancelled"
+        "canceled": "Cancelled",
+        "planning": "Planning",
+        "unknown": "Status unknown"
       }
     },
     "activityLog": {
@@ -2634,7 +2725,7 @@
       "custom": "Custom",
       "general": "General",
       "projectManagement": "Project Management",
-      "subagent": "Subagent",
+      "subagent": "Delegated tasks",
       "email": "Email",
       "aware": "Aware & Triggers",
       "social": "Social",
@@ -2646,8 +2737,8 @@
       "okr": "OKR"
     },
     "toolCategoryDescriptions": {
-      "project_management": "Review progress and maintain project work, runs, milestones, and workspace assets",
-      "subagent": "Delegate tasks to child agents with multi-round, bidirectional collaboration"
+      "project_management": "Review project progress and manage tasks, execution records, milestones, and workspace content",
+      "subagent": "Delegate tasks, review progress, and provide additional guidance"
     },
     "toolTranslations": {
       "user_project_search": {
@@ -2659,16 +2750,16 @@
         "description": "View a project's goals, progress, status, and delivery overview."
       },
       "user_project_work_item_list": {
-        "name": "View work items",
-        "description": "View project work-item status, priority, ownership, and schedule."
+        "name": "View tasks",
+        "description": "View project task status, priority, ownership, and schedule."
       },
       "user_project_work_item_get": {
-        "name": "View work-item details",
-        "description": "View a work item's description, acceptance criteria, dependencies, and progress."
+        "name": "View task details",
+        "description": "View a task's description, acceptance criteria, dependencies, and progress."
       },
       "user_project_run_list": {
-        "name": "View run history",
-        "description": "View project run status, ownership, trigger, and timing."
+        "name": "View execution history",
+        "description": "View project execution status, ownership, and timing."
       },
       "user_project_member_list": {
         "name": "View project members",
@@ -2688,27 +2779,27 @@
       },
       "user_project_git_get": {
         "name": "View version status",
-        "description": "View the current version, branches, file count, and recent commits."
+        "description": "View the current version, branches, file count, and recent versions."
       },
       "user_project_git_diff": {
         "name": "View version changes",
-        "description": "View change statistics or a file diff for a selected commit."
+        "description": "View change statistics or a file diff for a selected version."
       },
       "user_project_message_list": {
         "name": "View project activity",
         "description": "View recent collaboration messages from the project group chat."
       },
       "user_project_work_item_create": {
-        "name": "Create work item",
-        "description": "Create a work item with delivery criteria, ownership, and schedule."
+        "name": "Create task",
+        "description": "Create a task with delivery criteria, ownership, and schedule."
       },
       "user_project_work_item_update": {
-        "name": "Update work item",
-        "description": "Update a work item's content, status, priority, ownership, or dependencies."
+        "name": "Update task",
+        "description": "Update a task's content, status, priority, ownership, or dependencies."
       },
       "user_project_run_start": {
-        "name": "Start project run",
-        "description": "Start a project run for a work item or a focused instruction."
+        "name": "Start project execution",
+        "description": "Start project execution for a task or a focused instruction."
       },
       "user_project_message_send": {
         "name": "Send project message",
@@ -2723,24 +2814,24 @@
         "description": "Write a project text file and create a version record."
       },
       "user_project_status_update": {
-        "name": "Control project run",
+        "name": "Control project execution",
         "description": "Pause or resume project work."
       },
       "run_subagent": {
-        "name": "Run Subagent",
-        "description": "Name and delegate a focused task to an independent child-agent session, with sync or async execution, model selection, context forking, and optional Soul or memory loading."
+        "name": "Delegate task",
+        "description": "Assign a focused task to a Digital Employee and choose how it should be handled."
       },
       "send_message_to_subagent": {
-        "name": "Message Subagent",
-        "description": "Append a message to a child agent. Running work receives it at the next model round; finished work resumes asynchronously in the same session."
+        "name": "Update delegated task",
+        "description": "Add requirements or background information to a delegated task."
       },
       "stop_subagent": {
-        "name": "Stop Subagent",
-        "description": "Stop a queued or running child agent. External tool side effects that have already started are not rolled back."
+        "name": "Stop delegated task",
+        "description": "Stop a delegated task that is waiting or in progress."
       },
       "send_message_to_parent": {
-        "name": "Message Parent Agent",
-        "description": "Send one or more interim messages from a child agent to its parent session. Async messages wake the parent; sync messages are returned with the final result. Available only in child-agent sessions."
+        "name": "Send task update",
+        "description": "Send progress or results to the task requester."
       }
     },
     "upload": {

@@ -578,6 +578,7 @@ async def _send_to_agent_background(
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
         from app.models.llm import LLMModel
+        from app.models.participant import Participant
         from app.services.llm import call_llm
 
         async with async_session() as db:
@@ -616,7 +617,6 @@ async def _send_to_agent_background(
                     .values(
                         id=session_uuid,
                         agent_id=uuid.UUID(str(session_agent_id)),
-                        user_id=uuid.UUID(str(target_creator_id)),
                         title=f"{source_agent_name} ↔ {target_agent_name}",
                         source_channel="agent",
                         peer_agent_id=uuid.UUID(str(session_peer_id)),
@@ -701,8 +701,6 @@ async def _send_to_agent_background(
             # Add the new message with agent communication context
             user_msg = f"{agent_comm_alert}\n\n[Message from agent: {source_agent_name}]\n{content}"
             messages.append({"role": "user", "content": user_msg})
-
-            from app.models.participant import Participant
 
             # Lookup participants for both agents
             src_part_r = await db.execute(

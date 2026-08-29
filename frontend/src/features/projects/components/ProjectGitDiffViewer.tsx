@@ -45,13 +45,9 @@ export default function ProjectGitDiffViewer({
       .then((response) => {
         if (!disposed) setDiff(response);
       })
-      .catch((reason: unknown) => {
+      .catch(() => {
         if (!disposed)
-          setError(
-            reason instanceof Error
-              ? reason.message
-              : t("projectGit.diff.loadFallback"),
-          );
+          setError(t("projectGit.diff.loadFallback"));
       });
     return () => {
       disposed = true;

@@ -156,20 +156,11 @@ export default function ProjectPlanningPage() {
   }
 
   if (failed || !project || !sessionTarget) {
-    const error =
-      projectQuery.error ||
-      membersQuery.error ||
-      groupSessionQuery.error ||
-      planningMessagesQuery.error;
     return (
       <main className="pm-planning-page pm-planning-state" role="alert">
         <IconAlertTriangle size={26} />
         <strong>{t("projectTerminology.planning.unavailableTitle")}</strong>
-        <p>
-          {error instanceof Error
-            ? error.message
-            : t("projectTerminology.planningUnavailable")}
-        </p>
+        <p>{t("projectTerminology.planningUnavailable")}</p>
         <Button
           variant="secondary"
           onClick={() => {
@@ -313,9 +304,7 @@ export default function ProjectPlanningPage() {
           {confirmMutation.isError && (
             <div className="pm-planning-error" role="alert">
               <IconAlertTriangle size={15} />
-              {confirmMutation.error instanceof Error
-                ? confirmMutation.error.message
-                : t("projectTerminology.planning.startFailed")}
+              {t("projectTerminology.planning.startFailed")}
             </div>
           )}
           {hasStarted ? (

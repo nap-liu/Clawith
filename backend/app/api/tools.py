@@ -791,6 +791,25 @@ async def update_agent_tools(
             at.enabled = u.enabled
         else:
             db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=u.enabled))
+    if agent_obj.scope == "project" and agent_obj.project_id is not None:
+        mcp_server_ids = {
+            tool.mcp_server_id
+            for _update, tool in resolved_updates
+            if tool.type == "mcp" and tool.mcp_server_id is not None
+        }
+        if mcp_server_ids:
+            from app.models.project import Project
+            from app.services.project_member_runtime import sync_project_agent_mcp_bindings
+
+            project = await db.get(Project, agent_obj.project_id)
+            if project is not None and project.tenant_id == agent_obj.tenant_id:
+                await db.flush()
+                await sync_project_agent_mcp_bindings(
+                    db,
+                    project,
+                    project_agent_id=agent_obj.id,
+                    server_ids=mcp_server_ids,
+                )
     await db.commit()
     return {"ok": True}
 
