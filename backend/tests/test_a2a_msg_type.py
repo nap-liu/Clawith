@@ -14,6 +14,51 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _durable_consult_helpers(monkeypatch):
+    async def transition(*_args, **_kwargs):
+        return None
+
+    async def persist_reply(db, **kwargs):
+        row = MagicMock()
+        row.role = "assistant"
+        row.thinking = kwargs.get("thinking")
+        row.content = kwargs.get("content")
+        db.add(row)
+        return uuid.uuid4()
+
+    async def publish(*_args, **_kwargs):
+        return None
+
+    async def ingest(db, **kwargs):
+        row = MagicMock()
+        row.id = uuid.uuid4()
+        row.role = "user"
+        row.message_meta = dict(kwargs.get("message_meta") or {})
+        db.add(row)
+        result = MagicMock()
+        result.message = row
+        result.consumed_by_onmessage = False
+        return result
+
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.transition_conversation_turn",
+        transition,
+    )
+    monkeypatch.setattr(
+        "app.services.chat_history.persist_assistant_reply_row",
+        persist_reply,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.publish_committed_turn_terminal",
+        publish,
+    )
+    monkeypatch.setattr(
+        "app.services.chat_history.ingest_incoming_chat_message",
+        ingest,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _active_a2a_relationship(monkeypatch):
     async def active(*_args, **_kwargs):
         return {
@@ -141,7 +186,7 @@ async def test_notify_returns_immediately():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=_make_tenant()),
     ])
 
@@ -256,7 +301,7 @@ async def test_consult_calls_llm_synchronously():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=_make_tenant()),
         DummyResult(scalar_value=model),
         DummyResult(scalars_list=[]),   # ChatMessage rows (empty history)
@@ -315,7 +360,7 @@ async def test_default_msg_type_is_notify():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=_make_tenant()),
     ])
 
@@ -598,7 +643,7 @@ async def test_feature_flag_off_falls_back_to_consult():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=tenant),
         DummyResult(scalar_value=model),
         DummyResult(scalars_list=[]),   # ChatMessage rows (empty history)
@@ -657,7 +702,7 @@ async def test_feature_flag_on_uses_notify():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=tenant),
     ])
 

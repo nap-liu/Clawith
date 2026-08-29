@@ -16,6 +16,7 @@ from app.database import async_session
 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE, Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.user import User
 from app.services.channel_llm import _call_agent_llm
 from app.services.chat_history import (
     is_incomplete_delivery_progress,
@@ -69,6 +70,43 @@ async def _validated_execution_agent_id(
     if candidate == anchor.agent_id:
         return candidate
     meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+    if meta.get("source_channel") == "agent":
+        try:
+            session_id = uuid.UUID(str(anchor.conversation_id))
+        except (TypeError, ValueError):
+            return None
+        session = await db.get(ChatSession, session_id)
+        storage_agent = await db.get(Agent, anchor.agent_id)
+        execution_agent = await db.get(Agent, candidate)
+        execution_user = await db.get(User, anchor.user_id)
+        participants = (
+            {
+                participant_id
+                for participant_id in (session.agent_id, session.peer_agent_id)
+                if participant_id is not None
+            }
+            if session is not None
+            else set()
+        )
+        if (
+            session is None
+            or session.source_channel != "agent"
+            or storage_agent is None
+            or execution_agent is None
+            or execution_user is None
+            or session.agent_id != anchor.agent_id
+            or candidate not in participants
+            or anchor.sender_agent_id not in participants
+            or anchor.sender_agent_id == candidate
+            or storage_agent.tenant_id != execution_agent.tenant_id
+            or execution_user.tenant_id != execution_agent.tenant_id
+        ):
+            logger.error(
+                "[turn_recovery] rejected invalid A2A execution edge "
+                f"anchor={anchor.id} candidate={candidate}"
+            )
+            return None
+        return candidate
     if meta.get("kind") != "subagent_event":
         logger.warning(f"[turn_recovery] ignored execution_agent_id on non-subagent anchor={anchor.id}")
         return anchor.agent_id
@@ -482,6 +520,51 @@ async def prepare_recoverable_turn_history(
     )
 
 
+async def _upsert_gateway_direct_reply(
+    db,
+    *,
+    anchor: ChatMessage,
+    reply: str,
+    execution_agent_id: uuid.UUID,
+) -> bool | None:
+    """Write a Gateway reply outbox row in the caller's terminal transaction."""
+    raw_anchor_meta = getattr(anchor, "message_meta", None)
+    anchor_meta = raw_anchor_meta if isinstance(raw_anchor_meta, dict) else {}
+    gateway_reply = anchor_meta.get("gateway_direct_reply")
+    if not isinstance(gateway_reply, dict):
+        return None
+    try:
+        gateway_message_id = uuid.UUID(str(gateway_reply["message_id"]))
+        gateway_agent_id = uuid.UUID(str(gateway_reply["agent_id"]))
+        gateway_sender_agent_id = uuid.UUID(
+            str(gateway_reply["sender_agent_id"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        gateway_agent_id != anchor.sender_agent_id
+        or gateway_sender_agent_id != execution_agent_id
+    ):
+        return False
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from app.models.gateway_message import GatewayMessage
+
+    await db.execute(
+        pg_insert(GatewayMessage)
+        .values(
+            id=gateway_message_id,
+            agent_id=gateway_agent_id,
+            sender_agent_id=gateway_sender_agent_id,
+            content=reply,
+            status="pending",
+            conversation_id=anchor.conversation_id,
+        )
+        .on_conflict_do_nothing(index_elements=["id"])
+    )
+    return True
+
+
 async def _deliver_recovered_reply(
     anchor: ChatMessage,
     *,
@@ -499,6 +582,22 @@ async def _deliver_recovered_reply(
         )
         if current_origin != expected_origin:
             return False
+
+        gateway_delivery = await _upsert_gateway_direct_reply(
+            db,
+            anchor=anchor,
+            reply=reply,
+            execution_agent_id=execution_agent_id,
+        )
+        if expected_origin.source_channel == "agent":
+            if gateway_delivery is not None:
+                if gateway_delivery:
+                    await db.commit()
+                return gateway_delivery
+            # A standard native A2A session is itself the durable delivery
+            # destination. The terminal assistant row was committed before
+            # this origin check; it must not be routed through an IM adapter.
+            return True
 
         delivery_kwargs = {
             "agent_id": execution_agent_id,
@@ -898,6 +997,14 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                     turn_anchor_id=anchor.id,
                     sender_agent_id=execution_agent_id,
                 )
+                gateway_outbox = await _upsert_gateway_direct_reply(
+                    db,
+                    anchor=anchor,
+                    reply=reply,
+                    execution_agent_id=execution_agent_id,
+                )
+                if gateway_outbox is False:
+                    raise RuntimeError("invalid Gateway direct reply route")
                 await db.commit()
                 from app.services.conversation_turn_lifecycle import get_conversation_turn_snapshot
 
@@ -931,6 +1038,21 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             if not delivered:
                 logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
                 return False
+            try:
+                from app.services.turn_inbox import kick_promoted_turn_inbox
+
+                await kick_promoted_turn_inbox(
+                    agent_id=anchor.agent_id,
+                    session_id=anchor.conversation_id,
+                )
+            except Exception:
+                # Promotion is already durable. Startup recovery remains the
+                # fallback if this local handoff cannot be scheduled.
+                logger.opt(exception=True).warning(
+                    "[turn_recovery] promoted turn kick failed after recovery "
+                    "anchor={}",
+                    anchor.id,
+                )
             return True
 
         return False

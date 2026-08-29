@@ -30,6 +30,48 @@ def _active_a2a_relationship(monkeypatch):
         active,
     )
 
+    async def transition(*_args, **_kwargs):
+        return None
+
+    async def persist_reply(db, **kwargs):
+        row = MagicMock()
+        row.role = "assistant"
+        row.thinking = kwargs.get("thinking")
+        row.content = kwargs.get("content")
+        db.add(row)
+        return uuid.uuid4()
+
+    async def publish(*_args, **_kwargs):
+        return None
+
+    async def ingest(db, **kwargs):
+        row = MagicMock()
+        row.id = uuid.uuid4()
+        row.role = "user"
+        row.message_meta = dict(kwargs.get("message_meta") or {})
+        db.add(row)
+        result = MagicMock()
+        result.message = row
+        result.consumed_by_onmessage = False
+        return result
+
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.transition_conversation_turn",
+        transition,
+    )
+    monkeypatch.setattr(
+        "app.services.chat_history.persist_assistant_reply_row",
+        persist_reply,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_turn_lifecycle.publish_committed_turn_terminal",
+        publish,
+    )
+    monkeypatch.setattr(
+        "app.services.chat_history.ingest_incoming_chat_message",
+        ingest,
+    )
+
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -145,7 +187,7 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
         DummyResult(scalar_value=uuid.uuid4()),   # relationship check
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=tenant),
         DummyResult(scalar_value=model),          # primary LLMModel
         DummyResult(scalars_list=[]),              # ChatMessage rows (empty)
@@ -228,7 +270,7 @@ async def test_consult_persists_target_thinking():
         DummyResult(scalar_value=uuid.uuid4()),   # relationship check
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=tenant),
         DummyResult(scalar_value=model),
         DummyResult(scalars_list=[]),              # ChatMessage history rows
@@ -308,7 +350,7 @@ async def test_consult_persist_tool_call_stores_raw_connection_string():
         DummyResult(scalar_value=uuid.uuid4()),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=tenant),
         DummyResult(scalar_value=model),
         DummyResult(scalars_list=[]),

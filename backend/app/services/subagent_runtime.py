@@ -3230,6 +3230,49 @@ async def _materialize_parent_event_batch(
 
         event_ids = [event.id for event, _run, _child in candidates]
         projections = await _parent_event_projections(db, event_ids)
+
+        async def _discard_unowned_legacy_projection_group(
+            legacy_root_id: uuid.UUID,
+        ) -> bool:
+            """Delete one broken derived group while preserving source events."""
+            from app.services.conversation_turn_lifecycle import (
+                conversation_turn_snapshot_for_session,
+            )
+
+            current = conversation_turn_snapshot_for_session(parent)
+            if current.status in {"running", "suspended"}:
+                return False
+            stale_rows = list(
+                (
+                    await db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.conversation_id == str(parent.id),
+                            ChatMessage.message_meta["kind"].as_string()
+                            == SUBAGENT_PARENT_EVENT,
+                            or_(
+                                ChatMessage.id == legacy_root_id,
+                                ChatMessage.message_meta[
+                                    "subagent_turn_anchor_id"
+                                ].as_string()
+                                == str(legacy_root_id),
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            stale_ids = {row.id for row in stale_rows}
+            for row in stale_rows:
+                await db.delete(row)
+            # Release every external-event key in the old batch before this
+            # transaction inserts a repaired subset under a new root.
+            await db.flush()
+            for event_id, projection in list(projections.items()):
+                if projection.id in stale_ids:
+                    projections.pop(event_id, None)
+            return True
+
         projected_root_ids: list[uuid.UUID] = []
         for projection in projections.values():
             raw_root_id = _message_meta(projection).get("subagent_turn_anchor_id")
@@ -3267,12 +3310,27 @@ async def _materialize_parent_event_batch(
             root_id = projected_root_ids[0]
             root = await db.get(ChatMessage, root_id, with_for_update=True)
             if root is None or root.conversation_id != str(parent.id):
-                return None, [], "busy"
+                if not await _discard_unowned_legacy_projection_group(root_id):
+                    return None, [], "busy"
+                root = None
             # Only synthetic Subagent roots are resumed by the idle daemon.
             # A projection already attached to a human/channel turn is owned by
             # that turn and its ordinary crash-recovery path.
-            if _message_meta(root).get("kind") != SUBAGENT_PARENT_EVENT:
+            if (
+                root is not None
+                and _message_meta(root).get("kind") != SUBAGENT_PARENT_EVENT
+            ):
                 return None, [], "busy"
+            root_meta = _message_meta(root) if root is not None else {}
+            if root is not None and root_meta.get("conversation_turn_lifecycle") is not True:
+                # Compatibility repair for roots materialized by an older
+                # process before durable admission. Their child rows remain
+                # the authoritative pending audit events, so discard only the
+                # broken parent projections and let this transaction create a
+                # newly admitted idempotent batch below.
+                if not await _discard_unowned_legacy_projection_group(root.id):
+                    return None, [], "busy"
+                root = None
         else:
             latest = (
                 await db.execute(
@@ -3338,6 +3396,7 @@ async def _materialize_parent_event_batch(
             await before_injection()
 
         now = datetime.now(UTC)
+        created_root = False
         injected: list[dict] = []
         for index, (event, run, child, content) in enumerate(valid):
             projection_id = uuid.uuid4()
@@ -3376,9 +3435,32 @@ async def _materialize_parent_event_batch(
                 projected_event_ids.append(event.id)
             if is_new_root:
                 root = projection
+                created_root = True
             injected.append({"role": "user", "content": content})
 
         parent.last_message_at = now + timedelta(microseconds=len(valid) - 1)
+        if created_root and root is not None:
+            # ChatSession lifecycle admission is the durable mutex shared by
+            # Web, IM, Trigger, Subagent, Recovery, A2A and MCP. Commit the
+            # synthetic wake and its ownership atomically: a competing turn
+            # rolls the whole projection back instead of leaving an orphan
+            # ``running`` root that absorbs every later child event.
+            from app.services.conversation_turn_lifecycle import (
+                ConversationTurnConflict,
+                transition_conversation_turn,
+            )
+
+            try:
+                await transition_conversation_turn(
+                    db,
+                    agent_id=parent.agent_id,
+                    conversation_id=str(parent.id),
+                    turn_anchor_id=root.id,
+                    status="running",
+                )
+            except ConversationTurnConflict:
+                await db.rollback()
+                return None, [], "busy"
         try:
             await db.commit()
         except IntegrityError:
@@ -3486,6 +3568,7 @@ def build_parent_subagent_before_round(
     active_turn_anchor_id: uuid.UUID,
     execution_agent_id: uuid.UUID,
     execution_user_id: uuid.UUID,
+    turn_anchor_agent_id: uuid.UUID | None = None,
     include_turn_inbox: bool = False,
     upstream: Callable[[int], Awaitable[list[dict]]] | None = None,
 ) -> Callable[[int], Awaitable[list[dict]]]:
@@ -3516,7 +3599,9 @@ def build_parent_subagent_before_round(
                 await drain_turn_inbox(
                     session_id=parent_session_id,
                     active_turn_anchor_id=active_turn_anchor_id,
-                    execution_agent_id=execution_agent_id,
+                    execution_agent_id=(
+                        turn_anchor_agent_id or execution_agent_id
+                    ),
                     execution_user_id=execution_user_id,
                     **turn_inbox_kwargs,
                 )

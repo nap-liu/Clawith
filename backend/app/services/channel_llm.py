@@ -459,6 +459,7 @@ async def _call_agent_llm(
             active_turn_anchor_id=turn_anchor_id,
             execution_agent_id=agent_id,
             execution_user_id=parent_event_execution_user_id,
+            turn_anchor_agent_id=history_agent_id,
             include_turn_inbox=is_turn_inbox_channel(
                 runtime_session.source_channel
             ),

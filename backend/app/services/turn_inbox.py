@@ -25,6 +25,7 @@ CHANNEL_RECEIPT_CLEANUP_DIAGNOSTIC_RING_SIZE = 8
 CHANNEL_RECEIPT_STARTUP_MAX_BATCHES = 512
 TURN_INBOX_CHANNELS = frozenset(
     {
+        "agent",
         "dingtalk",
         "feishu",
         "wecom",
@@ -547,18 +548,29 @@ async def _resume_promoted_turn(anchor: ChatMessage) -> None:
     for delay in (0, 0.25, 1, 4, 10):
         if delay:
             await asyncio.sleep(delay)
+        resume_owner = False
         try:
             async with RedisLeaseLock(
                 str(anchor.id),
                 namespace="turn-inbox-resume",
             ):
+                resume_owner = True
                 if await resume_turn(anchor):
                     return
                 raise RuntimeError("promoted turn was not accepted by recovery")
-        except RedisLeaseBusyError:
-            # Another replica owns the exact anchor. It will either finish the
-            # turn or leave the durable running row for restart recovery.
-            return
+        except RedisLeaseBusyError as exc:
+            if not resume_owner:
+                # Another replica owns the exact recovery anchor.
+                return
+            # This owner reached resume_turn but the shared conversation lease
+            # is still draining. Retry locally instead of waiting for restart.
+            last_error = exc
+            logger.warning(
+                "[turn_inbox] conversation lease busy during resume "
+                "anchor={} delay={}",
+                anchor.id,
+                delay,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -570,6 +582,15 @@ async def _resume_promoted_turn(anchor: ChatMessage) -> None:
                 exc,
             )
     await _fail_exhausted_promoted_turn(anchor, last_error)
+
+
+def schedule_durable_turn_resume(anchor: ChatMessage) -> None:
+    """Resume any admitted durable turn after its foreground owner exits."""
+
+    asyncio.create_task(
+        _resume_promoted_turn(anchor),
+        name=f"durable-turn-resume:{anchor.id}",
+    )
 
 
 async def _fail_exhausted_promoted_turn(
@@ -698,10 +719,7 @@ async def kick_promoted_turn_inbox(
         if anchor is None or dict(anchor.message_meta or {}).get("turn_inbox_state") != "promoted":
             return False
 
-    asyncio.create_task(
-        _resume_promoted_turn(anchor),
-        name=f"turn-inbox:{anchor.id}",
-    )
+    schedule_durable_turn_resume(anchor)
     return True
 
 
@@ -807,41 +825,44 @@ async def drain_turn_inbox(
             injected.append(message)
             row.message_meta = {**meta, "turn_inbox_state": "delivered"}
         if selected:
-            prior_marker = dict(session.im_config or {}).get(
-                CHANNEL_RECEIPT_ANCHOR_KEY
-            )
-            cleanup_message_ids = (
-                _marker_cleanup_message_ids(prior_marker)
-                if isinstance(prior_marker, dict)
-                else []
-            )
-            for row in selected:
-                if row.id not in cleanup_message_ids:
-                    cleanup_message_ids.append(row.id)
-            session.im_config = {
-                **dict(session.im_config or {}),
-                CHANNEL_RECEIPT_ANCHOR_KEY: {
-                    "message_id": str(selected[-1].id),
-                    "turn_anchor_id": str(active_turn_anchor_id),
-                    "generation": snapshot.generation,
-                    "cleanup_message_ids": [
-                        str(message_id) for message_id in cleanup_message_ids
-                    ],
-                    "cleanup_attempts": (
-                        dict(prior_marker.get("cleanup_attempts") or {})
-                        if isinstance(prior_marker, dict)
-                        and isinstance(prior_marker.get("cleanup_attempts"), dict)
-                        else {}
-                    ),
-                },
-            }
+            if session.source_channel == "dingtalk":
+                prior_marker = dict(session.im_config or {}).get(
+                    CHANNEL_RECEIPT_ANCHOR_KEY
+                )
+                cleanup_message_ids = (
+                    _marker_cleanup_message_ids(prior_marker)
+                    if isinstance(prior_marker, dict)
+                    else []
+                )
+                for row in selected:
+                    if row.id not in cleanup_message_ids:
+                        cleanup_message_ids.append(row.id)
+                session.im_config = {
+                    **dict(session.im_config or {}),
+                    CHANNEL_RECEIPT_ANCHOR_KEY: {
+                        "message_id": str(selected[-1].id),
+                        "turn_anchor_id": str(active_turn_anchor_id),
+                        "generation": snapshot.generation,
+                        "cleanup_message_ids": [
+                            str(message_id) for message_id in cleanup_message_ids
+                        ],
+                        "cleanup_attempts": (
+                            dict(prior_marker.get("cleanup_attempts") or {})
+                            if isinstance(prior_marker, dict)
+                            and isinstance(
+                                prior_marker.get("cleanup_attempts"), dict
+                            )
+                            else {}
+                        ),
+                    },
+                }
             await db.commit()
             from app.services.channel_dispatch import advance_channel_receipt_anchor
 
             previous_cleanup_completed = await advance_channel_receipt_anchor(
                 [row.id for row in selected]
             )
-            if previous_cleanup_completed:
+            if previous_cleanup_completed and session.source_channel == "dingtalk":
                 await _acknowledge_live_receipt_handoff(
                     session_id=durable_session_id,
                     agent_id=execution_agent_id,

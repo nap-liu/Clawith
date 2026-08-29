@@ -304,19 +304,41 @@ async def load_recoverable_messages_for_turn(
         return []
 
     prefix = active_rows[:anchor_idx]
+    causally_prior_rows: list[Any] = []
     tail: list[Any] = []
     for row in active_rows[anchor_idx:]:
+        meta = (
+            row.message_meta
+            if isinstance(getattr(row, "message_meta", None), dict)
+            else {}
+        )
+        owned_turn_anchor_id = (
+            meta.get("turn_anchor_id")
+            or meta.get("subagent_turn_anchor_id")
+            or (
+                meta.get("turn_inbox_anchor_id")
+                if meta.get("turn_inbox_state") == "delivered"
+                else None
+            )
+        )
+        if (
+            tail
+            and owned_turn_anchor_id
+            and str(owned_turn_anchor_id) != str(turn_anchor_id)
+        ):
+            # A next-turn input is persisted while the previous turn is still
+            # running. Tool/assistant rows from that previous turn can therefore
+            # have later timestamps than this anchor. Restore causal turn order
+            # without modifying any durable row: previous-turn completion first,
+            # then the promoted anchor and its own continuation.
+            causally_prior_rows.append(row)
+            continue
         if tail and getattr(row, "role", None) == "user":
             # Subagent parent messages are inserted into the currently running
             # logical turn at an LLM round boundary.  They are separate durable
             # user rows, but carry the original turn anchor so a crashed worker
             # can rebuild the exact same multi-round tail instead of truncating
             # at the first injected message and replaying the task from scratch.
-            meta = (
-                row.message_meta
-                if isinstance(getattr(row, "message_meta", None), dict)
-                else {}
-            )
             injected_anchor_id = (
                 meta.get("subagent_turn_anchor_id")
                 or (
@@ -332,7 +354,7 @@ async def load_recoverable_messages_for_turn(
     # compact/replay an already-started turn, so retain the full active prefix;
     # the stateless dispatch guard will stop if that exact continuation cannot
     # fit.
-    rows = prefix + tail
+    rows = prefix + causally_prior_rows + tail
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
     if marker is not None:
@@ -1417,9 +1439,23 @@ async def ingest_incoming_chat_message(
         snapshot = conversation_turn_snapshot_for_session(locked_session)
         if snapshot.status == ACTIVE_TURN_STATUS and snapshot.anchor_id is not None:
             active_anchor = await db.get(ChatMessage, snapshot.anchor_id)
-            same_execution_user = bool(
+            active_meta = (
+                dict(active_anchor.message_meta or {})
+                if active_anchor is not None
+                else {}
+            )
+            active_execution_agent_id = str(
+                active_meta.get("execution_agent_id")
+                or (active_anchor.agent_id if active_anchor is not None else "")
+            )
+            incoming_execution_agent_id = str(
+                dict(row.message_meta or {}).get("execution_agent_id")
+                or row.agent_id
+            )
+            same_execution_identity = bool(
                 active_anchor is not None
                 and active_anchor.user_id == row.user_id
+                and active_execution_agent_id == incoming_execution_agent_id
             )
             row.message_meta = {
                 **dict(row.message_meta or {}),
@@ -1430,7 +1466,7 @@ async def ingest_incoming_chat_message(
                 # execution identity. It remains durable and is promoted only
                 # after the current generation terminates.
                 "turn_inbox_mode": (
-                    "current_turn" if same_execution_user else "next_turn"
+                    "current_turn" if same_execution_identity else "next_turn"
                 ),
             }
             await db.flush()
@@ -1441,7 +1477,7 @@ async def ingest_incoming_chat_message(
             )
 
             await mark_channel_turn_admitted()
-            if same_execution_user:
+            if same_execution_identity:
                 await register_channel_receipt_anchor(row.id)
         else:
             await transition_conversation_turn(
@@ -2108,6 +2144,7 @@ async def persist_assistant_reply_row(
     message_meta: dict[str, Any] | None = None,
     turn_anchor_id: uuid.UUID | None = None,
     sender_agent_id: uuid.UUID | None = None,
+    participant_id: uuid.UUID | None = None,
     turn_terminal_status: str = "completed",
 ) -> uuid.UUID:
     """Persist a non-empty assistant reply in the caller's transaction."""
@@ -2154,6 +2191,7 @@ async def persist_assistant_reply_row(
         agent_id=agent_id,
         user_id=user_id,
         sender_agent_id=sender_agent_id,
+        participant_id=participant_id,
         role="assistant",
         content=content,
         conversation_id=conversation_id,

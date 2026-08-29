@@ -13195,6 +13195,7 @@ async def _send_message_to_agent(
     trigger remember WHERE the originating conversation lived so the eventual
     reply is routed back to it.
     """
+    recoverable_anchor = None
     canonical_agent_id = str(args.get("agent_id") or "").strip()
     message_text = args.get("message", "").strip()
     msg_type = args.get("msg_type", "notify").strip().lower()
@@ -13544,9 +13545,62 @@ async def _send_message_to_agent(
                     title=message_text.strip()[:40] or None,
                 )
 
-            # Save source message (common to all paths)
+            # Save source message. Ordinary native consults use the same
+            # durable admission path as IM/Gateway so a concurrent delivery is
+            # merged into the running turn or queued for promotion.
             outbound_a2a_message = recorded_project_outbound
-            if outbound_a2a_message is None:
+            if (
+                outbound_a2a_message is None
+                and msg_type == "consult"
+                and project_id is None
+            ):
+                from app.services.chat_history import ingest_incoming_chat_message
+
+                ingested = await ingest_incoming_chat_message(
+                    db,
+                    session=chat_session,
+                    agent_id=session_agent_id,
+                    user_id=owner_id,
+                    content=message_text,
+                    source_channel="agent",
+                    provider_event_id=(
+                        outbound_operation_key or f"native-consult:{uuid.uuid4()}"
+                    ),
+                    channel_config_id="native-a2a",
+                    actor_ref=str(
+                        src_participant.id if src_participant else from_agent_id
+                    ),
+                    participant_id=(
+                        src_participant.id if src_participant else None
+                    ),
+                    message_meta={
+                        "origin_session_id": str(origin_session_id or ""),
+                        "origin_source_channel": origin_source_channel,
+                        "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+                        "tool_call_id": str(tool_call_id or ""),
+                        "execution_agent_id": str(target.id),
+                        "target_agent_id": str(target.id),
+                        "target_name": target.name,
+                    },
+                )
+                outbound_a2a_message = ingested.message
+                outbound_a2a_message.sender_user_id = None
+                outbound_a2a_message.sender_agent_id = from_agent_id
+                chat_session.last_message_at = datetime.now(timezone.utc)
+                if ingested.consumed_by_onmessage:
+                    await db.commit()
+                    inbox_mode = dict(
+                        outbound_a2a_message.message_meta or {}
+                    ).get("turn_inbox_mode")
+                    return (
+                        f"✅ Message to {target.name} was "
+                        + (
+                            "merged into the current durable conversation turn."
+                            if inbox_mode == "current_turn"
+                            else "queued for the next durable conversation turn."
+                        )
+                    )
+            elif outbound_a2a_message is None:
                 outbound_a2a_message = ChatMessage(
                     id=uuid.uuid4(),
                     agent_id=session_agent_id,
@@ -13565,6 +13619,11 @@ async def _send_message_to_agent(
                         "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
                         "tool_call_id": str(tool_call_id or ""),
                         "actor_ref": str(tgt_participant.id if tgt_participant else target.id),
+                        **(
+                            {"execution_agent_id": str(target.id)}
+                            if msg_type == "consult" and project_id is None
+                            else {}
+                        ),
                         "target_agent_id": str(target.id),
                         "target_name": target.name,
                         "work_item_id": str(work_item_id) if work_item_id else None,
@@ -13581,6 +13640,8 @@ async def _send_message_to_agent(
                     session_id=session_id,
                     message_id=outbound_a2a_message.id,
                 )
+                if project_id is None:
+                    recoverable_anchor = outbound_a2a_message
             else:
                 await db.commit()
 
@@ -13842,6 +13903,19 @@ async def _send_message_to_agent(
             async def _a2a_on_thinking(text: str):
                 _a2a_thinking.append(text)
 
+            from app.services.subagent_runtime import (
+                build_parent_subagent_before_round,
+            )
+
+            before_round = build_parent_subagent_before_round(
+                parent_session_id=session_id,
+                active_turn_anchor_id=outbound_a2a_message.id,
+                execution_agent_id=target.id,
+                execution_user_id=owner_id,
+                turn_anchor_agent_id=session_agent_id,
+                include_turn_inbox=True,
+            )
+
             # 4) Run target via the unified, failover-aware loop. NO outer wait_for.
             #    agent_id=target.id so build_agent_context loads the right soul/system
             #    prompt; tool calls are stored under session_agent_id via _a2a_persist.
@@ -13859,6 +13933,7 @@ async def _send_message_to_agent(
                 turn_anchor_id=outbound_a2a_message.id,
                 turn_anchor_agent_id=session_agent_id,
                 context_recovery=_a2a_context_recovery,
+                before_round=before_round,
             )
 
             if not target_reply:
@@ -13871,33 +13946,33 @@ async def _send_message_to_agent(
                 )
                 tgt_part = part_r.scalar_one_or_none()
                 from app.services.chat_history import (
-                    cap_thinking,
-                    lock_turn_anchor_for_finalization,
+                    persist_assistant_reply_row,
                 )
 
-                await lock_turn_anchor_for_finalization(
+                assistant_message_id = await persist_assistant_reply_row(
                     db2,
                     agent_id=session_agent_id,
+                    user_id=owner_id,
                     conversation_id=session_id,
+                    content=target_reply,
                     turn_anchor_id=outbound_a2a_message.id,
-                )
-                db2.add(
-                    ChatMessage(
-                        agent_id=session_agent_id,
-                        user_id=owner_id,
-                        sender_agent_id=target.id,
-                        role="assistant",
-                        content=target_reply,
-                        conversation_id=session_id,
-                        participant_id=tgt_part.id if tgt_part else None,
-                        thinking=cap_thinking("".join(_a2a_thinking)),
-                        message_meta={
-                            "turn_anchor_id": str(outbound_a2a_message.id),
-                            "turn_status": "completed",
-                        },
-                    )
+                    sender_agent_id=target.id,
+                    participant_id=tgt_part.id if tgt_part else None,
+                    thinking="".join(_a2a_thinking),
                 )
                 await db2.commit()
+
+            from app.services.conversation_turn_lifecycle import (
+                publish_committed_turn_terminal,
+            )
+
+            await publish_committed_turn_terminal(
+                agent_id=session_agent_id,
+                conversation_id=session_id,
+                turn_anchor_id=outbound_a2a_message.id,
+                message_id=assistant_message_id,
+                content=target_reply,
+            )
 
             # Log activity
             from app.services.activity_logger import log_activity
@@ -13918,6 +13993,12 @@ async def _send_message_to_agent(
             return f"💬 {target.name} replied:\n{target_reply}"
 
     except Exception as e:
+        from app.services.redis_lease_lock import RedisLeaseError
+
+        if recoverable_anchor is not None and isinstance(e, RedisLeaseError):
+            from app.services.turn_inbox import schedule_durable_turn_resume
+
+            schedule_durable_turn_resume(recoverable_anchor)
         logger.exception(f"[A2A] send_message_to_agent failed: from={from_agent_id}, to={args.get('agent_id', '')}")
         error_type = type(e).__name__
         error_detail = (str(e) or "").strip()

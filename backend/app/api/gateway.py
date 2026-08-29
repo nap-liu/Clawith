@@ -506,10 +506,54 @@ async def _run_gateway_native_turn_with_lease(
 ) -> None:
     """Keep an already-admitted permit for exactly one native Gateway turn."""
 
+    recovery_anchor = None
     try:
-        await _send_to_agent_background(*args)
+        recovery_anchor = await _send_to_agent_background(*args)
     finally:
         await lease.release()
+    if recovery_anchor is not None:
+        _schedule_gateway_turn_recovery(recovery_anchor)
+
+
+async def _recover_gateway_turn(anchor) -> None:
+    """Retry an accepted durable Gateway turn after its capacity lease exits."""
+    from app.services.redis_lease_lock import RedisLeaseError
+    from app.services.turn_recovery import resume_turn
+
+    for delay in (0, 0.25, 1, 4, 10):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            if await resume_turn(anchor):
+                return
+        except asyncio.CancelledError:
+            raise
+        except RedisLeaseError as exc:
+            logger.warning(
+                "[Gateway] durable turn lease retry anchor={} delay={}: {}",
+                anchor.id,
+                delay,
+                exc,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "[Gateway] durable turn retry failed anchor={} delay={}",
+                anchor.id,
+                delay,
+            )
+    logger.error(
+        "[Gateway] durable turn remains recoverable after local retries anchor={}",
+        anchor.id,
+    )
+
+
+def _schedule_gateway_turn_recovery(anchor) -> None:
+    task = asyncio.create_task(
+        _recover_gateway_turn(anchor),
+        name=f"gateway-turn-recovery:{anchor.id}",
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def _send_to_agent_background(
@@ -529,6 +573,7 @@ async def _send_to_agent_background(
     since this runs after the request's DB session has closed.
     """
     logger.info(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
+    recovery_anchor = None
     try:
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
@@ -566,18 +611,23 @@ async def _send_to_agent_background(
             if not session:
                 from datetime import datetime, timezone
 
-                session = ChatSession(
-                    id=session_uuid,
-                    agent_id=session_agent_id,
-                    user_id=target_creator_id,
-                    title=f"{source_agent_name} ↔ {target_agent_name}",
-                    source_channel="agent",
-                    peer_agent_id=session_peer_id,
-                    created_at=datetime.now(timezone.utc),
+                await db.execute(
+                    pg_insert(ChatSession)
+                    .values(
+                        id=session_uuid,
+                        agent_id=uuid.UUID(str(session_agent_id)),
+                        user_id=uuid.UUID(str(target_creator_id)),
+                        title=f"{source_agent_name} ↔ {target_agent_name}",
+                        source_channel="agent",
+                        peer_agent_id=uuid.UUID(str(session_peer_id)),
+                        created_at=datetime.now(timezone.utc),
+                    )
+                    .on_conflict_do_nothing(index_elements=["id"])
                 )
-                db.add(session)
                 await db.commit()
-                await db.refresh(session)
+                session = await db.get(ChatSession, session_uuid)
+                if session is None:
+                    raise RuntimeError("gateway A2A session was not persisted")
 
                 # Migrate any existing messages from old gw_agent_ format
                 old_conv_id = f"gw_agent_{source_agent_id}_{target_agent_id}"
@@ -589,6 +639,36 @@ async def _send_to_agent_background(
                     .values(conversation_id=conv_id)
                 )
                 await db.commit()
+
+            expected_pair = {
+                uuid.UUID(str(source_agent_id)),
+                uuid.UUID(str(target_agent_id)),
+            }
+            session_pair = {session.agent_id, session.peer_agent_id}
+            tenant_rows = list(
+                (
+                    await db.execute(
+                        select(Agent.id, Agent.tenant_id).where(
+                            Agent.id.in_(expected_pair)
+                        )
+                    )
+                ).all()
+            )
+            if (
+                session.source_channel != "agent"
+                or session_pair != expected_pair
+                or len(tenant_rows) != 2
+                or len({tenant_id for _agent_id, tenant_id in tenant_rows}) != 1
+            ):
+                raise RuntimeError("gateway A2A session identity mismatch")
+
+            storage_agent_id = uuid.UUID(str(session.agent_id))
+            execution_agent_id = uuid.UUID(str(target_agent_id))
+            execution_user_id = uuid.UUID(str(target_creator_id))
+            gateway_reply_id = _uuid.uuid5(
+                _ns,
+                f"gateway-direct-reply:{source_event_id}",
+            )
 
             # Update last_message_at
             from datetime import datetime, timezone
@@ -639,18 +719,27 @@ async def _send_to_agent_background(
             ingested = await ingest_incoming_chat_message(
                 db,
                 session=session,
-                agent_id=uuid.UUID(str(target_agent_id)),
-                user_id=uuid.UUID(str(target_creator_id)),
+                agent_id=storage_agent_id,
+                user_id=execution_user_id,
                 content=user_msg,
                 source_channel="agent",
                 provider_event_id=source_event_id,
                 channel_config_id="gateway-direct",
                 actor_ref=str(src_participant.id if src_participant else source_agent_id),
                 participant_id=src_participant.id if src_participant else None,
+                message_meta={
+                    "execution_agent_id": str(execution_agent_id),
+                    "gateway_direct_reply": {
+                        "message_id": str(gateway_reply_id),
+                        "agent_id": str(source_agent_id),
+                        "sender_agent_id": str(execution_agent_id),
+                    },
+                },
             )
             ingested.message.sender_user_id = None
             ingested.message.sender_agent_id = uuid.UUID(str(source_agent_id))
             await db.commit()
+            recovery_anchor = ingested.message
 
             if ingested.consumed_by_onmessage:
                 logger.info("[Gateway] Direct A2A event %s routed to on_message", source_event_id)
@@ -662,6 +751,17 @@ async def _send_to_agent_background(
         async def on_chunk(text):
             collected.append(text)
 
+        from app.services.subagent_runtime import build_parent_subagent_before_round
+
+        before_round = build_parent_subagent_before_round(
+            parent_session_id=conv_id,
+            active_turn_anchor_id=ingested.message.id,
+            execution_agent_id=execution_agent_id,
+            execution_user_id=execution_user_id,
+            turn_anchor_agent_id=storage_agent_id,
+            include_turn_inbox=True,
+        )
+
         reply = await call_llm(
             model=model,
             messages=messages,
@@ -672,59 +772,74 @@ async def _send_to_agent_background(
             session_id=conv_id,
             on_chunk=on_chunk,
             turn_anchor_id=ingested.message.id,
+            turn_anchor_agent_id=storage_agent_id,
             turn_type="gateway",
+            before_round=before_round,
         )
         final_reply = reply or "".join(collected)
 
         # Save assistant reply to conversation
         async with async_session() as db:
             from app.models.participant import Participant
-            from app.services.chat_history import lock_turn_anchor_for_finalization
+            from app.services.chat_history import persist_assistant_reply_row
 
             tgt_part_r = await db.execute(
                 select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id)
             )
             tgt_participant = tgt_part_r.scalar_one_or_none()
-            await lock_turn_anchor_for_finalization(
+            assistant_message_id = await persist_assistant_reply_row(
                 db,
-                agent_id=uuid.UUID(str(target_agent_id)),
+                agent_id=storage_agent_id,
+                user_id=execution_user_id,
                 conversation_id=conv_id,
-                turn_anchor_id=ingested.message.id,
-            )
-
-            reply_row = ChatMessage(
-                agent_id=target_agent_id,
-                conversation_id=conv_id,
-                role="assistant",
                 content=final_reply,
-                user_id=target_creator_id,
-                sender_agent_id=uuid.UUID(str(target_agent_id)),
-                participant_id=tgt_participant.id if tgt_participant else None,
-                external_event_key=f"gateway-direct-reply:{source_event_id}",
+                turn_anchor_id=ingested.message.id,
+                sender_agent_id=execution_agent_id,
+                message_id=gateway_reply_id,
                 message_meta={
                     "direction": "inbound",
                     "source_channel": "agent",
-                    "actor_ref": str(tgt_participant.id if tgt_participant else target_agent_id),
-                    "turn_anchor_id": str(ingested.message.id),
-                    "turn_status": "completed",
+                    "actor_ref": str(
+                        tgt_participant.id if tgt_participant else target_agent_id
+                    ),
                 },
             )
-            db.add(reply_row)
-            await db.flush()
+            reply_row = await db.get(ChatMessage, assistant_message_id)
+            if reply_row is None:
+                raise RuntimeError("gateway direct reply row was not persisted")
+            reply_row.participant_id = (
+                tgt_participant.id if tgt_participant else None
+            )
             from app.services.trigger_runtime.evaluator import match_incoming_chat_message
 
             await match_incoming_chat_message(db, reply_row, session)
 
             # Write reply to gateway_messages for source (OpenClaw) to poll
-            gw_reply = GatewayMessage(
-                agent_id=source_agent_id,
-                sender_agent_id=target_agent_id,
-                content=final_reply,
-                status="pending",
-                conversation_id=conv_id,
+            await db.execute(
+                pg_insert(GatewayMessage)
+                .values(
+                    id=gateway_reply_id,
+                    agent_id=uuid.UUID(str(source_agent_id)),
+                    sender_agent_id=execution_agent_id,
+                    content=final_reply,
+                    status="pending",
+                    conversation_id=conv_id,
+                )
+                .on_conflict_do_nothing(index_elements=["id"])
             )
-            db.add(gw_reply)
             await db.commit()
+
+        from app.services.conversation_turn_lifecycle import (
+            publish_committed_turn_terminal,
+        )
+
+        await publish_committed_turn_terminal(
+            agent_id=storage_agent_id,
+            conversation_id=conv_id,
+            turn_anchor_id=ingested.message.id,
+            message_id=assistant_message_id,
+            content=final_reply,
+        )
 
         logger.info(f"[Gateway] Agent {target_agent_name} replied to {source_agent_name}")
 
@@ -733,6 +848,9 @@ async def _send_to_agent_background(
         import traceback
 
         traceback.print_exc()
+        if recovery_anchor is not None:
+            return recovery_anchor
+    return None
 
 
 @router.post("/send-message")

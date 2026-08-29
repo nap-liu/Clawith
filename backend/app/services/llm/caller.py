@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
+from app.services.conversation_execution_lock import serialize_conversation_execution
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
 # import: agent_tools → llm/__init__ → caller → agent_tools
@@ -1501,6 +1502,7 @@ async def _process_tool_call(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@serialize_conversation_execution
 async def call_llm(
     model: LLMModel,
     messages: list[dict],
@@ -2606,6 +2608,7 @@ async def call_llm(
     return "[Error] Too many tool call rounds"
 
 
+@serialize_conversation_execution
 async def call_llm_with_failover(
     primary_model,
     fallback_model,
