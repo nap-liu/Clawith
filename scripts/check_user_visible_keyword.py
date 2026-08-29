@@ -103,6 +103,11 @@ ALLOWANCES = (
         "Provenance records an immutable historical filename.",
     ),
     _allow(
+        r"\.agents/runbooks/production_release\.md",
+        rf"{_legacy}_project_legacy",
+        "The legacy rollback database role is an operator-only compatibility identifier.",
+    ),
+    _allow(
         r"backend/app/config\.py",
         rf"(?:\.{_legacy}|postgresql\+asyncpg://{_legacy}|{_legacy}_network)",
         "Filesystem, database credential defaults, and Docker network names are deployment identifiers.",
@@ -116,6 +121,11 @@ ALLOWANCES = (
         r"backend/app/(?:core/token_cache\.py|services/(?:auth_provider|feishu_service|org_sync_adapter|dingtalk_token|webhook_security|toolscall/runtime)\.py|api/(?:wecom|teams)\.py)",
         rf"{_legacy}[:.-]",
         "Redis and idempotency key namespaces must remain readable across rolling upgrades.",
+    ),
+    _allow(
+        r"backend/app/api/websocket\.py",
+        rf"{_legacy}:project-subagent-web",
+        "The project WebSocket Redis namespace is an internal rolling-upgrade contract.",
     ),
     _allow(
         r"backend/app/services/agent_tools\.py",
@@ -138,6 +148,31 @@ ALLOWANCES = (
         "Container labels/names and stripped transport-header names are operational compatibility contracts.",
     ),
     _allow(
+        r"backend/app/services/project_git_service\.py",
+        rf"(?:{_legacy}(?: project)?|\.{_legacy}-(?:clone|write)-|{_legacy}-project-sandboxes|{_legacy}-Milestone-Operation)",
+        "Project repositories retain historical author aliases, trailers, and internal staging-path prefixes.",
+    ),
+    _allow(
+        r"backend/app/services/project_template_snapshot\.py",
+        rf"{_legacy}-project-template-",
+        "Template export uses an internal temporary-directory prefix.",
+    ),
+    _allow(
+        r"backend/app/services/redis_lease_lock\.py",
+        rf"{_legacy}:",
+        "Distributed lease keys retain their rolling-upgrade namespace.",
+    ),
+    _allow(
+        r"backend/app/services/sandbox/local/docker_backend\.py",
+        rf"{_legacy}_IMAGE_MIRROR",
+        "The sandbox registry environment variable is an operator contract.",
+    ),
+    _allow(
+        r"backend/app/services/workload_capacity\.py",
+        rf"{_legacy}_workload_capacity_",
+        "Prometheus metric names are monitoring compatibility contracts.",
+    ),
+    _allow(
         r"backend/app/(?:core/logging_config\.py|api/upload\.py|services/cli_tools/state_storage\.py)",
         rf"{_legacy}",
         "Log, upload, and runtime-user paths preserve existing deployment ownership and storage.",
@@ -156,6 +191,26 @@ ALLOWANCES = (
         r"backend/app/scripts/(?:backfill_department_paths|cleanup_duplicate_feishu_users)\.py",
         rf"{_legacy}-backend-1",
         "Historical operator examples retain the deployed container name.",
+    ),
+    _allow(
+        r"backend/app/scripts/project_legacy_rollback\.py",
+        rf"{_legacy}_(?:project_legacy|legacy_is_project_agent)",
+        "The reversible project rollback role, lock, and classifier names are database compatibility contracts.",
+    ),
+    _allow(
+        r"frontend/src/features/projects/ProjectWorkspacePage\.tsx",
+        rf"{_legacy}(?: project)?",
+        "Historical Git author aliases are normalized before rendering.",
+    ),
+    _allow(
+        r"frontend/src/features/projects/components/ProjectCodeEditor\.tsx",
+        rf"(?:define{_legacy}Theme|{_legacy}-)",
+        "Monaco theme IDs are internal editor registration keys.",
+    ),
+    _allow(
+        r"frontend/src/features/projects/projectUserFacingCopy\.ts",
+        rf"{_legacy}",
+        "The dynamic-copy sanitizer matches and replaces the legacy keyword before rendering.",
     ),
 )
 
