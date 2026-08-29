@@ -1,5 +1,5 @@
 ARG CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io
-FROM ${CLAWITH_IMAGE_MIRROR}/library/node:20-alpine AS build
+FROM --platform=$BUILDPLATFORM ${CLAWITH_IMAGE_MIRROR}/library/node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --registry https://registry.npmmirror.com
