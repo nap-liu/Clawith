@@ -15,6 +15,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
@@ -809,6 +810,239 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
         )
     ).scalar_one_or_none()
     assert detached_row is None
+
+
+async def test_project_private_mcp_credential_is_referenced_only_for_its_creator_and_not_exported(
+    project_api: ProjectApiEnv,
+):
+    from app.models.mcp_server import MCPServerOverride
+    from app.services.mcp_server_service import (
+        lookup_overrides,
+        lookup_project_source_tool_config,
+    )
+    from app.services.project_agent_template_service import export_project_capabilities_for_template
+
+    env = project_api
+    server = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"private-project-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Private project MCP",
+        base_url_template="https://private.project.test/mcp",
+        headers_template={},
+        created_by_user_id=env.owner_id,
+    )
+    env.db.add(server)
+    await env.db.flush()
+    tool = Tool(
+        name=f"private_project_mcp_tool_{uuid.uuid4().hex[:8]}",
+        display_name="Private project MCP tool",
+        description="Private source tool",
+        type="mcp",
+        category="general",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        is_default=False,
+        source="admin",
+        tenant_id=env.tenant_id,
+        mcp_server_id=server.id,
+        mcp_server_name=server.display_name,
+        mcp_tool_name="private_action",
+    )
+    env.db.add(tool)
+    await env.db.flush()
+    env.db.add_all(
+        [
+            AgentTool(
+                agent_id=env.source_leader_id,
+                tool_id=tool.id,
+                enabled=True,
+                config={"api_key": "private-agent-tool-secret"},
+                source="user_installed",
+                installed_by_agent_id=env.source_leader_id,
+            ),
+            MCPServerOverride(
+                mcp_server_id=server.id,
+                scope_type="agent",
+                scope_id=env.source_leader_id,
+                credential_template="private-source-secret",
+                headers_template={"Authorization": "Bearer private-source-secret"},
+                last_modified_by_user_id=env.owner_id,
+            ),
+        ]
+    )
+    await env.db.commit()
+
+    created = await env.client.post(
+        "/api/projects",
+        json={
+            "name": "Private MCP reference",
+            "members": [
+                {
+                    "agent_id": str(env.source_leader_id),
+                    "is_leader": True,
+                    "settings": {
+                        "tools": [
+                            {
+                                "tool_id": str(tool.id),
+                                "enabled": True,
+                                "config": {
+                                    "scope": "project-only",
+                                    "api_key": "submitted-project-secret",
+                                    "token": "submitted-token",
+                                    "auth": "submitted-auth",
+                                    "headers": {"Authorization": "submitted-header-secret"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    project_id = uuid.UUID(created.json()["id"])
+    project = await env.db.get(Project, project_id)
+    member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(ProjectMemberSnapshot.project_id == project_id)
+        )
+    ).scalar_one()
+    project_override = (
+        await env.db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == server.id,
+                MCPServerOverride.scope_type == "agent",
+                MCPServerOverride.scope_id == member.agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    assert project_override is None
+    project_assignment = (
+        await env.db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == member.agent_id,
+                AgentTool.tool_id == tool.id,
+            )
+        )
+    ).scalar_one()
+    assert project_assignment.config == {"scope": "project-only"}
+    assert await lookup_project_source_tool_config(
+        env.db,
+        project_agent_id=member.agent_id,
+        tool_id=tool.id,
+        execution_user_id=env.owner_id,
+    ) == {"api_key": "private-agent-tool-secret"}
+    assert await lookup_project_source_tool_config(
+        env.db,
+        project_agent_id=member.agent_id,
+        tool_id=tool.id,
+        execution_user_id=env.viewer_id,
+    ) == {}
+    env.db.add(
+        MCPServerOverride(
+            mcp_server_id=server.id,
+            scope_type="agent",
+            scope_id=member.agent_id,
+            credential_template="legacy-copied-secret",
+            headers_template={"Authorization": "Bearer legacy-copied-secret"},
+            last_modified_by_user_id=env.owner_id,
+        )
+    )
+    await env.db.commit()
+
+    _tenant_override, creator_override = await lookup_overrides(
+        env.db,
+        server.id,
+        env.tenant_id,
+        member.agent_id,
+        execution_user_id=env.owner_id,
+        allow_project_source_reference=True,
+    )
+    assert creator_override is not None
+    assert creator_override.scope_id == env.source_leader_id
+    assert creator_override.credential_template == "private-source-secret"
+
+    _tenant_override, other_override = await lookup_overrides(
+        env.db,
+        server.id,
+        env.tenant_id,
+        member.agent_id,
+        execution_user_id=env.viewer_id,
+        allow_project_source_reference=True,
+    )
+    assert other_override is None
+
+    exported = await export_project_capabilities_for_template(env.db, project)
+    assert any(item.get("capability_id") == str(server.id) for item in exported)
+    assert "private-source-secret" not in json.dumps(exported, ensure_ascii=False)
+    assert "legacy-copied-secret" not in json.dumps(exported, ensure_ascii=False)
+    assert "private-agent-tool-secret" not in json.dumps(exported, ensure_ascii=False)
+    assert "submitted-project-secret" not in json.dumps(exported, ensure_ascii=False)
+
+
+async def test_project_rejects_copying_private_mcp_credentials(project_api: ProjectApiEnv):
+    env = project_api
+    server = MCPServer(
+        tenant_id=env.tenant_id,
+        name=f"private-copy-mcp-{uuid.uuid4().hex[:8]}",
+        display_name="Private copy MCP",
+        base_url_template="https://private-copy.project.test/mcp",
+        headers_template={},
+        created_by_user_id=env.owner_id,
+    )
+    env.db.add(server)
+    await env.db.flush()
+    tool = Tool(
+        name=f"private_copy_mcp_tool_{uuid.uuid4().hex[:8]}",
+        display_name="Private copy MCP tool",
+        description="Private source tool",
+        type="mcp",
+        category="general",
+        parameters_schema={"type": "object", "properties": {}},
+        enabled=True,
+        is_default=False,
+        source="agent",
+        tenant_id=env.tenant_id,
+        mcp_server_id=server.id,
+        mcp_server_name=server.display_name,
+        mcp_tool_name="private_copy_action",
+    )
+    env.db.add(tool)
+    await env.db.flush()
+    env.db.add(
+        AgentTool(
+            agent_id=env.source_leader_id,
+            tool_id=tool.id,
+            enabled=True,
+            source="user_installed",
+            installed_by_agent_id=env.source_leader_id,
+        )
+    )
+    await env.db.commit()
+
+    response = await env.client.post(
+        "/api/projects",
+        json={
+            "name": "Reject private MCP copy",
+            "members": [
+                {
+                    "agent_id": str(env.source_leader_id),
+                    "is_leader": True,
+                    "settings": {
+                        "tools": [{"tool_id": str(tool.id), "enabled": True, "config": {}}],
+                        "mcp_server_overrides": [
+                            {
+                                "server_id": str(server.id),
+                                "credential_template": "must-not-copy",
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "cannot be copied" in response.json()["detail"]
 
 
 async def test_project_capability_options_are_the_create_authorization_boundary(
@@ -3390,12 +3624,16 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
             execution_user_id=env.owner_id,
         )
     }
-    assert {"project_write_file", "project_update_work_item", "project_message_agent"} <= tool_names
+    assert {"write_file", "project_update_work_item", "project_message_agent"} <= tool_names
 
     write_result = json.loads(
-        await project_runtime_tools.execute_project_runtime_tool(
-            "project_write_file",
-            {"path": "docs/a2a-evidence.md", "content": "# Exact A2A evidence\n"},
+        await project_runtime_tools.execute_project_workspace_tool(
+            "write_file",
+            {
+                "workspace": "project",
+                "path": "docs/a2a-evidence.md",
+                "content": "# Exact A2A evidence\n",
+            },
             agent_id=env.worker_id,
             execution_user_id=env.owner_id,
             session_id=str(child_id),
@@ -3575,9 +3813,9 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
                 role="tool_call",
                 content=json.dumps(
                     {
-                        "name": "project_write_file",
+                        "name": "write_file",
                         "call_id": "worker-write-a2a-evidence",
-                        "args": {"path": "docs/a2a-evidence.md"},
+                        "args": {"workspace": "project", "path": "docs/a2a-evidence.md"},
                         "status": "done",
                         "result": write_result,
                     }
@@ -6191,6 +6429,502 @@ async def test_leader_reply_batch_is_bounded_and_causally_isolated() -> None:
     assert len(truncated.encode("utf-8")) <= PROJECT_LEADER_BATCH_MAX_BYTES
 
 
+async def test_project_standard_file_tools_use_shared_git_without_project_specific_size_limits(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.services.agent_runtime_workspace import (
+        bind_agent_runtime_workspace,
+        project_agent_runtime_workspace,
+    )
+    from app.services.agent_tools import execute_tool
+
+    env = project_api
+    project = await _create_project(env, name="Standard project files")
+    project_id = project["id"]
+    await _mark_project_running(env, project_id)
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    wake = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Prepare project files", "mentions": [str(env.worker_id)]},
+    )
+    assert wake.status_code == 201, wake.text
+    child_id = next(
+        row["session_id"]
+        for row in wake.json()["subagent_runs"]
+        if row["agent_id"] == str(env.worker_id)
+    )
+    runtime_workspace = project_agent_runtime_workspace(
+        agent_id=env.worker_id,
+        tenant_id=env.tenant_id,
+        project_id=uuid.UUID(project_id),
+    )
+
+    with bind_agent_runtime_workspace(runtime_workspace):
+        missing_workspace = await execute_tool(
+            "list_files",
+            {"path": ""},
+            env.worker_id,
+            env.owner_id,
+            session_id=child_id,
+            tool_call_id="project-file-missing-workspace",
+            skip_autonomy=True,
+        )
+    assert "require workspace='agent' or workspace='project'" in missing_workspace
+
+    async def run(tool_name: str, arguments: dict[str, Any], *, workspace: str = "project") -> str:
+        with bind_agent_runtime_workspace(runtime_workspace):
+            return await execute_tool(
+                tool_name,
+                {"workspace": workspace, **arguments},
+                env.worker_id,
+                env.owner_id,
+                session_id=child_id,
+                tool_call_id=f"project-file-{tool_name}-{uuid.uuid4().hex[:8]}",
+                skip_autonomy=True,
+            )
+
+    repo = project_repo_path(env.tenant_id, uuid.UUID(project_id))
+    head_before_workspace_reads = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    async def deny_project_write(*_args, **_kwargs):
+        return {"allowed": False, "level": "L2", "message": "project write denied"}
+
+    from app.services.autonomy_service import autonomy_service
+
+    monkeypatch.setattr(autonomy_service, "check_and_enforce", deny_project_write)
+    with bind_agent_runtime_workspace(runtime_workspace):
+        denied_by_autonomy = await execute_tool(
+            "write_file",
+            {"workspace": "project", "path": "blocked.txt", "content": "must not exist"},
+            env.worker_id,
+            env.owner_id,
+            session_id=child_id,
+            tool_call_id="project-file-autonomy-denied",
+        )
+    assert "project write denied" in denied_by_autonomy
+    assert not (repo / "blocked.txt").exists()
+
+    private_listing = await run("list_files", {"path": ""}, workspace="agent")
+    assert "PROJECT.json" not in private_listing
+    project_root = await run("list_files", {"path": ""})
+    assert "PROJECT.json" in project_root
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == head_before_workspace_reads
+
+    large_content = "project file content\n" + ("x" * (1024 * 1024 + 1))
+    written = json.loads(
+        await run("write_file", {"path": "docs/result.txt", "content": large_content})
+    )
+    assert written["operation"] == "write_file"
+    assert written["path"] == "docs/result.txt"
+
+    listed = await run("list_files", {"path": "docs"})
+    assert "docs/result.txt" in listed
+    read = await run("read_file", {"path": "docs/result.txt", "offset": 0, "limit": 1})
+    assert "project file content" in read
+    searched = await run(
+        "search_files",
+        {"pattern": "project file content", "path": "docs", "file_pattern": "*.txt"},
+    )
+    assert "docs/result.txt:1" in searched
+    found = await run("find_files", {"pattern": "**/*.txt", "path": "."})
+    assert "docs/result.txt" in found
+
+    edited = json.loads(
+        await run(
+            "edit_file",
+            {
+                "path": "docs/result.txt",
+                "old_string": "project file content",
+                "new_string": "project file updated",
+            },
+        )
+    )
+    assert edited["replacements"] == 1
+    moved = json.loads(
+        await run(
+            "move_file",
+            {"source_path": "docs/result.txt", "destination_path": "deliverables/result.txt"},
+        )
+    )
+    assert moved["destination_path"] == "deliverables/result.txt"
+    deleted = json.loads(await run("delete_file", {"path": "deliverables"}))
+    assert deleted["operation"] == "delete_file"
+
+    denied = await run("write_file", {"path": ".agents/forbidden.txt", "content": "blocked"})
+    assert "project deliverables" in denied
+
+    stored = await env.db.get(Project, uuid.UUID(project_id))
+    assert stored.settings["git"]["head"] == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    committed_events = (
+        await env.db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.project_id == uuid.UUID(project_id),
+                ProjectEvent.event_type == "project.file.committed",
+            )
+        )
+    ).scalars().all()
+    assert len(committed_events) == 4
+
+    stored.status = "paused"
+    await env.db.commit()
+    paused_write = await run("write_file", {"path": "paused.txt", "content": "blocked"})
+    assert "only while the project is running" in paused_write
+    assert not (repo / "paused.txt").exists()
+
+
+async def test_approved_project_tool_resumes_with_the_original_project_workspace(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import app.database as database
+    from app.services import agent_tools
+    from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+    from app.services.autonomy_service import autonomy_service
+
+    env = project_api
+    project = await _create_project(env, name="Approved project workspace")
+    project_id = uuid.UUID(project["id"])
+    session = ChatSession(
+        project_id=project_id,
+        agent_id=env.worker_id,
+        user_id=env.owner_id,
+        title="Approved project action",
+        source_channel="project",
+        external_conv_id=f"approval-{uuid.uuid4()}",
+    )
+    env.db.add(session)
+    await env.db.commit()
+
+    observed: dict[str, Any] = {}
+
+    async def observe_execute_tool(
+        _tool_name: str,
+        _arguments: dict[str, Any],
+        agent_id: uuid.UUID,
+        **_kwargs: Any,
+    ) -> str:
+        workspace = current_agent_runtime_workspace(agent_id)
+        observed["agent_id"] = workspace.agent_id
+        observed["project_id"] = workspace.project_id
+        observed["is_project"] = workspace.is_project
+        return "approved project tool executed"
+
+    monkeypatch.setattr(database, "async_session", env.session_factory)
+    monkeypatch.setattr(agent_tools, "execute_tool", observe_execute_tool)
+    result = await autonomy_service._execute_approved_action(
+        env.worker_id,
+        "write_workspace_files",
+        {
+            "tool": "write_file",
+            "args": {"workspace": "project", "path": "approved.txt", "content": "ok"},
+            "requested_by": str(env.owner_id),
+            "session_id": str(session.id),
+            "tool_call_id": "approved-project-write",
+        },
+        env.owner_id,
+    )
+
+    assert result == "approved project tool executed"
+    assert observed == {
+        "agent_id": env.worker_id,
+        "project_id": project_id,
+        "is_project": True,
+    }
+    assert await autonomy_service._execute_approved_action(
+        env.worker_id,
+        "write_workspace_files",
+        {
+            "tool": "write_file",
+            "args": {"workspace": "project", "path": "invalid.txt", "content": "blocked"},
+            "session_id": str(session.id),
+        },
+        env.owner_id,
+    ) == "Execution failed: approval has no valid original requester"
+
+
+async def test_project_structured_readers_and_isolated_sandbox_share_the_project_repository(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from docx import Document
+
+    from app.services import agent_tools
+    from app.services.agent_runtime_workspace import (
+        bind_agent_runtime_workspace,
+        project_agent_runtime_workspace,
+    )
+    from app.services.tools import read_image as read_image_tool
+
+    env = project_api
+    project = await _create_project(env, name="Structured project workspace")
+    project_id = uuid.UUID(project["id"])
+    await _mark_project_running(env, project_id)
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    wake = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Inspect and update project files", "mentions": [str(env.worker_id)]},
+    )
+    assert wake.status_code == 201, wake.text
+    child_id = next(
+        row["session_id"]
+        for row in wake.json()["subagent_runs"]
+        if row["agent_id"] == str(env.worker_id)
+    )
+    runtime_workspace = project_agent_runtime_workspace(
+        agent_id=env.worker_id,
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+    )
+    repo = project_repo_path(env.tenant_id, project_id)
+    (repo / "docs").mkdir(exist_ok=True)
+    document = Document()
+    document.add_paragraph("Project document content")
+    document.save(repo / "docs" / "brief.docx")
+    (repo / "assets").mkdir(exist_ok=True)
+    (repo / "assets" / "diagram.png").write_bytes(b"project-image-marker")
+    (repo / "sandbox-delete.txt").write_text("remove me\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "--",
+            "docs/brief.docx",
+            "assets/diagram.png",
+            "sandbox-delete.txt",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Project test",
+            "-c",
+            "user.email=project@test.invalid",
+            "commit",
+            "-m",
+            "Add structured project inputs",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    async def run(tool_name: str, arguments: dict[str, Any]) -> str:
+        with bind_agent_runtime_workspace(runtime_workspace):
+            return await agent_tools.execute_tool(
+                tool_name,
+                {"workspace": "project", **arguments},
+                env.worker_id,
+                env.owner_id,
+                session_id=child_id,
+                tool_call_id=f"project-{tool_name}-{uuid.uuid4().hex[:8]}",
+                skip_autonomy=True,
+            )
+
+    document_result = await run("read_document", {"path": "docs/brief.docx"})
+    assert "Project document content" in document_result
+
+    async def fake_read_image(agent_id, arguments, *, workspace_root=None):
+        assert agent_id == env.worker_id
+        assert workspace_root is not None
+        assert (workspace_root / "assets" / "diagram.png").read_bytes() == b"project-image-marker"
+        assert not (workspace_root / ".agents").exists()
+        assert not (workspace_root / ".git").exists()
+        return "project image read"
+
+    monkeypatch.setattr(read_image_tool, "handle_read_image", fake_read_image)
+    assert await run("read_image", {"image_paths": ["assets/diagram.png"]}) == "project image read"
+
+    async def fake_execute_code(_agent_id, _ws, _arguments, **kwargs):
+        sandbox_root = kwargs["work_dir_override"]
+        runtime_temp_root = kwargs["runtime_temp_path_override"]
+        assert runtime_temp_root.parent == sandbox_root.parent
+        assert runtime_temp_root != sandbox_root / ".tmp"
+        runtime_temp_root.mkdir(parents=True, exist_ok=True)
+        (runtime_temp_root / "runtime-only.txt").write_text("not a project file")
+        assert (sandbox_root / "PROJECT.json").is_file()
+        assert not (sandbox_root / ".agents").exists()
+        assert not (sandbox_root / ".git").exists()
+        if _arguments.get("code") == "create oversized output":
+            with (sandbox_root / "oversized.bin").open("wb") as oversized:
+                oversized.truncate(10 * 1024 * 1024 + 1)
+            return "oversized output created"
+        (sandbox_root / "sandbox").mkdir(exist_ok=True)
+        (sandbox_root / "sandbox" / "result.txt").write_text(
+            "sandbox project output\n",
+            encoding="utf-8",
+        )
+        (sandbox_root / "sandbox-delete.txt").unlink()
+        return "sandbox ok"
+
+    monkeypatch.setattr(agent_tools, "_execute_code", fake_execute_code)
+    sandbox_result = await run(
+        "execute_code",
+        {
+            "action": "execute",
+            "language": "python",
+            "code": "print('ok')",
+            "execution_mode": "foreground",
+        },
+    )
+    assert "sandbox ok" in sandbox_result
+    assert "sandbox_commit" in sandbox_result
+    assert (repo / "sandbox" / "result.txt").read_text(encoding="utf-8") == "sandbox project output\n"
+    assert not (repo / "sandbox-delete.txt").exists()
+    assert not (repo / ".tmp").exists()
+    assert not (repo / ".runtime-tmp").exists()
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+    sandbox_parent = Path(tempfile.gettempdir()) / "clawith-project-sandboxes"
+    assert not list(sandbox_parent.glob("project-code-*"))
+    assert not list(sandbox_parent.glob("project-read-*"))
+
+    oversized_result = await run(
+        "execute_code",
+        {
+            "action": "execute",
+            "language": "python",
+            "code": "create oversized output",
+            "execution_mode": "foreground",
+        },
+    )
+    assert "项目文件提交未完成" in oversized_result
+    assert not (repo / "oversized.bin").exists()
+
+    stored = await env.db.get(Project, project_id)
+    assert stored.settings["git"]["head"] == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    sandbox_events = (
+        await env.db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.project_id == project_id,
+                ProjectEvent.event_type == "project.file.committed",
+                ProjectEvent.event_metadata["operation"].astext == "sandbox_commit",
+            )
+        )
+    ).scalars().all()
+    assert len(sandbox_events) == 1
+
+
+async def test_project_uncertain_audit_resolution_preserves_only_reachable_commits(
+    project_api: ProjectApiEnv,
+):
+    from app.services.project_git_service import (
+        repository_state,
+        write_project_workspace_file,
+    )
+    from app.services.project_runtime_tools import _resolve_uncertain_project_file_audit
+    from app.services.project_service import add_event
+
+    env = project_api
+    created = await _create_project(env, name="Uncertain file audit")
+    project = await env.db.get(Project, uuid.UUID(created["id"]))
+    member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(ProjectMemberSnapshot.project_id == project.id)
+        )
+    ).scalars().first()
+    assert project is not None and member is not None
+
+    initial_head = (await repository_state(project))["head"]
+    exact = await write_project_workspace_file(project, "exact.txt", "exact\n")
+    assert await _resolve_uncertain_project_file_audit(
+        project,
+        previous_head=initial_head,
+        result=exact,
+        tool_call_id="exact-compensation",
+        member=member,
+        agent_id=member.agent_id,
+        project_run=None,
+        summary="exact compensation",
+        metadata={**exact, "tool_call_id": "exact-compensation"},
+    ) is False
+    assert (await repository_state(project))["head"] == initial_head
+
+    committed = await write_project_workspace_file(project, "committed.txt", "committed\n")
+    add_event(
+        env.db,
+        project,
+        "project.file.committed",
+        "already committed",
+        actor_agent_id=member.agent_id,
+        metadata={**committed, "tool_call_id": "ambiguous-success"},
+    )
+    await env.db.commit()
+    assert await _resolve_uncertain_project_file_audit(
+        project,
+        previous_head=initial_head,
+        result=committed,
+        tool_call_id="ambiguous-success",
+        member=member,
+        agent_id=member.agent_id,
+        project_run=None,
+        summary="already committed",
+        metadata={**committed, "tool_call_id": "ambiguous-success"},
+    ) is True
+    assert (await repository_state(project))["head"] == committed["commit"]
+
+    descendant_base = committed["commit"]
+    ancestor = await write_project_workspace_file(project, "ancestor.txt", "ancestor\n")
+    descendant = await write_project_workspace_file(project, "descendant.txt", "descendant\n")
+    assert await _resolve_uncertain_project_file_audit(
+        project,
+        previous_head=descendant_base,
+        result=ancestor,
+        tool_call_id="descendant-recovery",
+        member=member,
+        agent_id=member.agent_id,
+        project_run=None,
+        summary="descendant recovery",
+        metadata={**ancestor, "tool_call_id": "descendant-recovery"},
+    ) is True
+    assert (await repository_state(project))["head"] == descendant["commit"]
+    recovered = (
+        await env.db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.project_id == project.id,
+                ProjectEvent.event_metadata["tool_call_id"].astext == "descendant-recovery",
+            )
+        )
+    ).scalar_one()
+    assert recovered.event_metadata["audit_recovered"] is True
+    assert recovered.event_metadata["current_head"] == descendant["commit"]
+
+
 async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     project_api: ProjectApiEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -6208,18 +6942,19 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         "send_message_to_parent",
         "send_session_message",
     }
-    private_file_names = {
+    standard_file_names = {
         "delete_file",
         "edit_file",
         "find_files",
         "list_files",
         "move_file",
-        "read_document",
         "read_file",
-        "read_image",
         "search_files",
         "write_file",
     }
+    structured_read_names = {"read_document", "read_image"}
+    sandbox_names = {"execute_code", "execute_code_e2b", "execute_code_aio"}
+    project_sandbox_names = {"execute_code"}
 
     async def normal_tools_with_collaboration_bypasses(_agent_id, *, assignment_snapshot=None):
         return [
@@ -6231,7 +6966,12 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
-            for name in collaboration_bypass_names | private_file_names
+            for name in (
+                collaboration_bypass_names
+                | structured_read_names
+                | standard_file_names
+                | sandbox_names
+            )
         ]
 
     monkeypatch.setattr(
@@ -6279,14 +7019,12 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         next(row for row in leader_wake.json()["subagent_runs"] if row["agent_id"] == str(env.leader_id))["session_id"]
     )
 
-    worker_names = {
-        item["function"]["name"]
-        for item in await prepare_subagent_tools(
-            env.worker_id,
-            worker_child_id,
-            execution_user_id=env.owner_id,
-        )
-    }
+    worker_tools = await prepare_subagent_tools(
+        env.worker_id,
+        worker_child_id,
+        execution_user_id=env.owner_id,
+    )
+    worker_names = {item["function"]["name"] for item in worker_tools}
     leader_names = {
         item["function"]["name"]
         for item in await prepare_subagent_tools(
@@ -6295,15 +7033,29 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
             execution_user_id=env.owner_id,
         )
     }
-    assert {"project_get_context", "project_list_work_items", "project_list_files", "project_read_file"} <= worker_names
-    assert {"project_update_work_item", "project_write_file", "project_message_agent"} <= worker_names
+    assert {"project_get_context", "project_list_work_items", "project_update_work_item", "project_message_agent"} <= worker_names
+    assert {"project_list_files", "project_read_file", "project_write_file"}.isdisjoint(worker_names)
+    assert standard_file_names <= worker_names
+    for tool in worker_tools:
+        if tool["function"]["name"] not in (
+            standard_file_names | structured_read_names | project_sandbox_names
+        ):
+            continue
+        parameters = tool["function"]["parameters"]
+        assert "workspace" in parameters["required"]
+        assert parameters["properties"]["workspace"]["enum"] == ["agent", "project"]
     assert "project_create_work_item" not in worker_names
     assert "project_update_plan" not in worker_names
     assert "project_set_status" not in worker_names
     assert worker_names.isdisjoint(collaboration_bypass_names)
     assert leader_names.isdisjoint(collaboration_bypass_names)
-    assert worker_names.isdisjoint(private_file_names)
-    assert leader_names.isdisjoint(private_file_names)
+    assert structured_read_names | sandbox_names <= worker_names
+    assert structured_read_names | sandbox_names <= leader_names
+    e2b_tool = next(item for item in worker_tools if item["function"]["name"] == "execute_code_e2b")
+    assert "workspace" not in e2b_tool["function"]["parameters"].get("properties", {})
+    aio_tool = next(item for item in worker_tools if item["function"]["name"] == "execute_code_aio")
+    assert "workspace" not in aio_tool["function"]["parameters"].get("properties", {})
+    assert standard_file_names <= leader_names
     assert {
         "project_create_work_item",
         "project_update_plan",
@@ -6336,7 +7088,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
 
     settings_update = await env.client.patch(
         f"/api/projects/{project_id}/settings",
-        json={"policies": {"project_tools": {"participant_disabled": ["project_write_file"]}}},
+        json={"policies": {"project_tools": {"participant_disabled": ["project_message_agent"]}}},
     )
     members = (await env.client.get(f"/api/projects/{project_id}/members")).json()
     worker_member = next(item for item in members if item["agent_id"] == str(env.worker_id))
@@ -6345,7 +7097,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         json={
             "config_snapshot": {
                 **worker_member["config_snapshot"],
-                "disabled_project_tools": ["project_message_agent"],
+                "disabled_project_tools": ["project_update_work_item"],
             }
         },
     )
@@ -6358,8 +7110,8 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
             execution_user_id=env.owner_id,
         )
     }
-    assert "project_write_file" not in projected_names
-    assert "project_message_agent" in projected_names
+    assert "project_message_agent" not in projected_names
+    assert "project_update_work_item" in projected_names
     refreshed_wake = await env.client.post(
         f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
         json={"content": "Worker runtime after member policy change", "mentions": [str(env.worker_id)]},
@@ -6380,18 +7132,28 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
             execution_user_id=env.owner_id,
         )
     }
-    assert "project_write_file" not in refreshed_names
     assert "project_message_agent" not in refreshed_names
+    assert "project_update_work_item" not in refreshed_names
     with pytest.raises(ValueError, match="not allowed"):
         await execute_project_runtime_tool(
-            "project_write_file",
-            {"path": "docs/blocked.md", "content": "must not commit"},
+            "project_message_agent",
+            {},
             agent_id=env.worker_id,
             execution_user_id=env.owner_id,
             session_id=str(worker_child_id),
             tool_call_id="worker-policy-bypass",
             turn_anchor_id=None,
         )
+    restore_member_tools = await env.client.patch(
+        f"/api/projects/{project_id}/members/{worker_member['id']}",
+        json={
+            "config_snapshot": {
+                **worker_member["config_snapshot"],
+                "disabled_project_tools": [],
+            }
+        },
+    )
+    assert restore_member_tools.status_code == 200, restore_member_tools.text
 
     long_progress = "Implementation started: " + ("progress " * 100)
     long_evidence = [f"docs/progress-{index}.md:" + ("e" * 400) for index in range(8)]
@@ -6535,7 +7297,10 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from app.models.project import ProjectRun
-    from app.services.project_runtime_tools import execute_project_runtime_tool
+    from app.services.project_runtime_tools import (
+        execute_project_runtime_tool,
+        execute_project_workspace_tool,
+    )
 
     env = project_api
     project = await _create_project(env, name="Explicit trace contract")
@@ -6596,9 +7361,13 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
         turn_anchor_id=anchor_id,
     )
     write_result = json.loads(
-        await execute_project_runtime_tool(
-            "project_write_file",
-            {"path": "deliverables/traced.md", "content": "# Durable evidence\n"},
+        await execute_project_workspace_tool(
+            "write_file",
+            {
+                "workspace": "project",
+                "path": "deliverables/traced.md",
+                "content": "# Durable evidence\n",
+            },
             agent_id=env.leader_id,
             execution_user_id=env.owner_id,
             session_id=str(child_id),

@@ -1186,6 +1186,15 @@ async def _validate_project_create_inputs(
             for server_id in override_server_ids
         ):
             raise HTTPException(status_code=422, detail="One or more configured MCP services are unavailable")
+        private_server_ids = capability_options.agent_mcp_ids.get(member.agent_id, frozenset())
+        if set(override_server_ids) & set(private_server_ids):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Private MCP credentials cannot be copied into a project. "
+                    "They are referenced at runtime only when the execution user owns the source digital employee."
+                ),
+            )
         enabled_tool_ids = [
             setting.tool_id for setting in member.settings.tools if setting.enabled
         ]
@@ -1494,6 +1503,9 @@ async def _create_project_uncompensated(
                 for setting in source_member.settings.tools
             ],
         )
+        # These are explicit project-local overrides submitted by the user,
+        # not credentials copied from the source Agent. They affect only the
+        # project Agent; source-Agent private credentials remain reference-only.
         for override in source_member.settings.mcp_server_overrides:
             db.add(
                 MCPServerOverride(

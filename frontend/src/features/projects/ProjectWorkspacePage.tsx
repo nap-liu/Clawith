@@ -416,28 +416,10 @@ const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
     participant: true,
   },
   {
-    name: "project_list_files",
-    label: "View workspace",
-    description: "Review project deliverables and their versions.",
-    participant: true,
-  },
-  {
-    name: "project_read_file",
-    label: "Read workspace file",
-    description: "Read a project text file. The file must already exist.",
-    participant: true,
-  },
-  {
     name: "project_update_work_item",
     label: "Update task",
     description: "Update the status, progress, or evidence of an existing task.",
     descriptionKey: "projectTerminology.workspace.ownerToolDescription",
-    participant: true,
-  },
-  {
-    name: "project_write_file",
-    label: "Write workspace file",
-    description: "Save a file at a specified path in the project workspace.",
     participant: true,
   },
   {

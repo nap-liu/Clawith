@@ -316,13 +316,16 @@ async def test_project_agent_tool_clone_groups_mcp_server_and_excludes_credentia
     async with async_session() as db:
         parent = await db.get(ChatSession, parent_id)
         project = await db.get(Project, parent.project_id)
+        target_id = uuid.uuid4()
         target = Agent(
+            id=target_id,
             name=f"Project copy {suffix}",
             creator_id=user_id,
             tenant_id=project.tenant_id,
             scope="project",
             project_id=project.id,
-            agent_dir=f".agents/{suffix}",
+            source_agent_id=source_agent_id,
+            agent_dir=f".agents/{target_id}",
             status="idle",
         )
         server = MCPServer(
@@ -2961,7 +2964,10 @@ async def test_subagent_confirmation_suspends_and_resumes_durable_turn(monkeypat
                 intro_text="需要确认",
                 title="继续执行",
                 summary="确认后继续当前项目任务",
-                action={"tool": "project_write_file", "args": {"path": "ok.txt"}},
+                action={
+                    "tool": "write_file",
+                    "args": {"workspace": "project", "path": "ok.txt"},
+                },
                 risk_level="medium",
                 buttons=[{"label": "继续", "value": "continue"}],
                 force_confirmation=True,

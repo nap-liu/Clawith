@@ -3874,6 +3874,7 @@ async def execute_tool(
     on_output=None,
     skip_autonomy: bool = False,
     tools_for_llm: list[dict] | None = None,
+    approved_by_human: bool = False,
 ) -> str:
     """Execute a tool call and return the result as a string.
 
@@ -3884,6 +3885,9 @@ async def execute_tool(
                     already approved this exact action (e.g. a confirmation card
                     the user confirmed) — the card IS the approval, so re-gating
                     on autonomy would be redundant.
+        approved_by_human: Internal approval-resume marker. Forced-L3 market
+                    actions ignore ordinary ``skip_autonomy`` callers and honor
+                    this marker only after a durable approval resolution.
     """
     if not isinstance(tool_name, str):
         tool_name = str(tool_name or "")
@@ -4060,9 +4064,26 @@ async def execute_tool(
             return "❌ Project query failed."
 
     from app.services.project_runtime_tools import (
+        PROJECT_SANDBOX_TOOL_NAMES,
+        PROJECT_STANDARD_FILE_TOOL_NAMES,
+        PROJECT_STRUCTURED_READ_TOOL_NAMES,
         PROJECT_RUNTIME_TOOL_NAMES,
+        execute_project_workspace_tool,
         execute_project_runtime_tool,
+        finalize_project_sandbox_changes,
+        resolve_project_sandbox_scope,
     )
+
+    project_sandbox_scope = None
+    project_workspace = None
+    if current_agent_runtime_workspace(agent_id).is_project and tool_name in (
+        PROJECT_STANDARD_FILE_TOOL_NAMES
+        | PROJECT_STRUCTURED_READ_TOOL_NAMES
+        | PROJECT_SANDBOX_TOOL_NAMES
+    ):
+        project_workspace = str(arguments.get("workspace") or "").strip().casefold()
+        if project_workspace not in {"agent", "project"}:
+            return "❌ Project file tools require workspace='agent' or workspace='project'."
 
     if tool_name in PROJECT_RUNTIME_TOOL_NAMES:
         try:
@@ -4089,7 +4110,10 @@ async def execute_tool(
     # ── Autonomy boundary check (skipped when a human already approved, e.g. a
     #    confirmation card the user confirmed) ──
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
-    if action_type and (not skip_autonomy or tool_name in _FORCED_L3_TOOLS):
+    if action_type and (
+        not skip_autonomy
+        or (tool_name in _FORCED_L3_TOOLS and not approved_by_human)
+    ):
         try:
             from app.services.autonomy_service import autonomy_service
             from app.models.agent import Agent as AgentModel
@@ -4159,6 +4183,45 @@ async def execute_tool(
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
+
+    if project_workspace == "project" and tool_name in (
+        PROJECT_STANDARD_FILE_TOOL_NAMES | PROJECT_STRUCTURED_READ_TOOL_NAMES
+    ):
+        if user_id is None:
+            return "❌ Project file tools require an authorized execution user."
+        try:
+            return await execute_project_workspace_tool(
+                tool_name,
+                arguments,
+                agent_id=agent_id,
+                execution_user_id=user_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+        except (ValueError, HTTPException) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            return f"❌ {detail}"
+        except Exception:
+            logger.exception("[ProjectWorkspaceTool] {} failed", tool_name)
+            return "❌ 项目文件操作未完成，请稍后重试。"
+
+    if project_workspace == "project" and tool_name in PROJECT_SANDBOX_TOOL_NAMES:
+        if user_id is None:
+            return "❌ Project sandbox requires an authorized execution user."
+        try:
+            project_sandbox_scope = await resolve_project_sandbox_scope(
+                agent_id=agent_id,
+                execution_user_id=user_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+        except (ValueError, HTTPException) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            return f"❌ {detail}"
+        except Exception:
+            logger.exception("[ProjectSandbox] scope resolution failed")
+            return "❌ 项目沙箱未能启动，请稍后重试。"
 
     # Tool-loop recovery can replay a completed tool call after a process crash.
     # Messaging providers do not all expose an idempotency header, so the durable
@@ -4678,22 +4741,76 @@ async def execute_tool(
             result = await _plaza_add_comment(agent_id, arguments)
         elif tool_name in _CODE_EXEC_TOOL_NAMES:
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
-            result = await _run_with_temp_workspace(
-                agent_id,
-                _agent_tenant_id,
-                lambda temp_ws: _execute_code(
+            if project_sandbox_scope is not None:
+                project, project_member, project_run = project_sandbox_scope
+                action = str(arguments.get("action") or "execute").strip().casefold()
+                execution_mode = str(arguments.get("execution_mode") or "foreground").strip().casefold()
+                if action != "execute" or execution_mode != "foreground":
+                    return (
+                        "❌ Project repository sandbox execution is foreground-only. "
+                        "Use workspace='agent' for persistent background jobs."
+                    )
+                from app.services.project_git_service import create_project_sandbox_workspace
+
+                sandbox_workspace = await create_project_sandbox_workspace(
+                    project,
+                    max_file_bytes=TOOL_MATERIALIZE_MAX_FILE_BYTES,
+                    max_total_bytes=TOOL_MATERIALIZE_MAX_TOTAL_BYTES,
+                )
+                try:
+                    result = await _execute_code(
+                        agent_id,
+                        sandbox_workspace.root,
+                        arguments,
+                        tool_name=tool_name,
+                        user_id=user_id,
+                        session_id=session_id,
+                        turn_anchor_id=turn_anchor_id,
+                        tools_for_llm=tools_for_llm,
+                        on_output=on_output,
+                        work_dir_override=sandbox_workspace.root,
+                        hardened_workspace=True,
+                        venv_path_override=sandbox_workspace.venv_root,
+                        runtime_temp_path_override=sandbox_workspace.runtime_temp_root,
+                    )
+                    try:
+                        committed = await finalize_project_sandbox_changes(
+                            project,
+                            project_member,
+                            project_run,
+                            sandbox_workspace,
+                            agent_id=agent_id,
+                            session_id=session_id,
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                        )
+                    except Exception:
+                        logger.exception("[ProjectSandbox] result commit failed")
+                        return f"{result}\n\n❌ 项目文件提交未完成，请稍后重试。"
+                finally:
+                    sandbox_workspace.cleanup()
+                if committed is not None:
+                    result = (
+                        f"{result}\n\nProject repository commit:\n"
+                        + json.dumps(committed, ensure_ascii=False, indent=2)
+                    )
+            else:
+                result = await _run_with_temp_workspace(
                     agent_id,
-                    temp_ws,
-                    arguments,
-                    tool_name=tool_name,
-                    user_id=user_id,
-                    session_id=session_id,
-                    turn_anchor_id=turn_anchor_id,
-                    tools_for_llm=tools_for_llm,
-                    on_output=on_output,
-                ),
-                sync_back=True,
-            )
+                    _agent_tenant_id,
+                    lambda temp_ws: _execute_code(
+                        agent_id,
+                        temp_ws,
+                        arguments,
+                        tool_name=tool_name,
+                        user_id=user_id,
+                        session_id=session_id,
+                        turn_anchor_id=turn_anchor_id,
+                        tools_for_llm=tools_for_llm,
+                        on_output=on_output,
+                    ),
+                    sync_back=True,
+                )
         elif tool_name == "sql_execute":
             result = await _sql_execute(arguments)
         elif tool_name == "upload_image":
@@ -8567,6 +8684,7 @@ async def _execute_mcp_tool(
         from app.services.mcp_server_service import (
             compose_runtime_config,
             lookup_overrides,
+            lookup_project_source_tool_config,
             build_placeholder_context_for_call,
         )
 
@@ -8627,6 +8745,21 @@ async def _execute_mcp_tool(
             ).scalar_one_or_none()
             if live_assignment is None:
                 return f"❌ MCP tool {tool_name}: no longer installed or enabled for this agent"
+            runtime_workspace = current_agent_runtime_workspace(agent_id)
+            referenced_source_config = (
+                await lookup_project_source_tool_config(
+                    db,
+                    project_agent_id=agent_id,
+                    tool_id=tool.id,
+                    execution_user_id=user_id,
+                )
+                if runtime_workspace.is_project
+                else {}
+            )
+            effective_assignment_config = _decrypt_sensitive_fields(
+                {**referenced_source_config, **dict(live_assignment.config or {})},
+                tool.config_schema,
+            )
 
             # NEW PATH: when tool.mcp_server_id is populated (P0a migration done),
             # use the mcp_servers table + overrides + placeholder rendering.
@@ -8645,7 +8778,14 @@ async def _execute_mcp_tool(
                     agent_row = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
                 tenant_id = agent_row.tenant_id if agent_row else None
 
-                t_ovr, a_ovr = await lookup_overrides(db, srv.id, tenant_id, agent_id)
+                t_ovr, a_ovr = await lookup_overrides(
+                    db,
+                    srv.id,
+                    tenant_id,
+                    agent_id,
+                    execution_user_id=user_id,
+                    allow_project_source_reference=runtime_workspace.is_project,
+                )
                 cfg = compose_runtime_config(srv, t_ovr, a_ovr)
 
                 ctx = await build_placeholder_context_for_call(
@@ -8780,7 +8920,7 @@ async def _execute_mcp_tool(
                     # Smithery path expects merged_config dict with credential and headers.
                     # Adapter: stuff resolved values back into a dict matching the legacy contract.
                     smithery_cfg = {
-                        **(live_assignment.config or {}),
+                        **effective_assignment_config,
                         "smithery_api_key": resolved_credential,
                         "headers": resolved_headers if resolved_headers else None,
                     }
@@ -8811,7 +8951,7 @@ async def _execute_mcp_tool(
                     )
                 )
                 at = at_r.scalar_one_or_none()
-                agent_config = (at.config or {}) if at else {}
+                agent_config = effective_assignment_config
 
         if not tool.mcp_server_url:
             logger.error(f"[MCP] Tool {tool_name} has no server URL configured")
@@ -14753,6 +14893,10 @@ async def _execute_code(
     session_id: Optional[str] = None,
     turn_anchor_id: uuid.UUID | None = None,
     tools_for_llm: list[dict] | None = None,
+    work_dir_override: Path | None = None,
+    hardened_workspace: bool = False,
+    venv_path_override: Path | None = None,
+    runtime_temp_path_override: Path | None = None,
     on_output=None,
 ) -> str:
     """Execute code using the configured sandbox backend.
@@ -14810,7 +14954,9 @@ async def _execute_code(
     # /data/agents bind mount, so point work_dir there. The mkdir below lands
     # on that shared mount → the dir is real on both sides. Falls back to the
     # passed-in ws when agent_id is unknown.
-    if tool_name in _REMOTE_SANDBOX_TOOL_NAMES and agent_id is not None:
+    if work_dir_override is not None:
+        work_dir = work_dir_override.resolve()
+    elif tool_name in _REMOTE_SANDBOX_TOOL_NAMES and agent_id is not None:
         work_dir = _agent_workspace_root(agent_id).resolve()
     else:
         work_dir = ws.resolve()
@@ -14837,6 +14983,20 @@ async def _execute_code(
         else:
             sandbox_config = fallback_config
             logger.info(f"[Sandbox] No per-agent config found for '{tool_name}', using fallback")
+
+        if hardened_workspace:
+            # Project repository code uses the existing hardened local sandbox
+            # so its only writable mount is the isolated public copy. Ordinary
+            # timeout, memory and network settings still come from the tool.
+            from app.services.sandbox.config import SandboxType
+
+            sandbox_config = sandbox_config.model_copy(
+                update={
+                    "type": SandboxType.SUBPROCESS,
+                    "hardened": True,
+                    "allow_unsafe_fallback_when_bwrap_missing": False,
+                }
+            )
 
         backend = get_sandbox_backend(sandbox_config)
 
@@ -14873,7 +15033,7 @@ async def _execute_code(
             # Caller already built it (e.g. _execute_cli_tool, scoped to its own
             # tool) — avoid a second DB round-trip.
             injection = cli_injection
-        elif tool_name == "execute_code_aio":
+        elif tool_name == "execute_code_aio" and not hardened_workspace:
             # All languages (bash/node/python) get native CLI wrappers. The
             # current turn's ToolCall bridge follows the Agent-level switch.
             injection = await build_cli_injection(agent_id, user_id)
@@ -14929,9 +15089,13 @@ async def _execute_code(
             language=language,
             timeout=timeout,
             work_dir=str(work_dir),
-            agent_id=str(agent_id) if agent_id else None,
+            agent_id=None if hardened_workspace else (str(agent_id) if agent_id else None),
             conversation_id=session_id or None,
             inject=injection,
+            venv_path_override=(str(venv_path_override) if venv_path_override else None),
+            runtime_temp_path_override=(
+                str(runtime_temp_path_override) if runtime_temp_path_override else None
+            ),
             on_output=on_output,
         )
 
@@ -14940,8 +15104,10 @@ async def _execute_code(
 
     except ValueError as e:
         # Sandbox disabled or misconfigured
-        if is_explicit_remote_sandbox:
-            # Do not silently fall back — surface the config error to the user
+        if hardened_workspace or is_explicit_remote_sandbox:
+            # Project repository execution and explicit remote sandboxes are
+            # fail-closed. Falling back would run project code directly on the
+            # backend host with access beyond the isolated public snapshot.
             return f"❌ Sandbox configuration error: {str(e)[:300]}\nPlease check the tool settings."
         logger.warning(f"[Sandbox] Config issue, falling back to legacy subprocess: {e}")
         return await _execute_code_legacy(
@@ -14954,8 +15120,8 @@ async def _execute_code(
 
     except Exception as e:
         logger.exception(f"[Sandbox] Execution failed for agent {agent_id} (tool={tool_name})")
-        if is_explicit_remote_sandbox:
-            # Do not silently fall back to local execution
+        if hardened_workspace or is_explicit_remote_sandbox:
+            # Never turn an isolation failure into unsandboxed host execution.
             return f"❌ Sandbox execution error: {str(e)[:200]}"
         # For local tool: try legacy subprocess as last resort
         try:

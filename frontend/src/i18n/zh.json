@@ -989,21 +989,9 @@
         "label": "查看任务",
         "description": "查看项目任务或本人负责的工作。"
       },
-      "project_list_files": {
-        "label": "查看工作区",
-        "description": "查看项目成果文件及其版本。"
-      },
-      "project_read_file": {
-        "label": "读取工作区文件",
-        "description": "读取指定的项目文本文件；文件必须已经存在。"
-      },
       "project_update_work_item": {
         "label": "更新任务",
         "description": "更新已有任务的状态、进展或证据。"
-      },
-      "project_write_file": {
-        "label": "写入工作区文件",
-        "description": "在项目工作区的指定位置保存文件。"
       },
       "project_message_agent": {
         "label": "联系数字员工",

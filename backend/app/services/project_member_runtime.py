@@ -15,6 +15,7 @@ from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 from app.models.tool import AgentTool, Tool
+from app.services.tool_config import strip_sensitive_fields
 from app.services.tool_enablement import tool_is_required
 
 # Project copies start with the smallest useful local execution surface. These
@@ -24,16 +25,20 @@ from app.services.tool_enablement import tool_is_required
 PROJECT_AGENT_DEFAULT_TOOL_NAMES = frozenset(
     {
         "complete_focus_item",
-        "execute_code_aio",
+        "execute_code",
+        "edit_file",
         "find_files",
         "list_files",
         "list_focus_items",
+        "move_file",
         "read_document",
         "read_file",
         "read_image",
         "search_files",
         "send_media",
         "upsert_focus_item",
+        "write_file",
+        "delete_file",
     }
 )
 
@@ -129,6 +134,14 @@ async def apply_project_agent_tool_settings(
     for tool_id, requested_enabled, requested_config in settings:
         tool = tools_by_id[tool_id]
         enabled = True if tool_is_required(tool.name) else requested_enabled
+        # MCP credentials are never copied into a project Agent assignment.
+        # Keep ordinary per-tool options intact; shared credentials remain
+        # inherited and eligible private credentials are resolved by reference.
+        persisted_config = (
+            strip_sensitive_fields(requested_config, tool.config_schema)
+            if tool.type == "mcp"
+            else requested_config
+        )
         assignment = assignments.get(tool_id)
         if assignment is None:
             db.add(
@@ -136,7 +149,7 @@ async def apply_project_agent_tool_settings(
                     agent_id=project_agent_id,
                     tool_id=tool_id,
                     enabled=enabled,
-                    config=requested_config,
+                    config=persisted_config,
                     source="user_installed",
                     installed_by_agent_id=(
                         project_agent_id if tool.source == "agent" else None
@@ -145,7 +158,7 @@ async def apply_project_agent_tool_settings(
             )
         else:
             assignment.enabled = enabled
-            assignment.config = requested_config
+            assignment.config = persisted_config
             if tool.source == "agent":
                 assignment.source = "user_installed"
                 assignment.installed_by_agent_id = project_agent_id

@@ -1305,6 +1305,7 @@ async def prepare_subagent_tools(
             if execution_user_id is None:
                 raise ValueError("Project Subagent tool preparation requires its execution user identity")
             from app.services.project_runtime_tools import (
+                add_project_workspace_parameter,
                 load_project_runtime_scope,
                 project_runtime_tool_schemas,
             )
@@ -1380,28 +1381,7 @@ async def prepare_subagent_tools(
                 for item in child_tools
                 if item.get("function", {}).get("name") not in project_collaboration_bypass_tools
             ]
-            # Project deliverables have one versioned workspace. Generic file
-            # tools resolve against a member-private Agent directory and can
-            # therefore return a stale or empty view of shared project files.
-            # Project runtimes use only the project-scoped catalogue/read/write
-            # tools so every member observes the same Git HEAD and audit trail.
-            private_file_tools = {
-                "delete_file",
-                "edit_file",
-                "find_files",
-                "list_files",
-                "move_file",
-                "read_document",
-                "read_file",
-                "read_image",
-                "search_files",
-                "write_file",
-            }
-            child_tools = [
-                item
-                for item in child_tools
-                if item.get("function", {}).get("name") not in private_file_tools
-            ]
+            child_tools = add_project_workspace_parameter(child_tools)
             if (
                 runtime_config.get("project_execution_tools_enabled") is False
                 or project.status in {"planning", "paused", "waiting", "completed"}
@@ -1421,7 +1401,10 @@ async def prepare_subagent_tools(
                     )
                 else:
                     runtime_member = member
-                project_tools = project_runtime_tool_schemas(project, runtime_member)
+                project_tools = project_runtime_tool_schemas(
+                    project,
+                    runtime_member,
+                )
         else:
             tools = await get_agent_tools_for_llm(agent_id)
             child_tools = [tool for tool in tools if tool.get("function", {}).get("name") not in hidden]

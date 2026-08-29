@@ -989,21 +989,9 @@
         "label": "View tasks",
         "description": "Review project tasks or work assigned to the current member."
       },
-      "project_list_files": {
-        "label": "View workspace",
-        "description": "Review project deliverables and their versions."
-      },
-      "project_read_file": {
-        "label": "Read workspace file",
-        "description": "Read a specified project text file. The file must already exist."
-      },
       "project_update_work_item": {
         "label": "Update task",
         "description": "Update the status, progress, or evidence of an existing task."
-      },
-      "project_write_file": {
-        "label": "Write workspace file",
-        "description": "Save a file at a specified location in the project workspace."
       },
       "project_message_agent": {
         "label": "Contact Digital Employee",

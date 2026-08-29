@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import uuid
@@ -22,13 +23,23 @@ from app.models.project import (
 )
 from app.models.subagent_run import SubagentRun
 from app.services.project_git_service import (
+    ProjectSandboxWorkspace,
+    commit_project_workspace_sandbox_changes,
     commit_project_changes,
-    list_project_files,
+    delete_project_workspace_file,
+    edit_project_workspace_file,
+    find_project_workspace_files,
+    list_project_workspace,
+    materialize_project_read_workspace,
+    move_project_workspace_path,
     project_agent_git_email,
-    read_project_file,
+    project_repository_commit_is_ancestor,
+    read_project_workspace_file,
     repository_state,
+    reset_project_repository_head,
     restore_as_new_commit,
-    write_project_file,
+    search_project_workspace,
+    write_project_workspace_file,
 )
 from app.services.project_service import (
     add_event,
@@ -40,10 +51,7 @@ PARTICIPANT_PROJECT_TOOLS = frozenset(
     {
         "project_get_context",
         "project_list_work_items",
-        "project_list_files",
-        "project_read_file",
         "project_update_work_item",
-        "project_write_file",
         "project_message_agent",
     }
 )
@@ -59,6 +67,26 @@ LEADER_ONLY_PROJECT_TOOLS = frozenset(
     }
 )
 PROJECT_RUNTIME_TOOL_NAMES = PARTICIPANT_PROJECT_TOOLS | LEADER_ONLY_PROJECT_TOOLS
+PROJECT_STANDARD_FILE_TOOL_NAMES = frozenset(
+    {
+        "list_files",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_files",
+        "find_files",
+        "move_file",
+        "delete_file",
+    }
+)
+PROJECT_STRUCTURED_READ_TOOL_NAMES = frozenset({"read_document", "read_image"})
+PROJECT_SANDBOX_TOOL_NAMES = frozenset({"execute_code"})
+PROJECT_WORKSPACE_ROUTED_TOOL_NAMES = (
+    PROJECT_STANDARD_FILE_TOOL_NAMES
+    | PROJECT_STRUCTURED_READ_TOOL_NAMES
+    | PROJECT_SANDBOX_TOOL_NAMES
+)
+PROJECT_FILE_WORKSPACES = frozenset({"agent", "project"})
 
 WORK_ITEM_STATUSES = {"backlog", "todo", "in_progress", "review", "blocked", "done"}
 WORK_ITEM_PRIORITIES = {"low", "medium", "high", "urgent"}
@@ -73,6 +101,116 @@ WORK_ITEM_PROGRESS_MAX_CHARS = 600
 WORK_ITEM_EVIDENCE_MAX_ITEMS = 6
 WORK_ITEM_EVIDENCE_MAX_CHARS = 300
 WORK_ITEM_EVENT_SCAN_MAX = 600
+
+
+async def _resolve_uncertain_project_file_audit(
+    project: Project,
+    *,
+    previous_head: str,
+    result: dict[str, Any],
+    tool_call_id: str,
+    member: ProjectMemberSnapshot,
+    agent_id: uuid.UUID,
+    project_run: ProjectRun | None,
+    summary: str,
+    metadata: dict[str, Any],
+) -> bool:
+    """Resolve an uncertain DB commit without erasing a later Git commit."""
+
+    commit = str(result["commit"])
+    call_id = str(tool_call_id or "")
+
+    async def _event_exists(db) -> bool:
+        query = select(ProjectEvent.id).where(
+            ProjectEvent.project_id == project.id,
+            ProjectEvent.event_type == "project.file.committed",
+            ProjectEvent.event_metadata["commit"].astext == commit,
+        )
+        if call_id:
+            query = query.where(ProjectEvent.event_metadata["tool_call_id"].astext == call_id)
+        return (await db.execute(query.limit(1))).scalar_one_or_none() is not None
+
+    async with async_session() as verify_db:
+        if await _event_exists(verify_db):
+            return True
+
+    compensated = await reset_project_repository_head(
+        project,
+        previous_head,
+        expected_head=commit,
+    )
+    if compensated:
+        return False
+
+    # HEAD advanced after this commit. Preserve later work and durably restore
+    # the missing audit record instead of rewinding the repository.
+    async with async_session() as recovery_db:
+        attached = (
+            await recovery_db.execute(
+                select(Project)
+                .where(Project.id == project.id, Project.tenant_id == project.tenant_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if attached is None:
+            return False
+        if await _event_exists(recovery_db):
+            return True
+        current_head = (await repository_state(attached))["head"]
+        if not await project_repository_commit_is_ancestor(attached, commit, current_head):
+            return False
+        settings = dict(attached.settings or {})
+        settings["git"] = {**dict(settings.get("git") or {}), "head": current_head}
+        attached.settings = settings
+        add_event(
+            recovery_db,
+            attached,
+            "project.file.committed",
+            summary,
+            actor_agent_id=agent_id,
+            work_item_id=project_run.work_item_id if project_run else None,
+            run_id=project_run.id if project_run else None,
+            metadata={**metadata, "audit_recovered": True, "current_head": current_head},
+        )
+        await recovery_db.commit()
+        return True
+
+
+def add_project_workspace_parameter(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extend standard file schemas only while they run inside a project.
+
+    The original tool name and all existing arguments stay unchanged. Requiring
+    one explicit workspace prevents a project Agent from accidentally crossing
+    between its private workspace and the shared project repository.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("function", {}).get("name") not in PROJECT_WORKSPACE_ROUTED_TOOL_NAMES:
+            projected.append(tool)
+            continue
+        item = copy.deepcopy(tool)
+        function = item["function"]
+        parameters = function.setdefault("parameters", {"type": "object", "properties": {}})
+        properties = parameters.setdefault("properties", {})
+        properties["workspace"] = {
+            "type": "string",
+            "enum": sorted(PROJECT_FILE_WORKSPACES),
+            "description": (
+                "Required in a project: use 'agent' for the Digital Employee's private workspace, "
+                "or 'project' for the shared project repository."
+            ),
+        }
+        required = list(parameters.get("required") or [])
+        if "workspace" not in required:
+            required.append("workspace")
+        parameters["required"] = required
+        function["description"] = (
+            f"{str(function.get('description') or '').rstrip()} "
+            "In a project, explicitly select the target with workspace."
+        ).strip()
+        projected.append(item)
+    return projected
 
 
 def _bounded_context_text(value: Any, max_chars: int) -> str:
@@ -167,26 +305,6 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "Optionally return only work assigned to this member.",
         {"mine_only": {"type": "boolean", "default": False}},
     ),
-    "project_list_files": _schema(
-        "project_list_files",
-        "List files currently saved in the project workspace and their version identifiers.",
-        {},
-    ),
-    "project_read_file": _schema(
-        "project_read_file",
-        "Read text from one saved project file. Use a path returned by the project file list.",
-        {
-            "path": {"type": "string", "description": "Exact project-relative file path."},
-            "max_chars": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 100000,
-                "default": 20000,
-                "description": "Maximum number of characters to return.",
-            },
-        },
-        ["path"],
-    ),
     "project_create_work_item": _schema(
         "project_create_work_item",
         "Create one project work item. This records the work but does not start it. Available to the project lead.",
@@ -231,15 +349,6 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
             "evidence": {"type": "array", "items": {"type": "string"}},
         },
         ["work_item_id"],
-    ),
-    "project_write_file": _schema(
-        "project_write_file",
-        "Save text to one project file as a new project version.",
-        {
-            "path": {"type": "string", "description": "Project-relative file path."},
-            "content": {"type": "string", "description": "Complete text content to save."},
-        },
-        ["path", "content"],
     ),
     "project_message_agent": _schema(
         "project_message_agent",
@@ -382,7 +491,10 @@ def effective_project_tool_names(project: Project, member: ProjectMemberSnapshot
     return effective & PROJECT_RUNTIME_TOOL_NAMES
 
 
-def project_runtime_tool_schemas(project: Project, member: ProjectMemberSnapshot) -> list[dict[str, Any]]:
+def project_runtime_tool_schemas(
+    project: Project,
+    member: ProjectMemberSnapshot,
+) -> list[dict[str, Any]]:
     names = effective_project_tool_names(project, member)
     return [PROJECT_TOOL_REGISTRY[name] for name in PROJECT_TOOL_REGISTRY if name in names]
 
@@ -487,6 +599,305 @@ async def _runtime_scope(
         if project_run is not None:
             db.expunge(project_run)
         return project, member, project_run
+
+
+async def execute_project_workspace_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    session_id: str,
+    tool_call_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> str:
+    """Route standard file-tool contracts to the shared project Git tree."""
+
+    if tool_name not in PROJECT_STANDARD_FILE_TOOL_NAMES | PROJECT_STRUCTURED_READ_TOOL_NAMES:
+        raise ValueError(f"Unknown project workspace tool: {tool_name}")
+    project, member, project_run = await _runtime_scope(
+        session_id,
+        agent_id,
+        execution_user_id,
+        turn_anchor_id,
+    )
+    if tool_name in {"write_file", "edit_file", "move_file", "delete_file"} and project.status != "running":
+        raise ValueError("Project files can be modified only while the project is running")
+
+    if tool_name == "read_document":
+        path = str(arguments.get("path") or "").strip()
+        if not path:
+            raise ValueError("path is required")
+        from app.services.agent_tools import _READ_DOCUMENT_MAX_FILE_BYTES, _read_document
+        materialized = await materialize_project_read_workspace(
+            project,
+            [path],
+            max_bytes=_READ_DOCUMENT_MAX_FILE_BYTES,
+        )
+        try:
+            return await _read_document(
+                materialized.root,
+                path,
+                max_chars=min(int(arguments.get("max_chars", 8000)), 20000),
+                tenant_id=None,
+            )
+        finally:
+            materialized.cleanup()
+    if tool_name == "read_image":
+        image_paths = arguments.get("image_paths") or []
+        if not isinstance(image_paths, list):
+            raise ValueError("image_paths must be an array")
+        local_paths: list[str] = []
+        for image_path in image_paths:
+            value = str(image_path or "").strip()
+            if not value.lower().startswith(("http://", "https://", "data:")):
+                local_paths.append(value)
+        from app.services.tools.read_image import (
+            get_effective_read_image_max_bytes,
+            handle_read_image,
+        )
+        max_image_bytes = await get_effective_read_image_max_bytes(agent_id)
+        materialized = await materialize_project_read_workspace(
+            project,
+            local_paths,
+            max_bytes=max_image_bytes,
+        )
+        try:
+            return await handle_read_image(
+                agent_id,
+                arguments,
+                workspace_root=materialized.root,
+            )
+        finally:
+            materialized.cleanup()
+
+    if tool_name == "list_files":
+        return await list_project_workspace(project, str(arguments.get("path") or ""))
+    if tool_name == "read_file":
+        path = str(arguments.get("path") or "").strip()
+        if not path:
+            raise ValueError("path is required")
+        return await read_project_workspace_file(
+            project,
+            path,
+            offset=int(arguments.get("offset", 0)),
+            limit=int(arguments.get("limit", 2000)),
+        )
+    if tool_name == "search_files":
+        pattern = str(arguments.get("pattern") or "")
+        if not pattern:
+            raise ValueError("pattern is required")
+        return await search_project_workspace(
+            project,
+            pattern,
+            path=str(arguments.get("path") or "."),
+            file_pattern=str(arguments.get("file_pattern") or "*"),
+            ignore_case=bool(arguments.get("ignore_case", False)),
+        )
+    if tool_name == "find_files":
+        pattern = str(arguments.get("pattern") or "")
+        if not pattern:
+            raise ValueError("pattern is required")
+        return await find_project_workspace_files(
+            project,
+            pattern,
+            path=str(arguments.get("path") or "."),
+        )
+
+    trace_metadata = {
+        "tool_name": tool_name,
+        "tool_call_id": str(tool_call_id or ""),
+        "session_id": session_id,
+        "subagent_session_id": session_id,
+        "project_run_id": str(project_run.id) if project_run else None,
+        "work_item_id": str(project_run.work_item_id) if project_run and project_run.work_item_id else None,
+    }
+    async with async_session() as db:
+        attached = (
+            await db.execute(
+                select(Project)
+                .where(Project.id == project.id, Project.tenant_id == project.tenant_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if attached is None or attached.status != "running":
+            raise ValueError("Project files can be modified only while the project is running")
+        previous_head = (await repository_state(attached))["head"]
+        author_email = project_agent_git_email(agent_id)
+        if tool_name == "write_file":
+            path = str(arguments.get("path") or "").strip()
+            content = arguments.get("content")
+            if not path or not isinstance(content, str):
+                raise ValueError("path and string content are required")
+            result = await write_project_workspace_file(
+                attached, path, content,
+                author_name=member.name_snapshot, author_email=author_email,
+            )
+        elif tool_name == "edit_file":
+            path = str(arguments.get("path") or "").strip()
+            old_string = arguments.get("old_string")
+            new_string = arguments.get("new_string")
+            if not path or not isinstance(old_string, str) or not isinstance(new_string, str):
+                raise ValueError("path, old_string, and new_string are required")
+            result = await edit_project_workspace_file(
+                attached, path, old_string, new_string,
+                replace_all=bool(arguments.get("replace_all", False)),
+                author_name=member.name_snapshot, author_email=author_email,
+            )
+        elif tool_name == "move_file":
+            source_path = str(arguments.get("source_path") or "").strip()
+            destination_path = str(arguments.get("destination_path") or "").strip()
+            if not source_path or not destination_path:
+                raise ValueError("source_path and destination_path are required")
+            result = await move_project_workspace_path(
+                attached, source_path, destination_path,
+                overwrite=bool(arguments.get("overwrite", False)),
+                author_name=member.name_snapshot, author_email=author_email,
+            )
+        else:
+            path = str(arguments.get("path") or "").strip()
+            if not path:
+                raise ValueError("path is required")
+            result = await delete_project_workspace_file(
+                attached, path,
+                author_name=member.name_snapshot, author_email=author_email,
+            )
+        event_metadata = {
+            key: result[key]
+            for key in ("operation", "path", "source_path", "destination_path", "commit", "replacements")
+            if key in result
+        }
+        settings = dict(attached.settings or {})
+        settings["git"] = {**dict(settings.get("git") or {}), "head": result["commit"]}
+        attached.settings = settings
+        display_path = result.get("path") or result.get("destination_path") or result.get("source_path")
+        add_event(
+            db,
+            attached,
+            "project.file.committed",
+            f"{member.name_snapshot} 更新了项目文件：{display_path}",
+            actor_agent_id=agent_id,
+            work_item_id=project_run.work_item_id if project_run else None,
+            run_id=project_run.id if project_run else None,
+            metadata={**event_metadata, **trace_metadata},
+        )
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            if not await _resolve_uncertain_project_file_audit(
+                project,
+                previous_head=previous_head,
+                result=result,
+                tool_call_id=tool_call_id,
+                member=member,
+                agent_id=agent_id,
+                project_run=project_run,
+                summary=f"{member.name_snapshot} 更新了项目文件：{display_path}",
+                metadata={**event_metadata, **trace_metadata},
+            ):
+                raise
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def resolve_project_sandbox_scope(
+    *,
+    agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    session_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> tuple[Project, ProjectMemberSnapshot, ProjectRun | None]:
+    """Resolve the same authorized project scope used by every project tool."""
+
+    project, member, project_run = await _runtime_scope(
+        session_id,
+        agent_id,
+        execution_user_id,
+        turn_anchor_id,
+    )
+    if project.status != "running":
+        raise ValueError("Project sandbox can run only while the project is running")
+    return project, member, project_run
+
+
+async def finalize_project_sandbox_changes(
+    project: Project,
+    member: ProjectMemberSnapshot,
+    project_run: ProjectRun | None,
+    workspace: ProjectSandboxWorkspace,
+    *,
+    agent_id: uuid.UUID,
+    session_id: str,
+    tool_call_id: str,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    """Commit and audit public repository changes made by sandbox code."""
+
+    async with async_session() as db:
+        attached = (
+            await db.execute(
+                select(Project)
+                .where(Project.id == project.id, Project.tenant_id == project.tenant_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            attached is None
+            or attached.status != "running"
+        ):
+            raise ValueError("Project sandbox results can be committed only while the project is running")
+        previous_head = (await repository_state(attached))["head"]
+        result = await commit_project_workspace_sandbox_changes(
+            attached,
+            workspace,
+            author_name=member.name_snapshot,
+            author_email=project_agent_git_email(agent_id),
+        )
+        if result is None:
+            return None
+        settings = dict(attached.settings or {})
+        settings["git"] = {**dict(settings.get("git") or {}), "head": result["commit"]}
+        attached.settings = settings
+        sandbox_metadata = {
+            **result,
+            "tool_name": tool_name,
+            "tool_call_id": str(tool_call_id or ""),
+            "session_id": session_id,
+            "subagent_session_id": session_id,
+            "project_run_id": str(project_run.id) if project_run else None,
+            "work_item_id": (
+                str(project_run.work_item_id)
+                if project_run and project_run.work_item_id
+                else None
+            ),
+        }
+        add_event(
+            db,
+            attached,
+            "project.file.committed",
+            f"{member.name_snapshot} 更新了项目文件",
+            actor_agent_id=agent_id,
+            work_item_id=project_run.work_item_id if project_run else None,
+            run_id=project_run.id if project_run else None,
+            metadata=sandbox_metadata,
+        )
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            if not await _resolve_uncertain_project_file_audit(
+                project,
+                previous_head=previous_head,
+                result=result,
+                tool_call_id=tool_call_id,
+                member=member,
+                agent_id=agent_id,
+                project_run=project_run,
+                summary=f"{member.name_snapshot} 更新了项目文件",
+                metadata=sandbox_metadata,
+            ):
+                raise
+    return result
 
 
 async def _enabled_member(db, project: Project, agent_id: uuid.UUID | None) -> ProjectMemberSnapshot | None:
@@ -706,28 +1117,6 @@ async def execute_project_runtime_tool(
         return await _project_context(project)
     if tool_name == "project_list_work_items":
         return await _list_work_items(project, agent_id, bool(arguments.get("mine_only", False)))
-    if tool_name == "project_list_files":
-        files = await list_project_files(project)
-        # Project collaboration exposes one shared, versioned deliverable
-        # tree. Member identity files are loaded by the runtime itself and do
-        # not belong in the project file catalogue shown to the model.
-        return json.dumps(
-            [
-                item
-                for item in files
-                if not str(item.get("path") or "").startswith(".agents/")
-            ],
-            ensure_ascii=False,
-        )
-    if tool_name == "project_read_file":
-        path = str(arguments.get("path") or "").strip()
-        if not path:
-            raise ValueError("path is required")
-        return json.dumps(
-            await read_project_file(project, path, int(arguments.get("max_chars", 20_000))),
-            ensure_ascii=False,
-        )
-
     if tool_name == "project_message_agent":
         target_id = _uuid(arguments.get("agent_id"), "agent_id")
         message = str(arguments.get("message") or "").strip()
@@ -934,36 +1323,6 @@ async def execute_project_runtime_tool(
                 f"{member.name_snapshot} 恢复了项目版本",
                 actor_agent_id=agent_id,
                 metadata={**result, "session_id": session_id},
-            )
-            await db.commit()
-        return json.dumps(result, ensure_ascii=False)
-
-    if tool_name == "project_write_file":
-        path = str(arguments.get("path") or "").strip()
-        content = arguments.get("content")
-        if not path or not isinstance(content, str):
-            raise ValueError("path and string content are required")
-        result = await write_project_file(
-            project,
-            path,
-            content,
-            author_name=member.name_snapshot,
-            author_email=project_agent_git_email(agent_id),
-        )
-        async with async_session() as db:
-            attached = await db.get(Project, project.id)
-            settings = dict(attached.settings or {})
-            settings["git"] = {**dict(settings.get("git") or {}), "head": result["commit"]}
-            attached.settings = settings
-            add_event(
-                db,
-                attached,
-                "project.file.committed",
-                f"{member.name_snapshot} 保存了项目文件：{result['path']}",
-                actor_agent_id=agent_id,
-                work_item_id=project_run.work_item_id if project_run else None,
-                run_id=project_run.id if project_run else None,
-                metadata={"path": result["path"], "commit": result["commit"], **trace_metadata},
             )
             await db.commit()
         return json.dumps(result, ensure_ascii=False)

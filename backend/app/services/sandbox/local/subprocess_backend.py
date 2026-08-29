@@ -201,7 +201,14 @@ class SubprocessBackend(BaseSandboxBackend):
                 pip_path.write_text(wrapper_script, encoding="utf-8")
                 pip_path.chmod(0o755)
 
-    def _build_exec_kwargs(self, work_path: Path, timeout: int, use_preexec: bool = False) -> dict:
+    def _build_exec_kwargs(
+        self,
+        work_path: Path,
+        timeout: int,
+        use_preexec: bool = False,
+        *,
+        chroot_workspace: bool = True,
+    ) -> dict:
         kwargs = {
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
@@ -209,10 +216,20 @@ class SubprocessBackend(BaseSandboxBackend):
             "start_new_session": True,
         }
         if use_preexec:
-            kwargs["preexec_fn"] = self._build_preexec_fn(work_path, timeout)
+            kwargs["preexec_fn"] = self._build_preexec_fn(
+                work_path,
+                timeout,
+                chroot_workspace=chroot_workspace,
+            )
         return kwargs
 
-    def _build_preexec_fn(self, work_path: Path, timeout: int):
+    def _build_preexec_fn(
+        self,
+        work_path: Path,
+        timeout: int,
+        *,
+        chroot_workspace: bool = True,
+    ):
         def _preexec():
             os.chdir(work_path)
             os.umask(0o077)
@@ -243,7 +260,7 @@ class SubprocessBackend(BaseSandboxBackend):
                 except Exception:
                     pass
 
-            if hasattr(os, "chroot") and os.geteuid() == 0:
+            if chroot_workspace and hasattr(os, "chroot") and os.geteuid() == 0:
                 try:
                     os.chroot(work_path)
                     os.chdir("/")
@@ -252,7 +269,13 @@ class SubprocessBackend(BaseSandboxBackend):
 
         return _preexec
 
-    def _build_bwrap_command(self, command: list[str], work_path: Path, venv_path: Path) -> list[str] | None:
+    def _build_bwrap_command(
+        self,
+        command: list[str],
+        work_path: Path,
+        venv_path: Path,
+        runtime_temp_path: Path,
+    ) -> list[str] | None:
         bwrap = shutil.which("bwrap")
         if not bwrap:
             if not SubprocessBackend._bwrap_missing_warned:
@@ -285,6 +308,7 @@ class SubprocessBackend(BaseSandboxBackend):
             "--bind", "/data/agents/.uv-cache", "/uv-cache",
             "--bind", str(work_path), "/workspace",
             "--bind", str(venv_path), "/workspace/.venv",
+            "--bind", str(runtime_temp_path), "/workspace/.tmp",
             "--dev", "/dev",
             "--proc", "/proc",
             "--dir", "/tmp",
@@ -382,11 +406,23 @@ class SubprocessBackend(BaseSandboxBackend):
                 error=str(exc),
             )
         work_path.mkdir(parents=True, exist_ok=True)
-        (work_path / ".tmp").mkdir(parents=True, exist_ok=True)
-        (work_path / ".tmp" / "pip-cache").mkdir(parents=True, exist_ok=True)
+        runtime_temp_override = kwargs.get("runtime_temp_path_override")
+        runtime_temp_path = (
+            Path(runtime_temp_override).resolve()
+            if runtime_temp_override
+            else (work_path / ".tmp").resolve()
+        )
+        runtime_temp_path.mkdir(parents=True, exist_ok=True)
+        (runtime_temp_path / "pip-cache").mkdir(parents=True, exist_ok=True)
         
         # Determine persistent venv path if possible
-        if agent_id:
+        venv_path_override = kwargs.get("venv_path_override")
+        if venv_path_override:
+            venv_path = Path(venv_path_override).resolve()
+            venv_path.parent.mkdir(parents=True, exist_ok=True)
+            uv_cache = Path("/data/agents/.uv-cache")
+            uv_cache.mkdir(parents=True, exist_ok=True)
+        elif agent_id:
             # We place the virtual environment in a persistent location
             venv_path = Path("/data/agents").resolve() / str(agent_id) / ".venv"
             venv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -443,7 +479,12 @@ class SubprocessBackend(BaseSandboxBackend):
             else:
                 self._ensure_workspace_venv(venv_path)
                 sandbox_command = self._build_command(language, f"/workspace/{script_path.name}")
-                bwrap_command = self._build_bwrap_command(sandbox_command, work_path, venv_path)
+                bwrap_command = self._build_bwrap_command(
+                    sandbox_command,
+                    work_path,
+                    venv_path,
+                    runtime_temp_path,
+                )
                 if not bwrap_command:
                     if not self.config.allow_unsafe_fallback_when_bwrap_missing:
                         duration_ms = int((time.time() - start_time) * 1000)
@@ -473,7 +514,12 @@ class SubprocessBackend(BaseSandboxBackend):
                     proc = await asyncio.create_subprocess_exec(
                         *bwrap_command,
                         cwd=str(work_path),
-                        **self._build_exec_kwargs(work_path, timeout),
+                        **self._build_exec_kwargs(
+                            work_path,
+                            timeout,
+                            use_preexec=True,
+                            chroot_workspace=False,
+                        ),
                     )
 
             stdout_data = bytearray()
