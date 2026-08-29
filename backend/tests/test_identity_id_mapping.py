@@ -207,6 +207,84 @@ async def test_channel_user_service_accepts_scoped_feishu_open_id_binding():
 
 
 @pytest.mark.asyncio
+async def test_dingtalk_resolution_reuses_one_subject_lock_during_provisioning(
+    monkeypatch,
+):
+    class _NestedTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return False
+
+    service = ChannelUserService()
+    tenant_id = uuid.uuid4()
+    provider_id = uuid.uuid4()
+    external_id = "staff-locked-once"
+    provider = SimpleNamespace(
+        id=provider_id,
+        tenant_id=tenant_id,
+        provider_type="dingtalk",
+        config={},
+    )
+    user = SimpleNamespace(id=uuid.uuid4())
+    member = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=user.id,
+    )
+    db = AsyncMock()
+    db.begin_nested = Mock(return_value=_NestedTransaction())
+    service._ensure_provider = AsyncMock(return_value=provider)
+    service._find_bound_user = AsyncMock(return_value=user)
+    service._ensure_bindings = AsyncMock(return_value=(user, False))
+    service._find_existing_org_member_for_user = AsyncMock(return_value=member)
+    service._merge_channel_info_into_member = Mock()
+
+    acquire_subject_lock = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.dingtalk_identity_reconciliation."
+        "dingtalk_legacy_identity_reconciler.acquire_subject_lock",
+        acquire_subject_lock,
+    )
+    ensure_user = AsyncMock(return_value=SimpleNamespace(user=user))
+    monkeypatch.setattr(
+        "app.services.contact_provisioning."
+        "contact_provisioning.ensure_user_for_org_member",
+        ensure_user,
+    )
+
+    async def _load_user(*_args, **_kwargs):
+        return user
+
+    monkeypatch.setattr(
+        "app.services.channel_user_service._load_user_with_identity",
+        _load_user,
+    )
+
+    resolved = await service.resolve_channel_user(
+        db=db,
+        agent=SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id),
+        channel_type="dingtalk",
+        external_user_id=external_id,
+        extra_info={
+            "identity_verified": True,
+            "_installation_scope": "test:dingtalk:one-lock",
+        },
+    )
+
+    assert resolved is user
+    acquire_subject_lock.assert_awaited_once_with(
+        db,
+        tenant_id=tenant_id,
+        provider_id=provider_id,
+        external_id=external_id,
+    )
+    ensure_user.assert_awaited_once()
+    assert ensure_user.await_args.kwargs["subject_lock_held"] is True
+
+
+@pytest.mark.asyncio
 async def test_channel_user_service_skips_dingtalk_lookup_when_ids_missing():
     service = ChannelUserService()
     db = AsyncMock()

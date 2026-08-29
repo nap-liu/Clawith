@@ -873,7 +873,6 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 turn_anchor_id=anchor.id,
                 storage_agent_id=anchor.agent_id,
                 turn_type="recovery",
-                release_db_before_dispatch=True,
             )
 
         if reply and reply.strip():

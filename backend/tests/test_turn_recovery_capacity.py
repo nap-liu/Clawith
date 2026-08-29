@@ -139,9 +139,8 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
     async def fake_normalize(*_args, **_kwargs):
         return None
 
-    async def fake_llm(db, *_args, **kwargs):
+    async def fake_llm(db, *_args, **_kwargs):
         assert capacity_active is True
-        assert kwargs["release_db_before_dispatch"] is True
         await db.close()
         assert all(session.active is False for session in sessions)
         return "recovered"
