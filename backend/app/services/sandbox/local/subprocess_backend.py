@@ -175,10 +175,11 @@ class SubprocessBackend(BaseSandboxBackend):
         if not venv_python.exists():
             import subprocess
 
-            # Use uv to create the virtual environment for extreme speed
-            # --seed ensures pip is still present in the venv
+            # Keep first-run setup offline and deterministic. ``_fix_pip_shebangs``
+            # installs the uv-backed pip wrapper below, so seeding packages here
+            # is unnecessary and can block before the execution timeout starts.
             subprocess.run(
-                ["uv", "venv", "--seed", str(venv_path)],
+                ["uv", "venv", str(venv_path)],
                 check=True,
                 cwd=str(venv_path.parent),
             )
@@ -191,10 +192,8 @@ class SubprocessBackend(BaseSandboxBackend):
     def _fix_pip_shebangs(self, venv_path: Path) -> None:
         """Replace pip with a bash wrapper that delegates to uv pip for extreme performance."""
         venv_bin = venv_path / "bin"
-        sandbox_python = "/workspace/.venv/bin/python"
-        
-        wrapper_script = f"#!/bin/bash\nexec uv pip \"$@\"\n"
-        
+        wrapper_script = "#!/bin/bash\nexec uv pip \"$@\"\n"
+
         for pip_cmd in ["pip", "pip3", "pip3.12"]:
             pip_path = venv_bin / pip_cmd
             if pip_path.parent.exists():
@@ -208,6 +207,7 @@ class SubprocessBackend(BaseSandboxBackend):
         use_preexec: bool = False,
         *,
         chroot_workspace: bool = True,
+        apply_nproc_limit: bool = True,
     ) -> dict:
         kwargs = {
             "stdout": asyncio.subprocess.PIPE,
@@ -220,6 +220,7 @@ class SubprocessBackend(BaseSandboxBackend):
                 work_path,
                 timeout,
                 chroot_workspace=chroot_workspace,
+                apply_nproc_limit=apply_nproc_limit,
             )
         return kwargs
 
@@ -229,6 +230,7 @@ class SubprocessBackend(BaseSandboxBackend):
         timeout: int,
         *,
         chroot_workspace: bool = True,
+        apply_nproc_limit: bool = True,
     ):
         def _preexec():
             os.chdir(work_path)
@@ -243,7 +245,8 @@ class SubprocessBackend(BaseSandboxBackend):
                 resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
                 resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
                 resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-                resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+                if apply_nproc_limit:
+                    resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
                 if hasattr(resource, "RLIMIT_CORE"):
                     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             except Exception as exc:
@@ -478,7 +481,12 @@ class SubprocessBackend(BaseSandboxBackend):
                 )
             else:
                 self._ensure_workspace_venv(venv_path)
-                sandbox_command = self._build_command(language, f"/workspace/{script_path.name}")
+                sandbox_command = [
+                    "/usr/bin/prlimit",
+                    "--nproc=32:32",
+                    "--",
+                    *self._build_command(language, f"/workspace/{script_path.name}"),
+                ]
                 bwrap_command = self._build_bwrap_command(
                     sandbox_command,
                     work_path,
@@ -519,6 +527,7 @@ class SubprocessBackend(BaseSandboxBackend):
                             timeout,
                             use_preexec=True,
                             chroot_workspace=False,
+                            apply_nproc_limit=False,
                         ),
                     )
 

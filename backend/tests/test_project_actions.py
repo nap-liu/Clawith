@@ -63,6 +63,7 @@ from app.models.project import (
     ProjectEvent,
     ProjectMemberSnapshot,
     ProjectTemplate,
+    ProjectWorkItem,
 )
 from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.tenant import Tenant
@@ -7705,6 +7706,30 @@ async def test_run_work_item_and_milestone_contracts_are_explicit(
     )
     assert set(recovered_event.event_metadata["related_run_ids"]) == {run["id"], str(late_success.id)}
     assert not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain"], text=True).strip()
+
+    with pytest.raises(ValueError, match=r"2 unfinished"):
+        await execute_project_runtime_tool(
+            "project_set_status",
+            {"status": "completed", "reason": "Must not skip unfinished work"},
+            agent_id=env.leader_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            tool_call_id="trace-premature-complete",
+            turn_anchor_id=anchor_id,
+        )
+
+    work_items = (
+        (
+            await env.db.execute(
+                select(ProjectWorkItem).where(ProjectWorkItem.project_id == uuid.UUID(project_id))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for work_item in work_items:
+        work_item.status = "done"
+    await env.db.commit()
 
     completed = json.loads(
         await execute_project_runtime_tool(

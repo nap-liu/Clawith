@@ -8,7 +8,7 @@ import json
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database import async_session
 from app.models.audit import ChatMessage
@@ -24,8 +24,8 @@ from app.models.project import (
 from app.models.subagent_run import SubagentRun
 from app.services.project_git_service import (
     ProjectSandboxWorkspace,
-    commit_project_workspace_sandbox_changes,
     commit_project_changes,
+    commit_project_workspace_sandbox_changes,
     delete_project_workspace_file,
     edit_project_workspace_file,
     find_project_workspace_files,
@@ -1274,6 +1274,22 @@ async def execute_project_runtime_tool(
                 raise ValueError("Confirm project kickoff before changing execution status")
             if attached.status in {"completed", "failed", "archived"} and attached.status != requested_status:
                 raise ValueError("A terminal project cannot be reopened by an Agent tool")
+            if requested_status == "completed":
+                unfinished_count = int(
+                    await db.scalar(
+                        select(func.count())
+                        .select_from(ProjectWorkItem)
+                        .where(
+                            ProjectWorkItem.project_id == attached.id,
+                            ProjectWorkItem.status != "done",
+                        )
+                    )
+                    or 0
+                )
+                if unfinished_count:
+                    raise ValueError(
+                        f"Complete all project work items before completion ({unfinished_count} unfinished)"
+                    )
             previous_status = attached.status
             attached.status = requested_status
             add_event(
