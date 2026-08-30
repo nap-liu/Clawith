@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import time
+import uuid
 from pathlib import Path
 
 from loguru import logger
@@ -15,6 +16,7 @@ from app.services.workspace_paths import WorkspacePathError, resolve_path_within
 
 MAX_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_STDERR_CAPTURE_BYTES = 500_000
+SANDBOX_PROCESS_LIMIT = 32
 
 
 # Security patterns - reused from agent_tools.py
@@ -208,6 +210,7 @@ class SubprocessBackend(BaseSandboxBackend):
         *,
         chroot_workspace: bool = True,
         apply_nproc_limit: bool = True,
+        pids_cgroup_path: Path | None = None,
     ) -> dict:
         kwargs = {
             "stdout": asyncio.subprocess.PIPE,
@@ -221,6 +224,7 @@ class SubprocessBackend(BaseSandboxBackend):
                 timeout,
                 chroot_workspace=chroot_workspace,
                 apply_nproc_limit=apply_nproc_limit,
+                pids_cgroup_path=pids_cgroup_path,
             )
         return kwargs
 
@@ -231,10 +235,18 @@ class SubprocessBackend(BaseSandboxBackend):
         *,
         chroot_workspace: bool = True,
         apply_nproc_limit: bool = True,
+        pids_cgroup_path: Path | None = None,
     ):
         def _preexec():
             os.chdir(work_path)
             os.umask(0o077)
+
+            if pids_cgroup_path is not None:
+                # Join the per-execution cgroup before bubblewrap starts. RLIMIT_NPROC
+                # is UID-wide and therefore counts the long-running Worker's own
+                # threads; a pids cgroup preserves the same 32-process ceiling while
+                # applying it only to this isolated execution tree.
+                (pids_cgroup_path / "tasks").write_text(str(os.getpid()), encoding="utf-8")
 
             try:
                 import resource
@@ -246,7 +258,7 @@ class SubprocessBackend(BaseSandboxBackend):
                 resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
                 resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
                 if apply_nproc_limit:
-                    resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+                    resource.setrlimit(resource.RLIMIT_NPROC, (SANDBOX_PROCESS_LIMIT, SANDBOX_PROCESS_LIMIT))
                 if hasattr(resource, "RLIMIT_CORE"):
                     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             except Exception as exc:
@@ -271,6 +283,35 @@ class SubprocessBackend(BaseSandboxBackend):
                     logger.warning(f"[Subprocess] Failed to chroot into workspace: {exc}")
 
         return _preexec
+
+    def _prepare_pids_cgroup(self) -> Path | None:
+        """Create one cgroup-v1 process boundary when the runtime exposes it."""
+
+        controller = Path("/sys/fs/cgroup/pids")
+        if not (controller / "pids.max").exists():
+            return None
+        path = controller / f"clawith-sandbox-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            path.mkdir(mode=0o700)
+            (path / "pids.max").write_text(str(SANDBOX_PROCESS_LIMIT), encoding="utf-8")
+            return path
+        except OSError:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+            return None
+
+    async def _remove_pids_cgroup(self, path: Path | None) -> None:
+        if path is None:
+            return
+        for _ in range(5):
+            try:
+                path.rmdir()
+                return
+            except OSError:
+                await asyncio.sleep(0.01)
+        logger.warning("[Subprocess] Failed to remove sandbox pids cgroup {}", path)
 
     def _build_bwrap_command(
         self,
@@ -446,6 +487,7 @@ class SubprocessBackend(BaseSandboxBackend):
         
         # Write code to temp file
         script_path = work_path / f"_exec_tmp{ext}"
+        pids_cgroup_path: Path | None = None
 
         try:
             script_path.write_text(code, encoding="utf-8")
@@ -481,12 +523,17 @@ class SubprocessBackend(BaseSandboxBackend):
                 )
             else:
                 self._ensure_workspace_venv(venv_path)
-                sandbox_command = [
-                    "/usr/bin/prlimit",
-                    "--nproc=32:32",
-                    "--",
-                    *self._build_command(language, f"/workspace/{script_path.name}"),
-                ]
+                pids_cgroup_path = self._prepare_pids_cgroup()
+                sandbox_command = self._build_command(language, f"/workspace/{script_path.name}")
+                if pids_cgroup_path is None:
+                    # Portable fallback for runtimes without a writable cgroup-v1
+                    # pids controller. The standard process ceiling is unchanged.
+                    sandbox_command = [
+                        "/usr/bin/prlimit",
+                        f"--nproc={SANDBOX_PROCESS_LIMIT}:{SANDBOX_PROCESS_LIMIT}",
+                        "--",
+                        *sandbox_command,
+                    ]
                 bwrap_command = self._build_bwrap_command(
                     sandbox_command,
                     work_path,
@@ -528,6 +575,7 @@ class SubprocessBackend(BaseSandboxBackend):
                             use_preexec=True,
                             chroot_workspace=False,
                             apply_nproc_limit=False,
+                            pids_cgroup_path=pids_cgroup_path,
                         ),
                     )
 
@@ -605,6 +653,7 @@ class SubprocessBackend(BaseSandboxBackend):
             )
 
         finally:
+            await self._remove_pids_cgroup(pids_cgroup_path)
             # Clean up temp script
             try:
                 script_path.unlink(missing_ok=True)
