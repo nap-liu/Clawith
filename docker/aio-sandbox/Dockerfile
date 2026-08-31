@@ -16,7 +16,7 @@ COPY mcp_client.py /opt/python3.12/lib/python3.12/site-packages/app/services/mcp
 # Patch 3: make the generated mcp-hub.json writable by the `gem` API user so
 # Clawith can register stdio MCP servers at runtime via the sandbox API
 # (the only change vs upstream run.sh is one `chmod 666` after it generates the file).
-COPY run.sh /opt/gem/run.sh
+COPY run.sh run_gost_proxy.sh /opt/gem/
 RUN chmod +x /opt/gem/run.sh
 # Patch 4: stop masking real tool errors. The tool-call REST endpoint caught any
 # exception and returned a generic "Failed to execute tool" 500 while logging the
@@ -29,8 +29,8 @@ COPY mcp.py /opt/python3.12/lib/python3.12/site-packages/app/api/v1/mcp.py
 # foreground process group while keeping the stateful tmux shell and prior
 # background jobs. Explicit session close also reaps all processes still
 # attached to the pane's Linux process session, including resistant children.
-COPY bash.py /opt/python3.12/lib/python3.12/site-packages/vendors/openhands/runtime/utils/bash.py
-COPY shell.py /opt/python3.12/lib/python3.12/site-packages/app/api/v1/shell.py
+COPY bash.py bash_parse.py bash_process.py /opt/python3.12/lib/python3.12/site-packages/vendors/openhands/runtime/utils/
+COPY shell.py shell_sessions.py /opt/python3.12/lib/python3.12/site-packages/app/api/v1/
 # Patch 7: make the Jupyter timeout an absolute execution deadline. Interrupt
 # the active cell when it expires and reset only that kernel when it does not
 # return to idle within the grace period.

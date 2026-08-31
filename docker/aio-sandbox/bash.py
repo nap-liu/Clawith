@@ -5,12 +5,25 @@ import shlex
 import signal
 import tempfile
 import time
-import uuid
 from enum import Enum
 
-import bashlex
 import libtmux
 
+from vendors.openhands.runtime.utils.bash_parse import (
+    build_tmux_session_name,
+    escape_bash_special_chars,
+    remove_command_prefix,
+    split_bash_commands,
+)
+from vendors.openhands.runtime.utils.bash_process import (
+    pane_shell_pid,
+    read_process_stat,
+    session_process_ids,
+    signal_process_session,
+    terminate_foreground_process_group,
+    wait_for_process_session_exit,
+    wait_for_prompt,
+)
 from vendors.openhands.core.logger import openhands_logger as logger
 from vendors.openhands.events.action import CmdRunAction
 from vendors.openhands.events.observation import ErrorObservation
@@ -33,79 +46,6 @@ SU_TO_USER = os.getenv('SU_TO_USER', 'true').lower() in (
     'on',
 )
 
-
-def split_bash_commands(commands: str) -> list[str]:
-    if not commands.strip():
-        return ['']
-    try:
-        parsed = bashlex.parse(commands)
-    except (
-        bashlex.errors.ParsingError,
-        NotImplementedError,
-        TypeError,
-        AttributeError,
-    ):
-        # Added AttributeError to catch 'str' object has no attribute 'kind' error (issue #8369)
-        logger.debug(
-            f'Failed to parse bash commands\n'
-            f'[input]: {commands}\n'
-            f'The original command will be returned as is.',
-            exc_info=True,
-        )
-        # If parsing fails, return the original commands
-        return [commands]
-
-    result: list[str] = []
-    last_end = 0
-
-    for node in parsed:
-        start, end = node.pos
-
-        # Include any text between the last command and this one
-        if start > last_end:
-            between = commands[last_end:start]
-            logger.debug(f'BASH PARSING between: {between}')
-            if result:
-                result[-1] += between.rstrip()
-            elif between.strip():
-                # THIS SHOULD NOT HAPPEN
-                result.append(between.rstrip())
-
-        # Extract the command, preserving original formatting
-        command = commands[start:end].rstrip()
-        logger.debug(f'BASH PARSING command: {command}')
-        result.append(command)
-
-        last_end = end
-
-    # Add any remaining text after the last command to the last command
-    remaining = commands[last_end:].rstrip()
-    logger.debug(f'BASH PARSING remaining: {remaining}')
-    if last_end < len(commands) and result:
-        result[-1] += remaining
-        logger.debug(f'BASH PARSING result[-1] += remaining: {result[-1]}')
-    elif last_end < len(commands):
-        if remaining:
-            result.append(remaining)
-            logger.debug(f'BASH PARSING result.append(remaining): {result[-1]}')
-    return result
-
-
-def escape_bash_special_chars(command: str) -> str:
-    r"""Returns the command as-is without modification.
-
-    Previously this function attempted to escape special characters like \;, \|, \&
-    for the difference between Python string escaping and bash escaping. However,
-    this caused a bug where already-escaped characters in user commands (e.g., \&
-    to escape an ampersand in a filename) would be double-escaped to \\&, causing
-    bash to interpret & as a background process operator instead of a literal character.
-
-    When users send commands via the API, they are expected to provide properly
-    formatted bash commands. No additional escaping is needed.
-    """
-    return command
-
-
 # Threshold (in bytes) above which commands are written to a temp file
 # instead of being sent directly via tmux send_keys.  tmux has an input
 # buffer limit (~1024-2048 bytes depending on version) that causes long
@@ -118,23 +58,6 @@ class BashCommandStatus(Enum):
     COMPLETED = 'completed'
     NO_CHANGE_TIMEOUT = 'no_change_timeout'
     HARD_TIMEOUT = 'hard_timeout'
-
-
-def _remove_command_prefix(command_output: str, command: str) -> str:
-    return command_output.lstrip().removeprefix(command.lstrip()).lstrip()
-
-
-def _build_tmux_session_name(username: str | None) -> str:
-    """Build a tmux-safe session name.
-
-    tmux session names cannot contain periods or colons, so sanitize the
-    username portion before constructing the internal session name while
-    keeping the original separators distinguishable in logs.
-    """
-    username_part = username or 'user'
-    username_part = username_part.replace(':', '__').replace('.', '_')
-    return f'openhands-{username_part}-{uuid.uuid4()}'
-
 
 class BashSession:
     # Adaptive polling strategy:
@@ -210,7 +133,7 @@ class BashSession:
         logger.debug(
             f'Initializing bash session in {self.work_dir} with command: {window_command}'
         )
-        session_name = _build_tmux_session_name(self.username)
+        session_name = build_tmux_session_name(self.username)
         self.session = self.server.new_session(
             session_name=session_name,
             start_directory=self.work_dir,  # This parameter is supported by libtmux
@@ -278,176 +201,14 @@ class BashSession:
         )
         return content
 
-    def _pane_shell_pid(self) -> int | None:
-        """Return the shell PID that owns this tmux pane."""
-        try:
-            output = self.pane.cmd(
-                'display-message', '-p', '#{pane_pid}'
-            ).stdout
-            if not output:
-                return None
-            pid = int(output[0].strip())
-            return pid if pid > 1 else None
-        except Exception:
-            logger.warning('Unable to read tmux pane PID', exc_info=True)
-            return None
-
-    @staticmethod
-    def _read_process_stat(pid: int) -> tuple[str, int, int, int, int] | None:
-        """Return (state, ppid, pgrp, session, tpgid) from Linux /proc."""
-        try:
-            raw = pathlib.Path(f'/proc/{pid}/stat').read_text()
-            # comm is parenthesized and may contain spaces or parentheses, so
-            # split only after its final closing parenthesis.
-            fields = raw[raw.rfind(')') + 2 :].split()
-            return (
-                fields[0],
-                int(fields[1]),
-                int(fields[2]),
-                int(fields[3]),
-                int(fields[5]),
-            )
-        except (FileNotFoundError, IndexError, ValueError, OSError):
-            return None
-
-    @classmethod
-    def _process_group_exists(cls, pgid: int) -> bool:
-        # killpg(pgid, 0) also reports true for a group containing only
-        # zombies. Those processes have already stopped executing and merely
-        # await bash's wait/reap cycle, so only non-Z members count as alive.
-        for entry in pathlib.Path('/proc').iterdir():
-            if not entry.name.isdigit():
-                continue
-            stat = cls._read_process_stat(int(entry.name))
-            if stat is not None and stat[2] == pgid and stat[0] != 'Z':
-                return True
-        return False
-
-    def _wait_for_foreground_release(
-        self, shell_pid: int, foreground_pgid: int, timeout: float
-    ) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            stat = self._read_process_stat(shell_pid)
-            if stat is None or stat[4] != foreground_pgid:
-                return True
-            time.sleep(0.025)
-        stat = self._read_process_stat(shell_pid)
-        return stat is None or stat[4] != foreground_pgid
-
-    def _wait_for_prompt(self, timeout: float) -> str | None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            content = self._get_pane_content()
-            if content.rstrip().endswith(CMD_OUTPUT_PS1_END.rstrip()):
-                return content
-            time.sleep(0.025)
-        return None
-
-    def _terminate_foreground_process_group(self) -> int:
-        """Kill only the command currently in the pane foreground.
-
-        The tmux shell and previously launched background jobs stay alive.
-        Linux job control exposes the foreground process group as tpgid on
-        the pane shell's /proc stat entry, which lets us terminate pipelines
-        and child trees as one unit without destroying the stateful shell.
-        """
-        shell_pid = self._pane_shell_pid()
-        if shell_pid is None:
-            raise RuntimeError('cannot determine tmux pane shell PID')
-
-        stat = self._read_process_stat(shell_pid)
-        if stat is None:
-            raise RuntimeError(f'tmux pane shell {shell_pid} disappeared')
-        shell_pgid = stat[2]
-        foreground_pgid = stat[4]
-        if foreground_pgid <= 1:
-            raise RuntimeError(
-                'cannot identify the foreground command process group '
-                f'(shell_pid={shell_pid}, shell_pgid={shell_pgid}, '
-                f'tpgid={foreground_pgid})'
-            )
-        if foreground_pgid == shell_pgid:
-            # A sourced shell builtin executes in bash itself, so killing this
-            # process group would destroy session state and background jobs.
-            # Interactive bash normally handles Ctrl-C by aborting the builtin
-            # and returning to its prompt.
-            self.pane.send_keys('C-c', enter=False)
-            if self._wait_for_prompt(self.PROCESS_KILL_WAIT_SECONDS) is not None:
-                return foreground_pgid
-            raise RuntimeError(
-                f'shell builtin in process group {shell_pgid} ignored Ctrl-C'
-            )
-
-        released = False
-        for sig, grace in (
-            (signal.SIGINT, self.PROCESS_SIGNAL_GRACE_SECONDS),
-            (signal.SIGTERM, self.PROCESS_SIGNAL_GRACE_SECONDS),
-            (signal.SIGKILL, self.PROCESS_KILL_WAIT_SECONDS),
-        ):
-            if not self._process_group_exists(foreground_pgid):
-                released = True
-                break
-            try:
-                os.killpg(foreground_pgid, sig)
-            except ProcessLookupError:
-                released = True
-                break
-            released = self._wait_for_foreground_release(
-                shell_pid, foreground_pgid, grace
-            )
-            if released:
-                break
-
-        if not released or self._process_group_exists(foreground_pgid):
-            raise RuntimeError(
-                f'foreground process group {foreground_pgid} survived SIGKILL'
-            )
-        return foreground_pgid
-
-    @classmethod
-    def _session_process_ids(cls, process_session_id: int) -> list[int]:
-        pids: list[int] = []
-        for entry in pathlib.Path('/proc').iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            stat = cls._read_process_stat(pid)
-            if (
-                stat is not None
-                and stat[3] == process_session_id
-                and stat[0] != 'Z'
-            ):
-                pids.append(pid)
-        return pids
-
-    @classmethod
-    def _signal_process_session(cls, process_session_id: int, sig: int) -> None:
-        for pid in cls._session_process_ids(process_session_id):
-            try:
-                os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError):
-                continue
-
-    @classmethod
-    def _wait_for_process_session_exit(
-        cls, process_session_id: int, timeout: float
-    ) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not cls._session_process_ids(process_session_id):
-                return True
-            time.sleep(0.025)
-        return not cls._session_process_ids(process_session_id)
-
     def close(self) -> None:
         """Clean up the tmux session and all processes attached to its SID."""
         if not hasattr(self, '_closed') or self._closed:
             return
-        shell_pid = self._pane_shell_pid()
+        shell_pid = pane_shell_pid(self.pane)
         process_session_id = None
         if shell_pid is not None:
-            stat = self._read_process_stat(shell_pid)
+            stat = read_process_stat(shell_pid)
             process_session_id = stat[3] if stat is not None else None
         # Clean up any leftover temp command files (from long command execution)
         self._cleanup_temp_command_files()
@@ -457,18 +218,18 @@ class BashSession:
             except Exception:
                 logger.warning('Failed to kill tmux session', exc_info=True)
         if process_session_id is not None:
-            self._signal_process_session(process_session_id, signal.SIGTERM)
-            if not self._wait_for_process_session_exit(
+            signal_process_session(process_session_id, signal.SIGTERM)
+            if not wait_for_process_session_exit(
                 process_session_id, self.PROCESS_SIGNAL_GRACE_SECONDS
             ):
-                self._signal_process_session(process_session_id, signal.SIGKILL)
-                if not self._wait_for_process_session_exit(
+                signal_process_session(process_session_id, signal.SIGKILL)
+                if not wait_for_process_session_exit(
                     process_session_id, self.PROCESS_KILL_WAIT_SECONDS
                 ):
                     logger.error(
                         'Processes survived tmux session cleanup: sid=%s pids=%s',
                         process_session_id,
-                        self._session_process_ids(process_session_id),
+                        session_process_ids(process_session_id),
                     )
         self._closed = True
 
@@ -548,7 +309,7 @@ class BashSession:
         else:
             command_output = raw_command_output
         self.prev_output = raw_command_output  # update current command output anyway
-        command_output = _remove_command_prefix(command_output, command)
+        command_output = remove_command_prefix(command_output, command)
         return command_output.rstrip()
 
     def _handle_completed_command(
@@ -657,13 +418,20 @@ class BashSession:
         )
         session_reset = False
         try:
-            foreground_pgid = self._terminate_foreground_process_group()
+            foreground_pgid = terminate_foreground_process_group(
+                self.pane,
+                self.PROCESS_SIGNAL_GRACE_SECONDS,
+                self.PROCESS_KILL_WAIT_SECONDS,
+                self._get_pane_content,
+            )
             logger.info(
                 'Terminated foreground process group %s after hard timeout',
                 foreground_pgid,
             )
             # Do not publish HARD_TIMEOUT until bash has rendered its prompt.
-            settled_content = self._wait_for_prompt(self.PROCESS_KILL_WAIT_SECONDS)
+            settled_content = wait_for_prompt(
+                self._get_pane_content, self.PROCESS_KILL_WAIT_SECONDS
+            )
             if settled_content is None:
                 raise RuntimeError('bash did not regain its prompt after termination')
             pane_content = settled_content
