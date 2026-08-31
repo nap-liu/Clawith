@@ -4,6 +4,7 @@ from app.services.project_service_shared import *  # noqa: F403
 from app.services.project_service_access import *  # noqa: F403
 from app.services.project_service_access import _tenant_id
 from app.services.project_service_membership import *  # noqa: F403
+from app.services.project_service_membership import _resolve_capability
 
 async def _validate_project_create_inputs(
     db: AsyncSession,
