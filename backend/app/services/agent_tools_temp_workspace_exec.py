@@ -22,6 +22,7 @@ from app.services.agent_tools import (
     _jina_search,
     _publish_skill_to_market,
     _read_webpage,
+    _remove_contact_tool,
     _resolve_storage_source_path,
     _send_feishu_message,
     _sql_execute,
