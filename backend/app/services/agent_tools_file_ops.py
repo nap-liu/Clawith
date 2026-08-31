@@ -17,7 +17,8 @@ def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = rel_path[len("enterprise_info"):].lstrip("/")
+        # Remap: enterprise_info/... → enterprise_info_{tenant_id}/...
+        sub = rel_path[len("enterprise_info") :].lstrip("/")
         target = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(target).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -31,6 +32,7 @@ def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
         return f"Directory not found: {rel_path or '/'}"
 
     items = []
+    # If listing root, also show enterprise_info entry
     if not rel_path:
         if tenant_id:
             enterprise_dir = WORKSPACE_ROOT / f"enterprise_info_{tenant_id}"
@@ -51,7 +53,10 @@ def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
         elif p.is_file():
             file_count += 1
             size_bytes = p.stat().st_size
-            size_str = f"{size_bytes}B" if size_bytes < 1024 else f"{size_bytes / 1024:.1f}KB"
+            if size_bytes < 1024:
+                size_str = f"{size_bytes}B"
+            else:
+                size_str = f"{size_bytes / 1024:.1f}KB"
             items.append(f"  📄 {p.name} ({size_str})")
 
     if not items:
@@ -62,6 +67,18 @@ def _list_files(ws: Path, rel_path: str, tenant_id: str | None = None) -> str:
 
 
 def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: int = 0, limit: int = 2000) -> str:
+    """Read file contents with optional line range support.
+
+    Args:
+        ws: Workspace root path
+        rel_path: Relative file path
+        tenant_id: Optional tenant ID for enterprise_info
+        offset: Starting line number (0-indexed)
+        limit: Maximum number of lines to read
+
+    Returns:
+        File content with line numbers, or error message
+    """
     try:
         file_path = _resolve_tool_source_path(ws, rel_path, tenant_id=tenant_id)
     except ValueError as exc:
@@ -74,6 +91,8 @@ def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: in
         content = file_path.read_text(encoding="utf-8", errors="replace")
         lines = content.splitlines()
         total_lines = len(lines)
+
+        # Apply offset and limit
         start = max(0, offset)
         end = min(total_lines, start + limit)
 
@@ -81,10 +100,19 @@ def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: in
             return f"Offset {offset} exceeds file length ({total_lines} lines total)"
 
         selected_lines = lines[start:end]
-        result = [f"{i + 1:6}\t{line}" for i, line in enumerate(selected_lines, start=start)]
+
+        # Format with line numbers (like cat -n)
+        result = []
+        for i, line in enumerate(selected_lines, start=start):
+            result.append(f"{i + 1:6}\t{line}")
+
         output = "\n".join(result)
+
+        # Add pagination info if file is larger than what we show
         if total_lines > end:
             output += f"\n\n... [{total_lines - end} more lines not shown, lines {end + 1}-{total_lines}]"
+
+        # Add header with file info
         header = f"📄 {rel_path} (lines {start + 1}-{end} of {total_lines})\n"
         return header + output
     except Exception as e:
@@ -140,8 +168,9 @@ def _delete_file(ws: Path, rel_path: str) -> str:
 
             shutil.rmtree(file_path)
             return f"✅ Deleted directory {rel_path}"
-        file_path.unlink()
-        return f"✅ Deleted {rel_path}"
+        else:
+            file_path.unlink()
+            return f"✅ Deleted {rel_path}"
     except Exception as e:
         return f"Delete failed: {e}"
 
@@ -149,15 +178,29 @@ def _delete_file(ws: Path, rel_path: str) -> str:
 def _edit_file(
     ws: Path, rel_path: str, old_string: str, new_string: str, replace_all: bool = False, tenant_id: str | None = None
 ) -> str:
+    """Perform surgical string replacement in a file.
+
+    Args:
+        ws: Workspace root path
+        rel_path: Relative file path
+        old_string: Exact text to find and replace
+        new_string: Replacement text
+        replace_all: Replace all occurrences if True
+        tenant_id: Optional tenant ID for enterprise_info
+
+    Returns:
+        Success message or error
+    """
     if _is_enterprise_info_path(rel_path):
         return "enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
 
+    # Handle enterprise_info/ as shared directory (tenant-scoped)
     if rel_path and rel_path.startswith("enterprise_info"):
         if tenant_id:
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = rel_path[len("enterprise_info"):].lstrip("/")
+        sub = rel_path[len("enterprise_info") :].lstrip("/")
         file_path = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(file_path).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -168,11 +211,13 @@ def _edit_file(
 
     if not file_path.exists():
         return f"File not found: {rel_path}"
+
     if not file_path.is_file():
         return f"Not a file: {rel_path}"
 
     try:
         content = file_path.read_text(encoding="utf-8")
+
         if old_string not in content:
             return f"❌ 'old_string' not found in {rel_path}. Please check the exact text including whitespace and newlines."
 
@@ -180,6 +225,7 @@ def _edit_file(
             new_content = content.replace(old_string, new_string)
             count = content.count(old_string)
         else:
+            # Ensure uniqueness for single replacement
             count = content.count(old_string)
             if count > 1:
                 return f"❌ 'old_string' appears {count} times in {rel_path}. Use replace_all=true or provide more context to make the match unique."
@@ -200,12 +246,26 @@ def _search_files(
     ignore_case: bool = False,
     tenant_id: str | None = None,
 ) -> str:
+    """Search for content patterns across files using regex.
+
+    Args:
+        ws: Workspace root path
+        pattern: Regex pattern to search for
+        path: Directory to search in (relative to workspace root)
+        file_pattern: File pattern to match (glob)
+        ignore_case: Case-insensitive search
+        tenant_id: Optional tenant ID for enterprise_info
+
+    Returns:
+        Matching lines with file paths and line numbers
+    """
+    # Handle enterprise_info/ as shared directory (tenant-scoped)
     if path and path.startswith("enterprise_info"):
         if tenant_id:
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = path[len("enterprise_info"):].lstrip("/")
+        sub = path[len("enterprise_info") :].lstrip("/")
         search_path = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(search_path).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -229,11 +289,28 @@ def _search_files(
     total_matches = 0
     files_searched = 0
 
+    # Use rglob for recursive search
     for file_path in search_path.rglob(file_pattern):
-        if not file_path.is_file() or file_path.name.startswith("."):
+        if not file_path.is_file():
             continue
-        if file_path.suffix.lower() in {
-            ".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".tar", ".gz",
+        # Skip hidden files and common binary/extensions
+        if file_path.name.startswith("."):
+            continue
+        suffix = file_path.suffix.lower()
+        if suffix in {
+            ".pyc",
+            ".pyo",
+            ".so",
+            ".dll",
+            ".exe",
+            ".bin",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".zip",
+            ".tar",
+            ".gz",
         }:
             continue
 
@@ -243,9 +320,11 @@ def _search_files(
             for i, line in enumerate(content.splitlines(), 1):
                 if regex.search(line):
                     rel_path = file_path.relative_to(ws_for_relative)
-                    results.append(f"{rel_path}:{i}: {line.strip()[:100]}")
+                    # Truncate long lines
+                    display_line = line.strip()[:100]
+                    results.append(f"{rel_path}:{i}: {display_line}")
                     total_matches += 1
-                    if len(results) >= 50:
+                    if len(results) >= 50:  # Limit results per query
                         break
         except Exception:
             continue
@@ -256,19 +335,36 @@ def _search_files(
     if not results:
         return f"No matches found for pattern '{pattern}' in {files_searched} file(s)"
 
+    # Warn the LLM if results were capped so it knows to refine the search.
     truncated = total_matches > len(results)
-    truncation_note = f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)" if truncated else ""
-    header = f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) for pattern '{pattern}'{truncation_note}:\n"
+    truncation_note = (
+        f" (showing first {len(results)} of {total_matches}+ — refine pattern or path for more)" if truncated else ""
+    )
+    header = (
+        f"🔍 Found {total_matches}+ match(es) in {files_searched} file(s) for pattern '{pattern}'{truncation_note}:\n"
+    )
     return header + "\n".join(results)
 
 
 def _find_files(ws: Path, pattern: str, path: str = ".", tenant_id: str | None = None) -> str:
+    """Find files matching glob patterns.
+
+    Args:
+        ws: Workspace root path
+        pattern: Glob pattern to match files
+        path: Base directory for search (relative to workspace root)
+        tenant_id: Optional tenant ID for enterprise_info
+
+    Returns:
+        List of matching files with sizes
+    """
+    # Handle enterprise_info/ as shared directory (tenant-scoped)
     if path and path.startswith("enterprise_info"):
         if tenant_id:
             enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
         else:
             enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
-        sub = path[len("enterprise_info"):].lstrip("/")
+        sub = path[len("enterprise_info") :].lstrip("/")
         search_path = (enterprise_root / sub).resolve() if sub else enterprise_root
         if not str(search_path).startswith(str(enterprise_root)):
             return "Access denied for this path"
@@ -290,12 +386,13 @@ def _find_files(ws: Path, pattern: str, path: str = ".", tenant_id: str | None =
     if not matches:
         return f"No files matching pattern: {pattern}"
 
+    # Sort by modification time (most recent first)
     matches.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
     results = []
     dir_count = 0
     file_count = 0
 
-    for m in matches[:100]:
+    for m in matches[:100]:  # Limit to 100 results
         rel_path = m.relative_to(ws_for_relative)
         if m.is_dir():
             dir_count += 1
