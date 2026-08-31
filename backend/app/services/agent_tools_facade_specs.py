@@ -100,7 +100,7 @@ MAIN_FACADE_SPECS: tuple[FacadeSpec, ...] = (
         _send_teams_channel_message _send_wechat_channel_message
         _send_wecom_message append_delivery_part register_delivery
         prepare_group_user_mentions deliver_message_with_receipt
-        sanitize_user_visible_text
+        resolve_human_channel_recipient sanitize_user_visible_text
         """,
     ),
     _spec(
