@@ -72,8 +72,80 @@ from app.services.agent_tools_a2a_messaging import _send_message_to_agent
 from app.services.agent_tools_execute_tool_preflight import ExecuteToolDispatchContext
 from app.services.agent_tools_temp_workspace_exec import _CODE_EXEC_TOOL_NAMES, _execute_workspace_mutation, _run_with_temp_workspace
 
+_ROOT_TOOL_SYMBOLS = (
+    "MEDIA_TOOL_MAX_FILE_BYTES",
+    "TOOL_MATERIALIZE_MAX_FILE_BYTES",
+    "TOOL_MATERIALIZE_MAX_TOTAL_BYTES",
+    "_add_contact_tool",
+    "_agent_workspace_root",
+    "_bing_search_tool",
+    "_convert_csv_to_xlsx",
+    "_convert_html_to_pdf",
+    "_convert_html_to_pptx",
+    "_convert_markdown_to_docx",
+    "_convert_markdown_to_pdf",
+    "_describe_media_delivery_result",
+    "_discover_resources",
+    "_duckduckgo_search_tool",
+    "_exa_search",
+    "_execute_code",
+    "_generate_image",
+    "_get_dingtalk_channel_provisioning_status_tool",
+    "_google_search_tool",
+    "_handle_cancel_trigger",
+    "_handle_list_triggers",
+    "_handle_set_trigger",
+    "_handle_update_trigger",
+    "_import_mcp_server",
+    "_jina_read",
+    "_jina_search",
+    "_manage_tasks",
+    "_media_materialization_size_error",
+    "_non_empty_paths",
+    "_plaza_add_comment",
+    "_plaza_create_post",
+    "_plaza_get_new_posts",
+    "_read_document_from_storage",
+    "_read_webpage",
+    "_remove_contact_tool",
+    "_replay_terminal_media_delivery",
+    "_resolve_storage_source_path",
+    "_search_contacts_tool",
+    "_send_channel_file",
+    "_send_channel_media",
+    "_send_channel_message",
+    "_send_feishu_message",
+    "_send_group_session_message",
+    "_send_platform_message",
+    "_send_session_message",
+    "_sql_execute",
+    "_start_dingtalk_channel_provisioning_tool",
+    "_storage_find_files",
+    "_storage_list_dir",
+    "_storage_read_file",
+    "_storage_search_files",
+    "_tavily_search_tool",
+    "_upload_image",
+    "_web_search",
+    "complete_focus_item",
+    "get_storage_backend",
+    "is_focus_file_path",
+    "list_focus_items",
+    "logger",
+    "recall_message",
+    "upsert_focus_item",
+)
+
+
+def _sync_root_tool_symbols() -> None:
+    from app.services import agent_tools as _agent_tools_root
+
+    for _name in _ROOT_TOOL_SYMBOLS:
+        globals()[_name] = getattr(_agent_tools_root, _name)
+
 
 async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str | None:
+    _sync_root_tool_symbols()
     tool_name = state.tool_name
     arguments = state.arguments
     agent_id = state.agent_id

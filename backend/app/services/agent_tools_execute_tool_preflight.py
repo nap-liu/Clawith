@@ -31,6 +31,21 @@ from app.services.user_project_tools import (
     user_project_tool_error,
 )
 
+_ROOT_TOOL_SYMBOLS = (
+    "_FORCED_AUTONOMY_LEVELS",
+    "_TOOL_AUTONOMY_MAP",
+    "_agent_workspace_root",
+    "_find_outbound_tool_receipt",
+    "_get_agent_tenant_id",
+)
+
+
+def _sync_root_tool_symbols() -> None:
+    from app.services import agent_tools as _agent_tools_root
+
+    for _name in _ROOT_TOOL_SYMBOLS:
+        globals()[_name] = getattr(_agent_tools_root, _name)
+
 
 @dataclass
 class ExecuteToolDispatchContext:
@@ -77,6 +92,7 @@ async def execute_tool_preflight(
                     actions ignore ordinary ``skip_autonomy`` callers and honor
                     this marker only after a durable approval resolution.
     """
+    _sync_root_tool_symbols()
     if not isinstance(tool_name, str):
         tool_name = str(tool_name or "")
     tool_name = (
