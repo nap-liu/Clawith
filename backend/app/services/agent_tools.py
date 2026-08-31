@@ -148,6 +148,7 @@ from app.services import agent_tools_media_delivery_support as _agent_tools_medi
 from app.services import agent_tools_outbound_core as _agent_tools_outbound_core_module
 from app.services import agent_tools_plaza_ops as _agent_tools_plaza_ops_module
 from app.services import agent_tools_sandbox_web_ops as _agent_tools_sandbox_web_ops_module
+from app.services import agent_tools_trigger_ops as _agent_tools_trigger_ops_module
 from app.services import agent_tools_web_ops as _agent_tools_web_ops_module
 from app.services.agent_tools_facade import (
     export_module_symbols,
@@ -488,6 +489,19 @@ _FEISHU_AUTH_SYNC_NAMES = (
     "select",
     *_FEISHU_AUTH_EXPORT_NAMES,
 )
+_TRIGGER_OPS_SYNC_NAMES = (
+    "async_session",
+    "logger",
+    "select",
+    "ensure_focus_item",
+    "RecipientResolutionError",
+    "resolve_agent_recipient",
+    "resolve_platform_user_recipient",
+    "_handle_set_trigger",
+    "_handle_update_trigger",
+    "_handle_cancel_trigger",
+    "_handle_list_triggers",
+)
 
 
 async def _deploy_ops_get_tool_config_proxy(*args, **kwargs):
@@ -610,6 +624,11 @@ register_sync_targets(
     __name__,
     (_agent_tools_feishu_auth_module,),
     _FEISHU_AUTH_SYNC_NAMES,
+)
+register_sync_targets(
+    __name__,
+    (_agent_tools_trigger_ops_module,),
+    _TRIGGER_OPS_SYNC_NAMES,
 )
 
 
