@@ -191,3 +191,46 @@ def _format_sql_result(columns: list, rows: list, truncated: bool, max_rows: int
             f"或加 WHERE/LIMIT 缩小范围;确需更多明细可传 max_rows(上限 {HARD_SQL_MAX_ROWS},当前 {max_rows})。"
         )
     return result
+
+
+async def _sql_execute(arguments: dict) -> str:
+    """Execute SQL on any database via connection URI.
+
+    Parses and clamps max_rows (default DEFAULT_SQL_MAX_ROWS, hard ceiling HARD_SQL_MAX_ROWS)
+    and resolves max_bytes (env-overridable, hard ceiling HARD_SQL_MAX_BYTES), then passes both
+    through to the DB-specific backend so that streaming and dual-limit enforcement are active
+    for every engine.
+    """
+    import asyncio
+
+    connection_string = arguments.get("connection_string", "").strip()
+    sql = arguments.get("sql", "").strip()
+    timeout = min(int(arguments.get("timeout", 30)), 120)
+    max_rows = _clamp_sql_max_rows(arguments.get("max_rows", DEFAULT_SQL_MAX_ROWS))
+    max_bytes = _resolve_sql_max_bytes()
+
+    if not connection_string:
+        return "❌ Missing required argument 'connection_string'"
+    if not sql:
+        return "❌ Missing required argument 'sql'"
+
+    uri_lower = connection_string.lower()
+    try:
+        if uri_lower.startswith("sqlite"):
+            return await asyncio.wait_for(
+                _sql_execute_sqlite(connection_string, sql, max_rows, max_bytes), timeout=timeout
+            )
+        elif uri_lower.startswith("mysql"):
+            return await asyncio.wait_for(
+                _sql_execute_mysql(connection_string, sql, max_rows, max_bytes), timeout=timeout
+            )
+        elif uri_lower.startswith("postgresql") or uri_lower.startswith("postgres"):
+            return await asyncio.wait_for(
+                _sql_execute_postgres(connection_string, sql, max_rows, max_bytes), timeout=timeout
+            )
+        else:
+            return "❌ Unsupported database type. Supported: mysql://, postgresql://, sqlite:///"
+    except asyncio.TimeoutError:
+        return f"❌ Query timed out after {timeout}s"
+    except Exception as e:
+        return f"❌ Database error: {type(e).__name__}: {str(e)[:500]}"
