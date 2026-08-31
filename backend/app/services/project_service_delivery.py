@@ -18,9 +18,6 @@ def apply_run_status(run: ProjectRun, status: str) -> None:
         run.finished_at = now
 
 
-TERMINAL_PROJECT_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
-
-
 def reconcile_project_run_terminal_state(run: ProjectRun) -> bool:
     """Repair the durable invariant ``finished_at => terminal status``.
 

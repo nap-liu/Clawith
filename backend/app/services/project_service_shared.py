@@ -42,6 +42,7 @@ from app.services.project_capability_options import load_project_capability_opti
 PROJECT_EVENT_SUMMARY_MAX_LENGTH = 500
 PROJECT_RUNTIME_STATUS_RUNNING = "running"
 PROJECT_RUNTIME_STATUS_PAUSED = "paused"
+TERMINAL_PROJECT_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 PROJECT_CONVERSATION_STATUSES = frozenset(
     {
         "planning",
