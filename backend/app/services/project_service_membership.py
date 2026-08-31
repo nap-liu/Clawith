@@ -2,6 +2,10 @@
 
 from app.services.project_service_shared import *  # noqa: F403
 from app.services.project_service_access import *  # noqa: F403
+from app.services.project_service_access import (
+    _is_company_project_admin,
+    _is_platform_project_admin,
+)
 
 def add_event(
     db: AsyncSession,
