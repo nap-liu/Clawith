@@ -304,4 +304,3 @@ async def test_agent_creation_skill_ids_are_scoped_and_market_skills_are_rejecte
                 tenant_id=tenant_a.id,
                 skill_ids=[public_market.id],
             )
-
