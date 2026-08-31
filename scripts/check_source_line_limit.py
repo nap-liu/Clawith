@@ -11,6 +11,25 @@ from pathlib import Path
 
 MAX_SOURCE_LINES = 800
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOTS = ("backend", "frontend", "scripts")
+SOURCE_SUFFIXES = {
+    ".py",
+    ".pyi",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".mts",
+    ".cts",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".sh",
+    ".sql",
+}
 
 
 @dataclass(frozen=True)
@@ -80,22 +99,31 @@ def _text_line_count(path: Path) -> int | None:
     return content.count(b"\n") + (0 if content.endswith(b"\n") else 1)
 
 
+def _is_handwritten_source(relative: str) -> bool:
+    path = Path(relative)
+    if not path.parts or path.parts[0] not in SOURCE_ROOTS:
+        return False
+    return path.suffix in SOURCE_SUFFIXES
+
+
 def main() -> int:
     violations: list[tuple[str, int]] = []
     applied_exemptions: list[tuple[str, int, str]] = []
-    scanned_text_files = 0
+    scanned_source_files = 0
 
     for path in _repository_files():
         if not path.is_file() or path.is_symlink():
             continue
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        if not _is_handwritten_source(relative):
+            continue
         line_count = _text_line_count(path)
         if line_count is None:
             continue
-        scanned_text_files += 1
+        scanned_source_files += 1
         if line_count <= MAX_SOURCE_LINES:
             continue
 
-        relative = path.relative_to(REPO_ROOT).as_posix()
         reason = EXPLICIT_EXEMPTIONS.get(relative)
         if reason is not None:
             applied_exemptions.append((relative, line_count, reason))
@@ -103,7 +131,7 @@ def main() -> int:
         violations.append((relative, line_count))
 
     print(
-        f"Scanned {scanned_text_files} tracked/untracked UTF-8 text files; "
+        f"Scanned {scanned_source_files} tracked/untracked hand-written source candidates; "
         f"maximum allowed source length is {MAX_SOURCE_LINES} physical lines."
     )
     if applied_exemptions:
@@ -115,7 +143,7 @@ def main() -> int:
         print("PASS: no non-exempt text file exceeds the source line limit.")
         return 0
 
-    print(f"FAIL: {len(violations)} non-exempt text files exceed {MAX_SOURCE_LINES} lines:")
+    print(f"FAIL: {len(violations)} non-exempt source files exceed {MAX_SOURCE_LINES} lines:")
     for relative, line_count in sorted(violations, key=lambda item: (-item[1], item[0])):
         print(f"  {line_count:6d}  {relative}")
     print(
