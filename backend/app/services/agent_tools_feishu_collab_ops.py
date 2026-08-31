@@ -19,11 +19,6 @@ from app.services.agent_tools_feishu_auth import (
 )
 from app.services.agent_tools_feishu_docs import _feishu_wiki_get_node
 from app.services.recipient_resolver import RecipientResolutionError, resolve_human_channel_recipient
-_ROOT_TOOL_SYMBOLS = ("channel_feishu_sender_open_id",)
-def _sync_root_tool_symbols() -> None:
-    from app.services import agent_tools as _agent_tools_root
-    for _name in _ROOT_TOOL_SYMBOLS:
-        globals()[_name] = getattr(_agent_tools_root, _name)
 async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
     """Manage Feishu drive file collaborators.
     Automatically handles both regular docs/files (Drive permissions API)
@@ -321,7 +316,6 @@ async def _resolve_feishu_open_id(
 
 
 async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
-    _sync_root_tool_symbols()
     import httpx
     import re as _re
     from datetime import timedelta as _td
@@ -478,7 +472,6 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
 
 
 async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
-    _sync_root_tool_symbols()
     import httpx
 
     summary = arguments.get("summary", "").strip()
