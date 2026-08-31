@@ -7,7 +7,7 @@ from app.config import get_settings
 
 async def _search_duckduckgo(query: str, max_results: int) -> str:
     """Search via DuckDuckGo HTML (free, no API key)."""
-    import httpx
+    import httpx, re
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(
@@ -28,7 +28,7 @@ async def _search_duckduckgo(query: str, max_results: int) -> str:
         title = re.sub(r"<[^>]+>", "", title).strip()
         snippet = re.sub(r"<[^>]+>", "", snippet).strip()
         if "uddg=" in url:
-            from urllib.parse import parse_qs, unquote, urlparse
+            from urllib.parse import unquote, parse_qs, urlparse
 
             parsed = parse_qs(urlparse(url).query)
             url = unquote(parsed.get("uddg", [url])[0])
@@ -53,6 +53,8 @@ async def _get_jina_api_key() -> str:
                 return setting.value["api_key"]
     except Exception:
         pass
+    from app.config import get_settings
+
     return get_settings().JINA_API_KEY
 
 
@@ -107,6 +109,7 @@ async def _jina_search(arguments: dict) -> str:
 async def _jina_read(arguments: dict) -> str:
     """Read web page via Jina AI Reader API (r.jina.ai). Returns clean structured markdown."""
     import httpx
+    from app.config import get_settings
 
     url = arguments.get("url", "").strip()
     if not url:
@@ -152,6 +155,7 @@ async def _validate_public_http_url(url: str) -> tuple[str | None, str | None]:
     """Normalize a URL and reject local/private network targets."""
     import ipaddress
     import socket
+    from urllib.parse import urlparse
 
     url = (url or "").strip()
     if not url:
@@ -183,9 +187,7 @@ async def _validate_public_http_url(url: str) -> tuple[str | None, str | None]:
             infos = await loop.run_in_executor(
                 None,
                 lambda: socket.getaddrinfo(
-                    hostname,
-                    parsed.port or (443 if parsed.scheme == "https" else 80),
-                    type=socket.SOCK_STREAM,
+                    hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM
                 ),
             )
             addresses = [info[4][0] for info in infos]
@@ -284,10 +286,10 @@ async def _read_webpage(arguments: dict) -> str:
                 content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
                 encoding = resp.encoding or "utf-8"
 
-        raw = b"".join(chunks)
         if status_code >= 400:
             return f"❌ Webpage fetch failed HTTP {status_code}: {final_url}"
 
+        raw = b"".join(chunks)
         text = raw.decode(encoding, errors="replace").strip()
         if not text:
             return f"❌ Empty response from {final_url}"
