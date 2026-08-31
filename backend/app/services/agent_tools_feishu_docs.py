@@ -10,6 +10,15 @@ from app.services.agent_tools_feishu_auth import (
     _parse_feishu_url,
 )
 
+_ROOT_TOOL_SYMBOLS = ("channel_feishu_sender_open_id",)
+
+
+def _sync_root_tool_symbols() -> None:
+    from app.services import agent_tools as _agent_tools_root
+
+    for _name in _ROOT_TOOL_SYMBOLS:
+        globals()[_name] = getattr(_agent_tools_root, _name)
+
 
 async def _resolve_docx_document_token(agent_id: uuid.UUID, parsed_url: dict) -> str | None:
     doc_token = parsed_url.get("document_token")
@@ -354,6 +363,7 @@ async def _feishu_doc_read(agent_id: uuid.UUID, arguments: dict) -> str:
 
 
 async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
+    _sync_root_tool_symbols()
     title = arguments.get("title", "").strip()
     if not title:
         return "Failed: Missing required argument 'title'"
