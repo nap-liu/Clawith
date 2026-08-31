@@ -1,5 +1,13 @@
 """Agent (Digital Employee) API routes."""
 
+import sys
+import types
+
+from app.api import agent_routes_approvals as _approvals
+from app.api import agent_routes_directory as _directory
+from app.api import agent_routes_lifecycle as _lifecycle
+from app.api import agent_routes_permissions as _permissions
+
 from app.api.agent_api_shared import *  # noqa: F401,F403
 from app.api.agent_routes_directory import *  # noqa: F401,F403
 from app.api.agent_routes_permissions import *  # noqa: F401,F403
@@ -12,3 +20,16 @@ for _compat_name in _COMPAT_SYMBOLS:
     _compat_symbol = globals().get(_compat_name)
     if _compat_symbol is not None:
         _compat_symbol.__module__ = __name__
+
+
+class _AgentApiFacadeModule(types.ModuleType):
+    """Keep historical root-module monkeypatch targets effective."""
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        for implementation in (_directory, _permissions, _lifecycle, _approvals):
+            if hasattr(implementation, name):
+                setattr(implementation, name, value)
+
+
+sys.modules[__name__].__class__ = _AgentApiFacadeModule
