@@ -34,7 +34,7 @@ async def resolve_workspace_agent_impl(
     return agent
 
 
-def runtime_workspace_impl(agent: Agent):
+def runtime_workspace_impl(api: Any, agent: Agent):
     if getattr(agent, "scope", "standard") != "project":
         return api.standard_agent_runtime_workspace(agent.id)
     if agent.project_id is None or agent.tenant_id is None:
