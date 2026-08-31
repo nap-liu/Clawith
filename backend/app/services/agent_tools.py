@@ -353,6 +353,7 @@ from app.services.agent_tools_task_contact_ops import (
 from app.services.agent_tools_trigger_ops import (
     MAX_TRIGGERS_PER_AGENT,
     VALID_TRIGGER_TYPES,
+    _handle_cancel_trigger,
     _handle_list_triggers,
     _handle_set_trigger,
     _handle_update_trigger,
@@ -1672,57 +1673,6 @@ _DANGEROUS_NODE_NETWORK = [
 
 
 
-async def _handle_cancel_trigger(
-    agent_id: uuid.UUID,
-    arguments: dict,
-    *,
-    user_id: uuid.UUID | None = None,
-) -> str:
-    """Cancel (disable) a trigger by name."""
-    from app.models.trigger import AgentTrigger
-
-    name = arguments.get("name", "").strip()
-    if not name:
-        return "❌ Missing required argument 'name'"
-
-    try:
-        async with async_session() as db:
-            result = await db.execute(
-                select(AgentTrigger).where(
-                    AgentTrigger.agent_id == agent_id,
-                    AgentTrigger.name == name,
-                )
-            )
-            trigger = result.scalar_one_or_none()
-            if not trigger:
-                return f"❌ Trigger '{name}' not found"
-            if not trigger.is_enabled:
-                return f"ℹ️ Trigger '{name}' is already disabled"
-
-            if user_id is not None:
-                from app.services.execution_identity import align_background_execution_user
-
-                await align_background_execution_user(
-                    db,
-                    agent_id=agent_id,
-                    resource_type="trigger",
-                    resource_id=trigger.id,
-                    execution_user_id=user_id,
-                )
-            trigger.is_enabled = False
-            await db.commit()
-
-        try:
-            from app.services.audit_logger import write_audit_log
-
-            await write_audit_log("trigger_cancelled", {"name": name}, agent_id=agent_id)
-        except Exception:
-            pass
-
-        return f"✅ Trigger '{name}' cancelled. It will no longer fire."
-
-    except Exception as e:
-        return f"❌ Failed to cancel trigger: {e}"
 
 
 # ─── Feishu Helper ────────────────────────────────────────────────────────────
