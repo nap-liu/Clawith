@@ -1973,6 +1973,7 @@ async def delete_project(
             "audit_logs",
             "approval_requests",
             "channel_configs",
+            "daily_token_usage",
             "dingtalk_channel_provisioning_sessions",
             "published_pages",
             "notifications",
