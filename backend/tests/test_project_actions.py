@@ -57,6 +57,7 @@ from app.api import mcp_servers as mcp_servers_api
 from app.api import projects as projects_api
 from app.core.security import get_current_user
 from app.database import Base, get_db
+from app.models.activity_log import DailyTokenUsage
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
@@ -94,6 +95,7 @@ TABLES = [
     "agents",
     "agent_permissions",
     "agent_activity_logs",
+    "daily_token_usage",
     "audit_logs",
     "approval_requests",
     "channel_configs",
@@ -1757,6 +1759,32 @@ async def test_project_delete_cleans_bidirectional_agent_and_session_references(
         status="completed",
     )
     env.db.add_all([child_run, gateway])
+    # Production historically created this foreign key without ON DELETE
+    # CASCADE even though the ORM model declares it. Keep the API cleanup
+    # compatible with that deployed schema instead of relying on fresh-schema
+    # behavior in this test.
+    await env.db.execute(
+        text(
+            "ALTER TABLE daily_token_usage "
+            "DROP CONSTRAINT daily_token_usage_agent_id_fkey"
+        )
+    )
+    await env.db.execute(
+        text(
+            "ALTER TABLE daily_token_usage "
+            "ADD CONSTRAINT daily_token_usage_agent_id_fkey "
+            "FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE NO ACTION"
+        )
+    )
+    usage = DailyTokenUsage(
+        tenant_id=env.tenant_id,
+        agent_id=env.leader_id,
+        date=datetime.now(UTC),
+        tokens_used=17,
+        input_tokens=11,
+        output_tokens=6,
+    )
+    env.db.add(usage)
     await env.db.commit()
 
     deleted = await env.client.delete(f"/api/projects/{project_id}")
@@ -1766,6 +1794,7 @@ async def test_project_delete_cleans_bidirectional_agent_and_session_references(
     assert await env.db.get(ChatSession, parent.id) is None
     assert await env.db.get(ChatSession, child.id) is None
     assert await env.db.scalar(select(GatewayMessage.id).where(GatewayMessage.id == gateway.id)) is None
+    assert await env.db.scalar(select(DailyTokenUsage.id).where(DailyTokenUsage.id == usage.id)) is None
     assert await env.db.scalar(select(Agent.id).where(Agent.id == env.leader_id)) is None
     assert not project_repo_path(env.tenant_id, project_id).exists()
 
