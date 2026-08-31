@@ -142,6 +142,12 @@ async def test_scene_draft_publish_lifecycle_keeps_unpublished_changes_off_consu
                         "ai_context": "MENU_ONLY_INTERNAL_CONTEXT",
                         "uri": "https://internal.example/old-admin",
                         "message": "I need warranty service.",
+                        "style": {
+                            "bold": True,
+                            "italic": False,
+                            "color": "#7C3AED",
+                            "font": "serif",
+                        },
                     },
                     {
                         "id": "menu_open",
@@ -231,6 +237,12 @@ async def test_scene_draft_publish_lifecycle_keeps_unpublished_changes_off_consu
             "type": "send_message",
             "message": "I need warranty service.",
             "menu_visible": True,
+            "style": {
+                "bold": True,
+                "italic": False,
+                "color": "#7C3AED",
+                "font": "serif",
+            },
         }
         assert consumer_manifest["quick_actions"][1] == {
             "id": "menu_open",

@@ -4,12 +4,13 @@ import re
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.utils.mini_program_uri import parse_mini_program_uri
 
 SCENE_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
 class SceneSystemPrompt(BaseModel):
@@ -26,6 +27,25 @@ class SceneSystemPrompt(BaseModel):
         return value
 
 
+class SceneQuickActionStyle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    bold: bool = False
+    italic: bool = False
+    color: str | None = None
+    font: Literal["default", "sans", "serif", "monospace"] = "default"
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not HEX_COLOR_RE.fullmatch(value):
+            raise ValueError("color must use #RRGGBB format")
+        return value.upper()
+
+
 class SceneQuickAction(BaseModel):
     id: str = Field(max_length=64)
     label: str = Field(min_length=1, max_length=80)
@@ -35,6 +55,7 @@ class SceneQuickAction(BaseModel):
     ai_context: str = Field(default="", max_length=4000)
     uri: str | None = Field(default=None, max_length=2048)
     message: str | None = Field(default=None, max_length=12000)
+    style: SceneQuickActionStyle | None = None
 
     @model_validator(mode="before")
     @classmethod

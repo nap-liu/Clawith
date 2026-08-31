@@ -76,6 +76,49 @@ def test_quick_action_preserves_inactive_type_content():
     assert action.ai_context == ""
 
 
+def test_quick_action_accepts_bounded_horizontal_button_style():
+    action = SceneQuickAction(
+        id="warranty",
+        label="Warranty",
+        type="send_message",
+        message="I need warranty service",
+        style={
+            "bold": True,
+            "italic": True,
+            "color": "#7c3aed",
+            "font": "serif",
+        },
+    )
+
+    assert action.style is not None
+    assert action.style.model_dump() == {
+        "bold": True,
+        "italic": True,
+        "color": "#7C3AED",
+        "font": "serif",
+    }
+
+
+@pytest.mark.parametrize(
+    "style",
+    [
+        {"color": "red"},
+        {"color": "#12345G"},
+        {"font": "Comic Sans MS"},
+        {"css": "display:none"},
+    ],
+)
+def test_quick_action_rejects_unbounded_horizontal_button_style(style):
+    with pytest.raises(ValidationError):
+        SceneQuickAction(
+            id="warranty",
+            label="Warranty",
+            type="send_message",
+            message="I need warranty service",
+            style=style,
+        )
+
+
 @pytest.mark.parametrize("legacy_enabled", [True, False])
 def test_quick_action_maps_legacy_enabled_to_both_visibility_flags(legacy_enabled):
     action = SceneQuickAction.model_validate(
@@ -212,6 +255,13 @@ def test_scene_tool_is_global_builtin_and_opt_in():
     assert action_properties["menu_visible"]["default"] is True
     assert action_properties["ai_visible"]["default"] is True
     assert action_properties["ai_context"]["maxLength"] == 4000
+    assert action_properties["style"]["additionalProperties"] is False
+    assert action_properties["style"]["properties"]["font"]["enum"] == [
+        "default",
+        "sans",
+        "serif",
+        "monospace",
+    ]
     assert "enabled" not in action_properties
     assert "examples" not in schema
     Draft7Validator.check_schema(schema)
@@ -258,6 +308,12 @@ def test_scene_tool_is_global_builtin_and_opt_in():
                     "label": "Repair",
                     "type": "send_message",
                     "message": "I need a repair",
+                    "style": {
+                        "bold": True,
+                        "italic": False,
+                        "color": "#7C3AED",
+                        "font": "serif",
+                    },
                 },
                 {
                     "id": "orders",

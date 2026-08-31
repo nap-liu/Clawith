@@ -181,6 +181,8 @@ def serialize_scene_manifest(scene: AgentScene, revision: AgentSceneRevision) ->
             projected["message"] = action.get("message")
         elif action_type == "open_uri":
             projected["uri"] = action.get("uri")
+        if isinstance(action.get("style"), dict):
+            projected["style"] = action["style"]
         menu_actions.append(projected)
     return {
         **published,

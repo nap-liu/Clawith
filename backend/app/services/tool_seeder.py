@@ -480,6 +480,27 @@ BUILTIN_TOOLS = [
                                 "maxLength": 12000,
                                 "description": "Required for send_message; sent exactly as a normal user message.",
                             },
+                            "style": {
+                                "type": "object",
+                                "description": (
+                                    "Optional text style for the H5 horizontal quick-action button. "
+                                    "Other quick-action surfaces keep their platform styling."
+                                ),
+                                "additionalProperties": False,
+                                "properties": {
+                                    "bold": {"type": "boolean", "default": False},
+                                    "italic": {"type": "boolean", "default": False},
+                                    "color": {
+                                        "type": ["string", "null"],
+                                        "pattern": "^#[0-9A-Fa-f]{6}$",
+                                    },
+                                    "font": {
+                                        "type": "string",
+                                        "enum": ["default", "sans", "serif", "monospace"],
+                                        "default": "default",
+                                    },
+                                },
+                            },
                         },
                         "required": ["id", "label", "type"],
                         "anyOf": [
