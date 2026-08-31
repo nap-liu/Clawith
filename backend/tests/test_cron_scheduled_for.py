@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings
@@ -454,6 +454,188 @@ async def test_concurrent_enqueue_uses_schedule_for_record_key_and_context():
             runtime_trigger.config,
             observed_at,
         )
+    finally:
+        await _cleanup_seeded_cron(ids)
+
+
+async def test_recurring_trigger_does_not_enqueue_while_agent_run_is_active():
+    trigger, ids = await _seed_persisted_cron()
+    first_scheduled_for = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    second_scheduled_for = first_scheduled_for + timedelta(days=1)
+    try:
+        await enqueue_due_trigger(
+            trigger,
+            first_scheduled_for,
+            scheduled_for=first_scheduled_for,
+            scheduled_timezone="Asia/Shanghai",
+        )
+        async with async_session() as db:
+            await db.execute(
+                update(TriggerExecution)
+                .where(TriggerExecution.trigger_id == trigger.id)
+                .values(status="processing")
+            )
+            await db.commit()
+
+        await enqueue_due_trigger(
+            trigger,
+            second_scheduled_for,
+            scheduled_for=second_scheduled_for,
+            scheduled_timezone="Asia/Shanghai",
+        )
+        async with async_session() as db:
+            executions = list(
+                (
+                    await db.execute(
+                        select(TriggerExecution).where(
+                            TriggerExecution.trigger_id == trigger.id
+                        )
+                    )
+                ).scalars()
+            )
+            assert len(executions) == 1
+            executions[0].status = "completed"
+            await db.commit()
+
+        await enqueue_due_trigger(
+            trigger,
+            second_scheduled_for,
+            scheduled_for=second_scheduled_for,
+            scheduled_timezone="Asia/Shanghai",
+        )
+        async with async_session() as db:
+            executions = list(
+                (
+                    await db.execute(
+                        select(TriggerExecution).where(
+                            TriggerExecution.trigger_id == trigger.id
+                        )
+                    )
+                ).scalars()
+            )
+        assert len(executions) == 2
+    finally:
+        await _cleanup_seeded_cron(ids)
+
+
+async def test_different_recurring_triggers_for_one_agent_enqueue_one_at_a_time():
+    trigger, ids = await _seed_persisted_cron()
+    sibling = _cron_trigger(
+        agent_id=ids["agent"],
+        config={"expr": "5 18 * * *", "timezone": "Asia/Shanghai"},
+    )
+    sibling.created_by_user_id = ids["user"]
+    sibling.execution_user_id = ids["user"]
+    async with async_session() as db:
+        db.add(sibling)
+        await db.commit()
+        await db.refresh(sibling)
+        db.expunge(sibling)
+
+    scheduled_for = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    try:
+        await asyncio.gather(
+            enqueue_due_trigger(
+                trigger,
+                scheduled_for,
+                scheduled_for=scheduled_for,
+                scheduled_timezone="Asia/Shanghai",
+            ),
+            enqueue_due_trigger(
+                sibling,
+                scheduled_for + timedelta(minutes=5),
+                scheduled_for=scheduled_for + timedelta(minutes=5),
+                scheduled_timezone="Asia/Shanghai",
+            ),
+        )
+        async with async_session() as db:
+            executions = list(
+                (
+                    await db.execute(
+                        select(TriggerExecution).where(
+                            TriggerExecution.agent_id == ids["agent"]
+                        )
+                    )
+                ).scalars()
+            )
+            assert len(executions) == 1
+            queued_trigger_ids = {execution.trigger_id for execution in executions}
+            executions[0].status = "completed"
+            await db.commit()
+
+        missing_trigger = sibling if trigger.id in queued_trigger_ids else trigger
+        missing_scheduled_for = (
+            scheduled_for + timedelta(minutes=5)
+            if missing_trigger.id == sibling.id
+            else scheduled_for
+        )
+        await enqueue_due_trigger(
+            missing_trigger,
+            missing_scheduled_for,
+            scheduled_for=missing_scheduled_for,
+            scheduled_timezone="Asia/Shanghai",
+        )
+        async with async_session() as db:
+            count = len(
+                list(
+                    (
+                        await db.execute(
+                            select(TriggerExecution.id).where(
+                                TriggerExecution.agent_id == ids["agent"]
+                            )
+                        )
+                    ).scalars()
+                )
+            )
+        assert count == 2
+    finally:
+        await _cleanup_seeded_cron(ids)
+
+
+async def test_poll_enqueue_is_not_dropped_by_an_active_scheduled_run():
+    trigger, ids = await _seed_persisted_cron()
+    scheduled_for = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    poll_trigger = AgentTrigger(
+        agent_id=ids["agent"],
+        created_by_user_id=ids["user"],
+        execution_user_id=ids["user"],
+        name=f"poll-{uuid.uuid4().hex[:8]}",
+        type="poll",
+        config={"_last_value": "changed-value"},
+        reason="changed remote value",
+        is_enabled=True,
+    )
+    try:
+        async with async_session() as db:
+            db.add(poll_trigger)
+            await db.commit()
+            await db.refresh(poll_trigger)
+            db.expunge(poll_trigger)
+        await enqueue_due_trigger(
+            trigger,
+            scheduled_for,
+            scheduled_for=scheduled_for,
+            scheduled_timezone="Asia/Shanghai",
+        )
+        async with async_session() as db:
+            await db.execute(
+                update(TriggerExecution)
+                .where(TriggerExecution.trigger_id == trigger.id)
+                .values(status="processing")
+            )
+            await db.commit()
+
+        await enqueue_due_trigger(poll_trigger, scheduled_for)
+        async with async_session() as db:
+            poll_execution = (
+                await db.execute(
+                    select(TriggerExecution).where(
+                        TriggerExecution.trigger_id == poll_trigger.id
+                    )
+                )
+            ).scalar_one_or_none()
+        assert poll_execution is not None
+        assert poll_execution.payload == {}
     finally:
         await _cleanup_seeded_cron(ids)
 

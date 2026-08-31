@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.database import async_session
+from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.services.trigger_runtime.executions import (
@@ -16,6 +17,8 @@ from app.services.trigger_runtime.executions import (
 )
 from app.services.trigger_runtime.keys import build_scheduled_execution_key
 from app.services.trigger_runtime.queue import enqueue_trigger_execution
+
+_NON_OVERLAPPING_RECURRING_SOURCES = ("cron", "interval")
 
 
 def runtime_execution_payload(trigger: AgentTrigger) -> dict:
@@ -66,6 +69,43 @@ async def enqueue_due_trigger(
     scheduled_timezone: str | None = None,
 ) -> None:
     async with async_session() as db:
+        if trigger.type in _NON_OVERLAPPING_RECURRING_SOURCES:
+            # Serialize the enqueue decision on the durable Agent row. A
+            # recurring scan that outlives its interval must finish before the
+            # same Agent receives another recurring execution; otherwise old
+            # rounds accumulate and contend for the shared workspace.
+            agent_exists = (
+                await db.execute(
+                    select(Agent.id)
+                    .where(Agent.id == trigger.agent_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if agent_exists is None:
+                return
+            fresh = (
+                await db.execute(
+                    select(AgentTrigger)
+                    .where(AgentTrigger.id == trigger.id)
+                )
+            ).scalar_one_or_none()
+            if fresh is None or not fresh.is_enabled:
+                return
+            active_execution = (
+                await db.execute(
+                    select(TriggerExecution.id)
+                    .where(
+                        TriggerExecution.agent_id == fresh.agent_id,
+                        TriggerExecution.source.in_(_NON_OVERLAPPING_RECURRING_SOURCES),
+                        TriggerExecution.status.in_(("pending", "processing")),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if active_execution is not None:
+                return
+            trigger = fresh
+
         cfg = trigger.config or {}
         webhook_mode = (
             cfg.get("webhook_mode", "legacy")

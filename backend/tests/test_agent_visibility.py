@@ -56,21 +56,6 @@ def test_build_visible_agents_query_platform_admin_sees_everything_in_tenant():
     assert "agent_permissions" not in where
 
 
-def test_build_visible_agents_query_org_admin_hides_others_private():
-    """org_admin is a tenant-level manager. Sees own + non-private agents
-    (company + custom). Other users' private agents are filtered out
-    to preserve v1.9.3 privacy guarantee."""
-    admin = make_user(role="org_admin")
-
-    where = _where_clause(build_visible_agents_query(admin))
-
-    assert "agents.tenant_id" in where
-    assert "agents.creator_id" in where
-    assert "access_mode" in where
-    # org_admin shouldn't need per-user grant table — non-private is enough.
-    assert "agent_permissions" not in where
-
-
 def test_build_visible_agents_query_regular_user_uses_explicit_grants():
     """Regular users see own creations, company-visible agents, and any
     agent explicitly added to a custom roster they're on."""
@@ -163,18 +148,17 @@ async def test_global_agent_access_still_allows_cross_tenant_platform_admin():
 
 
 @pytest.mark.asyncio
-async def test_access_level_org_admin_cannot_manage_others_private():
-    """org_admin must NOT see someone else's private agent — v1.9.3 privacy."""
+async def test_access_level_org_admin_manages_others_private_standard_agent():
+    """org_admin governs every standard Agent in their tenant."""
     tenant = uuid.uuid4()
     admin = SimpleNamespace(id=uuid.uuid4(), role="org_admin", tenant_id=tenant, is_active=True)
     creator = uuid.uuid4()
     agent = _make_agent(creator_id=creator, tenant_id=tenant, access_mode="private")
 
-    # First db.execute resolves the user; second resolves agent_permissions
-    db = _AccessLevelDb([_ScalarResult(admin), _ScalarsResult([])])
+    db = _AccessLevelDb([_ScalarResult(admin)])
     level = await permissions.get_agent_access_level_for_user_id(db, admin.id, agent)
 
-    assert level is None
+    assert level == "manage"
 
 
 @pytest.mark.asyncio

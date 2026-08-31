@@ -203,7 +203,7 @@ async def test_schedule_fields_remain_creator_only_and_identity_matches_actor():
         assert changed.execution_user_id == candidate.id
 
 
-async def test_schedule_identity_only_requires_agent_manage_access():
+async def test_org_admin_can_reassign_private_agent_schedule_identity():
     suffix = uuid.uuid4().hex[:10]
     async with async_session() as db:
         tenant = Tenant(name=f"Private Schedule {suffix}", slug=f"private-schedule-{suffix}")
@@ -241,15 +241,17 @@ async def test_schedule_identity_only_requires_agent_manage_access():
 
     async with async_session() as db:
         actor = await db.get(User, org_admin.id)
-        with pytest.raises(HTTPException) as denied:
-            await update_schedule(
-                agent.id,
-                schedule.id,
-                ScheduleUpdate(execution_user_id=org_admin.id),
-                actor,
-                db,
-            )
-        assert denied.value.status_code == 403
+        changed = await update_schedule(
+            agent.id,
+            schedule.id,
+            ScheduleUpdate(
+                execution_user_id=org_admin.id,
+                expected_execution_user_id=creator.id,
+            ),
+            actor,
+            db,
+        )
+        assert changed.execution_user_id == org_admin.id
 
 
 async def test_regular_trigger_update_freezes_queued_legacy_identity():

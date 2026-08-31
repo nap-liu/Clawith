@@ -3,30 +3,22 @@ import uuid
 import pytest
 from fastapi import HTTPException
 
+import app.services.redis_lease_lock as redis_lease_lock_module
 from app.api import files as files_api
 from app.models.agent import Agent
 from app.models.user import User
 from app.services import workspace_collaboration
-from app.services import workspace_locking
 from app.services.storage_runtime import facade as storage_facade
 from app.services.storage_runtime.local import LocalStorageBackend
 
 
 class _FakeRedis:
-    """Minimal in-memory redis covering the surface workspace_locking touches.
-
-    ``delete_workspace_file`` acquires a distributed lock via
-    ``workspace_locks`` -> ``acquire_workspace_lock`` (``set(..., ex=, nx=True)``)
-    / ``release_workspace_lock`` (``eval(...)``). In the full-suite run the
-    module-cached real redis client binds to an already-closed function-scoped
-    event loop and raises ``RuntimeError: Event loop is closed``. A fresh fake
-    per test sidesteps that entirely.
-    """
+    """Minimal in-memory Redis for the shared renewable workspace lease."""
 
     def __init__(self):
         self._data: dict[str, str] = {}
 
-    async def set(self, key, value, *, ex=None, nx=False, **_kwargs):
+    async def set(self, key, value, *, ex=None, px=None, nx=False, **_kwargs):
         if nx and key in self._data:
             return None
         self._data[key] = value
@@ -42,7 +34,9 @@ class _FakeRedis:
                 removed += 1
         return removed
 
-    async def eval(self, _script, _numkeys, key, owner):
+    async def eval(self, script, _numkeys, key, owner, *_args):
+        if "pexpire" in script:
+            return int(self._data.get(key) == owner)
         if self._data.get(key) == owner:
             return await self.delete(key)
         return 0
@@ -55,15 +49,13 @@ def _isolate_storage_and_lock(monkeypatch):
     # backend at their own tmp_path via monkeypatch).
     monkeypatch.setattr(storage_facade, "_storage_backend", None)
 
-    # workspace_locking imports get_redis from app.core.events at module level;
-    # patch it to a per-test in-memory fake so the distributed lock never uses a
-    # real client cached against a dying event loop.
+    # Bind the shared renewable lease to a per-test in-memory Redis.
     fake_redis = _FakeRedis()
 
     async def _fake_get_redis():
         return fake_redis
 
-    monkeypatch.setattr(workspace_locking, "get_redis", _fake_get_redis)
+    monkeypatch.setattr(redis_lease_lock_module, "get_redis", _fake_get_redis)
 
 
 class _StubDb:
