@@ -9,6 +9,8 @@ from sqlalchemy import or_, select
 
 from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_feature_enabled
 from app.database import async_session
+from app.services.agent_tools_catalog import AGENT_TOOLS
+from app.services.agent_tools_config_runtime import _get_tool_config
 
 _ALWAYS_INCLUDE_CORE = {
     "add_contact",
@@ -65,7 +67,7 @@ def _build_always_tool_subsets(agent_tools: list[dict]) -> tuple[list[dict], lis
     )
 
 
-def _stabilize_media_tool_definitions(tools: list[dict], agent_tools: list[dict]) -> list[dict]:
+def _stabilize_media_tool_definitions_impl(tools: list[dict], agent_tools: list[dict]) -> list[dict]:
     canonical = {item["function"]["name"]: item for item in agent_tools if item["function"]["name"] in _FIXED_MEDIA_TOOL_NAMES}
     stable = [
         item
@@ -209,7 +211,7 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
     return result
 
 
-async def get_agent_tools_for_llm(
+async def _get_agent_tools_for_llm_impl(
     agent_id: uuid.UUID,
     *,
     agent_tools: list[dict],
@@ -377,7 +379,7 @@ async def get_agent_tools_for_llm(
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 if not _a2a_async:
                     result = _strip_a2a_msg_type(result)
-                result = _stabilize_media_tool_definitions(result, agent_tools)
+                result = _stabilize_media_tool_definitions_impl(result, agent_tools)
                 final_names = sorted(t["function"]["name"] for t in result)
                 logger.info(
                     f"[Tools] agent={agent_id} FINAL {len(result)} tools "
@@ -391,4 +393,47 @@ async def get_agent_tools_for_llm(
     fallback = _patch_computer_tool_descriptions(_always_tools, computer_os_type)
     if not _a2a_async:
         fallback = _strip_a2a_msg_type(fallback)
-    return _stabilize_media_tool_definitions(fallback, agent_tools)
+    return _stabilize_media_tool_definitions_impl(fallback, agent_tools)
+
+
+def _stabilize_media_tool_definitions(tools: list[dict]) -> list[dict]:
+    return _stabilize_media_tool_definitions_impl(tools, AGENT_TOOLS)
+
+
+async def get_agent_tools_for_llm(
+    agent_id: uuid.UUID,
+    *,
+    assignment_snapshot: list[dict] | None = None,
+) -> list[dict]:
+    return await _get_agent_tools_for_llm_impl(
+        agent_id,
+        agent_tools=AGENT_TOOLS,
+        get_tool_config=_get_tool_config,
+        assignment_snapshot=assignment_snapshot,
+    )
+
+
+def _stabilize_media_tool_definitions_runtime(
+    tools: list[dict],
+    agent_tools: list[dict] | None = None,
+) -> list[dict]:
+    return _stabilize_media_tool_definitions_impl(tools, agent_tools or AGENT_TOOLS)
+
+
+async def get_agent_tools_for_llm_runtime(
+    agent_id: uuid.UUID,
+    *,
+    agent_tools: list[dict] | None = None,
+    get_tool_config=None,
+    assignment_snapshot: list[dict] | None = None,
+) -> list[dict]:
+    return await _get_agent_tools_for_llm_impl(
+        agent_id,
+        agent_tools=agent_tools or AGENT_TOOLS,
+        get_tool_config=get_tool_config or _get_tool_config,
+        assignment_snapshot=assignment_snapshot,
+    )
+
+
+_stabilize_media_tool_definitions = _stabilize_media_tool_definitions_runtime
+get_agent_tools_for_llm = get_agent_tools_for_llm_runtime
