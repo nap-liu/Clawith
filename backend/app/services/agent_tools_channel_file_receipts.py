@@ -13,6 +13,7 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.services.agent_tools_outbound_core import _build_outbound_operation_key
 from app.services.im_delivery import (
     DeliveryReceiptPersistenceError,
     IMDeliveryPart,
@@ -26,20 +27,6 @@ channel_file_sender: ContextVar = ContextVar('channel_file_sender', default=None
 channel_file_part_recorder: ContextVar[Callable[[IMDeliveryPart], Awaitable[None]] | None] = ContextVar(
     "channel_file_part_recorder", default=None
 )
-
-def _build_outbound_operation_key(
-    *,
-    agent_id: uuid.UUID,
-    origin_session_id: str | None,
-    tool_call_id: str | None,
-    origin_turn_anchor_id: uuid.UUID | str | None = None,
-) -> str | None:
-    """Return the durable replay key for one messaging tool invocation."""
-    if not tool_call_id:
-        return None
-    session_scope = str(origin_session_id or "no-session")
-    turn_scope = str(origin_turn_anchor_id or "unanchored")
-    return f"outbound:{agent_id}:{session_scope}:{turn_scope}:{tool_call_id}"[:500]
 
 async def _claim_channel_file_receipt(
     *,
