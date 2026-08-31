@@ -824,11 +824,22 @@ async def drain_turn_inbox(
                 message["attachments"] = attachments
             injected.append(message)
             row.message_meta = {**meta, "turn_inbox_state": "delivered"}
+        marker_advanced = False
         if selected:
-            if session.source_channel == "dingtalk":
-                prior_marker = dict(session.im_config or {}).get(
-                    CHANNEL_RECEIPT_ANCHOR_KEY
-                )
+            prior_marker = dict(session.im_config or {}).get(
+                CHANNEL_RECEIPT_ANCHOR_KEY
+            )
+            # The adapter registry is the normalized capability signal. A
+            # pre-existing marker also remains valid for compatibility.
+            from app.services.channel_reaction_recovery import (
+                supports_recovered_channel_reactions,
+            )
+
+            tracks_reactions = isinstance(
+                prior_marker,
+                dict,
+            ) or supports_recovered_channel_reactions(session.source_channel)
+            if tracks_reactions:
                 cleanup_message_ids = (
                     _marker_cleanup_message_ids(prior_marker)
                     if isinstance(prior_marker, dict)
@@ -848,21 +859,21 @@ async def drain_turn_inbox(
                         ],
                         "cleanup_attempts": (
                             dict(prior_marker.get("cleanup_attempts") or {})
-                            if isinstance(prior_marker, dict)
-                            and isinstance(
+                            if isinstance(prior_marker, dict) and isinstance(
                                 prior_marker.get("cleanup_attempts"), dict
                             )
                             else {}
                         ),
                     },
                 }
+                marker_advanced = True
             await db.commit()
             from app.services.channel_dispatch import advance_channel_receipt_anchor
 
             previous_cleanup_completed = await advance_channel_receipt_anchor(
                 [row.id for row in selected]
             )
-            if previous_cleanup_completed and session.source_channel == "dingtalk":
+            if previous_cleanup_completed and marker_advanced:
                 await _acknowledge_live_receipt_handoff(
                     session_id=durable_session_id,
                     agent_id=execution_agent_id,

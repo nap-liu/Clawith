@@ -19,6 +19,9 @@ from app.models.participant import Participant  # noqa: F401
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services import channel_dispatch
+from app.services.channel_reaction_recovery import (
+    load_recovered_channel_reactions,
+)
 from app.services.chat_history import (
     build_llm_messages_from_rows,
     ingest_incoming_chat_message,
@@ -37,6 +40,7 @@ from app.services.turn_inbox import (
     cleanup_durable_channel_receipt_anchor,
     cleanup_stale_channel_receipt_anchors,
     drain_turn_inbox,
+    durable_channel_receipt_anchor_id,
     load_durable_channel_receipt_anchor,
 )
 
@@ -126,6 +130,90 @@ def _receipt_hooks(tag: str, events: list[str]) -> channel_dispatch.ChannelReact
         on_complete=complete,
         on_thinking=thinking,
     )
+
+
+async def test_restart_rebuilds_reaction_hooks_from_current_durable_im_receipt(
+    monkeypatch,
+):
+    from app.services import dingtalk_reaction
+
+    agent_id, _user_id, session_id, root_id, _generation = await _seed_running_im_turn()
+    robot_code = f"restart-robot-{uuid.uuid4().hex}"
+    async with async_session() as db:
+        session = await db.get(ChatSession, session_id)
+        root = await db.get(ChatMessage, root_id)
+        assert session is not None and root is not None
+        root.message_meta = {
+            **dict(root.message_meta or {}),
+            CHANNEL_RECEIPT_PROVIDER_META_KEY: {
+                "provider_message_id": "restart-provider-message",
+                "provider_conversation_id": "restart-provider-conversation",
+            },
+        }
+        db.add(
+            ChannelConfig(
+                agent_id=agent_id,
+                channel_type="dingtalk",
+                app_id=robot_code,
+                app_secret="restart-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+
+    events: list[tuple[str, str]] = []
+
+    async def cleanup(*_args) -> bool:
+        events.append(("cleanup", "stale"))
+        return True
+
+    async def attach(*args) -> bool:
+        events.append(("attach", args[-1]))
+        return True
+
+    async def recall(*args) -> bool:
+        events.append(("recall", args[-1]))
+        return True
+
+    monkeypatch.setattr(
+        dingtalk_reaction,
+        "cleanup_durable_progress_reactions",
+        cleanup,
+    )
+    monkeypatch.setattr(dingtalk_reaction, "add_reaction", attach)
+    monkeypatch.setattr(dingtalk_reaction, "recall_reaction", recall)
+
+    reactions = await load_recovered_channel_reactions(
+        agent_id=agent_id,
+        conversation_id=str(session_id),
+    )
+    async with async_session() as db:
+        session = await db.get(ChatSession, session_id)
+        assert session is not None
+        assert durable_channel_receipt_anchor_id(session) == root_id
+    assert reactions.on_recover is not None
+    assert reactions.on_consume is not None
+    assert reactions.on_tool_call is not None
+    assert reactions.on_complete is not None
+
+    await reactions.on_recover()
+    await reactions.on_consume()
+    await reactions.on_tool_call(
+        {"status": "running", "name": "web_search", "args": {}}
+    )
+    await reactions.on_complete("done")
+
+    assert events == [
+        ("cleanup", "stale"),
+        ("attach", dingtalk_reaction.DEFAULT_THINKING_REACTION),
+        ("recall", dingtalk_reaction.DEFAULT_THINKING_REACTION),
+        ("attach", "🌐"),
+        ("recall", "🌐"),
+    ]
+    async with async_session() as db:
+        session = await db.get(ChatSession, session_id)
+        assert session is not None
+        assert CHANNEL_RECEIPT_ANCHOR_KEY not in dict(session.im_config or {})
 
 
 async def test_receipt_anchor_advances_only_after_each_interjected_message_is_consumed():
@@ -1011,8 +1099,7 @@ async def test_one_startup_drains_ten_successful_terminal_receipt_anchors(
         async def __aexit__(self, *_args):
             return False
 
-    async def no_recoverable_anchors(_db, *, limit: int):
-        assert limit == 50
+    async def no_recoverable_anchors(_db):
         return []
 
     monkeypatch.setattr(

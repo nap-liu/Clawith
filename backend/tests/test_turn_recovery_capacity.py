@@ -64,8 +64,7 @@ async def test_startup_scan_closes_database_before_resuming_turn(monkeypatch):
         lambda: _FakeDatabaseSession(sessions),
     )
 
-    async def fake_load(db, *, limit):
-        assert limit == 1
+    async def fake_load(db):
         assert db.active is True
         return [anchor]
 
@@ -119,6 +118,9 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
     async def fake_origin(_anchor):
         return origin
 
+    async def fake_owner(_anchor):
+        return True
+
     async def fake_origin_matches(_anchor, _origin):
         return True
 
@@ -138,6 +140,10 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
 
     async def fake_normalize(*_args, **_kwargs):
         return None
+
+    async def fake_reactions(**_kwargs):
+        assert all(session.active is False for session in sessions)
+        return turn_recovery.ChannelReactions()
 
     async def fake_llm(db, *_args, **_kwargs):
         assert capacity_active is True
@@ -173,6 +179,7 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
                 capacity_active = False
 
     monkeypatch.setattr(turn_recovery, "_load_fresh_recovery_origin", fake_origin)
+    monkeypatch.setattr(turn_recovery, "_ensure_recovery_owner", fake_owner)
     monkeypatch.setattr(turn_recovery, "_validated_execution_agent_id", fake_execution_agent)
     monkeypatch.setattr(turn_recovery, "_recovery_origin_matches", fake_origin_matches)
     monkeypatch.setattr(turn_recovery, "_tail_has_pending_confirmation", fake_pending)
@@ -181,6 +188,11 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
         turn_recovery,
         "_normalize_completed_tool_rounds_for_recovery",
         fake_normalize,
+    )
+    monkeypatch.setattr(
+        turn_recovery,
+        "load_recovered_channel_reactions",
+        fake_reactions,
     )
     monkeypatch.setattr(turn_recovery, "load_recoverable_history_for_turn", fake_history)
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_llm)

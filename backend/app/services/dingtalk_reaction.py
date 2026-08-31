@@ -9,7 +9,14 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 
 from loguru import logger
+from sqlalchemy import select
 
+from app.models.channel_config import ChannelConfig
+from app.services.channel_dispatch import ChannelReactions
+from app.services.channel_reaction_recovery import (
+    RecoveryReactionContext,
+    register_recovery_reaction_factory,
+)
 from app.services.dingtalk_token import dingtalk_token_manager
 
 REACTION_REPLY_URL = "https://api.dingtalk.com/v1.0/robot/emotion/reply"
@@ -209,6 +216,137 @@ async def recall_thinking_reaction(
     )
 
 
+def make_dingtalk_reactions(
+    app_key: str,
+    app_secret: str,
+    message_id: str,
+    conversation_id: str,
+    *,
+    recover_existing: bool = False,
+) -> ChannelReactions:
+    """Build the channel-neutral lifecycle bundle for one DingTalk receipt."""
+
+    async def _attach(reaction: str) -> bool:
+        return await add_reaction(
+            app_key,
+            app_secret,
+            message_id,
+            conversation_id,
+            reaction,
+        )
+
+    async def _recall(reaction: str) -> bool:
+        return await recall_reaction(
+            app_key,
+            app_secret,
+            message_id,
+            conversation_id,
+            reaction,
+        )
+
+    controller = DingTalkReactionController(
+        attach_reaction=_attach,
+        recall_reaction=_recall,
+    )
+    receipt_agent_id = None
+    receipt_session_id = ""
+    receipt_message_id = None
+
+    def _bind_receipt_context(agent_id, session_id, local_message_id) -> None:
+        nonlocal receipt_agent_id, receipt_session_id, receipt_message_id
+        receipt_agent_id = agent_id
+        receipt_session_id = session_id
+        receipt_message_id = local_message_id
+
+    async def _recover() -> None:
+        if recover_existing:
+            await cleanup_durable_progress_reactions(
+                app_key,
+                app_secret,
+                message_id,
+                conversation_id,
+            )
+
+    async def _dispose_and_ack(value: object) -> bool:
+        cleanup_completed = (
+            await controller.on_error(value)
+            if isinstance(value, BaseException)
+            else await controller.on_complete(str(value or ""))
+        )
+        if (
+            receipt_agent_id is not None
+            and receipt_session_id
+            and receipt_message_id is not None
+        ):
+            from app.services.turn_inbox import (
+                acknowledge_durable_channel_receipt_cleanup,
+                cleanup_durable_channel_receipt_anchor,
+            )
+
+            has_durable_leftovers = not cleanup_completed
+            if cleanup_completed:
+                has_durable_leftovers = (
+                    await acknowledge_durable_channel_receipt_cleanup(
+                        session_id=receipt_session_id,
+                        agent_id=receipt_agent_id,
+                        message_id=receipt_message_id,
+                    )
+                )
+            if has_durable_leftovers:
+                await cleanup_durable_channel_receipt_anchor(
+                    session_id=receipt_session_id,
+                    agent_id=receipt_agent_id,
+                    require_terminal=True,
+                )
+        return cleanup_completed
+
+    return ChannelReactions(
+        on_recover=_recover if recover_existing else None,
+        on_consume=controller.on_consume,
+        on_complete=_dispose_and_ack,
+        on_error=_dispose_and_ack,
+        bind_receipt_context=_bind_receipt_context,
+        on_tool_call=controller.on_tool_call,
+        on_thinking=controller.on_thinking,
+    )
+
+
+async def _build_recovered_dingtalk_reactions(
+    context: RecoveryReactionContext,
+) -> ChannelReactions:
+    config = (
+        await context.db.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == context.session.agent_id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one_or_none()
+    if config is None:
+        return ChannelReactions()
+    message_id = str(context.provider_receipt.get("provider_message_id") or "")
+    conversation_id = str(
+        context.provider_receipt.get("provider_conversation_id") or ""
+    )
+    app_key = str(config.app_id or "")
+    app_secret = str(config.app_secret or "")
+    if not message_id or not conversation_id or not app_key or not app_secret:
+        return ChannelReactions()
+    return make_dingtalk_reactions(
+        app_key,
+        app_secret,
+        message_id,
+        conversation_id,
+        recover_existing=True,
+    )
+
+
+register_recovery_reaction_factory(
+    "dingtalk",
+    _build_recovered_dingtalk_reactions,
+)
+
+
 async def cleanup_durable_progress_reactions(
     app_key: str,
     app_secret: str,
@@ -283,15 +421,12 @@ def resolve_tool_reaction(tool_name: object, args: object | None = None) -> str:
         return DEFAULT_TOOL_REACTION
     if (
         name in {"read", "view", "read_file", "read_image", "list_files", "read_session_messages"}
-        or name.startswith("read_")
-        or name.startswith("list_")
+        or name.startswith(("read_", "list_"))
     ):
         return "📂"
     if (
         name in {"write", "edit", "patch", "write_file", "edit_file", "move_file"}
-        or name.startswith("write_")
-        or name.startswith("edit_")
-        or name.startswith("patch_")
+        or name.startswith(("write_", "edit_", "patch_"))
     ):
         return "✍️"
     if (

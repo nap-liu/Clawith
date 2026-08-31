@@ -7,7 +7,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 from sqlalchemy import func, select
@@ -17,7 +17,11 @@ from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE, Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.user import User
+from app.services.channel_dispatch import ChannelReactions, run_channel_reaction_hook
 from app.services.channel_llm import _call_agent_llm
+from app.services.channel_reaction_recovery import (
+    load_recovered_channel_reactions,
+)
 from app.services.chat_history import (
     is_incomplete_delivery_progress,
     load_recoverable_history_for_turn,
@@ -25,6 +29,15 @@ from app.services.chat_history import (
     persist_assistant_reply_row,
     persist_tool_call_row,
     rewrite_tool_call_done_results,
+)
+from app.services.conversation_turn_lifecycle import (
+    ACTIVE_TURN_STATUS,
+    SUSPENDED_TURN_STATUS,
+    TERMINAL_TURN_STATUSES,
+    ConversationTurnConflict,
+    ConversationTurnSnapshot,
+    conversation_turn_snapshot_for_session,
+    transition_conversation_turn,
 )
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
@@ -34,7 +47,6 @@ from app.services.workload_capacity import WorkloadKind, get_workload_capacity
 
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
 STARTUP_RECOVERY_LEASE_RESOURCE = "startup-turn-recovery"
-RECOVERY_CONCURRENCY = 8
 RECOVERY_TOOL_MATERIALIZE_TIMEOUT_SECONDS = 60.0
 
 
@@ -46,11 +58,17 @@ class RecoveryStats:
     failed: int = 0
 
 
+class _RecoveryFenceLost(RuntimeError):
+    """The durable owner or route changed while recovery was running."""
+
+
 @dataclass(frozen=True)
 class _RecoveryOrigin:
     session_found: bool
     source_channel: str | None
     external_conv_id: str | None
+    turn_anchor_id: uuid.UUID | None = None
+    turn_generation: int = 0
 
 
 def _metadata_execution_agent_id(anchor: ChatMessage) -> uuid.UUID:
@@ -163,7 +181,7 @@ def _recovery_max_age_hours() -> float:
 def _tool_payload(row: ChatMessage) -> dict | None:
     try:
         payload = json.loads(row.content or "{}")
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -440,11 +458,19 @@ def _turn_status(row: ChatMessage) -> str:
     return str(meta.get("turn_status") or "")
 
 
+def _metadata_int(meta: dict, key: str) -> int | None:
+    try:
+        return int(meta.get(key) or 0)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _load_recovery_origin(
     db,
     anchor: ChatMessage,
     *,
     for_update: bool = False,
+    allow_completed: bool = False,
 ) -> _RecoveryOrigin | None:
     """Load the cancellation and session-generation boundary for a turn."""
     try:
@@ -457,23 +483,80 @@ async def _load_recovery_origin(
         anchor.id,
         with_for_update=for_update,
     )
-    if fresh_anchor is None or _turn_status(fresh_anchor) == "cancelled":
+    if fresh_anchor is None:
+        return None
+    anchor_status = _turn_status(fresh_anchor)
+    if anchor_status in {"cancelled", "failed"} or (
+        anchor_status == "completed" and not allow_completed
+    ):
         return None
     if session is None:
         return _RecoveryOrigin(False, None, None)
     external_conv_id = session.external_conv_id
     if external_conv_id and "__archived_" in external_conv_id:
         return None
+    snapshot = conversation_turn_snapshot_for_session(session)
+    anchor_meta = dict(fresh_anchor.message_meta or {})
+    anchor_generation = _metadata_int(anchor_meta, "turn_generation")
+    if anchor_generation is None:
+        return None
+    if anchor_status == "completed" and allow_completed:
+        origin_anchor_id = fresh_anchor.id
+        origin_generation = anchor_generation
+    else:
+        if snapshot.anchor_id is not None and (
+            snapshot.anchor_id != fresh_anchor.id
+            or snapshot.generation != anchor_generation
+        ):
+            return None
+        origin_anchor_id = snapshot.anchor_id
+        origin_generation = snapshot.generation
     return _RecoveryOrigin(
         True,
         session.source_channel,
         external_conv_id,
+        origin_anchor_id,
+        origin_generation,
     )
 
 
 async def _load_fresh_recovery_origin(anchor: ChatMessage) -> _RecoveryOrigin | None:
     async with async_session() as db:
         return await _load_recovery_origin(db, anchor)
+
+
+async def _ensure_recovery_owner(anchor: ChatMessage) -> bool:
+    """Admit a legacy markerless anchor or validate its durable current owner."""
+
+    try:
+        session_id = uuid.UUID(str(anchor.conversation_id))
+    except (TypeError, ValueError):
+        return True
+    async with async_session() as db:
+        session = await db.get(ChatSession, session_id)
+        if session is None or session.agent_id != anchor.agent_id:
+            return session is None
+        snapshot = conversation_turn_snapshot_for_session(session)
+        if snapshot.anchor_id == anchor.id:
+            return snapshot.status in {
+                ACTIVE_TURN_STATUS,
+                SUSPENDED_TURN_STATUS,
+            }
+        if snapshot.status in {ACTIVE_TURN_STATUS, SUSPENDED_TURN_STATUS}:
+            return False
+        try:
+            await transition_conversation_turn(
+                db,
+                agent_id=anchor.agent_id,
+                conversation_id=anchor.conversation_id,
+                turn_anchor_id=anchor.id,
+                status=ACTIVE_TURN_STATUS,
+            )
+        except (ConversationTurnConflict, LookupError, ValueError):
+            await db.rollback()
+            return False
+        await db.commit()
+        return True
 
 
 async def _recovery_origin_matches(
@@ -579,6 +662,7 @@ async def _deliver_recovered_reply(
             db,
             anchor,
             for_update=True,
+            allow_completed=True,
         )
         if current_origin != expected_origin:
             return False
@@ -614,29 +698,154 @@ async def _deliver_recovered_reply(
                 }
             )
         delivered = await deliver_recovered_reply_to_origin(**delivery_kwargs)
-    # Release the origin row lock before the cleanup transaction locks the same
-    # ChatSession. Terminal delivery is already durable and remains authoritative.
-    if expected_origin.source_channel == "dingtalk":
-        from app.services.turn_inbox import (
-            cleanup_durable_channel_receipt_anchor,
-        )
-
-        try:
-            await cleanup_durable_channel_receipt_anchor(
-                session_id=anchor.conversation_id,
-                agent_id=anchor.agent_id,
-            )
-        except Exception:  # noqa: BLE001 - terminal delivery is authoritative
-            logger.opt(exception=True).warning(
-                "[turn_recovery] durable reaction cleanup failed after delivery "
-                "anchor={}",
-                anchor.id,
-            )
     return delivered
 
 
-async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=_recovery_max_age_hours())
+async def _start_recovered_reactions(anchor: ChatMessage) -> ChannelReactions:
+    reactions = await load_recovered_channel_reactions(
+        agent_id=anchor.agent_id,
+        conversation_id=anchor.conversation_id,
+    )
+    await run_channel_reaction_hook(
+        reactions.on_recover,
+        hook_name="recovery_prepare",
+        timeout_seconds=3.0,
+    )
+    await run_channel_reaction_hook(
+        reactions.on_consume,
+        hook_name="recovery_consume",
+    )
+    return reactions
+
+
+async def _finish_recovered_reactions(
+    reactions: ChannelReactions,
+    value: str | BaseException,
+) -> None:
+    if isinstance(value, BaseException):
+        await run_channel_reaction_hook(
+            reactions.on_error,
+            value,
+            hook_name="recovery_error",
+        )
+        return
+    await run_channel_reaction_hook(
+        reactions.on_complete,
+        value,
+        hook_name="recovery_complete",
+    )
+
+
+async def _persist_and_deliver_recovered_reply(
+    anchor: ChatMessage,
+    *,
+    expected_origin: _RecoveryOrigin,
+    execution_agent_id: uuid.UUID,
+    reply: str,
+) -> bool:
+    """Commit the recovered terminal result, then deliver and promote."""
+
+    if not await _recovery_origin_matches(anchor, expected_origin):
+        raise _RecoveryFenceLost("recovery owner or route changed")
+
+    from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+
+    runtime = await load_turn_runtime(
+        agent_id=anchor.agent_id,
+        conversation_id=anchor.conversation_id,
+    )
+    async with async_session() as db:
+        assistant_message_id = await persist_assistant_reply_row(
+            db,
+            agent_id=anchor.agent_id,
+            user_id=anchor.user_id,
+            conversation_id=anchor.conversation_id,
+            content=reply,
+            message_meta=attach_delivery_to_meta(
+                {},
+                IMDeliveryResult.pending(runtime.source_channel),
+            ),
+            turn_anchor_id=anchor.id,
+            sender_agent_id=execution_agent_id,
+        )
+        gateway_outbox = await _upsert_gateway_direct_reply(
+            db,
+            anchor=anchor,
+            reply=reply,
+            execution_agent_id=execution_agent_id,
+        )
+        if gateway_outbox is False:
+            raise RuntimeError("invalid Gateway direct reply route")
+        await db.commit()
+        from app.services.conversation_turn_lifecycle import (
+            get_conversation_turn_snapshot,
+        )
+
+        turn_snapshot = await get_conversation_turn_snapshot(
+            db,
+            agent_id=anchor.agent_id,
+            conversation_id=anchor.conversation_id,
+            turn_anchor_id=anchor.id,
+        )
+    from app.services.conversation_turn_lifecycle import (
+        publish_conversation_turn_event,
+    )
+
+    await publish_conversation_turn_event(
+        agent_id=anchor.agent_id,
+        conversation_id=anchor.conversation_id,
+        payload={
+            "type": "done",
+            "role": "assistant",
+            "content": reply,
+            "message_id": str(assistant_message_id),
+        },
+        snapshot=turn_snapshot,
+        event_kind="turn_terminal",
+    )
+    delivered = await _deliver_recovered_reply(
+        anchor,
+        expected_origin=expected_origin,
+        reply=reply,
+        execution_agent_id=execution_agent_id,
+        message_id=assistant_message_id,
+    )
+    if not delivered:
+        logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
+        return False
+    return True
+
+
+async def _kick_recovered_promoted_turn(anchor: ChatMessage) -> None:
+    """Start a durably promoted successor after prior feedback is cleaned."""
+
+    try:
+        from app.services.turn_inbox import kick_promoted_turn_inbox
+
+        await kick_promoted_turn_inbox(
+            agent_id=anchor.agent_id,
+            session_id=anchor.conversation_id,
+        )
+    except Exception:  # noqa: BLE001 - durable promotion is independently recoverable
+        logger.opt(exception=True).warning(
+            "[turn_recovery] promoted turn kick failed after recovery "
+            "anchor={}",
+            anchor.id,
+        )
+
+
+async def _load_recoverable_anchors(db) -> list[ChatMessage]:
+    """Snapshot every recoverable turn with activity inside the safety window.
+
+    A durable session owner is authoritative even when newer user messages are
+    queued behind it. The recent message-tail scan remains as a compatibility
+    fallback for turns created before the lifecycle pointer existed.
+
+    This query deliberately has no candidate limit. Startup creates one task
+    for every eligible turn; the existing workload-capacity layer remains the
+    only execution admission boundary.
+    """
+    cutoff = datetime.now(UTC) - timedelta(hours=_recovery_max_age_hours())
     latest = (
         select(
             ChatMessage.id.label("id"),
@@ -658,21 +867,110 @@ async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
         .join(latest, ChatMessage.id == latest.c.id)
         .where(latest.c.rn == 1)
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-        .limit(limit * 4)
     )
-    anchors: list[ChatMessage] = []
-    for latest_row in result.scalars().all():
-        if not await _latest_row_needs_recovery(db, latest_row):
+    latest_rows = list(result.scalars().all())
+
+    recent_session_ids: set[uuid.UUID] = set()
+    for row in latest_rows:
+        try:
+            recent_session_ids.add(uuid.UUID(str(row.conversation_id)))
+        except (TypeError, ValueError):
             continue
-        anchor = await _find_turn_anchor_for_latest(db, latest_row)
-        if anchor is None:
+
+    sessions: list[ChatSession] = []
+    if recent_session_ids:
+        sessions = list(
+            (
+                await db.execute(
+                    select(ChatSession).where(ChatSession.id.in_(recent_session_ids))
+                )
+            ).scalars()
+        )
+
+    authoritative_sessions: dict[
+        tuple[uuid.UUID, str],
+        tuple[ChatSession, ConversationTurnSnapshot],
+    ] = {}
+    owner_anchor_ids: set[uuid.UUID] = set()
+    for session in sessions:
+        snapshot = conversation_turn_snapshot_for_session(session)
+        if snapshot.status not in {ACTIVE_TURN_STATUS, SUSPENDED_TURN_STATUS}:
+            continue
+        if session.source_channel == "subagent":
+            continue
+        if snapshot.anchor_id is None:
+            continue
+        authoritative_sessions[(session.agent_id, str(session.id))] = (
+            session,
+            snapshot,
+        )
+        owner_anchor_ids.add(snapshot.anchor_id)
+
+    owner_rows: dict[uuid.UUID, ChatMessage] = {}
+    if owner_anchor_ids:
+        owner_rows = {
+            row.id: row
+            for row in (
+                (
+                    await db.execute(
+                        select(ChatMessage).where(ChatMessage.id.in_(owner_anchor_ids))
+                    )
+                ).scalars()
+            )
+        }
+
+    anchors: list[ChatMessage] = []
+    selected_anchor_ids: set[uuid.UUID] = set()
+    for (agent_id, conversation_id), (_session, snapshot) in sorted(
+        authoritative_sessions.items(),
+        key=lambda item: item[0][1],
+    ):
+        anchor = owner_rows.get(snapshot.anchor_id)
+        meta = (
+            dict(anchor.message_meta or {})
+            if anchor is not None
+            else {}
+        )
+        if (
+            anchor is None
+            or anchor.agent_id != agent_id
+            or anchor.conversation_id != conversation_id
+            or anchor.role not in {"user", "system"}
+            or _metadata_int(meta, "turn_generation") != snapshot.generation
+            or _metadata_int(meta, "turn_revision") != snapshot.revision
+            or str(meta.get("turn_status") or "") != snapshot.status
+            or meta.get("consumed_by_onmessage")
+            or meta.get("kind") == "on_message_event"
+        ):
+            logger.warning(
+                "[turn_recovery] ignored inconsistent durable owner "
+                "conversation={} anchor={}",
+                conversation_id,
+                snapshot.anchor_id,
+            )
             continue
         if await _load_recovery_origin(db, anchor) is None:
             continue
         anchors.append(anchor)
-        if len(anchors) >= limit:
-            break
-    return anchors
+        selected_anchor_ids.add(anchor.id)
+
+    for latest_row in latest_rows:
+        # A later queued input must never replace a durable current owner.
+        if (
+            latest_row.agent_id,
+            latest_row.conversation_id,
+        ) in authoritative_sessions:
+            continue
+        if not await _latest_row_needs_recovery(db, latest_row):
+            continue
+        anchor = await _find_turn_anchor_for_latest(db, latest_row)
+        if anchor is None or anchor.id in selected_anchor_ids:
+            continue
+        if await _load_recovery_origin(db, anchor) is None:
+            continue
+        anchors.append(anchor)
+        selected_anchor_ids.add(anchor.id)
+    return sorted(anchors, key=lambda row: (row.created_at, str(row.id)))
 
 
 async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
@@ -691,15 +989,13 @@ async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
     if row.role == "assistant":
         if meta.get("artifact_role") == "intermediate_assistant":
             return True
-        if is_incomplete_delivery_progress(row):
-            return True
         # Persisted assistant output is the durable completion boundary. Without a
         # separate delivery receipt, startup cannot distinguish "persisted before
         # send" from "already sent"; retrying here duplicates every recent IM reply
         # on each restart. Recover only turns that stopped before assistant output.
-        return False
+        return is_incomplete_delivery_progress(row)
     if row.role == "user":
-        return True
+        return str(meta.get("turn_status") or "") not in TERMINAL_TURN_STATUSES
     if row.role != "tool_call":
         return False
     payload = _tool_payload(row)
@@ -787,16 +1083,14 @@ async def _tail_has_pending_confirmation(db, anchor: ChatMessage, *, ctx_size: i
 
 async def _resume_one(
     anchor: ChatMessage,
-    semaphore: asyncio.Semaphore,
 ) -> RecoveryStats:
-    """Resume one independently cancellable anchor within the resource cap."""
+    """Resume one independently cancellable anchor."""
     result = RecoveryStats()
     try:
-        async with semaphore:
-            # A recovered turn owns its cancellation lifecycle. Running it in
-            # a child task lets one stopped turn remain isolated while an
-            # actual shutdown still cancels the whole startup batch.
-            did_resume = await asyncio.create_task(resume_turn(anchor))
+        # A recovered turn owns its cancellation lifecycle. Running it in a
+        # child task lets one stopped turn remain isolated while an actual
+        # shutdown still cancels the whole startup recovery set.
+        did_resume = await asyncio.create_task(resume_turn(anchor))
     except asyncio.CancelledError:
         recovery_task = asyncio.current_task()
         if recovery_task is not None and recovery_task.cancelling():
@@ -821,9 +1115,11 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
     """Resume startup-recoverable turn anchors once.
 
     All app instances may pass through this gate. A renewable Redis lease keeps
-    one replica responsible for a recovery batch without reserving a PostgreSQL
-    connection while model turns execute. Callers may run this synchronously or
-    as a detached startup background task.
+    one replica responsible for the complete recovery set without reserving a
+    PostgreSQL connection while model turns execute. ``limit`` is retained only
+    for bounded cleanup of already-terminal provider feedback; it never limits
+    eligible turns. Callers may run this synchronously or as a detached startup
+    background task.
     """
     stats = RecoveryStats()
     try:
@@ -847,22 +1143,19 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
             # Scanning is a short read transaction. Close it before admission,
             # model execution, tool execution, or inter-turn waits.
             async with async_session() as db:
-                anchors = await _load_recoverable_anchors(db, limit=limit)
+                anchors = await _load_recoverable_anchors(db)
             stats.scanned = len(anchors)
             if anchors:
-                concurrency = min(len(anchors), RECOVERY_CONCURRENCY)
                 logger.info(
-                    "[turn_recovery] resuming anchors={} concurrency={}",
+                    "[turn_recovery] resuming all eligible anchors in parallel: {}",
                     len(anchors),
-                    concurrency,
                 )
-                semaphore = asyncio.Semaphore(concurrency)
                 tasks: list[asyncio.Task[RecoveryStats]] = []
                 async with asyncio.TaskGroup() as task_group:
                     for anchor in anchors:
                         tasks.append(
                             task_group.create_task(
-                                _resume_one(anchor, semaphore),
+                                _resume_one(anchor),
                                 name=f"turn_recovery:{anchor.id}",
                             )
                         )
@@ -879,6 +1172,8 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
 async def resume_turn(anchor: ChatMessage) -> bool:
     """Resume one inferred incomplete user turn via the normal channel LLM path."""
 
+    if not await _ensure_recovery_owner(anchor):
+        return False
     expected_origin = await _load_fresh_recovery_origin(anchor)
     if expected_origin is None:
         return False
@@ -959,100 +1254,51 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                     # continuation point.
                     return False
 
-            reply = await _call_agent_llm(
-                db,
-                execution_agent_id,
-                "",
-                session_id=anchor.conversation_id,
-                user_id=anchor.user_id,
-                history=history,
-                recovery_hint=None,
-                continue_turn=True,
-                recovery_mode=True,
-                turn_anchor_id=anchor.id,
-                storage_agent_id=anchor.agent_id,
-                turn_type="recovery",
-            )
-
-        if reply and reply.strip():
-            if not await _recovery_origin_matches(anchor, expected_origin):
-                return False
-            from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
-
-            runtime = await load_turn_runtime(
-                agent_id=anchor.agent_id,
-                conversation_id=anchor.conversation_id,
-            )
+        reactions = await _start_recovered_reactions(anchor)
+        try:
             async with async_session() as db:
-                assistant_message_id = await persist_assistant_reply_row(
+                reply = await _call_agent_llm(
                     db,
-                    agent_id=anchor.agent_id,
-                    user_id=anchor.user_id,
-                    conversation_id=anchor.conversation_id,
-                    content=reply,
-                    message_meta=attach_delivery_to_meta(
-                        {},
-                        IMDeliveryResult.pending(runtime.source_channel),
-                    ),
-                    turn_anchor_id=anchor.id,
-                    sender_agent_id=execution_agent_id,
-                )
-                gateway_outbox = await _upsert_gateway_direct_reply(
-                    db,
-                    anchor=anchor,
-                    reply=reply,
-                    execution_agent_id=execution_agent_id,
-                )
-                if gateway_outbox is False:
-                    raise RuntimeError("invalid Gateway direct reply route")
-                await db.commit()
-                from app.services.conversation_turn_lifecycle import get_conversation_turn_snapshot
-
-                turn_snapshot = await get_conversation_turn_snapshot(
-                    db,
-                    agent_id=anchor.agent_id,
-                    conversation_id=anchor.conversation_id,
-                    turn_anchor_id=anchor.id,
-                )
-            from app.services.conversation_turn_lifecycle import publish_conversation_turn_event
-
-            await publish_conversation_turn_event(
-                agent_id=anchor.agent_id,
-                conversation_id=anchor.conversation_id,
-                payload={
-                    "type": "done",
-                    "role": "assistant",
-                    "content": reply,
-                    "message_id": str(assistant_message_id),
-                },
-                snapshot=turn_snapshot,
-                event_kind="turn_terminal",
-            )
-            delivered = await _deliver_recovered_reply(
-                anchor,
-                expected_origin=expected_origin,
-                reply=reply,
-                execution_agent_id=execution_agent_id,
-                message_id=assistant_message_id,
-            )
-            if not delivered:
-                logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
-                return False
-            try:
-                from app.services.turn_inbox import kick_promoted_turn_inbox
-
-                await kick_promoted_turn_inbox(
-                    agent_id=anchor.agent_id,
+                    execution_agent_id,
+                    "",
                     session_id=anchor.conversation_id,
+                    user_id=anchor.user_id,
+                    history=history,
+                    recovery_hint=None,
+                    continue_turn=True,
+                    recovery_mode=True,
+                    turn_anchor_id=anchor.id,
+                    storage_agent_id=anchor.agent_id,
+                    turn_type="recovery",
+                    on_tool_call=reactions.on_tool_call,
+                    on_thinking=reactions.on_thinking,
+                    on_chunk=reactions.on_chunk,
                 )
-            except Exception:
-                # Promotion is already durable. Startup recovery remains the
-                # fallback if this local handoff cannot be scheduled.
-                logger.opt(exception=True).warning(
-                    "[turn_recovery] promoted turn kick failed after recovery "
-                    "anchor={}",
-                    anchor.id,
-                )
-            return True
+        except _RecoveryFenceLost as exc:
+            await _finish_recovered_reactions(reactions, exc)
+            return False
+        except BaseException as exc:
+            await _finish_recovered_reactions(reactions, exc)
+            raise
 
-        return False
+        try:
+            result = (
+                await _persist_and_deliver_recovered_reply(
+                    anchor,
+                    expected_origin=expected_origin,
+                    execution_agent_id=execution_agent_id,
+                    reply=reply,
+                )
+                if reply and reply.strip()
+                else False
+            )
+        except _RecoveryFenceLost as exc:
+            await _finish_recovered_reactions(reactions, exc)
+            return False
+        except BaseException as exc:
+            await _finish_recovered_reactions(reactions, exc)
+            raise
+        await _finish_recovered_reactions(reactions, reply or "")
+        if result:
+            await _kick_recovered_promoted_turn(anchor)
+        return result

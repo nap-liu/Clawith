@@ -47,6 +47,9 @@ class ChannelReactions:
     """
 
     # —— 轮边界钩子(run_channel_message 在锁内触发)——
+    # Recovery calls this before ``on_consume`` so an adapter can clear
+    # process-local progress state left behind by the previous instance.
+    on_recover: Hook0 | None = None
     on_consume: Hook0 | None = None
     on_complete: Callable[[str], Awaitable[None]] | None = None
     on_error: Callable[[BaseException], Awaitable[None]] | None = None
@@ -152,6 +155,7 @@ async def run_channel_reaction_hook(
     hook: Callable[..., Awaitable[None]] | None,
     *args: object,
     hook_name: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> bool:
     """Run one reaction hook within a strict best-effort time boundary.
 
@@ -162,12 +166,17 @@ async def run_channel_reaction_hook(
     """
     if hook is None:
         return True
+    effective_timeout = (
+        CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
     label = hook_name or getattr(hook, "__name__", type(hook).__name__)
     task = asyncio.create_task(hook(*args), name=f"channel-reaction:{label}")
     try:
         done, _pending = await asyncio.wait(
             {task},
-            timeout=CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS,
+            timeout=effective_timeout,
         )
     except BaseException:
         task.cancel()
@@ -178,7 +187,7 @@ async def run_channel_reaction_hook(
         task.add_done_callback(_consume_reaction_task_result)
         logger.warning(
             "[channel_dispatch] reaction hook timed out (ignored): "
-            f"hook={label} timeout={CHANNEL_REACTION_HOOK_TIMEOUT_SECONDS}s"
+            f"hook={label} timeout={effective_timeout}s"
         )
         return False
     try:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -371,9 +371,9 @@ async def test_startup_recovery_scans_recent_incomplete_message_tails(monkeypatc
 
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
-    assert resumed == [first_anchor]
-    assert stats.scanned == 1
-    assert stats.resumed == 1
+    assert resumed == [first_anchor, second_anchor]
+    assert stats.scanned == 2
+    assert stats.resumed == 2
 
     resumed.clear()
     stats = await turn_recovery.startup_turn_resume_once(limit=2)
@@ -381,6 +381,128 @@ async def test_startup_recovery_scans_recent_incomplete_message_tails(monkeypatc
     assert resumed == [first_anchor, second_anchor]
     assert stats.scanned == 2
     assert stats.resumed == 2
+
+
+async def test_startup_scan_does_not_drop_recoverable_tail_after_two_hundred_complete_conversations(
+    monkeypatch,
+):
+    """Eligibility is decided before any count cap, including a busy two-hour window."""
+    from app.services import turn_recovery
+
+    agent_id, user_id = await _make_agent_with_model()
+    now = datetime.now(UTC)
+    async with async_session() as db:
+        rows: list[ChatMessage] = []
+        for index in range(205):
+            conversation_id = f"complete-busy-window-{index}-{uuid.uuid4().hex}"
+            rows.extend(
+                [
+                    ChatMessage(
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        role="user",
+                        content="already handled",
+                        created_at=now - timedelta(minutes=110) + timedelta(seconds=index * 2),
+                    ),
+                    ChatMessage(
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content="done",
+                        created_at=now - timedelta(minutes=110) + timedelta(seconds=index * 2 + 1),
+                    ),
+                ]
+            )
+        target = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=f"recover-after-200-{uuid.uuid4().hex}",
+            role="user",
+            content="must still recover",
+            created_at=now - timedelta(seconds=1),
+        )
+        rows.append(target)
+        db.add_all(rows)
+        await db.commit()
+        target_id = target.id
+
+    resumed: list[uuid.UUID] = []
+
+    async def fake_resume(anchor):
+        resumed.append(anchor.id)
+        return True
+
+    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    stats = await turn_recovery.startup_turn_resume_once(limit=1)
+
+    assert resumed == [target_id]
+    assert stats.scanned == 1
+    assert stats.resumed == 1
+
+
+async def test_startup_scan_prefers_durable_owner_over_newer_queued_user(monkeypatch):
+    """A later inbox row cannot hide the turn that owned the session at restart."""
+    from app.services import turn_recovery
+    from app.services.chat_history import persist_incoming_user_message
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+    agent_id, user_id = await _make_agent_with_model()
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="durable recovery owner",
+            source_channel="dingtalk",
+            external_conv_id=f"dingtalk_group_{uuid.uuid4().hex}",
+        )
+        db.add(session)
+        await db.flush()
+        owner = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=str(session.id),
+            content="running before restart",
+        )
+        await transition_conversation_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+            turn_anchor_id=owner.id,
+            status="running",
+        )
+        queued = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=str(session.id),
+            content="arrived while owner was running",
+            message_meta={
+                "turn_inbox_state": "pending",
+                "turn_inbox_anchor_id": str(owner.id),
+                "turn_inbox_generation": 1,
+                "turn_inbox_mode": "current_turn",
+            },
+        )
+        owner_id = owner.id
+        queued_id = queued.id
+        await db.commit()
+
+    resumed: list[uuid.UUID] = []
+
+    async def fake_resume(anchor):
+        resumed.append(anchor.id)
+        return True
+
+    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    stats = await turn_recovery.startup_turn_resume_once(limit=1)
+
+    assert resumed == [owner_id]
+    assert queued_id not in resumed
+    assert stats.scanned == 1
+    assert stats.resumed == 1
 
 
 async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(monkeypatch):
@@ -494,8 +616,7 @@ async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatc
     first_ready = asyncio.Event()
     resumed_ids: list[uuid.UUID] = []
 
-    async def fake_load(_db, *, limit):
-        assert limit == 2
+    async def fake_load(_db):
         return anchors
 
     async def fake_resume(anchor):
@@ -528,8 +649,8 @@ async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatc
     await reset_active_turns_for_testing()
 
 
-async def test_startup_recovery_runs_anchors_with_bounded_parallelism(monkeypatch):
-    """Independent recovery turns overlap while respecting the configured cap."""
+async def test_startup_recovery_starts_every_eligible_anchor_in_parallel(monkeypatch):
+    """Recovery adds no batching or concurrency gate beyond normal admission."""
     from types import SimpleNamespace
 
     from app.services import turn_recovery
@@ -543,15 +664,14 @@ async def test_startup_recovery_runs_anchors_with_bounded_parallelism(monkeypatc
     in_flight = 0
     peak_in_flight = 0
 
-    async def fake_load(_db, *, limit):
-        assert limit == len(anchors)
+    async def fake_load(_db):
         return anchors
 
     async def fake_resume(_anchor):
         nonlocal in_flight, peak_in_flight
         in_flight += 1
         peak_in_flight = max(peak_in_flight, in_flight)
-        if in_flight == 2:
+        if in_flight == len(anchors):
             first_wave_ready.set()
         try:
             await release.wait()
@@ -560,14 +680,13 @@ async def test_startup_recovery_runs_anchors_with_bounded_parallelism(monkeypatc
             in_flight -= 1
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "RECOVERY_CONCURRENCY", 2)
     monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
 
     scanner = asyncio.create_task(
         turn_recovery.startup_turn_resume_once(limit=len(anchors))
     )
     await asyncio.wait_for(first_wave_ready.wait(), timeout=1)
-    assert peak_in_flight == 2
+    assert peak_in_flight == len(anchors)
     release.set()
 
     stats = await asyncio.wait_for(scanner, timeout=1)
@@ -575,7 +694,7 @@ async def test_startup_recovery_runs_anchors_with_bounded_parallelism(monkeypatc
     assert stats.resumed == 4
     assert stats.skipped == 0
     assert stats.failed == 0
-    assert peak_in_flight == 2
+    assert peak_in_flight == len(anchors)
 
 
 async def test_startup_recovery_failure_does_not_cancel_siblings(monkeypatch):
@@ -587,8 +706,7 @@ async def test_startup_recovery_failure_does_not_cancel_siblings(monkeypatch):
     anchors = [SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())]
     successful_anchor = asyncio.Event()
 
-    async def fake_load(_db, *, limit):
-        assert limit == 2
+    async def fake_load(_db):
         return anchors
 
     async def fake_resume(anchor):
@@ -616,8 +734,7 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
     anchor = SimpleNamespace(id=uuid.uuid4())
     recovery_started = asyncio.Event()
 
-    async def fake_load(_db, *, limit):
-        assert limit == 1
+    async def fake_load(_db):
         return [anchor]
 
     async def fake_resume(_anchor):
@@ -1077,6 +1194,7 @@ async def test_startup_scan_skips_recent_dingtalk_assistant_tail(monkeypatch):
 async def test_resume_turn_continues_from_recoverable_history_and_marks_completed(monkeypatch):
     """A processing user anchor is resumed via the normal channel LLM path."""
     from app.services import turn_recovery
+    from app.services.channel_dispatch import ChannelReactions
     from app.services.chat_history import persist_incoming_user_message
 
     agent_id, user_id = await _make_agent_with_model(context_window_size=1)
@@ -1093,11 +1211,38 @@ async def test_resume_turn_continues_from_recoverable_history_and_marks_complete
         await db.commit()
 
     captured = {}
+    reaction_events: list[str] = []
+
+    async def reaction_prepare():
+        reaction_events.append("prepare")
+
+    async def reaction_consume():
+        reaction_events.append("consume")
+
+    async def reaction_tool(_event):
+        reaction_events.append("tool")
+
+    async def reaction_complete(_reply):
+        reaction_events.append("complete")
+
+    async def fake_reactions(**_kwargs):
+        return ChannelReactions(
+            on_recover=reaction_prepare,
+            on_consume=reaction_consume,
+            on_tool_call=reaction_tool,
+            on_complete=reaction_complete,
+        )
 
     async def fake_call_agent_llm(*args, **kwargs):
         captured.update(kwargs)
+        await kwargs["on_tool_call"]({"status": "running", "name": "web_search"})
         return "resumed reply"
 
+    monkeypatch.setattr(
+        turn_recovery,
+        "load_recovered_channel_reactions",
+        fake_reactions,
+    )
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
 
     async with async_session() as db:
@@ -1108,6 +1253,7 @@ async def test_resume_turn_continues_from_recoverable_history_and_marks_complete
     assert result is True
     assert captured["continue_turn"] is True
     assert captured["recovery_mode"] is True
+    assert reaction_events == ["prepare", "consume", "tool", "complete"]
     assert captured["turn_anchor_id"] == anchor_id
     assert captured["history"][-1] == {
         "role": "user",
@@ -1131,9 +1277,59 @@ async def test_resume_turn_continues_from_recoverable_history_and_marks_complete
     assert len(replies) == 1
 
 
+async def test_recovered_turn_cancellation_runs_rebuilt_reaction_error_hook(
+    monkeypatch,
+):
+    """A stop or shutdown during recovery clears provider progress feedback."""
+    from app.services import turn_recovery
+    from app.services.channel_dispatch import ChannelReactions
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=2)
+    anchor_id = await _make_user_anchor(
+        agent_id,
+        user_id,
+        conv=f"cancel-recovery-reaction-{uuid.uuid4().hex}",
+    )
+    events: list[str] = []
+
+    async def prepare():
+        events.append("prepare")
+
+    async def consume():
+        events.append("consume")
+
+    async def error(exc):
+        assert isinstance(exc, asyncio.CancelledError)
+        events.append("error")
+
+    async def fake_reactions(**_kwargs):
+        return ChannelReactions(
+            on_recover=prepare,
+            on_consume=consume,
+            on_error=error,
+        )
+
+    async def cancelled_llm(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        turn_recovery,
+        "load_recovered_channel_reactions",
+        fake_reactions,
+    )
+    monkeypatch.setattr(turn_recovery, "_call_agent_llm", cancelled_llm)
+
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+    with pytest.raises(asyncio.CancelledError):
+        await turn_recovery.resume_turn(anchor)
+
+    assert events == ["prepare", "consume", "error"]
+
+
 async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch):
     """Recovered IM turns must be delivered through their original channel runtime."""
-    from app.services import turn_inbox, turn_recovery
+    from app.services import turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
     agent_id, user_id = await _make_agent_with_model(context_window_size=1)
@@ -1169,17 +1365,8 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
         delivered.append(kwargs)
         return True
 
-    async def failing_reaction_cleanup(**_kwargs):
-        lifecycle_events.append("reaction-cleanup")
-        raise RuntimeError("provider cleanup unavailable")
-
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
     monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver, raising=False)
-    monkeypatch.setattr(
-        turn_inbox,
-        "cleanup_durable_channel_receipt_anchor",
-        failing_reaction_cleanup,
-    )
 
     async with async_session() as db:
         anchor = (await db.execute(select(ChatMessage).where(ChatMessage.id == anchor_id))).scalar_one()
@@ -1187,7 +1374,7 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
-    assert lifecycle_events == ["terminal-delivered", "reaction-cleanup"]
+    assert lifecycle_events == ["terminal-delivered"]
     assert len(delivered) == 1
     delivered_message_id = delivered[0].pop("message_id")
     assert isinstance(delivered_message_id, uuid.UUID)
