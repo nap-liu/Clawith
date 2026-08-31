@@ -173,9 +173,11 @@ from app.services.agent_tools_facade import (
     register_sync_targets,
 )
 from app.services.agent_tools_file_support import _tool_storage_key
-
-TOOL_MATERIALIZE_MAX_FILE_BYTES = 10 * 1024 * 1024
-TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+from app.services.agent_tools_media_limits import (
+    TOOL_MATERIALIZE_MAX_FILE_BYTES,
+    TOOL_MATERIALIZE_MAX_TOTAL_BYTES,
+    _media_materialization_size_error,
+)
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
 
 from app.services.agent_tools_document_tools import (
@@ -368,8 +370,6 @@ from app.services.agent_tools_skill_market_ops import (
 
 _settings = get_settings()
 WORKSPACE_ROOT = Path(_settings.STORAGE_LOCAL_ROOT or _settings.AGENT_DATA_DIR)
-TOOL_MATERIALIZE_MAX_FILE_BYTES = 10 * 1024 * 1024
-TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MEDIA_DELIVERY_MAX_IN_FLIGHT = 4
 _outbound_media_slots = _agent_tools_outbound_core_module._outbound_media_slots
 _OUTBOUND_CORE_EXPORT_NAMES = (
@@ -1146,20 +1146,6 @@ async def _read_document_from_storage(
         max_chars=max_chars,
         tenant_id=tenant_id,
     )
-
-
-def _media_materialization_size_error(
-    media_size: int,
-    cover_size: int | None = None,
-) -> str | None:
-    """Return the stable preflight error before selective materialization."""
-    if media_size > MEDIA_TOOL_MAX_FILE_BYTES:
-        return "MEDIA_TOO_LARGE"
-    if cover_size is not None and cover_size > TOOL_MATERIALIZE_MAX_FILE_BYTES:
-        return "VIDEO_COVER_TOO_LARGE"
-    if media_size + (cover_size or 0) > TOOL_MATERIALIZE_MAX_TOTAL_BYTES:
-        return "MEDIA_BUNDLE_TOO_LARGE"
-    return None
 
 
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
