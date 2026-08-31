@@ -1,19 +1,61 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
 
+from loguru import logger
 from sqlalchemy import select
 
+from app.database import async_session as _database_async_session
 from app.models.task import Task
 from app.services.recipient_resolver import RecipientResolutionError
 
 
-def _root_agent_tools():
-    from app.services import agent_tools as root_agent_tools
+class _AsyncSessionProxy:
+    def __call__(self):
+        from app.services import agent_tools
 
-    return root_agent_tools
+        bound = getattr(agent_tools, "async_session", None)
+        if bound is self or bound is None:
+            bound = _database_async_session
+        return bound()
+
+
+async_session = _AsyncSessionProxy()
+
+
+async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
+    """Sync tasks from DB to legacy tasks.json, if the file already exists."""
+    tasks_path = ws / "tasks.json"
+    if not tasks_path.exists():
+        return
+
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(Task).where(Task.agent_id == agent_id).order_by(Task.created_at.desc()))
+            tasks = result.scalars().all()
+
+        task_list = []
+        for t in tasks:
+            task_list.append(
+                {
+                    "title": t.title,
+                    "status": t.status,
+                    "priority": t.priority,
+                    "description": t.description or "",
+                    "created_at": t.created_at.isoformat() if t.created_at else "",
+                    "completed_at": t.completed_at.isoformat() if t.completed_at else "",
+                }
+            )
+
+        tasks_path.write_text(
+            json.dumps(task_list, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.error(f"[AgentTools] Failed to sync tasks: {e}")
 
 
 async def _manage_tasks(
@@ -24,12 +66,12 @@ async def _manage_tasks(
 ) -> str:
     """Create / update / delete tasks in DB and sync to workspace."""
     from app.models.task import TaskLog
+    from datetime import datetime, timezone
 
-    root_agent_tools = _root_agent_tools()
     action = args["action"]
     title = args["title"]
 
-    async with root_agent_tools.async_session() as db:
+    async with async_session() as db:
         if action == "create":
             task_type = args.get("task_type", "todo")
             resolved_target = None
@@ -87,23 +129,27 @@ async def _manage_tasks(
             await db.refresh(task)
 
             if task_type == "todo":
+                # Trigger auto-execution for todo tasks
                 import asyncio
                 from app.services.task_executor import execute_task
 
                 asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
-                await root_agent_tools._sync_tasks_to_file(agent_id, ws)
+                await _sync_tasks_to_file(agent_id, ws)
                 return f"✅ Task created: {title} — auto-execution started"
+            else:
+                # Supervision task — reminder engine will pick it up
+                target = resolved_target.display_name if resolved_target else "unknown"
+                schedule = args.get("remind_schedule", "not set")
+                await _sync_tasks_to_file(agent_id, ws)
+                return f"✅ Supervision task created: '{title}' — will remind {target} on schedule ({schedule})"
 
-            target = resolved_target.display_name if resolved_target else "unknown"
-            schedule = args.get("remind_schedule", "not set")
-            await root_agent_tools._sync_tasks_to_file(agent_id, ws)
-            return f"✅ Supervision task created: '{title}' — will remind {target} on schedule ({schedule})"
-
-        if action == "update_status":
+        elif action == "update_status":
             result = await db.execute(select(Task).where(Task.agent_id == agent_id, Task.title.ilike(f"%{title}%")))
             task = result.scalars().first()
             if not task:
                 return f"No task found matching '{title}'"
+            # Persisted background work always follows the last conversation
+            # user who changed it. ``created_by`` remains immutable audit data.
             from app.services.execution_identity import align_background_execution_user
 
             await align_background_execution_user(
@@ -118,10 +164,10 @@ async def _manage_tasks(
             if args["status"] == "done":
                 task.completed_at = datetime.now(timezone.utc)
             await db.commit()
-            await root_agent_tools._sync_tasks_to_file(agent_id, ws)
+            await _sync_tasks_to_file(agent_id, ws)
             return f"✅ Updated '{task.title}' from {old} to {args['status']}"
 
-        if action == "delete":
+        elif action == "delete":
             from sqlalchemy import delete as sa_delete
 
             result = await db.execute(select(Task).where(Task.agent_id == agent_id, Task.title.ilike(f"%{title}%")))
@@ -132,7 +178,7 @@ async def _manage_tasks(
             await db.execute(sa_delete(TaskLog).where(TaskLog.task_id == task.id))
             await db.delete(task)
             await db.commit()
-            await root_agent_tools._sync_tasks_to_file(agent_id, ws)
+            await _sync_tasks_to_file(agent_id, ws)
             return f"✅ Task deleted: {task_title}"
 
         return f"Unknown action: {action}"
@@ -171,7 +217,7 @@ async def _search_contacts_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.U
 
     from app.services.contact_relationships import search_contacts_for_agent
 
-    async with _root_agent_tools().async_session() as db:
+    async with async_session() as db:
         rows = await search_contacts_for_agent(
             db,
             agent_id,
@@ -192,6 +238,8 @@ async def _search_contacts_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.U
                 continue
             canonical_user_id = public.get("user_id") or raw_id
             if not canonical_user_id:
+                # Workstream 3 must provision an external-only User before this
+                # person can enter the public Agent identity contract.
                 continue
             canonical = str(canonical_user_id)
             if canonical in seen_users:
@@ -208,9 +256,12 @@ async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID 
     if bool(human_id) == bool(digital_id):
         return "❌ Provide exactly one of user_id or agent_id from search_contacts"
 
-    from app.services.contact_relationships import add_agent_contact_for_agent, add_user_contact_for_agent
+    from app.services.contact_relationships import (
+        add_agent_contact_for_agent,
+        add_user_contact_for_agent,
+    )
 
-    async with _root_agent_tools().async_session() as db:
+    async with async_session() as db:
         try:
             target_uuid = uuid.UUID(digital_id or human_id)
         except ValueError:
@@ -249,9 +300,12 @@ async def _remove_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UU
     if bool(human_id) == bool(digital_id):
         return "❌ Provide exactly one of user_id or agent_id from search_contacts"
 
-    from app.services.contact_relationships import remove_agent_contact_for_agent, remove_user_contact_for_agent
+    from app.services.contact_relationships import (
+        remove_agent_contact_for_agent,
+        remove_user_contact_for_agent,
+    )
 
-    async with _root_agent_tools().async_session() as db:
+    async with async_session() as db:
         try:
             target_uuid = uuid.UUID(digital_id or human_id)
         except ValueError:
@@ -308,12 +362,11 @@ async def _start_dingtalk_channel_provisioning_tool(
     if not isinstance(force_reconfigure, bool):
         return "❌ force_reconfigure 必须是布尔值。普通配置请求请保持 false。"
 
-    root_agent_tools = _root_agent_tools()
     from app.core.permissions import user_can_manage_agent_id
     from app.models.agent import Agent as AgentModel
     from app.services.dingtalk_provisioning import start_dingtalk_channel_provisioning
 
-    async with root_agent_tools.async_session() as db:
+    async with async_session() as db:
         result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
         agent = result.scalar_one_or_none()
         if not agent:
@@ -369,13 +422,12 @@ async def _get_dingtalk_channel_provisioning_status_tool(
     if not provisioning_id:
         return "❌ 缺少有效的配置编号 provisioning_id。"
 
-    root_agent_tools = _root_agent_tools()
     from app.core.permissions import user_can_manage_agent_id
     from app.models.agent import Agent as AgentModel
     from app.models.dingtalk_provisioning import DingTalkChannelProvisioningSession
     from app.services.dingtalk_provisioning import get_dingtalk_provisioning_status_response
 
-    async with root_agent_tools.async_session() as db:
+    async with async_session() as db:
         agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
         agent = agent_result.scalar_one_or_none()
         if not agent:
