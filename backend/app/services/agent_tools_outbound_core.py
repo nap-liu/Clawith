@@ -1,6 +1,7 @@
 """Durable outbound-message operation and receipt primitives."""
 
 import asyncio
+import json
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
