@@ -139,6 +139,7 @@ from app.services.user_project_tools import (
     user_project_tool_error,
 )
 from app.services.agent_tools_catalog import AGENT_TOOLS
+from app.services import agent_tools_document_tools as _agent_tools_document_tools_module
 from app.services.agent_tools_file_support import _tool_storage_key
 
 TOOL_MATERIALIZE_MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -160,9 +161,10 @@ from app.services.agent_tools_document_tools import (
     _convert_html_to_pptx,
     _convert_markdown_to_docx,
     _convert_markdown_to_pdf,
-    _read_document,
-    _read_document_sync,
-    _read_document_with_timeout,
+    _read_document as _read_document_impl,
+    _read_document_from_storage as _read_document_from_storage_impl,
+    _read_document_sync as _read_document_sync_impl,
+    _read_document_with_timeout as _read_document_with_timeout_impl,
     _read_document_worker,
     _read_pdf_fast_sync,
     _read_pdf_fast_with_timeout,
@@ -361,6 +363,57 @@ _agent_tools_deploy_ops_module._get_vercel_token = _deploy_ops_get_vercel_token_
 _agent_tools_deploy_ops_module._get_vercel_quota_summary = _deploy_ops_get_vercel_quota_summary_proxy
 _agent_tools_deploy_ops_module._check_neon_quota_limit = _deploy_ops_check_neon_quota_limit_proxy
 _agent_tools_deploy_ops_module._agent_workspace_root = _agent_workspace_root
+
+
+def _sync_document_tool_bindings() -> None:
+    _agent_tools_document_tools_module.get_storage_backend = get_storage_backend
+    _agent_tools_document_tools_module._prepare_temp_workspace = _prepare_temp_workspace
+    _agent_tools_document_tools_module._read_document = globals()["_read_document"]
+    _agent_tools_document_tools_module._READ_DOCUMENT_MAX_FILE_BYTES = _READ_DOCUMENT_MAX_FILE_BYTES
+    _agent_tools_document_tools_module._READ_DOCUMENT_TIMEOUT_SECONDS = _READ_DOCUMENT_TIMEOUT_SECONDS
+    _agent_tools_document_tools_module._READ_DOCUMENT_FALLBACK_TIMEOUT_SECONDS = _READ_DOCUMENT_FALLBACK_TIMEOUT_SECONDS
+    _agent_tools_document_tools_module._READ_DOCUMENT_MAX_COLUMNS = _READ_DOCUMENT_MAX_COLUMNS
+    _agent_tools_document_tools_module._READ_DOCUMENT_MAX_ROWS = _READ_DOCUMENT_MAX_ROWS
+    _agent_tools_document_tools_module._READ_DOCUMENT_MAX_SHEETS = _READ_DOCUMENT_MAX_SHEETS
+    _agent_tools_document_tools_module._READ_DOCUMENT_MAX_PAGES = _READ_DOCUMENT_MAX_PAGES
+    _agent_tools_document_tools_module._READ_DOCUMENT_MAX_SLIDES = _READ_DOCUMENT_MAX_SLIDES
+    _agent_tools_document_tools_module._READ_DOCUMENT_HARD_CHAR_CEILING = _READ_DOCUMENT_HARD_CHAR_CEILING
+
+
+def _read_document_sync(
+    ws: Path, rel_path: str, max_chars: int = _READ_DOCUMENT_HARD_CHAR_CEILING, tenant_id: str | None = None
+) -> str:
+    _sync_document_tool_bindings()
+    return _read_document_sync_impl(ws, rel_path, max_chars=max_chars, tenant_id=tenant_id)
+
+
+async def _read_document(
+    ws: Path, rel_path: str, max_chars: int = _READ_DOCUMENT_HARD_CHAR_CEILING, tenant_id: str | None = None
+) -> str:
+    _sync_document_tool_bindings()
+    return await _read_document_impl(ws, rel_path, max_chars=max_chars, tenant_id=tenant_id)
+
+
+async def _read_document_with_timeout(
+    ws: Path, rel_path: str, max_chars: int = _READ_DOCUMENT_HARD_CHAR_CEILING, tenant_id: str | None = None
+) -> str:
+    _sync_document_tool_bindings()
+    return await _read_document_with_timeout_impl(ws, rel_path, max_chars=max_chars, tenant_id=tenant_id)
+
+
+async def _read_document_from_storage(
+    agent_id: uuid.UUID,
+    rel_path: str,
+    max_chars: int = 8000,
+    tenant_id: str | None = None,
+) -> str:
+    _sync_document_tool_bindings()
+    return await _read_document_from_storage_impl(
+        agent_id,
+        rel_path,
+        max_chars=max_chars,
+        tenant_id=tenant_id,
+    )
 
 
 def _media_materialization_size_error(
@@ -5349,83 +5402,6 @@ async def _smithery_auto_recover(
 
     except Exception as e:
         return f"❌ Auto-recovery failed: {str(e)[:200]}"
-
-
-async def _read_document_from_storage(
-    agent_id: uuid.UUID,
-    rel_path: str,
-    max_chars: int = 8000,
-    tenant_id: str | None = None,
-) -> str:
-    storage = get_storage_backend()
-    try:
-        resolved = await _resolve_exact_storage_source_path(agent_id, rel_path, tenant_id)
-    except Exception as exc:
-        return (
-            "Document read was not started.\n"
-            "Stage: storage_lookup\n"
-            f"Requested path: {rel_path}\n"
-            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
-        )
-    if not resolved.exists:
-        return _exact_storage_source_error(resolved)
-
-    try:
-        version = await storage.get_version(resolved.storage_key)
-    except Exception as exc:
-        return (
-            "Document read was not started.\n"
-            "Stage: storage_metadata\n"
-            f"Requested path: {resolved.virtual_path}\n"
-            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
-        )
-    if not version.exists or version.is_dir:
-        return _exact_storage_source_error(resolved)
-    if version.size > _READ_DOCUMENT_MAX_FILE_BYTES:
-        return (
-            "Document read was not started.\n"
-            "Stage: materialization\n"
-            f"Requested path: {resolved.virtual_path}\n"
-            "File exists: true\n"
-            f"File size: {version.size} bytes\n"
-            f"Limit: {_READ_DOCUMENT_MAX_FILE_BYTES} bytes\n"
-            "Reason: file exceeds the document-processing limit."
-        )
-
-    try:
-        temp_workspace = await _prepare_temp_workspace(
-            agent_id,
-            tenant_id=tenant_id,
-            paths=[resolved.virtual_path],
-            max_file_bytes=_READ_DOCUMENT_MAX_FILE_BYTES,
-        )
-    except Exception as exc:
-        return (
-            "Document read was not started.\n"
-            "Stage: materialization\n"
-            f"Requested path: {resolved.virtual_path}\n"
-            "File exists: true\n"
-            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
-        )
-    try:
-        materialized_path = temp_workspace.root / resolved.virtual_path
-        if not materialized_path.is_file():
-            return (
-                "Document read was not started.\n"
-                "Stage: materialization\n"
-                f"Requested path: {resolved.virtual_path}\n"
-                "File exists: true\n"
-                "Reason: storage file was not materialized into the document workspace."
-            )
-        content = await _read_document(
-            temp_workspace.root,
-            resolved.virtual_path,
-            max_chars=max_chars,
-            tenant_id=None,
-        )
-        return content
-    finally:
-        temp_workspace.cleanup()
 
 async def _send_feishu_message(
     agent_id: uuid.UUID,
