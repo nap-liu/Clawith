@@ -203,7 +203,6 @@ okay-{epoch}
         )
         assert passed is True
         assert recall == 1.0
-
     def test_missing_commands_and_ids_are_appended_before_validation(self):
         opaque_id = "5baa7373-b5c5-9eb4-8d10-d81aef980b1c"
         original = (
@@ -350,4 +349,3 @@ okay-{epoch}
         )
         assert passed is True, reason
         assert recall == 1.0
-

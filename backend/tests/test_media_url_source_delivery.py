@@ -188,5 +188,3 @@ async def test_same_provider_intent_in_different_sessions_does_not_reuse_media(
     assert (tmp_path / first.workspace_path).read_bytes().endswith(b"ONE")
     assert (tmp_path / second.workspace_path).read_bytes().endswith(b"TWO")
     assert fetch_count == 2
-
-

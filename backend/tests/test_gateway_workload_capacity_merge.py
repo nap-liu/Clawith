@@ -93,4 +93,3 @@ async def test_concurrent_native_gateway_messages_merge_into_one_durable_turn(
         "one merged gateway reply"
     ]
     assert [row.content for row in gateway_replies] == ["one merged gateway reply"]
-

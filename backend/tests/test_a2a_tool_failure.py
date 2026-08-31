@@ -45,7 +45,7 @@ async def test_execute_tool_failure_writes_system_message():
     assert result.startswith("❌")
     assert db.committed
     assert len(db.added) == 1
-    
+
     error_msg = db.added[0]
     assert error_msg.conversation_id == session_id
     assert error_msg.role == "assistant"
