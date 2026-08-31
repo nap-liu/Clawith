@@ -286,6 +286,7 @@ from app.services.agent_tools_sql_support import (
     _clamp_sql_max_rows,
     _format_sql_result,
     _resolve_sql_max_bytes,
+    _sql_execute,
     _sql_execute_mysql,
     _sql_execute_postgres,
     _sql_execute_sqlite,
@@ -12745,50 +12746,6 @@ async def _agentbay_code_edit_file(agent_id: Optional[uuid.UUID], ws: Path, argu
     except Exception as e:
         logger.exception(f"[AgentBay] Code edit file failed for agent {agent_id}")
         return f"Edit file failed: {str(e)[:200]}"
-
-
-async def _sql_execute(arguments: dict) -> str:
-    """Execute SQL on any database via connection URI.
-
-    Parses and clamps max_rows (default DEFAULT_SQL_MAX_ROWS, hard ceiling HARD_SQL_MAX_ROWS)
-    and resolves max_bytes (env-overridable, hard ceiling HARD_SQL_MAX_BYTES), then passes both
-    through to the DB-specific backend so that streaming and dual-limit enforcement are active
-    for every engine.
-    """
-    import asyncio
-
-    connection_string = arguments.get("connection_string", "").strip()
-    sql = arguments.get("sql", "").strip()
-    timeout = min(int(arguments.get("timeout", 30)), 120)
-    max_rows = _clamp_sql_max_rows(arguments.get("max_rows", DEFAULT_SQL_MAX_ROWS))
-    max_bytes = _resolve_sql_max_bytes()
-
-    if not connection_string:
-        return "❌ Missing required argument 'connection_string'"
-    if not sql:
-        return "❌ Missing required argument 'sql'"
-
-    uri_lower = connection_string.lower()
-    try:
-        if uri_lower.startswith("sqlite"):
-            return await asyncio.wait_for(
-                _sql_execute_sqlite(connection_string, sql, max_rows, max_bytes), timeout=timeout
-            )
-        elif uri_lower.startswith("mysql"):
-            return await asyncio.wait_for(
-                _sql_execute_mysql(connection_string, sql, max_rows, max_bytes), timeout=timeout
-            )
-        elif uri_lower.startswith("postgresql") or uri_lower.startswith("postgres"):
-            return await asyncio.wait_for(
-                _sql_execute_postgres(connection_string, sql, max_rows, max_bytes), timeout=timeout
-            )
-        else:
-            return "❌ Unsupported database type. Supported: mysql://, postgresql://, sqlite:///"
-    except asyncio.TimeoutError:
-        return f"❌ Query timed out after {timeout}s"
-    except Exception as e:
-        return f"❌ Database error: {type(e).__name__}: {str(e)[:500]}"
-
 
 from app.services import agent_tools_temp_workspace as _agent_tools_temp_workspace_module
 from app.services.agent_tools_temp_workspace import (
