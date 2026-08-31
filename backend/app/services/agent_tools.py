@@ -369,6 +369,15 @@ _OUTBOUND_CORE_SYNC_NAMES = (
     "_outbound_media_slots",
     *_OUTBOUND_CORE_EXPORT_NAMES,
 )
+_MEDIA_DELIVERY_SUPPORT_SYNC_NAMES = (
+    "_outbound_media_connection",
+    "_outbound_media_slots",
+    "_lock_outbound_operation",
+    "_outbound_operation_lock_id",
+    "_outbound_operation_lifecycle_lock",
+    "_locked_outbound_media_connection",
+    "_outbound_media_db_session",
+)
 _IMAGE_OPS_EXPORT_NAMES = (
     "_upload_image",
     "_generate_image",
@@ -523,11 +532,13 @@ channel_feishu_sender_open_id: ContextVar = ContextVar("channel_feishu_sender_op
 _outbound_media_connection: ContextVar = _agent_tools_outbound_core_module._outbound_media_connection
 register_sync_targets(
     __name__,
-    (
-        _agent_tools_outbound_core_module,
-        _agent_tools_media_delivery_support_module,
-    ),
+    (_agent_tools_outbound_core_module,),
     _OUTBOUND_CORE_SYNC_NAMES,
+)
+register_sync_targets(
+    __name__,
+    (_agent_tools_media_delivery_support_module,),
+    _MEDIA_DELIVERY_SUPPORT_SYNC_NAMES,
 )
 
 # ─── Tool Definitions (OpenAI function-calling format) ──────────
