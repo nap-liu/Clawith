@@ -17,6 +17,7 @@ from app.services.storage_runtime.facade import (
     guess_content_type,
     normalize_storage_key,
 )
+from app.services.workspace_locking import serialize_workspace_write
 
 
 def sanitize_filename(filename: str, fallback: str = "file.bin") -> str:
@@ -49,6 +50,7 @@ def tenant_storage_key(tenant_id: uuid.UUID | str, rel_path: str = "") -> str:
     return f"{prefix}/{rel}" if rel else prefix
 
 
+@serialize_workspace_write
 async def store_agent_bytes(
     agent_id: uuid.UUID | str,
     rel_path: str,
@@ -66,6 +68,7 @@ async def store_agent_bytes(
     return key
 
 
+@serialize_workspace_write
 async def store_agent_upload(
     agent_id: uuid.UUID | str,
     filename: str,

@@ -1,56 +1,29 @@
-"""Redis-backed short-lived locks for workspace mutations."""
+"""One bounded, renewable write queue per Agent workspace."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import wraps
+from inspect import signature
+from typing import Any, ParamSpec, TypeVar
 
-from app.core.events import get_redis
+from app.services.redis_lease_lock import RedisLeaseBusyError, redis_lease_lock
 
-LOCK_PREFIX = "workspace-lock"
-DEFAULT_LOCK_TTL_SECONDS = 60
-
-_RELEASE_IF_OWNER_SCRIPT = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-  return redis.call('del', KEYS[1])
-end
-return 0
-"""
-
-
-def _normalize_workspace_path(path: str) -> str:
-    clean = (path or "").replace("\\", "/").strip().lstrip("/")
-    parts: list[str] = []
-    for part in clean.split("/"):
-        if part in ("", "."):
-            continue
-        if part == "..":
-            if parts:
-                parts.pop()
-            continue
-        parts.append(part)
-    return "/".join(parts)
+WORKSPACE_LOCK_ACQUIRE_TIMEOUT_SECONDS = 30.0
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_held_agents: ContextVar[dict[str, asyncio.Task[Any]] | None] = ContextVar(
+    "workspace_write_agents",
+    default=None,
+)
 
 
-def _lock_key(agent_id: uuid.UUID, path: str) -> str:
-    normalized = _normalize_workspace_path(path) or "."
-    return f"{LOCK_PREFIX}:{agent_id}:{normalized}"
-
-
-async def acquire_workspace_lock(
-    agent_id: uuid.UUID,
-    path: str,
-    *,
-    owner_token: str,
-    ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
-) -> bool:
-    redis = await get_redis()
-    return bool(await redis.set(_lock_key(agent_id, path), owner_token, ex=ttl_seconds, nx=True))
-
-
-async def release_workspace_lock(agent_id: uuid.UUID, path: str, *, owner_token: str) -> None:
-    redis = await get_redis()
-    await redis.eval(_RELEASE_IF_OWNER_SCRIPT, 1, _lock_key(agent_id, path), owner_token)
+class WorkspaceLockTimeoutError(RuntimeError):
+    """The workspace write queue did not become available within its bound."""
 
 
 @asynccontextmanager
@@ -58,23 +31,55 @@ async def workspace_locks(
     agent_id: uuid.UUID,
     paths: list[str],
     *,
-    ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
-):
-    normalized = sorted({_normalize_workspace_path(path) or "." for path in paths if path is not None})
-    owner_token = uuid.uuid4().hex
-    acquired: list[str] = []
-    try:
-        for path in normalized:
-            ok = await acquire_workspace_lock(
-                agent_id,
-                path,
-                owner_token=owner_token,
-                ttl_seconds=ttl_seconds,
-            )
-            if not ok:
-                raise RuntimeError(f"Workspace lock busy: {path}")
-            acquired.append(path)
+    acquire_timeout_seconds: float = WORKSPACE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+) -> AsyncIterator[None]:
+    """Serialize workspace mutations for one Agent, regardless of file path.
+
+    Path-level locks allowed broad operations such as ``workspace`` to race an
+    exact file mutation such as ``workspace/report.md``. A workspace is the
+    actual consistency boundary, so every mutation for one Agent shares one
+    bounded Redis queue. The underlying lease renews while held and remains
+    cancellation-safe.
+    """
+    del paths  # Kept in the public signature for existing mutation call sites.
+    resource = str(agent_id)
+    task = asyncio.current_task()
+    held = _held_agents.get() or {}
+    if task is not None and held.get(resource) is task:
         yield
-    finally:
-        for path in reversed(acquired):
-            await release_workspace_lock(agent_id, path, owner_token=owner_token)
+        return
+    try:
+        async with redis_lease_lock(
+            resource,
+            namespace="workspace-write",
+            acquire_timeout_seconds=acquire_timeout_seconds,
+        ):
+            token = _held_agents.set({**held, resource: task})
+            try:
+                yield
+            finally:
+                _held_agents.reset(token)
+    except RedisLeaseBusyError as exc:
+        raise WorkspaceLockTimeoutError(
+            "Workspace remained busy after waiting "
+            f"{acquire_timeout_seconds:g} seconds. Another operation is still writing this Agent's workspace. "
+            "No new workspace write was started; retry later or continue with a task that does not modify the workspace."
+        ) from exc
+
+
+def serialize_workspace_write(
+    func: Callable[_P, Awaitable[_R]],
+) -> Callable[_P, Awaitable[_R]]:
+    """Put one complete Agent workspace mutation in the shared write queue."""
+    call_signature = signature(func)
+
+    @wraps(func)
+    async def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        bound = call_signature.bind(*args, **kwargs)
+        agent_id = bound.arguments.get("agent_id")
+        if agent_id is None:
+            agent_id = bound.arguments["agent"].id
+        async with workspace_locks(agent_id, []):
+            return await func(*args, **kwargs)
+
+    return wrapped

@@ -105,9 +105,9 @@ async def test_human_viewer_access_maps_from_authoritative_helper():
         assert await resolve_human_viewer_access(db, creator.id, private_agent) == SCOPE_ALL
         assert await resolve_human_viewer_access(db, admin.id, private_agent) == SCOPE_ALL
         assert await resolve_human_viewer_access(db, identity_admin.id, private_agent) == SCOPE_ALL
-        # org_admin manages company agents (ALL) but has NO access to others' private (DENY) — HIGH-1
+        # org_admin governs every standard Agent in the tenant.
         assert await resolve_human_viewer_access(db, org_admin.id, company_agent) == SCOPE_ALL
-        assert await resolve_human_viewer_access(db, org_admin.id, private_agent) == SCOPE_DENY
+        assert await resolve_human_viewer_access(db, org_admin.id, private_agent) == SCOPE_ALL
         # plain member on a company agent -> 'use' -> OWN (only own sessions)
         assert await resolve_human_viewer_access(db, member.id, company_agent) == SCOPE_OWN
         # member on others' private agent: no access -> DENY

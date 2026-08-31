@@ -430,7 +430,7 @@ async def test_identity_platform_admin_visibility_follows_switched_tenant_and_st
             await session.execute(permissions.build_visible_agents_query(org_admin))
         ).scalars()
     }
-    assert org_admin_visible == {target_company.id}
+    assert org_admin_visible == {target_private.id, target_company.id}
 
 
 # ─── Change 2: save gate = visible (not manage) ───────────────────────────

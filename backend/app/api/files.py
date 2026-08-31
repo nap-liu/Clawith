@@ -65,6 +65,7 @@ from app.services.media_playback import (
     verify_signature,
 )
 from app.services.workspace_paths import WorkspacePathError, resolve_agent_visible_path
+from app.services.workspace_locking import workspace_locks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1541,10 +1542,11 @@ async def import_skill_to_agent(
 
     storage = get_storage_backend()
     written = []
-    for f in skill.files:
-        skill_key = _agent_storage_key(agent_id, f"skills/{skill.folder_name}/{f.path}")
-        await storage.write_text(skill_key, f.content, encoding="utf-8")
-        written.append(f.path)
+    async with workspace_locks(agent_id, []):
+        for f in skill.files:
+            skill_key = _agent_storage_key(agent_id, f"skills/{skill.folder_name}/{f.path}")
+            await storage.write_text(skill_key, f.content, encoding="utf-8")
+            written.append(f.path)
 
     return {
         "status": "ok",
@@ -1590,18 +1592,23 @@ async def upload_file_to_workspace(
     file_key = _agent_storage_key(agent_id, f"{normalized_path}/{filename}")
 
     content = await file.read()
-    await storage.write_bytes(file_key, content, content_type=guess_content_type(filename))
-
-    # Auto-extract text from non-text files
     extracted_path = None
-    from app.services.text_extractor import needs_extraction, save_extracted_text
-    if needs_extraction(filename):
-        save_path = await ensure_local_path(file_key)
-        txt_file = save_extracted_text(save_path, content, filename)
-        if txt_file:
-            extracted_path = f"{normalized_path}/{txt_file.name}"
-            extracted_key = _agent_storage_key(agent_id, extracted_path)
-            await storage.write_bytes(extracted_key, txt_file.read_bytes(), content_type="text/plain; charset=utf-8")
+    async with workspace_locks(agent_id, []):
+        await storage.write_bytes(file_key, content, content_type=guess_content_type(filename))
+
+        # Auto-extract text from non-text files in the same workspace mutation.
+        from app.services.text_extractor import needs_extraction, save_extracted_text
+        if needs_extraction(filename):
+            save_path = await ensure_local_path(file_key)
+            txt_file = save_extracted_text(save_path, content, filename)
+            if txt_file:
+                extracted_path = f"{normalized_path}/{txt_file.name}"
+                extracted_key = _agent_storage_key(agent_id, extracted_path)
+                await storage.write_bytes(
+                    extracted_key,
+                    txt_file.read_bytes(),
+                    content_type="text/plain; charset=utf-8",
+                )
 
     return {
         "status": "ok",

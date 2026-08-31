@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 
-
 _IDEMPOTENCY_CONSTRAINT = "uq_trigger_execution_idempotency"
 
 
@@ -49,6 +48,7 @@ async def enqueue_trigger_execution(
     commit: bool = True,
 ) -> tuple[TriggerExecution | None, bool]:
     """Insert a generic trigger execution record."""
+    trigger_id = trigger.id
     canonical_scheduled_at = scheduled_at or datetime.now(timezone.utc)
     if canonical_scheduled_at.tzinfo is None:
         raise ValueError("scheduled_at must be timezone-aware")
@@ -78,7 +78,7 @@ async def enqueue_trigger_execution(
             raise
         logger.debug(
             "[Trigger] Deduplicated execution trigger_id={} key={}",
-            trigger.id,
+            trigger_id,
             idempotency_key[:255],
         )
         return None, False

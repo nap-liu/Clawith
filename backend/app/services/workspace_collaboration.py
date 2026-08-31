@@ -22,7 +22,7 @@ from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.storage import get_storage_backend
 from app.services.storage_runtime.base import WriteCondition
 from app.services.storage_runtime.local import LocalStorageBackend
-from app.services.workspace_locking import workspace_locks
+from app.services.workspace_locking import serialize_workspace_write, workspace_locks
 
 USER_AUTOSAVE_MERGE_SECONDS = 60
 EDIT_LOCK_TTL_SECONDS = 90
@@ -267,6 +267,7 @@ async def record_revision(
     return revision
 
 
+@serialize_workspace_write
 async def write_workspace_file(
     db: AsyncSession,
     *,
@@ -311,23 +312,28 @@ async def write_workspace_file(
     except Exception:
         target = None
         local_base_available = False
-    before = (
-        await storage.read_text(storage_key, encoding="utf-8", errors="replace")
-        if await storage.exists(storage_key)
-        else None
-    )
-    write_result = await storage.write_bytes_if_match(
-        storage_key,
-        content.encode("utf-8"),
-        condition=WriteCondition(version_token=expected_version_token) if expected_version_token is not None else None,
-        content_type="text/plain; charset=utf-8",
-    )
-    if not write_result.ok:
-        return WorkspaceWriteResult(False, normalized, f"Conflict detected while writing {normalized}")
-    if local_base_available and target is not None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        async with aiofiles.open(target, "w", encoding="utf-8") as f:
-            await f.write(content)
+    async with workspace_locks(agent_id, [normalized]):
+        before = (
+            await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+            if await storage.exists(storage_key)
+            else None
+        )
+        write_result = await storage.write_bytes_if_match(
+            storage_key,
+            content.encode("utf-8"),
+            condition=(
+                WriteCondition(version_token=expected_version_token)
+                if expected_version_token is not None
+                else None
+            ),
+            content_type="text/plain; charset=utf-8",
+        )
+        if not write_result.ok:
+            return WorkspaceWriteResult(False, normalized, f"Conflict detected while writing {normalized}")
+        if local_base_available and target is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            async with aiofiles.open(target, "w", encoding="utf-8") as f:
+                await f.write(content)
 
     revision = await record_revision(
         db,
@@ -349,6 +355,7 @@ async def write_workspace_file(
     )
 
 
+@serialize_workspace_write
 async def delete_workspace_file(
     db: AsyncSession,
     *,
@@ -437,6 +444,7 @@ async def delete_workspace_file(
     )
 
 
+@serialize_workspace_write
 async def move_workspace_path(
     db: AsyncSession,
     *,

@@ -573,68 +573,6 @@ async def _build_project_template_definition(
     )
 
 
-async def _ensure_builtin_templates(db: AsyncSession) -> None:
-    found = (
-        await db.execute(select(ProjectTemplate.id).where(ProjectTemplate.tenant_id.is_(None)).limit(1))
-    ).scalar_one_or_none()
-    if found:
-        return
-    definitions = [
-        {
-            "name": "产品研发冲刺",
-            "category": "研发",
-            "description": "由负责人驱动需求、研发、测试与交付闭环。",
-            "definition": {
-                "featured": True,
-                "goal": "按验收标准交付一个可发布的产品增量",
-                "success_criteria": ["关键路径通过", "评审与测试留痕", "产出进入 Git 历史"],
-                "roles": ["负责人", "产品设计", "前端开发", "后端开发", "质量工程"],
-                "skills": ["需求拆解", "代码评审"],
-                "mcp_servers": ["GitHub"],
-                "settings": {"runtime": {"max_parallel_runs": 4}},
-            },
-        },
-        {
-            "name": "市场洞察研究",
-            "category": "研究",
-            "description": "并行采集、交叉验证并形成有证据链的研究报告。",
-            "definition": {
-                "goal": "输出可追溯的市场研究报告",
-                "success_criteria": ["来源可回溯", "结论经交叉评审"],
-                "roles": ["研究负责人", "情报分析", "事实核查", "报告编辑"],
-                "skills": ["深度研究", "事实核查"],
-                "mcp_servers": ["Web Search"],
-            },
-        },
-        {
-            "name": "内容发布流水线",
-            "category": "内容",
-            "description": "从选题、创作、审校到多渠道发布的协作模板。",
-            "definition": {
-                "goal": "稳定产出符合品牌规范的内容",
-                "success_criteria": ["审校通过", "发布物与素材均进入项目 Git"],
-                "roles": ["内容负责人", "作者", "审校", "发布运营"],
-                "skills": ["内容创作", "品牌审校"],
-                "mcp_servers": [],
-            },
-        },
-    ]
-    for item in definitions:
-        db.add(
-            ProjectTemplate(
-                tenant_id=None,
-                created_by_user_id=None,
-                name=item["name"],
-                description=item["description"],
-                category=item["category"],
-                version="1.0.0",
-                is_published=True,
-                definition=item["definition"],
-            )
-        )
-    await db.flush()
-
-
 @router.get("/templates")
 async def list_project_templates(
     category: str | None = None,
@@ -642,7 +580,6 @@ async def list_project_templates(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _ensure_builtin_templates(db)
     stmt = select(ProjectTemplate).where(_visible_template_clause(current_user))
     if category:
         stmt = stmt.where(ProjectTemplate.category == category)

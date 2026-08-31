@@ -34,10 +34,8 @@ def build_visible_agents_query(
     - ``platform_admin``: cross-tenant operator. Sees every agent in the
       target tenant unconditionally, including other users' ``private``
       and ``custom`` agents. This is required for ops/audit duties.
-    - ``org_admin``: regular company manager. Sees own creations +
-      ``company``/``custom`` agents (not in custom roster is OK, admin
-      still manages them). Cannot see other users' ``private`` agents —
-      that preserves v1.9.3's privacy guarantee for personal agents.
+    - ``org_admin``: company governance role. Sees every standard agent in
+      their tenant, including other users' ``private`` agents.
     - Regular users: own creations + ``company`` agents + agents
       explicitly added to a ``custom`` roster they're on.
     """
@@ -61,13 +59,7 @@ def build_visible_agents_query(
         return stmt.where(Agent.tenant_id == target_tenant_id)
 
     if user.role == "org_admin":
-        return stmt.where(
-            Agent.tenant_id == target_tenant_id,
-            or_(
-                Agent.creator_id == user.id,
-                Agent.access_mode != "private",
-            ),
-        )
+        return stmt.where(Agent.tenant_id == target_tenant_id)
 
     explicit_user_ids = select(AgentPermission.agent_id).where(
         and_(
@@ -270,11 +262,11 @@ async def get_agent_access_level_for_user_id(
         return "manage"
 
     access_mode = getattr(agent, "access_mode", None) or "company"
-    # platform_admin manages everything in the tenant including others' private agents.
-    # org_admin only manages non-private agents — preserves v1.9.3 privacy guarantee.
+    # Administrators govern every standard Agent in the tenant, including
+    # private Agents. Project Agents remain behind project membership APIs.
     if is_platform_admin_user(user):
         return "manage"
-    if user.role == "org_admin" and access_mode != "private":
+    if user.role == "org_admin" and getattr(agent, "scope", "standard") == "standard":
         return "manage"
 
     perms_result = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent.id))
@@ -319,7 +311,8 @@ async def user_can_view_agent_id(
 
     Visibility is the superset of manageability (``manage`` implies ``view``),
     and is equivalent to ``build_visible_agents_query`` membership: a user sees
-    their own agents, company agents, and custom agents they're rostered on.
+    every standard tenant Agent for org admins, and own/company/explicitly
+    granted Agents for regular users.
     """
     return (await get_agent_access_level_for_user_id(db, user_id, agent)) is not None
 
@@ -603,7 +596,7 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
 
     Access is granted if:
     1. User is the agent creator -> manage
-    2. Company admin + non-private agent -> manage
+    2. Company admin + same-tenant standard agent -> manage
     3. User has explicit permission (company/user scope) -> from permission record
     """
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -632,8 +625,9 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
 
     access_mode = getattr(agent, "access_mode", None) or "company"
 
-    # Org admins manage tenant-visible agents, but private agents remain private.
-    if user.role == "org_admin" and access_mode != "private":
+    # Org admins govern every standard Agent in their tenant. Project Agents
+    # stay behind project membership and project-specific APIs.
+    if user.role == "org_admin" and getattr(agent, "scope", "standard") == "standard":
         return agent, "manage"
 
     perms = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent_id))

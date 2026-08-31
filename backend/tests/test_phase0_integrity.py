@@ -219,7 +219,7 @@ def test_confirmation_actor_binding_rejects_forwarded_card():
 
 
 @pytest.mark.asyncio
-async def test_org_admin_is_tenant_scoped_and_private_agents_stay_private():
+async def test_org_admin_is_tenant_scoped_and_manages_same_tenant_private_agents():
     from fastapi import HTTPException
     from app.core.permissions import check_agent_access
 
@@ -264,9 +264,8 @@ async def test_org_admin_is_tenant_scoped_and_private_agents_stay_private():
         id=uuid.uuid4(), tenant_id=tenant_a, creator_id=uuid.uuid4(),
         access_mode="private", company_access_level=None,
     )
-    with pytest.raises(HTTPException) as exc:
-        await check_agent_access(DB(private), admin, private.id)
-    assert exc.value.status_code == 403
+    _, level = await check_agent_access(DB(private), admin, private.id)
+    assert level == "manage"
 
 
 @pytest.mark.asyncio

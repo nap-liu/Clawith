@@ -10546,6 +10546,44 @@ async def test_template_market_admin_visibility_and_cross_tenant_management_boun
     assert await env.db.get(ProjectTemplate, other_private_id) is None
 
 
+async def test_deleting_all_platform_templates_does_not_recreate_them_on_list(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    platform_admin = await _user(
+        env.db,
+        await env.db.get(Tenant, env.tenant_id),
+        "PlatformTemplateAdmin",
+    )
+    platform_admin.role = "platform_admin"
+    templates = [
+        ProjectTemplate(
+            tenant_id=None,
+            created_by_user_id=None,
+            name=f"Deletable platform template {index}",
+            is_published=True,
+            definition={"goal": f"Delete template {index}"},
+        )
+        for index in range(2)
+    ]
+    env.db.add_all(templates)
+    await env.db.commit()
+    template_ids = [template.id for template in templates]
+
+    env.authenticate_as(platform_admin.id)
+    for template_id in template_ids:
+        response = await env.client.delete(f"/api/projects/templates/{template_id}")
+        assert response.status_code == 204, response.text
+
+    response = await env.client.get("/api/projects/templates")
+    assert response.status_code == 200, response.text
+    assert not {str(item["id"]) for item in response.json()} & {str(item) for item in template_ids}
+    remaining_platform_templates = await env.db.scalar(
+        select(func.count(ProjectTemplate.id)).where(ProjectTemplate.tenant_id.is_(None))
+    )
+    assert remaining_platform_templates == 0
+
+
 async def test_template_editor_is_hidden_and_overwrite_uses_same_project_snapshot(
     project_api: ProjectApiEnv,
 ):

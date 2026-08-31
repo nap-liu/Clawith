@@ -21,6 +21,7 @@ from app.models.agent import Agent
 from app.models.skill import Skill, SkillFile, SkillInstall
 from app.models.user import User
 from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.workspace_locking import serialize_workspace_write
 
 _settings = get_settings()
 MAX_SKILL_SIZE = int(getattr(_settings, "MAX_SKILL_SIZE", 512_000) or 512_000)
@@ -399,6 +400,7 @@ async def _restore_storage_tree(prefix: str, snapshot: dict[str, bytes]) -> None
         await storage.write_bytes(normalize_storage_key(f"{prefix}/{rel_path}"), content)
 
 
+@serialize_workspace_write
 async def install_market_skill(
     db: AsyncSession,
     *,
@@ -495,6 +497,7 @@ async def install_market_skill(
     }
 
 
+@serialize_workspace_write
 async def uninstall_market_skill(
     db: AsyncSession,
     *,

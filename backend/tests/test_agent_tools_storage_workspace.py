@@ -1,28 +1,31 @@
+import asyncio
+import io
 import uuid
 
 import pytest
+from starlette.datastructures import UploadFile
 
-from app.services import agent_tools
-from app.services import workspace_collaboration
-from app.services import workspace_locking
-from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion, WriteCondition, ConditionalWriteResult
+import app.services.redis_lease_lock as redis_lease_lock_module
+from app.api import files as files_api
+from app.services import agent_tools, workspace_collaboration, workspace_locking
+from app.services.storage_runtime import agent_files
+from app.services.storage_runtime.base import (
+    ConditionalWriteResult,
+    StorageBackend,
+    StorageEntry,
+    StorageVersion,
+    WriteCondition,
+)
 from app.services.storage_runtime.local import LocalStorageBackend
 
 
 class _FakeRedis:
-    """Minimal in-memory redis covering the surface workspace_locking touches.
-
-    ``acquire_workspace_lock`` calls ``set(key, val, ex=, nx=True)`` and
-    ``release_workspace_lock`` calls ``eval(script, 1, key, owner)``. A fresh
-    instance is bound per test, avoiding the module-cached real client that
-    otherwise leaks across function-scoped event loops and raises
-    ``RuntimeError: Event loop is closed``.
-    """
+    """Minimal in-memory Redis for the shared renewable workspace lease."""
 
     def __init__(self):
         self._data: dict[str, str] = {}
 
-    async def set(self, key, value, *, ex=None, nx=False, **_kwargs):
+    async def set(self, key, value, *, ex=None, px=None, nx=False, **_kwargs):
         if nx and key in self._data:
             return None
         self._data[key] = value
@@ -38,7 +41,9 @@ class _FakeRedis:
                 removed += 1
         return removed
 
-    async def eval(self, _script, _numkeys, key, owner):
+    async def eval(self, script, _numkeys, key, owner, *_args):
+        if "pexpire" in script:
+            return int(self._data.get(key) == owner)
         # Mirror the release-if-owner Lua: delete only when the caller owns it.
         if self._data.get(key) == owner:
             return await self.delete(key)
@@ -52,10 +57,141 @@ def _fake_workspace_lock_redis(monkeypatch):
     async def _fake_get_redis():
         return fake_redis
 
-    # workspace_locking imports get_redis from app.core.events at module level;
-    # patch it there so the distributed lock uses a per-test in-memory fake
-    # instead of the real client cached against a dying event loop.
-    monkeypatch.setattr(workspace_locking, "get_redis", _fake_get_redis)
+    monkeypatch.setattr(redis_lease_lock_module, "get_redis", _fake_get_redis)
+
+
+@pytest.mark.asyncio
+async def test_workspace_write_queue_serializes_different_paths():
+    agent_id = uuid.uuid4()
+    owner_entered = asyncio.Event()
+    release_owner = asyncio.Event()
+    order: list[str] = []
+
+    async def owner():
+        async with workspace_locking.workspace_locks(agent_id, ["workspace"]):
+            order.append("owner")
+            owner_entered.set()
+            await release_owner.wait()
+
+    async def waiter():
+        await owner_entered.wait()
+        async with workspace_locking.workspace_locks(
+            agent_id,
+            ["HEARTBEAT.md"],
+            acquire_timeout_seconds=0.2,
+        ):
+            order.append("waiter")
+
+    owner_task = asyncio.create_task(owner())
+    waiter_task = asyncio.create_task(waiter())
+    await owner_entered.wait()
+    await asyncio.sleep(0.02)
+    assert order == ["owner"]
+
+    release_owner.set()
+    await asyncio.gather(owner_task, waiter_task)
+    assert order == ["owner", "waiter"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_write_queue_is_reentrant_for_one_operation():
+    agent_id = uuid.uuid4()
+    async with (
+        workspace_locking.workspace_locks(agent_id, ["workspace"]),
+        workspace_locking.workspace_locks(agent_id, ["workspace/report.md"]),
+    ):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_workspace_write_queue_timeout_is_actionable():
+    agent_id = uuid.uuid4()
+    owner_entered = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    async def owner():
+        async with workspace_locking.workspace_locks(agent_id, ["workspace"]):
+            owner_entered.set()
+            await release_owner.wait()
+
+    owner_task = asyncio.create_task(owner())
+    await owner_entered.wait()
+    try:
+        with pytest.raises(
+            workspace_locking.WorkspaceLockTimeoutError,
+            match="retry later or continue with a task that does not modify the workspace",
+        ):
+            async with workspace_locking.workspace_locks(
+                agent_id,
+                ["memory/memory.md"],
+                acquire_timeout_seconds=0.02,
+            ):
+                pass
+    finally:
+        release_owner.set()
+        await owner_task
+
+
+@pytest.mark.asyncio
+async def test_agent_storage_helper_uses_shared_workspace_write_queue(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend()
+    monkeypatch.setattr(agent_files, "get_storage_backend", lambda: storage)
+    owner_entered = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    async def owner():
+        async with workspace_locking.workspace_locks(agent_id, ["workspace"]):
+            owner_entered.set()
+            await release_owner.wait()
+
+    owner_task = asyncio.create_task(owner())
+    await owner_entered.wait()
+    write_task = asyncio.create_task(agent_files.store_agent_bytes(agent_id, "workspace/report.txt", b"queued"))
+    await asyncio.sleep(0.02)
+    assert not await storage.exists(f"{agent_id}/workspace/report.txt")
+
+    release_owner.set()
+    await asyncio.gather(owner_task, write_task)
+    assert await storage.read_bytes(f"{agent_id}/workspace/report.txt") == b"queued"
+
+
+@pytest.mark.asyncio
+async def test_binary_upload_uses_shared_workspace_write_queue(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend()
+    monkeypatch.setattr(files_api, "get_storage_backend", lambda: storage)
+
+    async def allow_access(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(files_api, "check_agent_access", allow_access)
+    owner_entered = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    async def owner():
+        async with workspace_locking.workspace_locks(agent_id, ["workspace"]):
+            owner_entered.set()
+            await release_owner.wait()
+
+    owner_task = asyncio.create_task(owner())
+    await owner_entered.wait()
+    upload_task = asyncio.create_task(
+        files_api.upload_file_to_workspace(
+            agent_id=agent_id,
+            file=UploadFile(io.BytesIO(b"queued"), filename="report.txt"),
+            path="workspace/uploads",
+            current_user=object(),
+            db=object(),
+            _workspace_agent=object(),
+        )
+    )
+    await asyncio.sleep(0.02)
+    assert not await storage.exists(f"{agent_id}/workspace/uploads/report.txt")
+
+    release_owner.set()
+    await asyncio.gather(owner_task, upload_task)
+    assert await storage.read_bytes(f"{agent_id}/workspace/uploads/report.txt") == b"queued"
 
 
 class MemoryStorageBackend(StorageBackend):
@@ -583,6 +719,46 @@ async def test_write_workspace_file_does_not_mirror_to_local_for_non_local_stora
 
 
 @pytest.mark.asyncio
+async def test_workspace_write_queue_covers_revision_before_next_mutation(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend()
+    revision_entered = asyncio.Event()
+    release_revision = asyncio.Event()
+    monkeypatch.setattr(workspace_collaboration, "get_storage_backend", lambda: storage)
+
+    async def _record_revision(*args, **kwargs):
+        if kwargs.get("after_content") == "first":
+            revision_entered.set()
+            await release_revision.wait()
+
+    monkeypatch.setattr(workspace_collaboration, "record_revision", _record_revision)
+
+    async def write(content):
+        return await workspace_collaboration.write_workspace_file(
+            db=None,
+            agent_id=agent_id,
+            base_dir=tmp_path / str(agent_id),
+            path="workspace/test.md",
+            content=content,
+            actor_type="agent",
+            actor_id=agent_id,
+            enforce_human_lock=False,
+        )
+
+    first_task = asyncio.create_task(write("first"))
+    await revision_entered.wait()
+    second_task = asyncio.create_task(write("second"))
+    await asyncio.sleep(0.02)
+    assert storage.files[f"{agent_id}/workspace/test.md"] == b"first"
+
+    release_revision.set()
+    first_result, second_result = await asyncio.gather(first_task, second_task)
+    assert first_result.ok is True
+    assert second_result.ok is True
+    assert storage.files[f"{agent_id}/workspace/test.md"] == b"second"
+
+
+@pytest.mark.asyncio
 async def test_flush_temp_workspace_only_writes_changed_files(monkeypatch):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({
@@ -774,10 +950,7 @@ async def test_agent_workspace_mutations_reject_system_webhook_inbox(tmp_path):
 @pytest.mark.asyncio
 async def test_agent_can_read_complete_webhook_inbox_payload(monkeypatch):
     agent_id = uuid.uuid4()
-    rel_path = (
-        "webhook/1d5930c4-1d59-40c4-9bb4-b9532f2f6432/20260825/"
-        "1787625600123_00000000000000000042/payload.json"
-    )
+    rel_path = "webhook/1d5930c4-1d59-40c4-9bb4-b9532f2f6432/20260825/1787625600123_00000000000000000042/payload.json"
     payload = b'{"submission":"complete","score":100}\n'
     storage = MemoryStorageBackend({f"{agent_id}/{rel_path}": payload})
     monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
