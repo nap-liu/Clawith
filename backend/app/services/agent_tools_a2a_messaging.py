@@ -18,6 +18,22 @@ from app.services.agent_tools import (
 )
 from app.services.recipient_resolver import RecipientResolutionError, resolve_agent_recipient
 
+_ROOT_TOOL_SYMBOLS = (
+    "A2A_DELIVERY_GUIDANCE",
+    "_arm_a2a_delegate_callback",
+    "_build_outbound_operation_key",
+    "_lock_outbound_operation",
+    "_wake_agent_async",
+    "logger",
+)
+
+
+def _sync_root_tool_symbols() -> None:
+    from app.services import agent_tools as _agent_tools_root
+
+    for _name in _ROOT_TOOL_SYMBOLS:
+        globals()[_name] = getattr(_agent_tools_root, _name)
+
 
 async def _send_message_to_agent(
     from_agent_id: uuid.UUID,
@@ -42,6 +58,7 @@ async def _send_message_to_agent(
     trigger remember WHERE the originating conversation lived so the eventual
     reply is routed back to it.
     """
+    _sync_root_tool_symbols()
     recoverable_anchor = None
     canonical_agent_id = str(args.get("agent_id") or "").strip()
     message_text = args.get("message", "").strip()

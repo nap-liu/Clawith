@@ -19,6 +19,23 @@ from app.services.agent_tools import (
 )
 from app.services.recipient_resolver import RecipientResolutionError, resolve_agent_recipient
 
+_ROOT_TOOL_SYMBOLS = (
+    "_build_outbound_operation_key",
+    "current_agent_runtime_workspace",
+    "ensure_focus_item",
+    "get_storage_backend",
+    "logger",
+    "project_agent_runtime_workspace",
+    "standard_agent_runtime_workspace",
+)
+
+
+def _sync_root_tool_symbols() -> None:
+    from app.services import agent_tools as _agent_tools_root
+
+    for _name in _ROOT_TOOL_SYMBOLS:
+        globals()[_name] = getattr(_agent_tools_root, _name)
+
 
 async def _send_file_to_agent(
     from_agent_id: uuid.UUID,
@@ -29,6 +46,7 @@ async def _send_file_to_agent(
     origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send a workspace file to another digital employee (agent)."""
+    _sync_root_tool_symbols()
     canonical_agent_id = str(args.get("agent_id") or "").strip()
     rel_path = (args.get("file_path") or "").strip()
     delivery_note = (args.get("message") or "").strip()
@@ -234,6 +252,7 @@ async def _create_on_message_trigger(
     expires_in_minutes: int = 1440,
 ) -> None:
     """Programmatically create an on_message trigger for an agent."""
+    _sync_root_tool_symbols()
     from app.models.trigger import AgentTrigger
     creator_user_id = uuid.UUID(origin_user_id) if origin_user_id else None
     focus_ref = await ensure_focus_item(
@@ -491,6 +510,7 @@ async def _arm_a2a_delegate_callback(
 
 async def _append_focus_item(agent_id: uuid.UUID, identifier: str, description: str) -> None:
     """Create or update an in-progress Focus item."""
+    _sync_root_tool_symbols()
     try:
         await ensure_focus_item(agent_id, focus_ref=identifier, description=description)
     except Exception as e:
