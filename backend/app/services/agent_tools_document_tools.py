@@ -10,11 +10,17 @@ import uuid
 
 from loguru import logger
 
-from app.services.agent_tools_file_support import _resolve_tool_source_path, _resolve_tool_target_path
+from app.services.agent_tools_file_support import (
+    _exact_storage_source_error,
+    _resolve_exact_storage_source_path,
+    _resolve_tool_source_path,
+    _resolve_tool_target_path,
+)
 from app.services.document_conversion import (
     convert_html_to_pdf as convert_html_file_to_pdf,
     convert_html_to_pptx as convert_html_file_to_pptx,
 )
+from app.services.storage import get_storage_backend
 
 _READ_DOCUMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 _READ_DOCUMENT_TIMEOUT_SECONDS = 25
@@ -612,3 +618,80 @@ async def _convert_markdown_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dic
     except Exception as e:
         logger.exception(f"Convert MD to PDF failed: {e}")
         return f"❌ Conversion failed: {e}"
+
+
+async def _read_document_from_storage(
+    agent_id: uuid.UUID,
+    rel_path: str,
+    max_chars: int = 8000,
+    tenant_id: str | None = None,
+) -> str:
+    storage = get_storage_backend()
+    try:
+        resolved = await _resolve_exact_storage_source_path(agent_id, rel_path, tenant_id)
+    except Exception as exc:
+        return (
+            "Document read was not started.\n"
+            "Stage: storage_lookup\n"
+            f"Requested path: {rel_path}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    if not resolved.exists:
+        return _exact_storage_source_error(resolved)
+
+    try:
+        version = await storage.get_version(resolved.storage_key)
+    except Exception as exc:
+        return (
+            "Document read was not started.\n"
+            "Stage: storage_metadata\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    if not version.exists or version.is_dir:
+        return _exact_storage_source_error(resolved)
+    if version.size > _READ_DOCUMENT_MAX_FILE_BYTES:
+        return (
+            "Document read was not started.\n"
+            "Stage: materialization\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            "File exists: true\n"
+            f"File size: {version.size} bytes\n"
+            f"Limit: {_READ_DOCUMENT_MAX_FILE_BYTES} bytes\n"
+            "Reason: file exceeds the document-processing limit."
+        )
+
+    try:
+        temp_workspace = await _prepare_temp_workspace(
+            agent_id,
+            tenant_id=tenant_id,
+            paths=[resolved.virtual_path],
+            max_file_bytes=_READ_DOCUMENT_MAX_FILE_BYTES,
+        )
+    except Exception as exc:
+        return (
+            "Document read was not started.\n"
+            "Stage: materialization\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            "File exists: true\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    try:
+        materialized_path = temp_workspace.root / resolved.virtual_path
+        if not materialized_path.is_file():
+            return (
+                "Document read was not started.\n"
+                "Stage: materialization\n"
+                f"Requested path: {resolved.virtual_path}\n"
+                "File exists: true\n"
+                "Reason: storage file was not materialized into the document workspace."
+            )
+        content = await _read_document(
+            temp_workspace.root,
+            resolved.virtual_path,
+            max_chars=max_chars,
+            tenant_id=None,
+        )
+        return content
+    finally:
+        temp_workspace.cleanup()
