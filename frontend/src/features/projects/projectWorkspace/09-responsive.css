@@ -1,0 +1,608 @@
+@media (max-width: 1080px) {
+  .project-workspace__body {
+    grid-template-columns: 58px minmax(0, 1fr);
+  }
+  .project-workspace__nav {
+    padding-inline: 7px;
+  }
+  .project-workspace__nav h2,
+  .project-workspace__nav section > button > span,
+  .project-workspace__nav section > button > em {
+    display: none;
+  }
+  .project-workspace__nav section > button {
+    justify-content: center;
+    padding: 0;
+  }
+  .project-workspace__two-column {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__project-brief {
+    grid-template-columns: 46px minmax(0, 1fr);
+  }
+  .project-workspace__project-brief-meta {
+    grid-column: 2;
+  }
+  .project-workspace__git-layout {
+    grid-template-columns: minmax(440px, 1fr) 310px;
+  }
+  .project-workspace__git-log-head,
+  .project-workspace__git-log li > .btn {
+    grid-template-columns: 78px minmax(170px, 1fr) 94px 108px;
+  }
+  .project-workspace__git-log-head > :last-child,
+  .project-workspace__git-log li > .btn > :last-child {
+    display: none;
+  }
+  .project-workspace__kanban {
+    grid-template-columns: repeat(4, 240px);
+  }
+  .project-workspace__item-context-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .project-workspace__item-context-grid > aside {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+  .project-workspace__item-control {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0 12px;
+  }
+  .project-workspace__item-control > .project-workspace__item-kicker,
+  .project-workspace__item-control > h3,
+  .project-workspace__item-control > footer {
+    grid-column: 1 / -1;
+  }
+  .project-workspace__repository-grid {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__repository-grid > section + section {
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 1079px) {
+  .project-workspace__snapshot-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .project-workspace__member-page-heading .project-workspace__heading-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .project-workspace__item-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .project-workspace__item-side {
+    padding-top: var(--space-6);
+    padding-left: 0;
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .project-workspace__agent-drawer {
+    width: 100vw;
+  }
+  .project-workspace__agent-drawer-content > header,
+  .project-workspace__agent-drawer-body,
+  .project-workspace__agent-drawer-content > footer {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+  .project-workspace__milestone-drawer {
+    width: 100vw;
+  }
+  .project-workspace {
+    --project-content-gutter: 14px;
+    --project-content-block-start: 16px;
+    --project-content-block-end: 24px;
+    height: auto;
+    min-height: calc(100dvh - var(--notification-bar-height, 0px));
+    overflow: visible;
+  }
+  .project-workspace.project-workspace--files {
+    height: auto;
+    min-height: calc(100dvh - var(--notification-bar-height, 0px));
+    overflow: visible;
+  }
+  .project-workspace.project-workspace--chat {
+    height: calc(100vh - var(--notification-bar-height, 0px));
+    height: calc(100dvh - var(--notification-bar-height, 0px));
+    min-height: 0;
+    overflow: hidden;
+  }
+  .project-workspace__header {
+    padding: 13px 15px;
+    flex-wrap: wrap;
+  }
+  .project-workspace__project-copy {
+    flex-basis: calc(100% - 56px);
+  }
+  .project-workspace__header > .btn {
+    flex: 1 1 150px;
+  }
+  .project-workspace__template-actions {
+    flex: 1 1 100%;
+  }
+  .project-workspace__template-actions .btn {
+    flex: 1;
+  }
+  .project-workspace__body {
+    display: block;
+    overflow: visible;
+  }
+  .project-workspace--chat .project-workspace__body {
+    min-height: 0;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .project-workspace__nav {
+    position: sticky;
+    z-index: 20;
+    top: 0;
+    padding: 6px 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .project-workspace--chat .project-workspace__nav {
+    position: static;
+    flex: 0 0 auto;
+  }
+  .project-workspace__nav section {
+    display: flex;
+  }
+  .project-workspace__nav section + section {
+    margin: 0 0 0 8px;
+    padding-left: 8px;
+    border-left: 1px solid var(--border-subtle);
+  }
+  .project-workspace__nav section > button {
+    width: 36px;
+    flex: 0 0 36px;
+  }
+  .project-workspace__content {
+    padding: var(--project-content-block-start) var(--project-content-gutter)
+      var(--project-content-block-end);
+    overflow: visible;
+  }
+  .project-workspace--chat .project-workspace__content--chat {
+    min-height: 0;
+    flex: 1 1 auto;
+    padding: 0;
+    overflow: hidden;
+  }
+  .project-workspace__content.project-workspace__content--cockpit {
+    padding: var(--project-content-block-start) var(--project-content-gutter)
+      var(--project-content-block-end);
+  }
+  .project-workspace__content.project-workspace__content--files {
+    padding: var(--project-content-block-start) var(--project-content-gutter)
+      var(--project-content-block-end);
+    overflow: visible;
+  }
+  .project-workspace__content--chat > .project-workspace__domain-tabs {
+    margin: var(--project-content-block-start) var(--project-content-gutter)
+      var(--project-content-gap);
+  }
+  .project-workspace__mesh-graph {
+    height: min(400px, calc(100dvh - 150px));
+    min-height: 320px;
+    max-height: none;
+  }
+  .project-workspace__section-heading {
+    display: block;
+  }
+  .project-workspace__section-heading.is-title-only {
+    display: none;
+  }
+  .project-workspace__heading-actions {
+    margin-top: 0;
+  }
+  .project-workspace__section-heading select {
+    width: 100%;
+    min-width: 0;
+  }
+  .project-workspace__run-hero {
+    grid-template-columns: 40px 1fr;
+    padding: 17px;
+  }
+  .project-workspace__pulse {
+    width: 38px;
+    height: 38px;
+  }
+  .project-workspace__run-actions {
+    grid-column: 1 / -1;
+  }
+  .project-workspace__project-brief {
+    min-height: 0;
+    padding: 14px;
+    grid-template-columns: 36px minmax(0, 1fr);
+    align-items: start;
+  }
+  .project-workspace__project-brief-icon {
+    width: 36px;
+    height: 36px;
+  }
+  .project-workspace__project-brief-meta {
+    grid-column: 1 / -1;
+    grid-template-columns: 1fr 1fr;
+  }
+  .project-workspace__metric-strip {
+    grid-template-columns: 1fr 1fr;
+  }
+  .project-workspace__metric-strip article:nth-child(3) {
+    border-left: 0;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .project-workspace__metric-strip article:nth-child(4) {
+    border-top: 1px solid var(--border-subtle);
+  }
+  .project-workspace__detail-grid,
+  .project-workspace__files,
+  .project-workspace__git-layout {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__member-page-heading .project-workspace__heading-actions,
+  .project-workspace__member-page-heading .btn {
+    width: 100%;
+  }
+  .project-workspace__member-page-heading .btn {
+    min-height: 44px;
+  }
+  .project-workspace__team-relationships > header {
+    display: block;
+  }
+  .project-workspace__team-relationships > header .btn {
+    width: 100%;
+    min-height: 44px;
+    margin-top: var(--space-3);
+  }
+  .project-workspace__team-relationships-graph {
+    height: 280px;
+  }
+  .project-workspace__member-editor > header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__project-tools.is-compact
+    .project-workspace__project-tool-grid
+    > article {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+  .project-workspace__project-tools.is-compact
+    .project-workspace__project-tool-grid
+    p {
+    padding-left: 40px;
+  }
+  .project-workspace__member-capability-add {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .project-workspace__member-capability-add .btn {
+    width: 100%;
+  }
+  .project-workspace__template-capability-row {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+  .project-workspace__template-capability-row > span:last-child {
+    grid-column: 2;
+    text-align: left;
+  }
+  .project-workspace__member-actions {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+  .project-workspace__member-run-history > article {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .project-workspace__member-run-history > article > .btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .project-workspace__snapshot-form {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__planning-banner {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+  .project-workspace__planning-banner > .btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .project-workspace__item-heading {
+    padding: var(--space-4) 0 var(--space-3);
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__item-heading h2,
+  .project-workspace__item-heading h3 {
+    font-size: var(--text-xl);
+  }
+  .project-workspace__item-heading .btn {
+    width: 100%;
+    min-height: 44px;
+  }
+  .project-workspace__item-breadcrumb .btn,
+  .project-workspace__item-section > .btn {
+    min-height: 44px;
+  }
+  .project-workspace__item-section > .btn {
+    width: 100%;
+  }
+  .project-workspace__item-properties {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-3);
+  }
+  .project-workspace__item-next-step {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__item-next-actions {
+    width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__item-next-step .btn {
+    width: 100%;
+    min-height: 44px;
+  }
+  .project-workspace__item-layout {
+    padding-top: var(--space-4);
+    gap: var(--space-4);
+  }
+  .project-workspace__item-primary,
+  .project-workspace__item-side {
+    gap: var(--space-4);
+  }
+  .project-workspace__item-side {
+    padding-top: var(--space-4);
+  }
+  .project-workspace__item-section {
+    padding-bottom: var(--space-4);
+  }
+  .project-workspace__item-section > header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .project-workspace__item-edit-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .project-workspace__item-edit-panel > footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__item-edit-panel .btn {
+    width: 100%;
+    min-height: 44px;
+  }
+  .project-workspace__item-dependencies .btn {
+    min-height: 44px;
+  }
+  .project-workspace__item-evidence > article {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .project-workspace__item-evidence .btn {
+    width: 100%;
+    min-height: 44px;
+  }
+  .project-workspace__item-activity-list > article {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+  .project-workspace__item-activity-list > article > .btn {
+    width: fit-content;
+    min-height: 44px;
+    margin-left: 0;
+    grid-column: 2;
+  }
+  .project-workspace__item-meta {
+    grid-template-columns: 1fr 1fr;
+  }
+  .project-workspace__item-breadcrumb {
+    flex-wrap: wrap;
+  }
+  .project-workspace__item-breadcrumb .project-select {
+    width: 100%;
+    margin-left: 0;
+  }
+  .project-workspace__item-meta > .project-workspace__status {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+  .project-workspace__item-context-grid,
+  .project-workspace__item-review,
+  .project-workspace__item-changes {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__item-context-grid > * + * {
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+  .project-workspace__item-context-grid > aside {
+    grid-column: auto;
+  }
+  .project-workspace__item-control {
+    display: block;
+  }
+  .project-workspace__item-list > header {
+    display: none;
+  }
+  .project-workspace__item-list-row.btn {
+    min-width: 0;
+    padding: 14px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+  }
+  .project-workspace__item-list-copy {
+    grid-column: 1 / -1;
+  }
+  .project-workspace__item-list-state {
+    grid-column: 1 / -1;
+  }
+  .project-workspace__item-list-owner {
+    grid-column: 1 / 2;
+  }
+  .project-workspace__item-list-progress {
+    grid-column: 1 / 2;
+  }
+  .project-workspace__item-list-acceptance {
+    grid-column: 2 / 3;
+  }
+  .project-workspace__item-list-row time {
+    grid-column: 1 / 2;
+  }
+  .project-workspace__item-list-row > svg {
+    grid-column: 2 / 3;
+    justify-self: end;
+  }
+  .project-workspace__item-review > aside {
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+  .project-workspace__item-changes > aside {
+    max-height: 220px;
+    overflow-y: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .project-workspace__item-sessions article {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+  .project-workspace__item-sessions article > .btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .project-workspace__commit-detail {
+    position: static;
+  }
+  .project-workspace__git-log-head,
+  .project-workspace__git-log li > .btn {
+    grid-template-columns: 76px minmax(160px, 1fr) 96px;
+  }
+  .project-workspace__git-log-head > :nth-child(4),
+  .project-workspace__git-log li > .btn > :nth-child(4) {
+    display: none;
+  }
+  .project-workspace__files > aside {
+    min-height: 0;
+    max-height: 220px;
+    overflow: auto;
+  }
+  .project-workspace__cap-grid,
+  .project-workspace__policy-grid,
+  .project-workspace__project-tool-grid,
+  .project-workspace__tool-baselines {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__subsection-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__project-tool-member {
+    justify-content: space-between;
+  }
+  .project-workspace__run-list > article {
+    grid-template-columns: 40px 1fr;
+  }
+  .project-workspace__run-list dl {
+    grid-column: 1 / -1;
+    padding-left: 53px;
+  }
+  .project-workspace__audit-filters {
+    flex-wrap: wrap;
+  }
+  .project-workspace__audit-filters .ui-search-input,
+  .project-workspace__audit-filters .project-select {
+    flex: 1 1 100%;
+  }
+  .project-workspace__form-grid,
+  .project-workspace__settings-grid {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__visibility-settings,
+  .project-workspace__runtime-settings {
+    grid-template-columns: 1fr;
+    row-gap: 18px;
+  }
+  .project-workspace__settings-section-heading p {
+    max-width: 640px;
+  }
+  .project-workspace__visibility-body {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__visibility-settings > footer {
+    grid-column: 1;
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__repository-summary {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__repository-summary article + article {
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+  .project-workspace__remote-form {
+    grid-template-columns: 1fr;
+  }
+  .project-workspace__form-grid .is-wide {
+    grid-column: auto;
+  }
+  .project-workspace__inline-create {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__milestone-actions {
+    grid-column: 1 / -1;
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-workspace__milestone-actions > small {
+    text-align: left;
+  }
+  .project-workspace__milestone-actions > div {
+    justify-content: flex-end;
+  }
+  .project-workspace__milestone-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .project-workspace__milestone-stats > div:nth-child(3) {
+    border-top: 1px solid var(--border-subtle);
+    border-left: 0;
+  }
+  .project-workspace__milestone-stats > div:nth-child(4) {
+    border-top: 1px solid var(--border-subtle);
+  }
+  .project-workspace__milestone-run-list > article {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+  }
+  .project-workspace__milestone-run-list > article > .btn {
+    grid-column: 2 / -1;
+    justify-self: start;
+  }
+  .project-workspace__run-controls {
+    grid-column: 1 / -1;
+    padding-left: 53px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .project-workspace__content {
+    animation: none;
+  }
+  .project-workspace__spinner {
+    animation-duration: 1.6s;
+  }
+  .project-workspace__kanban > section > div > button {
+    transition: none;
+  }
+}
