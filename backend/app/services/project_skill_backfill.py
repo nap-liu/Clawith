@@ -33,6 +33,7 @@ from app.services.skill_market import MAX_SKILL_FILES, validate_skill_files
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 from app.services.project_skill_assets_support import (
+    _SkillBackfillPlan,
     _ASSET_CONFIG_KEY,
     _ASSET_KEYS_V1,
     _ASSET_KEYS,
@@ -70,17 +71,6 @@ from app.services.project_skill_assets_support import (
     _write_files,
     _link_files,
 )
-
-@dataclass(slots=True)
-class _SkillBackfillPlan:
-    binding: ProjectCapabilityBinding
-    previous_schema_version: int
-    previous_asset_id: str | None
-    metadata: dict
-    source_path: Path
-    target_path: Path
-    other_config_fingerprint: str
-
 
 async def bind_library_skill_to_project_agent(
     db: AsyncSession,

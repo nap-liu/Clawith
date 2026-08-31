@@ -60,6 +60,18 @@ _PACKAGE_KEYS = {
 _PACKAGE_FILE_KEYS = {"path", "size", "sha256", "content_base64"}
 _FRONTMATTER_FIELD = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
 
+
+@dataclass(slots=True)
+class _SkillBackfillPlan:
+    binding: ProjectCapabilityBinding
+    previous_schema_version: int
+    previous_asset_id: str | None
+    metadata: dict
+    source_path: Path
+    target_path: Path
+    other_config_fingerprint: str
+
+
 async def _read_storage_skill(prefix: str) -> list[dict[str, str]]:
     storage = get_storage_backend()
     files: list[dict[str, str]] = []
