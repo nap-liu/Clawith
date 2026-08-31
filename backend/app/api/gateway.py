@@ -7,6 +7,8 @@ to poll for messages, report results, send messages, and send heartbeat pings.
 import asyncio
 import hashlib
 import json
+import sys
+import types
 import uuid
 from datetime import datetime, timezone
 
@@ -38,6 +40,7 @@ from app.services.workload_capacity import (
 
 router = APIRouter(prefix="/gateway", tags=["gateway"])
 from app.api.gateway_support import _get_agent_by_key, _hash_key
+from app.api import gateway_agent_io as _agent_io
 from app.api.gateway_agent_io import (
     heartbeat,
     poll_messages,
@@ -144,6 +147,18 @@ for _gateway_endpoint in (poll_messages, report_result, heartbeat):
     _gateway_endpoint.__module__ = __name__
 
 router.include_router(agent_io_router)
+
+
+class _GatewayApiFacadeModule(types.ModuleType):
+    """Keep historical root-module monkeypatch targets effective."""
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if hasattr(_agent_io, name):
+            setattr(_agent_io, name, value)
+
+
+sys.modules[__name__].__class__ = _GatewayApiFacadeModule
 
 # ─── Send message ───────────────────────────────────────
 
