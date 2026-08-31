@@ -305,7 +305,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 .project-workspace__audit-shell {
   min-height: 0;
   display: flex;
@@ -622,4 +621,3 @@
   justify-content: flex-end;
   gap: 8px;
 }
-

@@ -14,7 +14,6 @@
   color: var(--text-primary);
   background: var(--bg-primary);
 }
-
 .project-workspace.project-workspace--files {
   height: calc(100vh - var(--notification-bar-height, 0px));
   height: calc(100dvh - var(--notification-bar-height, 0px));
@@ -795,4 +794,3 @@
   color: var(--text-tertiary);
   font-size: 12px;
 }
-
