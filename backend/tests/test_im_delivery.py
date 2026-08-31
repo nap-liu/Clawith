@@ -21,14 +21,14 @@ from app.models.participant import Participant  # noqa: F401 - register ChatMess
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
+from app.scripts.rollback_im_recall import remove_builtin_tool
 from app.services import agent_tools, im_delivery
+from app.services.channel_commands import prepare_channel_command_reply
 from app.services.chat_history import build_llm_messages_from_rows, load_messages_for_session
 from app.services.chat_message_serializer import serialize_chat_message_for_client
-from app.services.channel_commands import prepare_channel_command_reply
 from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, PartRecallResult
 from app.services.llm.compactor import serialize_span_for_summary
 from app.services.llm.utils import convert_chat_messages_to_llm_format
-from app.scripts.rollback_im_recall import remove_builtin_tool
 
 pytestmark = pytest.mark.asyncio
 
@@ -348,6 +348,200 @@ async def test_duplicate_reset_event_archives_once_and_never_requests_redelivery
     assert archived.external_conv_id.count("__archived_") == 1
     assert [str(row.id) for row in command_rows] == [first["message_id"]]
     assert provider_sends == [first["message"]]
+
+
+async def test_reset_releases_identity_locks_before_locking_chat_session(monkeypatch):
+    """A command and ordinary ingress must never acquire User/Session inversely."""
+    agent, user = await _seed_agent()
+    external_conv_id = f"im_p2p_lock-order-{uuid.uuid4().hex}"
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent.id,
+            user_id=user.id,
+            title="Lock order regression",
+            source_channel="slack",
+            external_conv_id=external_conv_id,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    stop_entered = asyncio.Event()
+    ingress_locked_session = asyncio.Event()
+
+    async def pause_stop_tree(**_kwargs):
+        stop_entered.set()
+        await ingress_locked_session.wait()
+        return SimpleNamespace(stopped=False)
+
+    async def no_local_turn(_lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "app.services.turn_control.stop_session_turn_tree",
+        pause_stop_tree,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_commands.cancel_running_turn",
+        no_local_turn,
+    )
+
+    async def reset_command() -> dict:
+        async with async_session() as command_db:
+            # Model identity enrichment performed by any IM adapter: this
+            # transaction owns a User lock before entering the command path.
+            await command_db.execute(
+                select(User).where(User.id == user.id).with_for_update()
+            )
+            result = await prepare_channel_command_reply(
+                command_db,
+                command="/new",
+                agent_id=agent.id,
+                user_id=user.id,
+                external_user_id="lock-order-user",
+                external_conv_id=external_conv_id,
+                source_channel="slack",
+                provider_event_id=f"lock-order-command-{uuid.uuid4().hex}",
+            )
+            await command_db.commit()
+            return result
+
+    async def ordinary_ingress() -> None:
+        await stop_entered.wait()
+        async with async_session() as ingress_db:
+            await ingress_db.execute(
+                select(ChatSession)
+                .where(ChatSession.id == session_id)
+                .with_for_update()
+            )
+            ingress_locked_session.set()
+            ingress_db.add(
+                ChatMessage(
+                    agent_id=agent.id,
+                    user_id=user.id,
+                    role="user",
+                    content="message racing with reset",
+                    conversation_id=str(session_id),
+                    external_event_key=(
+                        f"lock-order-ingress-{uuid.uuid4().hex}"
+                    ),
+                )
+            )
+            await ingress_db.commit()
+
+    command_result, _ = await asyncio.wait_for(
+        asyncio.gather(reset_command(), ordinary_ingress()),
+        timeout=5,
+    )
+
+    async with async_session() as db:
+        archived = await db.get(ChatSession, session_id)
+        ingress_row = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.content == "message racing with reset"
+                )
+            )
+        ).scalar_one()
+
+    assert command_result["action"] == "new_session"
+    assert "__archived_" in archived.external_conv_id
+    assert ingress_row.user_id == user.id
+
+
+async def test_stop_releases_identity_locks_before_unified_turn_tree_stop(monkeypatch):
+    """IM /stop must not retain a User lock while shared STOP waits on Session."""
+    agent, user = await _seed_agent()
+    external_conv_id = f"im_p2p_stop-lock-order-{uuid.uuid4().hex}"
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent.id,
+            user_id=user.id,
+            title="Shared stop lock order regression",
+            source_channel="teams",
+            external_conv_id=external_conv_id,
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    stop_entered = asyncio.Event()
+    ingress_locked_session = asyncio.Event()
+
+    async def unified_stop(**_kwargs):
+        stop_entered.set()
+        await ingress_locked_session.wait()
+        async with async_session() as stop_db:
+            await stop_db.execute(
+                select(ChatSession)
+                .where(ChatSession.id == session_id)
+                .with_for_update()
+            )
+            await stop_db.commit()
+        return SimpleNamespace(stopped=True)
+
+    async def no_local_turn(_lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "app.services.turn_control.stop_session_turn_tree",
+        unified_stop,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_commands.cancel_running_turn",
+        no_local_turn,
+    )
+
+    async def stop_command() -> dict:
+        async with async_session() as command_db:
+            await command_db.execute(
+                select(User).where(User.id == user.id).with_for_update()
+            )
+            result = await prepare_channel_command_reply(
+                command_db,
+                command="/stop",
+                agent_id=agent.id,
+                user_id=user.id,
+                external_user_id="lock-order-user",
+                external_conv_id=external_conv_id,
+                source_channel="teams",
+                provider_event_id=f"lock-order-stop-{uuid.uuid4().hex}",
+            )
+            await command_db.commit()
+            return result
+
+    async def ordinary_ingress() -> None:
+        await stop_entered.wait()
+        async with async_session() as ingress_db:
+            await ingress_db.execute(
+                select(ChatSession)
+                .where(ChatSession.id == session_id)
+                .with_for_update()
+            )
+            ingress_locked_session.set()
+            ingress_db.add(
+                ChatMessage(
+                    agent_id=agent.id,
+                    user_id=user.id,
+                    role="user",
+                    content="message racing with stop",
+                    conversation_id=str(session_id),
+                    external_event_key=f"stop-ingress-{uuid.uuid4().hex}",
+                )
+            )
+            await ingress_db.commit()
+
+    command_result, _ = await asyncio.wait_for(
+        asyncio.gather(stop_command(), ordinary_ingress()),
+        timeout=5,
+    )
+
+    async with async_session() as db:
+        current = await db.get(ChatSession, session_id)
+
+    assert command_result["action"] == "stop_turn"
+    assert command_result["message"] == "已请求停止当前工作。"
+    assert current.external_conv_id == external_conv_id
 
 
 async def test_persisted_part_survives_second_part_timeout_as_partial_unknown():

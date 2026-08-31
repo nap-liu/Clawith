@@ -675,6 +675,44 @@ async def handle_channel_command(
     return {"action": "unknown", "message": f"未知命令: {cmd}"}
 
 
+async def _lock_command_event(db: AsyncSession, event_key: str) -> None:
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    lock_id = int.from_bytes(
+        hashlib.blake2b(event_key.encode("utf-8"), digest_size=8).digest(),
+        byteorder="big",
+        signed=True,
+    )
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": lock_id},
+    )
+
+
+async def _load_command_replay(
+    db: AsyncSession,
+    event_key: str,
+) -> dict | None:
+    existing = (
+        await db.execute(
+            select(ChatMessage).where(ChatMessage.external_event_key == event_key)
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        return None
+    meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
+    return {
+        "action": str(meta.get("command_action") or "replayed"),
+        "message": existing.content,
+        "message_id": str(existing.id),
+        "external_event_key": event_key,
+        "conversation_id": str(existing.conversation_id),
+        "user_id": str(existing.user_id) if existing.user_id else None,
+        "should_deliver": False,
+        "replayed": True,
+    }
+
+
 async def prepare_channel_command_reply(
     db: AsyncSession,
     *,
@@ -689,38 +727,22 @@ async def prepare_channel_command_reply(
     group_name: str | None = None,
     external_user_info: dict | None = None,
 ) -> dict:
-    """Execute a command and durably prepare its one normalized reply anchor."""
+    """Execute a command and durably prepare its one normalized reply anchor.
+
+    The adapter may have resolved or enriched the channel identity in this same
+    session before reaching the command path. Persist that work in a separate
+    transaction before locking a chat session. Normal message ingress locks the
+    chat session before inserting a message that references the user, so mixing
+    both orders in one transaction can deadlock the two paths.
+    """
     if not provider_event_id:
         raise ValueError("provider_event_id is required for channel commands")
     event_digest = hashlib.sha256(str(provider_event_id).encode("utf-8")).hexdigest()
     event_key = f"channel-command:{source_channel}:{agent_id}:{event_digest}"
-    if db.get_bind().dialect.name == "postgresql":
-        lock_id = int.from_bytes(
-            hashlib.blake2b(event_key.encode("utf-8"), digest_size=8).digest(),
-            byteorder="big",
-            signed=True,
-        )
-        await db.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_id)"),
-            {"lock_id": lock_id},
-        )
-    existing = (
-        await db.execute(
-            select(ChatMessage).where(ChatMessage.external_event_key == event_key)
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
-        return {
-            "action": str(meta.get("command_action") or "replayed"),
-            "message": existing.content,
-            "message_id": str(existing.id),
-            "external_event_key": event_key,
-            "conversation_id": str(existing.conversation_id),
-            "user_id": str(existing.user_id) if existing.user_id else None,
-            "should_deliver": False,
-            "replayed": True,
-        }
+    await _lock_command_event(db, event_key)
+    replay = await _load_command_replay(db, event_key)
+    if replay is not None:
+        return replay
 
     agent = await _load_agent(db, agent_id=agent_id)
     resolved_user_id = user_id
@@ -735,6 +757,18 @@ async def prepare_channel_command_reply(
             extra_info=dict(external_user_info or {}),
         )
         resolved_user_id = platform_user.id
+
+    # This is an intentional command-ingress transaction boundary. It releases
+    # any identity/user locks acquired by the adapter or resolver before /new
+    # and /stop perform cancellation and lock the channel session. Reacquire the
+    # event lock and recheck the receipt because another replica may have won
+    # the command while this transaction boundary was crossed.
+    if db.in_transaction():
+        await db.commit()
+    await _lock_command_event(db, event_key)
+    replay = await _load_command_replay(db, event_key)
+    if replay is not None:
+        return replay
 
     result = await handle_channel_command(
         db=db,
