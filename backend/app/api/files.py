@@ -1,79 +1,41 @@
 """File management API routes for agent workspaces."""
 
-import base64
-import csv
-import io
-import json
-import mimetypes
-import os
-import time
+from __future__ import annotations
+
+import sys
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 
-import aiofiles
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi import APIRouter, Depends, File as FastFile, HTTPException, Request, UploadFile as UploadFileType, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
-from app.models.audit import ChatMessage
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
 from app.models.user import User
-from app.models.workspace import WorkspaceFileRevision
-from app.services.focus_service import is_focus_file_path
 from app.services.agent_runtime_workspace import (
     bind_agent_runtime_workspace,
     current_agent_runtime_workspace,
     project_agent_runtime_workspace,
     standard_agent_runtime_workspace,
 )
-from app.services.workspace_collaboration import (
-    acquire_edit_lock,
-    content_hash,
-    delete_workspace_file,
-    list_revisions,
-    read_text_if_exists,
-    record_revision,
-    release_edit_lock,
-    write_workspace_file,
-)
-from app.services.storage import (
-    ensure_local_path,
-    get_storage_backend,
-    guess_content_type,
-    normalize_storage_key,
-)
+from app.services.storage import ensure_local_path, get_storage_backend, guess_content_type, normalize_storage_key
 from app.services.storage_runtime.base import StorageEntry
-from app.services.chat_attachments import (
-    canonical_media_mime,
-    MEDIA_PROBE_CHUNK_BYTES,
-    parse_legacy_chat_attachments,
-    sniff_media_mime_bytes,
-)
-from app.services.media_playback import (
-    MAX_RANGE_BYTES,
-    PLAYBACK_COOKIE,
-    create_ticket,
-    decode_cookie_user,
-    error_detail as playback_error_detail,
-    load_ticket,
-    verify_signature,
-)
-from app.services.workspace_paths import WorkspacePathError, resolve_agent_visible_path
-from app.services.workspace_locking import workspace_locks
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from app.api import files_enterprise_ops, files_playback_ops, files_route_ops, files_workspace_support
 
 settings = get_settings()
 router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
+upload_router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
+enterprise_kb_router = APIRouter(prefix="/enterprise/knowledge-base", tags=["enterprise"])
+MODULE = sys.modules[__name__]
 
-# Files only visible/editable by agent creator (platform_admin also allowed)
 CREATOR_ONLY_FILES = {"secrets.md"}
+DEFAULT_UPLOAD_DIR = "workspace/uploads"
 
 
 class FileInfo(BaseModel):
@@ -109,63 +71,31 @@ class RestoreRevisionBody(BaseModel):
     expected_version_token: str | None = None
 
 
-TEXT_PREVIEW_EXTENSIONS = {
-    ".bat",
-    ".bash",
-    ".c",
-    ".cfg",
-    ".clj",
-    ".cpp",
-    ".cs",
-    ".css",
-    ".dart",
-    ".env",
-    ".go",
-    ".h",
-    ".hpp",
-    ".ini",
-    ".java",
-    ".js",
-    ".jsx",
-    ".kt",
-    ".kts",
-    ".less",
-    ".lua",
-    ".m",
-    ".mm",
-    ".php",
-    ".pl",
-    ".pm",
-    ".properties",
-    ".py",
-    ".r",
-    ".rb",
-    ".rs",
-    ".sass",
-    ".scala",
-    ".scss",
-    ".sh",
-    ".sql",
-    ".swift",
-    ".toml",
-    ".ts",
-    ".tsx",
-    ".vue",
-    ".xml",
-    ".yaml",
-    ".yml",
-    ".zsh",
-}
+class PlaybackTicketBody(BaseModel):
+    path: str
+    message_id: uuid.UUID
 
+
+class ImportSkillBody(BaseModel):
+    skill_id: str
+
+
+class ClawhubImportBody(BaseModel):
+    slug: str
+
+
+class UrlImportBody(BaseModel):
+    url: str
+
+
+TEXT_PREVIEW_EXTENSIONS = {
+    ".bat", ".bash", ".c", ".cfg", ".clj", ".cpp", ".cs", ".css", ".dart", ".env", ".go",
+    ".h", ".hpp", ".ini", ".java", ".js", ".jsx", ".kt", ".kts", ".less", ".lua", ".m",
+    ".mm", ".php", ".pl", ".pm", ".properties", ".py", ".r", ".rb", ".rs", ".sass", ".scala",
+    ".scss", ".sh", ".sql", ".swift", ".toml", ".ts", ".tsx", ".vue", ".xml", ".yaml", ".yml", ".zsh",
+}
 TEXT_PREVIEW_FILENAMES = {
-    ".dockerignore",
-    ".env",
-    ".env.example",
-    ".gitignore",
-    ".npmrc",
-    ".prettierrc",
-    "dockerfile",
-    "makefile",
+    ".dockerignore", ".env", ".env.example", ".gitignore", ".npmrc", ".prettierrc", "dockerfile", "makefile",
 }
 
 
@@ -182,8 +112,6 @@ async def _bind_file_workspace(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Route control-plane file APIs to the same workspace used at runtime."""
-
     agent, _access = await check_agent_access(db, current_user, agent_id)
     workspace = _runtime_workspace(agent)
     with bind_agent_runtime_workspace(workspace):
@@ -196,24 +124,17 @@ async def _resolve_workspace_agent(
     agent_id: uuid.UUID,
     candidate: object,
 ) -> Agent:
-    """Keep endpoint functions callable outside FastAPI dependency injection."""
-
-    if getattr(candidate, "id", None) == agent_id:
-        return candidate  # type: ignore[return-value]
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    return agent
+    return await files_workspace_support.resolve_workspace_agent_impl(
+        MODULE,
+        db,
+        current_user,
+        agent_id,
+        candidate,
+    )
 
 
 def _runtime_workspace(agent: Agent):
-    if getattr(agent, "scope", "standard") != "project":
-        return standard_agent_runtime_workspace(agent.id)
-    if agent.project_id is None or agent.tenant_id is None:
-        raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
-    return project_agent_runtime_workspace(
-        agent_id=agent.id,
-        tenant_id=agent.tenant_id,
-        project_id=agent.project_id,
-    )
+    return files_workspace_support.runtime_workspace_impl(MODULE, agent)
 
 
 async def _record_project_skill_change(
@@ -222,34 +143,12 @@ async def _record_project_skill_change(
     current_user: User,
     path: str,
 ) -> None:
-    normalized = normalize_storage_key(path)
-    parts = Path(normalized).parts
-    if getattr(agent, "scope", "standard") != "project" or len(parts) < 2 or parts[0] != "skills":
-        return
-    from app.models.project import Project
-    from app.services.project_git_service import commit_project_changes, project_user_git_email
-    from app.services.project_skill_assets import register_project_workspace_skill
-
-    project = await db.get(Project, agent.project_id)
-    if project is None or project.tenant_id != agent.tenant_id:
-        raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
-    skill_root = _agent_base_dir(agent.id) / "skills" / parts[1]
-    if (skill_root / "SKILL.md").is_file():
-        await register_project_workspace_skill(
-            db,
-            project,
-            project_agent_id=agent.id,
-            folder_name=parts[1],
-            actor_user_id=current_user.id,
-            actor_display_name=current_user.display_name,
-        )
-        return
-    await commit_project_changes(
-        project,
-        f"Update project Skill files: {parts[1]}",
-        [f".agents/{agent.id}/skills/{parts[1]}"],
-        author_name=current_user.display_name,
-        author_email=project_user_git_email(current_user.id),
+    await files_workspace_support.record_project_skill_change_impl(
+        MODULE,
+        db,
+        agent,
+        current_user,
+        path,
     )
 
 
@@ -258,112 +157,26 @@ async def _delete_bound_project_skill(
     agent: Agent,
     current_user: User,
     path: str,
-) -> dict | None:
-    """Route a project Skill root deletion through its binding lifecycle."""
-
-    normalized = normalize_storage_key(path)
-    parts = Path(normalized).parts
-    is_skill_root = len(parts) == 2 and parts[0] == "skills"
-    is_skill_manifest = len(parts) == 3 and parts[0] == "skills" and parts[2] == "SKILL.md"
-    if getattr(agent, "scope", "standard") != "project" or not (is_skill_root or is_skill_manifest):
-        return None
-
-    from app.models.project import Project, ProjectCapabilityBinding
-    from app.services.project_service import add_event
-    from app.services.project_skill_assets import (
-        delete_project_skill_asset,
-        project_skill_deletion_impact,
-    )
-
-    project = await db.get(Project, agent.project_id)
-    if (
-        project is None
-        or project.tenant_id != agent.tenant_id
-        or project.owner_user_id != current_user.id
-    ):
-        raise HTTPException(status_code=404, detail="Project not found")
-    bindings = list(
-        (
-            await db.execute(
-                select(ProjectCapabilityBinding).where(
-                    ProjectCapabilityBinding.project_id == project.id,
-                    ProjectCapabilityBinding.tenant_id == project.tenant_id,
-                    ProjectCapabilityBinding.capability_type == "skill",
-                    ProjectCapabilityBinding.inherited_from_agent_id == agent.id,
-                )
-            )
-        ).scalars()
-    )
-    expected_path = f"skills/{parts[1]}"
-    binding = next(
-        (
-            item
-            for item in bindings
-            if isinstance(item.config, dict)
-            and isinstance(item.config.get("skill_asset"), dict)
-            and item.config["skill_asset"].get("path") == expected_path
-        ),
-        None,
-    )
-    if binding is None:
-        return None
-
-    impact = await project_skill_deletion_impact(db, project, binding)
-    deleted = await delete_project_skill_asset(
+):
+    return await files_workspace_support.delete_bound_project_skill_impl(
+        MODULE,
         db,
-        project,
-        binding,
-        actor_user_id=current_user.id,
-        actor_display_name=current_user.display_name,
+        agent,
+        current_user,
+        path,
     )
-    add_event(
-        db,
-        project,
-        "capability.deleted",
-        f"Deleted project Skill {deleted['skill_name']}",
-        actor_user_id=current_user.id,
-        metadata={
-            "asset_id": deleted["asset_id"],
-            "affected_member_count": impact["affected_member_count"],
-            "source": "agent_files",
-        },
-    )
-    await db.flush()
-    return {
-        "status": "ok",
-        "path": expected_path,
-        "project_skill_deleted": True,
-        "affected_member_count": impact["affected_member_count"],
-        "affected_members": impact["affected_members"],
-    }
 
 
 def _safe_path(agent_id: uuid.UUID, rel_path: str) -> Path:
-    """Ensure the path is within the agent's directory (no path traversal)."""
-    base = _agent_base_dir(agent_id)
-    full = (base / rel_path).resolve()
-    if not str(full).startswith(str(base.resolve())):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Path traversal not allowed")
-    return full
+    return files_workspace_support.safe_path_impl(MODULE, agent_id, rel_path)
 
 
-def _visible_path(agent_id: uuid.UUID, rel_path: str, tenant_id: uuid.UUID | None) -> tuple[Path, Path, bool]:
-    """Resolve an agent-visible path, including virtual enterprise_info/."""
-    try:
-        resolved = resolve_agent_visible_path(
-            _agent_base_dir(agent_id),
-            rel_path,
-            workspace_root=Path(settings.AGENT_DATA_DIR),
-            tenant_id=str(tenant_id) if tenant_id else None,
-        )
-    except WorkspacePathError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-    return resolved.path, resolved.relative_root, resolved.is_enterprise
+def _visible_path(agent_id: uuid.UUID, rel_path: str, tenant_id: uuid.UUID | None):
+    return files_workspace_support.visible_path_impl(MODULE, agent_id, rel_path, tenant_id)
 
 
 def _is_enterprise_visible_path(rel_path: str) -> bool:
-    normalized = (rel_path or "").strip().strip("/")
-    return normalized == "enterprise_info" or normalized.startswith("enterprise_info/")
+    return files_workspace_support.is_enterprise_visible_path_impl(rel_path)
 
 
 def _visible_storage_key(
@@ -372,15 +185,14 @@ def _visible_storage_key(
     tenant_id: uuid.UUID | None,
     *,
     workspace=None,
-) -> tuple[str, bool]:
-    normalized = (rel_path or "").strip().strip("/")
-    if _is_enterprise_visible_path(normalized):
-        if not tenant_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No tenant associated")
-        sub_path = normalized[len("enterprise_info"):].lstrip("/")
-        return _enterprise_storage_key(str(tenant_id), sub_path), True
-    key = workspace.storage_key(normalized) if workspace is not None else _agent_storage_key(agent_id, normalized)
-    return key, False
+):
+    return files_workspace_support.visible_storage_key_impl(
+        MODULE,
+        agent_id,
+        rel_path,
+        tenant_id,
+        workspace=workspace,
+    )
 
 
 async def _require_agent_file_delete_access(
@@ -388,425 +200,48 @@ async def _require_agent_file_delete_access(
     current_user: User,
     agent_id: uuid.UUID,
 ) -> None:
-    """Allow destructive workspace file operations only for managers/admins."""
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level == "manage" or current_user.role in ("platform_admin", "org_admin", "super_admin"):
-        return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Only agent managers or admins can delete files",
+    await files_workspace_support.require_agent_file_delete_access_impl(
+        MODULE,
+        db,
+        current_user,
+        agent_id,
     )
 
 
-@router.get("/", response_model=list[FileInfo])
-async def list_files(
-    agent_id: uuid.UUID,
-    path: str = "",
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    workspace_agent: Agent = Depends(_bind_file_workspace),
-):
-    """List files and directories in an agent's file system."""
-    # Adopt upstream's storage-backend listing; keep our is_creator so the
-    # CREATOR_ONLY_FILES filter (below) still hides secrets.md from non-creators.
-    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
-    is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
-    storage = get_storage_backend()
-    storage_key, is_enterprise = _visible_storage_key(agent_id, path, current_user.tenant_id)
-    normalized_path = (path or "").strip().strip("/")
-    path_exists = await storage.exists(storage_key)
-    path_is_dir = await storage.is_dir(storage_key)
-    if not path_exists and not path_is_dir:
-        if not (
-            normalized_path == ""
-            or (is_enterprise and normalized_path == "enterprise_info")
-        ):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
-    elif path_exists and not path_is_dir:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is not a directory")
-
-    items = []
-    if not path and current_user.tenant_id:
-        items.append(FileInfo(
-            name="enterprise_info",
-            path="enterprise_info",
-            is_dir=True,
-            size=0,
-            modified_at="",
-            version_token=None,
-            url=None,
-        ))
-    entries = await storage.list_dir(storage_key) if path_exists or path_is_dir else []
-    for entry in entries:
-        if entry.name == '.gitkeep':
-            continue
-        if not path and entry.name.lower() in {"focus.md", "agenda.md"}:
-            continue
-        if not path and entry.name == "enterprise_info":
-            continue
-        if entry.name in CREATOR_ONLY_FILES and not is_creator:
-            continue
-        if is_enterprise:
-            rel = str(Path(entry.key).relative_to(f"enterprise_info_{current_user.tenant_id}"))
-            rel_path = f"enterprise_info/{rel}" if rel != "." else "enterprise_info"
-        else:
-            rel_path = str(Path(entry.key).relative_to(current_agent_runtime_workspace(agent_id).storage_prefix))
-        items.append(FileInfo(
-            name=entry.name,
-            path=rel_path,
-            is_dir=entry.is_dir,
-            size=entry.size,
-            modified_at=entry.modified_at,
-            version_token=_entry_version_token(entry),
-            url=f"/api/agents/{agent_id}/files/download?path={rel_path}" if not entry.is_dir else None
-        ))
-    return items
-
-
-@router.get("/content", response_model=FileContent)
-async def read_file(
-    agent_id: uuid.UUID,
-    path: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    workspace_agent: Agent = Depends(_bind_file_workspace),
-):
-    """Read the content of a file."""
-    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
-    is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
-    filename = Path(path).name
-    if filename in CREATOR_ONLY_FILES and not is_creator:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    if is_focus_file_path(path):
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Focus is stored in the system database. Use the Focus API.",
-        )
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, path, current_user.tenant_id)
-    if not await storage.exists(key) or not await storage.is_file(key):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-    version = await storage.get_version(key)
-
-    try:
-        content = await storage.read_text(key, encoding="utf-8", errors="replace")
-        return FileContent(path=path, content=content, version_token=version.token)
-    except UnicodeDecodeError:
-        stat = await storage.stat(key)
-        return FileContent(
-            path=path,
-            content=f"[二进制文件: {Path(path).name}, {stat.size} bytes]",
-            version_token=version.token,
-        )
-
-
 def _entry_version_token(entry: StorageEntry) -> str | None:
-    token = entry.version_id or entry.etag or entry.content_hash
-    if token:
-        return token
-    if entry.is_dir:
-        return None
-    if entry.modified_at or entry.size:
-        return f"{entry.modified_at}:{entry.size}"
-    return None
+    return files_workspace_support.entry_version_token_impl(entry)
 
 
 def _file_kind(path: str) -> str:
-    file_path = Path(path)
-    ext = file_path.suffix.lower()
-    name = file_path.name.lower()
-    if ext in {".md", ".markdown"}:
-        return "markdown"
-    if ext == ".csv":
-        return "csv"
-    if ext in {".html", ".htm"}:
-        return "html"
-    if ext == ".pdf":
-        return "pdf"
-    if ext in {".xlsx", ".xls"}:
-        return "xlsx"
-    if ext in {".docx", ".doc"}:
-        return "docx"
-    if ext in {".pptx", ".ppt"}:
-        return "pptx"
-    if ext in {".txt", ".log", ".json"} or ext in TEXT_PREVIEW_EXTENSIONS or name in TEXT_PREVIEW_FILENAMES:
-        return "text"
-    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}:
-        return "image"
-    return "binary"
+    return files_workspace_support.file_kind_impl(MODULE, path)
 
 
 def _find_companion_text_preview(target: Path) -> Path | None:
-    for suffix in (".md", ".txt"):
-        candidate = target.with_suffix(suffix)
-        if candidate.exists() and candidate.is_file():
-            return candidate
-    return None
+    return files_workspace_support.find_companion_text_preview_impl(target)
 
 
 def _extract_document_text(target: Path, kind: str) -> str:
-    """Best-effort rich document text extraction for lightweight previews."""
-    try:
-        if kind == "xlsx":
-            from openpyxl import load_workbook
-
-            wb = load_workbook(target, read_only=True, data_only=True)
-            sheets: list[str] = []
-            for ws in wb.worksheets[:5]:
-                rows = []
-                for row in ws.iter_rows(max_row=80, max_col=20, values_only=True):
-                    rows.append("\t".join("" if cell is None else str(cell) for cell in row))
-                sheets.append(f"Sheet: {ws.title}\n" + "\n".join(rows))
-            return "\n\n".join(sheets)
-        if kind == "docx":
-            from docx import Document
-
-            doc = Document(str(target))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        if kind == "pptx":
-            from pptx import Presentation
-
-            prs = Presentation(str(target))
-            slides = []
-            for idx, slide in enumerate(prs.slides, start=1):
-                texts = []
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text.strip():
-                        texts.append(shape.text.strip())
-                slides.append(f"Slide {idx}\n" + "\n".join(texts))
-            return "\n\n".join(slides)
-    except ImportError as exc:
-        return f"Missing preview dependency: {exc}"
-    except Exception as exc:
-        return f"Preview extraction failed: {str(exc)[:200]}"
-    return ""
+    return files_workspace_support.extract_document_text_impl(target, kind)
 
 
 def _detect_csv_delimiter(text: str) -> str:
-    lines = [line.strip() for line in text.splitlines() if line.strip()][:10]
-    if not lines:
-        return ","
-    candidates = [",", "，", ";", "\t", "|"]
-    scores = {
-        candidate: sum(line.count(candidate) for line in lines)
-        for candidate in candidates
-    }
-    return max(scores, key=scores.get) if any(scores.values()) else ","
+    return files_workspace_support.detect_csv_delimiter_impl(text)
 
 
 def _parse_csv_rows(text: str) -> list[list[str]]:
-    delimiter = _detect_csv_delimiter(text)
-    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
-    normalized: list[list[str]] = []
-    for row in rows[:500]:
-        values = list(row)
-        while values and not str(values[-1] or "").strip():
-            values.pop()
-        if values:
-            normalized.append(values)
-    return normalized
-
-
-@router.get("/preview")
-async def preview_file(
-    agent_id: uuid.UUID,
-    path: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    _workspace_agent: Agent = Depends(_bind_file_workspace),
-):
-    """Return a browser-friendly preview payload for Workspace files."""
-    await check_agent_access(db, current_user, agent_id)
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, path, current_user.tenant_id)
-    if not await storage.exists(key) or not await storage.is_file(key):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-
-    kind = _file_kind(path)
-    mime_type = mimetypes.guess_type(Path(path).name)[0] or "application/octet-stream"
-    download_url = f"/api/agents/{agent_id}/files/download?path={path}"
-    local_target: Path | None = None
-
-    if kind in {"markdown", "html", "text"}:
-        content = await storage.read_text(key, encoding="utf-8", errors="replace")
-        return {
-            "path": path,
-            "kind": kind,
-            "mime_type": mime_type,
-            "content": content or "",
-            "content_hash": content_hash(content or ""),
-            "download_url": download_url,
-        }
-    if kind == "csv":
-        content = await storage.read_text(key, encoding="utf-8", errors="replace")
-        rows = _parse_csv_rows(content)
-        return {
-            "path": path,
-            "kind": kind,
-            "mime_type": mime_type,
-            "content": content,
-            "content_hash": content_hash(content),
-            "rows": rows[:500],
-            "download_url": download_url,
-        }
-    if kind == "pdf":
-        return {
-            "path": path,
-            "kind": kind,
-            "mime_type": mime_type,
-            "url": download_url,
-            "download_url": download_url,
-        }
-    if kind == "xlsx":
-        try:
-            target = await ensure_local_path(key)
-            local_target = target
-            from openpyxl import load_workbook
-
-            wb = load_workbook(target, read_only=True, data_only=True)
-            sheets = []
-            for ws in wb.worksheets[:5]:
-                rows = []
-                for row in ws.iter_rows(max_row=120, max_col=30, values_only=True):
-                    values = ["" if cell is None else str(cell) for cell in row]
-                    while values and not str(values[-1] or "").strip():
-                        values.pop()
-                    if any(value.strip() for value in values):
-                        rows.append(values)
-                sheets.append({
-                    "title": ws.title,
-                    "rows": rows,
-                })
-            wb.close()
-            return {
-                "path": path,
-                "kind": kind,
-                "mime_type": mime_type,
-                "text": _extract_document_text(target, kind),
-                "sheets": sheets,
-                "download_url": download_url,
-            }
-        except Exception as exc:
-            return {
-                "path": path,
-                "kind": kind,
-                "mime_type": mime_type,
-                "text": f"Preview extraction failed: {str(exc)[:200]}",
-                "download_url": download_url,
-            }
-    if kind in {"docx", "pptx"}:
-        target = await ensure_local_path(key)
-        local_target = target
-        extracted_text = _extract_document_text(target, kind)
-        companion = _find_companion_text_preview(target)
-        companion_content = await read_text_if_exists(companion) if companion is not None else None
-        return {
-            "path": path,
-            "kind": kind,
-            "mime_type": mime_type,
-            "text": companion_content or extracted_text,
-            "companion_path": str(companion.resolve().relative_to(_agent_base_dir(agent_id).resolve())) if companion is not None and not path.startswith("enterprise_info") else None,
-            "download_url": download_url,
-        }
-
-    if local_target is not None:
-        companion = _find_companion_text_preview(local_target)
-    else:
-        companion = None
-    if companion is not None:
-        content = await read_text_if_exists(companion)
-        return {
-            "path": path,
-            "kind": "text",
-            "mime_type": "text/markdown" if companion.suffix.lower() == ".md" else "text/plain",
-            "content": content or "",
-            "content_hash": content_hash(content or ""),
-            "companion_path": str(companion.resolve().relative_to(_agent_base_dir(agent_id).resolve())) if not path.startswith("enterprise_info") else None,
-            "download_url": download_url,
-        }
-
-    raw = await storage.read_bytes(key)
-    encoded = base64.b64encode(raw[:1024 * 1024]).decode("ascii")
-    return {
-        "path": path,
-        "kind": kind,
-        "mime_type": mime_type,
-        "size": len(raw),
-        "base64_sample": encoded,
-        "download_url": download_url,
-    }
-
-
-class PlaybackTicketBody(BaseModel):
-    path: str
-    message_id: uuid.UUID
+    return files_workspace_support.parse_csv_rows_impl(MODULE, text)
 
 
 def _playback_headers() -> dict[str, str]:
-    return {
-        "Cache-Control": "private, no-store",
-        "Referrer-Policy": "no-referrer",
-        "X-Content-Type-Options": "nosniff",
-        "Accept-Ranges": "bytes",
-    }
+    return files_playback_ops.playback_headers_impl()
 
 
 def _storage_entry_version_token(entry: StorageEntry) -> str:
-    return entry.version_id or entry.etag or entry.content_hash or f"{entry.modified_at}:{entry.size}"
+    return files_playback_ops.storage_entry_version_token_impl(entry)
 
 
 def _message_references_media_path(message: ChatMessage, path: str) -> bool:
-    meta = message.message_meta if isinstance(message.message_meta, dict) else {}
-    if "attachments" in meta:
-        attachments = meta.get("attachments")
-        return isinstance(attachments, list) and any(
-            isinstance(item, dict) and str(item.get("path") or "") == path
-            for item in attachments
-        )
-
-    # Historical marker envelopes represented inbound user attachments. New
-    # user and assistant writers always persist attachments=[], so current free
-    # text can never enter this compatibility branch.
-    if getattr(message, "role", None) == "user":
-        source_channel = str(meta.get("source_channel") or "")
-        _, legacy_attachments = parse_legacy_chat_attachments(
-            message.content or "", source_channel
-        )
-        if any(str(item.get("path") or "") == path for item in legacy_attachments):
-            return True
-
-    # Nested JSON paths are accepted only from persisted tool-call results, not
-    # from user/assistant prose that happens to contain JSON-looking text.
-    if getattr(message, "role", None) != "tool_call":
-        return False
-
-    try:
-        payload = json.loads(message.content or "")
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    tool_name = str(payload.get("name") or payload.get("tool_name") or "")
-    if tool_name not in {"send_channel_file", "send_media", "send_audio", "send_video"}:
-        return False
-    if str(payload.get("status") or "") != "done":
-        return False
-    result = payload.get("result")
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except (TypeError, ValueError):
-            return False
-    if not isinstance(result, dict):
-        return False
-    if str(result.get("type") or "") not in {
-        "platform_file_delivery",
-        "platform_media_delivery",
-    }:
-        return False
-    if result.get("status") not in {None, "sent", "already_sent"}:
-        return False
-    return str(result.get("path") or result.get("file_path") or "") == path
+    return files_playback_ops.message_references_media_path_impl(message, path)
 
 
 async def _authorize_message_media_path(
@@ -816,145 +251,18 @@ async def _authorize_message_media_path(
     message_id: str,
     path: str,
 ) -> None:
-    try:
-        message_uuid = uuid.UUID(message_id)
-        session_uuid = None
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    message = (
-        await db.execute(
-            select(ChatMessage).where(
-                ChatMessage.id == message_uuid,
-                ChatMessage.agent_id == agent_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if message is not None:
-        try:
-            session_uuid = uuid.UUID(str(message.conversation_id))
-        except (TypeError, ValueError):
-            session_uuid = None
-    if message is None or session_uuid is None or not _message_references_media_path(message, path):
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    from app.api.chat_sessions import _load_accessible_session
-    try:
-        await _load_accessible_session(db, user, agent_id, session_uuid)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
+    await files_playback_ops.authorize_message_media_path_impl(
+        MODULE,
+        db,
+        user,
+        agent_id,
+        message_id,
+        path,
+    )
 
 
 def _parse_media_range(value: str | None, size: int) -> tuple[int, int, bool]:
-    """Return an inclusive, bounded range and whether the client sent Range."""
-    if size <= 0:
-        return 0, -1, bool(value)
-    if not value:
-        return 0, size - 1, False
-    if not value.startswith("bytes=") or "," in value:
-        raise ValueError("invalid range")
-    spec = value[6:].strip()
-    start_raw, separator, end_raw = spec.partition("-")
-    if not separator:
-        raise ValueError("invalid range")
-    if not start_raw:
-        suffix = int(end_raw)
-        if suffix <= 0:
-            raise ValueError("invalid suffix")
-        start = max(0, size - min(suffix, MAX_RANGE_BYTES))
-        return start, size - 1, True
-    start = int(start_raw)
-    if start < 0 or start >= size:
-        raise ValueError("range start outside object")
-    requested_end = int(end_raw) if end_raw else size - 1
-    if requested_end < start:
-        raise ValueError("range end before start")
-    end = min(requested_end, size - 1, start + MAX_RANGE_BYTES - 1)
-    return start, end, True
-
-
-@router.post("/playback-ticket")
-async def create_media_playback_ticket(
-    agent_id: uuid.UUID,
-    body: PlaybackTicketBody,
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Create a fresh, cookie-bound URL for one audio/video playback."""
-    await check_agent_access(db, current_user, agent_id)
-    await _authorize_message_media_path(
-        db, current_user, agent_id, str(body.message_id), body.path
-    )
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, body.path, current_user.tenant_id)
-    if not await storage.exists(key) or not await storage.is_file(key):
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    filename = Path(body.path).name
-    entry = await storage.stat(key)
-    if entry.size <= MEDIA_PROBE_CHUNK_BYTES * 2:
-        probe = await storage.read_range(key, 0, max(0, entry.size - 1))
-    else:
-        probe = (
-            await storage.read_range(key, 0, MEDIA_PROBE_CHUNK_BYTES - 1)
-        ) + (
-            await storage.read_range(
-                key,
-                entry.size - MEDIA_PROBE_CHUNK_BYTES,
-                entry.size - 1,
-            )
-        )
-    actual_mime = sniff_media_mime_bytes(probe, filename)
-    actual_kind = actual_mime.split("/", 1)[0] if actual_mime else None
-    if actual_kind not in {"audio", "video"}:
-        raise HTTPException(status_code=415, detail=playback_error_detail(
-            "MEDIA_TYPE_UNSUPPORTED", "无法识别该附件的音视频格式"
-        ))
-    mime_type = canonical_media_mime(filename, actual_kind, actual_mime)
-    try:
-        ticket, signature, cookie_token = await create_ticket(
-            user_id=str(current_user.id),
-            agent_id=str(agent_id),
-            path=body.path,
-            mime_type=mime_type,
-            size_bytes=entry.size,
-            version_token=_storage_entry_version_token(entry),
-            message_id=str(body.message_id),
-        )
-    except Exception:
-        raise HTTPException(status_code=503, detail=playback_error_detail(
-            "PLAYBACK_SERVICE_UNAVAILABLE", "播放服务暂时不可用", retryable=True, retry_after_ms=1500
-        ))
-    playback_url = (
-        f"/api/agents/{agent_id}/files/playback/{ticket.ticket_id}"
-        f"?signature={signature}"
-    )
-    response = JSONResponse({
-        "playback_session_id": ticket.ticket_id,
-        "playback_url": playback_url,
-        "mime_type": mime_type,
-        "size_bytes": entry.size,
-        "absolute_expires_at": ticket.absolute_expires_at,
-    }, headers=_playback_headers())
-    response.set_cookie(
-        PLAYBACK_COOKIE,
-        cookie_token,
-        max_age=max(1, ticket.absolute_expires_at - int(time.time())),
-        httponly=True,
-        secure=(
-            request.url.scheme == "https"
-            or request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower() == "https"
-        ),
-        samesite="lax",
-        path=f"/api/agents/{agent_id}/files/playback",
-    )
-    return response
+    return files_playback_ops.parse_media_range_impl(value, size)
 
 
 async def _authorize_playback_ticket(
@@ -965,51 +273,97 @@ async def _authorize_playback_ticket(
     cookie_token: str | None,
     db: AsyncSession,
 ):
-    if not verify_signature(ticket_id, signature):
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    cookie_user_id = decode_cookie_user(cookie_token)
-    if not cookie_user_id:
-        raise HTTPException(status_code=401, detail=playback_error_detail(
-            "PLAYBACK_AUTHORIZATION_REQUIRED", "播放授权已过期", retryable=True
-        ))
-    try:
-        ticket = await load_ticket(ticket_id, touch=True)
-    except Exception:
-        raise HTTPException(status_code=503, detail=playback_error_detail(
-            "PLAYBACK_SERVICE_UNAVAILABLE", "播放服务暂时不可用", retryable=True
-        ))
-    if not ticket or ticket.agent_id != str(agent_id) or ticket.user_id != cookie_user_id:
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "PLAYBACK_SESSION_EXPIRED", "播放授权已过期", retryable=True
-        ))
-    try:
-        user_uuid = uuid.UUID(cookie_user_id)
-    except ValueError:
-        raise HTTPException(status_code=401, detail=playback_error_detail(
-            "PLAYBACK_AUTHORIZATION_REQUIRED", "播放授权已过期", retryable=True
-        ))
-    result = await db.execute(select(User).where(User.id == user_uuid))
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    try:
-        await check_agent_access(db, user, agent_id)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    if not ticket.message_id:
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "PLAYBACK_SESSION_EXPIRED", "播放授权已过期", retryable=True
-        ))
-    await _authorize_message_media_path(
-        db, user, agent_id, ticket.message_id, ticket.path
+    return await files_playback_ops.authorize_playback_ticket_impl(
+        MODULE,
+        agent_id=agent_id,
+        ticket_id=ticket_id,
+        signature=signature,
+        cookie_token=cookie_token,
+        db=db,
     )
-    return ticket, user
+
+
+def _enterprise_kb_dir(tenant_id: str) -> Path:
+    return files_enterprise_ops.enterprise_kb_dir_impl(MODULE, tenant_id)
+
+
+def _enterprise_info_dir(tenant_id: str) -> Path:
+    return files_enterprise_ops.enterprise_info_dir_impl(MODULE, tenant_id)
+
+
+def _enterprise_storage_key(tenant_id: str, rel_path: str = "") -> str:
+    return files_enterprise_ops.enterprise_storage_key_impl(MODULE, tenant_id, rel_path)
+
+
+@router.get("/", response_model=list[FileInfo])
+async def list_files(
+    agent_id: uuid.UUID,
+    path: str = "",
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
+):
+    return await files_route_ops.list_files_impl(
+        MODULE,
+        agent_id=agent_id,
+        path=path,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
+    )
+
+
+@router.get("/content", response_model=FileContent)
+async def read_file(
+    agent_id: uuid.UUID,
+    path: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    workspace_agent: Agent = Depends(_bind_file_workspace),
+):
+    return await files_route_ops.read_file_impl(
+        MODULE,
+        agent_id=agent_id,
+        path=path,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
+    )
+
+
+@router.get("/preview")
+async def preview_file(
+    agent_id: uuid.UUID,
+    path: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _workspace_agent: Agent = Depends(_bind_file_workspace),
+):
+    return await files_route_ops.preview_file_impl(
+        MODULE,
+        agent_id=agent_id,
+        path=path,
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post("/playback-ticket")
+async def create_media_playback_ticket(
+    agent_id: uuid.UUID,
+    body: PlaybackTicketBody,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await files_playback_ops.create_media_playback_ticket_impl(
+        MODULE,
+        agent_id=agent_id,
+        body=body,
+        request=request,
+        current_user=current_user,
+        db=db,
+    )
 
 
 @router.get("/playback/{ticket_id}/status")
@@ -1020,44 +374,14 @@ async def get_media_playback_status(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    try:
-        ticket, user = await _authorize_playback_ticket(
-            agent_id=agent_id,
-            ticket_id=ticket_id,
-            signature=signature,
-            cookie_token=request.cookies.get(PLAYBACK_COOKIE),
-            db=db,
-        )
-    except HTTPException as exc:
-        code = "PLAYBACK_SESSION_EXPIRED" if exc.status_code in {401, 404} else "PLAYBACK_SERVICE_UNAVAILABLE"
-        return JSONResponse(
-            playback_error_detail(code, "播放授权已过期" if code.endswith("EXPIRED") else "播放服务暂时不可用", retryable=True),
-            status_code=exc.status_code,
-            headers=_playback_headers(),
-        )
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, ticket.path, user.tenant_id)
-    if not await storage.exists(key) or not await storage.is_file(key):
-        return JSONResponse(
-            playback_error_detail(
-                "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-            ),
-            status_code=404,
-            headers=_playback_headers(),
-        )
-    entry = await storage.stat(key)
-    if ticket.version_token and ticket.version_token != _storage_entry_version_token(entry):
-        return JSONResponse(
-            playback_error_detail(
-                "MEDIA_VERSION_CHANGED", "媒体文件已更新，请重新加载", retryable=True
-            ),
-            status_code=409,
-            headers=_playback_headers(),
-        )
-    return JSONResponse({
-        "status": "ready",
-        "absolute_expires_at": ticket.absolute_expires_at,
-    }, headers=_playback_headers())
+    return await files_playback_ops.get_media_playback_status_impl(
+        MODULE,
+        agent_id=agent_id,
+        ticket_id=ticket_id,
+        signature=signature,
+        request=request,
+        db=db,
+    )
 
 
 @router.api_route("/playback/{ticket_id}", methods=["GET", "HEAD"])
@@ -1068,80 +392,13 @@ async def stream_media_playback(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    ticket, user = await _authorize_playback_ticket(
+    return await files_playback_ops.stream_media_playback_impl(
+        MODULE,
         agent_id=agent_id,
         ticket_id=ticket_id,
         signature=signature,
-        cookie_token=request.cookies.get(PLAYBACK_COOKIE),
+        request=request,
         db=db,
-    )
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, ticket.path, user.tenant_id)
-    if not await storage.exists(key) or not await storage.is_file(key):
-        raise HTTPException(status_code=404, detail=playback_error_detail(
-            "MEDIA_NOT_FOUND_OR_FORBIDDEN", "媒体不存在或当前不可访问"
-        ))
-    entry = await storage.stat(key)
-    size = entry.size
-    current_version = _storage_entry_version_token(entry)
-    if ticket.version_token and ticket.version_token != current_version:
-        return JSONResponse(
-            playback_error_detail(
-                "MEDIA_VERSION_CHANGED", "媒体文件已更新，请重新加载", retryable=True
-            ),
-            status_code=409,
-            headers=_playback_headers(),
-        )
-    etag = entry.etag or current_version
-    etag_header = f'"{etag}"' if etag else ""
-    range_header = request.headers.get("range")
-    if_range = request.headers.get("if-range")
-    if range_header and if_range and if_range.strip() != etag_header:
-        range_header = None
-    try:
-        start, end, had_range = _parse_media_range(range_header, size)
-    except (TypeError, ValueError):
-        return Response(
-            status_code=416,
-            headers={**_playback_headers(), "Content-Range": f"bytes */{size}"},
-        )
-    partial = had_range or start > 0 or end < size - 1
-    content_length = max(0, end - start + 1)
-    headers = {
-        **_playback_headers(),
-        "Content-Length": str(content_length),
-        "Content-Disposition": f"inline; filename*=UTF-8''{quote(Path(ticket.path).name)}",
-    }
-    if partial:
-        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-    if etag_header:
-        headers["ETag"] = etag_header
-    if request.method == "HEAD" or content_length == 0:
-        return Response(status_code=206 if partial else 200, media_type=ticket.mime_type, headers=headers)
-    if not partial:
-        async def iter_full_media():
-            offset = 0
-            while offset < size:
-                chunk_end = min(size - 1, offset + MAX_RANGE_BYTES - 1)
-                chunk = await storage.read_range(key, offset, chunk_end)
-                if not chunk:
-                    break
-                yield chunk
-                offset += len(chunk)
-
-        return StreamingResponse(
-            iter_full_media(),
-            status_code=200,
-            media_type=ticket.mime_type,
-            headers=headers,
-        )
-    data = await storage.read_range(key, start, end)
-    headers["Content-Length"] = str(len(data))
-    return Response(
-        content=data,
-        status_code=206 if partial else 200,
-        media_type=ticket.mime_type,
-        headers=headers,
     )
 
 
@@ -1154,65 +411,14 @@ async def download_file(
     credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Download / serve a file from the agent workspace (browser-friendly).
-    
-    Auth via Bearer header OR `token` query parameter (for <img> tags).
-    """
-    from app.core.security import decode_access_token
-
-    # Resolve JWT token from either Bearer header or query param
-    jwt_token = None
-    if credentials:
-        jwt_token = credentials.credentials
-    elif token:
-        jwt_token = token
-
-    if not jwt_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
-
-    payload = decode_access_token(jwt_token)
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
-
-    agent, _access = await check_agent_access(db, user, agent_id)
-    is_creator = (agent.creator_id == user.id) or (user.role == "platform_admin")
-    filename = Path(path).name
-    if filename in CREATOR_ONLY_FILES and not is_creator:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(
-        agent_id,
-        path,
-        user.tenant_id,
-        workspace=_runtime_workspace(agent),
-    )
-    if not await storage.exists(key) or not await storage.is_file(key):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-    presigned = await storage.presign_download_url(key, filename=Path(path).name, inline=inline)
-    if presigned:
-        return Response(
-            status_code=302,
-            headers={"Location": presigned},
-        )
-    local_path = await storage.local_path_for(key)
-    if local_path is not None:
-        return FileResponse(
-            path=str(local_path),
-            filename=Path(path).name,
-            content_disposition_type="inline" if inline else "attachment",
-        )
-    data = await storage.read_bytes(key)
-    disposition = "inline" if inline else "attachment"
-    return Response(
-        content=data,
-        media_type=guess_content_type(Path(path).name),
-        headers={"Content-Disposition": f'{disposition}; filename="{Path(path).name}"'},
+    return await files_route_ops.download_file_impl(
+        MODULE,
+        agent_id=agent_id,
+        path=path,
+        token=token,
+        inline=inline,
+        credentials=credentials,
+        db=db,
     )
 
 
@@ -1225,51 +431,15 @@ async def write_file(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Write content to a file (create or overwrite)."""
-    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
-    is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
-    filename = Path(path).name
-    if filename in CREATOR_ONLY_FILES and not is_creator:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    if is_focus_file_path(path):
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Focus is stored in the system database. Use the Focus API.",
-        )
-    if path.startswith("enterprise_info"):
-        # enterprise_info is admin-only company knowledge base; intentionally
-        # bypasses workspace_file revision tracking + collaborative locks
-        # because it's not part of agent-user pair editing flow. revision_id
-        # is always None to signal "no version history" to the frontend.
-        if current_user.role not in ("platform_admin", "org_admin"):
-            raise HTTPException(status_code=403, detail="Only admins can edit enterprise knowledge base")
-        if path.strip("/") == "enterprise_info":
-            raise HTTPException(status_code=400, detail="Cannot overwrite enterprise_info root")
-        target, _, _ = _visible_path(agent_id, path, current_user.tenant_id)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        async with aiofiles.open(target, "w", encoding="utf-8") as f:
-            await f.write(data.content)
-        return {"status": "ok", "path": path, "revision_id": None}
-
-    result = await write_workspace_file(
-        db,
+    return await files_route_ops.write_file_impl(
+        MODULE,
         agent_id=agent_id,
-        base_dir=_agent_base_dir(agent_id),
         path=path,
-        content=data.content,
-        actor_type="user",
-        actor_id=current_user.id,
-        operation="autosave" if data.autosave else "write",
-        session_id=data.session_id,
-        enforce_human_lock=False,
-        merge_user_autosave=data.autosave,
-        expected_version_token=data.expected_version_token,
+        data=data,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
     )
-    if not result.ok:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
-    await _record_project_skill_change(db, agent, current_user, result.path)
-    await db.commit()
-    return {"status": "ok", "path": result.path, "revision_id": result.revision_id}
 
 
 @router.post("/locks")
@@ -1280,19 +450,13 @@ async def lock_file(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Acquire or refresh a short-lived human editing lock for a file."""
-    await check_agent_access(db, current_user, agent_id)
-    if is_focus_file_path(data.path):
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Focus is stored in the system database.")
-    lock = await acquire_edit_lock(
-        db,
+    return await files_route_ops.lock_file_impl(
+        MODULE,
         agent_id=agent_id,
-        path=data.path,
-        user_id=current_user.id,
-        session_id=data.session_id,
+        data=data,
+        current_user=current_user,
+        db=db,
     )
-    await db.commit()
-    return {"status": "ok", "path": lock.path, "expires_at": lock.expires_at.isoformat()}
 
 
 @router.delete("/locks")
@@ -1303,11 +467,13 @@ async def unlock_file(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Release the current user's edit lock for a file."""
-    await check_agent_access(db, current_user, agent_id)
-    await release_edit_lock(db, agent_id=agent_id, path=path, user_id=current_user.id)
-    await db.commit()
-    return {"status": "ok", "path": path}
+    return await files_route_ops.unlock_file_impl(
+        MODULE,
+        agent_id=agent_id,
+        path=path,
+        current_user=current_user,
+        db=db,
+    )
 
 
 @router.get("/revisions")
@@ -1318,28 +484,13 @@ async def get_file_revisions(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """List version history for the currently opened Workspace file."""
-    await check_agent_access(db, current_user, agent_id)
-    if is_focus_file_path(path):
-        return []
-    if path.startswith("enterprise_info"):
-        return []
-    revisions = await list_revisions(db, agent_id=agent_id, path=path)
-    return [
-        {
-            "id": str(rev.id),
-            "path": rev.path,
-            "operation": rev.operation,
-            "actor_type": rev.actor_type,
-            "actor_id": str(rev.actor_id) if rev.actor_id else None,
-            "session_id": rev.session_id,
-            "before_content": rev.before_content,
-            "after_content": rev.after_content,
-            "created_at": rev.created_at.isoformat() if rev.created_at else None,
-            "updated_at": rev.updated_at.isoformat() if rev.updated_at else None,
-        }
-        for rev in revisions
-    ]
+    return await files_route_ops.get_file_revisions_impl(
+        MODULE,
+        agent_id=agent_id,
+        path=path,
+        current_user=current_user,
+        db=db,
+    )
 
 
 @router.post("/restore")
@@ -1350,37 +501,14 @@ async def restore_file_revision(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Restore a file to a previous revision's after-content."""
-    await check_agent_access(db, current_user, agent_id)
-    result = await db.execute(
-        select(WorkspaceFileRevision).where(
-            WorkspaceFileRevision.id == data.revision_id,
-            WorkspaceFileRevision.agent_id == agent_id,
-        )
-    )
-    revision = result.scalar_one_or_none()
-    if not revision:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision not found")
-    if revision.after_content is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot restore an empty/deleted revision")
-
-    restored = await write_workspace_file(
-        db,
+    return await files_route_ops.restore_file_revision_impl(
+        MODULE,
         agent_id=agent_id,
-        base_dir=_agent_base_dir(agent_id),
-        path=revision.path,
-        content=revision.after_content,
-        actor_type="user",
-        actor_id=current_user.id,
-        operation="restore",
-        enforce_human_lock=False,
-        expected_version_token=data.expected_version_token,
+        data=data,
+        current_user=current_user,
+        db=db,
+        workspace_agent=_workspace_agent,
     )
-    if not restored.ok:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=restored.message)
-    await _record_project_skill_change(db, _workspace_agent, current_user, revision.path)
-    await db.commit()
-    return {"status": "ok", "path": revision.path, "revision_id": restored.revision_id}
 
 
 @router.delete("/content")
@@ -1392,50 +520,15 @@ async def delete_file(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Delete a file."""
-    # Upstream: only managers/admins may delete workspace files. Ours: creator-only
-    # files (e.g. secrets.md) are protected even from non-creator managers. Apply both.
-    await _require_agent_file_delete_access(db, current_user, agent_id)
-    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
-    is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
-    filename = Path(path).name
-    if filename in CREATOR_ONLY_FILES and not is_creator:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    if is_focus_file_path(path):
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Focus is stored in the system database. Use the Focus API.",
-        )
-    storage = get_storage_backend()
-    if path.startswith("enterprise_info") and current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
-    if path.strip("/") == "enterprise_info":
-        raise HTTPException(status_code=400, detail="Cannot delete enterprise_info root")
-    project_skill_result = await _delete_bound_project_skill(db, agent, current_user, path)
-    if project_skill_result is not None:
-        await db.commit()
-        return project_skill_result
-    result = await delete_workspace_file(
-        db,
+    return await files_route_ops.delete_file_impl(
+        MODULE,
         agent_id=agent_id,
-        base_dir=_agent_base_dir(agent_id),
         path=path,
-        actor_type="user",
-        actor_id=current_user.id,
-        enforce_human_lock=False,
         expected_version_token=expected_version_token,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
     )
-    if not result.ok:
-        if "not found" in result.message.lower():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result.message)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
-    await _record_project_skill_change(db, agent, current_user, path)
-    await db.commit()
-    return {"status": "ok", "path": path}
-
-
-class ImportSkillBody(BaseModel):
-    skill_id: str
 
 
 @router.post("/import-skill")
@@ -1446,123 +539,14 @@ async def import_skill_to_agent(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Import a global skill into this agent's skills/ workspace folder.
-
-    Copies all files from the global skill registry into
-    <agent_workspace>/skills/<folder_name>/.
-    """
-    agent = await _resolve_workspace_agent(db, current_user, agent_id, workspace_agent)
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(status_code=403, detail="需要数字员工管理权限")
-
-    from sqlalchemy import or_
-    from sqlalchemy.orm import selectinload
-
-    from app.models.skill import Skill
-
-    # Load the global skill with its files
-    result = await db.execute(
-        select(Skill)
-        .where(
-            Skill.id == body.skill_id,
-            or_(Skill.tenant_id.is_(None), Skill.tenant_id == agent.tenant_id),
-        )
-        .options(selectinload(Skill.files))
+    return await files_route_ops.import_skill_to_agent_impl(
+        MODULE,
+        agent_id=agent_id,
+        body=body,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
     )
-    skill = result.scalar_one_or_none()
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
-    if agent.scope == "project":
-        from app.models.project import Project
-        from app.services.project_capability_options import load_project_capability_options
-        from app.services.project_skill_assets import bind_library_skill_to_project_agent
-
-        project = await db.get(Project, agent.project_id)
-        if project is None or project.tenant_id != agent.tenant_id:
-            raise HTTPException(status_code=409, detail="Project Agent workspace is unavailable")
-        source_agent = await db.get(Agent, agent.source_agent_id) if agent.source_agent_id is not None else None
-        if (
-            source_agent is not None
-            and (
-                source_agent.tenant_id != project.tenant_id
-                or source_agent.scope != "standard"
-                or source_agent.is_deleted
-            )
-        ):
-            source_agent = None
-        options = await load_project_capability_options(
-            db,
-            project.tenant_id,
-            [source_agent] if source_agent is not None else [],
-        )
-        allowed = (
-            options.allows(source_agent.id, "skill", skill.id)
-            if source_agent is not None
-            else options.allows_shared("skill", skill.id)
-        )
-        if not allowed:
-            raise HTTPException(status_code=422, detail="Selected project Skill is unavailable")
-        binding = await bind_library_skill_to_project_agent(
-            db,
-            project,
-            skill_id=skill.id,
-            project_agent_id=agent.id,
-            is_enabled=True,
-            scope={},
-            actor_user_id=current_user.id,
-            actor_display_name=current_user.display_name,
-        )
-        await db.commit()
-        return {
-            "status": "ok",
-            "skill_name": skill.name,
-            "folder_name": skill.folder_name,
-            "files_written": len(skill.files),
-            "files": [file.path for file in skill.files],
-            "project_skill_binding_id": str(binding.id),
-        }
-
-    # Market-managed Skills use one installation path so validation, visibility,
-    # conflict handling, version tracking, and unique Agent counts cannot drift.
-    # The central service also keeps an offline Skill unavailable here.
-    if skill.status != "draft":
-        from app.services.skill_market import install_market_skill
-
-        return await install_market_skill(
-            db,
-            agent=agent,
-            skill_id=skill.id,
-            actor_user_id=current_user.id,
-        )
-
-    if not skill.files:
-        raise HTTPException(status_code=400, detail="Skill has no files")
-
-    storage = get_storage_backend()
-    written = []
-    async with workspace_locks(agent_id, []):
-        for f in skill.files:
-            skill_key = _agent_storage_key(agent_id, f"skills/{skill.folder_name}/{f.path}")
-            await storage.write_text(skill_key, f.content, encoding="utf-8")
-            written.append(f.path)
-
-    return {
-        "status": "ok",
-        "skill_name": skill.name,
-        "folder_name": skill.folder_name,
-        "files_written": len(written),
-        "files": written,
-    }
-
-
-# Separate router for file uploads (binary) since we need UploadFile
-from fastapi import File as FastFile, UploadFile as UploadFileType
-
-
-upload_router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
-DEFAULT_UPLOAD_DIR = "workspace/uploads"
 
 
 @upload_router.post("/upload")
@@ -1574,71 +558,14 @@ async def upload_file_to_workspace(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Upload a binary file to agent workspace."""
-    await check_agent_access(db, current_user, agent_id)
-
-    normalized_path = (path or "").strip().strip("/")
-    if not normalized_path or normalized_path == ".":
-        normalized_path = DEFAULT_UPLOAD_DIR
-
-    # Validate path prefix
-    if normalized_path not in {"workspace", "skills"} and not normalized_path.startswith(("workspace/", "skills/")):
-        raise HTTPException(status_code=400, detail="右侧根目录视图是 agent 根目录；上传文件时请放到 workspace/ 或 skills/ 目录下")
-
-    filename = file.filename or "unnamed"
-    # Sanitize filename
-    filename = filename.replace("/", "_").replace("\\", "_")
-    storage = get_storage_backend()
-    file_key = _agent_storage_key(agent_id, f"{normalized_path}/{filename}")
-
-    content = await file.read()
-    extracted_path = None
-    async with workspace_locks(agent_id, []):
-        await storage.write_bytes(file_key, content, content_type=guess_content_type(filename))
-
-        # Auto-extract text from non-text files in the same workspace mutation.
-        from app.services.text_extractor import needs_extraction, save_extracted_text
-        if needs_extraction(filename):
-            save_path = await ensure_local_path(file_key)
-            txt_file = save_extracted_text(save_path, content, filename)
-            if txt_file:
-                extracted_path = f"{normalized_path}/{txt_file.name}"
-                extracted_key = _agent_storage_key(agent_id, extracted_path)
-                await storage.write_bytes(
-                    extracted_key,
-                    txt_file.read_bytes(),
-                    content_type="text/plain; charset=utf-8",
-                )
-
-    return {
-        "status": "ok",
-        "path": f"{normalized_path}/{filename}",
-        "url": f"/api/agents/{agent_id}/files/download?path={normalized_path}/{filename}",
-        "filename": filename,
-        "size": len(content),
-        "extracted_text_path": extracted_path,
-    }
-
-
-# ─── Enterprise Knowledge Base ─────────────────────────────────
-
-enterprise_kb_router = APIRouter(prefix="/enterprise/knowledge-base", tags=["enterprise"])
-
-
-def _enterprise_kb_dir(tenant_id: str) -> Path:
-    local_root = settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR
-    return Path(local_root) / f"enterprise_info_{tenant_id}" / "knowledge_base"
-
-
-def _enterprise_info_dir(tenant_id: str) -> Path:
-    local_root = settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR
-    return Path(local_root) / f"enterprise_info_{tenant_id}"
-
-
-def _enterprise_storage_key(tenant_id: str, rel_path: str = "") -> str:
-    prefix = f"enterprise_info_{tenant_id}"
-    rel = normalize_storage_key(rel_path)
-    return f"{prefix}/{rel}" if rel else prefix
+    return await files_route_ops.upload_file_to_workspace_impl(
+        MODULE,
+        agent_id=agent_id,
+        file=file,
+        path=path,
+        current_user=current_user,
+        db=db,
+    )
 
 
 @enterprise_kb_router.get("/files")
@@ -1646,27 +573,11 @@ async def list_enterprise_kb_files(
     path: str = "",
     current_user: User = Depends(get_current_user),
 ):
-    """List files in enterprise knowledge base (tenant-scoped)."""
-    if not current_user.tenant_id:
-        return []
-    storage = get_storage_backend()
-    storage_key = _enterprise_storage_key(str(current_user.tenant_id), path)
-    if not await storage.exists(storage_key) or not await storage.is_dir(storage_key):
-        return []
-
-    items = []
-    for entry in await storage.list_dir(storage_key):
-        if entry.name == '.gitkeep':
-            continue
-        rel = str(Path(entry.key).relative_to(f"enterprise_info_{current_user.tenant_id}"))
-        items.append({
-            "name": entry.name,
-            "path": rel,
-            "is_dir": entry.is_dir,
-            "size": entry.size,
-            "url": f"/api/enterprise/knowledge-base/download?path={rel}" if not entry.is_dir else None
-        })
-    return items
+    return await files_enterprise_ops.list_enterprise_kb_files_impl(
+        MODULE,
+        path=path,
+        current_user=current_user,
+    )
 
 
 @enterprise_kb_router.post("/upload")
@@ -1675,44 +586,12 @@ async def upload_enterprise_kb_file(
     sub_path: str = "",
     current_user: User = Depends(get_current_user),
 ):
-    """Upload a file to enterprise knowledge base (tenant-scoped)."""
-    from app.core.security import require_role
-    # Only admin can upload to enterprise KB
-    if current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can upload to enterprise knowledge base")
-    if not current_user.tenant_id:
-        raise HTTPException(status_code=400, detail="No tenant associated")
-
-    filename = file.filename or "unnamed"
-    filename = filename.replace("/", "_").replace("\\", "_")
-    storage = get_storage_backend()
-    rel_path = f"{sub_path}/{filename}" if sub_path else filename
-    storage_key = _enterprise_storage_key(str(current_user.tenant_id), rel_path)
-
-    content = await file.read()
-    await storage.write_bytes(storage_key, content, content_type=guess_content_type(filename))
-
-    # Auto-extract text from non-text files
-    extracted_path = None
-    from app.services.text_extractor import needs_extraction, save_extracted_text
-    if needs_extraction(filename):
-        save_path = await ensure_local_path(storage_key)
-        txt_file = save_extracted_text(save_path, content, filename)
-        if txt_file:
-            extracted_path = f"{sub_path}/{txt_file.name}" if sub_path else txt_file.name
-            await storage.write_bytes(
-                _enterprise_storage_key(str(current_user.tenant_id), extracted_path),
-                txt_file.read_bytes(),
-                content_type="text/plain; charset=utf-8",
-            )
-    return {
-        "status": "ok",
-        "path": rel_path,
-        "url": f"/api/enterprise/knowledge-base/download?path={rel_path}",
-        "filename": filename,
-        "size": len(content),
-        "extracted_text_path": extracted_path,
-    }
+    return await files_enterprise_ops.upload_enterprise_kb_file_impl(
+        MODULE,
+        file=file,
+        sub_path=sub_path,
+        current_user=current_user,
+    )
 
 
 @enterprise_kb_router.get("/content")
@@ -1720,20 +599,11 @@ async def read_enterprise_file(
     path: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Read content of an enterprise knowledge base file (tenant-scoped)."""
-    if not current_user.tenant_id:
-        raise HTTPException(status_code=400, detail="No tenant associated")
-    storage = get_storage_backend()
-    storage_key = _enterprise_storage_key(str(current_user.tenant_id), path)
-    if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    try:
-        content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
-        return {"path": path, "content": content}
-    except Exception:
-        stat = await storage.stat(storage_key)
-        return {"path": path, "content": f"[二进制文件: {Path(path).name}, {stat.size} bytes]"}
+    return await files_enterprise_ops.read_enterprise_file_impl(
+        MODULE,
+        path=path,
+        current_user=current_user,
+    )
 
 
 @enterprise_kb_router.put("/content")
@@ -1742,15 +612,12 @@ async def write_enterprise_file(
     data: FileWrite,
     current_user: User = Depends(get_current_user),
 ):
-    """Write content to an enterprise file (tenant-scoped)."""
-    if current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can edit enterprise knowledge base")
-    if not current_user.tenant_id:
-        raise HTTPException(status_code=400, detail="No tenant associated")
-
-    storage = get_storage_backend()
-    await storage.write_text(_enterprise_storage_key(str(current_user.tenant_id), path), data.content, encoding="utf-8")
-    return {"status": "ok", "path": path}
+    return await files_enterprise_ops.write_enterprise_file_impl(
+        MODULE,
+        path=path,
+        data=data,
+        current_user=current_user,
+    )
 
 
 @enterprise_kb_router.delete("/content")
@@ -1758,32 +625,11 @@ async def delete_enterprise_file(
     path: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Delete an enterprise knowledge base file (tenant-scoped)."""
-    if current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
-    if not current_user.tenant_id:
-        raise HTTPException(status_code=400, detail="No tenant associated")
-
-    storage = get_storage_backend()
-    storage_key = _enterprise_storage_key(str(current_user.tenant_id), path)
-    storage_exists = await storage.exists(storage_key)
-    storage_is_dir = await storage.is_dir(storage_key)
-    if not storage_exists and not storage_is_dir:
-        raise HTTPException(status_code=404, detail="File not found")
-    if storage_is_dir:
-        await storage.delete_tree(storage_key)
-    else:
-        await storage.delete(storage_key)
-    return {"status": "ok", "path": path}
-
-
-# ─── Agent-level ClawHub / URL Skill Import ─────────────────
-
-class ClawhubImportBody(BaseModel):
-    slug: str
-
-class UrlImportBody(BaseModel):
-    url: str
+    return await files_enterprise_ops.delete_enterprise_file_impl(
+        MODULE,
+        path=path,
+        current_user=current_user,
+    )
 
 
 @router.post("/import-from-clawhub")
@@ -1794,60 +640,14 @@ async def agent_import_from_clawhub(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Import a skill from ClawHub directly into this agent's skills/ workspace."""
-    await check_agent_access(db, current_user, agent_id)
-
-    from app.api.skills import (
-        _fetch_clawhub_skill_archive, _fetch_clawhub_skill_meta, _get_clawhub_key,
+    return await files_enterprise_ops.agent_import_from_clawhub_impl(
+        MODULE,
+        agent_id=agent_id,
+        body=body,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
     )
-
-    slug = body.slug
-    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-    api_key = await _get_clawhub_key(tenant_id)
-
-    # 1. Fetch metadata from ClawHub
-    try:
-        meta, meta_base = await _fetch_clawhub_skill_meta(slug, api_key=api_key)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"Failed to connect to ClawHub: {e}")
-
-    skill_info = meta.get("skill", {})
-
-    # 2. Fetch files from the ClawHub archive
-    files, _ = await _fetch_clawhub_skill_archive(slug, api_key=api_key, preferred_base=meta_base)
-
-    # 3. Write to agent workspace: skills/<slug>/
-    base = _agent_base_dir(agent_id)
-    folder_name = slug
-    skill_dir = base / "skills" / folder_name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    written = []
-    for f in files:
-        file_path = (skill_dir / f["path"]).resolve()
-        if not str(file_path).startswith(str(base.resolve())):
-            continue
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(f["content"], encoding="utf-8")
-        written.append(f["path"])
-
-    await _record_project_skill_change(
-        db,
-        workspace_agent,
-        current_user,
-        f"skills/{folder_name}/SKILL.md",
-    )
-    await db.commit()
-
-    return {
-        "status": "ok",
-        "skill_name": skill_info.get("displayName", slug),
-        "folder_name": folder_name,
-        "files_written": len(written),
-        "files": written,
-    }
 
 
 @router.post("/import-from-url")
@@ -1858,50 +658,11 @@ async def agent_import_from_url(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
-    """Import a skill from a GitHub URL directly into this agent's skills/ workspace."""
-    await check_agent_access(db, current_user, agent_id)
-
-    from app.api.skills import _parse_github_url, _fetch_github_directory, _get_github_token
-
-    parsed = _parse_github_url(body.url)
-    if not parsed:
-        raise HTTPException(400, "Invalid GitHub URL")
-
-    owner, repo, branch, path = parsed["owner"], parsed["repo"], parsed["branch"], parsed["path"]
-    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-    token = await _get_github_token(tenant_id)
-    files = await _fetch_github_directory(owner, repo, path, branch, token)
-    if not files:
-        raise HTTPException(404, "No files found")
-
-    # Derive folder name
-    folder_name = path.rstrip("/").split("/")[-1] if path else repo
-
-    # Write to agent workspace
-    base = _agent_base_dir(agent_id)
-    skill_dir = base / "skills" / folder_name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    written = []
-    for f in files:
-        file_path = (skill_dir / f["path"]).resolve()
-        if not str(file_path).startswith(str(base.resolve())):
-            continue
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(f["content"], encoding="utf-8")
-        written.append(f["path"])
-
-    await _record_project_skill_change(
-        db,
-        workspace_agent,
-        current_user,
-        f"skills/{folder_name}/SKILL.md",
+    return await files_enterprise_ops.agent_import_from_url_impl(
+        MODULE,
+        agent_id=agent_id,
+        body=body,
+        current_user=current_user,
+        db=db,
+        workspace_agent=workspace_agent,
     )
-    await db.commit()
-
-    return {
-        "status": "ok",
-        "folder_name": folder_name,
-        "files_written": len(written),
-        "files": written,
-    }
