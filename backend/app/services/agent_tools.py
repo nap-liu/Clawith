@@ -204,6 +204,7 @@ from app.services.agent_tools_file_support import (
     WORKSPACE_ROOT,
     _ResolvedStorageSource,
     _agent_workspace_root,
+    _allowed_root_for_tool_path,
     _canonicalize_execute_code_upload_paths,
     _collapse_filename_for_match,
     _display_size,
