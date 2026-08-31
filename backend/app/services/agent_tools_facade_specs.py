@@ -381,3 +381,32 @@ OUTBOUND_STATE_FACADE_SPECS: tuple[FacadeSpec, ...] = (
         sync_exports=False,
     ),
 )
+
+
+A2A_DELIVERY_FACADE_SPECS: tuple[FacadeSpec, ...] = (
+    _spec(
+        "agent_tools_a2a_delivery",
+        """
+        _send_file_to_agent _resolve_a2a_target _create_on_message_trigger
+        _arm_a2a_delegate_callback _append_focus_item _wake_agent_async
+        """,
+        """
+        async_session logger _build_outbound_operation_key
+        current_agent_runtime_workspace ensure_focus_item get_storage_backend
+        project_agent_runtime_workspace standard_agent_runtime_workspace
+        """,
+    ),
+)
+
+
+A2A_MESSAGING_FACADE_SPECS: tuple[FacadeSpec, ...] = (
+    _spec(
+        "agent_tools_a2a_messaging",
+        "_send_message_to_agent",
+        """
+        async_session logger A2A_DELIVERY_GUIDANCE
+        _arm_a2a_delegate_callback _build_outbound_operation_key
+        _lock_outbound_operation _wake_agent_async
+        """,
+    ),
+)

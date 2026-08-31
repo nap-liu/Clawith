@@ -142,13 +142,10 @@ from app.services.agent_tools_catalog import AGENT_TOOLS
 from app.services import agent_tools_document_tools as _agent_tools_document_tools_module
 from app.services import agent_tools_channel_file_receipts as _agent_tools_file_receipts_module
 from app.services import agent_tools_outbound_core as _agent_tools_outbound_core_module
-from app.services.agent_tools_facade import (
-    export_module_symbols,
-    install_facade_specs,
-    prepare_exported_callables,
-    register_sync_targets,
-)
+from app.services.agent_tools_facade import install_facade_specs
 from app.services.agent_tools_facade_specs import (
+    A2A_DELIVERY_FACADE_SPECS,
+    A2A_MESSAGING_FACADE_SPECS,
     FEISHU_BITABLE_FACADE_SPECS,
     FEISHU_COLLAB_FACADE_SPECS,
     FEISHU_DOCS_FACADE_SPECS,
@@ -903,63 +900,8 @@ _GROUP_SESSION_DENIAL = "❌ 无法投递：该群会话不存在，或不属于
 
 
 
-from app.services import agent_tools_a2a_delivery as _agent_tools_a2a_delivery_module
-
-_A2A_DELIVERY_EXPORT_NAMES = (
-    "_send_file_to_agent",
-    "_resolve_a2a_target",
-    "_create_on_message_trigger",
-    "_arm_a2a_delegate_callback",
-    "_append_focus_item",
-    "_wake_agent_async",
-)
-_A2A_DELIVERY_SYNC_NAMES = (
-    "async_session",
-    "logger",
-    "_build_outbound_operation_key",
-    "current_agent_runtime_workspace",
-    "ensure_focus_item",
-    "get_storage_backend",
-    "project_agent_runtime_workspace",
-    "standard_agent_runtime_workspace",
-    *_A2A_DELIVERY_EXPORT_NAMES,
-)
-export_module_symbols(
-    __name__,
-    (_agent_tools_a2a_delivery_module,),
-    _A2A_DELIVERY_EXPORT_NAMES,
-)
-prepare_exported_callables(__name__, _A2A_DELIVERY_EXPORT_NAMES)
-register_sync_targets(
-    __name__,
-    (_agent_tools_a2a_delivery_module,),
-    _A2A_DELIVERY_SYNC_NAMES,
-)
-
-from app.services import agent_tools_a2a_messaging as _agent_tools_a2a_messaging_module
-
-_A2A_MESSAGING_EXPORT_NAMES = ("_send_message_to_agent",)
-_A2A_MESSAGING_SYNC_NAMES = (
-    "async_session",
-    "logger",
-    "A2A_DELIVERY_GUIDANCE",
-    "_arm_a2a_delegate_callback",
-    "_build_outbound_operation_key",
-    "_lock_outbound_operation",
-    "_wake_agent_async",
-    *_A2A_MESSAGING_EXPORT_NAMES,
-)
-export_module_symbols(
-    __name__,
-    (_agent_tools_a2a_messaging_module,),
-    _A2A_MESSAGING_EXPORT_NAMES,
-)
-prepare_exported_callables(__name__, _A2A_MESSAGING_EXPORT_NAMES)
-register_sync_targets(
-    __name__,
-    (_agent_tools_a2a_messaging_module,),
-    _A2A_MESSAGING_SYNC_NAMES,
-)
+install_facade_specs(__name__, A2A_DELIVERY_FACADE_SPECS)
+install_facade_specs(__name__, A2A_MESSAGING_FACADE_SPECS)
 
 
 from app.services import agent_tools_temp_workspace as _agent_tools_temp_workspace_module
