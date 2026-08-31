@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from importlib import import_module
 from types import ModuleType
 
 _FACADE_STATE_KEY = "_agent_tools_facade_state"
@@ -77,3 +78,18 @@ def register_sync_targets(
                 target.__dict__[name] = module.__dict__[name]
     if module.__class__ is not _AgentToolsFacadeModule:
         module.__class__ = _AgentToolsFacadeModule
+
+
+FacadeSpec = tuple[str, tuple[str, ...], tuple[str, ...], bool]
+
+
+def install_facade_specs(module_name: str, specs: tuple[FacadeSpec, ...]) -> None:
+    """Install ordered facade specifications after root dependencies exist."""
+    for module_path, export_names, sync_names, sync_exports in specs:
+        source = import_module(module_path)
+        if export_names:
+            export_module_symbols(module_name, (source,), export_names)
+            prepare_exported_callables(module_name, export_names)
+        target_names = (*sync_names, *export_names) if sync_exports else sync_names
+        if target_names:
+            register_sync_targets(module_name, (source,), target_names)
