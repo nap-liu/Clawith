@@ -2,7 +2,10 @@
 
 from app.services.project_service_shared import *  # noqa: F403
 from app.services.project_service_serialization import *  # noqa: F403
-from app.services.project_service_serialization import _resolve_project_a2a_session_info
+from app.services.project_service_serialization import (
+    _project_a2a_receipt,
+    _resolve_project_a2a_session_info,
+)
 
 def apply_run_status(run: ProjectRun, status: str) -> None:
     # A ProjectRun is an append-only execution fact. Retrying creates another
