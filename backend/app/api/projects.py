@@ -37,6 +37,7 @@ from app.models.project import (
     ProjectTemplate,
     ProjectWorkItem,
 )
+from app.models.subagent_run import SubagentRun
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.project import (
@@ -154,6 +155,7 @@ from app.services.project_service import (
     add_event,
     add_member,
     apply_run_status,
+    can_manage_project_execution_user,
     create_project,
     deactivate_project_member,
     deliver_project_a2a,
@@ -1756,27 +1758,41 @@ async def patch_project(
         raise HTTPException(status_code=422, detail="A shared project requires at least one shared user")
 
     execution_change = "execution_user_id" in data.model_fields_set
+    if execution_change and not can_manage_project_execution_user(current_user, project):
+        raise HTTPException(
+            status_code=403,
+            detail="Only platform or company administrators can change the project execution user",
+        )
+    previous_execution_user_id = project_execution_user_id(project)
+    automatic_execution_fallback = False
     if effective_visibility == "private":
+        automatic_execution_fallback = previous_execution_user_id != project.owner_user_id
         project.execution_user_id = None
     else:
-        selected_execution_user_id = requested_execution_user_id if execution_change else project.execution_user_id
-        explicit_selection_required = project.visibility != "shared" or shared_ids is not None
-        if execution_change and selected_execution_user_id is None:
-            raise HTTPException(
-                status_code=422,
-                detail="A shared project requires an execution user",
+        if execution_change:
+            selected_execution_user_id = requested_execution_user_id
+            # NULL and the owner UUID are the same canonical owner fallback.
+            project.execution_user_id = (
+                None if selected_execution_user_id in {None, project.owner_user_id} else selected_execution_user_id
             )
-        if selected_execution_user_id is None and explicit_selection_required:
-            raise HTTPException(
-                status_code=422,
-                detail="Select an active shared project user for project execution",
-            )
-        if selected_execution_user_id is not None and selected_execution_user_id not in effective_shared_ids:
-            raise HTTPException(
-                status_code=422,
-                detail="Project execution user must remain in shared_with_user_ids",
-            )
-        project.execution_user_id = selected_execution_user_id
+        elif project.visibility != "shared":
+            # A newly shared project always starts under its owner unless an
+            # administrator atomically chooses another active shared user.
+            project.execution_user_id = None
+        selected_execution_user_id = project_execution_user_id(project)
+        valid_execution_user_ids = {project.owner_user_id, *effective_shared_ids}
+        if selected_execution_user_id not in valid_execution_user_ids:
+            if execution_change:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Project execution user must be the owner or an active shared project user",
+                )
+            if project.execution_user_id is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The current project execution user must be changed before removing their access",
+                )
+            selected_execution_user_id = project.owner_user_id
     for key, value in updates.items():
         setattr(project, key, value)
     if shared_ids is not None:
@@ -1787,6 +1803,20 @@ async def patch_project(
         raise HTTPException(status_code=422, detail="Set shared_with_user_ids when sharing a project")
     if project.execution_user_id is not None:
         await resolve_project_execution_user(db, project, project.execution_user_id)
+    current_execution_user_id = project_execution_user_id(project)
+    if current_execution_user_id != previous_execution_user_id:
+        add_event(
+            db,
+            project,
+            "project.execution_user.changed",
+            "Changed the project execution user",
+            actor_user_id=current_user.id,
+            metadata={
+                "previous_execution_user_id": str(previous_execution_user_id),
+                "execution_user_id": str(current_execution_user_id),
+                "automatic_fallback": automatic_execution_fallback,
+            },
+        )
     if runtime_event_type is not None:
         add_event(
             db,
@@ -1845,7 +1875,12 @@ async def delete_project(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_owner(db, current_user, project_id)
+    project = await require_owner(db, current_user, project_id, lock=True)
+    if project.status in {"initializing", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Pause the project before deleting it",
+        )
     cleanup_target = SimpleNamespace(id=project.id, tenant_id=project.tenant_id)
 
     # Project-scoped Agents and conversations are owned by the project and are
@@ -1864,18 +1899,54 @@ async def delete_project(
             )
         ).scalars()
     )
-    project_session_ids = [
-        str(session_id)
-        for session_id in (
+    session_scope = [ChatSession.project_id == project.id]
+    if project_agent_ids:
+        session_scope.extend(
             (
-                await db.execute(
-                    select(ChatSession.id).where(ChatSession.project_id == project.id)
-                )
+                ChatSession.agent_id.in_(project_agent_ids),
+                ChatSession.peer_agent_id.in_(project_agent_ids),
             )
-            .scalars()
-            .all()
         )
-    ]
+    related_session_ids = list(
+        (
+            await db.execute(select(ChatSession.id).where(or_(*session_scope)))
+        ).scalars()
+    )
+    active_project_run_id = await db.scalar(
+        select(ProjectRun.id)
+        .where(
+            ProjectRun.project_id == project.id,
+            ProjectRun.status.not_in({"succeeded", "failed", "cancelled"}),
+        )
+        .limit(1)
+    )
+    subagent_scope = [SubagentRun.project_id == project.id]
+    if related_session_ids:
+        subagent_scope.extend(
+            (
+                SubagentRun.id.in_(related_session_ids),
+                SubagentRun.parent_session_id.in_(related_session_ids),
+            )
+        )
+    active_subagent_run_id = await db.scalar(
+        select(SubagentRun.id)
+        .where(
+            or_(*subagent_scope),
+            SubagentRun.status.not_in({"completed", "failed", "cancelled"}),
+        )
+        .limit(1)
+    )
+    if active_project_run_id is not None or active_subagent_run_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="The project still has active work; wait for it to finish or cancel it before deleting",
+        )
+
+    # Child runs must be removed before their parent ChatSessions because the
+    # durable parent edge intentionally uses RESTRICT.
+    await db.execute(delete(SubagentRun).where(or_(*subagent_scope)))
+
+    project_session_ids = [str(session_id) for session_id in related_session_ids]
     message_scope = []
     if project_session_ids:
         message_scope.append(ChatMessage.conversation_id.in_(project_session_ids))
@@ -1888,6 +1959,8 @@ async def delete_project(
         )
     if message_scope:
         await db.execute(delete(ChatMessage).where(or_(*message_scope)))
+    if related_session_ids:
+        await db.execute(delete(ChatSession).where(ChatSession.id.in_(related_session_ids)))
 
     # Project digital employees are deleted by the project FK cascade, but a
     # small set of older Agent-owned tables intentionally has no cascade. Clear
@@ -1901,12 +1974,18 @@ async def delete_project(
             "approval_requests",
             "channel_configs",
             "dingtalk_channel_provisioning_sessions",
-            "gateway_messages",
             "published_pages",
             "notifications",
             "agent_permissions",
         )
         for agent_id in project_agent_ids:
+            await db.execute(
+                text(
+                    "DELETE FROM gateway_messages "
+                    "WHERE agent_id = :agent_id OR sender_agent_id = :agent_id"
+                ),
+                {"agent_id": agent_id},
+            )
             await db.execute(
                 text(
                     "DELETE FROM task_logs WHERE task_id IN "
@@ -2002,21 +2081,55 @@ async def delete_access_grant(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_owner(db, current_user, project_id)
-    deleted = await db.execute(
+    project = await require_owner(db, current_user, project_id, lock=True)
+    grant = (
+        await db.execute(
+            select(ProjectAccessGrant).where(
+                ProjectAccessGrant.id == grant_id,
+                ProjectAccessGrant.project_id == project.id,
+                ProjectAccessGrant.tenant_id == project.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if grant is None:
+        raise HTTPException(status_code=404, detail="Access grant not found")
+    previous_execution_user_id = project_execution_user_id(project)
+    remaining = (
+        await db.execute(
+            select(func.count(ProjectAccessGrant.id)).where(
+                ProjectAccessGrant.project_id == project.id,
+                ProjectAccessGrant.id != grant.id,
+            )
+        )
+    ).scalar_one()
+    if grant.user_id == previous_execution_user_id and remaining:
+        raise HTTPException(
+            status_code=409,
+            detail="The current project execution user must be changed before removing their access",
+        )
+    await db.execute(
         delete(ProjectAccessGrant).where(
             ProjectAccessGrant.id == grant_id,
             ProjectAccessGrant.project_id == project.id,
             ProjectAccessGrant.tenant_id == project.tenant_id,
         )
     )
-    if not deleted.rowcount:
-        raise HTTPException(status_code=404, detail="Access grant not found")
-    remaining = (
-        await db.execute(select(func.count(ProjectAccessGrant.id)).where(ProjectAccessGrant.project_id == project.id))
-    ).scalar_one()
     if remaining == 0:
         project.visibility = "private"
+        project.execution_user_id = None
+        if previous_execution_user_id != project.owner_user_id:
+            add_event(
+                db,
+                project,
+                "project.execution_user.changed",
+                "Changed the project execution user",
+                actor_user_id=current_user.id,
+                metadata={
+                    "previous_execution_user_id": str(previous_execution_user_id),
+                    "execution_user_id": str(project.owner_user_id),
+                    "automatic_fallback": True,
+                },
+            )
     add_event(db, project, "project.unshared", "Removed a project access grant", actor_user_id=current_user.id)
     return {"ok": True}
 

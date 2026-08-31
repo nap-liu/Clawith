@@ -513,6 +513,7 @@ export const agentApi = {
     status?: string;
     page?: number;
     pageSize?: number;
+    signal?: AbortSignal;
   } = {}) => {
     const query = new URLSearchParams();
     if (params.tenantId) query.set("tenant_id", params.tenantId);
@@ -520,7 +521,115 @@ export const agentApi = {
     if (params.status) query.set("status", params.status);
     query.set("page", String(params.page || 1));
     query.set("page_size", String(params.pageSize || 24));
-    return request<ExploreAgentPage>(`/agents/explore?${query.toString()}`);
+    return request<ExploreAgentPage>(`/agents/explore?${query.toString()}`, {
+      signal: params.signal,
+    });
+  },
+
+  async exploreAll(params: {
+    tenantId: string;
+    signal?: AbortSignal;
+  }): Promise<ExploreAgentPage & { incomplete: boolean; load_error?: string }> {
+    const pageSize = 500;
+    const maxConsistencyAttempts = 2;
+
+    consistencyAttempts: for (
+      let consistencyAttempt = 1;
+      consistencyAttempt <= maxConsistencyAttempts;
+      consistencyAttempt += 1
+    ) {
+      const items: ExploreAgentPage["items"] = [];
+      const seen = new Set<string>();
+      let page = 1;
+      let expectedTotal: number | null = null;
+      let counts: ExploreAgentPage["counts"] = {
+        all: 0,
+        running: 0,
+        idle: 0,
+        stopped: 0,
+      };
+
+      for (;;) {
+        let response: ExploreAgentPage;
+        try {
+          response = await agentApi.explore({
+            tenantId: params.tenantId,
+            page,
+            pageSize,
+            signal: params.signal,
+          });
+        } catch (error) {
+          if (params.signal?.aborted || items.length === 0) throw error;
+          return {
+            items,
+            total: expectedTotal ?? items.length,
+            page,
+            page_size: pageSize,
+            has_more: true,
+            counts,
+            incomplete: true,
+            load_error: error instanceof Error ? error.message : String(error),
+          };
+        }
+
+        expectedTotal ??= response.total;
+        counts = response.counts;
+        let added = 0;
+        for (const item of response.items) {
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          items.push(item);
+          added += 1;
+        }
+
+        if (response.total !== expectedTotal) {
+          if (consistencyAttempt < maxConsistencyAttempts) {
+            continue consistencyAttempts;
+          }
+          return {
+            ...response,
+            items,
+            page_size: pageSize,
+            incomplete: true,
+            load_error: "Agent directory total changed while loading",
+          };
+        }
+
+        if (!response.has_more) {
+          if (seen.size !== expectedTotal) {
+            if (consistencyAttempt < maxConsistencyAttempts) {
+              continue consistencyAttempts;
+            }
+            return {
+              ...response,
+              items,
+              page_size: pageSize,
+              incomplete: true,
+              load_error: "Agent directory unique item count did not match total",
+            };
+          }
+          return {
+            ...response,
+            items,
+            page_size: pageSize,
+            incomplete: false,
+          };
+        }
+
+        if (added === 0 || page >= 10_000) {
+          return {
+            ...response,
+            items,
+            page_size: pageSize,
+            incomplete: true,
+            load_error: "Agent directory pagination did not make progress",
+          };
+        }
+        page += 1;
+      }
+    }
+
+    throw new Error("Agent directory consistency retry loop exhausted");
   },
 
   get: (id: string) => request<Agent>(`/agents/${id}`),

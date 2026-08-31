@@ -436,8 +436,9 @@ select:focus {
 
 .sidebar-scrollable {
   flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   min-height: 0;
   position: relative;
   z-index: 0;
@@ -445,20 +446,34 @@ select:focus {
 }
 
 /* Custom scrollbar for sidebar */
-.sidebar-scrollable::-webkit-scrollbar {
+.sidebar-agent-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-agent-sticky {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+  background: var(--bg-secondary);
+}
+
+.sidebar-agent-list::-webkit-scrollbar {
   width: 4px;
 }
 
-.sidebar-scrollable::-webkit-scrollbar-track {
+.sidebar-agent-list::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.sidebar-scrollable::-webkit-scrollbar-thumb {
+.sidebar-agent-list::-webkit-scrollbar-thumb {
   background: transparent;
   border-radius: 4px;
 }
 
-.sidebar-scrollable:hover::-webkit-scrollbar-thumb {
+.sidebar-agent-list:hover::-webkit-scrollbar-thumb {
   background: var(--border-strong);
 }
 

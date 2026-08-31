@@ -290,7 +290,7 @@ class SubprocessBackend(BaseSandboxBackend):
         controller = Path("/sys/fs/cgroup/pids")
         if not (controller / "pids.max").exists():
             return None
-        path = controller / f"clawith-sandbox-{os.getpid()}-{uuid.uuid4().hex}"
+        path = controller / f"agent-sandbox-{os.getpid()}-{uuid.uuid4().hex}"
         try:
             path.mkdir(mode=0o700)
             (path / "pids.max").write_text(str(SANDBOX_PROCESS_LIMIT), encoding="utf-8")

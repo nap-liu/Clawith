@@ -165,6 +165,16 @@ function normalizeProject(value: unknown): ProjectSummary {
     owner_id: string(source.owner_id || source.owner_user_id) || null,
     owner_name: string(source.owner_name) || null,
     access_role: accessRole,
+    is_project_owner: boolean(source.is_project_owner),
+    can_delete:
+      typeof source.can_delete === "boolean"
+        ? source.can_delete
+        : accessRole === "owner",
+    can_manage_sharing:
+      typeof source.can_manage_sharing === "boolean"
+        ? source.can_manage_sharing
+        : accessRole === "owner",
+    can_manage_execution_user: boolean(source.can_manage_execution_user),
     shared_with_user_ids: (array(source.shared_with_user_ids).length
       ? array(source.shared_with_user_ids)
       : sharedWith.map((item) => item.user_id || item.id)

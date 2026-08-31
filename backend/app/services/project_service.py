@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from loguru import logger
-from sqlalchemy import and_, delete, exists, func, or_, select, true
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
@@ -171,11 +171,29 @@ def _is_company_project_admin(user: User) -> bool:
     return user.role == "org_admin" and user.tenant_id is not None
 
 
+def can_manage_project_execution_user(user: User, project: Project) -> bool:
+    """Return whether the current tenant administrator may choose the runtime principal."""
+
+    return user.tenant_id == project.tenant_id and (
+        _is_platform_project_admin(user) or _is_company_project_admin(user)
+    )
+
+
+def can_manage_project_as_owner(user: User, project: Project) -> bool:
+    """Return the compatibility owner-management capability for one project."""
+
+    if user.tenant_id != project.tenant_id:
+        return False
+    return (
+        user.id == project.owner_user_id
+        or _is_platform_project_admin(user)
+        or _is_company_project_admin(user)
+    )
+
+
 def accessible_projects_clause(user: User, *, edit: bool = False):
-    if _is_platform_project_admin(user):
-        return true()
     tenant_id = _tenant_id(user)
-    if _is_company_project_admin(user):
+    if _is_platform_project_admin(user) or _is_company_project_admin(user):
         return Project.tenant_id == tenant_id
     grant = exists().where(
         ProjectAccessGrant.project_id == Project.id,
@@ -232,14 +250,12 @@ async def require_owner(
     *,
     lock: bool = False,
 ) -> Project:
-    statement = select(Project).where(Project.id == project_id)
-    if _is_platform_project_admin(user):
-        pass
-    elif _is_company_project_admin(user):
-        statement = statement.where(Project.tenant_id == _tenant_id(user))
-    else:
+    statement = select(Project).where(
+        Project.id == project_id,
+        Project.tenant_id == _tenant_id(user),
+    )
+    if not (_is_platform_project_admin(user) or _is_company_project_admin(user)):
         statement = statement.where(
-            Project.tenant_id == _tenant_id(user),
             Project.owner_user_id == user.id,
         )
     if lock:
@@ -2283,14 +2299,11 @@ async def project_summary(
             select(User.display_name).where(User.id == execution_user_id, User.tenant_id == project.tenant_id)
         )
     ).scalar_one_or_none()
-    access_role = "owner" if actor_user_id == project.owner_user_id else None
-    if access_role is None and actor_user_id is not None:
-        actor = await db.get(User, actor_user_id)
-        if actor is not None and (
-            _is_platform_project_admin(actor)
-            or (_is_company_project_admin(actor) and actor.tenant_id == project.tenant_id)
-        ):
-            access_role = "owner"
+    actor = await db.get(User, actor_user_id) if actor_user_id is not None else None
+    is_project_owner = actor_user_id == project.owner_user_id
+    can_manage_as_owner = actor is not None and can_manage_project_as_owner(actor, project)
+    can_manage_execution_user = actor is not None and can_manage_project_execution_user(actor, project)
+    access_role = "owner" if can_manage_as_owner else None
     if access_role is None and actor_user_id is not None:
         access_role = next(
             (grant.role for grant, _display_name in grants if grant.user_id == actor_user_id),
@@ -2333,6 +2346,10 @@ async def project_summary(
         "next_action": project.settings.get("next_action"),
         "owner_name": owner_name,
         "access_role": access_role,
+        "is_project_owner": is_project_owner,
+        "can_delete": can_manage_as_owner,
+        "can_manage_sharing": can_manage_as_owner,
+        "can_manage_execution_user": can_manage_execution_user,
         "shared_with_user_ids": [str(grant.user_id) for grant, _ in grants],
         "shared_with_names": [display_name for _, display_name in grants],
         "shared_with": [

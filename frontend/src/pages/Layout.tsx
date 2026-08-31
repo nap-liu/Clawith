@@ -1100,16 +1100,14 @@ export default function Layout() {
     }
   }, [currentTenant]);
 
-  const { data: agentDirectory } = useQuery({
+  const agentDirectoryQuery = useQuery({
     queryKey: ["agents", "directory", currentTenant],
-    queryFn: () =>
-      agentApi.explore({
-        tenantId: currentTenant,
-        pageSize: 24,
-      }),
+    queryFn: ({ signal }) =>
+      agentApi.exploreAll({ tenantId: currentTenant, signal }),
     enabled: Boolean(currentTenant),
     refetchInterval: 30000,
   });
+  const agentDirectory = agentDirectoryQuery.data;
   const agents = agentDirectory?.items || [];
 
   const openAgentDrawer = useCallback(() => {
@@ -1506,13 +1504,32 @@ export default function Layout() {
   const agentListContent = (drawer = false) => (
     <>
       {sortedAgents.map((agent) => renderAgent(agent, { drawer }))}
+      {agentDirectoryQuery.isError && (
+        <div className="sidebar-agent-empty" role="alert">
+          {t("sidebar.agentLoadFailed")} {" "}
+          <button type="button" onClick={() => void agentDirectoryQuery.refetch()}>
+            {t("sidebar.retry")}
+          </button>
+        </div>
+      )}
+      {agentDirectory?.incomplete && (
+        <div className="sidebar-agent-empty" role="status">
+          {t("sidebar.agentLoadIncomplete")} {" "}
+          <button type="button" onClick={() => void agentDirectoryQuery.refetch()}>
+            {t("sidebar.retry")}
+          </button>
+        </div>
+      )}
       {agents.length === 0 && (
         <div className="sidebar-section">
           <div className="sidebar-section-title">{t("nav.myAgents")}</div>
         </div>
       )}
       {agents.length > 0 && sortedAgents.length === 0 && q && (
-        <div className="sidebar-agent-empty">{t("sidebar.noAgentMatches")}</div>
+        <div className="sidebar-agent-empty">
+          {t("sidebar.noAgentMatches")}
+          {agentDirectory?.incomplete && ` · ${t("sidebar.resultsIncomplete")}`}
+        </div>
       )}
     </>
   );
@@ -1704,20 +1721,22 @@ export default function Layout() {
           onMouseLeave={scheduleCloseAgentDrawer}
         >
           {!sidebarCollapsed && (
-            <div className="sidebar-agent-header">
-              <span>{t("sidebar.agents")}</span>
-              <button
-                type="button"
-                data-tour-target="hire-agent"
-                onClick={() => setShowTalentMarket(true)}
-                title={t("nav.hire", t("nav.newAgent"))}
-              >
-                <IconPlus size={15} stroke={1.7} />
-              </button>
+            <div className="sidebar-agent-sticky">
+              <div className="sidebar-agent-header">
+                <span>{t("sidebar.agents")}</span>
+                <button
+                  type="button"
+                  data-tour-target="hire-agent"
+                  onClick={() => setShowTalentMarket(true)}
+                  title={t("nav.hire", t("nav.newAgent"))}
+                >
+                  <IconPlus size={15} stroke={1.7} />
+                </button>
+              </div>
+              {agentSearchBox(true)}
             </div>
           )}
-          {!sidebarCollapsed && agentSearchBox(true)}
-          {agentListContent()}
+          <div className="sidebar-agent-list">{agentListContent()}</div>
         </div>
 
         <div className="sidebar-bottom">

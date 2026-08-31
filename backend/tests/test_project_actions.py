@@ -32,16 +32,23 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models.agent  # noqa: F401
+import app.models.activity_log  # noqa: F401
 import app.models.audit  # noqa: F401
 import app.models.chat_compaction  # noqa: F401
 import app.models.chat_session  # noqa: F401
+import app.models.channel_config  # noqa: F401
+import app.models.dingtalk_provisioning  # noqa: F401
+import app.models.gateway_message  # noqa: F401
 import app.models.llm  # noqa: F401
 import app.models.mcp_server  # noqa: F401
 import app.models.org  # noqa: F401
 import app.models.participant  # noqa: F401
+import app.models.notification  # noqa: F401
 import app.models.project  # noqa: F401
+import app.models.published_page  # noqa: F401
 import app.models.skill  # noqa: F401
 import app.models.subagent_run  # noqa: F401
+import app.models.task  # noqa: F401
 import app.models.tenant  # noqa: F401
 import app.models.tool  # noqa: F401
 import app.models.user  # noqa: F401
@@ -53,6 +60,7 @@ from app.database import Base, get_db
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.gateway_message import GatewayMessage
 from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.org import OrgDepartment, OrgMember
@@ -62,10 +70,12 @@ from app.models.project import (
     ProjectCapabilityBinding,
     ProjectEvent,
     ProjectMemberSnapshot,
+    ProjectRun,
     ProjectTemplate,
     ProjectWorkItem,
 )
 from app.models.skill import Skill, SkillFile, SkillInstall
+from app.models.subagent_run import SubagentRun
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
@@ -83,6 +93,16 @@ TABLES = [
     "agent_templates",
     "agents",
     "agent_permissions",
+    "agent_activity_logs",
+    "audit_logs",
+    "approval_requests",
+    "channel_configs",
+    "dingtalk_channel_provisioning_sessions",
+    "gateway_messages",
+    "published_pages",
+    "notifications",
+    "tasks",
+    "task_logs",
     "mcp_servers",
     "mcp_server_overrides",
     "tools",
@@ -118,6 +138,7 @@ class ProjectApiEnv:
     tenant_id: uuid.UUID
     owner_id: uuid.UUID
     viewer_id: uuid.UUID
+    org_admin_id: uuid.UUID
     source_leader_id: uuid.UUID
     source_worker_id: uuid.UUID
     source_reviewer_id: uuid.UUID
@@ -126,6 +147,7 @@ class ProjectApiEnv:
     reviewer_id: uuid.UUID
     owner: User
     viewer: User
+    org_admin: User
     leader: Agent
     worker: Agent
     reviewer: Agent
@@ -219,6 +241,8 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
     tenant.default_model_id = tenant_model.id
     owner = await _user(session, tenant, "Owner")
     viewer = await _user(session, tenant, "Viewer")
+    org_admin = await _user(session, tenant, "Org Admin")
+    org_admin.role = "org_admin"
     leader = await _agent(session, tenant, owner, "Leader", "Drive outcomes")
     worker = await _agent(session, tenant, owner, "Worker", "Build deliverables")
     reviewer = await _agent(session, tenant, owner, "Reviewer", "Review evidence")
@@ -240,6 +264,7 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
     tenant_id = tenant.id
     owner_id = owner.id
     viewer_id = viewer.id
+    org_admin_id = org_admin.id
     leader_id = leader.id
     worker_id = worker.id
     reviewer_id = reviewer.id
@@ -294,6 +319,7 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
             tenant_id=tenant_id,
             owner_id=owner_id,
             viewer_id=viewer_id,
+            org_admin_id=org_admin_id,
             source_leader_id=leader_id,
             source_worker_id=worker_id,
             source_reviewer_id=reviewer_id,
@@ -302,6 +328,7 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
             reviewer_id=reviewer_id,
             owner=owner,
             viewer=viewer,
+            org_admin=org_admin,
             leader=leader,
             worker=worker,
             reviewer=reviewer,
@@ -1393,6 +1420,10 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     assert project["shared_with"] == []
     assert project["status"] == "planning"
     assert project["access_role"] == "owner"
+    assert project["is_project_owner"] is True
+    assert project["can_delete"] is True
+    assert project["can_manage_sharing"] is True
+    assert project["can_manage_execution_user"] is False
     assert project["execution_user_id"] == str(env.owner_id)
     assert project["execution_user_name"] == "Owner"
 
@@ -1433,11 +1464,20 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
         json={
             "visibility": "shared",
             "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
         },
     )
     assert shared.status_code == 200, shared.text
     assert shared.json()["visibility"] == "shared"
+    assert shared.json()["execution_user_id"] == str(env.owner_id)
+    env.authenticate_as(env.org_admin_id)
+    selected = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"execution_user_id": str(env.viewer_id)},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["can_manage_execution_user"] is True
+    env.authenticate_as(env.owner_id)
+    shared = selected
     assert shared.json()["execution_user_id"] == str(env.viewer_id)
     assert shared.json()["execution_user_name"] == "Viewer"
     assert shared.json()["shared_with_user_ids"] == [str(env.viewer_id)]
@@ -1495,7 +1535,6 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
         f"/api/projects/{project_id}",
         json={
             "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
         },
     )
     assert retained_editor.status_code == 200, retained_editor.text
@@ -1523,7 +1562,10 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     await env.db.commit()
     cross_tenant_share = await env.client.patch(
         f"/api/projects/{project_id}",
-        json={"visibility": "shared", "shared_with_user_ids": [str(outsider.id)]},
+        json={
+            "visibility": "shared",
+            "shared_with_user_ids": [str(env.viewer_id), str(outsider.id)],
+        },
     )
     assert cross_tenant_share.status_code == 422
 
@@ -1550,7 +1592,24 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     events_response = await env.client.get(f"/api/projects/{project_id}/events")
     assert events_response.status_code == 200
     event_types = {event["event_type"] for event in events_response.json()}
-    assert {"project.created", "project.initialized", "project.settings.updated", "project.updated"} <= event_types
+    assert {
+        "project.created",
+        "project.initialized",
+        "project.settings.updated",
+        "project.updated",
+        "project.execution_user.changed",
+    } <= event_types
+    automatic_fallback = next(
+        event
+        for event in events_response.json()
+        if event["event_type"] == "project.execution_user.changed"
+        and event["event_metadata"]["automatic_fallback"] is True
+    )
+    assert automatic_fallback["event_metadata"] == {
+        "previous_execution_user_id": str(env.viewer_id),
+        "execution_user_id": str(env.owner_id),
+        "automatic_fallback": True,
+    }
 
 
 async def test_shared_project_execution_user_is_validated_atomically(project_api: ProjectApiEnv):
@@ -1558,16 +1617,20 @@ async def test_shared_project_execution_user_is_validated_atomically(project_api
     project = await _create_project(env, name="Shared execution identity")
     project_id = project["id"]
 
-    missing_selection = await env.client.patch(
+    shared_by_owner = await env.client.patch(
         f"/api/projects/{project_id}",
         json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
     )
-    assert missing_selection.status_code == 422
-    unchanged = (await env.client.get(f"/api/projects/{project_id}")).json()
-    assert unchanged["visibility"] == "private"
-    assert unchanged["shared_with"] == []
-    assert unchanged["execution_user_id"] == str(env.owner_id)
+    assert shared_by_owner.status_code == 200, shared_by_owner.text
+    assert shared_by_owner.json()["execution_user_id"] == str(env.owner_id)
 
+    owner_cannot_select = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"execution_user_id": str(env.viewer_id)},
+    )
+    assert owner_cannot_select.status_code == 403
+
+    env.authenticate_as(env.org_admin_id)
     configured = await env.client.patch(
         f"/api/projects/{project_id}",
         json={
@@ -1578,62 +1641,230 @@ async def test_shared_project_execution_user_is_validated_atomically(project_api
     )
     assert configured.status_code == 200, configured.text
 
-    stored = await env.db.get(Project, uuid.UUID(project_id))
-    assert stored is not None
-    stored.execution_user_id = None
-    await env.db.commit()
-    legacy_acl_change = await env.client.patch(
-        f"/api/projects/{project_id}",
-        json={"shared_with_user_ids": [str(env.viewer_id)]},
-    )
-    assert legacy_acl_change.status_code == 422
-    legacy_summary = (await env.client.get(f"/api/projects/{project_id}")).json()
-    assert legacy_summary["execution_user_id"] == str(env.owner_id)
-    reconfigured = await env.client.patch(
-        f"/api/projects/{project_id}",
-        json={
-            "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
-        },
-    )
-    assert reconfigured.status_code == 200, reconfigured.text
-
     tenant = await env.db.get(Tenant, env.tenant_id)
     assert tenant is not None
     alternate = await _user(env.db, tenant, "Alternate")
     await env.db.commit()
+    alternate_id = alternate.id
+    env.authenticate_as(env.owner_id)
+    added_alternate = await env.client.post(
+        f"/api/projects/{project_id}/access-grants",
+        json={"user_id": str(alternate_id), "role": "view"},
+    )
+    assert added_alternate.status_code == 201, added_alternate.text
+    viewer_grant = await env.db.scalar(
+        select(ProjectAccessGrant).where(
+            ProjectAccessGrant.project_id == uuid.UUID(project_id),
+            ProjectAccessGrant.user_id == env.viewer_id,
+        )
+    )
+    assert viewer_grant is not None
+    direct_removal = await env.client.delete(
+        f"/api/projects/{project_id}/access-grants/{viewer_grant.id}"
+    )
+    assert direct_removal.status_code == 409
     invalid_replacement = await env.client.patch(
         f"/api/projects/{project_id}",
-        json={"shared_with_user_ids": [str(alternate.id)]},
+        json={"shared_with_user_ids": [str(alternate_id)]},
     )
-    assert invalid_replacement.status_code == 422
+    assert invalid_replacement.status_code == 409
     still_configured = (await env.client.get(f"/api/projects/{project_id}")).json()
-    assert [entry["user_id"] for entry in still_configured["shared_with"]] == [str(env.viewer_id)]
+    assert {entry["user_id"] for entry in still_configured["shared_with"]} == {
+        str(env.viewer_id),
+        str(alternate_id),
+    }
     assert still_configured["execution_user_id"] == str(env.viewer_id)
 
+    alternate = await env.db.get(User, alternate_id)
+    assert alternate is not None
     alternate.is_active = False
     await env.db.commit()
+    env.authenticate_as(env.org_admin_id)
     inactive_selection = await env.client.patch(
         f"/api/projects/{project_id}",
         json={
-            "shared_with_user_ids": [str(env.viewer_id), str(alternate.id)],
-            "execution_user_id": str(alternate.id),
+            "shared_with_user_ids": [str(env.viewer_id), str(alternate_id)],
+            "execution_user_id": str(alternate_id),
         },
     )
     assert inactive_selection.status_code == 422
+    alternate = await env.db.get(User, alternate_id)
+    assert alternate is not None
     alternate.is_active = True
     await env.db.commit()
 
     replaced = await env.client.patch(
         f"/api/projects/{project_id}",
         json={
-            "shared_with_user_ids": [str(alternate.id)],
-            "execution_user_id": str(alternate.id),
+            "shared_with_user_ids": [str(alternate_id)],
+            "execution_user_id": str(alternate_id),
         },
     )
     assert replaced.status_code == 200, replaced.text
-    assert replaced.json()["execution_user_id"] == str(alternate.id)
+    assert replaced.json()["execution_user_id"] == str(alternate_id)
     assert replaced.json()["execution_user_name"] == "Alternate"
+    events = (await env.client.get(f"/api/projects/{project_id}/events?limit=200")).json()
+    changes = [event for event in events if event["event_type"] == "project.execution_user.changed"]
+    latest_change = next(
+        event for event in changes if event["event_metadata"]["execution_user_id"] == str(alternate_id)
+    )
+    assert latest_change["event_metadata"] == {
+        "previous_execution_user_id": str(env.viewer_id),
+        "execution_user_id": str(alternate_id),
+        "automatic_fallback": False,
+    }
+
+
+async def test_project_delete_cleans_bidirectional_agent_and_session_references(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    project = await _create_project(env, name="Delete used project")
+    project_id = uuid.UUID(project["id"])
+    parent = ChatSession(
+        project_id=project_id,
+        agent_id=env.leader_id,
+        title="Delete parent",
+        source_channel="project",
+        external_conv_id=f"delete-parent:{project_id}",
+        is_group=True,
+    )
+    child = ChatSession(
+        project_id=project_id,
+        agent_id=env.worker_id,
+        peer_agent_id=env.leader_id,
+        title="Delete child",
+        source_channel="subagent",
+        external_conv_id=f"delete-child:{project_id}",
+        is_group=False,
+    )
+    env.db.add_all([parent, child])
+    await env.db.flush()
+    child_run = SubagentRun(
+        id=child.id,
+        parent_session_id=parent.id,
+        project_id=project_id,
+        execution_user_id=env.owner_id,
+        origin_tool_call_id="delete-completed-child",
+        mode="run",
+        status="completed",
+    )
+    gateway = GatewayMessage(
+        agent_id=env.source_leader_id,
+        sender_agent_id=env.leader_id,
+        conversation_id=str(parent.id),
+        content="Project agent sent to a standard agent",
+        status="completed",
+    )
+    env.db.add_all([child_run, gateway])
+    await env.db.commit()
+
+    deleted = await env.client.delete(f"/api/projects/{project_id}")
+    assert deleted.status_code == 204, deleted.text
+    assert await env.db.get(Project, project_id) is None
+    assert await env.db.get(SubagentRun, child.id) is None
+    assert await env.db.get(ChatSession, parent.id) is None
+    assert await env.db.get(ChatSession, child.id) is None
+    assert await env.db.scalar(select(GatewayMessage.id).where(GatewayMessage.id == gateway.id)) is None
+    assert await env.db.scalar(select(Agent.id).where(Agent.id == env.leader_id)) is None
+    assert not project_repo_path(env.tenant_id, project_id).exists()
+
+
+async def test_project_delete_enforces_role_tenant_and_active_work_boundaries(
+    project_api: ProjectApiEnv,
+):
+    env = project_api
+    viewer_project = await _create_project(env, name="Viewer cannot delete")
+    env.authenticate_as(env.viewer_id)
+    assert (await env.client.delete(f"/api/projects/{viewer_project['id']}")).status_code == 404
+
+    env.authenticate_as(env.org_admin_id)
+    assert (await env.client.delete(f"/api/projects/{viewer_project['id']}")).status_code == 204
+
+    env.authenticate_as(env.owner_id)
+    running = await _create_project(env, name="Running cannot delete")
+    running_row = await env.db.get(Project, uuid.UUID(running["id"]))
+    assert running_row is not None
+    running_row.status = "running"
+    await env.db.commit()
+    assert (await env.client.delete(f"/api/projects/{running['id']}")).status_code == 409
+
+    waiting = await _create_project(env, name="Waiting child cannot delete")
+    waiting_id = uuid.UUID(waiting["id"])
+    waiting_row = await env.db.get(Project, waiting_id)
+    assert waiting_row is not None
+    waiting_row.status = "paused"
+    parent = ChatSession(
+        project_id=waiting_id,
+        agent_id=env.leader_id,
+        title="Waiting parent",
+        source_channel="project",
+        external_conv_id=f"waiting-parent:{waiting_id}",
+        is_group=True,
+    )
+    child = ChatSession(
+        project_id=waiting_id,
+        agent_id=env.worker_id,
+        title="Waiting child",
+        source_channel="subagent",
+        external_conv_id=f"waiting-child:{waiting_id}",
+        is_group=False,
+    )
+    env.db.add_all([parent, child])
+    await env.db.flush()
+    env.db.add(
+        SubagentRun(
+            id=child.id,
+            parent_session_id=parent.id,
+            project_id=waiting_id,
+            execution_user_id=env.owner_id,
+            origin_tool_call_id="waiting-confirmation-child",
+            mode="run",
+            status="waiting_confirmation",
+        )
+    )
+    await env.db.commit()
+    assert (await env.client.delete(f"/api/projects/{waiting_id}")).status_code == 409
+
+    other_tenant = Tenant(name="Other company", slug=f"other-{uuid.uuid4().hex[:8]}")
+    env.db.add(other_tenant)
+    await env.db.flush()
+    owner_identity_id = await env.db.scalar(select(User.identity_id).where(User.id == env.owner_id))
+    identity = await env.db.get(Identity, owner_identity_id)
+    assert identity is not None
+    identity.is_platform_admin = True
+    switched_user = User(
+        identity_id=identity.id,
+        tenant_id=other_tenant.id,
+        display_name="Owner switched company",
+        role="member",
+        is_active=True,
+    )
+    env.db.add(switched_user)
+    await env.db.flush()
+    cross_tenant_project = Project(
+        tenant_id=other_tenant.id,
+        owner_user_id=switched_user.id,
+        name="Tenant switched delete",
+        description="",
+        goal="",
+        visibility="private",
+        status="planning",
+        settings={},
+    )
+    env.db.add(cross_tenant_project)
+    await env.db.commit()
+    switched_user_id = switched_user.id
+    cross_tenant_project_id = cross_tenant_project.id
+
+    env.authenticate_as(env.owner_id)
+    assert (await env.client.delete(f"/api/projects/{cross_tenant_project_id}")).status_code == 404
+    env.authenticate_as(switched_user_id)
+    target_summary = await env.client.get(f"/api/projects/{cross_tenant_project_id}")
+    assert target_summary.status_code == 200, target_summary.text
+    assert target_summary.json()["can_delete"] is True
+    assert target_summary.json()["can_manage_execution_user"] is True
+    assert (await env.client.delete(f"/api/projects/{cross_tenant_project_id}")).status_code == 204
 
 
 async def test_project_owner_directory_is_tenant_scoped_and_excludes_owner(
@@ -1762,20 +1993,20 @@ async def test_project_owner_directory_lists_active_users_without_synced_org_pro
         f"/api/projects/{project['id']}/directory/members"
     )
     assert members.status_code == 200, members.text
-    assert members.json()["total"] == 1
-    assert members.json()["items"] == [
-        {
-            "id": str(env.viewer_id),
-            "member_id": None,
-            "name": "Viewer",
-            "nickname": None,
-            "department_id": None,
-            "department_path": "",
-            "title": "",
-            "avatar_url": None,
-            "email": env.viewer.email,
-        }
-    ]
+    assert members.json()["total"] == 2
+    items_by_id = {item["id"]: item for item in members.json()["items"]}
+    assert items_by_id[str(env.viewer_id)] == {
+        "id": str(env.viewer_id),
+        "member_id": None,
+        "name": "Viewer",
+        "nickname": None,
+        "department_id": None,
+        "department_path": "",
+        "title": "",
+        "avatar_url": None,
+        "email": env.viewer.email,
+    }
+    assert items_by_id[str(env.org_admin_id)]["name"] == "Org Admin"
     assert str(env.owner_id) not in {
         item["id"] for item in members.json()["items"]
     }
@@ -2412,6 +2643,7 @@ async def test_project_run_and_leader_batch_use_frozen_shared_execution_user(
     env = project_api
     project = await _create_project(env, name="Frozen shared execution")
     project_id = uuid.UUID(project["id"])
+    env.authenticate_as(env.org_admin_id)
     configured = await env.client.patch(
         f"/api/projects/{project_id}",
         json={
@@ -2421,6 +2653,7 @@ async def test_project_run_and_leader_batch_use_frozen_shared_execution_user(
         },
     )
     assert configured.status_code == 200, configured.text
+    env.authenticate_as(env.owner_id)
     await _mark_project_running(env, project_id)
 
     real_created = await env.client.post(
@@ -2460,6 +2693,7 @@ async def test_project_run_and_leader_batch_use_frozen_shared_execution_user(
     alternate = await _user(env.db, tenant, "Dispatch Alternate")
     await env.db.commit()
     alternate_id = alternate.id
+    env.authenticate_as(env.org_admin_id)
     changed = await env.client.patch(
         f"/api/projects/{project_id}",
         json={
@@ -2468,6 +2702,7 @@ async def test_project_run_and_leader_batch_use_frozen_shared_execution_user(
         },
     )
     assert changed.status_code == 200, changed.text
+    env.authenticate_as(env.owner_id)
 
     dispatched_users: list[uuid.UUID] = []
 
@@ -7959,7 +8194,6 @@ async def test_project_head_file_preview_media_range_and_acl(project_api: Projec
         json={
             "visibility": "shared",
             "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
         },
     )
     assert shared.status_code == 200
@@ -8069,7 +8303,6 @@ async def test_project_directory_archive_and_html_preview_use_one_immutable_head
         json={
             "visibility": "shared",
             "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
         },
     )
     assert shared.status_code == 200
@@ -8469,7 +8702,6 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
         json={
             "visibility": "shared",
             "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
         },
     )
     assert shared.status_code == 200, shared.text
@@ -9048,7 +9280,6 @@ async def test_project_skill_assets_are_owner_managed_and_template_portable(
         json={
             "visibility": "shared",
             "shared_with_user_ids": [str(env.viewer_id)],
-            "execution_user_id": str(env.viewer_id),
         },
     )
     assert shared.status_code == 200, shared.text

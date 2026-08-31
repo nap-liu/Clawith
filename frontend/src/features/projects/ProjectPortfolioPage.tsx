@@ -19,6 +19,7 @@ import {
 import { projectsApi } from "../../services/projects";
 import Pagination from "../../components/Pagination";
 import { useDialog } from "../../components/Dialog/DialogProvider";
+import { useToast } from "../../components/Toast/ToastProvider";
 import { useAuthStore } from "../../stores";
 import type { ProjectScope, ProjectStatus, ProjectSummary } from "./types";
 import {
@@ -108,6 +109,7 @@ export default function ProjectPortfolioPage() {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const dialog = useDialog();
+  const toast = useToast();
   const currentUser = useAuthStore((state) => state.user);
   const isProjectAdmin =
     currentUser?.role === "platform_admin" ||
@@ -162,7 +164,16 @@ export default function ProjectPortfolioPage() {
         confirmLabel: t("projectPortfolio.deleteAction"),
       },
     );
-    if (confirmed) await deleteMutation.mutateAsync(project.id);
+    if (!confirmed) return;
+    try {
+      await deleteMutation.mutateAsync(project.id);
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("projectPortfolio.deleteFailed"),
+      );
+    }
   };
   const projects = projectQuery.data?.items ?? [];
   const pageSize = 10;
@@ -514,7 +525,7 @@ export default function ProjectPortfolioPage() {
                   </small>
                 </div>
                 <div className="pm-project-actions">
-                  {(project.access_role === "owner" || isProjectAdmin) && (
+                  {project.can_delete === true && (
                     <Button
                       type="button"
                       variant="ghost"

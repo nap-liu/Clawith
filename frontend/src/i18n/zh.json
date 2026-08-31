@@ -1080,6 +1080,7 @@
     "deleteAction": "确认删除",
     "deleteNamedProject": "删除项目 {{name}}",
     "deleteConfirm": "确认删除“{{name}}”？此操作不可撤销。",
+    "deleteFailed": "项目删除失败，请稍后重试。",
     "private": "仅自己",
     "shared": "已分享",
     "digitalEmployeeCount": "{{count}} 个数字员工",
@@ -4649,6 +4650,10 @@
     "agentSearchPlaceholder": "搜索数字员工名称或创建者",
     "agentSearchLabel": "按名称或创建者搜索数字员工",
     "clearAgentSearch": "清空数字员工搜索",
-    "noAgentMatches": "没有匹配的数字员工"
+    "noAgentMatches": "没有匹配的数字员工",
+    "agentLoadFailed": "数字员工列表加载失败。",
+    "agentLoadIncomplete": "数字员工列表未加载完整。",
+    "resultsIncomplete": "搜索结果可能不完整",
+    "retry": "重试"
   }
 }
