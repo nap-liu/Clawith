@@ -7,6 +7,15 @@ from loguru import logger
 
 from app.database import async_session
 
+_ROOT_TOOL_SYMBOLS = ("async_session", "logger")
+
+
+def _sync_root_tool_symbols() -> None:
+    from app.services import agent_tools as _agent_tools_root
+
+    for _name in _ROOT_TOOL_SYMBOLS:
+        globals()[_name] = getattr(_agent_tools_root, _name)
+
 
 async def execute_tool_postprocess(
     tool_name: str,
@@ -16,6 +25,7 @@ async def execute_tool_postprocess(
     session_id: str,
     result: str,
 ) -> str:
+    _sync_root_tool_symbols()
     # Log tool call activity (skip noisy read operations). Keep the result
     # shape intact for diagnostics and mask only explicit credential values.
     if tool_name not in ("list_files", "read_file", "read_document"):
