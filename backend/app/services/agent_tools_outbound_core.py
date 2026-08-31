@@ -1,7 +1,9 @@
 """Durable outbound-message operation and receipt primitives."""
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -15,6 +17,13 @@ from app.services.im_delivery import (
     attach_delivery_to_meta,
 )
 from app.services.user_output import sanitize_user_visible_text
+
+MEDIA_DELIVERY_MAX_IN_FLIGHT = 4
+
+_outbound_media_slots = asyncio.Semaphore(MEDIA_DELIVERY_MAX_IN_FLIGHT)
+_outbound_media_connection: ContextVar = ContextVar(
+    "outbound_media_connection", default=None
+)
 
 
 def _build_outbound_operation_key(
@@ -327,4 +336,3 @@ def _session_receipt_replay_status(receipt: ChatMessage) -> str:
     return "unknown"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-
