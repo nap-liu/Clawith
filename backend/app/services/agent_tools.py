@@ -402,8 +402,6 @@ def _sync_document_tool_bindings() -> None:
     _agent_tools_document_tools_module._READ_DOCUMENT_HARD_CHAR_CEILING = _READ_DOCUMENT_HARD_CHAR_CEILING
 
 
-
-
 install_facade_specs(__name__, MAIN_FACADE_SPECS)
 
 
@@ -588,78 +586,9 @@ async def execute_tool(
         return f"Tool execution error ({tool_name}): {type(e).__name__}: {str(e)[:200]}"
 
 
-
-
-
-
 # ── Standalone search engine tool wrappers ───────────────────────────────────
 # Each function reads its own tool config (agent > company > defaults) and
 # delegates to the existing private search implementations above.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 _SESSION_MESSAGE_CAPABILITIES = {
@@ -681,49 +610,11 @@ _SESSION_MESSAGE_DENIAL = "❌ 无法投递：该会话不存在，或不属于�
 _GROUP_SESSION_DENIAL = "❌ 无法投递：该群会话不存在，或不属于当前数字员工。"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # Plaza Tools — Agent Square social feed
 # ═══════════════════════════════════════════════════════
 
 # Plaza Tools — Agent Square social feed
 # ═══════════════════════════════════════════════════════
-
-
-
-
-
-
 
 
 # ─── Code Execution ─────────────────────────────────────────────
@@ -731,173 +622,37 @@ _GROUP_SESSION_DENIAL = "❌ 无法投递：该群会话不存在，或不属于
 # Dangerous patterns to block (for legacy fallback)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ─── Resource Discovery Executors ───────────────────────────────
-
-
-
-
-
-
 
 
 # ─── Feishu Helper ────────────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ─── Feishu Bitable Tools ──────────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ─── Feishu Document Tools ──────────────────────────────────────────
 
 
-
-
-
-
-
-
-
-
 # ─── Feishu Wiki Tools ───────────────────────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ─── Feishu Drive Share (All File Types) ────────────────────────────────────────
 
 
-
-
 # ─── Feishu Drive Delete ──────────────────────────────────────────────────────
-
-
 
 
 # ─── Feishu Calendar Tools ────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
-
-
-
 # ─── Feishu Approval Tools ───────────────────────────────────────────────────
-
-
-
-
-
-
 
 
 # ─── Feishu User Search ───────────────────────────────────────────────────────
 
 
-
-
 # ─── AgentBay Tool Handlers ─────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 install_facade_specs(__name__, A2A_DELIVERY_FACADE_SPECS)
