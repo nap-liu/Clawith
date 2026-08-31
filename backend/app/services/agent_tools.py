@@ -662,17 +662,21 @@ async def execute_tool(
     if isinstance(preflight, str):
         return preflight
 
-    result = await execute_tool_dispatch_basic(preflight)
-    if result is None:
-        result = await execute_tool_dispatch_extended(preflight)
-    return await execute_tool_postprocess(
-        preflight.tool_name,
-        preflight.arguments,
-        preflight.agent_id,
-        preflight.user_id,
-        preflight.session_id,
-        result,
-    )
+    try:
+        result = await execute_tool_dispatch_basic(preflight)
+        if result is None:
+            result = await execute_tool_dispatch_extended(preflight)
+        return await execute_tool_postprocess(
+            preflight.tool_name,
+            preflight.arguments,
+            preflight.agent_id,
+            preflight.user_id,
+            preflight.session_id,
+            result,
+        )
+    except Exception as e:
+        logger.exception(f"[Tool] Execution failed: {tool_name}")
+        return f"Tool execution error ({tool_name}): {type(e).__name__}: {str(e)[:200]}"
 
 
 async def _web_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
