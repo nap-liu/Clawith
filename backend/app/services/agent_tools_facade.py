@@ -14,9 +14,9 @@ class _AgentToolsFacadeModule(ModuleType):
         if name.startswith("__"):
             return
         state = self.__dict__.get(_FACADE_STATE_KEY)
-        if not state or name not in state["names"]:
+        if not state:
             return
-        for target in state["modules"]:
+        for target in state["targets_by_name"].get(name, ()):
             target.__dict__[name] = value
 
 
@@ -24,7 +24,7 @@ def _facade_state(module_name: str) -> dict[str, object]:
     module = sys.modules[module_name]
     state = module.__dict__.get(_FACADE_STATE_KEY)
     if state is None:
-        state = {"modules": [], "names": set()}
+        state = {"targets_by_name": {}}
         module.__dict__[_FACADE_STATE_KEY] = state
     return state
 
@@ -65,16 +65,15 @@ def register_sync_targets(
 ) -> None:
     module = sys.modules[module_name]
     state = _facade_state(module_name)
-    modules: list[ModuleType] = state["modules"]  # type: ignore[assignment]
-    names: set[str] = state["names"]  # type: ignore[assignment]
+    targets_by_name: dict[str, list[ModuleType]] = state["targets_by_name"]  # type: ignore[assignment]
     for target in sync_modules:
-        if target not in modules:
-            modules.append(target)
+        for name in symbol_names:
+            targets = targets_by_name.setdefault(name, [])
+            if target not in targets:
+                targets.append(target)
     for name in symbol_names:
-        names.add(name)
         if name in module.__dict__:
             for target in sync_modules:
                 target.__dict__[name] = module.__dict__[name]
     if module.__class__ is not _AgentToolsFacadeModule:
         module.__class__ = _AgentToolsFacadeModule
-
