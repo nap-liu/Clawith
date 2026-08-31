@@ -20,14 +20,22 @@ _IMPLEMENTATION_MODULES = (
     _diff,
 )
 
+_IMPLEMENTATION_EXPORTS: dict[str, object] = {}
 for _module in _IMPLEMENTATION_MODULES:
-    globals().update(
+    _IMPLEMENTATION_EXPORTS.update(
         {
             _name: _value
             for _name, _value in vars(_module).items()
             if not _name.startswith("__")
         }
     )
+
+# The implementation files are contiguous slices of the former module. Restore
+# its single global namespace so functions in an earlier slice can resolve
+# helpers that were defined later in the original file.
+for _module in _IMPLEMENTATION_MODULES:
+    vars(_module).update(_IMPLEMENTATION_EXPORTS)
+globals().update(_IMPLEMENTATION_EXPORTS)
 
 for _name, _value in tuple(globals().items()):
     if callable(_value) and str(getattr(_value, "__module__", "")).startswith(
