@@ -117,7 +117,8 @@ MAIN_FACADE_SPECS: tuple[FacadeSpec, ...] = (
         """
         logger _get_tool_config _agent_workspace_root
         _canonicalize_execute_code_upload_paths _check_code_safety
-        build_cli_injection
+        build_cli_injection MAX_EXEC_STDOUT_CAPTURE_BYTES
+        MAX_EXEC_STDERR_CAPTURE_BYTES
         """,
     ),
     _spec(

@@ -403,6 +403,10 @@ def _sync_document_tool_bindings() -> None:
     _agent_tools_document_tools_module._READ_DOCUMENT_HARD_CHAR_CEILING = _READ_DOCUMENT_HARD_CHAR_CEILING
 
 
+MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
+MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
+
+
 install_facade_specs(__name__, MAIN_FACADE_SPECS)
 
 
@@ -443,8 +447,6 @@ async def _read_document_from_storage(
 
 
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
-MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
-MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
 
 # Cap web_eval/web_cdp serialized results surfaced to the LLM.
 _STDOUT_RPA_LIMIT = 20000
