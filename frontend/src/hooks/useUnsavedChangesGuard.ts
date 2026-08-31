@@ -1,7 +1,11 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useBeforeUnload, useBlocker } from 'react-router-dom';
+import { useDialog } from '../components/Dialog/DialogProvider';
 
 export function useUnsavedChangesGuard(active: boolean, message: string) {
+    const { confirm } = useDialog();
+    const blockerRef = useRef<ReturnType<typeof useBlocker> | null>(null);
+    const promptingRef = useRef(false);
     const shouldBlock = useCallback(
         ({ currentLocation, nextLocation }: {
             currentLocation: { pathname: string; search: string; hash: string };
@@ -14,6 +18,7 @@ export function useUnsavedChangesGuard(active: boolean, message: string) {
         [active],
     );
     const blocker = useBlocker(shouldBlock);
+    blockerRef.current = blocker;
 
     useBeforeUnload(useCallback((event: BeforeUnloadEvent) => {
         if (!active) return;
@@ -22,8 +27,18 @@ export function useUnsavedChangesGuard(active: boolean, message: string) {
     }, [active]));
 
     useEffect(() => {
-        if (blocker.state !== 'blocked') return;
-        if (window.confirm(message)) blocker.proceed();
-        else blocker.reset();
-    }, [blocker, message]);
+        if (blocker.state !== 'blocked' || promptingRef.current) return;
+        promptingRef.current = true;
+        void confirm(message, {
+            title: '放弃未保存修改？',
+            danger: true,
+            confirmLabel: '继续',
+        }).then((confirmed) => {
+            promptingRef.current = false;
+            const currentBlocker = blockerRef.current;
+            if (currentBlocker?.state !== 'blocked') return;
+            if (confirmed) currentBlocker.proceed();
+            else currentBlocker.reset();
+        });
+    }, [blocker.state, confirm, message]);
 }

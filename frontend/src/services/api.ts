@@ -104,6 +104,13 @@ export type SceneSystemPrompt = {
   enabled: boolean;
 };
 
+export type SceneQuickActionStyle = {
+  bold: boolean;
+  italic: boolean;
+  color?: string | null;
+  font: "default" | "sans" | "serif" | "monospace";
+};
+
 export type SceneQuickAction = {
   id: string;
   label: string;
@@ -115,6 +122,7 @@ export type SceneQuickAction = {
   enabled?: boolean;
   uri?: string | null;
   message?: string | null;
+  style?: SceneQuickActionStyle | null;
 };
 
 export type Scene = {
@@ -138,7 +146,7 @@ export type Scene = {
 
 type SceneManifestQuickActionBase = Pick<
   SceneQuickAction,
-  "id" | "label" | "menu_visible" | "enabled"
+  "id" | "label" | "menu_visible" | "enabled" | "style"
 >;
 
 export type SceneManifestQuickAction = SceneManifestQuickActionBase &

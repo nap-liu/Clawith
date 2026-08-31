@@ -6,6 +6,7 @@ import { loadTypeScriptModule } from './load-typescript-module.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
     findMenuVisibleSceneQuickAction,
+    horizontalSceneQuickActionStyle,
     isSceneQuickActionUnavailable,
     menuVisibleSceneQuickActions,
 } = loadTypeScriptModule(
@@ -47,6 +48,23 @@ assert.equal(
         { confirmationPending: true, sendMessageUnavailable: false },
     ),
     true,
+);
+assert.equal(horizontalSceneQuickActionStyle(undefined), undefined);
+assert.deepEqual(
+    {
+        ...horizontalSceneQuickActionStyle({
+            bold: true,
+            italic: true,
+            color: '#7C3AED',
+            font: 'serif',
+        }),
+    },
+    {
+        color: '#7C3AED',
+        fontFamily: '"Newsreader", Georgia, "Times New Roman", serif',
+        fontStyle: 'italic',
+        fontWeight: 700,
+    },
 );
 
 console.log('scene quick action tests passed');

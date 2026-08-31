@@ -366,6 +366,73 @@
     margin-top: 12px;
 }
 
+.scene-config__action-style {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 10px;
+}
+
+.scene-config__action-style > span,
+.scene-config__action-color > span {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.scene-config__action-style > button {
+    min-width: 32px;
+    height: 32px;
+    padding: 0 9px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 7px;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    cursor: pointer;
+}
+
+.scene-config__action-style > button.is-active {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+    background: var(--bg-active);
+}
+
+.scene-config__action-style > button:disabled {
+    opacity: .55;
+    cursor: default;
+}
+
+.scene-config__action-style > button:focus-visible,
+.scene-config__action-color input:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+}
+
+.scene-config__action-font-select {
+    flex: 0 0 130px;
+}
+
+.scene-config__action-color {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.scene-config__action-color input {
+    width: 32px;
+    min-height: 32px;
+    height: 32px;
+    padding: 2px;
+    cursor: pointer;
+}
+
+.scene-config__action-style > .scene-config__action-style-reset {
+    min-width: auto;
+    border-color: transparent;
+    background: transparent;
+    font-size: 12px;
+}
+
 .scene-config__action-context > span {
     display: flex;
     align-items: baseline;

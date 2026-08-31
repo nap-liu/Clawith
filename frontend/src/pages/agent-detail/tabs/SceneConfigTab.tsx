@@ -13,11 +13,13 @@ import {
     sceneApi,
     type Scene,
     type SceneQuickAction,
+    type SceneQuickActionStyle,
     type SceneSystemPrompt,
 } from '../../../services/api';
 import { parseMiniProgramUri } from '../../../utils/miniProgramUri';
 import SelectDropdown from '../../../components/SelectDropdown';
 import ToggleSwitch from '../../../components/ToggleSwitch';
+import { useDialog } from '../../../components/Dialog/DialogProvider';
 import './SceneConfigTab.css';
 
 type Section = 'welcome' | 'prompts' | 'actions';
@@ -35,6 +37,12 @@ const emptyScene = (): Scene => ({
 });
 
 const discardWarning = '当前有未发布的编辑内容，继续操作将丢失这些修改。是否继续？';
+const defaultQuickActionStyle: SceneQuickActionStyle = {
+    bold: false,
+    italic: false,
+    color: null,
+    font: 'default',
+};
 
 const editableSceneSnapshot = (scene: Scene) => JSON.stringify({
     scene_key: scene.scene_key,
@@ -103,6 +111,7 @@ export default function SceneConfigTab({
     agentId: string;
     onDirtyChange?: (dirty: boolean) => void;
 }) {
+    const dialog = useDialog();
     const [scenes, setScenes] = useState<Scene[]>([]);
     const [draft, setDraft] = useState<Scene>(emptyScene);
     const [savedSnapshot, setSavedSnapshot] = useState(() => editableSceneSnapshot(emptyScene()));
@@ -136,7 +145,15 @@ export default function SceneConfigTab({
         setPreview(null);
     };
 
-    const confirmDiscard = () => !isDirty || window.confirm(discardWarning);
+    const confirmDiscard = () => (
+        !isDirty
+            ? Promise.resolve(true)
+            : dialog.confirm(discardWarning, {
+                title: '放弃未保存修改？',
+                danger: true,
+                confirmLabel: '继续',
+            })
+    );
 
     useEffect(() => {
         onDirtyChange?.(isDirty);
@@ -200,6 +217,24 @@ export default function SceneConfigTab({
             quick_actions: current.quick_actions.map((item, itemIndex) =>
                 itemIndex === index ? { ...item, ...patch } : item,
             ),
+        }));
+    };
+
+    const updateActionStyle = (index: number, patch: Partial<SceneQuickActionStyle>) => {
+        setDraft((current) => ({
+            ...current,
+            quick_actions: current.quick_actions.map((item, itemIndex) => (
+                itemIndex === index
+                    ? {
+                        ...item,
+                        style: {
+                            ...defaultQuickActionStyle,
+                            ...(item.style || {}),
+                            ...patch,
+                        },
+                    }
+                    : item
+            )),
         }));
     };
 
@@ -274,7 +309,16 @@ export default function SceneConfigTab({
     };
 
     const remove = async () => {
-        if (isPreviewing || !draft.id || !window.confirm(`确认删除场景“${draft.name}”？历史版本也会一并删除。`)) return;
+        if (isPreviewing || !draft.id) return;
+        const confirmed = await dialog.confirm(
+            `确认删除场景“${draft.name}”？历史版本也会一并删除。`,
+            {
+                title: '删除场景',
+                danger: true,
+                confirmLabel: '删除',
+            },
+        );
+        if (!confirmed) return;
         setSaving(true);
         try {
             await sceneApi.delete(agentId, draft.scene_key);
@@ -314,8 +358,8 @@ export default function SceneConfigTab({
                     <button
                         className="scene-config__icon-button"
                         title="新增场景"
-                        onClick={() => {
-                            if (!confirmDiscard()) return;
+                        onClick={async () => {
+                            if (!(await confirmDiscard())) return;
                             setSelectedKey(null);
                             setCleanDraft(emptyScene());
                             setNotice('');
@@ -334,8 +378,8 @@ export default function SceneConfigTab({
                         <button
                             key={scene.scene_key}
                             className={`scene-config__scene ${selectedKey === scene.scene_key ? 'is-active' : ''}`}
-                            onClick={() => {
-                                if (!confirmDiscard()) return;
+                            onClick={async () => {
+                                if (!(await confirmDiscard())) return;
                                 void selectScene(scene.scene_key);
                             }}
                         >
@@ -387,8 +431,8 @@ export default function SceneConfigTab({
                                 {!isNew && (
                                     <button
                                         className="btn btn-ghost"
-                                        onClick={() => {
-                                            if (!confirmDiscard()) return;
+                                        onClick={async () => {
+                                            if (!(await confirmDiscard())) return;
                                             void loadScenes(draft.scene_key);
                                         }}
                                         disabled={saving}
@@ -582,6 +626,59 @@ export default function SceneConfigTab({
                                         ? '请输入相对路径、HTTP(S) 地址或 miniprogram://navigate-to/ 路径'
                                         : '请输入点击后直接发送的消息内容'}
                                 />
+                                <div className="scene-config__action-style">
+                                    <span>横向按钮样式</span>
+                                    <button
+                                        type="button"
+                                        className={action.style?.bold ? 'is-active' : ''}
+                                        disabled={isPreviewing}
+                                        aria-pressed={action.style?.bold || false}
+                                        onClick={() => updateActionStyle(index, { bold: !action.style?.bold })}
+                                    >
+                                        <strong>B</strong>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className={action.style?.italic ? 'is-active' : ''}
+                                        disabled={isPreviewing}
+                                        aria-pressed={action.style?.italic || false}
+                                        onClick={() => updateActionStyle(index, { italic: !action.style?.italic })}
+                                    >
+                                        <em>I</em>
+                                    </button>
+                                    <SelectDropdown
+                                        className="scene-config__action-font-select"
+                                        value={action.style?.font || 'default'}
+                                        options={[
+                                            { value: 'default', label: '默认字体' },
+                                            { value: 'sans', label: '无衬线' },
+                                            { value: 'serif', label: '衬线' },
+                                            { value: 'monospace', label: '等宽' },
+                                        ]}
+                                        disabled={isPreviewing}
+                                        ariaLabel={`${action.label || '快捷入口'}字体`}
+                                        onChange={(font) => updateActionStyle(index, { font })}
+                                    />
+                                    <label className="scene-config__action-color">
+                                        <span>颜色</span>
+                                        <input
+                                            type="color"
+                                            value={action.style?.color || '#8B8B9E'}
+                                            disabled={isPreviewing}
+                                            aria-label={`${action.label || '快捷入口'}文字颜色`}
+                                            onChange={(event) => updateActionStyle(index, { color: event.target.value.toUpperCase() })}
+                                        />
+                                    </label>
+                                    {!isPreviewing && action.style && (
+                                        <button
+                                            type="button"
+                                            className="scene-config__action-style-reset"
+                                            onClick={() => updateAction(index, { style: null })}
+                                        >
+                                            恢复默认
+                                        </button>
+                                    )}
+                                </div>
                                 <label className="scene-config__action-context">
                                     <span>
                                         <strong>AI 详细上下文（选填）</strong>

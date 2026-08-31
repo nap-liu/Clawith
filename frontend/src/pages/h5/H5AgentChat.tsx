@@ -87,6 +87,7 @@ import {
 } from '../../utils/chatAttachments';
 import {
     findMenuVisibleSceneQuickAction,
+    horizontalSceneQuickActionStyle,
     isSceneQuickActionUnavailable,
     menuVisibleSceneQuickActions,
 } from '../../utils/sceneQuickActions';
@@ -3130,6 +3131,7 @@ export default function H5AgentChat() {
                                     key={action.id}
                                     type="button"
                                     className="h5-chat__quick-action"
+                                    style={horizontalSceneQuickActionStyle(action.style)}
                                     disabled={quickActionUnavailable(action)}
                                     title={quickActionUnavailable(action) ? '当前操作完成后可用' : undefined}
                                     onClick={() => void activateQuickAction(action)}
