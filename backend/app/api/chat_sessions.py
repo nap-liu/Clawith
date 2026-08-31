@@ -48,51 +48,17 @@ router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 _can_view_all_agent_chat_sessions = can_view_all_agent_chat_sessions
 
 
-class SessionOut(BaseModel):
-    id: str
-    agent_id: str
-    user_id: Optional[str] = None
-    username: Optional[str] = None      # display_name ?? username
-    source_channel: str = "web"         # web / feishu / discord / slack / agent
-    title: str
-    created_at: str
-    last_message_at: Optional[str] = None
-    message_count: int = 0
-    unread_count: int = 0
-    is_primary: bool = False
-    # Agent-to-agent session fields
-    peer_agent_id: Optional[str] = None
-    peer_agent_name: Optional[str] = None
-    participant_type: str = "user"       # 'user' | 'agent'
-    # Group chat session fields
-    is_group: bool = False
-    group_name: Optional[str] = None
+from app.api.chat_session_models import (
+    SessionDetailOut,
+    SessionOut,
+    SessionPageOut,
+    SessionRuntimeOut,
+)
+import app.api.chat_session_access as _chat_session_access
+import app.api.chat_session_message_query as _chat_session_message_query
 
-    class Config:
-        from_attributes = True
-
-
-class SessionRuntimeOut(BaseModel):
-    kind: Literal["subagent"]
-    status: str
-    execution_agent_id: str
-    execution_agent_name: str
-    mode: str
-    model: Optional[str] = None
-    soul: bool = True
-    memory: bool = True
-
-
-class SessionDetailOut(SessionOut):
-    view_scope: Literal["mine", "all"]
-    runtime: Optional[SessionRuntimeOut] = None
-
-
-class SessionPageOut(BaseModel):
-    items: list[SessionOut]
-    has_more: bool
-    next_offset: Optional[int] = None
-    next_cursor: Optional[str] = None
+for _compat_symbol in (SessionOut, SessionRuntimeOut, SessionDetailOut, SessionPageOut):
+    _compat_symbol.__module__ = __name__
 
 
 def _encode_session_cursor(
@@ -155,98 +121,15 @@ async def _load_accessible_session(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
 ) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
-    """Resolve one session and the web picker scope that can display it."""
-    get_row = getattr(db, "get", None)
-    candidate = await get_row(ChatSession, session_id) if callable(get_row) else None
-    project_access: str | None = None
-    if candidate is not None and candidate.agent_id == agent_id:
-        from app.services.project_service import project_session_access_mode
-
-        project_access = await project_session_access_mode(db, current_user, candidate)
-    if project_access is not None:
-        agent = await get_row(Agent, agent_id)
-        if (
-            agent is None
-            or agent.is_deleted
-            or agent.tenant_id != current_user.tenant_id
-        ):
-            raise HTTPException(status_code=404, detail="Session not found")
-        agent_access = "manage" if project_access == "edit" else "read"
-    else:
-        agent, agent_access = await check_agent_access(db, current_user, agent_id)
-    require_current_agent_tenant(current_user, agent)
-    parent_session = aliased(ChatSession)
-    result = await db.execute(
-        select(ChatSession)
-        .outerjoin(SubagentRun, SubagentRun.id == ChatSession.id)
-        .outerjoin(parent_session, parent_session.id == SubagentRun.parent_session_id)
-        .where(
-            ChatSession.id == session_id,
-            or_(
-                ChatSession.agent_id == agent_id,
-                ChatSession.peer_agent_id == agent_id,
-                and_(
-                    ChatSession.source_channel == "subagent",
-                    or_(
-                        parent_session.agent_id == agent_id,
-                        and_(
-                            parent_session.source_channel == "agent",
-                            parent_session.peer_agent_id == agent_id,
-                        ),
-                    ),
-                ),
-            ),
-        )
+    _chat_session_access.check_agent_access = check_agent_access
+    _chat_session_access.require_current_agent_tenant = require_current_agent_tenant
+    _chat_session_access.require_tenant_safe_chat_session = require_tenant_safe_chat_session
+    _chat_session_access._can_view_all_agent_chat_sessions = (
+        _can_view_all_agent_chat_sessions
     )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    # Real ORM agents always expose tenant_id. A few isolated protocol-double
-    # tests intentionally omit it and exercise unrelated response shaping.
-    if hasattr(agent, "tenant_id"):
-        await require_tenant_safe_chat_session(db, session, agent.tenant_id)
-
-    source_channel = str(session.source_channel or "web").lower()
-    is_subagent_owner = False
-    if source_channel == "subagent":
-        run = await db.get(SubagentRun, session.id)
-        is_subagent_owner = bool(
-            run is not None and run.execution_user_id == current_user.id
-        )
-
-    is_owner = (
-        str(session.user_id) == str(current_user.id) or is_subagent_owner
+    return await _chat_session_access._load_accessible_session(
+        db, current_user, agent_id, session_id
     )
-    is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
-    is_group_member = False
-    if bool(getattr(session, "is_group", False)) and not is_owner and not is_privileged:
-        member_result = await db.execute(
-            select(ChatMessage.id)
-            .where(
-                ChatMessage.conversation_id == str(session_id),
-                ChatMessage.role == "user",
-                or_(
-                    ChatMessage.sender_user_id == current_user.id,
-                    and_(
-                        ChatMessage.sender_user_id.is_(None),
-                        ChatMessage.user_id == current_user.id,
-                    ),
-                ),
-            )
-            .limit(1)
-        )
-        is_group_member = member_result.scalar_one_or_none() is not None
-
-    is_trigger_manager = agent_access == "manage" and source_channel == "trigger"
-    if not (is_owner or is_privileged or is_group_member or is_trigger_manager or project_access is not None):
-        raise HTTPException(status_code=403, detail="Not authorized to view this session")
-
-    view_scope: Literal["mine", "all"] = (
-        "mine"
-        if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member or project_access is not None)
-        else "all"
-    )
-    return agent, session, view_scope
 
 
 async def _build_session_detail_out(
@@ -254,73 +137,8 @@ async def _build_session_detail_out(
     session: ChatSession,
     view_scope: Literal["mine", "all"],
 ) -> SessionDetailOut:
-    count_result = await db.execute(
-        select(func.count(ChatMessage.id)).where(ChatMessage.conversation_id == str(session.id))
-    )
-    message_count = int(count_result.scalar() or 0)
-
-    username: Optional[str] = None
-    peer_agent_id: Optional[str] = None
-    peer_agent_name: Optional[str] = None
-    participant_type = "user"
-    runtime: SessionRuntimeOut | None = None
-
-    if session.source_channel == "agent" and session.peer_agent_id:
-        participant_type = "agent"
-        peer_agent_id = str(session.peer_agent_id)
-        names_result = await db.execute(
-            select(Agent.id, Agent.name).where(Agent.id.in_([session.agent_id, session.peer_agent_id]))
-        )
-        agent_names = {str(row[0]): row[1] or "Agent" for row in names_result.all()}
-        first_name = agent_names.get(str(session.agent_id), "Agent")
-        second_name = agent_names.get(str(session.peer_agent_id), "Agent")
-        peer_agent_name = second_name
-        username = f"Agent {first_name} - {second_name}"
-    elif session.is_group:
-        participant_type = "group"
-        username = session.group_name or session.title or "Group Chat"
-    elif session.user_id:
-        user_result = await db.execute(
-            select(func.coalesce(User.display_name, Identity.username))
-            .outerjoin(Identity, User.identity_id == Identity.id)
-            .where(User.id == session.user_id)
-        )
-        username = user_result.scalar_one_or_none() or "Unknown"
-
-    if session.source_channel == "subagent":
-        run = await db.get(SubagentRun, session.id)
-        execution_agent = await db.get(Agent, session.agent_id)
-        if run is not None and execution_agent is not None:
-            runtime = SessionRuntimeOut(
-                kind="subagent",
-                status=run.status,
-                execution_agent_id=str(execution_agent.id),
-                execution_agent_name=execution_agent.name or "Agent",
-                mode=run.mode,
-                model=run.model,
-                soul=run.soul,
-                memory=run.memory,
-            )
-
-    return SessionDetailOut(
-        id=str(session.id),
-        agent_id=str(session.agent_id),
-        user_id=str(session.user_id) if session.user_id else None,
-        username=username,
-        source_channel=session.source_channel,
-        title=session.title,
-        created_at=session.created_at.isoformat(),
-        last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
-        message_count=message_count,
-        unread_count=0,
-        is_primary=bool(session.is_primary),
-        peer_agent_id=peer_agent_id,
-        peer_agent_name=peer_agent_name,
-        participant_type=participant_type,
-        is_group=bool(session.is_group),
-        group_name=session.group_name,
-        view_scope=view_scope,
-        runtime=runtime,
+    return await _chat_session_access._build_session_detail_out(
+        db, session, view_scope
     )
 
 
@@ -906,263 +724,11 @@ async def _get_session_messages_page(
     db: AsyncSession,
     response: Response | None,
 ):
-    _, session, _ = await _load_accessible_session(db, current_user, agent_id, session_id)
-
-    # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
-    # Optimized: use a single query with ORDER BY and LIMIT instead of subquery
-    from sqlalchemy import asc, desc
-    query = (
-        select(ChatMessage)
-        .where(
-            ChatMessage.conversation_id == str(session_id),
-            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
-                "subagent_event"
-            ),
-            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
-                "onboarding_turn_anchor"
-            ),
-            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
-                "project_subagent_external_continuation"
-            ),
-            or_(
-                ChatMessage.role != "assistant",
-                ChatMessage.message_meta["media_kind"].as_string().is_(None),
-                ChatMessage.message_meta["media_kind"].as_string().not_in(
-                    ["audio", "video"]
-                ),
-                ChatMessage.message_meta["delivery_status"].as_string().is_(None),
-                ChatMessage.message_meta["delivery_status"].as_string() == "sent",
-            ),
-        )
-        # id tiebreak: own-transaction tool_call/assistant rows can share a
-        # created_at microsecond; keep the render order deterministic.
-        .order_by(desc(ChatMessage.created_at), desc(ChatMessage.id))
+    _chat_session_message_query._load_accessible_session = _load_accessible_session
+    _chat_session_message_query._split_inline_tools = _split_inline_tools
+    return await _chat_session_message_query._get_session_messages_page(
+        agent_id, session_id, limit, turn_limit, before, current_user, db, response
     )
-    # Keep accepting the legacy timestamp-only cursor, while newer clients add
-    # the message UUID so rows sharing a timestamp cannot be skipped at a page boundary.
-    if before:
-        from datetime import datetime as dt
-        try:
-            before_timestamp, separator, before_message_id = before.partition('|')
-            before_dt = dt.fromisoformat(before_timestamp.replace('Z', '+00:00'))
-            if separator:
-                cursor_id = uuid.UUID(before_message_id)
-                query = query.where(or_(
-                    ChatMessage.created_at < before_dt,
-                    and_(ChatMessage.created_at == before_dt, ChatMessage.id < cursor_id),
-                ))
-            else:
-                query = query.where(ChatMessage.created_at < before_dt)
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid `before` cursor. Use ISO 8601 or <ISO 8601>|<message UUID>.",
-            )
-    if turn_limit is not None:
-        # A persisted user row is the durable turn anchor. Resolve the oldest
-        # anchor in this page first, then fetch every row through the current
-        # cursor. Tool-heavy turns are therefore returned whole with two
-        # bounded, indexed queries instead of a raw message-row cutoff.
-        anchors_result = await db.execute(
-            query.where(ChatMessage.role == "user").limit(turn_limit)
-        )
-        anchors = list(anchors_result.scalars().all())
-        if anchors:
-            oldest_anchor = anchors[-1]
-            at_or_after_anchor = or_(
-                ChatMessage.created_at > oldest_anchor.created_at,
-                and_(
-                    ChatMessage.created_at == oldest_anchor.created_at,
-                    ChatMessage.id >= oldest_anchor.id,
-                ),
-            )
-            messages_result = await db.execute(
-                query
-                .where(at_or_after_anchor)
-                .order_by(None)
-                .order_by(asc(ChatMessage.created_at), asc(ChatMessage.id))
-            )
-            messages = list(messages_result.scalars().all())
-            older_than_anchor = or_(
-                ChatMessage.created_at < oldest_anchor.created_at,
-                and_(
-                    ChatMessage.created_at == oldest_anchor.created_at,
-                    ChatMessage.id < oldest_anchor.id,
-                ),
-            )
-            older_result = await db.execute(query.where(older_than_anchor).limit(1))
-            has_more = older_result.scalar_one_or_none() is not None
-        else:
-            # Assistant-first greetings and legacy unanchored rows are not LLM
-            # turns. Preserve the old bounded row behavior for that small tail.
-            msgs_result = await db.execute(query.limit(limit + 1))
-            newest_first = list(msgs_result.scalars().all())
-            has_more = len(newest_first) > limit
-            messages = list(reversed(newest_first[:limit]))
-    else:
-        msgs_result = await db.execute(query.limit(limit + 1))
-        newest_first = list(msgs_result.scalars().all())
-        has_more = len(newest_first) > limit
-        messages = list(reversed(newest_first[:limit]))
-    oldest_raw_message = messages[0] if messages else None
-    next_cursor = (
-        f"{oldest_raw_message.created_at.isoformat()}|{oldest_raw_message.id}"
-        if oldest_raw_message is not None
-        else ""
-    )
-    if response is not None:
-        response.headers["X-Message-Has-More"] = "true" if has_more else "false"
-        response.headers["X-Message-Next-Cursor"] = next_cursor
-
-    # Reading your own first-party/channel session should clear its unread state.
-    if str(session.user_id) == str(current_user.id) and not session.is_group and session.source_channel not in ("agent", "trigger"):
-        session.last_read_at_by_user = datetime.now(tz.utc)
-        await db.commit()
-
-    # Resolve canonical sender IDs and display names in batches. Participant is
-    # consulted only as a one-release read bridge for legacy A2A rows; its ID is
-    # never returned to callers.
-    from app.models.agent import Agent
-    from app.models.participant import Participant
-
-    participant_ids = {m.participant_id for m in messages if m.participant_id}
-    legacy_participants: dict[str, tuple[str, uuid.UUID, str]] = {}
-    if participant_ids:
-        p_result = await db.execute(
-            select(Participant.id, Participant.type, Participant.ref_id, Participant.display_name)
-            .where(Participant.id.in_(participant_ids))
-        )
-        legacy_participants = {
-            str(pid): (ptype, ref_id, display_name or "Unknown")
-            for pid, ptype, ref_id, display_name in p_result.all()
-        }
-
-    user_ids_seen: set[uuid.UUID] = set()
-    agent_ids_seen: set[uuid.UUID] = set()
-    for message in messages:
-        sender_user_id = getattr(message, "sender_user_id", None)
-        sender_agent_id = getattr(message, "sender_agent_id", None)
-        if sender_user_id:
-            user_ids_seen.add(sender_user_id)
-        elif sender_agent_id:
-            agent_ids_seen.add(sender_agent_id)
-        elif message.participant_id and str(message.participant_id) in legacy_participants:
-            participant_type, ref_id, _display = legacy_participants[str(message.participant_id)]
-            if participant_type == "user":
-                user_ids_seen.add(ref_id)
-            elif participant_type == "agent":
-                agent_ids_seen.add(ref_id)
-        elif message.role == "user" and session.source_channel != "agent":
-            legacy_user_id = getattr(message, "user_id", None) or session.user_id
-            if legacy_user_id:
-                user_ids_seen.add(legacy_user_id)
-        elif message.role in {"assistant", "tool_call"}:
-            agent_ids_seen.add(getattr(message, "agent_id", None) or agent_id)
-
-    user_name_cache: dict[str, str] = {}
-    needs_sender_names = bool(getattr(session, "is_group", False)) or session.source_channel == "agent"
-    if needs_sender_names and user_ids_seen:
-        u_rows = await db.execute(select(User.id, User.display_name).where(User.id.in_(user_ids_seen)))
-        user_name_cache = {str(uid): (name or "Unknown") for uid, name in u_rows.all()}
-    agent_name_cache: dict[str, str] = {}
-    if needs_sender_names and agent_ids_seen:
-        a_rows = await db.execute(select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids_seen)))
-        agent_name_cache = {str(aid): (name or "Unknown") for aid, name in a_rows.all()}
-
-    out = []
-    tool_call_positions: dict[str, int] = {}
-    for m in messages:
-        raw_message_meta = getattr(m, "message_meta", None)
-        message_meta = raw_message_meta if isinstance(raw_message_meta, dict) else {}
-        if (
-            m.role == "assistant"
-            and message_meta.get("media_kind") in {"audio", "video"}
-            and (
-                message_meta.get("delivery_status") not in {None, "sent"}
-            )
-        ):
-            continue
-        sender_user_id = getattr(m, "sender_user_id", None)
-        sender_agent_id = getattr(m, "sender_agent_id", None)
-        legacy_sender_name = None
-        if not sender_user_id and not sender_agent_id and m.participant_id:
-            legacy = legacy_participants.get(str(m.participant_id))
-            if legacy:
-                participant_type, ref_id, legacy_sender_name = legacy
-                if participant_type == "user":
-                    sender_user_id = ref_id
-                elif participant_type == "agent":
-                    sender_agent_id = ref_id
-        if not sender_user_id and not sender_agent_id:
-            if m.role == "user" and session.source_channel != "agent":
-                sender_user_id = getattr(m, "user_id", None) or session.user_id
-            elif m.role in {"assistant", "tool_call"}:
-                sender_agent_id = getattr(m, "agent_id", None) or agent_id
-        sender_name = legacy_sender_name
-        if sender_user_id:
-            sender_name = user_name_cache.get(str(sender_user_id), sender_name)
-        elif sender_agent_id:
-            sender_name = agent_name_cache.get(str(sender_agent_id), sender_name)
-
-        if m.role == "tool_call":
-            entry = serialize_tool_call_for_client(
-                m,
-                source_channel=session.source_channel,
-                sender_name=sender_name,
-                sender_user_id=sender_user_id,
-                sender_agent_id=sender_agent_id,
-            )
-            # Canonical tool events persist the model call_id, shared by their append-only
-            # running/done rows. Pending confirmation rows intentionally have no call_id;
-            # their database row id remains the resolve handle.
-            tool_call_id = entry["toolCallId"]
-            turn_anchor_id = str(message_meta.get("turn_anchor_id") or "legacy")
-            entry["turnAnchorId"] = (
-                turn_anchor_id if turn_anchor_id != "legacy" else None
-            )
-            tool_identity = f"{turn_anchor_id}:{tool_call_id}"
-            previous_position = tool_call_positions.get(tool_identity)
-            if previous_position is None:
-                tool_call_positions[tool_identity] = len(out)
-                out.append(entry)
-            else:
-                out[previous_position] = merge_tool_call_update_for_client(
-                    out[previous_position],
-                    entry,
-                )
-            continue
-
-        # For agent sessions, parse inline tool_code blocks from assistant messages
-        if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (m.content or ""):
-            parts = _split_inline_tools(m.content)
-            for part_index, part in enumerate(parts):
-                derived_id = f"{m.id}:inline:{part_index}"
-                part["id"] = derived_id
-                part["created_at"] = m.created_at.isoformat() if m.created_at else None
-                if part.get("role") == "tool_call":
-                    part["toolCallId"] = derived_id
-                if sender_name:
-                    part["sender_name"] = sender_name
-                if sender_user_id:
-                    part["sender_user_id"] = str(sender_user_id)
-                if sender_agent_id:
-                    part["sender_agent_id"] = str(sender_agent_id)
-                out.append(part)
-        else:
-            entry = serialize_chat_message_for_client(
-                m,
-                source_channel=session.source_channel,
-                sender_name=sender_name,
-                sender_user_id=sender_user_id,
-                sender_agent_id=sender_agent_id,
-            )
-            out.append(entry)
-
-    # NB: confirmation cards are NOT merged here any more — a card is just a
-    # `request_confirmation` tool_call row, already returned as a normal tool_call
-    # message above (the frontend renders that specific tool as the card).
-
-    return out
 
 
 @router.get("/{agent_id}/sessions/{session_id}/messages")
@@ -1221,55 +787,4 @@ async def get_session_message_turns(
         response=response,
     )
 
-def _split_inline_tools(content: str) -> list[dict]:
-    """Parse assistant content containing inline ```tool_code blocks.
-
-    Splits into alternating text segments and tool_call entries.
-    Format: ```tool_code\ntool_name\n``` ```json\n{args}\n```
-    """
-    # Pattern: ```tool_code\n<name>\n``` optionally followed by ```json\n<args>\n```
-    pattern = re.compile(
-        r'```tool_code\s*\n\s*(\w+)\s*\n```'        # tool name
-        r'(?:\s*```json\s*\n(.*?)\n```)?',            # optional JSON args
-        re.DOTALL
-    )
-
-    parts: list[dict] = []
-    last_end = 0
-
-    for match in pattern.finditer(content):
-        # Text before this tool call
-        text_before = content[last_end:match.start()].strip()
-        if text_before:
-            parts.append({"role": "assistant", "content": text_before})
-
-        tool_name = match.group(1)
-        args_str = match.group(2)
-        tool_args = None
-        if args_str:
-            try:
-                import json
-                tool_args = json.loads(args_str.strip())
-            except Exception:
-                tool_args = {"raw": args_str.strip()}
-
-        parts.append({
-            "role": "tool_call",
-            "content": "",
-            "toolName": tool_name,
-            "toolArgs": tool_args,
-            "toolStatus": "done",
-            "toolResult": "",
-        })
-        last_end = match.end()
-
-    # Trailing text after last tool
-    trailing = content[last_end:].strip()
-    if trailing:
-        parts.append({"role": "assistant", "content": trailing})
-
-    # If no matches found, return the whole content as-is
-    if not parts:
-        parts.append({"role": "assistant", "content": content})
-
-    return parts
+_split_inline_tools = _chat_session_message_query._split_inline_tools
