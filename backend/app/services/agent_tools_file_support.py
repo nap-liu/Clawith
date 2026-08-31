@@ -10,20 +10,62 @@ from pathlib import Path, PurePosixPath
 from sqlalchemy import select
 
 from app.config import get_settings
-from app.database import async_session
+from app.database import async_session as _database_async_session
 from app.models.agent import Agent as AgentModel
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
-from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.storage import get_storage_backend as _storage_get_storage_backend, normalize_storage_key
 from app.services.workspace_collaboration import normalize_workspace_path
 
 _settings = get_settings()
-WORKSPACE_ROOT = Path(_settings.STORAGE_LOCAL_ROOT or _settings.AGENT_DATA_DIR)
+_DEFAULT_WORKSPACE_ROOT = Path(_settings.STORAGE_LOCAL_ROOT or _settings.AGENT_DATA_DIR)
 
 
-def _root_agent_tools():
-    from app.services import agent_tools as root_agent_tools
+class _CallableProxy:
+    def __init__(self, attr_name: str, fallback):
+        self._attr_name = attr_name
+        self._fallback = fallback
 
-    return root_agent_tools
+    def __call__(self, *args, **kwargs):
+        from app.services import agent_tools
+
+        bound = getattr(agent_tools, self._attr_name, None)
+        if bound is self or bound is None:
+            bound = self._fallback
+        return bound(*args, **kwargs)
+
+
+class _PathProxy:
+    def __init__(self, attr_name: str, fallback: Path):
+        self._attr_name = attr_name
+        self._fallback = fallback
+
+    def _current(self) -> Path:
+        from app.services import agent_tools
+
+        bound = getattr(agent_tools, self._attr_name, None)
+        if bound is self or bound is None:
+            bound = self._fallback
+        return Path(bound)
+
+    def __truediv__(self, other):
+        return self._current() / other
+
+    def __fspath__(self):
+        return self._current().__fspath__()
+
+    def __str__(self):
+        return str(self._current())
+
+    def __repr__(self):
+        return repr(self._current())
+
+    def __getattr__(self, name):
+        return getattr(self._current(), name)
+
+
+WORKSPACE_ROOT = _PathProxy("WORKSPACE_ROOT", _DEFAULT_WORKSPACE_ROOT)
+async_session = _CallableProxy("async_session", _database_async_session)
+get_storage_backend = _CallableProxy("get_storage_backend", _storage_get_storage_backend)
 
 
 def _is_enterprise_info_path(path: str | None) -> bool:
@@ -80,8 +122,8 @@ def _normalize_tool_rel_path(rel_path: str) -> str:
 def _collapse_filename_for_match(name: str) -> str:
     """Return a comparison-only filename key for tolerant source lookup.
 
-    Exact storage paths always win. This key is used only when an exact source
-    does not exist, and a match is accepted only when it is unique. NFKC folds
+    Exact storage paths always win.  This key is used only when an exact source
+    does not exist, and a match is accepted only when it is unique.  NFKC folds
     full-width variants while ``isspace`` covers Unicode whitespace that a model
     may insert when retyping a displayed filename (for example ``6 月``).
     """
@@ -92,13 +134,12 @@ def _collapse_filename_for_match(name: str) -> str:
 def _allowed_root_for_tool_path(ws: Path, rel_path: str, tenant_id: str | None = None) -> tuple[Path, str]:
     normalized = _normalize_tool_rel_path(rel_path)
     if normalized.startswith("enterprise_info"):
-        workspace_root = _root_agent_tools().WORKSPACE_ROOT
         enterprise_root = (
-            (workspace_root / f"enterprise_info_{tenant_id}").resolve()
+            (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
             if tenant_id
-            else (workspace_root / "enterprise_info").resolve()
+            else (WORKSPACE_ROOT / "enterprise_info").resolve()
         )
-        sub = normalized[len("enterprise_info"):].lstrip("/")
+        sub = normalized[len("enterprise_info") :].lstrip("/")
         return enterprise_root, sub
     return ws.resolve(), normalized
 
@@ -130,7 +171,7 @@ def _canonicalize_execute_code_upload_paths(ws: Path, code: str) -> tuple[str, l
     """Canonicalize unique existing upload paths embedded in code literals.
 
     ``execute_code`` is intentionally generic, so target paths must not be
-    fuzzy-rewritten. Uploaded attachments are the narrow safe exception:
+    fuzzy-rewritten.  Uploaded attachments are the narrow safe exception:
     when a quoted ``workspace/uploads/...`` literal does not exist but folds
     to exactly one existing file, replace only that literal's upload suffix.
     This covers model-generated ``6 月.xlsx`` variants while preserving new
@@ -208,8 +249,14 @@ async def _resolve_exact_storage_source_path(
     rel_path: str,
     tenant_id: str | None = None,
 ) -> _ResolvedStorageSource:
-    """Resolve a file-tool source by its exact canonical storage key."""
-    storage = _root_agent_tools().get_storage_backend()
+    """Resolve a file-tool source by its exact canonical storage key.
+
+    File-reading tools must report what the caller actually requested.  They
+    therefore do not fold whitespace, width variants, case, or neighboring
+    filenames.  Structural workspace normalization remains in
+    ``_tool_storage_key`` for traversal safety and virtual-root handling.
+    """
+    storage = get_storage_backend()
     storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
     exists = bool(normalized) and await storage.is_file(storage_key)
     return _ResolvedStorageSource(storage_key, normalized, is_enterprise, exists)
@@ -220,8 +267,15 @@ async def _resolve_storage_source_path(
     rel_path: str,
     tenant_id: str | None = None,
 ) -> _ResolvedStorageSource:
-    """Resolve a source path before selective workspace materialization."""
-    storage = _root_agent_tools().get_storage_backend()
+    """Resolve a source path before selective workspace materialization.
+
+    Storage-backed tools previously materialized the model-provided exact key
+    first and only performed tolerant filename matching inside the resulting
+    temporary directory.  A miss therefore materialized nothing, making the
+    fallback unreachable.  Resolve against the storage directory first so all
+    file tools share the same workspace path.
+    """
+    storage = get_storage_backend()
     storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
     if normalized and await storage.is_file(storage_key):
         return _ResolvedStorageSource(storage_key, normalized, is_enterprise, True)
@@ -245,7 +299,12 @@ async def _resolve_storage_source_path(
     ]
     candidate_paths = tuple(f"{parent_virtual}/{entry.name}" if parent_virtual else entry.name for entry in matches)
     if len(matches) == 1:
-        return _ResolvedStorageSource(matches[0].key, candidate_paths[0], parent_is_enterprise, True)
+        return _ResolvedStorageSource(
+            matches[0].key,
+            candidate_paths[0],
+            parent_is_enterprise,
+            True,
+        )
     return _ResolvedStorageSource(
         storage_key,
         normalized,
@@ -280,8 +339,8 @@ def _display_size(size_bytes: int) -> str:
 
 
 async def _storage_list_dir(agent_id: uuid.UUID, rel_path: str, tenant_id: str | None = None) -> str:
-    storage = _root_agent_tools().get_storage_backend()
-    storage_key, normalized, _ = _tool_storage_key(agent_id, rel_path, tenant_id)
+    storage = get_storage_backend()
+    storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
 
     try:
         exists = await storage.exists(storage_key)
@@ -343,7 +402,7 @@ async def _storage_read_file(
     offset: int = 0,
     limit: int = 2000,
 ) -> str:
-    storage = _root_agent_tools().get_storage_backend()
+    storage = get_storage_backend()
     try:
         resolved = await _resolve_exact_storage_source_path(agent_id, rel_path, tenant_id)
     except Exception as exc:
@@ -408,7 +467,7 @@ async def _storage_search_files(
     ignore_case: bool = False,
     tenant_id: str | None = None,
 ) -> str:
-    storage = _root_agent_tools().get_storage_backend()
+    storage = get_storage_backend()
     rel_path = "" if path in ("", ".") else path
     base_key, normalized, _ = _tool_storage_key(agent_id, rel_path, tenant_id)
     if not await storage.is_dir(base_key) and normalized:
@@ -462,7 +521,7 @@ async def _storage_find_files(
     path: str = ".",
     tenant_id: str | None = None,
 ) -> str:
-    storage = _root_agent_tools().get_storage_backend()
+    storage = get_storage_backend()
     rel_path = "" if path in ("", ".") else path
     base_key, normalized, _ = _tool_storage_key(agent_id, rel_path, tenant_id)
     if not await storage.is_dir(base_key) and normalized:
