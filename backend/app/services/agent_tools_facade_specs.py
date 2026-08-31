@@ -146,6 +146,15 @@ MAIN_FACADE_SPECS: tuple[FacadeSpec, ...] = (
         "async_session select",
     ),
     _spec(
+        "agent_tools_registry_runtime",
+        "_get_computer_os_type _agent_has_feishu _agent_has_any_channel",
+        """
+        async_session select logger _get_tool_config
+        _patch_computer_tool_descriptions _strip_a2a_msg_type
+        _stabilize_media_tool_definitions
+        """,
+    ),
+    _spec(
         "agent_tools_file_delivery_runtime",
         """
         _send_file_to_session _send_file_to_recipient _send_file_via_feishu
