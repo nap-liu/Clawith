@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { IconCopy, IconCheck, IconTrash, IconPlus, IconX } from '@tabler/icons-react';
 import { patApi, type Pat, type PatCreated } from '../services/api';
 import { useToast } from './Toast/ToastProvider';
+import { useDialog } from './Dialog/DialogProvider';
 
 /* ── helpers ───────────────────────────────────────────── */
 
@@ -303,6 +304,7 @@ function RevealModal({ pat, onClose }: RevealModalProps) {
 export default function PatManager() {
     const { t } = useTranslation();
     const toast = useToast();
+    const dialog = useDialog();
     const queryClient = useQueryClient();
     const [showCreate, setShowCreate] = useState(false);
     const [revealed, setRevealed] = useState<PatCreated | null>(null);
@@ -321,8 +323,13 @@ export default function PatManager() {
         onError: (e: any) => toast.error(e.message || t('pat.actionFailed')),
     });
 
-    const handleRevoke = (pat: Pat) => {
-        if (!window.confirm(t('pat.revokeConfirm'))) return;
+    const handleRevoke = async (pat: Pat) => {
+        const confirmed = await dialog.confirm(t('pat.revokeConfirm'), {
+            title: t('pat.revoke'),
+            danger: true,
+            confirmLabel: t('pat.revoke'),
+        });
+        if (!confirmed) return;
         revokeMutation.mutate(pat.id);
     };
 
@@ -389,7 +396,7 @@ export default function PatManager() {
                                                 type="button"
                                                 title={t('pat.revoke')}
                                                 disabled={revokeMutation.isPending}
-                                                onClick={() => handleRevoke(pat)}
+                                                onClick={() => void handleRevoke(pat)}
                                                 style={{
                                                     background: 'none', border: 'none', cursor: 'pointer',
                                                     color: 'var(--error)', padding: '3px 6px', borderRadius: '4px',

@@ -8,6 +8,7 @@ import ChannelConfig from '../../../components/ChannelConfig';
 import OpenClawSettings from '../../OpenClawSettings';
 import { agentApi, fileApi } from '../../../services/api';
 import { useAuthStore } from '../../../stores';
+import { useDialog } from '../../../components/Dialog/DialogProvider';
 
 type SettingsFormState = {
     primary_model_id: string;
@@ -72,6 +73,7 @@ export default function SettingsTab(props: Props) {
         onDeleteAgent,
     } = props;
     const { t, i18n } = useTranslation();
+    const dialog = useDialog();
     const token = useAuthStore((s) => s.token);
     const [avatarUploading, setAvatarUploading] = useState(false);
     const readOnly = !canManage;
@@ -166,14 +168,22 @@ export default function SettingsTab(props: Props) {
                         {agent?.avatar_url && (
                             <button className="btn btn-ghost" style={{ padding: '4px 12px', fontSize: '12px', color: 'var(--error)', margin: 0 }}
                                 onClick={async () => {
-                                    if (confirm(i18n.language?.startsWith('zh') ? '确定移除此头像吗？' : 'Remove avatar?')) {
-                                        setAvatarUploading(true);
-                                        try {
-                                            await agentApi.update(agentId, { avatar_url: '' } as any);
-                                            queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
-                                        } finally {
-                                            setAvatarUploading(false);
-                                        }
+                                    const isChinese = i18n.language?.startsWith('zh');
+                                    const confirmed = await dialog.confirm(
+                                        isChinese ? '确定移除此头像吗？' : 'Remove this avatar?',
+                                        {
+                                            title: isChinese ? '移除头像' : 'Remove avatar',
+                                            danger: true,
+                                            confirmLabel: isChinese ? '移除' : 'Remove',
+                                        },
+                                    );
+                                    if (!confirmed) return;
+                                    setAvatarUploading(true);
+                                    try {
+                                        await agentApi.update(agentId, { avatar_url: '' } as any);
+                                        queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+                                    } finally {
+                                        setAvatarUploading(false);
                                     }
                                 }}
                                 disabled={avatarUploading}

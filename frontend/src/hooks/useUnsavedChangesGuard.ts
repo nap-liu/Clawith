@@ -3,7 +3,7 @@ import { useBeforeUnload, useBlocker } from 'react-router-dom';
 import { useDialog } from '../components/Dialog/DialogProvider';
 
 export function useUnsavedChangesGuard(active: boolean, message: string) {
-    const { confirm } = useDialog();
+    const { confirm: confirmDialog } = useDialog();
     const blockerRef = useRef<ReturnType<typeof useBlocker> | null>(null);
     const promptingRef = useRef(false);
     const shouldBlock = useCallback(
@@ -29,7 +29,7 @@ export function useUnsavedChangesGuard(active: boolean, message: string) {
     useEffect(() => {
         if (blocker.state !== 'blocked' || promptingRef.current) return;
         promptingRef.current = true;
-        void confirm(message, {
+        void confirmDialog(message, {
             title: '放弃未保存修改？',
             danger: true,
             confirmLabel: '继续',
@@ -40,5 +40,5 @@ export function useUnsavedChangesGuard(active: boolean, message: string) {
             if (confirmed) currentBlocker.proceed();
             else currentBlocker.reset();
         });
-    }, [blocker.state, confirm, message]);
+    }, [blocker.state, confirmDialog, message]);
 }
