@@ -351,6 +351,14 @@ from app.services.agent_tools_skill_market_ops import (
     _search_skill_market,
     _withdraw_skill_from_market,
 )
+from app.services.agent_tools_sandbox_web_ops import (
+    _DANGEROUS_BASH_ALWAYS,
+    _DANGEROUS_BASH_NETWORK,
+    _DANGEROUS_NODE_ALWAYS,
+    _DANGEROUS_NODE_NETWORK,
+    _DANGEROUS_PYTHON_IMPORTS_ALWAYS,
+    _DANGEROUS_PYTHON_IMPORTS_NETWORK,
+)
 
 
 _settings = get_settings()
@@ -724,58 +732,11 @@ _GROUP_SESSION_DENIAL = "❌ 无法投递：该群会话不存在，或不属于
 # ─── Code Execution ─────────────────────────────────────────────
 
 # Dangerous patterns to block (for legacy fallback)
-_DANGEROUS_BASH_ALWAYS = [
-    "rm -rf /",
-    "rm -rf ~",
-    "sudo ",
-    "mkfs",
-    "dd if=",
-    ":(){ :",
-    "chmod 777 /",
-    "chown ",
-    "shutdown",
-    "reboot",
-]
 
-_DANGEROUS_BASH_NETWORK = [
-    "curl ",
-    "wget ",
-    "nc ",
-    "ncat ",
-    "ssh ",
-    "scp ",
-]
 
-_DANGEROUS_PYTHON_IMPORTS_ALWAYS = [
-    "shutil.rmtree",
-    "os.system",
-    "os.popen",
-    "os.exec",
-    "os.spawn",
-]
 
-_DANGEROUS_PYTHON_IMPORTS_NETWORK = [
-    "socket",
-    "http.client",
-    "urllib.request",
-    "requests",
-    "ftplib",
-    "smtplib",
-    "telnetlib",
-    "ctypes",
-]
 
-_DANGEROUS_NODE_ALWAYS = [
-    "fs.rmSync",
-    "fs.rmdirSync",
-    "process.exit",
-]
 
-_DANGEROUS_NODE_NETWORK = [
-    "require('http')",
-    "require('https')",
-    "require('net')",
-]
 
 
 
