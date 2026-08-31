@@ -7,7 +7,16 @@ from typing import Any
 
 from loguru import logger
 
-from app.services.agent_tools import _get_tool_config
+
+async def _get_tool_config(*args, **kwargs):
+    from app.services import agent_tools
+
+    bound = getattr(agent_tools, "_get_tool_config", None)
+    if bound is _get_tool_config or bound is None:
+        from app.services.agent_tools_config_runtime import _get_tool_config as fallback
+
+        bound = fallback
+    return await bound(*args, **kwargs)
 
 
 async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
