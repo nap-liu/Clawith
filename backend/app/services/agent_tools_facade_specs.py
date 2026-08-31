@@ -147,12 +147,19 @@ MAIN_FACADE_SPECS: tuple[FacadeSpec, ...] = (
     ),
     _spec(
         "agent_tools_registry_runtime",
-        "_get_computer_os_type _agent_has_feishu _agent_has_any_channel",
+        """
+        _get_computer_os_type _agent_has_feishu _agent_has_any_channel
+        _always_core_tools _feishu_tools _channel_tools
+        """,
         """
         async_session select logger _get_tool_config
         _patch_computer_tool_descriptions _strip_a2a_msg_type
         _stabilize_media_tool_definitions
         """,
+    ),
+    _spec(
+        "agent_tools_file_support",
+        "_QUOTED_UPLOAD_PATH_PATTERNS",
     ),
     _spec(
         "agent_tools_file_delivery_runtime",
