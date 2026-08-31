@@ -223,6 +223,7 @@ from app.services.agent_tools_deploy_ops import (
     _vercel_manage_domain,
     _vercel_set_env,
 )
+from app.services import agent_tools_deploy_ops as _agent_tools_deploy_ops_module
 from app.services.agent_tools_pages_ops import (
     _list_page_access_requests,
     _list_published_pages,
@@ -330,6 +331,29 @@ TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MEDIA_TOOL_MAX_FILE_BYTES = 100 * 1024 * 1024
 MEDIA_DELIVERY_MAX_IN_FLIGHT = 4
 _outbound_media_slots = asyncio.Semaphore(MEDIA_DELIVERY_MAX_IN_FLIGHT)
+
+
+async def _deploy_ops_get_tool_config_proxy(*args, **kwargs):
+    return await _get_tool_config(*args, **kwargs)
+
+
+async def _deploy_ops_get_vercel_token_proxy(*args, **kwargs):
+    return await _get_vercel_token(*args, **kwargs)
+
+
+async def _deploy_ops_get_vercel_quota_summary_proxy(*args, **kwargs):
+    return await _get_vercel_quota_summary(*args, **kwargs)
+
+
+async def _deploy_ops_check_neon_quota_limit_proxy(*args, **kwargs):
+    return await _check_neon_quota_limit(*args, **kwargs)
+
+
+_agent_tools_deploy_ops_module._get_tool_config = _deploy_ops_get_tool_config_proxy
+_agent_tools_deploy_ops_module._get_vercel_token = _deploy_ops_get_vercel_token_proxy
+_agent_tools_deploy_ops_module._get_vercel_quota_summary = _deploy_ops_get_vercel_quota_summary_proxy
+_agent_tools_deploy_ops_module._check_neon_quota_limit = _deploy_ops_check_neon_quota_limit_proxy
+_agent_tools_deploy_ops_module._agent_workspace_root = _agent_workspace_root
 
 
 def _media_materialization_size_error(
