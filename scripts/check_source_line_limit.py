@@ -29,6 +29,7 @@ SOURCE_SUFFIXES = {
     ".less",
     ".sh",
     ".sql",
+    ".html",
 }
 
 
@@ -103,7 +104,33 @@ def _is_handwritten_source(relative: str) -> bool:
     path = Path(relative)
     if not path.parts or path.parts[0] not in SOURCE_ROOTS:
         return False
+    suffixes = path.suffixes
+    if suffixes[-2:] == [".py", ".mako"]:
+        return True
     return path.suffix in SOURCE_SUFFIXES
+
+
+def _run_self_check() -> None:
+    checks = {
+        "backend/app/services/agent_tools.py": True,
+        "backend/tests/test_gateway_workload_capacity.py": True,
+        "backend/alembic/script.py.mako": True,
+        "frontend/index.html": True,
+        "backend/app/services/skill_creator_files/assets__eval_review.html": True,
+        "frontend/scripts/test-h5-chat-timeline.mjs": True,
+        "scripts/check_source_line_limit.py": True,
+        "AGENTS.md": False,
+        ".agents/workflows/read_architecture.md": False,
+        ".github/drone.yml": False,
+        "frontend/src/i18n/en.json": False,
+        "frontend/package-lock.json": False,
+        "frontend/nginx.conf.template": False,
+        "backend/Dockerfile": False,
+    }
+    for path, expected in checks.items():
+        got = _is_handwritten_source(path)
+        if got is not expected:
+            raise AssertionError(f"classification mismatch for {path}: got {got}, expected {expected}")
 
 
 def main() -> int:
@@ -155,6 +182,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
+        _run_self_check()
         raise SystemExit(main())
     except (OSError, subprocess.CalledProcessError, UnicodeError) as exc:
         print(f"ERROR: source-line gate could not complete: {exc}", file=sys.stderr)
