@@ -57,7 +57,7 @@ def build_visible_agents_query(
     if target_tenant_id is None:
         return stmt.where(false())
 
-    if user.role == "platform_admin":
+    if is_platform_admin_user(user):
         return stmt.where(Agent.tenant_id == target_tenant_id)
 
     if user.role == "org_admin":

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "npm run test:client-id && npm run test:login-return && npm run test:chat-attachments && npm run test:web-chat-resume && npm run test:h5-chat-timeline && npm run test:rich-mentions && npm run test:project-session-routing && npm run test:project-copy-i18n && npm run test:project-git-diff && npm run test:project-file-workspace && npm run test:h5-auto-scroll && npm run test:h5-theme && npm run test:h5-link && npm run test:h5-lifecycle && npm run test:h5-auth && npm run test:h5-content-protection && npm run test:published-page-sdk && npm run test:platform-watermark && npm run test:overlay-components && npm run test:vconsole",
+    "prebuild": "npm run test:client-id && npm run test:agent-directory && npm run test:login-return && npm run test:chat-attachments && npm run test:web-chat-resume && npm run test:h5-chat-timeline && npm run test:rich-mentions && npm run test:project-session-routing && npm run test:project-copy-i18n && npm run test:project-git-diff && npm run test:project-file-workspace && npm run test:h5-auto-scroll && npm run test:h5-theme && npm run test:h5-link && npm run test:h5-lifecycle && npm run test:h5-auth && npm run test:h5-content-protection && npm run test:published-page-sdk && npm run test:platform-watermark && npm run test:overlay-components && npm run test:vconsole",
     "build": "tsc && vite build",
     "test:h5-theme": "node scripts/test-h5-url-params.mjs && node scripts/test-h5-theme-tokens.mjs && node scripts/test-h5-theme-runtime.mjs",
     "test:h5-link": "node scripts/test-h5-platform-sdk-bootstrap.mjs && node scripts/test-miniprogram-uri.mjs && node scripts/test-scene-quick-actions.mjs && node scripts/test-h5-link-policy.mjs && node scripts/test-h5-link-feedback.mjs && node scripts/test-h5-container-runtime.mjs && node scripts/test-dingtalk-link-runtime.mjs && node scripts/test-wechat-miniprogram-link-runtime.mjs",
@@ -18,6 +18,7 @@
     "test:overlay-components": "node scripts/test-overlay-components.mjs",
     "test:vconsole": "node scripts/test-vconsole-runtime.mjs",
     "test:client-id": "node scripts/test-client-id.mjs",
+    "test:agent-directory": "node scripts/test-agent-directory-pagination.mjs",
     "test:login-return": "node scripts/test-login-return.mjs",
     "test:chat-attachments": "node scripts/test-chat-attachments.mjs",
     "test:web-chat-resume": "node scripts/test-web-chat-resume.mjs",

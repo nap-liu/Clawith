@@ -1082,6 +1082,7 @@
     "deleteAction": "Delete",
     "deleteNamedProject": "Delete project {{name}}",
     "deleteConfirm": "Delete “{{name}}”? This action cannot be undone.",
+    "deleteFailed": "The project could not be deleted. Try again later.",
     "private": "Only me",
     "shared": "Shared",
     "digitalEmployeeCount_one": "{{count}} Digital Employee",
@@ -1823,7 +1824,11 @@
     "agentSearchPlaceholder": "Search name or creator",
     "agentSearchLabel": "Search Agents by name or creator",
     "clearAgentSearch": "Clear Agent search",
-    "noAgentMatches": "No matching Agents"
+    "noAgentMatches": "No matching Agents",
+    "agentLoadFailed": "The Agent list could not be loaded.",
+    "agentLoadIncomplete": "The Agent list is only partially loaded.",
+    "resultsIncomplete": "search results may be incomplete",
+    "retry": "Retry"
   },
   "skillMarket": {
     "eyebrow": "SKILL MARKET",

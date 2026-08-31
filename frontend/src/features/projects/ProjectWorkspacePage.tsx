@@ -6895,7 +6895,9 @@ function ProjectVisibilitySettings({
 }) {
   const { t } = useTranslation();
   const toast = useToast();
-  const canManageAccess = project.access_role === "owner";
+  const canManageAccess = project.can_manage_sharing === true;
+  const canManageExecutionUser =
+    project.can_manage_execution_user === true;
   const [visibility, setVisibility] = useState<"private" | "shared">(
     project.visibility,
   );
@@ -6947,8 +6949,11 @@ function ProjectVisibilitySettings({
   const sharedWithoutMembers =
     visibility === "shared" && sharedUserIds.length === 0;
   const sharedWithoutExecutionUser =
+    canManageExecutionUser &&
     visibility === "shared" &&
-    (!executionUserId || !sharedUserIds.includes(executionUserId));
+    (!executionUserId ||
+      (executionUserId !== project.owner_id &&
+        !sharedUserIds.includes(executionUserId)));
   const save = async () => {
     if (readOnly) return;
     if (sharedWithoutMembers) {
@@ -6965,8 +6970,12 @@ function ProjectVisibilitySettings({
       await projectsApi.update(projectId, {
         visibility,
         shared_with_user_ids: visibility === "shared" ? sharedUserIds : [],
-        execution_user_id:
-          visibility === "shared" ? executionUserId : null,
+        ...(canManageExecutionUser
+          ? {
+              execution_user_id:
+                visibility === "shared" ? executionUserId : null,
+            }
+          : {}),
       });
       toast.success(
         t(
@@ -7079,44 +7088,41 @@ function ProjectVisibilitySettings({
             </div>
           )}
         </ProjectField>
-        <ProjectField
-          label={t("projectWorkspacePage.visibility.executionUser")}
-          hint={t("projectWorkspacePage.visibility.executionUserHint")}
-          error={
-            sharedWithoutExecutionUser
-              ? t(
-                  "projectWorkspacePage.visibility.executionUserRequiredShort",
-                )
-              : undefined
-          }
-        >
-          <ProjectSelect
-            value={visibility === "shared" ? executionUserId : "owner"}
-            options={
-              visibility === "shared"
-                ? selectedUsers.map((user) => ({
-                    value: user.id,
-                    label: user.name,
-                  }))
-                : [
-                    {
-                      value: "owner",
-                      label:
-                        project.owner_name ||
-                        t("projectWorkspacePage.visibility.executionUserOwner"),
-                    },
-                  ]
+        {canManageExecutionUser && (
+          <ProjectField
+            label={t("projectWorkspacePage.visibility.executionUser")}
+            hint={t("projectWorkspacePage.visibility.executionUserHint")}
+            error={
+              sharedWithoutExecutionUser
+                ? t(
+                    "projectWorkspacePage.visibility.executionUserRequiredShort",
+                  )
+                : undefined
             }
-            onChange={setExecutionUserId}
-            ariaLabel={t("projectWorkspacePage.visibility.executionUser")}
-            disabled={
-              readOnly || visibility !== "shared" || selectedUsers.length === 0
-            }
-            placeholder={t(
-              "projectWorkspacePage.visibility.selectExecutionUser",
-            )}
-          />
-        </ProjectField>
+          >
+            <ProjectSelect
+              value={visibility === "shared" ? executionUserId : project.owner_id || ""}
+              options={[
+                {
+                  value: project.owner_id || "",
+                  label:
+                    project.owner_name ||
+                    t("projectWorkspacePage.visibility.executionUserOwner"),
+                },
+                ...selectedUsers.map((user) => ({
+                  value: user.id,
+                  label: user.name,
+                })),
+              ].filter((option) => Boolean(option.value))}
+              onChange={setExecutionUserId}
+              ariaLabel={t("projectWorkspacePage.visibility.executionUser")}
+              disabled={readOnly || visibility !== "shared"}
+              placeholder={t(
+                "projectWorkspacePage.visibility.selectExecutionUser",
+              )}
+            />
+          </ProjectField>
+        )}
       </div>
       <footer>
         <div>
@@ -7163,7 +7169,13 @@ function ProjectVisibilitySettings({
           setSharedUsers(users);
           const userIds = users.map((user) => user.id);
           setSharedUserIds(userIds);
-          if (!userIds.includes(executionUserId)) setExecutionUserId("");
+          if (
+            canManageExecutionUser &&
+            executionUserId !== project.owner_id &&
+            !userIds.includes(executionUserId)
+          ) {
+            setExecutionUserId("");
+          }
         }}
       />
     </section>

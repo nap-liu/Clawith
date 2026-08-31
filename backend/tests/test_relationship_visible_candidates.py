@@ -209,10 +209,11 @@ async def session():
         OrgMember,
         RelationshipSuppression,
     )
-    from app.models.user import User
+    from app.models.user import Identity, User
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
     tables = [
+        Identity.__table__,
         User.__table__,
         Agent.__table__,
         AgentPermission.__table__,
@@ -333,6 +334,103 @@ async def test_visible_agents_query_includes_parent_department_grant(session):
         (await session.execute(permissions.build_visible_agents_query(user))).scalars()
     )
     assert [agent.id for agent in visible] == [custom.id]
+
+
+@pytest.mark.asyncio
+async def test_identity_platform_admin_visibility_follows_switched_tenant_and_standard_scope(session):
+    from app.models.user import Identity, User
+
+    old_tenant = uuid.uuid4()
+    target_tenant = uuid.uuid4()
+    identity = Identity(
+        id=uuid.uuid4(),
+        username=f"platform-{uuid.uuid4().hex[:8]}",
+        password_hash="test-only",
+        is_platform_admin=True,
+    )
+    old_token_user = User(
+        id=uuid.uuid4(),
+        identity=identity,
+        tenant_id=old_tenant,
+        display_name="Platform old tenant",
+        role="member",
+        is_active=True,
+    )
+    switched_user = User(
+        id=uuid.uuid4(),
+        identity=identity,
+        tenant_id=target_tenant,
+        display_name="Platform target tenant",
+        role="member",
+        is_active=True,
+    )
+    org_admin = _new_user(target_tenant, role="org_admin")
+    creator = _new_user(target_tenant)
+    old_private = _new_agent(
+        old_tenant,
+        old_token_user.id,
+        name="old-private",
+        access_mode="private",
+    )
+    target_private = _new_agent(
+        target_tenant,
+        creator.id,
+        name="target-private",
+        access_mode="private",
+    )
+    target_company = _new_agent(
+        target_tenant,
+        creator.id,
+        name="target-company",
+        access_mode="company",
+    )
+    project_agent = _new_agent(
+        target_tenant,
+        creator.id,
+        name="project-agent",
+        access_mode="private",
+    )
+    project_agent.scope = "project"
+    project_agent.project_id = uuid.uuid4()
+    project_agent.agent_dir = f"project-{project_agent.id}"
+    session.add_all(
+        [
+            identity,
+            old_token_user,
+            switched_user,
+            org_admin,
+            creator,
+            old_private,
+            target_private,
+            target_company,
+            project_agent,
+        ]
+    )
+    await session.flush()
+
+    old_visible = {
+        agent.id
+        for agent in (
+            await session.execute(permissions.build_visible_agents_query(old_token_user))
+        ).scalars()
+    }
+    assert old_visible == {old_private.id}
+
+    switched_visible = {
+        agent.id
+        for agent in (
+            await session.execute(permissions.build_visible_agents_query(switched_user))
+        ).scalars()
+    }
+    assert switched_visible == {target_private.id, target_company.id}
+
+    org_admin_visible = {
+        agent.id
+        for agent in (
+            await session.execute(permissions.build_visible_agents_query(org_admin))
+        ).scalars()
+    }
+    assert org_admin_visible == {target_company.id}
 
 
 # ─── Change 2: save gate = visible (not manage) ───────────────────────────

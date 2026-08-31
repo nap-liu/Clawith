@@ -41,6 +41,10 @@ export interface ProjectSummary {
   owner_id?: string | null;
   owner_name?: string | null;
   access_role: ProjectAccessRole;
+  is_project_owner?: boolean;
+  can_delete?: boolean;
+  can_manage_sharing?: boolean;
+  can_manage_execution_user?: boolean;
   shared_with_user_ids?: string[];
   shared_with_names?: string[];
   execution_user_id?: string | null;
