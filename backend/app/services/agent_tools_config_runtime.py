@@ -7,7 +7,10 @@ from typing import Optional
 from loguru import logger
 from sqlalchemy import select
 
-from app.database import async_session
+def _root_agent_tools():
+    from app.services import agent_tools as root_agent_tools
+
+    return root_agent_tools
 
 
 # ─── Tool Config Cache ──────────────────────────────────────────
@@ -113,7 +116,9 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
         merge_tool_config_layers,
     )
 
-    async with async_session() as db:
+    root_agent_tools = _root_agent_tools()
+
+    async with root_agent_tools.async_session() as db:
         agent_tenant_id = None
         if agent_id:
             tenant_r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
@@ -175,4 +180,3 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     return None
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

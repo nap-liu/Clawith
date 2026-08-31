@@ -5,15 +5,22 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from app.database import async_session
 from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields
+
+
+def _root_agent_tools():
+    from app.services import agent_tools as root_agent_tools
+
+    return root_agent_tools
 
 
 async def _get_email_config(agent_id: uuid.UUID) -> dict:
     """Retrieve per-agent email config from the send_email tool's AgentTool config."""
     from app.models.tool import Tool, AgentTool
 
-    async with async_session() as db:
+    root_agent_tools = _root_agent_tools()
+
+    async with root_agent_tools.async_session() as db:
         # Find the send_email tool
         r = await db.execute(select(Tool).where(Tool.name == "send_email"))
         tool = r.scalar_one_or_none()
@@ -77,4 +84,3 @@ async def _handle_email_tool(tool_name: str, agent_id: uuid.UUID, ws: Path, argu
         return f"❌ Email tool error: {str(e)[:200]}"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

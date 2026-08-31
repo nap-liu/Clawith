@@ -7,14 +7,19 @@ from pathlib import Path
 
 from loguru import logger
 
-from app.services.agent_tools import _agent_workspace_root, _get_tool_config
+
+def _root_agent_tools():
+    from app.services import agent_tools as root_agent_tools
+
+    return root_agent_tools
 
 
 async def _get_vercel_token(agent_id: uuid.UUID, tool_name: str) -> str | None:
-    config = await _get_tool_config(agent_id, tool_name)
+    root_agent_tools = _root_agent_tools()
+    config = await root_agent_tools._get_tool_config(agent_id, tool_name)
     token = (config or {}).get("vercel_token")
     if not token and tool_name != "vercel_deploy":
-        config_deploy = await _get_tool_config(agent_id, "vercel_deploy")
+        config_deploy = await root_agent_tools._get_tool_config(agent_id, "vercel_deploy")
         token = (config_deploy or {}).get("vercel_token")
     return token
 
@@ -83,7 +88,7 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     if not project_name:
         return "❌ Missing required argument 'project_name'."
 
-    token = await _get_vercel_token(agent_id, "vercel_deploy")
+    token = await _root_agent_tools()._get_vercel_token(agent_id, "vercel_deploy")
     if not token:
         return "❌ Vercel Access Token is not configured. Please paste your token in the tool settings."
 
@@ -92,7 +97,7 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     # Resolve the absolute path of the source directory in the workspace
     source_dir_path = ws / source_dir_arg.lstrip("/")
     if not source_dir_path.exists() or not source_dir_path.is_dir():
-        source_dir_path = _agent_workspace_root(agent_id) / source_dir_arg.lstrip("/")
+        source_dir_path = _root_agent_tools()._agent_workspace_root(agent_id) / source_dir_arg.lstrip("/")
         if not source_dir_path.exists() or not source_dir_path.is_dir():
             return f"❌ Source directory '{source_dir_arg}' does not exist in workspace."
 
@@ -218,7 +223,7 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                         break
                 await asyncio.sleep(2.0)
 
-            quota_summary = await _get_vercel_quota_summary(token)
+            quota_summary = await _root_agent_tools()._get_vercel_quota_summary(token)
 
             if status == "READY":
                 return (
@@ -251,7 +256,7 @@ async def _vercel_list_deployments(agent_id: uuid.UUID, arguments: dict) -> str:
     if not project_name:
         return "❌ Missing required argument: 'project_name'."
 
-    token = await _get_vercel_token(agent_id, "vercel_list_deployments")
+    token = await _root_agent_tools()._get_vercel_token(agent_id, "vercel_list_deployments")
     if not token:
         return "❌ Vercel Access Token is not configured."
 
@@ -295,7 +300,7 @@ async def _vercel_get_deploy_logs(agent_id: uuid.UUID, arguments: dict) -> str:
     if "https://" in deployment_id:
         deployment_id = deployment_id.replace("https://", "").split("/")[0]
 
-    token = await _get_vercel_token(agent_id, "vercel_get_deploy_logs")
+    token = await _root_agent_tools()._get_vercel_token(agent_id, "vercel_get_deploy_logs")
     if not token:
         return "❌ Vercel Access Token is not configured."
 
@@ -336,7 +341,7 @@ async def _vercel_set_env(agent_id: uuid.UUID, arguments: dict) -> str:
     if not project_name or not key or not value:
         return "❌ Missing required arguments: 'project_name', 'key', and 'value' are required."
 
-    token = await _get_vercel_token(agent_id, "vercel_set_env")
+    token = await _root_agent_tools()._get_vercel_token(agent_id, "vercel_set_env")
     if not token:
         return "❌ Vercel Access Token is not configured."
 
@@ -397,7 +402,7 @@ async def _vercel_manage_domain(agent_id: uuid.UUID, arguments: dict) -> str:
     if not action or not domain:
         return "❌ Missing required arguments: 'action' and 'domain' are required."
 
-    token = await _get_vercel_token(agent_id, "vercel_manage_domain")
+    token = await _root_agent_tools()._get_vercel_token(agent_id, "vercel_manage_domain")
     if not token:
         return "❌ Vercel Access Token is not configured."
 
@@ -456,12 +461,12 @@ async def _neon_create_database(agent_id: uuid.UUID, arguments: dict) -> str:
     if not project_name:
         return "❌ Missing required argument: 'project_name'."
 
-    config = await _get_tool_config(agent_id, "neon_create_database")
+    config = await _root_agent_tools()._get_tool_config(agent_id, "neon_create_database")
     api_key = (config or {}).get("neon_api_key")
     if not api_key:
         return "❌ Neon API Key is not configured. Please paste your key in the tool settings."
 
-    is_blocked, quota_msg = await _check_neon_quota_limit(api_key)
+    is_blocked, quota_msg = await _root_agent_tools()._check_neon_quota_limit(api_key)
     if is_blocked:
         return quota_msg
 
