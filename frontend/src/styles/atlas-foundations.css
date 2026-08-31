@@ -1,0 +1,272 @@
+/* ═══════════════════════════════════════════════════════
+   Atlas — Paper / Night design system
+   Used only by the 4 onboarding screens. All tokens scoped
+   to .atlas-page so the rest of the app is unaffected.
+   ═══════════════════════════════════════════════════════ */
+
+/* ─── Tokens ──────────────────────────────────────────── */
+.atlas-page {
+  /* Paper Atlas defaults (light theme) */
+  --bg: #F4F1EB;
+  --bg-card: #FFFFFF;
+  --ink: #1A1814;
+  --ink-soft: #3C3933;
+  --muted: #8A8478;
+  --hairline: #ECE9E2;
+  --grid: rgba(26, 24, 20, 0.05);
+  --star: rgba(26, 24, 20, 0.32);
+
+  --font-serif: 'Newsreader', Georgia, 'Times New Roman', serif;
+  --font-sans:  'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono:  'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  position: relative;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  animation: atlas-page-enter 520ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Page enter — whole page fades in, then the body content lifts up
+   slightly with a tiny stagger from the chrome */
+@keyframes atlas-page-enter {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.atlas-page > .atlas-frame-body {
+  animation: atlas-body-enter 720ms cubic-bezier(0.16, 1, 0.3, 1) 100ms both;
+}
+
+@keyframes atlas-body-enter {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .atlas-page,
+  .atlas-page > .atlas-frame-body {
+    animation: none;
+  }
+}
+
+[data-theme="dark"] .atlas-page {
+  --bg: #0E0F14;
+  --bg-card: #000000;
+  --ink: #ECE9E2;
+  --ink-soft: #C7C3B9;
+  --muted: #6C6A65;
+  --hairline: rgba(236, 233, 226, 0.12);
+  --grid: rgba(236, 233, 226, 0.04);
+  --star: rgba(236, 233, 226, 0.36);
+}
+
+/* ─── Page chrome (AtlasFrame) ───────────────────────── */
+.atlas-frame-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 30px 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  z-index: 50;
+}
+
+.atlas-frame-top-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.atlas-brand-wordmark {
+  display: block;
+  color: var(--ink);
+  flex: none;
+}
+
+.atlas-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+.atlas-step-rule {
+  display: inline-block;
+  width: 36px;
+  border-top: 1px solid var(--hairline);
+}
+
+.atlas-globe-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease;
+}
+.atlas-globe-btn:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.atlas-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  height: 32px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 140ms ease;
+}
+.atlas-back-btn:hover { border-color: var(--ink); }
+
+.atlas-frame-body {
+  position: relative;
+  z-index: 10;
+  min-height: 100vh;
+}
+
+.atlas-frame-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 0 40px 30px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+  z-index: 50;
+  pointer-events: none;
+  text-transform: uppercase;
+}
+
+.atlas-corner {
+  position: absolute;
+  width: 32px;
+  height: 32px;
+  pointer-events: none;
+  z-index: 49;
+}
+.atlas-corner--bl { bottom: 28px; left: 28px; border-left: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); }
+.atlas-corner--br { bottom: 28px; right: 28px; border-right: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); }
+.atlas-corner--tl { top: 28px;    left: 28px; border-left: 1px solid var(--hairline); border-top: 1px solid var(--hairline); }
+.atlas-corner--tr { top: 28px;    right: 28px; border-right: 1px solid var(--hairline); border-top: 1px solid var(--hairline); }
+
+/* ─── Star field (background) ────────────────────────── */
+.atlas-starfield {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+  color: var(--star);
+}
+
+/* ─── Illustration container helper ──────────────────── */
+.atlas-illustration {
+  display: block;
+  color: var(--ink);
+}
+.atlas-illustration * {
+  vector-effect: non-scaling-stroke;
+}
+
+/* ─── Typography ─────────────────────────────────────── */
+.atlas-display {
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-style: normal;
+  font-size: 64px;
+  line-height: 1.0;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  margin: 0;
+}
+.atlas-display em {
+  font-style: italic;
+  font-weight: 400;
+}
+
+.atlas-h1 {
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-style: normal;
+  font-size: 44px;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  margin: 0;
+}
+.atlas-h1 em {
+  font-style: italic;
+  font-weight: 400;
+}
+
+.atlas-h2 {
+  font-family: var(--font-serif);
+  font-weight: 400;
+  font-size: 32px;
+  line-height: 1.2;
+  color: var(--ink);
+  margin: 0;
+}
+.atlas-h2 em {
+  font-style: italic;
+}
+
+.atlas-body {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink);
+  margin: 0;
+}
+.atlas-body--muted { color: var(--muted); }
+
+.atlas-mono {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  font-size: 11px;
+  line-height: 1.4;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0;
+}
+
+.atlas-tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0;
+}

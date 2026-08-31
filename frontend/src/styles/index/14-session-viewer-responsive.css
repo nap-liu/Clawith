@@ -1,0 +1,78 @@
+.session-viewer-drawer__composer-row:focus-within {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+.session-viewer-drawer__composer-row textarea {
+  min-width: 0;
+  max-height: 132px;
+  flex: 1;
+  resize: none;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.session-viewer-drawer__composer-row > .ui-rich-mention-composer {
+  min-height: 34px;
+  padding: 6px 2px;
+  box-sizing: border-box;
+}
+
+.session-viewer-drawer__composer-row textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+.session-viewer-drawer__composer-icon,
+.session-viewer-drawer__composer-send {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 8px;
+}
+
+.session-viewer-drawer__composer-send {
+  background: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+.session-viewer-drawer__composer-send--stop {
+  background: var(--error);
+  color: var(--text-inverse);
+}
+
+.session-viewer-drawer__composer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.session-viewer-drawer__composer-status {
+  padding: 0 4px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+@media (max-width: 900px) {
+  .subagent-run-card {
+    width: min(620px, 100%);
+  }
+
+  .session-viewer-drawer--pc {
+    width: 100vw;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .subagent-run-card,
+  .session-viewer-drawer,
+  .session-viewer-drawer-backdrop,
+  .subagent-run-card__spin,
+  .session-viewer-drawer__live i {
+    animation: none;
+    transition: none;
+  }
+}
