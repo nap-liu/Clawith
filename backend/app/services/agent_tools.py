@@ -141,6 +141,7 @@ from app.services.user_project_tools import (
 from app.services.agent_tools_catalog import AGENT_TOOLS
 from app.services import agent_tools_document_tools as _agent_tools_document_tools_module
 from app.services import agent_tools_image_ops as _agent_tools_image_ops_module
+from app.services import agent_tools_media_delivery_support as _agent_tools_media_delivery_support_module
 from app.services import agent_tools_outbound_core as _agent_tools_outbound_core_module
 from app.services.agent_tools_facade import (
     export_module_symbols,
@@ -347,7 +348,7 @@ TOOL_MATERIALIZE_MAX_FILE_BYTES = 10 * 1024 * 1024
 TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MEDIA_TOOL_MAX_FILE_BYTES = 100 * 1024 * 1024
 MEDIA_DELIVERY_MAX_IN_FLIGHT = 4
-_outbound_media_slots = asyncio.Semaphore(MEDIA_DELIVERY_MAX_IN_FLIGHT)
+_outbound_media_slots = _agent_tools_outbound_core_module._outbound_media_slots
 _OUTBOUND_CORE_EXPORT_NAMES = (
     "_build_outbound_operation_key",
     "_lock_outbound_operation",
@@ -427,11 +428,6 @@ export_module_symbols(
     _OUTBOUND_CORE_EXPORT_NAMES,
 )
 prepare_exported_callables(__name__, _OUTBOUND_CORE_EXPORT_NAMES)
-register_sync_targets(
-    __name__,
-    (_agent_tools_outbound_core_module,),
-    _OUTBOUND_CORE_SYNC_NAMES,
-)
 export_module_symbols(
     __name__,
     (_agent_tools_image_ops_module,),
@@ -524,9 +520,14 @@ channel_web_agent_id: ContextVar = ContextVar("channel_web_agent_id", default=No
 # Set by Feishu channel handler — open_id of the message sender so calendar tool
 # can auto-invite them as attendee when no explicit attendee list is given
 channel_feishu_sender_open_id: ContextVar = ContextVar("channel_feishu_sender_open_id", default=None)
-_outbound_media_connection: ContextVar = ContextVar(
-    "outbound_media_connection",
-    default=None,
+_outbound_media_connection: ContextVar = _agent_tools_outbound_core_module._outbound_media_connection
+register_sync_targets(
+    __name__,
+    (
+        _agent_tools_outbound_core_module,
+        _agent_tools_media_delivery_support_module,
+    ),
+    _OUTBOUND_CORE_SYNC_NAMES,
 )
 
 # ─── Tool Definitions (OpenAI function-calling format) ──────────
