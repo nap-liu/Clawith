@@ -1,360 +1,364 @@
 # Production release runbook
 
 This is the canonical executable release workflow for the digital employee
-platform.  A release plan is incomplete unless it instantiates every section
-below with the actual release SHA, image digests, backup decision, validation
-evidence, owners, and rollback anchors.
+platform. A release is incomplete unless every applicable section has evidence,
+an owner, an authority checkpoint, and a tested rollback anchor.
 
-Production hosts, credentials, registry authentication, domains, and absolute
-data paths live in the approved operations inventory.  Keep them out of Git.
-Use the symbolic values in this document when preparing a plan and resolve them
-only inside the authorized release session.
+Production hosts, credentials, private endpoints, registry authentication,
+domains, and absolute data paths live in the approved operations inventory.
+Resolve them only inside the authorized release session; never copy remembered
+values into this repository.
 
-## 1. Authorization and roles
+## 1. Authorization and release record
 
-Production release, push, tag, PR merge, and production configuration changes
-each require explicit authorization.  Naming a plan or asking for an audit does
-not authorize execution.
+Production inspection, backup, migration, external smoke messages, configuration
+mutation, cutover, rollback, push, and tag are separate authority boundaries.
+Planning or auditing grants none of them.
 
-Assign these roles before the window; one person may hold multiple roles, but
-the release owner and rollback decision must be explicit:
+Record before GO:
 
-- release owner: owns GO/NO-GO and the immutable release record;
-- operator: builds, pushes, pulls, and performs the cutover;
-- verifier: runs the acceptance matrix and records evidence;
-- data owner: approves backup omissions and any point-in-time restore;
-- rollback owner: can stop the release immediately when a stop condition fires.
+```text
+RELEASE_OWNER=
+OPERATOR=
+VERIFIER=
+DATA_OWNER=
+ROLLBACK_OWNER=
+WINDOW_START=
+WINDOW_END=
+AUTHORIZED_INTERRUPTION_POLICY=
+CURRENT_RELEASE_SHA=
+CURRENT_BACKEND_DIGEST=
+CURRENT_FRONTEND_DIGEST=
+CURRENT_AIO_DIGEST=
+RELEASE_SHA=
+UPSTREAM_VERSION=
+RELEASE_ID=v<UPSTREAM_VERSION>-<RELEASE_SHA7>
+NEW_BACKEND_DIGEST=
+NEW_FRONTEND_DIGEST=
+COMPOSE_PROJECT=
+BACKUP_ID=
+```
 
-Record the maintenance window, expected write interruption, rollback deadline,
-communication channel, and user notification text before execution.
+The release owner makes GO/NO-GO decisions. The data owner approves backup
+scope and any restore that discards writes. The rollback owner may stop the
+release when a declared condition fires.
 
 ## 2. Freeze the authoritative source
 
 1. Fetch only the selected company remote and inspect `company/main`.
-2. Verify the reviewed candidate is based on the current authoritative main.
-3. If main moved, integrate it, rerun the change audit and all required Docker
-   validation, and choose a new final SHA.
-4. Prefer a linear/fast-forward integration that preserves the reviewed SHA.
-   If repository policy creates a merge or squash commit, that new commit is the
-   release SHA and all SHA-bound gates must run again.
-5. Confirm the release SHA is reachable from `company/main`, the tree is clean,
-   and backend and frontend `VERSION` files still match the current upstream
-   semantic version.
+2. Verify the reviewed candidate is based on current authoritative main.
+3. If main moves, integrate it, repeat the diff audit and required Docker gates,
+   and select a new final SHA.
+4. Confirm the candidate checkout is clean and backend/frontend `VERSION` files
+   match the current upstream semantic version.
+5. Run the user-visible wording scanner and confirm changed/new hand-written
+   source files comply with the 800-line gate.
 
-The private release identifier is:
+The private release identifier is `v<upstream-version>-<release-sha7>`. Tag the
+explicit immutable SHA, never a branch name. Backend, worker, connector,
+frontend, compose references, OCI labels, and the release record must agree on
+that SHA.
 
-```text
-v<upstream-version>-<release-sha7>
-```
-
-Never increment the semantic version for private work.  Create the annotated
-Git tag at the explicit immutable SHA, never at a mutable branch name.  The Git
-tag, backend image, frontend image, active Compose references, and recorded
-digests must all identify the same SHA.
-
-The generic `.github/workflows/release.yml` is not the production release
-authority for a private iteration: it currently increments semantic versions,
-creates release metadata, and does not build application images.  Do not run it
-unchanged for a private release.  Use this runbook, or first change and review
-the workflow so it accepts an exact SHA-suffixed version and implements every
-gate in this document.
+The generic `.github/workflows/release.yml` is not the authority for a private
+release unless it has first been changed and reviewed to implement every gate in
+this runbook.
 
 ## 3. Release-candidate gates
 
-All validation runs in Docker against the exact release checkout.  Production
-is not a development test target.
+All validation runs in Docker against the exact release checkout and isolated
+state. Production is not a development test target.
 
-Required gates:
+Required evidence:
 
-1. `git diff --check` and a clean worktree;
-2. neutral review of the real authoritative-main-to-release-SHA diff;
-3. migrations applied to an isolated PostgreSQL database;
-4. backend compile/import checks and the full backend test suite;
-5. frontend prebuild checks, TypeScript, and production build;
-6. the repository user-visible wording scanner (`python scripts/check_user_visible_keyword.py`)
-   and the frontend project-copy/i18n prebuild check;
-7. local 3008 health and feature-level API/IM/browser validation appropriate to
-   the change;
-8. rendered frontend nginx template validation in Docker when proxy behavior,
-   environment substitution, uploads, WebSocket, or MCP routing is in scope;
-9. a tested rollback helper for any newly seeded builtin tool or irreversible
-   enablement step.
+1. `git diff --check`, clean worktree, and final diff review;
+2. migrations from the current production parent to head on an isolated
+   PostgreSQL database plus a production-schema-derived copy;
+3. backend compile/import checks and the full backend test suite;
+4. frontend prebuild checks, TypeScript, and production build;
+5. user-visible wording/i18n checks;
+6. focused API, database, event, IM-adapter, and browser behavior for the change;
+7. local port-3008 validation for UI/cross-layer changes;
+8. rendered `frontend/nginx.conf.template` validation when proxy, WebSocket,
+   uploads, object storage, or MCP routing is in scope;
+9. tenant/ownership isolation tests for every changed query or capability;
+10. previous-image compatibility against the migrated schema;
+11. rollback helper drills for new seeded tools or compatibility boundaries.
 
-Record exact commands, counts, skipped tests, known baseline warnings, and the
-review verdict.  A raw `Traceback` match is not a deployment failure signal;
-use health, startup completion, precise error signatures, and behavior.
+Record exact commands, pass/fail counts, skipped tests, and baseline comparison.
+Never report a suite as green when it has failures. Raw `Traceback` text alone
+is not a health signal; use startup completion, health, precise errors, and
+observable behavior.
 
 ## 4. Build and publish immutable images
 
-The standard path is: build on the authorized local build machine, push to the
-registry, then let production pull.  Do not build application source on the
-production host except under separately approved emergency recovery.
+Build on the authorized build machine from a clean context at `RELEASE_SHA`.
+Production-host source builds are emergency-only and require separate approval.
 
-1. Create a clean build context from the exact release SHA.
-2. Generate a `COMMIT` provenance file containing the full SHA in the backend
-   build context and add OCI revision/version labels to both images.
-3. Build backend and frontend together even when only one source tree changed.
-4. On Apple Silicon, use `docker buildx build --platform linux/amd64 --push`.
-   A normal local Compose build is an arm64 development artifact and must never
-   be pushed as a production image.
-5. Use existing build caches.  If a dependency layer misses cache, keep plain
-   progress logs, clear stale proxy build arguments, and repair the local
-   builder rather than silently switching to a production-host build.
-6. Rebuild the AIO sandbox only when its source/base image changed or the user
-   explicitly requested it.  Otherwise retain its current tag and digest.
-7. Record immutable backend/frontend index digests and verify each published
-   manifest contains `linux/amd64`.
+1. Put the full SHA in the backend `COMMIT` build-context file.
+2. Build backend and frontend together for `linux/amd64` with OCI revision and
+   version labels.
+3. Reuse the reviewed stable build arguments and registry cache references.
+4. Rebuild AIO only when its source/base changed or explicitly requested.
+5. Push immutable release tags, then record index digests and prove the manifest
+   contains `linux/amd64`.
 
-Build template:
+Template (resolve registry and reviewed build arguments from current config):
 
 ```bash
 RELEASE_SHA=<full-release-sha>
 RELEASE_ID=v<upstream-version>-<release-sha7>
 REGISTRY=<approved-registry-namespace>
+BACKEND_CACHE="$REGISTRY/backend:buildcache-amd64"
+FRONTEND_CACHE="$REGISTRY/frontend:buildcache-amd64"
 
-docker buildx build --platform linux/amd64 --progress=plain \
+docker buildx build --builder <verified-builder> \
+  --platform linux/amd64 --progress=plain \
+  --cache-from type=registry,ref="$BACKEND_CACHE" \
+  --cache-to type=registry,ref="$BACKEND_CACHE",mode=max \
+  <reviewed-stable-backend-build-args> \
   --label org.opencontainers.image.revision="$RELEASE_SHA" \
   --label org.opencontainers.image.version="$RELEASE_ID" \
   --tag "$REGISTRY/backend:$RELEASE_ID" --push <clean-context>/backend
 
-docker buildx build --platform linux/amd64 --progress=plain \
+docker buildx build --builder <verified-builder> \
+  --platform linux/amd64 --progress=plain \
+  --cache-from type=registry,ref="$FRONTEND_CACHE" \
+  --cache-to type=registry,ref="$FRONTEND_CACHE",mode=max \
   --label org.opencontainers.image.revision="$RELEASE_SHA" \
   --label org.opencontainers.image.version="$RELEASE_ID" \
   --tag "$REGISTRY/frontend:$RELEASE_ID" --push <clean-context>/frontend
 ```
 
-Do not treat a mutable tag as proof.  Capture the registry index digest for
-each image and use `image:tag@sha256:digest` in the candidate deployment file.
+Never use `docker compose build` or `docker compose up --build` for production
+artifacts. Before building, confirm there is no stale concurrent build and that
+the intended builder, platform, Dockerfile, dependency manifests, and build
+arguments match the cache chain. If unchanged dependencies start downloading,
+cancel within about ten seconds, confirm no detached build remains, and diagnose
+the cache carrier/keys. Do not normalize an unexplained full dependency rebuild.
 
-## 5. Prepare production without cutting over
+## 5. Prepare production while the old release stays live
 
-Resolve current production facts from the secure operations inventory and the
-running containers; never copy remembered credentials or old tags into a plan.
+Resolve facts from the current deployment and secure inventory, not memory:
 
-Before downtime:
+- explicit Compose project/directory and active rendered configuration;
+- current backend/frontend/AIO tags, digests, revisions, and restart counts;
+- database migration revision and relevant schema/default/constraint state;
+- active-turn/trigger baseline, health, HTTP 5xx/latency, and channel errors;
+- disk capacity for selected snapshots;
+- authoritative stores affected by this diff.
 
-1. confirm the Compose project/directory and preserve the active Compose file;
-2. record current backend, frontend, and independent AIO tag plus digest;
-3. record current database migration revision, health, restart counts, and a
-   short baseline of HTTP and IM delivery errors;
-4. render the candidate Compose configuration and inspect its diff;
-5. verify frontend has non-empty `API_UPSTREAM`; verify the optional object
-   storage upstream when that route is enabled;
-6. pull both candidate application images by digest while the old stack remains
-   live;
-7. verify sufficient disk space for the database dump and workspace archive;
-8. prepare a timestamped backup directory under the approved production data
-   root, but do not take the authoritative data backup yet;
-9. prepare a rollback script that references the previous immutable digests and
-   does not delete volumes.
+Create digest-pinned candidate and rollback compose files. Each must describe
+backend, worker, connector, and frontend as one release set; backend/worker/
+connector use the same backend digest and frontend uses the matching release
+SHA. Preserve unchanged PostgreSQL, Redis, object storage, and AIO services.
 
-The frontend nginx truth is the template baked into the frontend image and
-rendered at container start.  Do not assume a similarly named repository or
-host file controls production.  Validate the rendered candidate template with
-the actual environment values before cutover.
+While the old application remains live:
 
-## 6. Drain and freeze writers
+1. pull candidate and rollback images by digest;
+2. verify manifests, OCI revision, image `COMMIT`, and architecture;
+3. render both compose files with the explicit production project name;
+4. validate required environment such as frontend `API_UPSTREAM` and optional
+   object-storage upstream;
+5. validate the rendered nginx template from the candidate image;
+6. prepare the exact cutover and rollback commands;
+7. confirm the cutover window contains no build, pull, or compose improvisation.
 
-Application restart can interrupt active turns.  Use the supported active-turn
-inspection when available; otherwise choose a quiet window and inspect recent
-activity.  Stop accepting new ingress, wait for active work to drain within the
-approved bound, and record any work that must be recovered.
+## 6. Decide and take change-scoped online backups
 
-Production currently requires no old/new backend overlap for process-local
-turn reservations and cancellation state.  Rolling replacement is forbidden
-unless the release explicitly proves a distributed implementation.
+Derive backup scope from the actual diff and rollback contract. Record each
+decision, including an explicit reason for every omission.
 
-Stop frontend ingress and every application writer, including the API backend,
-trigger/worker/connector roles, schedules, and any separately deployed writer.
-Keep PostgreSQL, Redis, and object storage running for backup.  Confirm the old
-backend process count is zero before starting a candidate backend.
+| Changed authority | Default online protection |
+|---|---|
+| no migration, seed, or data correction | compose, old/new digests, revision, checksums, rollback command; no automatic database dump |
+| PostgreSQL schema/data | one consistent custom-format dump of affected tables or the full database when cross-table rollback requires it |
+| Redis semantics/recovery | fresh persisted snapshot and checksum |
+| Agent workspace format/content | storage snapshot/archive or approved storage-native version |
+| object storage authority | storage snapshot/version manifest |
+| CLI binaries/resumable upload state | finalized binary store and upload-state snapshot |
+| environment/configuration | secure config snapshot outside Git plus redacted manifest |
 
-Do not use `docker compose down`; do not remove volumes.
+Take required snapshots online, after image preparation and as close to cutover
+as practical. Use one PostgreSQL snapshot for related tables, bounded lock wait,
+and no destructive dump options. Validate custom dumps with
+`pg_restore --list`, validate archives/readability, and checksum every artifact.
+Restore drills run only against isolated targets, never production.
 
-## 7. Take the authoritative cutover backup
+If a changed authority cannot be snapshotted consistently while live, or a
+rollback would require an unplanned cross-store point-in-time restore, declare
+NO-GO. Design a compatible snapshot/migration, blue-green topology, or a
+separately authorized maintenance release. Do not solve this by an ad-hoc
+`stop`/`down`.
 
-The rollback backup is taken only after writers stop.  An earlier preparation
-snapshot is supplemental and cannot replace this cutover snapshot.
+## 7. Apply backward-compatible migrations online
 
-The default full backup set is:
+Only online-compatible migrations may run before the application replacement
+while the old release still serves traffic. Prove this in isolated concurrent
+read/write tests.
 
-- custom-format PostgreSQL dump;
-- Redis RDB snapshot;
-- agent workspace/archive or an equivalent storage snapshot;
-- object-storage snapshot/manifest when object storage is authoritative;
-- active Compose file and a rendered candidate Compose file;
-- previous and candidate backend/frontend tag plus digest;
-- securely stored environment/config snapshot when it changes;
-- `README` containing timestamps, revisions, omissions, and restore commands;
-- executable rollback script using the previous immutable digests;
-- SHA-256 manifest for every backup artifact.
-
-At minimum, validate the PostgreSQL dump with `pg_restore --list`, validate all
-checksums, and confirm archives are readable.  A restore drill against an
-isolated database/storage target must have passed before the production window.
-
-Skipping database, Redis, workspace, or object-storage backup requires explicit
-user authorization for this release and a recorded reason.  No-schema-change
-does not automatically mean no-backup: cutover backup also protects writes and
-seeded state.
-
-## 8. Cut over
-
-Only the configured bootstrap role may mutate schema.  The current backend
-entrypoint performs table checks, safe patches, and `alembic upgrade head`
-before starting the application.  Do not run an extra manual migration path
-unless the exact release source or migration plan requires it.
-
-1. Activate the candidate Compose file pinned to both new image digests.
-2. Start the one bootstrap-capable backend with the candidate image.
-3. If migration/startup fails, do not start frontend or another backend; enter
-   rollback immediately.
-4. Wait for migration completion, builtin-tool seeding, Uvicorn readiness, and
-   backend health.
-5. Confirm exactly one backend process/replica where process-local turn state
-   requires it.
-6. Start frontend and any separately approved worker/connector roles in the
-   topology defined by the candidate Compose file.
-7. Confirm no container unexpectedly uses a mutable or mismatched image.
-
-## 9. Acceptance matrix
-
-The release is not complete when containers merely start.  Record evidence for:
-
-### Platform
-
-- backend health returns 200 with the upstream version;
-- the version/provenance endpoint reports the release SHA;
-- frontend home/login returns 200 through the public proxy;
-- authenticated API, WebSocket reconnect, session history, and one normal turn
-  succeed;
-- `/api`, `/ws`, `/mcp`, uploads, and object-storage proxy routes relevant to
-  the release resolve through the rendered nginx configuration;
-- restart count remains zero after stabilization.
-
-### IM delivery and recall
-
-- proactive sends persist one normalized receipt;
-- replay/concurrent claim does not send twice and reports the stored lifecycle
-  state truthfully;
-- supported adapters complete send then recall for their configured P2P/group
-  semantics;
-- unsupported transports return `unsupported` without a false provider call;
-- repeated recall is idempotent;
-- a user cannot recall inbound, cross-agent, or unauthorized messages;
-- media caption/title and all other user-visible fields use the shared sanitizer;
-- no `pending` receipt remains beyond the two-minute delivery lease without
-  becoming an explicit uncertain state;
-- provider success followed by receipt failure never triggers fallback duplicate
-  output.
-
-Run real-provider production smoke only in dedicated test conversations and only
-when explicitly authorized.  Do not create unrelated production users, PATs,
-sessions, or test data merely to prove health.
-
-## 10. Observation and release record
-
-Observe closely for at least 30 minutes and retain a 24-hour follow-up watch.
-Compare against the captured baseline:
-
-- HTTP 5xx and latency;
-- backend/frontend restart count;
-- IM delivery `failed`, `unknown`, `partial`, and stale `pending` counts;
-- recall failures by transport;
-- provider duplicate-send reports;
-- database, Redis, workspace, and object-storage errors;
-- active-turn interruption or recovery errors.
-
-Immediate rollback conditions are: migration failure, unhealthy startup beyond
-the approved timeout, authentication/tenant-isolation regression, data loss or
-corruption, wrong-message recall, duplicate provider output, or inability to
-execute the prepared rollback.
-
-After the observation gate, store a release record containing source/main SHA,
-tag, both image digests, independent AIO digest, backup ID, migration before and
-after, validation evidence, known warnings, owners, timestamps, and final GO.
-Publish release notes only after these values are fixed.
-
-## 11. Rollback
-
-Rollback backend and frontend as one release set.  Do not leave mixed SHAs.
-
-1. Stop frontend ingress and all candidate application writers.
-2. Before starting a binary that predates a newly seeded builtin tool, run the
-   candidate image's idempotent rollback helper against the current database.
-   For normalized IM recall:
-
-   ```bash
-   python -m app.scripts.rollback_im_recall
-   ```
-
-   Before starting a binary that predates project-scoped Agents, keep the
-   candidate project tables and history in place and apply the candidate
-   image's reversible database boundary:
-
-   ```bash
-   PROJECT_LEGACY_ROLLBACK_PASSWORD='<secret-manager value>' \
-     python -m app.scripts.project_legacy_rollback apply
-   python -m app.scripts.project_legacy_rollback status
-   ```
-
-   Construct a dedicated old-service DSN for the returned
-   `clawith_project_legacy` role from the same secret-manager value. Start the
-   previous API and worker as separate `PROCESS_ROLE=api` and
-   `PROCESS_ROLE=worker` services using only that DSN. An owner DSN and
-   `PROCESS_ROLE=all` are forbidden for this compatibility rollback: the owner
-   bypasses the row boundary, while `all` attempts to run migrations unknown to
-   the old binary. Verify standard Agent CRUD and task/schedule/trigger
-   processing, then prove a known project Agent ID and its sessions, tasks,
-   schedules, triggers, tools, permissions, activity, approvals, and gateway
-   messages all return not-found. Global inbox, notification, tool, Skill,
-   Plaza, and published-page lists must contain no project marker.
-
-3. Restore the saved Compose file or set both application images to their
-   previous immutable digests.
-4. Start the previous backend, wait for health, then start frontend and other
-   roles; confirm no candidate process remains.
-5. Repeat the platform and IM smoke subset and record the rollback result.
-
-To return from the project compatibility rollback to the candidate, first stop
-all legacy API/worker processes, then run the candidate image with the owner
-DSN:
+- Use short `lock_timeout` and bounded `statement_timeout`; lock contention must
+  fail quickly and leave the old application healthy.
+- Avoid table rewrites and long validation locks. For large constraints, add
+  them unvalidated, normalize data, then validate in an explicit bounded step.
+- Run migration from the candidate image with its entrypoint overridden so a
+  one-shot command cannot accidentally start another backend:
 
 ```bash
+docker compose -p <production-compose-project> \
+  -f <candidate-compose> run --rm --no-deps \
+  --entrypoint alembic backend upgrade heads < /dev/null
+```
+
+- Confirm exactly one expected Alembic head, schema/default/constraint values,
+  tenant behavior, and old-application health after migration.
+- Start the previous image against the upgraded schema in an isolated drill.
+
+An incompatible migration or failed compatibility drill is NO-GO. Do not start
+the candidate and do not automatically downgrade production schema.
+
+## 8. Active work and interruption decision
+
+Observe active turns, triggers, tasks, and connector work while the old release
+remains live. Prefer a quiet window and allow work to drain within the approved
+bound without closing ingress early. Record any active operation that may need
+durable recovery.
+
+The standard single-replica Compose replacement may cause a brief interruption.
+It is permitted only when the release record explicitly authorizes that policy.
+If the requirement is strict request/turn continuity, this topology is NO-GO;
+deploy only after a tested blue-green/rolling design with atomic traffic switch.
+
+## 9. One-command application replacement
+
+After every gate passes, run exactly one replacement command for all application
+roles:
+
+```bash
+docker compose -p <production-compose-project> \
+  -f <candidate-compose> up -d --no-deps --no-build \
+  backend worker connector frontend
+```
+
+Hard rules:
+
+- no pre-cutover `docker compose stop` or `down`;
+- no backend-first or role-by-role start sequence;
+- no `--remove-orphans`, build, pull, or dependency restart;
+- PostgreSQL, Redis, object storage, and unchanged AIO remain running;
+- do not claim that one Compose command is strict zero downtime.
+
+When the command returns, verify all four roles together. Only after acceptance
+may the already-validated candidate compose atomically replace the canonical
+compose file; that file replacement must not cause another restart.
+
+## 10. Acceptance matrix
+
+### Release identity and health
+
+- all four application roles run the intended digest/release SHA;
+- backend, worker, and connector are healthy; frontend returns 200;
+- restart counts remain zero and exactly the intended connector count exists;
+- `/api/health` and version/provenance report the expected result;
+- authenticated API, session history, one normal turn, and WebSocket reconnect
+  work through the public/frontend proxy;
+- relevant `/api`, `/ws`, `/mcp`, upload, and storage routes use the rendered
+  candidate nginx configuration;
+- database revision and changed seeded/configured values are correct.
+
+### Conversation and delivery
+
+- accepted turns persist completion/recovery state across disconnects;
+- provider waits do not leave long idle database transactions;
+- tool output, context compaction, and memory behavior relevant to the release
+  match local evidence;
+- durable outbound messages have one normalized receipt, no duplicate provider
+  send, and no stale `pending` beyond its lifecycle without explicit `unknown`;
+- recall and confirmation preserve ownership, source Session, provider
+  capability truth, and P2P/group semantics.
+
+Real-provider or production-data smoke is limited to dedicated authorized test
+identities/conversations. Do not create unrelated users, PATs, sessions, or
+messages merely to prove health.
+
+## 11. Observation and release record
+
+Observe closely for at least 30 minutes and retain a 24-hour follow-up watch.
+Compare with the pre-cutover baseline:
+
+- HTTP 5xx/latency and application restart counts;
+- database locks, long idle transactions, migration/storage errors;
+- LLM/tool/context/recovery errors and interrupted turns;
+- delivery `failed`, `unknown`, `partial`, and stale `pending` counts;
+- duplicate sends, recall failures, and connector errors.
+
+Immediate rollback conditions include unhealthy startup, wrong SHA/digest,
+migration failure, authentication or tenant-isolation regression, data loss,
+wrong-message recall, duplicate external output, unbounded context recovery, or
+inability to run the prepared rollback.
+
+Store an immutable release record with the source/main SHA, tag, application and
+AIO digests, migration before/after, backup ID/scope/omissions, validation
+evidence, owners, timestamps, interruption observation, warnings, and final GO.
+
+## 12. One-command rollback
+
+Rollback backend, worker, connector, and frontend as one release set with the
+prepared previous digest-pinned compose file:
+
+```bash
+docker compose -p <production-compose-project> \
+  -f <rollback-compose> up -d --no-deps --no-build \
+  backend worker connector frontend
+```
+
+Do not pre-stop/down the stack, roll roles back separately, rebuild, pull, remove
+orphans, or mix SHAs during rollback.
+
+Before rollback to a binary that predates a newly seeded builtin tool, run the
+candidate image's reviewed idempotent compatibility helper. For normalized IM
+recall, the existing helper is:
+
+```bash
+python -m app.scripts.rollback_im_recall
+```
+
+Before rollback to a binary that predates project-scoped Agents, follow the
+candidate helper's documented apply/status/restore lifecycle:
+
+```bash
+python -m app.scripts.project_legacy_rollback apply
+python -m app.scripts.project_legacy_rollback status
+# after legacy roles are gone and before candidate roles return:
 python -m app.scripts.project_legacy_rollback restore
 python -m app.scripts.project_legacy_rollback status
 ```
 
-`restore` is idempotent. Confirm the dedicated role, helper policies, and
-classifier are gone; every affected table has its recorded pre-apply RLS state;
-and project Agent, member, session, Run, event/history IDs and counts match the
-pre-rollback snapshot. Only then restart candidate API/worker roles with their
-normal DSN and verify those exact project records through candidate APIs.
+The full credential/role setup and verification must be instantiated from the
+current helper and secure inventory during release planning. If a compatibility
+helper requires a writer freeze, that requirement must already have a separately
+authorized maintenance/blue-green procedure; do not improvise it during an
+incident.
 
-Default application rollback keeps current database/workspace data when the old
-binary is schema-compatible.  Do not automatically run Alembic downgrade.
+Default binary rollback keeps compatible additive schema and current data. Do
+not automatically run Alembic downgrade or restore snapshots. A point-in-time
+data restore discards post-cutover writes and requires the data owner's explicit
+decision; restore all coupled stores to one consistent point.
 
-Restore the cutover PostgreSQL/workspace/object-storage snapshot only for an
-explicitly approved data/schema rollback.  Such a restore discards post-cutover
-writes and therefore requires the data owner's decision.  Restore aligned data
-components to the same point in time; do not combine an old database with newer
-workspace/object state.  Redis restore is likewise an explicit consistency
-decision, not a reflexive step.
+After rollback, repeat the health/identity and relevant conversation/delivery
+acceptance subset, record the result, and continue observation.
 
-## 12. Required plan output
+## 13. Required concrete plan output
 
-Every concrete release plan derived from this runbook must include:
+Every release plan derived from this runbook includes:
 
-- change range and authoritative branch;
-- exact final SHA and release ID, or the rule for recomputing them after merge;
-- included/excluded components and migration/seed impact;
-- Docker validation and neutral-audit evidence;
-- backend/frontend build and immutable digest capture commands;
-- production topology and no-overlap decision;
-- drain method and maintenance communication;
-- cutover backup set, path placeholder, validation, and approved omissions;
-- ordered cutover commands and pass/fail gates;
-- feature-specific acceptance matrix;
-- observation duration and rollback thresholds;
-- previous digests, candidate rollback helper, and data-restore decision tree;
-- named owners and explicit authorization checkpoints.
+- authoritative branch, diff range, final SHA, and release ID;
+- included/excluded components, 800-line gate, migration/seed/state impact;
+- exact Docker validation and independent review evidence;
+- cache-aware backend/frontend build and immutable digest capture commands;
+- current/candidate/rollback topology and explicit Compose project;
+- interruption requirement and why single-replica or blue-green is acceptable;
+- online backup matrix, evidence, omissions, and data-owner approvals;
+- compatibility migration commands, timeouts, and old-image drill;
+- the one cutover command, pass/fail acceptance, and observation thresholds;
+- the one rollback command, compatibility helpers, and data-restore decision;
+- named owners and every external authorization checkpoint.

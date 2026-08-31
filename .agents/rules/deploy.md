@@ -18,10 +18,16 @@
 ## Deployment authorization
 
 - Production configuration changes and deployment require explicit user authorization after a reviewed plan.
-- Prepare images before cutover. At cutover, stop writers and then take the authoritative consistent database/workspace backup so rollback has no write gap.
+- Prepare, pull, and verify images/configuration while the old release remains
+  live. Do not pre-stop the application; production role replacement and
+  rollback follow the single-command topology in the release runbook.
+- Determine online backup scope from the actual changed state and rollback
+  contract. If a required consistent snapshot or migration cannot be performed
+  compatibly while serving, stop at NO-GO and design an authorized
+  maintenance/blue-green procedure rather than improvising a stop/down.
 - Keep secrets in environment/config stores. Architecture and runbooks committed to Git must use symbolic hosts, users, and credentials.
 - Production nginx behavior comes from the template baked into the frontend image; validate the rendered template in Docker.
 
 The concrete local test recipe is in `.agents/architecture/environments-and-operations.md`.
-The canonical production cutover, backup, validation, and rollback procedure is
+The canonical production preparation, online backup, cutover, validation, and rollback procedure is
 `.agents/runbooks/production_release.md`.

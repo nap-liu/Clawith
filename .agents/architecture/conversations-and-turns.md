@@ -4,6 +4,12 @@
 
 Web, IM, A2A, trigger, task, webhook, and MCP-facing message paths should delegate model/tool work to `call_llm` / `call_llm_with_failover`. New entry points may adapt context and delivery, but must not fork a private tool loop.
 
+Build an immutable runtime/model snapshot and end the inbound read transaction
+before waiting on provider capacity or entering a long tool loop. Usage, tool
+results, delivery state, compaction, and other externally relevant progress use
+purpose-specific short transactions. A slow provider must not leave the ingress
+session idle in transaction.
+
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
 ### Asynchronous Subagent events on parent turns
@@ -25,6 +31,18 @@ Do not add a second inbox table, a completion-cohort state machine, or channel-s
 - Trigger/A2A/background turns can carry a creator `user_id` for execution context. They do not thereby inherit that creator's administrative read authority.
 
 Session introspection is always an owned-session subset. Human Web/IM access uses authoritative user permissions; non-human access is limited to the agent's own A2A, trigger, and current-session context. Denials should not leak whether another session exists.
+
+Active-turn listing and cancellation use one registry across Web, IM, MCP, A2A,
+trigger, task, and recovery entry points. Ordinary users can see/control only
+their own authorized turns; platform-wide authority must be explicit and
+server-enforced. Completion and cancellation serialize against the same durable
+turn identity so a late completion cannot overwrite a successful stop.
+
+Confirmation is a suspended ordinary tool call, not a parallel conversation
+protocol. Resume it through the original durable Session and source channel,
+preserve the assistant/tool ordering, and let channel adapters render buttons or
+cards. A confirmation response must not invent a new session or bypass the
+shared loop.
 
 ## Normalized outbound delivery
 
@@ -55,3 +73,9 @@ Fully recalled messages remain in the audit trail and render as a tombstone. LLM
 - Native provider capabilities differ across P2P and groups. Normalize the lifecycle result while keeping provider-specific request semantics in adapters.
 - `send_channel_file` has historically had stronger native file coverage on some transports than others. Capability absence must be explicit and a safe link fallback may be used where product-approved.
 - Web live monitoring is distinct from write permission. A read-only viewer may receive events, but server-side writes remain denied.
+- Reaction/thinking anchors move only when an inbound message is actually
+  consumed by the running turn. A merely pending interjection must not steal the
+  visible anchor.
+- Web and H5 normalize completed assistant/tool content from the same durable
+  message contract. Channel-specific card rendering must not create duplicate
+  assistant text or empty presentation bubbles.

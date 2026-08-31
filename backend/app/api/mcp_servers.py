@@ -48,6 +48,7 @@ from app.services.placeholder_engine import (
 )
 from app.services.audit_logger import write_audit_log
 from app.services.mcp_client import MCPClient
+from app.services.mcp_dry_run_context import _build_user_ctx, _mask_auth_headers
 from app.services.mcp_refresh_service import refresh_mcp_server_tools
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
@@ -674,8 +675,6 @@ async def delete_agent_override(
 # Dry-run endpoint
 # ---------------------------------------------------------------------------
 
-_AUTH_HEADER_KEYS = {"authorization", "x-api-key", "x-auth-token"}
-
 _SYNTHETIC_CTX = PlaceholderContext(
     user={"id": "00000000-0000-0000-0000-000000000000", "email": "preview@example.local",
           "phone": "0000000000", "name": "Preview User", "display_name": "Preview"},
@@ -685,50 +684,6 @@ _SYNTHETIC_CTX = PlaceholderContext(
     session={"id": "00000000-0000-0000-0000-000000000000"},
     channel={"type": "web"},
 )
-
-
-async def _build_user_ctx(
-    db: AsyncSession,
-    current_user: User,
-    agent_id: uuid.UUID | None,
-    tenant_id: uuid.UUID | None,
-) -> PlaceholderContext:
-    """Build a PlaceholderContext from the authenticated caller + agent row.
-
-    When agent_id is provided, the Agent row is loaded so ${agent.name} /
-    ${agent.slug} resolve to real values (otherwise placeholders render to
-    empty strings, which surprises users seeing the live preview).
-    """
-    agent_name = ""
-    agent_slug = ""
-    if agent_id is not None:
-        agent_row = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
-        if agent_row is not None:
-            agent_name = agent_row.name or ""
-            agent_slug = getattr(agent_row, "slug", "") or ""
-    return PlaceholderContext(
-        user={
-            "id": str(current_user.id),
-            "email": current_user.identity.email if current_user.identity else "",
-            "phone": current_user.identity.phone if current_user.identity else "",
-            "name": current_user.display_name or "",
-            "display_name": current_user.display_name or "",
-        },
-        agent={"id": str(agent_id) if agent_id else "", "name": agent_name, "slug": agent_slug},
-        tenant={"id": str(tenant_id or current_user.tenant_id or "")},
-        session={"id": "preview-session"},
-        channel={"type": "web"},
-    )
-
-
-def _mask_auth_headers(headers: dict[str, str]) -> dict[str, str]:
-    out = {}
-    for k, v in headers.items():
-        if k.lower() in _AUTH_HEADER_KEYS:
-            out[k] = "Bearer ***" if v else ""
-        else:
-            out[k] = v
-    return out
 
 
 @router.post("/{server_id}/dry-run", response_model=DryRunResponse)

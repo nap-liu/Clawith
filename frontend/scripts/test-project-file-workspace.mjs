@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { loadCssEntry } from "./load-css-entry.mjs";
 
 const service = readFileSync(
   new URL("../src/services/projects.ts", import.meta.url),
@@ -19,9 +20,8 @@ const styles = readFileSync(
   ),
   "utf8",
 );
-const workspaceStyles = readFileSync(
+const workspaceStyles = loadCssEntry(
   new URL("../src/features/projects/projectWorkspace.css", import.meta.url),
-  "utf8",
 );
 const codeEditor = readFileSync(
   new URL(

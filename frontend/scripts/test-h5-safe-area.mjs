@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadCssEntry } from './load-css-entry.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(resolve(__dirname, '../index.html'), 'utf8');
-const css = readFileSync(resolve(__dirname, '../src/pages/h5/H5AgentChat.css'), 'utf8');
+const css = loadCssEntry(resolve(__dirname, '../src/pages/h5/H5AgentChat.css'));
 
 function blockFor(selector) {
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

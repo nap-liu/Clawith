@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { loadCssEntry } from './load-css-entry.mjs';
 import { loadTypeScriptModule } from './load-typescript-module.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -381,7 +382,7 @@ function runBootstrap({
     assert.equal(blocked.doc.documentElement.getAttribute('data-theme'), 'light');
 }
 
-const css = readFileSync(resolve(__dirname, '../src/index.css'), 'utf8').toLowerCase();
+const css = loadCssEntry(resolve(__dirname, '../src/index.css')).toLowerCase();
 assert.match(css, new RegExp(`--bg-primary:\\s*${THEME_META_COLORS.dark}`), 'dark meta color must match --bg-primary');
 const lightThemeBlock = css.match(/\[data-theme="light"\]\s*\{([\s\S]*?)\n\}/)?.[1] || '';
 assert.match(lightThemeBlock, new RegExp(`--bg-primary:\\s*${THEME_META_COLORS.light}`), 'light meta color must match --bg-primary');

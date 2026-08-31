@@ -38,6 +38,12 @@ The FastAPI backend is organized under `backend/app/`:
 
 The central execution path is `call_llm` / `call_llm_with_failover`. Web, IM, A2A, trigger, and task behavior should converge on this core. Long-running turns must be connection-independent; WebSocket disconnects are delivery events, not authorization to destroy a turn.
 
+Read-only runtime configuration is snapshotted before dispatch and the inbound
+database transaction ends before provider waits or the tool loop. Tool results,
+usage, compaction, delivery state, and other intermediate outcomes use explicit
+short transactions so a slow model response does not hold an idle PostgreSQL
+transaction or lock.
+
 ## Frontend
 
 The React/TypeScript frontend renders durable sessions and live events. Authorization to view, write, or monitor a session is decided by backend policy. Read-only monitoring may receive live events but must remain server-enforced read-only.
@@ -51,6 +57,23 @@ Production nginx configuration is built from `frontend/nginx.conf.template`; a s
 - A2A sessions normalize the agent pair. Message queries for A2A history use `conversation_id`, not a caller-specific `ChatMessage.agent_id` filter.
 - Non-human turns (`agent`, `trigger`, task-like contexts) do not inherit a creator's administrative visibility.
 - Completion/recovery ordering must not rely solely on PostgreSQL transaction-start timestamps.
+
+## Context and memory
+
+- Context budgets derive from the selected model's configured context window,
+  configured usage ratio, and provider-reported usage.
+- The current turn is never compacted. Historical compaction operates on
+  complete turns, preserves a configured recent suffix, and archives source
+  material before replacing it with a validated or lossless-fallback summary.
+- Explicit provider overflow recovery is finite and may reduce protected
+  historical turns to zero only before the current turn has produced external
+  side effects; it retries the same current input unchanged.
+- Textual tool results have a bounded model-facing view with a truthful
+  truncation marker and exact full-content path. Durable originals and
+  multimodal payloads remain intact.
+- Product Agent memory is repository/workspace state with explicit loading
+  policy. Coding-agent project knowledge is owned by `AGENTS.md` and `.agents/`,
+  never personal assistant memory.
 
 ## Tools and sandboxes
 
@@ -73,3 +96,6 @@ Provider operations such as recall act through transport adapters over receipt p
 The supported local integration entry point is the Docker stack exposed through the frontend proxy on port 3008. Backend validation uses containers with the repository mounted at `/app` and an isolated PostgreSQL test database. Host Python/venv validation is unsupported.
 
 See `.agents/architecture/environments-and-operations.md` for the exact safe workflow.
+
+Context budgeting, compaction, tool-result views, and Agent memory loading are
+specified in `.agents/architecture/context-and-memory.md`.

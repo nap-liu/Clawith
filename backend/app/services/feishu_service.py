@@ -23,10 +23,14 @@ from app.services.user_output import sanitize_user_visible_text
 
 settings = get_settings()
 
-FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v1/oidc/access_token"
-FEISHU_USER_INFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
-FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
-FEISHU_SEND_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
+from app.services.feishu_constants import (
+    FEISHU_APP_TOKEN_URL,
+    FEISHU_SEND_MSG_URL,
+    FEISHU_TOKEN_URL,
+    FEISHU_USER_INFO_URL,
+)
+from app.services.feishu_message_resources import FeishuMessageResourceMethods
+from app.services.feishu_product_api import FeishuProductAPIMethods
 
 class FeishuAPIError(RuntimeError):
     """Structured Feishu API error that preserves provider-returned details."""
@@ -554,322 +558,25 @@ class FeishuService:
                     return uid
             return None
 
-    async def send_approval_card(self, app_id: str, app_secret: str,
-                                  creator_open_id: str, agent_name: str,
-                                  action_type: str, details: str, approval_id: str) -> dict:
-        """Send an interactive approval card to the agent creator via Feishu."""
-        import json
-        safe_agent_name = sanitize_user_visible_text(agent_name).strip() or "智能体"
-        safe_action_type = sanitize_user_visible_text(action_type).strip() or "操作"
-        safe_details = sanitize_user_visible_text(details)
-        card_content = json.dumps({
-            "type": "template",
-            "data": {
-                "template_id": "",  # Use custom card
-                "template_variable": {
-                    "agent_name": safe_agent_name,
-                    "action_type": safe_action_type,
-                    "details": safe_details,
-                    "approval_id": approval_id,
-                }
-            }
-        })
-        # Simplified — in production, use Feishu interactive card JSON
-        text_content = json.dumps({
-            "text": (
-                f"🔴 {safe_agent_name}: 请求审批\n"
-                f"操作: {safe_action_type}\n详情: {safe_details}\n\n请在平台审批。"
-            )
-        })
-        return await self.send_message(app_id, app_secret, creator_open_id, "text", text_content)
+    send_approval_card = FeishuMessageResourceMethods.send_approval_card
+    download_message_resource = FeishuMessageResourceMethods.download_message_resource
+    upload_and_send_file = FeishuMessageResourceMethods.upload_and_send_file
 
-    async def download_message_resource(self, app_id: str, app_secret: str,
-                                         message_id: str, file_key: str,
-                                         resource_type: str = "file") -> bytes:
-        """Download a file or image from a Feishu message.
+    bitable_list_tables = FeishuProductAPIMethods.bitable_list_tables
+    bitable_list_fields = FeishuProductAPIMethods.bitable_list_fields
+    bitable_query_records = FeishuProductAPIMethods.bitable_query_records
+    bitable_create_record = FeishuProductAPIMethods.bitable_create_record
+    bitable_update_record = FeishuProductAPIMethods.bitable_update_record
+    bitable_delete_record = FeishuProductAPIMethods.bitable_delete_record
+    bitable_create_app = FeishuProductAPIMethods.bitable_create_app
+    read_feishu_doc = FeishuProductAPIMethods.read_feishu_doc
+    create_feishu_doc = FeishuProductAPIMethods.create_feishu_doc
+    append_feishu_doc = FeishuProductAPIMethods.append_feishu_doc
+    append_feishu_doc_blocks = FeishuProductAPIMethods.append_feishu_doc_blocks
+    create_approval_instance = FeishuProductAPIMethods.create_approval_instance
+    query_approval_instances = FeishuProductAPIMethods.query_approval_instances
+    get_approval_instance = FeishuProductAPIMethods.get_approval_instance
 
-        Args:
-            resource_type: "file" or "image"
-        Returns raw file bytes.
-        """
-        async with httpx.AsyncClient(timeout=30) as client:
-            token_resp = await client.post(FEISHU_APP_TOKEN_URL, json={
-                "app_id": app_id,
-                "app_secret": app_secret,
-            })
-            app_token = token_resp.json().get("app_access_token", "")
-            resp = await client.get(
-                f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
-                params={"type": resource_type},
-                headers={"Authorization": f"Bearer {app_token}"},
-            )
-            resp.raise_for_status()
-            return resp.content
-
-    async def upload_and_send_file(self, app_id: str, app_secret: str,
-                                    receive_id: str, file_path,
-                                    receive_id_type: str = "open_id",
-                                    accompany_msg: str = "",
-                                    on_result=None) -> dict:
-        """Upload a local file to Feishu and send it as a file message.
-
-        Returns the send_message response dict.
-        """
-        import json as _json
-        from pathlib import Path as _Path
-        fp = _Path(file_path)
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Get token
-            token_resp = await client.post(FEISHU_APP_TOKEN_URL, json={
-                "app_id": app_id, "app_secret": app_secret,
-            })
-            token_data = self._parse_api_response(token_resp, stage="file_token")
-            app_token = token_data.get("app_access_token", "")
-            if not app_token:
-                raise RuntimeError("Feishu file token response missing app_access_token")
-            headers = {"Authorization": f"Bearer {app_token}"}
-
-            # Upload file
-            with open(fp, "rb") as f:
-                file_bytes = f.read()
-            # Determine file type for Feishu upload
-            ext = fp.suffix.lower()
-            feishu_file_type = "stream"  # generic binary
-            if ext in (".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".txt", ".md"):
-                feishu_file_type = "stream"
-            upload_resp = await client.post(
-                "https://open.feishu.cn/open-apis/im/v1/files",
-                files={"file": (fp.name, file_bytes, "application/octet-stream")},
-                data={"file_type": feishu_file_type, "file_name": fp.name},
-                headers=headers,
-            )
-            upload_data = self._parse_api_response(upload_resp, stage="file_upload")
-            file_key = upload_data["data"]["file_key"]
-
-            # Send text accompany message first if provided
-            if accompany_msg:
-                text_resp = await client.post(
-                    f"{FEISHU_SEND_MSG_URL}?receive_id_type={receive_id_type}",
-                    json={"receive_id": receive_id, "msg_type": "text",
-                          "content": _json.dumps({"text": accompany_msg})},
-                    headers=headers,
-                )
-                text_data = self._parse_api_response(
-                    text_resp,
-                    stage="file_caption",
-                )
-                if on_result is not None:
-                    await on_result("file_caption", text_data)
-
-            # Send file message
-            resp = await client.post(
-                f"{FEISHU_SEND_MSG_URL}?receive_id_type={receive_id_type}",
-                json={"receive_id": receive_id, "msg_type": "file",
-                      "content": _json.dumps({"file_key": file_key})},
-                headers=headers,
-            )
-            result = self._parse_api_response(resp, stage="file_message")
-            if on_result is not None:
-                await on_result("channel_file", result)
-            return result
-
-    # --- Bitable (多维表格) API ---
-
-    async def bitable_list_tables(self, app_id: str, app_secret: str, app_token: str) -> dict:
-        """List all tables in a Bitable app."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables",
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def bitable_list_fields(self, app_id: str, app_secret: str, app_token: str, table_id: str) -> dict:
-        """List all fields in a specific table."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def bitable_query_records(self, app_id: str, app_secret: str, app_token: str, table_id: str, filters: dict | None = None) -> dict:
-        """Query records in a specific table."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        body = {}
-        if filters:
-            body = filters
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
-                json=body,
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def bitable_create_record(self, app_id: str, app_secret: str, app_token: str, table_id: str, fields: dict) -> dict:
-        """Create a new record in a specific table."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
-                json={"fields": fields},
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def bitable_update_record(self, app_id: str, app_secret: str, app_token: str, table_id: str, record_id: str, fields: dict) -> dict:
-        """Update an existing record in a specific table."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.put(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
-                json={"fields": fields},
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-            
-    async def bitable_delete_record(self, app_id: str, app_secret: str, app_token: str, table_id: str, record_id: str) -> dict:
-        """Delete an existing record in a specific table."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.delete(
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def bitable_create_app(self, app_id: str, app_secret: str, name: str, folder_token: str = "") -> dict:
-        """Create a new Bitable (多维表格) app.
-
-        Uses the Bitable v1 apps API: POST /open-apis/bitable/v1/apps
-        If folder_token is empty, the file is created in the root 'My Drive'.
-
-        Args:
-            name:         The display name of the new Bitable (max 255 chars).
-            folder_token: Parent folder token (optional). Leave empty for root.
-        Returns:
-            API response dict containing 'data.app.app_token' as the new app_token.
-        """
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        body: dict = {"name": name}
-        if folder_token:
-            body["folder_token"] = folder_token
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://open.feishu.cn/open-apis/bitable/v1/apps",
-                json=body,
-                headers={"Authorization": f"Bearer {tenant_token}"},
-            )
-            return resp.json()
-
-
-    # --- Docs API ---
-    async def read_feishu_doc(self, app_id: str, app_secret: str, document_id: str) -> dict:
-        """Get pure text content of a new-version Feishu Doc (docx)."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/raw_content",
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def create_feishu_doc(self, app_id: str, app_secret: str, folder_token: str | None = None, title: str = "Untitled Document") -> dict:
-        """Create a new Feishu Doc (docx)."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        body = {"title": title}
-        if folder_token:
-            body["folder_token"] = folder_token
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://open.feishu.cn/open-apis/docx/v1/documents",
-                json=body,
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def append_feishu_doc(self, app_id: str, app_secret: str, document_id: str, content: str) -> dict:
-        """Append text to the end of a Feishu Doc (document_id is also the root block_id)."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        # Convert plain text to a text block
-        body = {
-            "children": [
-                {
-                    "block_type": 2, # Text block (paragraph)
-                    "text": {
-                        "elements": [
-                            {
-                                "text_run": {
-                                    "content": content
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/children",
-                json=body,
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def append_feishu_doc_blocks(self, app_id: str, app_secret: str, document_id: str, block_id: str, blocks: list) -> dict:
-        """Append pre-parsed Markdown blocks to a Feishu doc block (e.g., body_block_id)."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/children",
-                json={"children": blocks},
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    # --- Approval API ---
-    async def create_approval_instance(self, app_id: str, app_secret: str, approval_code: str, user_id: str, form_data: str) -> dict:
-        """Create a Feishu approval instance."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        body = {
-            "approval_code": approval_code,
-            "user_id": user_id,
-            "form": form_data
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://open.feishu.cn/open-apis/approval/v4/instances",
-                json=body,
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def query_approval_instances(self, app_id: str, app_secret: str, approval_code: str, status: str = None) -> dict:
-        """Query Feishu approval instances."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        body = {"approval_code": approval_code}
-        if status:
-            body["status"] = status
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://open.feishu.cn/open-apis/approval/v4/instances/query",
-                json=body,
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
-
-    async def get_approval_instance(self, app_id: str, app_secret: str, instance_id: str) -> dict:
-        """Get details of a specific Feishu approval instance."""
-        tenant_token = await self.get_tenant_access_token(app_id, app_secret)
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"https://open.feishu.cn/open-apis/approval/v4/instances/{instance_id}",
-                headers={"Authorization": f"Bearer {tenant_token}"}
-            )
-            return resp.json()
 
     # --- CardKit Streaming API ---
 
