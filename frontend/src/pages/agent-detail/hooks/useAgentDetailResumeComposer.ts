@@ -250,7 +250,7 @@ export function useAgentDetailResumeComposer({
         activeReadOnlyRef.current = !isWritableSession(activeSession);
         ensureSessionSocket(activeSession, id, token);
         chat.syncActiveSocketState(activeSession, id);
-    }, [activeSession?.id, activeTab, chat, ensureSessionSocket, id, isWritableSession, token]);
+    }, [activeSession?.id, activeTab, chat.canViewAllAgentChatSessions, chat.chatScope, ensureSessionSocket, id, isWritableSession, token]);
 
     useEffect(() => {
         const startRecoveryPolling = (session: any, scope: 'mine' | 'all') => {
@@ -429,7 +429,7 @@ export function useAgentDetailResumeComposer({
             const withoutAuto = prev.filter((file: any) => file.source !== 'workspace_auto');
             return [...withoutAuto, { name: helpers.workspaceFileName(path), text: '', path, source: 'workspace_auto' }];
         });
-    }, [dismissedWorkspaceRefPath, livePanelVisible, setAttachedFiles, sidePanelTab, workspaceActivePath, helpers]);
+    }, [dismissedWorkspaceRefPath, livePanelVisible, setAttachedFiles, sidePanelTab, workspaceActivePath, helpers.workspaceFileName]);
 
     useEffect(() => {
         return () => {
