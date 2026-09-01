@@ -303,6 +303,7 @@ async def list_files(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """List files and directories in an agent's file system."""
     return await files_route_ops.list_files_impl(
         MODULE,
         agent_id=agent_id,
@@ -321,6 +322,7 @@ async def read_file(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Read the content of a file."""
     return await files_route_ops.read_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -339,6 +341,7 @@ async def preview_file(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Return a browser-friendly preview payload for Workspace files."""
     return await files_route_ops.preview_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -356,6 +359,7 @@ async def create_media_playback_ticket(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Create a fresh, cookie-bound URL for one audio/video playback."""
     return await files_playback_ops.create_media_playback_ticket_impl(
         MODULE,
         agent_id=agent_id,
@@ -411,6 +415,10 @@ async def download_file(
     credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ):
+    """Download / serve a file from the agent workspace (browser-friendly).
+
+    Auth via Bearer header OR `token` query parameter (for <img> tags).
+    """
     return await files_route_ops.download_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -431,6 +439,7 @@ async def write_file(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Write content to a file (create or overwrite)."""
     return await files_route_ops.write_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -450,6 +459,7 @@ async def lock_file(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Acquire or refresh a short-lived human editing lock for a file."""
     return await files_route_ops.lock_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -467,6 +477,7 @@ async def unlock_file(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Release the current user's edit lock for a file."""
     return await files_route_ops.unlock_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -484,6 +495,7 @@ async def get_file_revisions(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """List version history for the currently opened Workspace file."""
     return await files_route_ops.get_file_revisions_impl(
         MODULE,
         agent_id=agent_id,
@@ -501,6 +513,7 @@ async def restore_file_revision(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Restore a file to a previous revision's after-content."""
     return await files_route_ops.restore_file_revision_impl(
         MODULE,
         agent_id=agent_id,
@@ -520,6 +533,7 @@ async def delete_file(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Delete a file."""
     return await files_route_ops.delete_file_impl(
         MODULE,
         agent_id=agent_id,
@@ -539,6 +553,11 @@ async def import_skill_to_agent(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Import a global skill into this agent's skills/ workspace folder.
+
+    Copies all files from the global skill registry into
+    <agent_workspace>/skills/<folder_name>/.
+    """
     return await files_route_ops.import_skill_to_agent_impl(
         MODULE,
         agent_id=agent_id,
@@ -558,6 +577,7 @@ async def upload_file_to_workspace(
     db: AsyncSession = Depends(get_db),
     _workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Upload a binary file to agent workspace."""
     return await files_route_ops.upload_file_to_workspace_impl(
         MODULE,
         agent_id=agent_id,
@@ -573,6 +593,7 @@ async def list_enterprise_kb_files(
     path: str = "",
     current_user: User = Depends(get_current_user),
 ):
+    """List files in enterprise knowledge base (tenant-scoped)."""
     return await files_enterprise_ops.list_enterprise_kb_files_impl(
         MODULE,
         path=path,
@@ -586,6 +607,7 @@ async def upload_enterprise_kb_file(
     sub_path: str = "",
     current_user: User = Depends(get_current_user),
 ):
+    """Upload a file to enterprise knowledge base (tenant-scoped)."""
     return await files_enterprise_ops.upload_enterprise_kb_file_impl(
         MODULE,
         file=file,
@@ -599,6 +621,7 @@ async def read_enterprise_file(
     path: str,
     current_user: User = Depends(get_current_user),
 ):
+    """Read content of an enterprise knowledge base file (tenant-scoped)."""
     return await files_enterprise_ops.read_enterprise_file_impl(
         MODULE,
         path=path,
@@ -612,6 +635,7 @@ async def write_enterprise_file(
     data: FileWrite,
     current_user: User = Depends(get_current_user),
 ):
+    """Write content to an enterprise file (tenant-scoped)."""
     return await files_enterprise_ops.write_enterprise_file_impl(
         MODULE,
         path=path,
@@ -625,6 +649,7 @@ async def delete_enterprise_file(
     path: str,
     current_user: User = Depends(get_current_user),
 ):
+    """Delete an enterprise knowledge base file (tenant-scoped)."""
     return await files_enterprise_ops.delete_enterprise_file_impl(
         MODULE,
         path=path,
@@ -640,6 +665,7 @@ async def agent_import_from_clawhub(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Import a skill from ClawHub directly into this agent's skills/ workspace."""
     return await files_enterprise_ops.agent_import_from_clawhub_impl(
         MODULE,
         agent_id=agent_id,
@@ -658,6 +684,7 @@ async def agent_import_from_url(
     db: AsyncSession = Depends(get_db),
     workspace_agent: Agent = Depends(_bind_file_workspace),
 ):
+    """Import a skill from a GitHub URL directly into this agent's skills/ workspace."""
     return await files_enterprise_ops.agent_import_from_url_impl(
         MODULE,
         agent_id=agent_id,
