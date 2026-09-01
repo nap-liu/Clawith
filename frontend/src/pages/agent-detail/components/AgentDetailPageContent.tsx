@@ -293,6 +293,7 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                 {activeTab === 'settings' && id && (
                     <SettingsTab
                         {...(props as any)}
+                        agentId={id}
                         accessPermissionsPanel={(
                             <AccessPermissionsPanel
                                 agentId={id}
