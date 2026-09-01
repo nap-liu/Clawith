@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 from sqlalchemy import delete, func, select
-from test_project_actions import ProjectApiEnv, _create_project, _user
+from project_actions_support import ProjectApiEnv, _create_project, _user
 
 from app.models.activity_log import AgentActivityLog
 from app.models.agent import AgentPermission
@@ -22,7 +22,7 @@ from app.services.agent_tools import execute_tool
 from app.services.user_project_tools import USER_PROJECT_TOOL_SEEDS
 
 pytestmark = pytest.mark.asyncio
-pytest_plugins = ("test_project_actions",)
+pytest_plugins = ("project_actions_support",)
 
 
 @dataclass(frozen=True)
