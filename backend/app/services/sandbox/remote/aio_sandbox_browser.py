@@ -13,6 +13,7 @@ from loguru import logger
 
 from app.services.sandbox.base import ExecutionResult
 from app.services.sandbox.remote.aio_sandbox_backend import (
+    _STDOUT_LIMIT,
     _is_browser_global_method,
     compute_session_anchor,
 )
