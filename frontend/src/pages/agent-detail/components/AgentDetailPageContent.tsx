@@ -260,7 +260,7 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                     </div>
                 )}
 
-                {activeTab === 'status' && <StatusTabContent {...(props as any)} />}
+                {activeTab === 'status' && <StatusTabContent {...(props as any)} formatTokens={formatTokens} />}
 
                 {activeTab === 'aware' && <AwareTabContent {...(props as any)} />}
 
