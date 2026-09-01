@@ -445,7 +445,7 @@ export function useAgentDetailSessionSelection({
         };
         void restoreSessionFromUrl();
         return () => { cancelled = true; };
-    }, [activeSessionIdRef, activeTab, clearChatSelection, currentAgentIdRef, fetchAllSessions, id, requestedSessionId, setSessionsLoading, setChatScope, t, toast, token]);
+    }, [id, token, activeTab, currentUser?.id, requestedSessionId]);
 
     parseChatMsgRef.current = ({ msg, id: messageAgentId = id, activeSession: messageSession = activeSession }: any) => parseAgentDetailChatMsg({
         msg,
