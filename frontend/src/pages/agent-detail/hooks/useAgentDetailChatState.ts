@@ -458,6 +458,7 @@ export function useAgentDetailChatState({
         setAllSessionsLoadingMore,
         agentExpired,
         setAgentExpired,
+        setOnboardingKickoffRequest,
         token,
         canViewAllAgentChatSessions,
         wsMapRef,
