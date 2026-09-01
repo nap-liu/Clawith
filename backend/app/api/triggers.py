@@ -35,6 +35,10 @@ class TriggerResponse(BaseModel):
     creator_display_name: str | None = None
     execution_user_id: str | None = None
     execution_user_display_name: str | None = None
+    model_id: str | None = None
+    temperature: float | None = None
+    soul: bool = True
+    memory: bool = True
 
 
 class TriggerUpdate(BaseModel):
@@ -46,6 +50,10 @@ class TriggerUpdate(BaseModel):
     expires_at: str | None = None
     execution_user_id: uuid.UUID | None = None
     expected_execution_user_id: uuid.UUID | None = None
+    model_id: uuid.UUID | None = None
+    temperature: float | None = None
+    soul: bool = True
+    memory: bool = True
 
 
 class TriggerExecutionResponse(BaseModel):
@@ -179,6 +187,10 @@ async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user
             creator_display_name=user_names.get(t.created_by_user_id),
             execution_user_id=str(t.execution_user_id) if t.execution_user_id else None,
             execution_user_display_name=user_names.get(t.execution_user_id),
+            model_id=str(t.model_id) if t.model_id else None,
+            temperature=t.temperature,
+            soul=t.soul,
+            memory=t.memory,
         )
         for t in triggers
     ]
@@ -246,11 +258,25 @@ async def update_trigger(
         if not trigger:
             raise HTTPException(404, "Trigger not found")
 
+        if "model_id" in body.model_fields_set:
+            from app.models.agent import Agent
+            from app.services.chat_model_selection import validate_agent_model_override
+
+            agent = await db.get(Agent, agent_id)
+            try:
+                await validate_agent_model_override(db, agent=agent, model_id=body.model_id)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+
         changed_fields = body.model_fields_set
         if trigger.is_system and changed_fields - {
             "is_enabled",
             "execution_user_id",
             "expected_execution_user_id",
+            "model_id",
+            "temperature",
+            "soul",
+            "memory",
         }:
             raise HTTPException(
                 403,
@@ -320,6 +346,16 @@ async def update_trigger(
         if body.expires_at is not None:
             from datetime import datetime
             trigger.expires_at = datetime.fromisoformat(body.expires_at)
+        if "model_id" in changed_fields:
+            trigger.model_id = body.model_id
+        if "temperature" in changed_fields:
+            if body.temperature is not None and not 0 <= body.temperature <= 2:
+                raise HTTPException(422, "temperature must be between 0 and 2")
+            trigger.temperature = body.temperature
+        if "soul" in changed_fields:
+            trigger.soul = body.soul
+        if "memory" in changed_fields:
+            trigger.memory = body.memory
 
         await db.commit()
 

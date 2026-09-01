@@ -19,6 +19,26 @@ MAX_TRIGGERS_PER_AGENT = 20
 VALID_TRIGGER_TYPES = {"cron", "once", "interval", "poll", "on_message", "webhook"}
 
 
+async def _resolve_trigger_model_id(db, agent_id: uuid.UUID, reference: object) -> uuid.UUID | None:
+    raw = str(reference or "").strip()
+    if not raw:
+        return None
+    from app.models.agent import Agent
+    from app.services.chat_model_selection import MODEL_STATUS_OK, resolve_tenant_model_reference
+
+    agent = await db.get(Agent, agent_id)
+    if agent is None or agent.tenant_id is None:
+        raise ValueError("当前 Agent 没有可用模型目录")
+    resolved = await resolve_tenant_model_reference(
+        db,
+        tenant_id=agent.tenant_id,
+        reference=raw,
+    )
+    if resolved.status != MODEL_STATUS_OK or resolved.model is None:
+        raise ValueError(f"模型 {raw} 不可用")
+    return resolved.model.id
+
+
 async def _handle_set_trigger(
     agent_id: uuid.UUID,
     arguments: dict,
@@ -41,6 +61,16 @@ async def _handle_set_trigger(
     }
     reason = arguments.get("reason", "").strip()
     focus_ref = arguments.get("focus_ref", "") or arguments.get("agenda_ref", "")  # backward compat
+    soul = arguments.get("soul", True) is not False
+    memory = arguments.get("memory", True) is not False
+    try:
+        from app.services.chat_model_selection import validate_temperature
+
+        temperature = validate_temperature(arguments.get("temperature"))
+        async with async_session() as model_db:
+            model_id = await _resolve_trigger_model_id(model_db, agent_id, arguments.get("model"))
+    except ValueError as exc:
+        return f"❌ {exc}"
 
     if not name:
         return "❌ Missing required argument 'name'"
@@ -302,6 +332,10 @@ async def _handle_set_trigger(
                 existing.reason = reason
                 existing.focus_ref = focus_ref
                 existing.is_enabled = True
+                existing.model_id = model_id
+                existing.temperature = temperature
+                existing.soul = soul
+                existing.memory = memory
                 # Keep fire_count and last_fired_at — they are cumulative stats,
                 # but reset fire_count if it reached max_fires to allow it to run again.
                 if existing.max_fires and existing.fire_count >= existing.max_fires:
@@ -318,6 +352,10 @@ async def _handle_set_trigger(
                     config=config,
                     reason=reason,
                     focus_ref=focus_ref,
+                    model_id=model_id,
+                    temperature=temperature,
+                    soul=soul,
+                    memory=memory,
                 )
             # Fix 4: Safety cap for on_message triggers —
             # prevent infinite loops if agent creates broad watchers.
@@ -428,9 +466,21 @@ async def _handle_update_trigger(
     new_config = arguments.get("config")
     new_reason = arguments.get("reason")
     new_webhook_mode = arguments.get("webhook_mode")
+    model_supplied = "model" in arguments
+    temperature_supplied = "temperature" in arguments
+    soul_supplied = "soul" in arguments
+    memory_supplied = "memory" in arguments
 
-    if new_config is None and new_reason is None and new_webhook_mode is None:
-        return "❌ Provide at least one of 'config', 'reason', or 'webhook_mode' to update"
+    if (
+        new_config is None
+        and new_reason is None
+        and new_webhook_mode is None
+        and not model_supplied
+        and not temperature_supplied
+        and not soul_supplied
+        and not memory_supplied
+    ):
+        return "❌ Provide at least one field to update"
 
     try:
         async with async_session() as db:
@@ -445,6 +495,32 @@ async def _handle_update_trigger(
             trigger = result.scalar_one_or_none()
             if not trigger:
                 return f"❌ Trigger '{name}' not found"
+            if model_supplied:
+                try:
+                    trigger.model_id = await _resolve_trigger_model_id(
+                        db,
+                        agent_id,
+                        arguments.get("model"),
+                    )
+                except ValueError as exc:
+                    return f"❌ {exc}"
+                changes = ["model updated"]
+            else:
+                changes = []
+            if temperature_supplied:
+                try:
+                    from app.services.chat_model_selection import validate_temperature
+
+                    trigger.temperature = validate_temperature(arguments.get("temperature"))
+                except ValueError as exc:
+                    return f"❌ {exc}"
+                changes.append("temperature updated")
+            if soul_supplied:
+                trigger.soul = arguments.get("soul") is not False
+                changes.append("soul updated")
+            if memory_supplied:
+                trigger.memory = arguments.get("memory") is not False
+                changes.append("memory updated")
 
             # Freeze already-queued work before changing config fields that can
             # participate in legacy execution-user fallback.
@@ -459,7 +535,6 @@ async def _handle_update_trigger(
                     execution_user_id=user_id,
                 )
 
-            changes = []
             if new_config is not None:
                 if not isinstance(new_config, dict):
                     return "❌ Trigger config must be an object"

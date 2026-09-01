@@ -9,6 +9,44 @@ import {
     schedToCron,
 } from '../shared';
 
+const settingsFormFromAgent = (agent: any) => ({
+    primary_model_id: agent?.primary_model_id || '',
+    fallback_model_id: agent?.fallback_model_id || '',
+    temperature: (agent?.temperature ?? null) as number | null,
+    context_window_size: (agent?.context_window_size ?? 100) as string | number,
+    daily_memory_load_days: (agent?.daily_memory_load_days ?? 0) as string | number,
+    max_tool_rounds: (agent?.max_tool_rounds ?? 50) as string | number,
+    max_tokens_per_day: (agent?.max_tokens_per_day ?? '') as string | number,
+    max_tokens_per_month: (agent?.max_tokens_per_month ?? '') as string | number,
+    max_triggers: (agent?.max_triggers ?? 20) as string | number,
+    min_poll_interval_min: (agent?.min_poll_interval_min ?? 5) as string | number,
+    webhook_rate_limit: (agent?.webhook_rate_limit ?? 5) as string | number,
+    im_thinking_output_enabled: agent?.im_thinking_output_enabled ?? false,
+});
+
+type SettingsForm = ReturnType<typeof settingsFormFromAgent>;
+
+const boundedNumber = (value: string | number, min: number, max: number, fallback: number) => {
+    const parsed = Number(value);
+    const isBlank = typeof value === 'string' && value.trim() === '';
+    return Math.max(min, Math.min(max, !isBlank && Number.isFinite(parsed) ? parsed : fallback));
+};
+
+const settingsUpdateFromForm = (form: SettingsForm) => ({
+    primary_model_id: form.primary_model_id || null,
+    fallback_model_id: form.fallback_model_id || null,
+    temperature: form.temperature,
+    context_window_size: boundedNumber(form.context_window_size, 10, 500, 100),
+    daily_memory_load_days: boundedNumber(form.daily_memory_load_days, 0, 30, 0),
+    max_tool_rounds: boundedNumber(form.max_tool_rounds, 5, 200, 50),
+    max_tokens_per_day: form.max_tokens_per_day === '' ? null : Number(form.max_tokens_per_day),
+    max_tokens_per_month: form.max_tokens_per_month === '' ? null : Number(form.max_tokens_per_month),
+    max_triggers: boundedNumber(form.max_triggers, 1, 100, 20),
+    min_poll_interval_min: boundedNumber(form.min_poll_interval_min, 1, 60, 5),
+    webhook_rate_limit: boundedNumber(form.webhook_rate_limit, 1, 60, 5),
+    im_thinking_output_enabled: form.im_thinking_output_enabled,
+});
+
 export function useAgentDetailResources({
     id,
     agent,
@@ -71,6 +109,22 @@ export function useAgentDetailResources({
         onError: (err: any) => {
             toast.error(t('agent.aware.executionIdentity.updateFailed'), { details: String(err?.detail || err?.message || err) });
         },
+    });
+    const updateBackgroundRuntime = useMutation({
+        mutationFn: ({ resourceType, resourceId, update }: any) => {
+            if (resourceType === 'trigger') return triggerApi.update(id, resourceId, update);
+            if (resourceType === 'task') return taskApi.update(id, resourceId, update);
+            return scheduleApi.update(id, resourceId, update);
+        },
+        onSuccess: (_data, variables) => {
+            const key = variables.resourceType === 'trigger' ? 'triggers' : `${variables.resourceType}s`;
+            queryClient.invalidateQueries({ queryKey: [key, id] });
+            toast.success(i18n.language?.startsWith('zh') ? '运行配置已更新' : 'Runtime settings updated');
+        },
+        onError: (err: any) => toast.error(
+            i18n.language?.startsWith('zh') ? '运行配置更新失败' : 'Runtime settings update failed',
+            { details: String(err?.detail || err?.message || err) },
+        ),
     });
 
     const { data: focusRecords = [], refetch: refetchFocusItems } = useQuery({
@@ -230,76 +284,34 @@ export function useAgentDetailResources({
         setExpirySaving(false);
     };
 
-    const [settingsForm, setSettingsForm] = useState({
-        primary_model_id: '',
-        fallback_model_id: '',
-        context_window_size: 100,
-        daily_memory_load_days: 2,
-        max_tool_rounds: 50,
-        max_tokens_per_day: '' as string | number,
-        max_tokens_per_month: '' as string | number,
-        max_triggers: 20,
-        min_poll_interval_min: 5,
-        webhook_rate_limit: 5,
-        im_thinking_output_enabled: false,
-    });
+    const [settingsForm, setSettingsForm] = useState(() => settingsFormFromAgent(agent));
     const [settingsSaving, setSettingsSaving] = useState(false);
     const [settingsSaved, setSettingsSaved] = useState(false);
     const [settingsError, setSettingsError] = useState('');
     const settingsInitRef = useRef(false);
     useEffect(() => {
         if (agent && !settingsInitRef.current) {
-            setSettingsForm({
-                primary_model_id: agent.primary_model_id || '',
-                fallback_model_id: agent.fallback_model_id || '',
-                context_window_size: agent.context_window_size ?? 100,
-                daily_memory_load_days: agent.daily_memory_load_days ?? 2,
-                max_tool_rounds: agent.max_tool_rounds ?? 50,
-                max_tokens_per_day: agent.max_tokens_per_day || '',
-                max_tokens_per_month: agent.max_tokens_per_month || '',
-                max_triggers: agent.max_triggers ?? 20,
-                min_poll_interval_min: agent.min_poll_interval_min ?? 5,
-                webhook_rate_limit: agent.webhook_rate_limit ?? 5,
-                im_thinking_output_enabled: agent.im_thinking_output_enabled ?? false,
-            });
+            setSettingsForm(settingsFormFromAgent(agent));
             settingsInitRef.current = true;
         }
     }, [agent]);
     const [wmDraft, setWmDraft] = useState('');
     const [wmSaved, setWmSaved] = useState(false);
     useEffect(() => { setWmDraft(agent?.welcome_message || ''); }, [agent?.welcome_message]);
-    const hasSettingsChanges = (
-        settingsForm.primary_model_id !== (agent?.primary_model_id || '')
-        || settingsForm.fallback_model_id !== (agent?.fallback_model_id || '')
-        || settingsForm.context_window_size !== (agent?.context_window_size ?? 100)
-        || settingsForm.daily_memory_load_days !== (agent?.daily_memory_load_days ?? 2)
-        || settingsForm.max_tool_rounds !== (agent?.max_tool_rounds ?? 50)
-        || String(settingsForm.max_tokens_per_day) !== String(agent?.max_tokens_per_day || '')
-        || String(settingsForm.max_tokens_per_month) !== String(agent?.max_tokens_per_month || '')
-        || settingsForm.max_triggers !== (agent?.max_triggers ?? 20)
-        || settingsForm.min_poll_interval_min !== (agent?.min_poll_interval_min ?? 5)
-        || settingsForm.webhook_rate_limit !== (agent?.webhook_rate_limit ?? 5)
-        || settingsForm.im_thinking_output_enabled !== (agent?.im_thinking_output_enabled ?? false)
+    const settingsUpdate = settingsUpdateFromForm(settingsForm);
+    const persistedSettings = settingsUpdateFromForm(settingsFormFromAgent(agent));
+    const hasSettingsChanges = Object.entries(settingsUpdate).some(
+        ([field, value]) => value !== persistedSettings[field as keyof typeof persistedSettings],
     );
     const handleSaveSettings = async () => {
         setSettingsSaving(true);
         setSettingsError('');
         try {
-            const result: any = await agentApi.update(id, {
-                primary_model_id: settingsForm.primary_model_id || null,
-                fallback_model_id: settingsForm.fallback_model_id || null,
-                context_window_size: settingsForm.context_window_size,
-                daily_memory_load_days: settingsForm.daily_memory_load_days,
-                max_tool_rounds: settingsForm.max_tool_rounds,
-                max_tokens_per_day: settingsForm.max_tokens_per_day ? Number(settingsForm.max_tokens_per_day) : null,
-                max_tokens_per_month: settingsForm.max_tokens_per_month ? Number(settingsForm.max_tokens_per_month) : null,
-                max_triggers: settingsForm.max_triggers,
-                min_poll_interval_min: settingsForm.min_poll_interval_min,
-                webhook_rate_limit: settingsForm.webhook_rate_limit,
-                im_thinking_output_enabled: settingsForm.im_thinking_output_enabled,
-            } as any);
-            queryClient.invalidateQueries({ queryKey: ['agent', id] });
-            settingsInitRef.current = false;
+            const result: any = await agentApi.update(id, settingsUpdate as any);
+            queryClient.setQueryData(['agent', id], (current: any) => ({ ...current, ...result }));
+            setSettingsForm(settingsFormFromAgent(result));
+            settingsInitRef.current = true;
+            void queryClient.invalidateQueries({ queryKey: ['agent', id] });
             const clamped = result?._clamped_fields;
             if (clamped && clamped.length > 0) {
                 const isCh = i18n.language?.startsWith('zh');
@@ -421,7 +433,7 @@ export function useAgentDetailResources({
     const { data: llmModels = [], isLoading: llmModelsLoading } = useQuery({
         queryKey: ['llm-models'],
         queryFn: () => enterpriseApi.llmModels(),
-        enabled: activeTab === 'settings' || activeTab === 'status' || activeTab === 'chat',
+        enabled: activeTab === 'settings' || activeTab === 'status' || activeTab === 'chat' || awareDataActive,
         refetchOnMount: 'always',
     });
     useEffect(() => {
@@ -579,6 +591,7 @@ export function useAgentDetailResources({
         executionUserPickerTarget,
         setExecutionUserPickerTarget,
         reassignExecutionUser,
+        updateBackgroundRuntime,
         focusRecords,
         refetchFocusItems,
         taskHistoryFile,

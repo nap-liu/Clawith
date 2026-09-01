@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { IconShieldCheck } from "@tabler/icons-react";
 
 import { enterpriseApi } from "../../../services/api";
+import { sortLlmModels } from "../../../utils/llmModels";
 import Pagination from "../../../components/Pagination";
 import ToolsTab from "../../../pages/agent-detail/tabs/ToolsTab";
 import SkillsTab from "../../../pages/agent-detail/tabs/SkillsTab";
@@ -103,14 +104,13 @@ export function CapabilitiesStep({
   }, [agentPage, agentPageCount]);
   const modelOptions = [
     { value: "", label: t("projectSnapshot.followSourceAgent") },
-    ...((modelsQuery.data || []) as Array<{
+    ...sortLlmModels(((modelsQuery.data || []) as Array<{
       id: string;
       provider: string;
       model: string;
       label?: string;
       enabled?: boolean;
-    }>)
-      .filter((model) => model.enabled !== false)
+    }>).filter((model) => model.enabled !== false))
       .map((model) => ({
         value: model.id,
         label: model.label || `${model.provider} · ${model.model}`,

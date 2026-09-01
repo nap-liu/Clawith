@@ -14,6 +14,7 @@ async def create_subagent(
     task: str,
     mode: str = "sync",
     model: str | None = None,
+    temperature: float | None = None,
     fork: bool = False,
     soul: bool = True,
     memory: bool = True,
@@ -101,7 +102,11 @@ async def create_subagent(
                 execution_user_id=resolved_user_id,
             )
 
-        canonical_model = await _resolve_model_name(db, agent, model)
+        try:
+            normalized_temperature = validate_temperature(temperature)
+        except ValueError as exc:
+            raise SubagentError("temperature 必须在 0 到 2 之间。") from exc
+        model_id, canonical_model = await _resolve_model_override(db, agent, model)
         now = datetime.now(UTC)
         child_id = uuid.uuid4()
         child_user_id = (
@@ -201,6 +206,8 @@ async def create_subagent(
             origin_tool_call_id=call_id,
             mode=normalized_mode,
             model=canonical_model,
+            model_id=model_id,
+            temperature=normalized_temperature,
             soul=bool(soul),
             memory=bool(memory),
             status=RUN_QUEUED,

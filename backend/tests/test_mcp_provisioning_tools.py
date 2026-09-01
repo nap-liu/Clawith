@@ -181,6 +181,66 @@ async def test_update_agent_name_syncs_participant():
     assert p.display_name == "NewParticipantName"
 
 
+async def test_update_agent_can_explicitly_clear_nullable_settings():
+    """MCP callers can distinguish clearing a setting from omitting it."""
+    from app.mcp_server.tools_provisioning import update_agent_impl
+    from app.models.agent import Agent
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="write")
+    async with async_session() as db:
+        persisted = await db.get(Agent, agent.id)
+        persisted.bio = "temporary"
+        persisted.timezone = "Asia/Shanghai"
+        persisted.temperature = 1.2
+        await db.commit()
+
+    out = await update_agent_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        clear_fields=["bio", "timezone", "imagination"],
+    )
+
+    assert "✅" in out
+    async with async_session() as db:
+        persisted = await db.get(Agent, agent.id)
+        assert persisted.bio is None
+        assert persisted.timezone is None
+        assert persisted.temperature is None
+
+
+async def test_org_admin_updates_all_visible_private_agent_runtime_settings():
+    """Company admins can update any visible standard Digital Employee."""
+    from app.mcp_server.tools_provisioning import update_agent_impl
+    from app.models.agent import Agent
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    admin = await _seed_admin_user(tenant_id=tenant.id)
+    private_agent = await _seed_agent(owner, name="Private", access_mode="private")
+    token = await _pat(admin, scope="write")
+
+    out = await update_agent_impl(
+        _ctx(token),
+        agent=str(private_agent.id),
+        imagination=0,
+        daily_memory_load_days=0,
+        im_thinking_output_enabled=True,
+    )
+    assert "✅" in out
+    assert "imagination" in out
+
+    async with async_session() as db:
+        updated = (
+            await db.execute(select(Agent).where(Agent.id == private_agent.id))
+        ).scalar_one()
+        assert updated.temperature == 0
+        assert updated.daily_memory_load_days == 0
+        assert updated.im_thinking_output_enabled is True
+
+
 async def test_create_agent_with_autonomy_and_tokens():
     """create_agent_impl accepts autonomy_policy + max_tokens_per_day + access_mode=private."""
     from app.mcp_server.tools_provisioning import create_agent_impl

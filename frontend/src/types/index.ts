@@ -28,6 +28,7 @@ export interface Agent {
     creator_display_name?: string;
     primary_model_id?: string;
     fallback_model_id?: string;
+    temperature?: number | null;
     autonomy_policy: Record<string, string>;
     tokens_used_today: number;
     tokens_used_month: number;
@@ -101,6 +102,10 @@ export interface Task {
     created_by: string;
     created_by_user_id: string;
     execution_user_id?: string;
+    model_id?: string | null;
+    temperature?: number | null;
+    soul?: boolean;
+    memory?: boolean;
     creator_username?: string;
     due_date?: string;
     supervision_target_user_id?: string;

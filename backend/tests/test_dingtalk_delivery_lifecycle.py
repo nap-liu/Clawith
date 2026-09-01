@@ -93,6 +93,7 @@ async def test_command_reply_uses_persisted_delivery_and_exact_session_lock_key(
     assert runtime.external_conv_id == "dingtalk_group_conversation-1"
     assert runtime.is_group is True
     assert deliveries[0]["message"] == "command reply"
+    assert deliveries[0]["content_format"] == "plain_text"
     assert result.status == "failed"
 
 
@@ -147,6 +148,51 @@ async def test_dingtalk_markdown_transports_use_plain_text_summary_and_keep_rece
             "title": "发布结果 服务已更新",
             "text": "## 发布结果\n\n**服务已更新**",
         }
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_plain_text_transports_keep_command_newlines(monkeypatch):
+    calls = []
+    response = _Response({"processQueryKey": "provider-command-1", "errcode": 0})
+
+    async def get_token(_key, _secret):
+        return "token"
+
+    async def get_access_token(_key, _secret):
+        return {"access_token": "token", "expires_in": 7200}
+
+    monkeypatch.setattr(dingtalk_service, "get_dingtalk_access_token", get_access_token)
+    monkeypatch.setattr(
+        "app.services.dingtalk_token.dingtalk_token_manager.get_token",
+        get_token,
+    )
+    monkeypatch.setattr(
+        dingtalk_service.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(response, calls),
+    )
+    monkeypatch.setattr(
+        turn_runtime.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(response, calls),
+    )
+    command = "可用模型：\nQwen3.7 Flash\nGLM 5.3"
+
+    for is_group, target_id in ((False, "staff"), (True, "conversation")):
+        result = await turn_runtime.send_dingtalk_proactive_text(
+            app_id="app",
+            app_secret="secret",
+            target_id=target_id,
+            is_group=is_group,
+            message=command,
+        )
+        assert result["processQueryKey"] == "provider-command-1"
+
+    assert len(calls) == 2
+    for _url, kwargs in calls:
+        payload = kwargs["json"]
+        assert payload["msgKey"] == "sampleText"
+        assert json.loads(payload["msgParam"]) == {"content": command}
 
 
 @pytest.mark.asyncio

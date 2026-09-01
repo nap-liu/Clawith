@@ -10,7 +10,6 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     from app.core.okr_feature import partition_retired_okr_triggers
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
-    from app.models.llm import LLMModel
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
     from app.services.llm import call_llm
@@ -153,16 +152,22 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             if await is_retired_okr_agent(db, agent):
                 return
 
-            # Load LLM model
-            if not agent.primary_model_id:
+            from app.services.chat_model_selection import (
+                MODEL_OVERRIDE_OK,
+                resolve_runtime_models,
+            )
+
+            runtime_models = await resolve_runtime_models(
+                db,
+                agent=agent,
+                override_model_id=triggers[0].model_id,
+                override_temperature=triggers[0].temperature,
+            )
+            if triggers[0].model_id and runtime_models.override_status != MODEL_OVERRIDE_OK:
+                raise RuntimeError("Trigger model override is unavailable")
+            model = runtime_models.primary_model
+            if model is None:
                 raise RuntimeError(f"Agent {agent.name} has no LLM model")
-            result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-            model = result.scalar_one_or_none()
-            if not model:
-                raise RuntimeError("Configured LLM model was not found")
-            # Skip invocation if model is disabled by admin
-            if not model.enabled:
-                raise RuntimeError(f"Agent {agent.name}'s model {model.model} is disabled")
 
             # Build trigger context. Keep this model-facing prompt in English so
             # autonomous wakeups behave consistently across UI locales.
@@ -379,6 +384,8 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             on_thinking=on_thinking,
             turn_anchor_id=turn_anchor.id,
             turn_type="trigger",
+            include_soul=triggers[0].soul,
+            include_memory=triggers[0].memory,
             # A2A wake uses the agent's own max_tool_rounds setting (no override)
         )
 

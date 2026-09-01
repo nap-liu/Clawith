@@ -267,6 +267,7 @@ async def create_agent(
         boundaries=data.boundaries,
         primary_model_id=data.primary_model_id,
         fallback_model_id=data.fallback_model_id,
+        temperature=data.temperature,
         permission_scope_type=data.permission_scope_type,
         permission_scope_ids=data.permission_scope_ids,
         permission_access_level=data.permission_access_level,

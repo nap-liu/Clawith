@@ -53,7 +53,7 @@ async def test_gateway_same_creator_different_execution_agent_queues_next_turn(
         await release_first.wait()
         return "first identity reply"
 
-    monkeypatch.setattr("app.services.llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_call_llm)
     first_args = await _native_background_args(
         source_id,
         target_id,
@@ -514,7 +514,7 @@ async def test_native_gateway_lease_failure_remains_durably_recoverable(
     async def fail_call_llm(**_kwargs):
         raise lease_error
 
-    monkeypatch.setattr("app.services.llm.call_llm", fail_call_llm)
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fail_call_llm)
     scheduled: list[ChatMessage] = []
     lease_released = False
 

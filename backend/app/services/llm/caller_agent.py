@@ -19,7 +19,7 @@ async def call_agent_llm(
     """Call the agent's LLM with automatic failover support."""
     from app.core.permissions import is_agent_expired
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
+    from app.services.chat_model_selection import resolve_runtime_models
 
     # Load agent
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -34,23 +34,9 @@ async def call_agent_llm(
     if is_agent_expired(agent):
         return "数字员工已过期并停止服务，请联系管理员延长有效期。"
 
-    # Load primary model
-    primary_model: LLMModel | None = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        primary_model = model_result.scalar_one_or_none()
-
-    # Load fallback model
-    fallback_model: LLMModel | None = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
-
-    # Config-level fallback: primary missing -> use fallback
-    if not primary_model and fallback_model:
-        primary_model = fallback_model
-        fallback_model = None
-        logger.warning(f"[call_agent_llm] Primary model unavailable, using fallback: {primary_model.model}")
+    runtime_models = await resolve_runtime_models(db, agent=agent)
+    primary_model = runtime_models.primary_model
+    fallback_model = runtime_models.fallback_model
 
     if not primary_model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
@@ -92,10 +78,17 @@ async def call_agent_llm_with_tools(
     session_id: str = "",
     execution_user_id: uuid.UUID | None = None,
     turn_type: str = "background",
+    model_override_id: uuid.UUID | str | None = None,
+    temperature_override: float | None = None,
 ) -> str:
     """Call agent LLM with tool-calling loop (for background services)."""
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
+    from app.services.chat_model_selection import (
+        BackgroundModelUnavailableError,
+        MODEL_OVERRIDE_NONE,
+        MODEL_OVERRIDE_OK,
+        resolve_runtime_models,
+    )
 
     # Load agent and models
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -119,6 +112,23 @@ async def call_agent_llm_with_tools(
             execution_user_id,
         )
 
+    resolved_models = await resolve_runtime_models(
+        db,
+        agent=agent,
+        override_model_id=model_override_id,
+        override_temperature=temperature_override,
+    )
+    if model_override_id and resolved_models.override_status not in {
+        MODEL_OVERRIDE_NONE,
+        MODEL_OVERRIDE_OK,
+    }:
+        raise BackgroundModelUnavailableError("后台任务指定的模型不可用")
+    primary_model = resolved_models.primary_model
+    fallback_model = resolved_models.fallback_model
+
+    if not primary_model:
+        raise BackgroundModelUnavailableError(f"{agent.name} 未配置可用的 LLM 模型")
+
     await ensure_active_turn(
         owner_user_id=execution_user_id,
         agent_id=agent_id,
@@ -126,25 +136,6 @@ async def call_agent_llm_with_tools(
         turn_type=turn_type,
         title=user_prompt.strip()[:40] or None,
     )
-
-    # Load models
-    primary_model: LLMModel | None = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        primary_model = model_result.scalar_one_or_none()
-
-    fallback_model: LLMModel | None = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
-
-    # Config-level fallback
-    if not primary_model and fallback_model:
-        primary_model = fallback_model
-        fallback_model = None
-
-    if not primary_model:
-        return f"⚠️ {agent.name} has no LLM model configured"
 
     if _same_model_record(primary_model, fallback_model):
         logger.info("[call_agent_llm_with_tools] Primary and fallback reference the same model id; skipping fallback")
@@ -169,7 +160,7 @@ async def call_agent_llm_with_tools(
     # each. ``expire_on_commit=False`` keeps the loaded agent/model values usable.
     await db.commit()
 
-    async def _try_model(model: LLMModel) -> tuple[str, bool, bool]:
+    async def _try_model(model) -> tuple[str, bool, bool]:
         """Try to complete with a model. Returns (response, success, tool_executed)."""
         _accumulated_usage = TokenUsage()
         _unsaved_usage = TokenUsage()

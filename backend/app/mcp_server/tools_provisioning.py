@@ -8,13 +8,26 @@ from mcp.server.fastmcp import Context
 from sqlalchemy import or_, select
 
 from app.database import async_session
+from app.core.permissions import is_platform_admin_user
 from app.mcp_server import mcp
 from app.mcp_server._common import authed_write, resolve_manageable_agent
 from app.models.llm import LLMModel
 from app.services.agent_provisioning import AgentProvisionInput, provision_agent
+from app.services.agent_settings_update import apply_agent_settings_patch, public_setting_name
 from app.services.quota_guard import QuotaExceeded
 
 _VALID_ACCESS = {"company", "private", "custom"}
+_CLEARABLE_SETTINGS = frozenset({
+    "avatar_url",
+    "bio",
+    "fallback_model",
+    "imagination",
+    "max_tokens_per_day",
+    "max_tokens_per_month",
+    "primary_model",
+    "timezone",
+    "welcome_message",
+})
 
 
 async def _resolve_model_id(db, tenant_id, ref):
@@ -172,6 +185,10 @@ async def update_agent_impl(
     heartbeat_active_hours=None,
     timezone=None,
     expires_at=None,
+    imagination=None,
+    daily_memory_load_days=None,
+    im_thinking_output_enabled=None,
+    clear_fields=None,
 ) -> str:
     async with async_session() as db:
         pc, err = await authed_write(ctx, db)
@@ -181,7 +198,7 @@ async def update_agent_impl(
         if err:
             return err
 
-        is_admin = pc.user.role in ("platform_admin", "org_admin")
+        is_admin = is_platform_admin_user(pc.user) or pc.user.role == "org_admin"
 
         # Collect requested changes with before values
         # Each entry: (field_name, old_value, new_value)
@@ -212,132 +229,94 @@ async def update_agent_impl(
                     ag.status = "idle"
             planned.append(("expires_at", ag.expires_at, parsed_expires))
 
-        # ── Simple string/int/bool fields ───────────────────────────────────
-        if name is not None:
-            planned.append(("name", ag.name, name))
-        if welcome_message is not None:
-            planned.append(("welcome_message", ag.welcome_message, welcome_message))
-        if avatar_url is not None:
-            planned.append(("avatar_url", ag.avatar_url, avatar_url))
+        # Keep existing governance fields as standard MCP update_agent capabilities.
         if autonomy_policy is not None:
             planned.append(("autonomy_policy", ag.autonomy_policy, autonomy_policy))
-        if max_tokens_per_day is not None:
-            planned.append(("max_tokens_per_day", ag.max_tokens_per_day, max_tokens_per_day))
-        if max_tokens_per_month is not None:
-            planned.append(("max_tokens_per_month", ag.max_tokens_per_month, max_tokens_per_month))
-        if max_triggers is not None:
-            planned.append(("max_triggers", ag.max_triggers, max_triggers))
-        if heartbeat_enabled is not None:
-            planned.append(("heartbeat_enabled", ag.heartbeat_enabled, heartbeat_enabled))
-        if heartbeat_active_hours is not None:
-            planned.append(("heartbeat_active_hours", ag.heartbeat_active_hours, heartbeat_active_hours))
-        if timezone is not None:
-            planned.append(("timezone", ag.timezone, timezone))
-        if role_description is not None:
-            planned.append(("role_description", ag.role_description, role_description))
-        if bio is not None:
-            planned.append(("bio", ag.bio, bio))
-        if context_window_size is not None:
-            planned.append(("context_window_size", ag.context_window_size, context_window_size))
-        if max_tool_rounds is not None:
-            planned.append(("max_tool_rounds", ag.max_tool_rounds, max_tool_rounds))
 
-        # ── Model resolution ────────────────────────────────────────────────
-        if primary_model is not None:
-            pm = await _resolve_model_id(db, pc.tenant_id, primary_model)
-            if pm is None:
-                return (
-                    f"❌ 找不到 primary_model（你传入了 {primary_model!r}）。"
-                    "用 list_models 查看可用模型，并以其 id 或 label 重试。"
-                )
-            planned.append(("primary_model_id", ag.primary_model_id, pm))
-        if fallback_model is not None:
-            fm = await _resolve_model_id(db, pc.tenant_id, fallback_model)
-            if fm is None:
-                return (
-                    f"❌ 找不到 fallback_model（你传入了 {fallback_model!r}）。"
-                    "用 list_models 查看可用模型，并以其 id 或 label 重试。"
-                )
-            planned.append(("fallback_model_id", ag.fallback_model_id, fm))
-
-        # ── Tenant clamps ───────────────────────────────────────────────────
-        # Load tenant once if we need it
-        needs_clamp = (heartbeat_interval_minutes is not None
-                       or min_poll_interval_min is not None
-                       or webhook_rate_limit is not None)
-        tenant = None
-        if needs_clamp and ag.tenant_id:
-            from app.models.tenant import Tenant
-            t_result = await db.execute(select(Tenant).where(Tenant.id == ag.tenant_id))
-            tenant = t_result.scalar_one_or_none()
-
-        if heartbeat_interval_minutes is not None:
-            old_hbi = ag.heartbeat_interval_minutes
-            new_hbi = heartbeat_interval_minutes
-            if tenant and new_hbi < tenant.min_heartbeat_interval_minutes:
-                new_hbi = tenant.min_heartbeat_interval_minutes
-                clamp_notes.append(
-                    f"heartbeat_interval_minutes 已按企业下限从 {heartbeat_interval_minutes} 调整为 {new_hbi}"
-                )
-            planned.append(("heartbeat_interval_minutes", old_hbi, new_hbi))
-
-        if min_poll_interval_min is not None:
-            old_mpi = ag.min_poll_interval_min
-            new_mpi = min_poll_interval_min
-            if tenant and new_mpi < tenant.min_poll_interval_floor:
-                new_mpi = tenant.min_poll_interval_floor
-                clamp_notes.append(
-                    f"min_poll_interval_min 已按企业下限从 {min_poll_interval_min} 调整为 {new_mpi}"
-                )
-            planned.append(("min_poll_interval_min", old_mpi, new_mpi))
-
-        if webhook_rate_limit is not None:
-            old_wrl = ag.webhook_rate_limit
-            new_wrl = webhook_rate_limit
-            if tenant and new_wrl > tenant.max_webhook_rate_ceiling:
-                new_wrl = tenant.max_webhook_rate_ceiling
-                clamp_notes.append(
-                    f"webhook_rate_limit 已按企业上限从 {webhook_rate_limit} 调整为 {new_wrl}"
-                )
-            planned.append(("webhook_rate_limit", old_wrl, new_wrl))
+        ordinary_values = {
+            field: value
+            for field, value in {
+                "name": name,
+                "welcome_message": welcome_message,
+                "avatar_url": avatar_url,
+                "role_description": role_description,
+                "bio": bio,
+                "primary_model": primary_model,
+                "fallback_model": fallback_model,
+                "imagination": imagination,
+                "context_window_size": context_window_size,
+                "daily_memory_load_days": daily_memory_load_days,
+                "max_tool_rounds": max_tool_rounds,
+                "max_tokens_per_day": max_tokens_per_day,
+                "max_tokens_per_month": max_tokens_per_month,
+                "max_triggers": max_triggers,
+                "min_poll_interval_min": min_poll_interval_min,
+                "webhook_rate_limit": webhook_rate_limit,
+                "heartbeat_enabled": heartbeat_enabled,
+                "heartbeat_interval_minutes": heartbeat_interval_minutes,
+                "heartbeat_active_hours": heartbeat_active_hours,
+                "timezone": timezone,
+                "im_thinking_output_enabled": im_thinking_output_enabled,
+            }.items()
+            if value is not None
+        }
+        requested_clear_fields = set(clear_fields or [])
+        unsupported_clear_fields = requested_clear_fields - _CLEARABLE_SETTINGS
+        if unsupported_clear_fields:
+            return (
+                "❌ clear_fields 包含不可清空的设置："
+                + ", ".join(sorted(unsupported_clear_fields))
+                + "。可清空字段："
+                + ", ".join(sorted(_CLEARABLE_SETTINGS))
+                + "。"
+            )
+        conflicts = requested_clear_fields & ordinary_values.keys()
+        if conflicts:
+            return "❌ 同一设置不能同时赋值和清空：" + ", ".join(sorted(conflicts)) + "。"
+        ordinary_values.update({field: None for field in requested_clear_fields})
+        try:
+            ordinary_outcome = await apply_agent_settings_patch(db, ag, ordinary_values)
+        except ValueError as exc:
+            await db.rollback()
+            return f"❌ 设置未更新：{exc}"
+        planned.extend(ordinary_outcome.changes)
+        clamp_notes.extend(
+            f"{item['field']} 已按企业限制从 {item['requested']} 调整为 {item['applied']}"
+            for item in ordinary_outcome.clamps
+        )
 
         if not planned:
             return "（未提供任何要修改的字段：请至少传一个字段，如 name 或 role_description。）"
 
-        # ── Apply changes ───────────────────────────────────────────────────
+        # The shared service applied ordinary settings. Apply the retained
+        # governance/lifecycle fields collected above in the same transaction.
         for field, _old, new_val in planned:
-            setattr(ag, field, new_val)
-
-        # ── Participant sync ────────────────────────────────────────────────
-        changed_fields = {f for f, _, _ in planned}
-        if "name" in changed_fields or "avatar_url" in changed_fields:
-            from app.models.participant import Participant
-            p_r = await db.execute(
-                select(Participant).where(Participant.type == "agent", Participant.ref_id == ag.id)
-            )
-            p = p_r.scalar_one_or_none()
-            if p:
-                if "name" in changed_fields:
-                    p.display_name = ag.name
-                if "avatar_url" in changed_fields:
-                    p.avatar_url = ag.avatar_url
+            if field in {"autonomy_policy", "expires_at"}:
+                setattr(ag, field, new_val)
 
         await db.commit()
 
         # ── Build before→after report ───────────────────────────────────────
         # Use human-friendly field labels for model fields
-        _field_label = {"primary_model_id": "primary_model", "fallback_model_id": "fallback_model"}
         change_lines = []
         revert_parts = []
+        revert_clear_fields = []
         for field, old_val, new_val in planned:
-            label = _field_label.get(field, field)
+            label = public_setting_name(field)
             change_lines.append(f"  {label}: {old_val!r} → {new_val!r}")
-            revert_parts.append(f"{label}={old_val!r}")
+            if old_val is None and label in _CLEARABLE_SETTINGS:
+                revert_clear_fields.append(label)
+            else:
+                old_arg = str(old_val) if isinstance(old_val, _uuid.UUID) else old_val
+                revert_parts.append(f"{label}={old_arg!r}")
 
         report = f"✅ 已更新「{ag.name}」：\n" + "\n".join(change_lines)
         if clamp_notes:
             report += "\n⚠ 企业限制已应用：\n" + "\n".join(f"  • {n}" for n in clamp_notes)
-        report += f"\n↩ 如需回滚：用相同 update_agent 传回旧值（{'; '.join(revert_parts)}）。"
+        revert_hints = list(revert_parts)
+        if revert_clear_fields:
+            revert_hints.append(f"clear_fields={sorted(revert_clear_fields)!r}")
+        report += f"\n↩ 如需回滚：用相同 update_agent 传回旧值（{'; '.join(revert_hints)}）。"
         return report
 
 
@@ -413,10 +392,18 @@ async def update_agent(  # noqa: D401
     heartbeat_active_hours: str | None = None,
     timezone: str | None = None,
     expires_at: str | None = None,
+    imagination: float | None = None,
+    daily_memory_load_days: int | None = None,
+    im_thinking_output_enabled: bool | None = None,
+    clear_fields: list[str] | None = None,
 ) -> str:
     """Update an existing agent's settings (requires write scope + manage access).
     agent: id or name. Only the fields you pass are changed.
     primary_model/fallback_model accept a model id or label (see list_models).
+    imagination ranges from 0 (stable) to 2 (rich); omit it to keep the current value.
+    daily_memory_load_days=0 disables Daily Memory loading while retaining Core Memory.
+    clear_fields explicitly clears nullable ordinary settings such as primary_model, fallback_model,
+    imagination, avatar_url, bio, welcome_message, timezone, and token limits.
     expires_at: ISO8601 datetime string — ADMIN ONLY (platform_admin/org_admin).
     Tenant-floor clamps apply to heartbeat_interval_minutes (floor), min_poll_interval_min (floor),
     and webhook_rate_limit (ceiling) — the response will note any adjustments.
@@ -445,4 +432,8 @@ async def update_agent(  # noqa: D401
         heartbeat_active_hours=heartbeat_active_hours,
         timezone=timezone,
         expires_at=expires_at,
+        imagination=imagination,
+        daily_memory_load_days=daily_memory_load_days,
+        im_thinking_output_enabled=im_thinking_output_enabled,
+        clear_fields=clear_fields,
     )

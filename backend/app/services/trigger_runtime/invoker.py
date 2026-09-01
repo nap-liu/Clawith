@@ -103,7 +103,6 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
     from app.core.okr_feature import partition_retired_okr_triggers
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
-    from app.models.llm import LLMModel
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
     from app.services.llm import call_llm
@@ -199,19 +198,28 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                     await mark_trigger_executions_completed(execution_ids)
                 return
 
-            if not agent.primary_model_id:
-                logger.warning(f"Agent {agent.name} has no LLM model, skipping trigger invocation")
-                if execution_ids:
-                    await mark_trigger_executions_failed(execution_ids, "Agent has no LLM model configured")
-                return
-            result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-            model = result.scalar_one_or_none()
-            if not model or not model.enabled:
-                logger.warning(f"Agent {agent.name}'s model is unavailable, skipping trigger invocation")
+            from app.services.chat_model_selection import (
+                MODEL_OVERRIDE_OK,
+                resolve_runtime_models,
+            )
+
+            runtime_models = await resolve_runtime_models(
+                db,
+                agent=agent,
+                override_model_id=triggers[0].model_id,
+                override_temperature=triggers[0].temperature,
+            )
+            if triggers[0].model_id and runtime_models.override_status != MODEL_OVERRIDE_OK:
                 if execution_ids:
                     await mark_trigger_executions_failed(
-                        execution_ids, "Agent primary model is unavailable or disabled"
+                        execution_ids,
+                        "Trigger model override is unavailable",
                     )
+                return
+            model = runtime_models.primary_model
+            if model is None:
+                if execution_ids:
+                    await mark_trigger_executions_failed(execution_ids, "Agent has no LLM model configured")
                 return
 
             context_parts = []
@@ -367,6 +375,8 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             current_user_name_override=from_agent_name,
             turn_anchor_id=turn_anchor.id,
             turn_type="trigger",
+            include_soul=triggers[0].soul,
+            include_memory=triggers[0].memory,
         )
 
         from app.services.chat_history import lock_turn_anchor_for_finalization

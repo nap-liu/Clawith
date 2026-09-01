@@ -172,6 +172,10 @@ async def run_background_resource(
                 agent_id,
                 item.instruction,
                 actor_user_id,
+                item.model_id,
+                item.temperature,
+                item.soul,
+                item.memory,
             )
         )
 
@@ -188,17 +192,33 @@ async def _execute_and_track_schedule(
     agent_id: uuid.UUID,
     instruction: str,
     execution_user_id: uuid.UUID,
+    model_id: uuid.UUID | None = None,
+    temperature: float | None = None,
+    soul: bool = True,
+    memory: bool = True,
 ) -> None:
     """Persist manual counters only after a successful schedule execution."""
     from app.database import async_session
     from app.services.scheduler import ScheduleExecutionOutcome, _execute_schedule
 
-    outcome = await _execute_schedule(
-        schedule_id,
-        agent_id,
-        instruction,
-        execution_user_id,
-    )
+    if model_id is None and temperature is None and soul and memory:
+        outcome = await _execute_schedule(
+            schedule_id,
+            agent_id,
+            instruction,
+            execution_user_id,
+        )
+    else:
+        outcome = await _execute_schedule(
+            schedule_id,
+            agent_id,
+            instruction,
+            execution_user_id,
+            model_id,
+            temperature,
+            soul,
+            memory,
+        )
     if outcome is not ScheduleExecutionOutcome.SUCCEEDED:
         return
     async with async_session() as db:

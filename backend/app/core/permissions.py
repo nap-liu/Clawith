@@ -145,15 +145,23 @@ def require_current_agent_tenant(user: User, agent: Agent) -> None:
         )
 
 
-def can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
+def can_view_all_agent_chat_sessions(
+    user: User,
+    agent: Agent,
+    agent_access_level: str | None = None,
+) -> bool:
     """Whether ``user`` may view/monitor OTHER users' chat sessions for ``agent``.
 
     Single source of truth for "who can see another user's conversation",
     shared by the REST session/message APIs (list/read) and the live WebSocket
-    monitor path. Admins (platform/org/agent) and the agent's creator qualify.
+    monitor path. Platform admins, standard-Agent org governance, the Agent's
+    creator, and Agent admins with manage access qualify.
     """
     return current_agent_tenant_matches(user, agent) and (
-        user.role in ("platform_admin", "org_admin", "agent_admin") or str(agent.creator_id) == str(user.id)
+        is_platform_admin_user(user)
+        or (user.role == "org_admin" and getattr(agent, "scope", "standard") == "standard")
+        or str(agent.creator_id) == str(user.id)
+        or (user.role == "agent_admin" and agent_access_level == "manage")
     )
 
 

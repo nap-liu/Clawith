@@ -37,7 +37,10 @@ from datetime import datetime
 from sqlalchemy import String, and_, cast, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import get_agent_access_level_for_user_id
+from app.core.permissions import (
+    can_view_all_agent_chat_sessions,
+    get_agent_access_level_for_user_id,
+)
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
@@ -255,12 +258,16 @@ async def resolve_human_viewer_access(db: AsyncSession, user_id, agent: Agent) -
     cannot read others' private agents), ignores the unrecognized ``agent_admin``
     role, and is HTTP-exception free.
     """
-    level = await get_agent_access_level_for_user_id(db, _as_uuid(user_id), agent)
-    if level == "manage":
+    viewer_id = _as_uuid(user_id)
+    if viewer_id is None:
+        return SCOPE_DENY
+    level = await get_agent_access_level_for_user_id(db, viewer_id, agent)
+    if not level:
+        return SCOPE_DENY
+    viewer = await db.get(User, viewer_id)
+    if viewer is not None and can_view_all_agent_chat_sessions(viewer, agent, level):
         return SCOPE_ALL
-    if level:  # 'use'/other: has access but not manage
-        return SCOPE_OWN
-    return SCOPE_DENY
+    return SCOPE_OWN
 
 
 async def resolve_scope(db: AsyncSession, agent: Agent, ctx_session_id: str, user_id):

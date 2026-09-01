@@ -10,6 +10,12 @@ results, delivery state, compaction, and other externally relevant progress use
 purpose-specific short transactions. A slow provider must not leave the ingress
 session idle in transaction.
 
+Model generation settings use one precedence rule across foreground and
+background work: execution override, then Agent override, then model default.
+Subagents, tasks, schedules, and triggers persist optional model and temperature
+overrides; missing values inherit from the Agent. The UI names temperature
+“想象力” and constrains it to the supported 0–2 range.
+
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
 ### Asynchronous Subagent events on parent turns
@@ -31,6 +37,12 @@ Do not add a second inbox table, a completion-cohort state machine, or channel-s
 - Trigger/A2A/background turns can carry a creator `user_id` for execution context. They do not thereby inherit that creator's administrative read authority.
 
 Session introspection is always an owned-session subset. Human Web/IM access uses authoritative user permissions; non-human access is limited to the agent's own A2A, trigger, and current-session context. Denials should not leak whether another session exists.
+
+Platform administrators in the active tenant context, tenant organization
+administrators governing standard Agents, and Agent administrators with manage
+access can audit every non-project Session for that Agent. Group membership is
+not an additional condition for this governance view; tenant-safe Session edges
+remain mandatory.
 
 Active-turn listing and cancellation use one registry across Web, IM, MCP, A2A,
 trigger, task, and recovery entry points. Ordinary users can see/control only
@@ -63,6 +75,11 @@ One logical message can have N parts because providers split text, cards, or att
 
 Commit `pending` before provider I/O, append each confirmed part immediately, and finalize to `sent`, `partial`, `failed`, or `unknown`. Commands, ACKs, welcome/background notifications, files, media, and confirmation artifacts do not get channel-specific persistence rules. Provider typing indicators and reactions are transient control-plane state rather than durable messages; they are cleaned up by their own bounded lifecycle and are not exposed as recallable chat content.
 
+DingTalk command replies remain ordinary persisted assistant messages. The
+normalized delivery marks them as plain text, so the OpenAPI adapter uses the
+provider text template and preserves intentional newlines. Normal model replies
+retain Markdown transport semantics.
+
 Recall state is explicit (`available`, `recalling`, `recalled`, `partial`, `expired`, `failed`, or `unsupported`). Claim a recall attempt in a short transaction, perform network I/O outside the database lock, then merge results only if the attempt still owns the claim. Provider batch APIs must parse per-item results, not equate HTTP 200 with success.
 
 Fully recalled messages remain in the audit trail and render as a tombstone. LLM history must not replay recalled content as if the recipient still saw it.
@@ -71,7 +88,11 @@ Fully recalled messages remain in the audit trail and render as a tombstone. LLM
 
 - IM model execution has no whole-tool-loop timeout; request-level model timeouts and tool-round limits belong in the shared core.
 - Native provider capabilities differ across P2P and groups. Normalize the lifecycle result while keeping provider-specific request semantics in adapters.
-- `send_channel_file` has historically had stronger native file coverage on some transports than others. Capability absence must be explicit and a safe link fallback may be used where product-approved.
+- `send_channel_file` resolves canonical users through transport adapters. A
+  DingTalk user route reuses or creates the canonical P2P Session and then uses
+  the exact-Session DingTalk file sender. Capability absence on other
+  transports must remain explicit; a product-approved safe link fallback may
+  be used where native upload is unavailable.
 - Web live monitoring is distinct from write permission. A read-only viewer may receive events, but server-side writes remain denied.
 - Reaction/thinking anchors move only when an inbound message is actually
   consumed by the running turn. A merely pending interjection must not steal the

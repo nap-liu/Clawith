@@ -76,7 +76,7 @@ const CATEGORIES = [
 ] as const;
 
 const TAG_LABELS_ZH: Record<string, string> = {
-    NATIVE: '原生智能体',
+    NATIVE: '原生数字员工',
     OPENCLAW: '外部应用',
 };
 
@@ -427,7 +427,7 @@ export default function Explore() {
                     margin: 0,
                 }}>
                     {isChinese
-                        ? '发现、对话，与团队中的智能体协作'
+                        ? '发现、对话，与团队中的数字员工协作'
                         : 'Discover, chat with, and collaborate with agents in your team'}
                 </p>
             </div>
@@ -515,13 +515,13 @@ export default function Explore() {
                     </div>
                     <div style={{ fontSize: '15px', fontWeight: 500, marginBottom: '4px' }}>
                         {search
-                            ? (isChinese ? '没有找到匹配的智能体' : 'No agents match your search')
-                            : (isChinese ? '暂无智能体' : 'No agents yet')}
+                            ? (isChinese ? '没有找到匹配的数字员工' : 'No agents match your search')
+                            : (isChinese ? '暂无数字员工' : 'No agents yet')}
                     </div>
                     <div style={{ fontSize: '13px' }}>
                         {search
                             ? (isChinese ? '试试其他关键词' : 'Try different keywords')
-                            : (isChinese ? '创建你的第一个 AI 智能体开始探索' : 'Create your first agent to get started')}
+                            : (isChinese ? '创建你的第一个 AI 数字员工开始探索' : 'Create your first agent to get started')}
                     </div>
                 </div>
             ) : (
@@ -549,7 +549,7 @@ export default function Explore() {
                     total={data.total}
                     onPageChange={setPage}
                     showJump={false}
-                    ariaLabel={isChinese ? '智能体分页' : 'Agent pages'}
+                    ariaLabel={isChinese ? '数字员工分页' : 'Agent pages'}
                 />
             )}
             {isFetching && !isLoading && (

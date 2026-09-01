@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next';
 import { IconSettings } from '@tabler/icons-react';
 
 import { useDialog } from '../../../../components/Dialog/DialogProvider';
+import LlmModelSelect from '../../../../components/LlmModelSelect';
 import { useAuthStore } from '../../../../stores';
 import { CATEGORY_CONFIG_SCHEMAS } from './config';
 
@@ -15,6 +16,7 @@ export function ToolConfigModal({
     configJson,
     setConfigJson,
     configSaving,
+    configInitialSnapshot,
     configGlobalData,
     focusedField,
     setFocusedField,
@@ -34,6 +36,7 @@ export function ToolConfigModal({
     configJson: string;
     setConfigJson: React.Dispatch<React.SetStateAction<string>>;
     configSaving: boolean;
+    configInitialSnapshot: string;
     configGlobalData: Record<string, any>;
     focusedField: string | null;
     setFocusedField: React.Dispatch<React.SetStateAction<string | null>>;
@@ -61,6 +64,13 @@ export function ToolConfigModal({
     });
     const primaryFields = visibleFields.filter((field: any) => !field.advanced);
     const advancedFields = visibleFields.filter((field: any) => field.advanced);
+    const currentSnapshot = fields.length > 0 ? JSON.stringify(configData) : configJson;
+    const dirty = currentSnapshot !== configInitialSnapshot;
+    const missingRequiredModel = visibleFields.some((field: any) => (
+        field.type === 'llm_model_picker'
+        && field.required
+        && !(configData[field.key] ?? field.default)
+    ));
 
     return (
         <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.55)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
@@ -167,6 +177,14 @@ export function ToolConfigModal({
                                                 );
                                             })()}
                                             </>
+                                        ) : field.type === 'llm_model_picker' ? (
+                                            <LlmModelSelect
+                                                value={configData[field.key] ?? field.default ?? ''}
+                                                onChange={value => setConfigData(p => ({ ...p, [field.key]: value }))}
+                                                supportsVision={field.filter?.supports_vision === true}
+                                                disabled={isReadOnly}
+                                                required={field.required}
+                                            />
                                         ) : field.type === 'select' ? (
                                             <select className="form-input" value={configData[field.key] ?? field.default ?? ''}
                                                 onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}>
@@ -266,6 +284,14 @@ export function ToolConfigModal({
                                                                 <span style={{ position: 'absolute', left: (configData[field.key] ?? field.default) ? '20px' : '2px', top: '2px', width: '18px', height: '18px', background: '#fff', borderRadius: '50%', transition: 'left 0.2s' }} />
                                                             </span>
                                                         </label>
+                                                    ) : field.type === 'llm_model_picker' ? (
+                                                        <LlmModelSelect
+                                                            value={configData[field.key] ?? field.default ?? ''}
+                                                            onChange={value => setConfigData(p => ({ ...p, [field.key]: value }))}
+                                                            supportsVision={field.filter?.supports_vision === true}
+                                                            disabled={isReadOnly}
+                                                            required={field.required}
+                                                        />
                                                     ) : field.type === 'select' ? (
                                                         <select className="form-input" value={configData[field.key] ?? field.default ?? ''} disabled={isReadOnly}
                                                             onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}>
@@ -383,7 +409,7 @@ export function ToolConfigModal({
                         >{t('agent.tools.testConnection')}</button>
                     )}
                     <button className="btn btn-secondary" onClick={() => { setConfigTool(null); setConfigCategory(null); }}>{t('common.cancel')}</button>
-                    <button className="btn btn-primary" onClick={saveConfig} disabled={configSaving}>{configSaving ? t('common.saving', 'Saving…') : t('common.save', 'Save')}</button>
+                    <button className="btn btn-primary" onClick={saveConfig} disabled={configSaving || !dirty || missingRequiredModel}>{configSaving ? t('common.saving', 'Saving…') : t('common.save', 'Save')}</button>
                 </div>
             </div>
         </div>

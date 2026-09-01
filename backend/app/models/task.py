@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, Float, ForeignKey, String, Text, func, true
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,10 @@ class Task(Base):
             "NOT (supervision_target_user_id IS NOT NULL "
             "AND supervision_target_agent_id IS NOT NULL)",
             name="ck_task_single_supervision_target",
+        ),
+        CheckConstraint(
+            "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
+            name="ck_tasks_temperature",
         ),
     )
 
@@ -45,6 +49,22 @@ class Task(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     execution_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    model_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "llm_models.id",
+            name="fk_tasks_model_id_llm_models",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    soul: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    memory: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
     )
     due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

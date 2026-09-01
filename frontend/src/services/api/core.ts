@@ -55,7 +55,7 @@ async function request<T>(
     const fieldLabels: Record<string, string> = {
       name: "名称",
       role_description: "角色描述",
-      agent_type: "智能体类型",
+      agent_type: "数字员工类型",
       primary_model_id: "主模型",
       max_tokens_per_day: "每日 Token 上限",
       max_tokens_per_month: "每月 Token 上限",

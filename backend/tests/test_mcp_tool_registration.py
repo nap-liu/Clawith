@@ -36,6 +36,10 @@ async def test_all_mcp_tools_registered():
     missing = expected - names
     assert not missing, f"missing tools: {missing}"
 
+    update_agent = next(tool for tool in tools if tool.name == "update_agent")
+    update_fields = update_agent.inputSchema["properties"]
+    assert {"imagination", "daily_memory_load_days", "im_thinking_output_enabled"} <= set(update_fields)
+
     assert "set_agent_access" not in names, "destructive access replacement tool must stay removed"
 
     # edit_agent_soul was superseded by write_agent_file and must not be registered

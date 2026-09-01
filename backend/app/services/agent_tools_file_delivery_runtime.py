@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import uuid
+from pathlib import Path
 
 from loguru import logger
 from sqlalchemy import select
@@ -12,7 +12,8 @@ from app.models.chat_session import ChatSession
 from app.models.org import OrgMember
 from app.services.agent_tools_channel_file_receipts import record_channel_file_part
 from app.services.agent_tools_file_support import _agent_workspace_root
-from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, DeliveryReceiptPersistenceError
+from app.services.channel_session import find_or_create_channel_session
+from app.services.im_delivery import DeliveryReceiptPersistenceError, IMDeliveryPart, IMDeliveryResult
 from app.services.recipient_resolver import RecipientResolutionError, resolve_human_channel_recipient
 from app.services.user_output import sanitize_user_visible_text
 
@@ -330,6 +331,7 @@ async def _send_file_to_recipient(
     channel: str | None = None,
 ) -> tuple[str, IMDeliveryResult]:
     """Resolve one canonical recipient route and send without name lookup."""
+    dingtalk_session_id: str | None = None
     async with async_session() as db:
         try:
             route = await resolve_human_channel_recipient(db, agent_id, user_id, channel=channel)
@@ -343,12 +345,37 @@ async def _send_file_to_recipient(
             )
         )
         config = config_result.scalar_one_or_none()
-    if not config:
-        error = RecipientResolutionError(
-            "channel_unconfigured",
-            f"Source agent has no configured {route.channel} channel",
+        if not config:
+            error = RecipientResolutionError(
+                "channel_unconfigured",
+                f"Source agent has no configured {route.channel} channel",
+            )
+            return error.as_json(), IMDeliveryResult.failed(route.channel, error.code)
+        if route.channel == "dingtalk":
+            target_staff_id = str(route.member.external_id or "").strip()
+            if not target_staff_id:
+                error = RecipientResolutionError(
+                    "recipient_unreachable",
+                    "Canonical user has no usable DingTalk endpoint",
+                )
+                return error.as_json(), IMDeliveryResult.failed("dingtalk", error.code)
+            session = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=route.user.id,
+                external_conv_id=f"dingtalk_p2p_{target_staff_id}",
+                source_channel="dingtalk",
+                first_message_title=message.strip()[:30] or file_path.name[:30],
+            )
+            await db.commit()
+            dingtalk_session_id = str(session.id)
+    if dingtalk_session_id:
+        return await _send_file_to_session(
+            agent_id,
+            file_path,
+            dingtalk_session_id,
+            message,
         )
-        return error.as_json(), IMDeliveryResult.failed(route.channel, error.code)
     if route.channel == "feishu":
         return await _send_file_via_feishu(agent_id, config, file_path, route.member, route.user.display_name, message)
     if route.channel == "slack":
@@ -420,6 +447,7 @@ async def _send_file_via_feishu(
     except Exception as e:
         # If upload fails, try sending a download link as fallback
         import json as _j
+
         from app.config import get_settings as _gs
 
         _s = _gs()

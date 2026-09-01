@@ -125,7 +125,7 @@ async def _tick():
     # Invoke each independent execution.  on_message buckets are force-invoked
     # and are serialized by their exact origin session in the invocation path.
     for invocation_key, agent_triggers in fired_by_invocation.items():
-        agent_id, _execution_user_id, _bucket = invocation_key
+        agent_id, _execution_user_id, _bucket, _model_id, _temperature, _soul, _memory = invocation_key
         last = _last_invoke.get(invocation_key)
         if invocation_key not in force_invoke and last and (now - last).total_seconds() < DEDUP_WINDOW:
             continue  # Skip — invoked too recently

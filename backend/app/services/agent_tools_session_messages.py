@@ -37,6 +37,7 @@ from app.services.im_delivery import (
     IMDeliveryPart,
     IMDeliveryResult,
     MentionIntent,
+    append_delivery_part,
     register_delivery,
 )
 from app.services.recipient_resolver import (

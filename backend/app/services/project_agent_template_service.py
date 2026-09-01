@@ -539,7 +539,7 @@ def _agent_from_template(
         autonomy_policy=dict(runtime.get("autonomy_policy") or {}),
         context_window_size=int(runtime.get("context_window_size") or 100),
         max_tool_rounds=int(runtime.get("max_tool_rounds") or 50),
-        daily_memory_load_days=int(runtime.get("daily_memory_load_days", 2)),
+        daily_memory_load_days=int(runtime.get("daily_memory_load_days", 0)),
         max_tokens_per_day=runtime.get("max_tokens_per_day"),
         max_tokens_per_month=runtime.get("max_tokens_per_month"),
         access_mode="private",

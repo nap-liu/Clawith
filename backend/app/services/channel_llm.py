@@ -138,6 +138,8 @@ async def _call_agent_llm(
     runtime_session: "ChatSession | None" = None,
     runtime_workspace: "AgentRuntimeWorkspace | None" = None,
     max_tool_rounds_override: int | None = None,
+    model_override_id: str | uuid.UUID | None = None,
+    temperature_override: float | None = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -205,88 +207,90 @@ async def _call_agent_llm(
         if runtime_workspace.agent_id != agent.id or runtime_workspace.project_id != agent.project_id:
             raise RuntimeError("Project Agent runtime workspace does not match execution identity")
 
-    if model_name:
+    if model_name and not model_override_id:
         from app.services.chat_model_selection import (
             MODEL_STATUS_OK,
-            resolve_tenant_model_by_name,
+            resolve_tenant_model_reference,
         )
-        from app.services.llm.runtime_model import RuntimeLLMModel
 
-        resolved_named = await resolve_tenant_model_by_name(
+        resolved_named = await resolve_tenant_model_reference(
             db,
             tenant_id=agent.tenant_id,
-            model_name=model_name,
+            reference=model_name,
         )
         if resolved_named.status != MODEL_STATUS_OK or resolved_named.model is None:
             return f"⚠️ Subagent 指定模型 {model_name} 已不可用"
-        model = RuntimeLLMModel.from_orm(resolved_named.model)
-        fallback_model = None
-    else:
-        turn_model_id = await load_turn_model_id(
-            db,
-            agent_id=agent_id,
-            session_id=session_id,
-            turn_anchor_id=turn_anchor_id,
-        )
-        from app.models.chat_session import ChatSession
+        model_override_id = resolved_named.model.id
 
-        if runtime_session is None:
-            try:
-                runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
-            except (TypeError, ValueError):
-                runtime_session = None
-        runtime_config = dict(runtime_session.im_config or {}) if runtime_session is not None else {}
+    turn_model_id = await load_turn_model_id(
+        db,
+        agent_id=agent_id,
+        session_id=session_id,
+        turn_anchor_id=turn_anchor_id,
+    )
+    from app.models.chat_session import ChatSession
+
+    if runtime_session is None:
+        try:
+            runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
+        except (TypeError, ValueError):
+            runtime_session = None
+    runtime_config = dict(runtime_session.im_config or {}) if runtime_session is not None else {}
+    effective_override_id = model_override_id or turn_model_id
+    if effective_override_id:
+        resolved_models = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=effective_override_id,
+            override_temperature=temperature_override,
+        )
+    elif (
+        runtime_session is not None
+        and runtime_session.source_channel == "subagent"
+        and runtime_session.project_id is not None
+        and isinstance(runtime_config.get("member_config_snapshot"), dict)
+    ):
+        from app.models.project import Project
+        from app.services.chat_model_selection import resolve_project_member_runtime_models
+
+        project = await db.get(Project, runtime_session.project_id)
+        resolved_models = await resolve_project_member_runtime_models(
+            db,
+            agent=agent,
+            member_config=runtime_config.get("member_config_snapshot"),
+            project_settings=project.settings if project is not None else {},
+            override_temperature=temperature_override,
+        )
+    else:
+        # Compatibility for project child inputs created before per-turn model
+        # snapshots were introduced. Keep retries in the unified channel path.
+        from app.models.project import Project
+        from app.services.chat_model_selection import resolve_project_runtime_models
+
         if (
             runtime_session is not None
             and runtime_session.source_channel == "subagent"
             and runtime_session.project_id is not None
-            and isinstance(runtime_config.get("member_config_snapshot"), dict)
         ):
-            from app.models.project import Project
-            from app.services.chat_model_selection import resolve_project_member_runtime_models
-
             project = await db.get(Project, runtime_session.project_id)
-            resolved_models = await resolve_project_member_runtime_models(
+            resolved_models = await resolve_project_runtime_models(
                 db,
                 agent=agent,
-                member_config=runtime_config.get("member_config_snapshot"),
                 project_settings=project.settings if project is not None else {},
+                override_temperature=temperature_override,
             )
-        elif turn_model_id:
+        else:
             resolved_models = await resolve_runtime_models(
                 db,
                 agent=agent,
-                override_model_id=turn_model_id,
+                override_temperature=temperature_override,
             )
-        else:
-            # Compatibility for project child inputs created before per-turn
-            # model snapshots were introduced.  Keep the fallback inside the
-            # unified channel path so retries and compaction use the same model.
-            from app.models.project import Project
-            from app.services.chat_model_selection import resolve_project_runtime_models
-
-            if runtime_session is None:
-                try:
-                    runtime_session = await db.get(ChatSession, uuid.UUID(str(session_id)))
-                except (TypeError, ValueError):
-                    runtime_session = None
-            if (
-                runtime_session is not None
-                and runtime_session.source_channel == "subagent"
-                and runtime_session.project_id is not None
-            ):
-                project = await db.get(Project, runtime_session.project_id)
-                resolved_models = await resolve_project_runtime_models(
-                    db,
-                    agent=agent,
-                    project_settings=project.settings if project is not None else {},
-                )
-            else:
-                resolved_models = await resolve_runtime_models(db, agent=agent)
-        if turn_model_id and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}:
-            return "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，或 /model default 恢复默认模型。"
-        model = resolved_models.primary_model
-        fallback_model = resolved_models.fallback_model
+    if effective_override_id and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}:
+        if model_override_id:
+            return "⚠️ Subagent 或后台任务指定的模型已不可用"
+        return "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，或 /model default 恢复默认模型。"
+    model = resolved_models.primary_model
+    fallback_model = resolved_models.fallback_model
 
     if not model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"

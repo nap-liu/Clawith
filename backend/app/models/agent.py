@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -46,6 +47,10 @@ class Agent(Base):
         CheckConstraint(
             "daily_memory_load_days >= 0 AND daily_memory_load_days <= 30",
             name="ck_agents_daily_memory_load_days",
+        ),
+        CheckConstraint(
+            "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
+            name="ck_agents_temperature",
         ),
     )
 
@@ -91,6 +96,7 @@ class Agent(Base):
     # LLM config
     primary_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
     fallback_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Autonomy policy (L1/L2/L3)
     autonomy_policy: Mapped[dict] = mapped_column(
@@ -132,8 +138,8 @@ class Agent(Base):
     daily_memory_load_days: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
-        default=2,
-        server_default="2",
+        default=0,
+        server_default="0",
     )
     max_tool_rounds: Mapped[int] = mapped_column(Integer, default=50)
 

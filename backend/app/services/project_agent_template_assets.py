@@ -392,7 +392,7 @@ def _validate_runtime(value: object) -> dict:
     for key, default, minimum, maximum in (
         ("context_window_size", 100, 1, 10_000),
         ("max_tool_rounds", 50, 1, 500),
-        ("daily_memory_load_days", 2, 0, 30),
+        ("daily_memory_load_days", 0, 0, 30),
     ):
         raw = value.get(key, default)
         if not isinstance(raw, int) or isinstance(raw, bool) or not minimum <= raw <= maximum:

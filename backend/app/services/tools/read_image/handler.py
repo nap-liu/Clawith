@@ -64,13 +64,17 @@ async def get_effective_read_image_max_bytes(agent_id: uuid.UUID) -> int:
 async def _load_vision_model(
     db: AsyncSession, model_id: str | uuid.UUID | None
 ) -> LLMModel | None:
-    if model_id is None:
+    if not model_id:
+        return None
+    try:
+        normalized_id = (
+            model_id if isinstance(model_id, uuid.UUID) else uuid.UUID(str(model_id))
+        )
+    except (TypeError, ValueError):
         return None
     return (
         await db.execute(
-            select(LLMModel).where(
-                LLMModel.id == (uuid.UUID(str(model_id)) if not isinstance(model_id, uuid.UUID) else model_id)
-            )
+            select(LLMModel).where(LLMModel.id == normalized_id)
         )
     ).scalar_one_or_none()
 

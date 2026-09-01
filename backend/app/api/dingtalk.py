@@ -88,6 +88,7 @@ async def _deliver_dingtalk_command_reply(
                 is_group=is_group,
             ),
             message=message,
+            content_format="plain_text",
         )
     except Exception as exc:
         result = IMDeliveryResult.from_exception("dingtalk", exc)

@@ -9,6 +9,7 @@ import LinearCopyButton from '../components/LinearCopyButton';
 import UserMultiSelect from '../components/UserMultiSelect';
 import { useAuthStore } from '../stores';
 import { buildAgentSetupCopyText, buildAgentSetupInstruction } from './agentCreateInstructions';
+import { sortLlmModels } from '../utils/llmModels';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -516,7 +517,7 @@ export default function AgentCreate() {
                             <label className="form-label">{t('wizard.step1.primaryModel')} <span style={{ color: 'var(--error)' }}>*</span></label>
                             {models.length > 0 ? (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                    {models.filter((m: any) => m.enabled).map((m: any) => (
+                                    {sortLlmModels(models.filter((m: any) => m.enabled)).map((m: any) => (
                                         <label key={m.id} style={{
                                             display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px',
                                             background: form.primary_model_id === m.id ? 'var(--accent-subtle)' : 'var(--bg-elevated)',

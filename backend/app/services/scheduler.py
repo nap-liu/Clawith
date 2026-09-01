@@ -44,6 +44,10 @@ class _DueSchedule:
     name: str
     instruction: str
     execution_user_id: uuid.UUID | None
+    model_id: uuid.UUID | None
+    temperature: float | None
+    soul: bool
+    memory: bool
     occurrence_at: datetime
     claimed_at: datetime
     previous_last_run_at: datetime | None
@@ -67,6 +71,10 @@ async def _execute_schedule(
     agent_id: uuid.UUID,
     instruction: str,
     execution_user_id: uuid.UUID | None = None,
+    model_id: uuid.UUID | None = None,
+    temperature: float | None = None,
+    soul: bool = True,
+    memory: bool = True,
 ) -> ScheduleExecutionOutcome:
     """Execute a single schedule by calling the LLM with the instruction."""
     try:
@@ -138,10 +146,16 @@ async def _execute_schedule(
                     if not project_running:
                         logger.info(f"Schedule {schedule_id}: project paused while waiting for capacity, deferring")
                         return ScheduleExecutionOutcome.RETRYABLE
+            context_options = {}
+            if not soul:
+                context_options["include_soul"] = False
+            if not memory:
+                context_options["include_memory"] = False
             static_prompt, dynamic_prompt = await build_agent_context(
                 agent_id,
                 agent_name,
                 role_description,
+                **context_options,
             )
             system_prompt = f"{static_prompt}\n\n{dynamic_prompt}"
 
@@ -160,6 +174,8 @@ async def _execute_schedule(
                     session_id=str(schedule_id),
                     execution_user_id=execution_user_id,
                     turn_type="schedule",
+                    model_override_id=model_id,
+                    temperature_override=temperature,
                 )
 
             from app.services.activity_logger import log_activity
@@ -238,6 +254,10 @@ async def _claim_due_schedules_for_scope(
                     name=schedule.name,
                     instruction=schedule.instruction,
                     execution_user_id=schedule.execution_user_id,
+                    model_id=getattr(schedule, "model_id", None),
+                    temperature=getattr(schedule, "temperature", None),
+                    soul=getattr(schedule, "soul", True),
+                    memory=getattr(schedule, "memory", True),
                     occurrence_at=occurrence_at,
                     claimed_at=now,
                     previous_last_run_at=previous_last_run_at,
@@ -294,6 +314,10 @@ async def _execute_claimed_schedule(schedule: _DueSchedule) -> None:
         schedule.agent_id,
         schedule.instruction,
         schedule.execution_user_id,
+        schedule.model_id,
+        schedule.temperature,
+        schedule.soul,
+        schedule.memory,
     )
     if outcome is ScheduleExecutionOutcome.RETRYABLE:
         released = await _release_schedule_occurrence(schedule)

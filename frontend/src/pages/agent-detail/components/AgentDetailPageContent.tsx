@@ -294,6 +294,9 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                     <SettingsTab
                         {...(props as any)}
                         agentId={id}
+                        hasChanges={props.hasSettingsChanges}
+                        onSaveSettings={props.handleSaveSettings}
+                        onSaveWelcomeMessage={props.handleSaveWelcomeMessage}
                         accessPermissionsPanel={(
                             <AccessPermissionsPanel
                                 agentId={id}

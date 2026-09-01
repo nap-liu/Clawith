@@ -19,6 +19,7 @@ from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES, USER_PROJEC
 _settings = get_settings()
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
+    "update_self_settings",
     "run_subagent",
     "send_message_to_subagent",
     "stop_subagent",

@@ -73,9 +73,9 @@ async def list_conversations(
     Historical provider-prefixed message buckets are intentionally excluded:
     without a canonical ChatSession they cannot prove a tenant or counterpart.
     """
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
-    if not can_view_all_agent_chat_sessions(current_user, agent):
+    if not can_view_all_agent_chat_sessions(current_user, agent, access):
         raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
     rows = (

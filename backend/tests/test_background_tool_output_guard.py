@@ -24,6 +24,38 @@ class _Result:
         return self.value
 
 
+def _model_row(
+    model_id: uuid.UUID,
+    *,
+    provider: str = "qwen",
+    model: str = "qwen-test",
+    context_window: int = 1_000_000,
+    max_output_tokens: int = 1_000,
+) -> SimpleNamespace:
+    """Return the persisted-model shape consumed by the shared resolver."""
+
+    return SimpleNamespace(
+        id=model_id,
+        tenant_id=None,
+        provider=provider,
+        model=model,
+        api_key_encrypted="",
+        base_url=None,
+        label=model,
+        max_tokens_per_day=None,
+        enabled=True,
+        supports_vision=False,
+        temperature=0.2,
+        request_timeout=30,
+        max_output_tokens=max_output_tokens,
+        context_window=context_window,
+        context_usage_ratio=0.7,
+        compact_trigger_ratio=0.8,
+        keep_recent_turns=3,
+        compact_summary_max_tokens=1_000,
+    )
+
+
 async def test_background_context_uses_provider_usage_not_local_text_size(
     monkeypatch,
 ):
@@ -39,14 +71,11 @@ async def test_background_context_uses_provider_usage_not_local_text_size(
     )
 
     def _small_model(model_id):
-        return SimpleNamespace(
-            id=model_id,
+        return _model_row(
+            model_id,
             provider="custom",
             model="tiny-context",
-            base_url=None,
-            temperature=0.2,
             max_output_tokens=100,
-            request_timeout=30,
             context_window=1_000,
         )
 
@@ -133,16 +162,7 @@ async def test_large_read_file_result_is_materialized_before_second_model_round(
         primary_model_id=model_id,
         fallback_model_id=None,
     )
-    model = SimpleNamespace(
-        id=model_id,
-        provider="qwen",
-        model="qwen-test",
-        base_url=None,
-        temperature=0.2,
-        max_output_tokens=1_000,
-        request_timeout=30,
-        context_window=1_000_000,
-    )
+    model = _model_row(model_id)
 
     responses = [
         LLMResponse(
@@ -249,16 +269,7 @@ async def test_background_tool_round_content_becomes_confirmation_intro(monkeypa
         primary_model_id=model_id,
         fallback_model_id=None,
     )
-    model = SimpleNamespace(
-        id=model_id,
-        provider="qwen",
-        model="qwen-test",
-        base_url=None,
-        temperature=0.2,
-        max_output_tokens=1_000,
-        request_timeout=30,
-        context_window=1_000_000,
-    )
+    model = _model_row(model_id)
     responses = [
         LLMResponse(
             content="background answer",
@@ -354,16 +365,7 @@ async def test_background_confirmation_round_id_is_unique_per_execution(monkeypa
         primary_model_id=model_id,
         fallback_model_id=None,
     )
-    model = SimpleNamespace(
-        id=model_id,
-        provider="qwen",
-        model="qwen-test",
-        base_url=None,
-        temperature=0.2,
-        max_output_tokens=1_000,
-        request_timeout=30,
-        context_window=1_000_000,
-    )
+    model = _model_row(model_id)
 
     class _Client:
         async def complete(self, **_kwargs):

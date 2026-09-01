@@ -314,12 +314,25 @@ docker compose -p <production-compose-project> \
 Do not pre-stop/down the stack, roll roles back separately, rebuild, pull, remove
 orphans, or mix SHAs during rollback.
 
+When compatible additive schema is retained, an older image may not contain the
+newer Alembic revision file. Its rollback Compose must therefore start only
+non-bootstrap roles and must not hide migration errors with
+`ALLOW_MIGRATION_FAILURE`. Prove that topology against the upgraded schema in
+the isolated old-image drill. Resume bootstrap ownership only with an image
+whose migration graph recognizes the database revision.
+
 Before rollback to a binary that predates a newly seeded builtin tool, run the
 candidate image's reviewed idempotent compatibility helper. For normalized IM
 recall, the existing helper is:
 
 ```bash
 python -m app.scripts.rollback_im_recall
+```
+
+For Agent self-service settings, use the same exact-tool cleanup contract:
+
+```bash
+python -m app.scripts.rollback_agent_self_settings
 ```
 
 Before rollback to a binary that predates project-scoped Agents, follow the

@@ -8,6 +8,11 @@ export const enterpriseApi = {
     );
   },
 
+  llmModelsForTenant: (tenantId: string) =>
+    request<any[]>(
+      `/enterprise/llm-models?tenant_id=${encodeURIComponent(tenantId)}`,
+    ),
+
   setDefaultModel: (modelId: string) =>
     request<void>(`/enterprise/llm-models/${modelId}/set-default`, {
       method: "POST",
@@ -72,7 +77,15 @@ export const scheduleApi = {
   list: (agentId: string) => request<any[]>(`/agents/${agentId}/schedules/`),
   create: (
     agentId: string,
-    data: { name: string; instruction: string; cron_expr: string },
+    data: {
+      name: string;
+      instruction: string;
+      cron_expr: string;
+      model_id?: string | null;
+      temperature?: number | null;
+      soul?: boolean;
+      memory?: boolean;
+    },
   ) =>
     request<any>(`/agents/${agentId}/schedules/`, {
       method: "POST",

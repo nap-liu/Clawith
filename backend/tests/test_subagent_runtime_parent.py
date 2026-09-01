@@ -259,6 +259,7 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
         task="do it",
         mode="sync",
         model="Readable-Test-Model",
+        temperature=1.2,
         turn_anchor_id=anchor_id,
     )
     captured = {}
@@ -288,6 +289,8 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
     assert (status, result) == ("completed", "child result")
     assert parent_messages == ["sync interim"]
     assert captured["model_name"] == "Readable-Test-Model"
+    assert captured["model_override_id"] == run.model_id
+    assert captured["temperature_override"] == 1.2
     assert captured["broadcast_web"] is True
     assert captured["turn_anchor_id"] is not None
     assert captured["continue_turn"] is False

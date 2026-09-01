@@ -161,7 +161,7 @@ async def list_sessions(
     agent = agent_result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="未找到数字员工")
-    await check_agent_access(db, current_user, agent_id)
+    _, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     source_channel = (source_channel or "").strip() or None
     limit = max(1, min(int(limit or 50), 200))
@@ -185,7 +185,7 @@ async def list_sessions(
     )
 
     if scope == "all":
-        if not _can_view_all_agent_chat_sessions(current_user, agent):
+        if not _can_view_all_agent_chat_sessions(current_user, agent, agent_access):
             raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
         # Fetch all sessions (including agent-to-agent where this agent is peer)
@@ -627,7 +627,7 @@ async def rename_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Rename a session. Owner, agent creator, or admin may rename others' sessions."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
@@ -643,7 +643,7 @@ async def rename_session(
             detail="Subagent sessions are runtime-owned and read-only; use stop_subagent.",
         )
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent, agent_access):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     session.title = body.title
@@ -659,7 +659,7 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a chat session and its messages. Owner, agent creator, or admin may delete others' sessions."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
@@ -675,7 +675,7 @@ async def delete_session(
             detail="Subagent sessions are runtime-owned and cannot be deleted.",
         )
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent, agent_access):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     child_run = (

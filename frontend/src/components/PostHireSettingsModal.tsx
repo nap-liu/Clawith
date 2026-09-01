@@ -6,6 +6,8 @@ import { IconAlertTriangle, IconSettings, IconX } from '@tabler/icons-react';
 import { agentApi, authApi, enterpriseApi, tenantApi } from '../services/api';
 import { translateTemplate } from '../i18n/templateTranslations';
 import { useDialog } from './Dialog/DialogProvider';
+import SelectDropdown from './SelectDropdown';
+import { sortLlmModels } from '../utils/llmModels';
 
 interface Template {
     id: string;
@@ -69,6 +71,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
         () => (models as Model[]).filter(m => m.enabled !== false),
         [models],
     );
+    const sortedEnabledModels = useMemo(() => sortLlmModels(enabledModels), [enabledModels]);
 
     const canManageModels = currentUser?.role === 'platform_admin'
         || currentUser?.role === 'org_admin'
@@ -231,19 +234,17 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                                 t={t}
                             />
                         ) : (
-                            <select
-                                className="form-input"
+                            <SelectDropdown
                                 value={modelId}
-                                onChange={e => setModelId(e.target.value)}
+                                options={sortedEnabledModels.map(model => ({
+                                    value: model.id,
+                                    label: `${labelFor(model)}${myTenant?.default_model_id === model.id ? ` · ${t('postHire.defaultSuffix')}` : ''}`,
+                                }))}
+                                onChange={setModelId}
+                                ariaLabel={t('postHire.model')}
                                 disabled={busy}
                                 style={{ width: '100%' }}
-                            >
-                                {enabledModels.map(m => (
-                                    <option key={m.id} value={m.id}>
-                                        {labelFor(m)}{myTenant?.default_model_id === m.id ? ` · ${t('postHire.defaultSuffix')}` : ''}
-                                    </option>
-                                ))}
-                            </select>
+                            />
                         )}
                     </section>
                 </div>

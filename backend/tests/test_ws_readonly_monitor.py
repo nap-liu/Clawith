@@ -24,6 +24,13 @@ from starlette.websockets import WebSocketDisconnect
 from app.api.websocket import WebSocketChatHandler
 from app.core.permissions import can_view_all_agent_chat_sessions
 from app.services.conversation_turn_lifecycle import ConversationTurnSnapshot
+from session_introspection_support import (
+    _isolate_async_engine_between_tests,
+    _seed_agent,
+    _seed_session,
+    _seed_tenant,
+    _seed_user,
+)
 
 # asyncio_mode = "auto" (pyproject) runs the async tests without an explicit
 # marker; the pure permission tests below stay synchronous.
@@ -115,11 +122,30 @@ def _agent(creator_id):
     return SimpleNamespace(id=uuid.uuid4(), creator_id=creator_id)
 
 
-@pytest.mark.parametrize("role", ["platform_admin", "org_admin", "agent_admin"])
-def test_admins_can_view_all_sessions(role):
+@pytest.mark.parametrize(
+    ("role", "access"),
+    [("platform_admin", None), ("org_admin", None), ("agent_admin", "manage")],
+)
+def test_admins_can_view_all_sessions(role, access):
     agent = _agent(creator_id=uuid.uuid4())
     user = SimpleNamespace(id=uuid.uuid4(), role=role)
-    assert can_view_all_agent_chat_sessions(user, agent) is True
+    assert can_view_all_agent_chat_sessions(user, agent, access) is True
+
+
+def test_agent_admin_requires_manage_access_for_this_agent():
+    agent = _agent(creator_id=uuid.uuid4())
+    user = SimpleNamespace(id=uuid.uuid4(), role="agent_admin")
+    assert can_view_all_agent_chat_sessions(user, agent, "use") is False
+
+
+def test_platform_admin_identity_flag_uses_the_same_governance_path():
+    agent = _agent(creator_id=uuid.uuid4())
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="member",
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
+    assert can_view_all_agent_chat_sessions(user, agent, "manage") is True
 
 
 def test_agent_creator_can_view_all_sessions():
@@ -255,6 +281,42 @@ async def test_resolve_honors_session_level_read_only_for_owner():
 
     assert conv == str(session_id)
     assert h.read_only is True
+
+
+async def test_resolve_accepts_a2a_session_from_peer_side():
+    """The peer Agent opens the normalized A2A session instead of a fallback web session."""
+    from app.database import async_session
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    source = await _seed_agent(owner.id, tenant_id=tenant.id, name="Source")
+    peer = await _seed_agent(owner.id, tenant_id=tenant.id, name="Peer")
+    session = await _seed_session(
+        source.id,
+        None,
+        channel="agent",
+        peer=peer.id,
+    )
+
+    h = _handler()
+    h.session_id_param = str(session.id)
+    h.agent_id = peer.id
+    h.source_channel = "web"
+    h.read_only = False
+    h.websocket = _FakeWS()
+
+    async with async_session() as db:
+        conv = await h._resolve_chat_session(
+            db,
+            owner.id,
+            viewer=owner,
+            agent=peer,
+            agent_access="manage",
+        )
+
+    assert conv == str(session.id)
+    assert h.source_channel == "agent"
+    assert h.websocket.closed_code is None
 
 
 # ── 3. message_loop blocks sends from a read-only monitor ─────────────────────

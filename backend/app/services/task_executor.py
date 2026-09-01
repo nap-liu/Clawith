@@ -20,6 +20,7 @@ from app.services.project_runtime_boundary import (
     lock_and_check_project_agent_runtime,
     project_agent_runtime_allows,
 )
+from app.services.chat_model_selection import BackgroundModelUnavailableError
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
@@ -137,6 +138,10 @@ async def _execute_task_impl(
         task_title = task.title
         task_description = task.description or ""
         task_type = task.type  # 'todo' or 'supervision'
+        task_model_id = getattr(task, "model_id", None)
+        task_temperature = getattr(task, "temperature", None)
+        task_soul = getattr(task, "soul", True)
+        task_memory = getattr(task, "memory", True)
 
     # Reload the durable run snapshot after releasing the transition
     # transaction. This is the source of truth if an administrator reassigns
@@ -210,6 +215,10 @@ async def _execute_task_impl(
                 task_title=task_title,
                 task_description=task_description,
                 task_type=task_type,
+                task_model_id=task_model_id,
+                task_temperature=task_temperature,
+                task_soul=task_soul,
+                task_memory=task_memory,
                 agent_name=agent_name,
                 agent_role_description=agent_role_description,
             )
@@ -221,6 +230,14 @@ async def _execute_task_impl(
         await _restore_retryable_task(
             task_id,
             execution_user_id=task_execution_user_id,
+        )
+        return
+    except BackgroundModelUnavailableError as e:
+        logger.warning(f"[TaskExec] Task {task_id} has an unavailable model: {e}")
+        await _restore_retryable_task(
+            task_id,
+            execution_user_id=task_execution_user_id,
+            log_message=f"❌ {e}；请更新运行配置后重试。",
         )
         return
     except Exception as e:  # noqa: BLE001 - task failures are persisted for operators
@@ -241,6 +258,10 @@ async def _execute_admitted_task(
     task_title: str,
     task_description: str,
     task_type: str,
+    task_model_id: uuid.UUID | None,
+    task_temperature: float | None,
+    task_soul: bool,
+    task_memory: bool,
     agent_name: str,
     agent_role_description: str,
 ) -> None:
@@ -261,10 +282,16 @@ async def _execute_admitted_task(
 
     from app.services.agent_context import build_agent_context
 
+    context_options = {}
+    if not task_soul:
+        context_options["include_soul"] = False
+    if not task_memory:
+        context_options["include_memory"] = False
     static_prompt, dynamic_prompt = await build_agent_context(
         agent_id,
         agent_name,
         agent_role_description,
+        **context_options,
     )
 
     task_addendum = """
@@ -301,6 +328,8 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             session_id=str(task_id),
             execution_user_id=task_execution_user_id,
             turn_type="task",
+            model_override_id=task_model_id,
+            temperature_override=task_temperature,
         )
 
     logger.info(f"[TaskExec] LLM reply: {reply[:80]}")

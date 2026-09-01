@@ -112,7 +112,7 @@ export function MembersWithoutOKRPanel({
                                     display: 'inline-block', marginTop: '2px',
                                 }}
                             >
-                                {isChinese ? '前往 Agent Settings 配置 →' : 'Configure in Agent Settings →'}
+                                {isChinese ? '前往数字员工设置配置 →' : 'Configure in Agent Settings →'}
                             </a>
                         )}
                     </div>
@@ -168,7 +168,7 @@ export function MembersWithoutOKRPanel({
                             <IconAlertTriangle size={14} stroke={1.8} style={{ flexShrink: 0 }} />
                             <div style={{ flex: 1, minWidth: 0 }}>
                                 <div style={{ fontWeight: 600, marginBottom: '2px' }}>
-                                    {isChinese ? 'OKR Agent 上次执行失败' : 'OKR Agent task failed'}
+                                    {isChinese ? 'OKR 数字员工上次执行失败' : 'OKR Agent task failed'}
                                 </div>
                                 <div style={{ color: '#991b1b', wordBreak: 'break-word' }}>
                                     {last_outreach_error.message}
@@ -183,7 +183,7 @@ export function MembersWithoutOKRPanel({
                                         href={`/agents/${okr_agent_id}#settings`}
                                         style={{ fontSize: '11px', color: 'var(--accent-primary)', textDecoration: 'none', marginTop: '4px', display: 'inline-block' }}
                                     >
-                                        {isChinese ? '检查 Agent 设置 →' : 'Check Agent Settings →'}
+                                        {isChinese ? '检查数字员工设置 →' : 'Check Agent Settings →'}
                                     </a>
                                 )}
                             </div>

@@ -547,27 +547,17 @@ async def _send_message_to_agent(
                     logger.warning(f"[A2A] Failed to wake {target.name} for delegate: {e}")
                 return f"✅ Task delegated to {target.name}. You will be notified when they complete it."
             from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-            from app.models.llm import LLMModel
             from app.services.chat_history import (
                 load_history_for_llm,
                 persist_tool_call,
                 strip_leading_orphan_tool_messages,
             )
             from app.services.llm import call_llm_with_failover
-            target_model = None
-            if target.primary_model_id:
-                _m = await db.execute(select(LLMModel).where(LLMModel.id == target.primary_model_id))
-                target_model = _m.scalar_one_or_none()
-                if target_model and not target_model.enabled:
-                    target_model = None
-            target_fallback = None
-            if target.fallback_model_id:
-                _fb = await db.execute(select(LLMModel).where(LLMModel.id == target.fallback_model_id))
-                target_fallback = _fb.scalar_one_or_none()
-                if target_fallback and not target_fallback.enabled:
-                    target_fallback = None
-            if not target_model and target_fallback:
-                target_model, target_fallback = target_fallback, None
+            from app.services.chat_model_selection import resolve_runtime_models
+
+            runtime_models = await resolve_runtime_models(db, agent=target)
+            target_model = runtime_models.primary_model
+            target_fallback = runtime_models.fallback_model
             if not target_model:
                 return f"⚠️ {target.name} has no LLM model configured"
             ctx_size = target.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE

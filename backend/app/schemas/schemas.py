@@ -242,6 +242,7 @@ class AgentCreate(BaseModel):
     # Model
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
     # Permissions
     permission_scope_type: str = "company"  # company | user | custom
     permission_scope_ids: list[uuid.UUID] = []
@@ -272,6 +273,7 @@ class AgentOut(BaseModel):
     creator_display_name: str | None = None  # Populated by API layer; not in ORM model directly
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    temperature: float | None = None
     autonomy_policy: dict
     tokens_used_today: int
     tokens_used_month: int
@@ -285,7 +287,7 @@ class AgentOut(BaseModel):
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
     context_window_size: int = 100
-    daily_memory_load_days: int = 2
+    daily_memory_load_days: int = 0
     max_tool_rounds: int = 50
     max_triggers: int = 20
     min_poll_interval_min: int = 5
@@ -355,6 +357,7 @@ class AgentUpdate(BaseModel):
     autonomy_policy: dict | None = None
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
     context_window_size: int | None = Field(default=None, ge=1, le=500)
     daily_memory_load_days: int | None = Field(default=None, ge=0, le=30)
     max_tokens_per_day: int | None = None
@@ -390,6 +393,10 @@ class TaskCreate(BaseModel):
     type: str = "todo"  # todo | supervision
     priority: str = "medium"
     due_date: datetime | None = None
+    model_id: uuid.UUID | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    soul: bool = True
+    memory: bool = True
     # Supervision fields
     supervision_target_user_id: uuid.UUID | None = None
     supervision_target_agent_id: uuid.UUID | None = None
@@ -429,6 +436,10 @@ class TaskOut(BaseModel):
     created_by: uuid.UUID
     created_by_user_id: uuid.UUID
     execution_user_id: uuid.UUID | None = None
+    model_id: uuid.UUID | None = None
+    temperature: float | None = None
+    soul: bool = True
+    memory: bool = True
     creator_username: str | None = None
     creator_display_name: str | None = None
     execution_user_display_name: str | None = None
@@ -458,6 +469,10 @@ class TaskUpdate(BaseModel):
     remind_schedule: str | None = None
     execution_user_id: uuid.UUID | None = None
     expected_execution_user_id: uuid.UUID | None = None
+    model_id: uuid.UUID | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    soul: bool = True
+    memory: bool = True
 
     model_config = {"extra": "forbid"}
 

@@ -236,7 +236,7 @@ async def _send_to_agent_background(
     source_agent_name: str,
     target_agent_id: str,
     target_agent_name: str,
-    target_primary_model_id: str,
+    _target_primary_model_id: str,
     target_role_description: str,
     target_creator_id: str,
     content: str,
@@ -252,22 +252,19 @@ async def _send_to_agent_background(
     try:
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
-        from app.models.llm import LLMModel
         from app.models.participant import Participant
-        from app.services.llm import call_llm
+        from app.services.chat_model_selection import resolve_runtime_models
+        from app.services.llm import call_llm_with_failover
 
         async with async_session() as db:
-            # Load target agent's LLM model
-            if not target_primary_model_id:
-                logger.warning(f"Target agent {target_agent_name} has no LLM model")
+            target_agent = await db.get(Agent, uuid.UUID(str(target_agent_id)))
+            if target_agent is None:
                 return
-            result = await db.execute(select(LLMModel).where(LLMModel.id == target_primary_model_id))
-            model = result.scalar_one_or_none()
-            if not model:
-                return
-            # Skip if model is disabled by admin
-            if not model.enabled:
-                logger.warning(f"Target agent {target_agent_name}'s model {model.model} is disabled, skipping")
+            runtime_models = await resolve_runtime_models(db, agent=target_agent)
+            model = runtime_models.primary_model
+            fallback_model = runtime_models.fallback_model
+            if model is None:
+                logger.warning(f"Target agent {target_agent_name} has no enabled LLM model")
                 return
 
             # Create or find a ChatSession for this agent pair
@@ -435,8 +432,9 @@ async def _send_to_agent_background(
             include_turn_inbox=True,
         )
 
-        reply = await call_llm(
-            model=model,
+        reply = await call_llm_with_failover(
+            primary_model=model,
+            fallback_model=fallback_model,
             messages=messages,
             agent_name=target_agent_name,
             role_description=target_role_description,

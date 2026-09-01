@@ -15,6 +15,19 @@ Tool availability requires an explicit enabled `AgentTool` row. `is_default` onl
 
 Do not hard-code one tool's name in unrelated tool descriptions, because disabled tools can leak back into model context through prose.
 
+Builtin runtime-override fields must stay synchronized between database seeds
+and in-code fallback schemas. `run_subagent` and trigger-management tools accept
+the normalized model reference forms and optional 0–2 temperature override
+used by the runtime resolver.
+
+Ordinary Digital Employee settings use one validated patch service across the
+REST settings page, MCP `update_agent`, and the builtin
+`update_self_settings` tool. The self tool has no target identifier and can
+only update its runtime-injected standard Digital Employee. It does not expose
+permissions, credentials, approval/autonomy policy, lifecycle state, Soul, or
+Core Memory. Public tool fields call temperature “imagination”; database and
+provider adapters may retain the internal `temperature` name.
+
 ## CLI execution models
 
 The platform supports two intentionally distinct command models:

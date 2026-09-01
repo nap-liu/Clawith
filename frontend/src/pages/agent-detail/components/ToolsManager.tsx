@@ -46,6 +46,7 @@ export default function ToolsManager({
     const [configTool, setConfigTool] = useState<any | null>(null);
     const [configData, setConfigData] = useState<Record<string, any>>({});
     const [configJson, setConfigJson] = useState('');
+    const [configInitialSnapshot, setConfigInitialSnapshot] = useState('');
     const [configSaving, setConfigSaving] = useState(false);
     const [toolTab, setToolTab] = useState<'company' | 'installed'>('company');
     const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
@@ -146,6 +147,7 @@ export default function ToolsManager({
         Object.assign(merged, applyConfigDefaults(tool.config_schema?.fields || [], merged));
         setConfigData(merged);
         setConfigJson(JSON.stringify(agentCfg, null, 2));
+        setConfigInitialSnapshot(tool.config_schema?.fields?.length > 0 ? JSON.stringify(merged) : JSON.stringify(agentCfg, null, 2));
         setFocusedField(null);
     };
 
@@ -153,12 +155,14 @@ export default function ToolsManager({
         setConfigCategory(category);
         setShowAdvancedToolConfig(false);
         setConfigData({});
+        setConfigInitialSnapshot(JSON.stringify({}));
         setConfigGlobalData({});
         setConfigSaving(true);
         setFocusedField(null);
         if (draftTools) {
             const configured = draftTools.find(tool => tool.category === category)?.agent_config || {};
             setConfigData(configured);
+            setConfigInitialSnapshot(JSON.stringify(configured));
             setConfigSaving(false);
             return;
         }
@@ -184,6 +188,7 @@ export default function ToolsManager({
                 }
                 Object.assign(merged, agentCfg);
                 setConfigData(merged);
+                setConfigInitialSnapshot(JSON.stringify(merged));
             }
         } catch (e) { console.error(e); }
         setConfigSaving(false);
@@ -746,6 +751,7 @@ export default function ToolsManager({
                 configJson={configJson}
                 setConfigJson={setConfigJson}
                 configSaving={configSaving}
+                configInitialSnapshot={configInitialSnapshot}
                 configGlobalData={configGlobalData}
                 focusedField={focusedField}
                 setFocusedField={setFocusedField}

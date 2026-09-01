@@ -90,7 +90,9 @@ async def _load_accessible_session(
     is_owner = (
         str(session.user_id) == str(current_user.id) or is_subagent_owner
     )
-    is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
+    is_privileged = _can_view_all_agent_chat_sessions(
+        current_user, agent, agent_access
+    )
     is_group_member = False
     if bool(getattr(session, "is_group", False)) and not is_owner and not is_privileged:
         member_result = await db.execute(

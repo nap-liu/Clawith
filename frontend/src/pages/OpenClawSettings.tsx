@@ -393,7 +393,7 @@ export default function OpenClawSettings({ agent, agentId, canManage }: OpenClaw
                             onClick={() => setShowDeleteConfirm(true)}
                             style={{ padding: '6px 20px', fontSize: '12px' }}
                         >
-                            {isChinese ? '删除此 Agent' : 'Delete this Agent'}
+                            {isChinese ? '删除此数字员工' : 'Delete this Agent'}
                         </button>
                     )}
                 </div>

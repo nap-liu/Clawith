@@ -15,12 +15,16 @@ import {
 import { agentApi, authApi, enterpriseApi, tenantApi } from '../services/api';
 import { useDialog } from './Dialog/DialogProvider';
 import LinearCopyButton from './LinearCopyButton';
+import SelectDropdown from './SelectDropdown';
+import { getLlmModelLabel, sortLlmModels } from '../utils/llmModels';
 
 type Mode = 'native' | 'openclaw';
 type Visibility = 'company' | 'only_me' | 'custom';
 
 interface Model {
     id: string;
+    provider?: string;
+    model?: string;
     label?: string;
     enabled?: boolean;
 }
@@ -75,6 +79,7 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
         () => (models as Model[]).filter((m) => m.enabled !== false),
         [models],
     );
+    const sortedEnabledModels = useMemo(() => sortLlmModels(enabledModels), [enabledModels]);
 
     const canManageModels = currentUser?.role === 'platform_admin'
         || currentUser?.role === 'org_admin'
@@ -327,20 +332,17 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                                                 allowExternalHint
                                             />
                                         ) : (
-                                            <select
-                                                className="form-input"
+                                            <SelectDropdown
                                                 value={modelId}
-                                                onChange={(e) => setModelId(e.target.value)}
+                                                options={sortedEnabledModels.map((model) => ({
+                                                    value: model.id,
+                                                    label: `${getLlmModelLabel(model)}${myTenant?.default_model_id === model.id ? ` · ${t('customAgentModal.defaultModel')}` : ''}`,
+                                                }))}
+                                                onChange={setModelId}
+                                                ariaLabel={t('customAgentModal.model')}
                                                 disabled={busy}
                                                 style={{ width: '100%' }}
-                                            >
-                                                {enabledModels.map((m) => (
-                                                    <option key={m.id} value={m.id}>
-                                                        {m.label || t('customAgentModal.modelFallback')}
-                                                        {myTenant?.default_model_id === m.id ? ` · ${t('customAgentModal.defaultModel')}` : ''}
-                                                    </option>
-                                                ))}
-                                            </select>
+                                            />
                                         )}
                                     </Field>
                                 )}

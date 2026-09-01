@@ -276,6 +276,7 @@ async def deliver_message_with_receipt(
     allow_wecom_group_actor_fallback: bool = True,
     mention: MentionIntent | None = None,
     dingtalk_lock_held: bool = False,
+    content_format: str = "markdown",
     on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     """Deliver through one exact Session route and preserve provider receipts."""
@@ -289,12 +290,15 @@ async def deliver_message_with_receipt(
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
+        if content_format not in {"markdown", "plain_text"}:
+            return IMDeliveryResult.failed(channel, "unsupported_content_format")
         if dingtalk_lock_held:
             return await _deliver_dingtalk_unlocked(
                 agent_id,
                 runtime,
                 message,
                 mention=mention,
+                content_format=content_format,
                 on_part=on_part,
             )
         return await _deliver_dingtalk(
@@ -302,6 +306,7 @@ async def deliver_message_with_receipt(
             runtime,
             message,
             mention=mention,
+            content_format=content_format,
             on_part=on_part,
         )
 
@@ -369,6 +374,7 @@ async def _deliver_dingtalk(
     reply: str,
     *,
     mention: MentionIntent | None = None,
+    content_format: str = "markdown",
     on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     return await run_channel_send(
@@ -378,6 +384,7 @@ async def _deliver_dingtalk(
             runtime,
             reply,
             mention=mention,
+            content_format=content_format,
             on_part=on_part,
         ),
     )
@@ -389,6 +396,7 @@ async def _deliver_dingtalk_unlocked(
     reply: str,
     *,
     mention: MentionIntent | None = None,
+    content_format: str = "markdown",
     on_part: DeliveryPartObserver | None = None,
 ) -> IMDeliveryResult:
     """Send one DingTalk message while the caller owns the conversation send lock."""
@@ -455,7 +463,12 @@ async def _deliver_dingtalk_unlocked(
         return IMDeliveryResult.sent("dingtalk", part)
 
     async def _send() -> dict:
-        return await send_dingtalk_proactive_markdown(
+        sender = (
+            send_dingtalk_proactive_text
+            if content_format == "plain_text"
+            else send_dingtalk_proactive_markdown
+        )
+        return await sender(
             app_id=cfg.app_id,
             app_secret=cfg.app_secret,
             target_id=space_id,
@@ -582,12 +595,13 @@ async def _deliver_discord(
     return await _transport_helpers._deliver_discord(agent_id, runtime, reply)
 
 
-async def _send_dingtalk_group_markdown(
+async def _send_dingtalk_group_message(
     *,
     app_id: str,
     app_secret: str,
     open_conversation_id: str,
     message: str,
+    msg_type: str,
     raise_on_transport_error: bool = False,
 ) -> dict:
     from app.services.dingtalk_service import build_dingtalk_markdown_content
@@ -604,9 +618,11 @@ async def _send_dingtalk_group_markdown(
     payload = {
         "robotCode": app_id,
         "openConversationId": open_conversation_id,
-        "msgKey": "sampleMarkdown",
+        "msgKey": "sampleText" if msg_type == "text" else "sampleMarkdown",
         "msgParam": json.dumps(
-            build_dingtalk_markdown_content(message),
+            {"content": message}
+            if msg_type == "text"
+            else build_dingtalk_markdown_content(message),
             ensure_ascii=False,
         ),
     }
@@ -630,6 +646,24 @@ async def _send_dingtalk_group_markdown(
     if resp.status_code >= 400 or data.get("errcode"):
         return {"errcode": data.get("errcode", resp.status_code), "errmsg": data.get("errmsg") or str(data)}
     return {"errcode": 0, "processQueryKey": data.get("processQueryKey")}
+
+
+async def _send_dingtalk_group_markdown(
+    *,
+    app_id: str,
+    app_secret: str,
+    open_conversation_id: str,
+    message: str,
+    raise_on_transport_error: bool = False,
+) -> dict:
+    return await _send_dingtalk_group_message(
+        app_id=app_id,
+        app_secret=app_secret,
+        open_conversation_id=open_conversation_id,
+        message=message,
+        msg_type="markdown",
+        raise_on_transport_error=raise_on_transport_error,
+    )
 
 
 async def send_dingtalk_proactive_markdown(
@@ -658,6 +692,38 @@ async def send_dingtalk_proactive_markdown(
         [target_id],
         message,
         msg_type="markdown",
+        robot_code=app_id,
+        raise_on_transport_error=True,
+    )
+
+
+async def send_dingtalk_proactive_text(
+    *,
+    app_id: str,
+    app_secret: str,
+    target_id: str,
+    is_group: bool,
+    message: str,
+) -> dict:
+    """Send plain text so command newlines retain their exact semantics."""
+    if is_group:
+        return await _send_dingtalk_group_message(
+            app_id=app_id,
+            app_secret=app_secret,
+            open_conversation_id=target_id,
+            message=message,
+            msg_type="text",
+            raise_on_transport_error=True,
+        )
+
+    from app.services.dingtalk_service import send_dingtalk_v1_robot_oto_message
+
+    return await send_dingtalk_v1_robot_oto_message(
+        app_id,
+        app_secret,
+        [target_id],
+        message,
+        msg_type="text",
         robot_code=app_id,
         raise_on_transport_error=True,
     )

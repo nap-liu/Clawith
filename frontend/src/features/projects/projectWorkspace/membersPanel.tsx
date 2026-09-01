@@ -10,6 +10,7 @@ import {
 } from "@tabler/icons-react";
 
 import { enterpriseApi } from "../../../services/api";
+import { sortLlmModels } from "../../../utils/llmModels";
 import { projectsApi } from "../../../services/projects";
 import type {
   ProjectCapabilityOption,
@@ -240,7 +241,7 @@ export function MembersPanel({
   }, [agentDrawerMode, projectAgent]);
   const modelOptions = [
     { value: "", label: t("projectSnapshot.followSourceAgent") },
-    ...memberModels.map((model) => ({
+    ...sortLlmModels(memberModels).map((model) => ({
       value: model.id,
       label: model.label || `${model.provider} · ${model.model}`,
     })),

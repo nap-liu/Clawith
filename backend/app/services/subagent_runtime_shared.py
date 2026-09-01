@@ -23,6 +23,7 @@ from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE, Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.subagent_run import SubagentRun
+from app.services.chat_model_selection import validate_temperature
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
@@ -561,10 +562,14 @@ async def _validate_execution_identity(
     return agent
 
 
-async def _resolve_model_name(db, agent: Agent, requested: str | None) -> str | None:
+async def _resolve_model_override(
+    db,
+    agent: Agent,
+    requested: str | None,
+) -> tuple[uuid.UUID | None, str | None]:
     model_name = str(requested or "").strip()
     if not model_name:
-        return None
+        return None, None
     if agent.tenant_id is None:
         raise SubagentError("当前 Agent 没有租户模型池，不能指定 Subagent 模型。")
 
@@ -572,13 +577,13 @@ async def _resolve_model_name(db, agent: Agent, requested: str | None) -> str | 
         MODEL_STATUS_AMBIGUOUS,
         MODEL_STATUS_DISABLED,
         MODEL_STATUS_OK,
-        resolve_tenant_model_by_name,
+        resolve_tenant_model_reference,
     )
 
-    resolved = await resolve_tenant_model_by_name(
+    resolved = await resolve_tenant_model_reference(
         db,
         tenant_id=agent.tenant_id,
-        model_name=model_name,
+        reference=model_name,
     )
     if resolved.status == MODEL_STATUS_AMBIGUOUS:
         raise SubagentError(f"模型 {model_name} 在当前租户中不唯一，请先清理模型配置。")
@@ -586,7 +591,7 @@ async def _resolve_model_name(db, agent: Agent, requested: str | None) -> str | 
         raise SubagentError(f"模型 {model_name} 已禁用。")
     if resolved.status != MODEL_STATUS_OK or resolved.model is None:
         raise SubagentError(f"找不到可用模型 {model_name}。")
-    return resolved.model.model
+    return resolved.model.id, resolved.model.model
 
 
 def _fork_row_meta(row) -> dict:

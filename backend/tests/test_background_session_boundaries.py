@@ -124,6 +124,7 @@ async def test_schedule_releases_read_session_before_context_and_llm() -> None:
     schedule_id = uuid.uuid4()
     agent_id = uuid.uuid4()
     owner_id = uuid.uuid4()
+    model_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     agent = SimpleNamespace(
         id=agent_id,
@@ -139,10 +140,11 @@ async def test_schedule_releases_read_session_before_context_and_llm() -> None:
     llm_checked = False
     capacity = _RecordingCapacity(lambda: assert_sessions_released([read_session]))
 
-    async def build_context(*_args: object) -> tuple[str, str]:
+    async def build_context(*_args: object, **options: object) -> tuple[str, str]:
         nonlocal context_checked
         assert read_session.closed
         assert not read_session.in_transaction()
+        assert options == {"include_soul": False, "include_memory": False}
         context_checked = True
         return "static", "dynamic"
 
@@ -152,6 +154,8 @@ async def test_schedule_releases_read_session_before_context_and_llm() -> None:
         assert db is llm_session
         assert not llm_session.in_transaction()
         assert read_session.closed
+        assert kwargs["model_override_id"] == model_id
+        assert kwargs["temperature_override"] == 1.1
         llm_checked = True
         return "scheduled result"
 
@@ -177,6 +181,10 @@ async def test_schedule_releases_read_session_before_context_and_llm() -> None:
             agent_id,
             "prepare report",
             owner_id,
+            model_id=model_id,
+            temperature=1.1,
+            soul=False,
+            memory=False,
         )
 
     assert context_checked
@@ -236,6 +244,7 @@ async def test_task_releases_snapshots_before_context_and_llm() -> None:
     task_id = uuid.uuid4()
     agent_id = uuid.uuid4()
     owner_id = uuid.uuid4()
+    model_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     task = SimpleNamespace(
         id=task_id,
@@ -246,6 +255,10 @@ async def test_task_releases_snapshots_before_context_and_llm() -> None:
         type="todo",
         status="pending",
         completed_at=None,
+        model_id=model_id,
+        temperature=1.4,
+        soul=False,
+        memory=False,
     )
     agent = SimpleNamespace(
         id=agent_id,
@@ -269,11 +282,12 @@ async def test_task_releases_snapshots_before_context_and_llm() -> None:
     llm_checked = False
     capacity = _RecordingCapacity(lambda: assert_sessions_released([task_transition, run_snapshot, agent_read]))
 
-    async def build_context(*_args: object) -> tuple[str, str]:
+    async def build_context(*_args: object, **options: object) -> tuple[str, str]:
         nonlocal context_checked
         assert task_transition.closed
         assert run_snapshot.closed
         assert agent_read.closed
+        assert options == {"include_soul": False, "include_memory": False}
         context_checked = True
         return "static", "dynamic"
 
@@ -282,6 +296,8 @@ async def test_task_releases_snapshots_before_context_and_llm() -> None:
         assert kwargs["db"] is llm_session
         assert not llm_session.in_transaction()
         assert all(session.closed for session in sessions[:3])
+        assert kwargs["model_override_id"] == model_id
+        assert kwargs["temperature_override"] == 1.4
         llm_checked = True
         return "task result"
 

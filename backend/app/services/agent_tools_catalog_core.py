@@ -1,9 +1,11 @@
 """Core workspace, scheduling, and delivery tool schemas."""
 
 from app.services.media_tool_contract import SEND_MEDIA_FUNCTION_TOOL
+from app.services.agent_self_settings_tool import UPDATE_SELF_SETTINGS_FUNCTION_TOOL
 
 
 AGENT_TOOL_CORE = [
+    UPDATE_SELF_SETTINGS_FUNCTION_TOOL,
     {
         "type": "function",
         "function": {
@@ -358,6 +360,10 @@ AGENT_TOOL_CORE = [
                         "type": "string",
                         "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason.",
                     },
+                    "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Omit to inherit the Agent model."},
+                    "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override. Omit to inherit the Digital Employee setting."},
+                    "soul": {"type": "boolean", "default": True, "description": "Whether to use the Agent's Soul for this trigger."},
+                    "memory": {"type": "boolean", "default": True, "description": "Whether to use the Agent's memory for this trigger."},
                     "webhook_mode": {
                         "type": "string",
                         "enum": ["legacy", "queue", "merge"],
@@ -388,6 +394,10 @@ AGENT_TOOL_CORE = [
                         "type": "string",
                         "description": "New reason text",
                     },
+                    "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Empty means inherit the Agent model."},
+                    "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override."},
+                    "soul": {"type": "boolean", "description": "Whether to use the Agent's Soul."},
+                    "memory": {"type": "boolean", "description": "Whether to use the Agent's memory."},
                     "webhook_mode": {
                         "type": "string",
                         "enum": ["legacy", "queue", "merge"],

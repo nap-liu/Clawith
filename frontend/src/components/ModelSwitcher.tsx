@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { IconChevronDown, IconCheck } from '@tabler/icons-react';
 import { enterpriseApi } from '../services/api';
+import { sortLlmModels } from '../utils/llmModels';
 
 interface Model {
     id: string;
@@ -45,6 +46,7 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
     });
 
     const enabled = (models as Model[]).filter(m => m.enabled !== false);
+    const sortedEnabled = sortLlmModels(enabled);
     const selected = enabled.find(m => m.id === value)
         || enabled.find(m => tenantDefaultId && m.id === tenantDefaultId)
         || enabled[0]
@@ -168,7 +170,7 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
                         zIndex: 10001, padding: '4px',
                     }}
                 >
-                    {enabled.map(m => {
+                    {sortedEnabled.map(m => {
                         const isSelected = selected?.id === m.id;
                         const isDefault = tenantDefaultId && m.id === tenantDefaultId;
                         return (

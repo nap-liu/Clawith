@@ -1,0 +1,181 @@
+.divergence-control {
+    width: 100%;
+    max-width: 360px;
+    min-width: 220px;
+    color: var(--text-primary);
+}
+
+.divergence-control__header,
+.divergence-control__title-group,
+.divergence-control__inherit {
+    display: flex;
+    align-items: center;
+}
+
+.divergence-control__header {
+    min-height: 24px;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.divergence-control__title-group {
+    min-width: 0;
+    gap: 8px;
+}
+
+.divergence-control__title {
+    overflow: hidden;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.divergence-control__value {
+    min-width: 24px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 18px;
+    text-align: center;
+}
+
+.divergence-control__inherit {
+    flex-shrink: 0;
+    gap: 8px;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    line-height: 1.2;
+}
+
+.divergence-control__inherit .toggle-switch {
+    width: 28px;
+    height: 16px;
+}
+
+.divergence-control__inherit .toggle-switch__knob {
+    width: 12px;
+    height: 12px;
+}
+
+.divergence-control__inherit .toggle-switch[data-state="checked"] .toggle-switch__knob {
+    transform: translateX(12px);
+}
+
+.divergence-control__interaction {
+    display: flex;
+    align-items: center;
+    height: 24px;
+    margin-top: 4px;
+    cursor: pointer;
+    outline: none;
+    touch-action: none;
+    user-select: none;
+}
+
+.divergence-control__rail {
+    position: relative;
+    width: 100%;
+    height: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-full);
+    background: var(--bg-tertiary);
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.16);
+}
+
+.divergence-control__fill {
+    position: absolute;
+    inset: -1px auto -1px -1px;
+    min-width: 4px;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--text-secondary), var(--accent-primary));
+}
+
+.divergence-control__tick {
+    position: absolute;
+    top: 50%;
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: var(--border-strong);
+    transform: translate(-50%, -50%);
+}
+
+.divergence-control__thumb {
+    position: absolute;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    border: 3px solid var(--accent-primary);
+    border-radius: 50%;
+    background: var(--bg-primary);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.32);
+    transform: translate(-50%, -50%);
+    transition: box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+
+.divergence-control__interaction:hover .divergence-control__thumb {
+    transform: translate(-50%, -50%) scale(1.08);
+}
+
+.divergence-control__interaction:focus-visible .divergence-control__thumb {
+    box-shadow: 0 0 0 4px var(--accent-subtle), 0 1px 4px rgba(0, 0, 0, 0.32);
+}
+
+.divergence-control__scale {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    margin-top: -1px;
+    color: var(--text-tertiary);
+    font-size: 10px;
+    line-height: 14px;
+}
+
+.divergence-control__scale span {
+    display: inline-flex;
+    gap: 4px;
+}
+
+.divergence-control__scale span:nth-child(2) {
+    justify-content: center;
+}
+
+.divergence-control__scale span:last-child {
+    justify-content: flex-end;
+}
+
+.divergence-control__scale b {
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-weight: 500;
+}
+
+.divergence-control.is-inherited .divergence-control__interaction,
+.divergence-control.is-disabled .divergence-control__interaction {
+    cursor: not-allowed;
+    opacity: 0.42;
+}
+
+.divergence-control.is-disabled {
+    opacity: 0.58;
+}
+
+@media (max-width: 380px) {
+    .divergence-control__header {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 5px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .divergence-control__thumb {
+        transition: none;
+    }
+}

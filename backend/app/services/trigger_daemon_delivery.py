@@ -484,6 +484,10 @@ async def _resume_origin_session_for_on_message(
                 recovery_mode=True,
                 turn_anchor_id=anchor_id,
                 storage_agent_id=history_agent_id,
+                model_override_id=trigger.model_id,
+                temperature_override=trigger.temperature,
+                include_soul=trigger.soul,
+                include_memory=trigger.memory,
             )
             if reply and reply.strip():
                 final_meta = {

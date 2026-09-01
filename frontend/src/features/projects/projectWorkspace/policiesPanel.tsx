@@ -12,6 +12,7 @@ import {
 
 import { useToast } from "../../../components/Toast/ToastProvider";
 import { enterpriseApi } from "../../../services/api";
+import { sortLlmModels } from "../../../utils/llmModels";
 import { projectsApi } from "../../../services/projects";
 import {
   Button,
@@ -142,7 +143,7 @@ export function PoliciesPanel({
       value: "default",
       label: t("projectWorkspacePage.policies.defaultTenantModel"),
     },
-    ...models.map((item) => ({
+    ...sortLlmModels(models).map((item) => ({
       value: item.id,
       label: item.label || `${item.provider} · ${item.model}`,
     })),

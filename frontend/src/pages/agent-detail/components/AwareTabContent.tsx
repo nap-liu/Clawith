@@ -10,6 +10,7 @@ import {
     synthesizeFocusForTrigger,
 } from '../shared';
 import ExecutionIdentityRail from './ExecutionIdentityRail';
+import BackgroundRuntimeControls from './BackgroundRuntimeControls';
 
 type ExecutionUserPickerTarget = {
     resourceType: 'trigger' | 'task' | 'schedule';
@@ -33,10 +34,12 @@ type Props = {
     executionUsers: ExecutionUserOption[];
     canReassignExecutionUser: boolean;
     reassignExecutionUser: any;
+    updateBackgroundRuntime: any;
     setExecutionUserPickerTarget: React.Dispatch<React.SetStateAction<ExecutionUserPickerTarget>>;
     executionUserPickerTarget: ExecutionUserPickerTarget;
     backgroundTasks: any[];
     schedules: any[];
+    llmModels: any[];
     id: string;
     agent: any;
     dialog: any;
@@ -76,10 +79,12 @@ export default function AwareTabContent({
     executionUsers,
     canReassignExecutionUser,
     reassignExecutionUser,
+    updateBackgroundRuntime,
     setExecutionUserPickerTarget,
     executionUserPickerTarget,
     backgroundTasks,
     schedules,
+    llmModels,
     id,
     agent,
     dialog,
@@ -272,6 +277,13 @@ export default function AwareTabContent({
                                                 expectedExecutionUserId: trig.execution_user_id || null,
                                             })}
                                         />
+                                        <BackgroundRuntimeControls
+                                            resource={trig}
+                                            models={llmModels}
+                                            disabled={!canManage}
+                                            isZh={isZh}
+                                            onSave={(update) => updateBackgroundRuntime.mutateAsync({ resourceType: 'trigger', resourceId: trig.id, update })}
+                                        />
                                         <div style={{ display: 'flex', gap: '4px' }}>
                                             {canManage && !trig.is_system && (
                                                 <button
@@ -388,6 +400,13 @@ export default function AwareTabContent({
                                         expectedExecutionUserId: task.execution_user_id || null,
                                     })}
                                 />
+                                <BackgroundRuntimeControls
+                                    resource={task}
+                                    models={llmModels}
+                                    disabled={!canManage}
+                                    isZh={isZh}
+                                    onSave={(update) => updateBackgroundRuntime.mutateAsync({ resourceType: 'task', resourceId: task.id, update })}
+                                />
                             </div>
                         ))}
                         {(schedules as any[]).map((schedule) => (
@@ -417,6 +436,13 @@ export default function AwareTabContent({
                                         executionUserId: schedule.execution_user_id || schedule.created_by_user_id || schedule.created_by,
                                         expectedExecutionUserId: schedule.execution_user_id || null,
                                     })}
+                                />
+                                <BackgroundRuntimeControls
+                                    resource={schedule}
+                                    models={llmModels}
+                                    disabled={!canManage}
+                                    isZh={isZh}
+                                    onSave={(update) => updateBackgroundRuntime.mutateAsync({ resourceType: 'schedule', resourceId: schedule.id, update })}
                                 />
                             </div>
                         ))}

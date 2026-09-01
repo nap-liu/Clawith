@@ -315,7 +315,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Model generation and response reads have no platform timeout.')}</div>
                         </div>
                         <div className="form-group">
-                            <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
+                            <label className="form-label">{t('enterprise.llm.temperature', 'Imagination')}</label>
                             <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.temperatureDesc', 'Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0')}</div>
                         </div>
@@ -410,7 +410,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Model generation and response reads have no platform timeout.')}</div>
                                     </div>
                                     <div className="form-group">
-                                        <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
+                                        <label className="form-label">{t('enterprise.llm.temperature', 'Imagination')}</label>
                                         <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                                     </div>
                                 </div>

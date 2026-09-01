@@ -63,13 +63,18 @@ async def _seed_user(suffix: str, display_name: str, role: str = "member") -> Us
         return user
 
 
-async def _seed_agent(creator_user_id) -> uuid.UUID:
+async def _seed_agent(
+    creator_user_id,
+    *,
+    company_access_level: str = "use",
+) -> uuid.UUID:
     async with async_session() as db:
         tenant_id = await db.scalar(select(User.tenant_id).where(User.id == creator_user_id))
         agent = Agent(
             name="ListTestAgent",
             creator_id=creator_user_id,
             tenant_id=tenant_id,
+            company_access_level=company_access_level,
         )
         db.add(agent)
         await db.commit()
@@ -237,6 +242,75 @@ async def test_group_session_hidden_in_scope_mine_when_user_has_no_messages():
 
     assert all(s.id != str(sess_id) for s in out), \
         "bob is not a member; he must not see the group in scope=mine"
+
+
+@pytest.mark.parametrize("role", ["platform_admin", "org_admin", "agent_admin"])
+async def test_governing_admin_can_list_and_read_group_without_membership(role: str):
+    """Governance access is Agent-scoped, not conditional on IM membership."""
+    from app.api.chat_sessions import get_session_messages, list_sessions
+
+    run = uuid.uuid4().hex[:8]
+    owner = await _seed_user(f"owner_{run}", "Owner")
+    speaker = await _seed_user(f"speaker_{run}", "Speaker")
+    admin = await _seed_user(f"admin_{run}", "Admin", role=role)
+    agent_id = await _seed_agent(owner.id, company_access_level="manage")
+    session_id = await _seed_group_session(
+        agent_id,
+        owner.id,
+        f"dingtalk_group_{run}",
+        group_name="Governed group",
+    )
+    await _insert_messages_bypass_fk([{
+        "id": uuid.uuid4(),
+        "agent_id": agent_id,
+        "user_id": speaker.id,
+        "role": "user",
+        "content": "governance audit message",
+        "conv_id": str(session_id),
+    }])
+
+    async with async_session() as db:
+        page = await list_sessions(
+            agent_id=agent_id,
+            scope="all",
+            exclude_mine=True,
+            current_user=admin,
+            db=db,
+        )
+        messages = await get_session_messages(
+            agent_id=agent_id,
+            session_id=session_id,
+            limit=20,
+            before=None,
+            current_user=admin,
+            db=db,
+        )
+
+    assert [item.id for item in page] == [str(session_id)]
+    assert [message["content"] for message in messages] == [
+        "governance audit message"
+    ]
+
+
+async def test_agent_admin_without_manage_access_cannot_view_all_sessions():
+    from fastapi import HTTPException
+    from app.api.chat_sessions import list_sessions
+
+    run = uuid.uuid4().hex[:8]
+    owner = await _seed_user(f"owner_{run}", "Owner")
+    admin = await _seed_user(f"admin_{run}", "Agent Admin", role="agent_admin")
+    agent_id = await _seed_agent(owner.id, company_access_level="use")
+
+    with pytest.raises(HTTPException) as exc:
+        async with async_session() as db:
+            await list_sessions(
+                agent_id=agent_id,
+                scope="all",
+                current_user=admin,
+                db=db,
+            )
+
+    assert exc.value.status_code == 403
 
 
 async def test_p2p_session_still_visible_in_scope_mine_for_owner():

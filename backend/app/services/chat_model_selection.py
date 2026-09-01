@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,10 @@ MODEL_OVERRIDE_UNAVAILABLE = "unavailable"
 MODEL_OVERRIDE_DISABLED = "disabled"
 
 
+class BackgroundModelUnavailableError(RuntimeError):
+    """A persisted background model selection cannot execute safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class ModelNameResolution:
     status: str
@@ -39,6 +43,32 @@ class RuntimeModelResolution:
     primary_model: RuntimeLLMModel | None
     fallback_model: RuntimeLLMModel | None
     override_status: str = MODEL_OVERRIDE_NONE
+
+
+def validate_temperature(value: float | None) -> float | None:
+    if value is None:
+        return None
+    normalized = float(value)
+    if normalized < 0 or normalized > 2:
+        raise ValueError("temperature must be between 0 and 2")
+    return normalized
+
+
+def _runtime_snapshot(
+    model: LLMModel | None,
+    *,
+    agent: Agent,
+    override_temperature: float | None = None,
+) -> RuntimeLLMModel | None:
+    if model is None:
+        return None
+    snapshot = RuntimeLLMModel.from_orm(model)
+    effective_temperature = (
+        validate_temperature(override_temperature)
+        if override_temperature is not None
+        else validate_temperature(getattr(agent, "temperature", None))
+    )
+    return replace(snapshot, temperature=effective_temperature) if effective_temperature is not None else snapshot
 
 
 def _normalized_model_name(value: str) -> str:
@@ -88,11 +118,58 @@ async def resolve_tenant_model_by_name(
     return ModelNameResolution(MODEL_STATUS_OK, matches[0])
 
 
+async def resolve_tenant_model_reference(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    reference: str | uuid.UUID,
+) -> ModelNameResolution:
+    """Resolve an enabled model by UUID, model key, or unique display label."""
+    raw = str(reference or "").strip()
+    if not raw:
+        return ModelNameResolution(MODEL_STATUS_NOT_FOUND)
+    visible = (
+        (
+            await db.execute(
+                select(LLMModel).where(
+                    or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None))
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    try:
+        requested_id = uuid.UUID(raw)
+    except ValueError:
+        requested_id = None
+    if requested_id is not None:
+        matches = [model for model in visible if model.id == requested_id]
+    else:
+        normalized = _normalized_model_name(raw)
+        matches = [
+            model
+            for model in visible
+            if normalized in {
+                _normalized_model_name(model.model),
+                _normalized_model_name(model.label),
+            }
+        ]
+    if not matches:
+        return ModelNameResolution(MODEL_STATUS_NOT_FOUND)
+    if len(matches) > 1:
+        return ModelNameResolution(MODEL_STATUS_AMBIGUOUS)
+    if not matches[0].enabled:
+        return ModelNameResolution(MODEL_STATUS_DISABLED, matches[0])
+    return ModelNameResolution(MODEL_STATUS_OK, matches[0])
+
+
 async def resolve_runtime_models(
     db: AsyncSession,
     *,
     agent: Agent,
     override_model_id: str | uuid.UUID | None = None,
+    override_temperature: float | None = None,
 ) -> RuntimeModelResolution:
     """Resolve the effective primary/fallback pair used by both Web and IM."""
 
@@ -108,8 +185,8 @@ async def resolve_runtime_models(
         primary_orm = fallback_orm
         fallback_orm = None
 
-    primary = RuntimeLLMModel.from_orm(primary_orm) if primary_orm is not None else None
-    fallback = RuntimeLLMModel.from_orm(fallback_orm) if fallback_orm is not None else None
+    primary = _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature)
+    fallback = _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature)
 
     if not override_model_id:
         return RuntimeModelResolution(primary, fallback)
@@ -123,15 +200,28 @@ async def resolve_runtime_models(
 
     override = (await db.execute(select(LLMModel).where(LLMModel.id == requested_id))).scalar_one_or_none()
     agent_tenant_id = getattr(agent, "tenant_id", None)
-    if override is None or agent_tenant_id is None or override.tenant_id != agent_tenant_id:
+    if override is None or agent_tenant_id is None or override.tenant_id not in {agent_tenant_id, None}:
         return RuntimeModelResolution(primary, fallback, MODEL_OVERRIDE_UNAVAILABLE)
     if not override.enabled:
         return RuntimeModelResolution(primary, fallback, MODEL_OVERRIDE_DISABLED)
 
-    effective = RuntimeLLMModel.from_orm(override)
+    effective = _runtime_snapshot(override, agent=agent, override_temperature=override_temperature)
     if fallback is not None and fallback.id == effective.id:
         fallback = None
     return RuntimeModelResolution(effective, fallback, MODEL_OVERRIDE_OK)
+
+
+async def validate_agent_model_override(
+    db: AsyncSession,
+    *,
+    agent: Agent,
+    model_id: uuid.UUID | None,
+) -> None:
+    if model_id is None:
+        return
+    resolved = await resolve_runtime_models(db, agent=agent, override_model_id=model_id)
+    if resolved.override_status != MODEL_OVERRIDE_OK:
+        raise ValueError("model override is unavailable for this Agent")
 
 
 async def resolve_project_runtime_models(
@@ -139,6 +229,7 @@ async def resolve_project_runtime_models(
     *,
     agent: Agent,
     project_settings: dict | None,
+    override_temperature: float | None = None,
 ) -> RuntimeModelResolution:
     """Resolve one project turn without crossing the tenant model boundary.
 
@@ -162,8 +253,8 @@ async def resolve_project_runtime_models(
         primary_orm, fallback_orm = fallback_orm, None
     if primary_orm is not None:
         return RuntimeModelResolution(
-            RuntimeLLMModel.from_orm(primary_orm),
-            RuntimeLLMModel.from_orm(fallback_orm) if fallback_orm is not None else None,
+            _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature),
+            _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature),
         )
 
     runtime_settings = dict(dict(project_settings or {}).get("runtime") or {})
@@ -183,13 +274,16 @@ async def resolve_project_runtime_models(
             if len(named) == 1:
                 project_model = named[0]
     if project_model is not None:
-        return RuntimeModelResolution(RuntimeLLMModel.from_orm(project_model), None)
+        return RuntimeModelResolution(
+            _runtime_snapshot(project_model, agent=agent, override_temperature=override_temperature),
+            None,
+        )
 
     tenant = await db.get(Tenant, tenant_id)
     tenant_default = by_id.get(tenant.default_model_id) if tenant is not None else None
     selected = tenant_default or (enabled_models[0] if enabled_models else None)
     return RuntimeModelResolution(
-        RuntimeLLMModel.from_orm(selected) if selected is not None else None,
+        _runtime_snapshot(selected, agent=agent, override_temperature=override_temperature),
         None,
     )
 
@@ -200,6 +294,7 @@ async def resolve_project_member_runtime_models(
     agent: Agent,
     member_config: dict | None,
     project_settings: dict | None,
+    override_temperature: float | None = None,
 ) -> RuntimeModelResolution:
     """Resolve models only from the frozen member config and project defaults."""
 
@@ -236,8 +331,8 @@ async def resolve_project_member_runtime_models(
         primary_orm, fallback_orm = fallback_orm, None
     if primary_orm is not None:
         return RuntimeModelResolution(
-            RuntimeLLMModel.from_orm(primary_orm),
-            RuntimeLLMModel.from_orm(fallback_orm) if fallback_orm is not None else None,
+            _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature),
+            _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature),
         )
 
     # An intentionally empty member override uses project/tenant defaults, but
@@ -253,12 +348,18 @@ async def resolve_project_member_runtime_models(
             if len(named) == 1:
                 project_model = named[0]
     if project_model is not None:
-        return RuntimeModelResolution(RuntimeLLMModel.from_orm(project_model), None)
+        return RuntimeModelResolution(
+            _runtime_snapshot(project_model, agent=agent, override_temperature=override_temperature),
+            None,
+        )
 
     tenant = await db.get(Tenant, tenant_id)
     tenant_default = by_id.get(tenant.default_model_id) if tenant is not None else None
     selected = tenant_default or (sorted(enabled_models, key=lambda model: str(model.id))[0] if enabled_models else None)
-    return RuntimeModelResolution(RuntimeLLMModel.from_orm(selected) if selected is not None else None, None)
+    return RuntimeModelResolution(
+        _runtime_snapshot(selected, agent=agent, override_temperature=override_temperature),
+        None,
+    )
 
 
 async def load_turn_model_id(

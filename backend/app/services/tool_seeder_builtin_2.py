@@ -253,6 +253,10 @@ BUILTIN_TOOLS_PART_2 = [
                 "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message must contain exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}. webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)"},
                 "reason": {"type": "string", "description": "What you should do when this trigger fires. This will be shown to you as context when you wake up."},
                 "focus_ref": {"type": "string", "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason."},
+                "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Omit to inherit the Agent model."},
+                "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override. Omit to inherit the Digital Employee setting."},
+                "soul": {"type": "boolean", "default": True, "description": "Whether to use the Agent's Soul for this trigger."},
+                "memory": {"type": "boolean", "default": True, "description": "Whether to use the Agent's memory for this trigger."},
                 "webhook_mode": {
                     "type": "string",
                     "enum": ["legacy", "queue", "merge"],
@@ -277,6 +281,10 @@ BUILTIN_TOOLS_PART_2 = [
                 "name": {"type": "string", "description": "Name of the trigger to update"},
                 "config": {"type": "object", "description": "New config. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged."},
                 "reason": {"type": "string", "description": "New reason text"},
+                "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Empty means inherit the Agent model."},
+                "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override."},
+                "soul": {"type": "boolean", "description": "Whether to use the Agent's Soul."},
+                "memory": {"type": "boolean", "description": "Whether to use the Agent's memory."},
                 "webhook_mode": {
                     "type": "string",
                     "enum": ["legacy", "queue", "merge"],

@@ -34,9 +34,9 @@ async def remove_builtin_tool(tool_name: str) -> tuple[int, int]:
         if tool is None:
             return 0, 0
         assignments = await db.execute(delete(AgentTool).where(AgentTool.tool_id == tool.id))
-        await db.delete(tool)
+        tools = await db.execute(delete(Tool).where(Tool.id == tool.id))
         await db.commit()
-        return int(assignments.rowcount or 0), 1
+        return int(assignments.rowcount or 0), int(tools.rowcount or 0)
 
 
 async def rollback_im_recall() -> tuple[int, int]:

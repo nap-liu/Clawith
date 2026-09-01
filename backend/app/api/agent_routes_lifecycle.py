@@ -1,6 +1,8 @@
 """Mechanically separated Agent API route group."""
 
 from app.api.agent_api_shared import *  # noqa: F401,F403
+from app.api.agent_routes_directory import _agent_to_out
+from app.core.permissions import is_platform_admin_user
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)
@@ -11,11 +13,12 @@ async def update_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Update agent settings (creator or admin)."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, agent_access = await check_agent_access(db, current_user, agent_id)
 
-    is_admin = current_user.role in ("platform_admin", "org_admin")
+    is_admin = is_platform_admin_user(current_user) or current_user.role == "org_admin"
+    is_agent_admin = current_user.role == "agent_admin" and agent_access == "manage"
 
-    if not is_agent_creator(current_user, agent) and not is_admin:
+    if not is_agent_creator(current_user, agent) and not is_admin and not is_agent_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only creator or admin can update agent settings")
 
     update_data = data.model_dump(exclude_unset=True)
@@ -34,64 +37,59 @@ async def update_agent(
                 agent.is_expired = False
                 agent.status = "idle"
 
-    # Enforce heartbeat floor from tenant
-    clamped_fields = []  # track fields adjusted by tenant floor
-    if "heartbeat_interval_minutes" in update_data and current_user.tenant_id:
-        from app.models.tenant import Tenant
-        t_result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
-        tenant = t_result.scalar_one_or_none()
-        if tenant and update_data["heartbeat_interval_minutes"] < tenant.min_heartbeat_interval_minutes:
-            update_data["heartbeat_interval_minutes"] = tenant.min_heartbeat_interval_minutes
-            clamped_fields.append({
-                "field": "heartbeat_interval_minutes",
-                "requested": update_data["heartbeat_interval_minutes"],
-                "applied": tenant.min_heartbeat_interval_minutes,
-                "reason": "company_floor",
-            })
+    # Native standard Digital Employees share the same validated ordinary
+    # settings path as MCP update_agent and update_self_settings.
+    clamped_fields = []
+    special_fields = {"autonomy_policy", "expires_at"}
+    regular_update = {
+        field: value for field, value in update_data.items()
+        if field not in special_fields
+    }
+    if agent.scope == "standard" and agent.agent_type == "native":
+        from app.services.agent_settings_update import apply_agent_settings_patch
 
-    # Enforce trigger limit floors from tenant
-    trigger_fields = {"min_poll_interval_min", "webhook_rate_limit", "max_triggers"}
-    if trigger_fields & set(update_data.keys()) and current_user.tenant_id:
-        from app.models.tenant import Tenant
-        t_result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
-        tenant = t_result.scalar_one_or_none()
-        if tenant:
-            if "min_poll_interval_min" in update_data:
-                original = update_data["min_poll_interval_min"]
-                update_data["min_poll_interval_min"] = max(original, tenant.min_poll_interval_floor)
-                if update_data["min_poll_interval_min"] != original:
-                    clamped_fields.append({
-                        "field": "min_poll_interval_min",
-                        "requested": original,
-                        "applied": update_data["min_poll_interval_min"],
-                        "reason": "company_floor",
-                    })
-            if "webhook_rate_limit" in update_data:
-                original = update_data["webhook_rate_limit"]
-                update_data["webhook_rate_limit"] = min(original, tenant.max_webhook_rate_ceiling)
-                if update_data["webhook_rate_limit"] != original:
-                    clamped_fields.append({
-                        "field": "webhook_rate_limit",
-                        "requested": original,
-                        "applied": update_data["webhook_rate_limit"],
-                        "reason": "company_ceiling",
-                    })
+        if "primary_model_id" in regular_update:
+            value = regular_update.pop("primary_model_id")
+            regular_update["primary_model"] = str(value) if value else None
+        if "fallback_model_id" in regular_update:
+            value = regular_update.pop("fallback_model_id")
+            regular_update["fallback_model"] = str(value) if value else None
+        if "temperature" in regular_update:
+            regular_update["imagination"] = regular_update.pop("temperature")
+        try:
+            outcome = await apply_agent_settings_patch(db, agent, regular_update)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+        clamped_fields = outcome.clamps
+        for field in special_fields & update_data.keys():
+            setattr(agent, field, update_data[field])
+        await db.flush()
+    else:
+        # Remote OpenClaw records retain their existing update semantics; their
+        # runtime settings are managed through the OpenClaw-specific endpoint.
+        for field, value in update_data.items():
+            setattr(agent, field, value)
+        await db.flush()
 
-    for field, value in update_data.items():
-        setattr(agent, field, value)
-    await db.flush()
-
-    # Sync Participant display_name / avatar if changed
-    if "name" in update_data or "avatar_url" in update_data:
-        from app.models.participant import Participant
-        p_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == agent_id))
-        p = p_r.scalar_one_or_none()
-        if p:
-            if "name" in update_data:
-                p.display_name = agent.name
-            if "avatar_url" in update_data:
-                p.avatar_url = agent.avatar_url
-            await db.flush()
+        if "name" in update_data or "avatar_url" in update_data:
+            from app.models.participant import Participant
+            participant = (
+                await db.execute(
+                    select(Participant).where(
+                        Participant.type == "agent",
+                        Participant.ref_id == agent_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if participant:
+                if "name" in update_data:
+                    participant.display_name = agent.name
+                if "avatar_url" in update_data:
+                    participant.avatar_url = agent.avatar_url
+                await db.flush()
 
     out_model = await _agent_to_out(db, agent, current_user.id)
     out = out_model.model_dump()

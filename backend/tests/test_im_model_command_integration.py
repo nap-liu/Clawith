@@ -309,18 +309,22 @@ async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
         assert agent is not None
+        agent.temperature = 0.9
 
         default_resolution = await resolve_runtime_models(db, agent=agent)
         assert default_resolution.primary_model.id == default_model_id
+        assert default_resolution.primary_model.temperature == 0.9
         assert default_resolution.fallback_model is None
 
         selected_resolution = await resolve_runtime_models(
             db,
             agent=agent,
             override_model_id=selected_model_id,
+            override_temperature=1.3,
         )
         assert selected_resolution.override_status == MODEL_OVERRIDE_OK
         assert selected_resolution.primary_model.id == selected_model_id
+        assert selected_resolution.primary_model.temperature == 1.3
 
         disabled_resolution = await resolve_runtime_models(
             db,

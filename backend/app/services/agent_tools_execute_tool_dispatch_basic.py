@@ -161,6 +161,10 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
 
     if tool_name == "list_files":
         result = await _storage_list_dir(agent_id, arguments.get("path", ""), tenant_id=_agent_tenant_id)
+    elif tool_name == "update_self_settings":
+        from app.services.agent_self_settings_tool import handle_update_self_settings
+
+        return await handle_update_self_settings(agent_id, arguments)
     elif tool_name == "list_focus_items":
         items = await list_focus_items(agent_id, include_completed=bool(arguments.get("include_completed", True)))
         if not items:

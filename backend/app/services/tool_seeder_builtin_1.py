@@ -2,10 +2,12 @@
 
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
+from app.services.agent_self_settings_tool import UPDATE_SELF_SETTINGS_TOOL_SEED
 
 
 BUILTIN_TOOLS_PART_1 = [
     REQUEST_CONFIRMATION_TOOL_SEED,
+    UPDATE_SELF_SETTINGS_TOOL_SEED,
     {
         "name": "run_background_resource",
         "display_name": "Run Background Resource",
@@ -61,7 +63,13 @@ BUILTIN_TOOLS_PART_1 = [
                 "mode": {"type": "string", "enum": ["sync", "async"], "default": "sync"},
                 "model": {
                     "type": "string",
-                    "description": "Optional readable model id from the tenant model catalog.",
+                    "description": "Optional model UUID, model key, or unique display label from the tenant catalog.",
+                },
+                "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 2,
+                    "description": "Optional imagination override. Omit to inherit the Digital Employee setting.",
                 },
                 "fork": {
                     "type": "boolean",

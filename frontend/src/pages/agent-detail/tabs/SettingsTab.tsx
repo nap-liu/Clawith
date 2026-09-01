@@ -9,18 +9,24 @@ import OpenClawSettings from '../../OpenClawSettings';
 import { agentApi, fileApi } from '../../../services/api';
 import { useAuthStore } from '../../../stores';
 import { useDialog } from '../../../components/Dialog/DialogProvider';
+import DivergenceSlider from '../../../components/DivergenceSlider';
+import BlurValidatedNumberInput from '../../../components/BlurValidatedNumberInput';
+import SelectDropdown from '../../../components/SelectDropdown';
+import { sortLlmModels } from '../../../utils/llmModels';
+import { getLlmModelLabel } from '../../../utils/llmModels';
 
 type SettingsFormState = {
     primary_model_id: string;
     fallback_model_id: string;
-    context_window_size: number;
-    daily_memory_load_days: number;
-    max_tool_rounds: number;
+    temperature: number | null;
+    context_window_size: string | number;
+    daily_memory_load_days: string | number;
+    max_tool_rounds: string | number;
     max_tokens_per_day: string | number;
     max_tokens_per_month: string | number;
-    max_triggers: number;
-    min_poll_interval_min: number;
-    webhook_rate_limit: number;
+    max_triggers: string | number;
+    min_poll_interval_min: string | number;
+    webhook_rate_limit: string | number;
     im_thinking_output_enabled: boolean;
 };
 
@@ -76,6 +82,15 @@ export default function SettingsTab(props: Props) {
     const dialog = useDialog();
     const token = useAuthStore((s) => s.token);
     const [avatarUploading, setAvatarUploading] = useState(false);
+    const modelOptions = (currentId: string) => [
+        { value: '', label: '--' },
+        ...sortLlmModels(
+            llmModels.filter((model: any) => model.enabled || model.id === currentId),
+        ).map((model: any) => ({
+            value: model.id as string,
+            label: getLlmModelLabel(model),
+        })),
+    ];
     const readOnly = !canManage;
     const canSave = canManage && hasChanges && !settingsSaving;
 
@@ -128,7 +143,7 @@ export default function SettingsTab(props: Props) {
                     )}
                 </div>
                 <div style={{ flex: 1 }}>
-                    <h4 style={{ margin: '0 0 4px 0', fontSize: '14px', fontWeight: 500 }}>{i18n.language?.startsWith('zh') ? '智能体头像' : 'Agent Avatar'}</h4>
+                    <h4 style={{ margin: '0 0 4px 0', fontSize: '14px', fontWeight: 500 }}>{i18n.language?.startsWith('zh') ? '数字员工头像' : 'Agent Avatar'}</h4>
                     <p style={{ margin: '0 0 10px 0', fontSize: '12px', color: 'var(--text-tertiary)' }}>
                         {i18n.language?.startsWith('zh') ? '上传自定义头像，推荐正方形图片（PNG、JPG 或 GIF），最大 5MB。' : 'Upload custom avatar. Recommended square image (PNG, JPG, GIF), max 5MB.'}
                     </p>
@@ -200,18 +215,14 @@ export default function SettingsTab(props: Props) {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     <div>
                         <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.primaryModel')}</label>
-                        <select
-                            className="input"
+                        <SelectDropdown
                             value={settingsForm.primary_model_id}
-                            onChange={(e) => setSettingsForm((form) => ({ ...form, primary_model_id: e.target.value }))}
-                        >
-                            <option value="">--</option>
-                            {llmModels.filter((m: any) => m.enabled || m.id === settingsForm.primary_model_id).map((m: any) => (
-                                <option key={m.id} value={m.id}>
-                                    {m.label || m.model}
-                                </option>
-                            ))}
-                        </select>
+                            options={modelOptions(settingsForm.primary_model_id)}
+                            onChange={(primary_model_id) => setSettingsForm((form) => ({ ...form, primary_model_id }))}
+                            ariaLabel={t('agent.settings.primaryModel')}
+                            disabled={!canManage}
+                            style={{ width: 'min(100%, 360px)' }}
+                        />
                         {settingsForm.primary_model_id && llmModels.some((m: any) => m.id === settingsForm.primary_model_id && !m.enabled) && (
                             <div style={{ fontSize: '11px', color: 'var(--error)', marginTop: '4px' }}>
                                 {t('agent.settings.modelDisabledWarning', 'This model has been disabled by admin. The agent will automatically use the fallback model.')}
@@ -221,18 +232,14 @@ export default function SettingsTab(props: Props) {
                     </div>
                     <div>
                         <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.fallbackModel')}</label>
-                        <select
-                            className="input"
+                        <SelectDropdown
                             value={settingsForm.fallback_model_id}
-                            onChange={(e) => setSettingsForm((form) => ({ ...form, fallback_model_id: e.target.value }))}
-                        >
-                            <option value="">--</option>
-                            {llmModels.filter((m: any) => m.enabled || m.id === settingsForm.fallback_model_id).map((m: any) => (
-                                <option key={m.id} value={m.id}>
-                                    {m.label || m.model}
-                                </option>
-                            ))}
-                        </select>
+                            options={modelOptions(settingsForm.fallback_model_id)}
+                            onChange={(fallback_model_id) => setSettingsForm((form) => ({ ...form, fallback_model_id }))}
+                            ariaLabel={t('agent.settings.fallbackModel')}
+                            disabled={!canManage}
+                            style={{ width: 'min(100%, 360px)' }}
+                        />
                         {settingsForm.fallback_model_id && llmModels.some((m: any) => m.id === settingsForm.fallback_model_id && !m.enabled) && (
                             <div style={{ fontSize: '11px', color: 'var(--error)', marginTop: '4px' }}>
                                 {t('agent.settings.modelDisabledWarning', 'This model has been disabled by admin. The agent will automatically use the fallback model.')}
@@ -240,6 +247,16 @@ export default function SettingsTab(props: Props) {
                         )}
                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.fallbackModel')}</div>
                     </div>
+                    <DivergenceSlider
+                        value={settingsForm.temperature}
+                        onChange={(temperature) => setSettingsForm((form) => ({ ...form, temperature }))}
+                        label={i18n.language?.startsWith('zh') ? '想象力' : 'Imagination'}
+                        inheritedLabel={i18n.language?.startsWith('zh') ? '继承模型默认值' : 'Inherit model default'}
+                        lowLabel={i18n.language?.startsWith('zh') ? '稳定' : 'Stable'}
+                        middleLabel={i18n.language?.startsWith('zh') ? '均衡' : 'Balanced'}
+                        highLabel={i18n.language?.startsWith('zh') ? '丰富' : 'Imaginative'}
+                        disabled={!canManage}
+                    />
                 </div>
             </div>
 
@@ -248,26 +265,24 @@ export default function SettingsTab(props: Props) {
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px' }}>
                     <div>
                     <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.maxRounds')}</label>
-                    <input
-                        className="input"
-                        type="number"
+                    <BlurValidatedNumberInput
                         min={10}
                         max={500}
+                        fallback={100}
                         value={settingsForm.context_window_size}
-                        onChange={(e) => setSettingsForm((form) => ({ ...form, context_window_size: Math.max(10, Math.min(500, parseInt(e.target.value) || 100)) }))}
+                        onChange={(context_window_size) => setSettingsForm((form) => ({ ...form, context_window_size }))}
                         style={{ width: '120px' }}
                     />
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.roundsDesc')}</div>
                     </div>
                     <div>
                         <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.dailyMemoryLoadDays')}</label>
-                        <input
-                            className="input"
-                            type="number"
+                        <BlurValidatedNumberInput
                             min={0}
                             max={30}
+                            fallback={0}
                             value={settingsForm.daily_memory_load_days}
-                            onChange={(e) => setSettingsForm((form) => ({ ...form, daily_memory_load_days: Math.max(0, Math.min(30, Number(e.target.value))) }))}
+                            onChange={(daily_memory_load_days) => setSettingsForm((form) => ({ ...form, daily_memory_load_days }))}
                             style={{ width: '120px' }}
                         />
                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.dailyMemoryLoadDaysDesc')}</div>
@@ -279,13 +294,12 @@ export default function SettingsTab(props: Props) {
                 <h4 style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}><IconTools size={16} stroke={1.8} /> {t('agent.settings.maxToolRounds', 'Max Tool Call Rounds')}</h4>
                 <div>
                     <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.maxToolRoundsLabel', 'Maximum rounds per message')}</label>
-                    <input
-                        className="input"
-                        type="number"
+                    <BlurValidatedNumberInput
                         min={5}
                         max={200}
+                        fallback={50}
                         value={settingsForm.max_tool_rounds}
-                        onChange={(e) => setSettingsForm((form) => ({ ...form, max_tool_rounds: Math.max(5, Math.min(200, parseInt(e.target.value) || 50)) }))}
+                        onChange={(max_tool_rounds) => setSettingsForm((form) => ({ ...form, max_tool_rounds }))}
                         style={{ width: '120px' }}
                     />
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.maxToolRoundsDesc', 'How many tool-calling rounds the agent can perform per message (search, write, etc). Default: 50')}</div>
@@ -353,22 +367,22 @@ export default function SettingsTab(props: Props) {
                     <div className="card" style={{ marginBottom: '12px' }}>
                         <h4 style={{ marginBottom: '4px' }}>{isChinese ? '触发器限制' : 'Trigger Limits'}</h4>
                         <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
-                            {isChinese ? '控制该 Agent 可以创建的触发器数量和行为限制' : 'Limit how many triggers this agent can create and their behavior'}
+                            {isChinese ? '控制该数字员工可以创建的触发器数量和行为限制' : 'Limit how many triggers this agent can create and their behavior'}
                         </p>
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' }}>
                             <div>
                                 <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{isChinese ? '最大触发器数' : 'Max Triggers'}</label>
-                                <input className="input" type="number" min={1} max={100} value={settingsForm.max_triggers} onChange={(e) => setSettingsForm((form) => ({ ...form, max_triggers: Math.max(1, Math.min(100, parseInt(e.target.value) || 20)) }))} style={{ width: '100%' }} />
-                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{isChinese ? 'Agent 最多可同时拥有的触发器数量' : 'Max active triggers the agent can have'}</div>
+                                <BlurValidatedNumberInput min={1} max={100} fallback={20} value={settingsForm.max_triggers} onChange={(max_triggers) => setSettingsForm((form) => ({ ...form, max_triggers }))} style={{ width: '100%' }} />
+                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{isChinese ? '数字员工最多可同时拥有的触发器数量' : 'Max active triggers the agent can have'}</div>
                             </div>
                             <div>
                                 <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{isChinese ? 'Poll 最短间隔 (分钟)' : 'Min Poll Interval (min)'}</label>
-                                <input className="input" type="number" min={1} max={60} value={settingsForm.min_poll_interval_min} onChange={(e) => setSettingsForm((form) => ({ ...form, min_poll_interval_min: Math.max(1, Math.min(60, parseInt(e.target.value) || 5)) }))} style={{ width: '100%' }} />
+                                <BlurValidatedNumberInput min={1} max={60} fallback={5} value={settingsForm.min_poll_interval_min} onChange={(min_poll_interval_min) => setSettingsForm((form) => ({ ...form, min_poll_interval_min }))} style={{ width: '100%' }} />
                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{isChinese ? '定时轮询外部接口的最短间隔' : 'Minimum interval for polling external URLs'}</div>
                             </div>
                             <div>
                                 <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{isChinese ? 'Webhook 频率限制 (次/分钟)' : 'Webhook Rate Limit (/min)'}</label>
-                                <input className="input" type="number" min={1} max={60} value={settingsForm.webhook_rate_limit} onChange={(e) => setSettingsForm((form) => ({ ...form, webhook_rate_limit: Math.max(1, Math.min(60, parseInt(e.target.value) || 5)) }))} style={{ width: '100%' }} />
+                                <BlurValidatedNumberInput min={1} max={60} fallback={5} value={settingsForm.webhook_rate_limit} onChange={(webhook_rate_limit) => setSettingsForm((form) => ({ ...form, webhook_rate_limit }))} style={{ width: '100%' }} />
                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{isChinese ? '外部系统每分钟最多可调用的 Webhook 次数' : 'Max webhook calls per minute from external services'}</div>
                             </div>
                         </div>
@@ -389,7 +403,7 @@ export default function SettingsTab(props: Props) {
                             {wmSaved && <span style={{ fontSize: '12px', color: 'var(--success)' }}>✓ {isChinese ? '已保存' : 'Saved'}</span>}
                         </div>
                         <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
-                            {isChinese ? '当用户在网页端发起新对话时，Agent 会自动发送的欢迎语。支持 Markdown 语法。留空则不发送。' : 'Greeting message sent automatically when a user starts a new web conversation. Supports Markdown. Leave empty to disable.'}
+                            {isChinese ? '当用户在网页端发起新对话时，数字员工会自动发送的欢迎语。支持 Markdown 语法。留空则不发送。' : 'Greeting message sent automatically when a user starts a new web conversation. Supports Markdown. Leave empty to disable.'}
                         </p>
                         <textarea className="input" rows={4} value={wmDraft} onChange={(e) => setWmDraft(e.target.value)} onBlur={() => { if (canManage) void onSaveWelcomeMessage(); }} placeholder={isChinese ? '例如：你好！我是你的 AI 助手，有什么可以帮你的吗？' : "e.g. Hello! I'm your AI assistant. How can I help you?"} style={{ width: '100%', minHeight: '80px', resize: 'vertical', fontFamily: 'inherit', fontSize: '13px' }} />
                     </div>

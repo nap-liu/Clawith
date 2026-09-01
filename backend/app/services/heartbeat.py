@@ -181,7 +181,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             model_api_key_encrypted = model.api_key_encrypted
             model_model = model.model
             model_base_url = model.base_url
-            model_temperature = model.temperature
+            model_temperature = agent.temperature if agent.temperature is not None else model.temperature
             model_max_output_tokens = getattr(model, 'max_output_tokens', None)
             model_request_timeout = getattr(model, 'request_timeout', None)
             model_context_window = getattr(model, "context_window", 0)

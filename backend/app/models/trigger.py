@@ -3,8 +3,20 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    true,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -33,6 +45,22 @@ class AgentTrigger(Base):
     execution_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
     )
+    model_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "llm_models.id",
+            name="fk_agent_triggers_model_id_llm_models",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    soul: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    memory: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     type: Mapped[str] = mapped_column(String(20), nullable=False)  # cron|once|interval|poll|on_message
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
@@ -50,4 +78,8 @@ class AgentTrigger(Base):
 
     __table_args__ = (
         UniqueConstraint("agent_id", "name", name="uq_agent_trigger_name"),
+        CheckConstraint(
+            "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
+            name="ck_agent_triggers_temperature",
+        ),
     )

@@ -148,6 +148,7 @@ export default function EnterpriseSettings() {
 
     const [editingToolId, setEditingToolId] = useState<string | null>(null);
     const [editingConfig, setEditingConfig] = useState<Record<string, any>>({});
+    const [editingConfigInitial, setEditingConfigInitial] = useState('');
     const [showAdvancedToolConfig, setShowAdvancedToolConfig] = useState(false);
 
     const [configCategory, setConfigCategory] = useState<string | null>(null);
@@ -680,10 +681,10 @@ export default function EnterpriseSettings() {
                 {activeTab === 'tools' && (
                     <EnterpriseToolsTab model={{
                         GLOBAL_CATEGORY_CONFIG_PRIMARY_TOOL, GLOBAL_CATEGORY_CONFIG_SCHEMAS, allTools, agentInstalledTools,
-                        applyConfigDefaults, configCategory, currentUser, dialog, editingConfig, editingMcpServer, editingToolId,
+                        applyConfigDefaults, configCategory, currentUser, dialog, editingConfig, editingConfigInitial, editingMcpServer, editingToolId,
                         expandedAgentInstalledGroups, expandedToolCategories, getToolGroupMeta, hasMeaningfulConfig, loadAgentInstalledTools,
                         loadAllTools, mcpForm, mcpRawInput, mcpStdioEntries, mcpTestResult, mcpTesting, renderCategoryIcon,
-                        selectedTenantId, setConfigCategory, setEditingConfig, setEditingMcpServer, setEditingToolId,
+                        selectedTenantId, setConfigCategory, setEditingConfig, setEditingConfigInitial, setEditingMcpServer, setEditingToolId,
                         setExpandedAgentInstalledGroups, setExpandedToolCategories, setMcpForm, setMcpRawInput, setMcpStdioEntries,
                         setMcpTestResult, setMcpTesting, setShowAddMCP, setShowAdvancedToolConfig, setToolSearch, setToolStatusFilter,
                         setToolsView, showAddMCP, showAdvancedToolConfig, switchKnob, switchTrack, t, toast, toolSearch, toolStatusFilter, toolsView,

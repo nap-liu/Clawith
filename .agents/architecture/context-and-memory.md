@@ -8,6 +8,11 @@ Context decisions use the selected model's configured capacity and ratio:
 effective prompt budget = floor(context_window * context_usage_ratio)
 ```
 
+Background resources may explicitly omit Soul and/or memory when building an
+Agent context. Tasks, schedules, triggers, and Subagents share the same
+`include_soul` / `include_memory` semantics; both default to enabled so legacy
+resources retain their prior behavior.
+
 Provider-reported usage is the authority for successful model rounds. Do not
 replace token accounting with character heuristics or a stale model-family
 lookup. Primary/fallback dispatch must preserve a safe protected history suffix

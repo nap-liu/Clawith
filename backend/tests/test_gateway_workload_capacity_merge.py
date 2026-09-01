@@ -35,7 +35,7 @@ async def test_concurrent_native_gateway_messages_merge_into_one_durable_turn(
         injected.extend(await kwargs["before_round"](0))
         return "one merged gateway reply"
 
-    monkeypatch.setattr("app.services.llm.call_llm", fake_call_llm)
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_call_llm)
     first_args = await _native_background_args(
         source_id,
         target_id,

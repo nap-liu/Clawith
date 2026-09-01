@@ -1,4 +1,5 @@
 import { CliToolsSection } from '../../../components/cli-tools/CliToolsSection';
+import LlmModelSelect from '../../../components/LlmModelSelect';
 import MCPServerEditor from '../../../components/MCPServerEditor';
 import { effectiveEditorRole } from '../../../components/MCPServerEditor/role';
 import { mcpServersApi } from '../../../services/mcpServers';
@@ -22,6 +23,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
         currentUser,
         dialog,
         editingConfig,
+        editingConfigInitial,
         editingMcpServer,
         editingToolId,
         expandedToolCategories,
@@ -38,6 +40,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
         renderCategoryIcon,
         setConfigCategory,
         setEditingConfig,
+        setEditingConfigInitial,
         setEditingMcpServer,
         setEditingToolId,
         setExpandedToolCategories,
@@ -438,7 +441,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                                                     if (d.value?.api_key) cfg.api_key = d.value.api_key;
                                                                 } catch { }
                                                             }
-                                                            setEditingConfig(cfg);
+                                                            setEditingConfig(cfg); setEditingConfigInitial(JSON.stringify(cfg));
                                                         }}
                                                     >
                                                         {t('enterprise.tools.configure')}
@@ -561,9 +564,9 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                                             {hasCategoryConfig && (
                                                                 <button onClick={() => {
                                                                     setConfigCategory(meta.configCategory);
-                                                                    setEditingConfig({});
                                                                     const firstToolWithConfig = (allCatTools as any[]).find((tl: any) => tl.category === meta.configCategory && hasMeaningfulConfig(tl.config));
-                                                                    if (firstToolWithConfig?.config) setEditingConfig({ ...firstToolWithConfig.config });
+                                                                    const initialConfig = firstToolWithConfig?.config ? { ...firstToolWithConfig.config } : {};
+                                                                    setEditingConfig(initialConfig); setEditingConfigInitial(JSON.stringify(initialConfig));
                                                                 }} style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '4px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }} title={t('agent.tools.configureCategory', { category: label })}>
                                                                     {t('enterprise.tools.configure', 'Configure')}
                                                                 </button>
@@ -619,6 +622,8 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                 });
                                 const primaryFields = visibleFields.filter((field: any) => !field.advanced);
                                 const advancedFields = visibleFields.filter((field: any) => field.advanced);
+                                const configDirty = JSON.stringify(editingConfig) !== editingConfigInitial;
+                                const missingRequiredModel = visibleFields.some((field: any) => field.type === 'llm_model_picker' && field.required && !(editingConfig[field.key] ?? field.default));
                                 const renderField = (field: any) => (
                                     <div key={field.key}>
                                         <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{field.label}</label>
@@ -642,6 +647,14 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                                     }} />
                                                 </span>
                                             </label>
+                                        ) : field.type === 'llm_model_picker' ? (
+                                            <LlmModelSelect
+                                                value={editingConfig[field.key] ?? field.default ?? ''}
+                                                onChange={value => setEditingConfig((p: Record<string, any>) => ({ ...p, [field.key]: value }))}
+                                                tenantId={selectedTenantId}
+                                                supportsVision={field.filter?.supports_vision === true}
+                                                required={field.required}
+                                            />
                                         ) : field.type === 'select' ? (
                                             <select className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} onChange={e => setEditingConfig((p: Record<string, any>) => ({ ...p, [field.key]: e.target.value }))}>
                                                 {(field.options || []).map((opt: any) => (
@@ -701,7 +714,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                                 )}
                                                 <div style={{ display: 'flex', gap: '8px', marginTop: '12px', justifyContent: 'flex-end', borderTop: '1px solid var(--border-subtle)', paddingTop: '16px' }}>
                                                     <button className="btn btn-secondary" onClick={() => setEditingToolId(null)}>{t('common.cancel')}</button>
-                                                    <button className="btn btn-primary" onClick={async () => {
+                                                    <button className="btn btn-primary" disabled={!configDirty || missingRequiredModel} onClick={async () => {
                                                         if (tool.name === 'jina_search' || tool.name === 'jina_read') {
                                                             if (editingConfig.api_key) {
                                                                 const token = localStorage.getItem('token');
@@ -755,7 +768,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                             ))}
                                             <div style={{ display: 'flex', gap: '8px', marginTop: '8px', justifyContent: 'flex-end' }}>
                                                 <button className="btn btn-secondary" onClick={() => setConfigCategory(null)}>{t('common.cancel')}</button>
-                                                <button className="btn btn-primary" onClick={async () => {
+                                                <button className="btn btn-primary" disabled={JSON.stringify(editingConfig) === editingConfigInitial} onClick={async () => {
                                                     // Save config to the category's runtime representative tool.
                                                     const catTools = allTools.filter((tl: any) => (tl.category || 'general') === configCategory);
                                                     const primaryToolName = GLOBAL_CATEGORY_CONFIG_PRIMARY_TOOL[configCategory];

@@ -198,7 +198,27 @@ async def test_call_agent_llm_keeps_genuinely_missing_user_anonymous(monkeypatch
         is_expired=False,
         expires_at=None,
     )
-    model = SimpleNamespace(model="test-model")
+    model_id = agent.primary_model_id
+    model = SimpleNamespace(
+        id=model_id,
+        tenant_id=None,
+        provider="custom",
+        model="test-model",
+        api_key_encrypted="",
+        base_url=None,
+        label="test-model",
+        max_tokens_per_day=None,
+        enabled=True,
+        supports_vision=False,
+        temperature=0.2,
+        request_timeout=30,
+        max_output_tokens=1_000,
+        context_window=128_000,
+        context_usage_ratio=0.7,
+        compact_trigger_ratio=0.8,
+        keep_recent_turns=3,
+        compact_summary_max_tokens=1_000,
+    )
 
     def result(value):
         return SimpleNamespace(scalar_one_or_none=lambda: value)

@@ -88,27 +88,13 @@ async def _resolve_report_models(tenant_id: uuid.UUID) -> ResolvedReportModels:
         if not agent:
             return ResolvedReportModels(primary=None, fallback=None, okr_agent_id=settings.okr_agent_id)
 
-        primary: LLMModel | None = None
-        fallback: LLMModel | None = None
+        from app.services.chat_model_selection import resolve_runtime_models
 
-        if agent.primary_model_id:
-            primary_result = await db.execute(
-                select(LLMModel).where(LLMModel.id == agent.primary_model_id)
-            )
-            primary = primary_result.scalar_one_or_none()
-
-        if agent.fallback_model_id:
-            fallback_result = await db.execute(
-                select(LLMModel).where(LLMModel.id == agent.fallback_model_id)
-            )
-            fallback = fallback_result.scalar_one_or_none()
-
-        if not primary and fallback:
-            primary, fallback = fallback, None
+        runtime_models = await resolve_runtime_models(db, agent=agent)
 
         return ResolvedReportModels(
-            primary=primary,
-            fallback=fallback,
+            primary=runtime_models.primary_model,
+            fallback=runtime_models.fallback_model,
             okr_agent_id=settings.okr_agent_id,
         )
 

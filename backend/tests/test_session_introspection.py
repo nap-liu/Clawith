@@ -139,11 +139,11 @@ async def test_resolve_scope_follows_execution_user_not_channel():
         assert (await resolve_scope(db, agent, str(a2a.id), None))[0] == SCOPE_AUTONOMOUS
 
 
-async def test_trigger_execution_user_with_agent_manage_access_sees_all_groups():
-    """Regression: a member who manages the Agent keeps full scope in a trigger turn."""
+async def test_agent_admin_with_manage_access_sees_all_groups():
+    """An Agent administrator with manage access can inspect every group."""
     t = await _seed_tenant()
     creator = await _seed_user(tenant_id=t.id, name="Creator")
-    manager = await _seed_user(tenant_id=t.id, name="宋柯")
+    manager = await _seed_user(role="agent_admin", tenant_id=t.id, name="宋柯")
     agent = await _seed_agent(
         creator.id,
         tenant_id=t.id,
@@ -187,6 +187,30 @@ async def test_trigger_execution_user_with_agent_manage_access_sees_all_groups()
     )
     assert str(shandong.id) in out
     assert str(northeast.id) in out
+
+
+async def test_plain_member_with_manage_access_remains_scoped_to_own_sessions():
+    """Manage capability alone does not grant the governance conversation archive."""
+    tenant = await _seed_tenant()
+    creator = await _seed_user(tenant_id=tenant.id, name="Creator")
+    manager = await _seed_user(tenant_id=tenant.id, name="Manager")
+    agent = await _seed_agent(
+        creator.id,
+        tenant_id=tenant.id,
+        access_mode="custom",
+        name="Scoped",
+    )
+    async with async_session() as db:
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=manager.id,
+                access_level="manage",
+            )
+        )
+        await db.commit()
+        assert await resolve_human_viewer_access(db, manager.id, agent) == SCOPE_OWN
 
 
 async def test_scope_predicates_select_right_sessions():

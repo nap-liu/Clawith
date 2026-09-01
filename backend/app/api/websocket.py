@@ -265,6 +265,7 @@ class WebSocketChatHandler:
         *,
         viewer: User,
         agent: Agent,
+        agent_access: str | None = None,
     ) -> str | None:
         return await websocket_setup_ops.resolve_chat_session_impl(
             MODULE,
@@ -273,6 +274,7 @@ class WebSocketChatHandler:
             user_id,
             viewer=viewer,
             agent=agent,
+            agent_access=agent_access,
         )
 
     async def _project_session_still_writable(self) -> bool:

@@ -1,7 +1,7 @@
-"""Validate context-governance checks online after their migration commits.
+"""Validate context and runtime-governance constraints online after migration.
 
-The schema migration installs these checks as ``NOT VALID`` so new writes are
-enforced immediately without scanning existing rows under its DDL lock.  This
+The schema migrations install these constraints as ``NOT VALID`` so new writes
+are enforced immediately without scanning existing rows under their DDL locks. This
 release command validates each table in its own bounded transaction; ordinary
 reads and writes remain compatible, and a lock conflict fails quickly.
 
@@ -23,9 +23,18 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.database import async_session
 
 _CONSTRAINTS = (
-    ("llm_models", "ck_llm_models_keep_recent_turns"),
-    ("llm_models", "ck_llm_models_context_usage_ratio"),
-    ("agents", "ck_agents_daily_memory_load_days"),
+    ("llm_models", "ck_llm_models_keep_recent_turns", "c"),
+    ("llm_models", "ck_llm_models_context_usage_ratio", "c"),
+    ("agents", "ck_agents_daily_memory_load_days", "c"),
+    ("agents", "ck_agents_temperature", "c"),
+    ("tasks", "fk_tasks_model_id_llm_models", "f"),
+    ("tasks", "ck_tasks_temperature", "c"),
+    ("agent_schedules", "fk_agent_schedules_model_id_llm_models", "f"),
+    ("agent_schedules", "ck_agent_schedules_temperature", "c"),
+    ("agent_triggers", "fk_agent_triggers_model_id_llm_models", "f"),
+    ("agent_triggers", "ck_agent_triggers_temperature", "c"),
+    ("subagent_runs", "fk_subagent_runs_model_id_llm_models", "f"),
+    ("subagent_runs", "ck_subagent_runs_temperature", "c"),
 )
 
 _STATE_SQL = text(
@@ -37,17 +46,25 @@ _STATE_SQL = text(
      WHERE schema_row.nspname = 'public'
        AND table_row.relname = :table_name
        AND constraint_row.conname = :constraint_name
-       AND constraint_row.contype = 'c'
+       AND constraint_row.contype::text = :constraint_type
     """
 )
 
 
-async def _constraint_state(table_name: str, constraint_name: str) -> bool | None:
+async def _constraint_state(
+    table_name: str,
+    constraint_name: str,
+    constraint_type: str,
+) -> bool | None:
     async with async_session() as db:
         value = (
             await db.execute(
                 _STATE_SQL,
-                {"table_name": table_name, "constraint_name": constraint_name},
+                {
+                    "table_name": table_name,
+                    "constraint_name": constraint_name,
+                    "constraint_type": constraint_type,
+                },
             )
         ).scalar_one_or_none()
         await db.rollback()
@@ -56,8 +73,12 @@ async def _constraint_state(table_name: str, constraint_name: str) -> bool | Non
 
 async def run(*, apply: bool, verify: bool) -> int:
     states_before = {
-        constraint_name: await _constraint_state(table_name, constraint_name)
-        for table_name, constraint_name in _CONSTRAINTS
+        constraint_name: await _constraint_state(
+            table_name,
+            constraint_name,
+            constraint_type,
+        )
+        for table_name, constraint_name, constraint_type in _CONSTRAINTS
     }
     missing = [name for name, state in states_before.items() if state is None]
     if missing:
@@ -73,7 +94,7 @@ async def run(*, apply: bool, verify: bool) -> int:
         return 2
 
     if apply:
-        for table_name, constraint_name in _CONSTRAINTS:
+        for table_name, constraint_name, _constraint_type in _CONSTRAINTS:
             if states_before[constraint_name]:
                 continue
             async with async_session() as db:
@@ -102,8 +123,12 @@ async def run(*, apply: bool, verify: bool) -> int:
                     return 3
 
     states_after = {
-        constraint_name: await _constraint_state(table_name, constraint_name)
-        for table_name, constraint_name in _CONSTRAINTS
+        constraint_name: await _constraint_state(
+            table_name,
+            constraint_name,
+            constraint_type,
+        )
+        for table_name, constraint_name, constraint_type in _CONSTRAINTS
     }
     validated = all(states_after.values())
     print(

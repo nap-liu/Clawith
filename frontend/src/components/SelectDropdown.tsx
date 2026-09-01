@@ -1,5 +1,6 @@
 import * as Select from '@radix-ui/react-select';
 import { IconCheck, IconChevronDown } from '@tabler/icons-react';
+import type { CSSProperties } from 'react';
 
 import './SelectDropdown.css';
 
@@ -16,7 +17,10 @@ type SelectDropdownProps<T extends string> = {
     disabled?: boolean;
     className?: string;
     placeholder?: string;
+    style?: CSSProperties;
 };
+
+const EMPTY_OPTION_VALUE = '__select_dropdown_empty_value__';
 
 export default function SelectDropdown<T extends string>({
     value,
@@ -26,12 +30,20 @@ export default function SelectDropdown<T extends string>({
     disabled = false,
     className = '',
     placeholder,
+    style,
 }: SelectDropdownProps<T>) {
+    const hasEmptyOption = options.some((option) => option.value === '');
+    const selectValue = value === ''
+        ? (hasEmptyOption ? EMPTY_OPTION_VALUE : undefined)
+        : value;
+
     return (
-        <div className={`select-dropdown ${className}`.trim()}>
+        <div className={`select-dropdown ${className}`.trim()} style={style}>
             <Select.Root
-                value={value}
-                onValueChange={(nextValue) => onChange(nextValue as T)}
+                value={selectValue}
+                onValueChange={(nextValue) => onChange(
+                    (nextValue === EMPTY_OPTION_VALUE ? '' : nextValue) as T,
+                )}
                 disabled={disabled}
             >
                 <Select.Trigger className="select-dropdown__trigger" aria-label={ariaLabel}>
@@ -51,7 +63,7 @@ export default function SelectDropdown<T extends string>({
                             {options.map((option) => (
                                 <Select.Item
                                     key={option.value}
-                                    value={option.value}
+                                    value={option.value === '' ? EMPTY_OPTION_VALUE : option.value}
                                     className="select-dropdown__option"
                                 >
                                     <Select.ItemText>{option.label}</Select.ItemText>

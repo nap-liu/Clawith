@@ -48,6 +48,7 @@ async def setup_impl(api, self) -> bool:
 
             api.logger.info(f"[WS] Checking agent access for {self.agent_id}")
             project_session = None
+            agent_access = None
             if self.session_id_param:
                 try:
                     project_session = await db.get(api.ChatSession, api.uuid.UUID(self.session_id_param))
@@ -64,7 +65,7 @@ async def setup_impl(api, self) -> bool:
                     await self.websocket.close(code=4003)
                     return False
             else:
-                agent, _ = await api.check_agent_access(db, user, self.agent_id)
+                agent, agent_access = await api.check_agent_access(db, user, self.agent_id)
             api.require_current_agent_tenant(user, agent)
             if api.is_agent_expired(agent):
                 await self.websocket.send_json(
@@ -95,6 +96,7 @@ async def setup_impl(api, self) -> bool:
                 user_id,
                 viewer=user,
                 agent=agent,
+                agent_access=agent_access,
             )
             if not self.conv_id:
                 return False
@@ -220,7 +222,11 @@ async def load_models_impl(api, self, db, agent):
     )
 
 
-async def resolve_chat_session_impl(api, self, db, user_id, *, viewer, agent) -> str | None:
+async def resolve_chat_session_impl(
+    api, self, db, user_id, *, viewer, agent, agent_access=None
+) -> str | None:
+    from app.services.session_query import build_owned_sessions_predicate
+
     conv_id = self.session_id_param
     if conv_id:
         try:
@@ -232,7 +238,7 @@ async def resolve_chat_session_impl(api, self, db, user_id, *, viewer, agent) ->
             _sr = await db.execute(
                 api.select(api.ChatSession).where(
                     api.ChatSession.id == _sid,
-                    api.ChatSession.agent_id == self.agent_id,
+                    build_owned_sessions_predicate(self.agent_id),
                 )
             )
             _existing = _sr.scalar_one_or_none()
@@ -269,7 +275,7 @@ async def resolve_chat_session_impl(api, self, db, user_id, *, viewer, agent) ->
                 and not is_subagent_owner
                 and self.project_session_access is None
             ):
-                if api.can_view_all_agent_chat_sessions(viewer, agent):
+                if api.can_view_all_agent_chat_sessions(viewer, agent, agent_access):
                     self.read_only = True
                 else:
                     await self.websocket.send_json({"type": "error", "content": "Not authorized for this session"})

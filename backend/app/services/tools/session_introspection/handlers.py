@@ -197,7 +197,10 @@ async def handle_read_session_messages(agent_id, user_id, ctx_session_id, argume
             return sq.DENIAL_MSG
 
         limit = _clamp(arguments.get("limit"), default=30, lo=1, hi=100)
-        before = sq.decode_cursor(arguments.get("before"))
+        raw_before = arguments.get("before")
+        before = sq.decode_cursor(raw_before)
+        if raw_before and before is None:
+            return "❌ before 游标无效，请原样使用上一页返回的游标"
         include_tc = bool(arguments.get("include_tool_calls", False))
         msgs = await sq.fetch_session_messages(
             db, target, limit=limit, before=before, include_tool_calls=include_tc

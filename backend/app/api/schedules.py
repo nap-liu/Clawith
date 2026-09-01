@@ -29,6 +29,10 @@ class ScheduleCreate(BaseModel):
     instruction: str = Field(default="", max_length=5000)
     cron_expr: str = Field(min_length=1, max_length=100)
     is_enabled: bool = True
+    model_id: uuid.UUID | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    soul: bool = True
+    memory: bool = True
 
 
 class ScheduleUpdate(BaseModel):
@@ -38,6 +42,10 @@ class ScheduleUpdate(BaseModel):
     is_enabled: bool | None = None
     execution_user_id: uuid.UUID | None = None
     expected_execution_user_id: uuid.UUID | None = None
+    model_id: uuid.UUID | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    soul: bool = True
+    memory: bool = True
 
 
 class ScheduleOut(BaseModel):
@@ -53,6 +61,10 @@ class ScheduleOut(BaseModel):
     created_by: uuid.UUID | None = None
     created_by_user_id: uuid.UUID | None = None
     execution_user_id: uuid.UUID | None = None
+    model_id: uuid.UUID | None = None
+    temperature: float | None = None
+    soul: bool = True
+    memory: bool = True
     creator_username: str | None = None
     creator_display_name: str | None = None
     execution_user_display_name: str | None = None
@@ -111,6 +123,12 @@ async def create_schedule(
     if not next_run:
         safe_cron_expr = sanitize_user_visible_text(data.cron_expr)
         raise HTTPException(status_code=400, detail=f"Invalid cron expression: {safe_cron_expr}")
+    from app.services.chat_model_selection import validate_agent_model_override
+
+    try:
+        await validate_agent_model_override(db, agent=agent, model_id=data.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     sched = AgentSchedule(
         agent_id=agent_id,
@@ -121,6 +139,10 @@ async def create_schedule(
         next_run_at=next_run if data.is_enabled else None,
         created_by=current_user.id,
         execution_user_id=current_user.id,
+        model_id=data.model_id,
+        temperature=data.temperature,
+        soul=data.soul,
+        memory=data.memory,
     )
     db.add(sched)
     await db.flush()
@@ -146,6 +168,13 @@ async def update_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
 
     updates = data.model_dump(exclude_unset=True)
+    if "model_id" in updates:
+        from app.services.chat_model_selection import validate_agent_model_override
+
+        try:
+            await validate_agent_model_override(db, agent=agent, model_id=updates["model_id"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     non_identity_fields = set(updates) - {
         "execution_user_id",
         "expected_execution_user_id",

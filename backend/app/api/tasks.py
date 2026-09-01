@@ -95,6 +95,12 @@ async def create_task(
     """Create a new task for an agent."""
     agent, _access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
+    from app.services.chat_model_selection import validate_agent_model_override
+
+    try:
+        await validate_agent_model_override(db, agent=agent, model_id=data.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     resolved_target = None
     if data.type == "supervision":
         try:
@@ -116,6 +122,10 @@ async def create_task(
         due_date=data.due_date,
         created_by=current_user.id,
         execution_user_id=current_user.id,
+        model_id=data.model_id,
+        temperature=data.temperature,
+        soul=data.soul,
+        memory=data.memory,
         supervision_target_user_id=data.supervision_target_user_id,
         supervision_target_agent_id=data.supervision_target_agent_id,
         supervision_target_name=(
@@ -160,6 +170,13 @@ async def update_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
     changes = data.model_dump(exclude_unset=True)
+    if "model_id" in changes:
+        from app.services.chat_model_selection import validate_agent_model_override
+
+        try:
+            await validate_agent_model_override(db, agent=agent, model_id=changes["model_id"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     identity_reassigned = False
     if "execution_user_id" in changes:
         if changes["execution_user_id"] is None:

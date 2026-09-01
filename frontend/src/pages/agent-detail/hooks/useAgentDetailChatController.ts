@@ -101,10 +101,16 @@ export function useAgentDetailChatController({
         helpers,
     });
 
+    const onAdminTabOthers = () => {
+        chat.onAdminTabOthers();
+        if (chat.allSessions.length === 0) void sessionSelection.fetchAllSessions();
+    };
+
     return {
         ...chat,
         ...sessionSelection,
         ...socketMessages,
         ...resumeComposer,
+        onAdminTabOthers,
     };
 }
