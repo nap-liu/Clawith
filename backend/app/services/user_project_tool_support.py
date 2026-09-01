@@ -6,11 +6,11 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from app.core.permissions import get_agent_access_level_for_user_id
 from app.models.agent import Agent
-from app.models.project import Project, ProjectAccessGrant
+from app.models.project import Project, ProjectAccessGrant, ProjectMemberSnapshot, ProjectWorkItem
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.services.activity_logger import log_activity
