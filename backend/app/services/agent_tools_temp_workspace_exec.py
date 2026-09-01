@@ -22,7 +22,6 @@ from app.services.agent_tools import (
     _jina_search,
     _publish_skill_to_market,
     _read_webpage,
-    _remove_contact_tool,
     _resolve_storage_source_path,
     _send_feishu_message,
     _sql_execute,
@@ -43,6 +42,7 @@ from app.services.agent_tools import (
     write_workspace_file,
 )
 from app.services.agent_tools import _send_file_to_agent, _send_message_to_agent
+from app.services.agent_tools_task_contact_ops import _remove_contact_tool
 from app.services.agent_tools_temp_workspace import _prepare_temp_workspace, flush_temp_workspace
 
 
