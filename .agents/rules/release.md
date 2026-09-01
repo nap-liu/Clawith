@@ -1,20 +1,54 @@
 # Release rules
 
-The complete production procedure is
-`.agents/runbooks/production_release.md`.  Read it in full for every release,
-production cutover, or rollback plan.  The bullets below are invariants, not a
-substitute for that runbook.
+Read `.agents/runbooks/production_release.md` in full for every release,
+production cutover, or rollback plan. These invariants are not a substitute for
+the runbook.
 
-- The semantic version prefix follows the current upstream release. Private changes are identified by the exact commit SHA suffix; do not invent a higher private semantic version.
-- Build and publish backend and frontend from the same exact release SHA, even when only one side changed.
-- Build production-bound images for `linux/amd64`. Apple Silicon local images are not production artifacts.
-- Rebuild AIO sandbox only when its source/base image changes or the user explicitly requests it; otherwise preserve its existing independent image.
-- Tag the immutable SHA used to build images, never a mutable branch head.
-- Keep release tags, compose image references, and deployed digests aligned.
-- Before production cutover: complete local Docker tests and any required browser validation, prepare/pull images, stop writers, take a fresh consistent rollback backup, migrate, start, and verify health.
-- A release plan must include explicit rollback anchors. Never commit credentials or current production secrets into release documentation.
-- Before rolling back to a binary that predates a newly seeded builtin tool, run the candidate image's idempotent rollback helper first. For IM recall this is `python -m app.scripts.rollback_im_recall`; only then start the older binary.
-- Before rolling back to a binary that predates project-scoped Agents, stop writers and run `python -m app.scripts.project_legacy_rollback apply` from the candidate image. The old API and worker must run as separate process roles through the helper's dedicated non-owner database role; never connect the old binary with the schema-owner DSN. Stop the old processes and run the candidate helper's idempotent `restore` before upgrading forward again.
+- Commit, push, tag, registry writes, production configuration changes,
+  migrations, backup, cutover, external smoke messages, and rollback each
+  require the applicable explicit authorization.
+- The semantic version prefix follows the current upstream release. Private
+  changes use the exact commit SHA suffix; do not invent a higher private
+  semantic version.
+- Build and publish backend and frontend from the same immutable release SHA,
+  even when only one side changed. Pin deployment and rollback to digests.
+- Build production images for `linux/amd64`. Rebuild AIO only when its source or
+  base image changed or the user explicitly requests it.
+- Production backend/frontend builds use the stable reviewed build arguments
+  and registry `cache-from` plus `cache-to`. Never use `docker compose build` or
+  `docker compose up --build` to produce production artifacts. An unexpected
+  dependency-cache miss is a stop-and-investigate condition.
+- Prepare, pull, render, and verify candidate and rollback images/configuration
+  while the old release remains live. The cutover window contains no build,
+  image download, or ad-hoc compose editing.
+- Do not pre-stop or `down` the production application. Replace backend,
+  worker, connector, and frontend through one explicit compose command with
+  `--no-deps --no-build`; never use `--remove-orphans`. Rollback uses the same
+  one-command four-role pattern and the previous digest-pinned compose file.
+- A single-replica Compose replacement can cause a brief request/turn
+  interruption and is not strict zero downtime. If a release requires no
+  request interruption, it is blocked until a tested blue-green/rolling
+  topology and atomic traffic switch exist.
+- Determine backup scope from actual schema, seed, state, and rollback impact.
+  Save compose/digests/release evidence every time; snapshot only affected data
+  stores online and close to cutover. Any omitted affected store requires the
+  data owner's explicit decision. If consistency requires stopped writers, the
+  default no-prestop topology is NO-GO until a compatible snapshot/migration or
+  separately approved maintenance/blue-green plan exists.
+- Apply only backward-compatible migrations online while the old application is
+  serving. Use bounded lock/statement timeouts and prove the previous image can
+  run against the upgraded schema. An incompatible migration blocks cutover.
+- Drain or observe active turns while the old release remains live. Do not call
+  a restart “lossless”; record the authorized interruption policy and recovery
+  evidence.
+- Roll back backend/frontend/worker/connector as one release set. Default
+  rollback keeps compatible additive schema and post-cutover data; data restore
+  or Alembic downgrade requires an explicit, tested data-owner decision.
+- Before an old binary sees a newly seeded builtin or incompatible project
+  schema, run the candidate's reviewed idempotent compatibility helper as
+  specified by the runbook.
 - The generic GitHub Release workflow currently increments semantic versions
-  and does not build application images.  Do not run it unchanged for a private
-  SHA-suffixed production release.
+  and does not implement these application-image and cutover gates. Do not run
+  it unchanged for a private SHA-suffixed production release.
+- Never commit production credentials, private endpoints, current tags, or
+  operations-inventory values to the repository.

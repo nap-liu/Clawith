@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import vm from "node:vm";
+import { loadCssEntry } from "./load-css-entry.mjs";
+import { loadLocalSourceGraph } from "./load-local-source-graph.mjs";
 
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
@@ -12,21 +14,16 @@ const sourcePath = resolve(
   __dirname,
   "../src/features/conversation/autoScroll.ts",
 );
-const sessionViewerSource = readFileSync(
+const sessionViewerSource = loadLocalSourceGraph(
   resolve(__dirname, "../src/components/SessionViewerDrawer.tsx"),
-  "utf8",
 );
-const timelineSource = readFileSync(
+const timelineSource = loadLocalSourceGraph(
   resolve(
     __dirname,
     "../src/features/conversation/web/ConversationTimeline.tsx",
   ),
-  "utf8",
 );
-const globalStyles = readFileSync(
-  resolve(__dirname, "../src/index.css"),
-  "utf8",
-);
+const globalStyles = loadCssEntry(resolve(__dirname, "../src/index.css"));
 const compiled = ts.transpileModule(readFileSync(sourcePath, "utf8"), {
   compilerOptions: {
     module: ts.ModuleKind.CommonJS,

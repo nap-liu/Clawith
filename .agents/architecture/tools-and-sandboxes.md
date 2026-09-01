@@ -26,9 +26,37 @@ CLI tools may appear as independent LLM functions while sharing a sandbox execut
 
 Tenant-specific CLI names and credentials live in tool/configuration data, never in generic platform code, UI placeholders, or fixtures.
 
+Large uploaded CLI binaries use a resumable, server-tracked upload lifecycle.
+Chunk ownership, ordering, completion, cancellation, and cleanup remain scoped
+to the tenant and tool. UI progress is a projection of that lifecycle, not a
+second upload protocol. Production storage/backup decisions must account for
+both finalized binaries and resumable state when their schema or semantics
+change.
+
+## MCP transports
+
+HTTP/streamable MCP and stdio MCP share discovery, persistence, assignment, and
+LLM tool contracts, while transport execution stays separate. Stdio/npx servers
+are hosted by the AIO sandbox under the Agent workspace; the platform owns
+registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
+
+- Persist discovered tools and explicit Agent assignment; a transient discovery
+  response alone is incomplete.
+- A newly imported tool becomes available on the next turn because the tool set
+  is assembled at turn start. Do not claim same-turn availability.
+- Preserve tenant, Agent, server, and workspace isolation in names, queries, and
+  sandbox registration. Global display-name deduplication is not an identity
+  boundary.
+- Do not mask nested MCP/TaskGroup failures with a generic HTTP error; surface a
+  bounded actionable leaf error to the shared tool loop.
+- HTTP behavior must remain unchanged when adding stdio lifecycle support.
+
 ## Security and history
 
 - Tool execution permissions and session visibility are separate checks.
 - Persist truthful tool errors and results; do not replace them with fabricated success or prompt-only patches.
 - Sanitization for display/logging must not mutate durable tool results replayed to the LLM.
 - Repetitive-call and round-limit guards belong in the shared loop so all entry points receive the same protection.
+- File tools use exact canonical virtual paths and report the failing stage
+  truthfully. Fuzzy filename repair and cross-tool canned failure counters hide
+  evidence and are not recovery mechanisms.

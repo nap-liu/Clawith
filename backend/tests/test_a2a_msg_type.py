@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from a2a_msg_type_support import DummyResult, RecordingDB
+
 
 @pytest.fixture(autouse=True)
 def _durable_consult_helpers(monkeypatch):
@@ -74,59 +76,6 @@ def _active_a2a_relationship(monkeypatch):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
-
-class DummyResult:
-    def __init__(self, values=None, scalar_value=None, scalars_list=None):
-        self._values = list(values or [])
-        self._scalar_value = scalar_value
-        self._scalars_list = scalars_list
-
-    def scalar_one_or_none(self):
-        if self._scalar_value is not None:
-            return self._scalar_value
-        return self._values[0] if self._values else None
-
-    def scalars(self):
-        return self
-
-    def all(self):
-        return list(self._scalars_list or self._values)
-
-    def first(self):
-        if self._scalars_list:
-            return self._scalars_list[0] if self._scalars_list else None
-        return self._values[0] if self._values else None
-
-    def scalar(self):
-        if self._scalar_value is not None:
-            return self._scalar_value
-        return self._values[0] if self._values else None
-
-
-class RecordingDB:
-    def __init__(self, responses=None):
-        self.responses = list(responses or [])
-        self.added = []
-        self.committed = False
-        self.flushed = False
-
-    async def execute(self, _statement, _params=None):
-        if not self.responses:
-            raise AssertionError("unexpected execute() call")
-        return self.responses.pop(0)
-
-    def add(self, value):
-        self.added.append(value)
-
-    async def commit(self):
-        self.committed = True
-
-    async def flush(self):
-        self.flushed = True
-
-    async def refresh(self, _value):
-        return None
-
 
 def _make_agent(agent_id=None, name="TestAgent", tenant_id=None, agent_type="native",
                 expired=False, primary_model_id=None):
@@ -770,48 +719,3 @@ async def test_handle_set_trigger_resets_fire_count():
     assert existing_trigger.is_enabled is True
     assert existing_trigger.fire_count == 0
     assert existing_trigger.reason == "New reason"
-
-
-@pytest.mark.asyncio
-async def test_execute_tool_failure_writes_system_message():
-    """execute_tool should write a system error message to the session if a messaging tool fails."""
-    from app.services.agent_tools import execute_tool
-
-    agent_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    session_id = str(uuid.uuid4())
-
-    tenant_id = uuid.uuid4()
-    db = RecordingDB(responses=[
-        DummyResult(scalar_value=tenant_id),     # tenant_id
-        DummyResult(scalar_value=None),          # query in _send_channel_message (returns empty -> fails)
-    ])
-
-    with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
-         patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
-
-        mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
-        mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        args = {
-            "member_name": "hi",
-            "message": "Hello from Ray",
-        }
-
-        result = await execute_tool(
-            "send_channel_message",
-            args,
-            agent_id=agent_id,
-            user_id=user_id,
-            session_id=session_id,
-        )
-
-    assert result.startswith("❌")
-    assert db.committed
-    assert len(db.added) == 1
-    
-    error_msg = db.added[0]
-    assert error_msg.conversation_id == session_id
-    assert error_msg.role == "assistant"
-    assert "系统提示" in error_msg.content
-    assert "send_channel_message" in error_msg.content

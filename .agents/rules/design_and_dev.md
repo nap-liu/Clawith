@@ -53,6 +53,15 @@ Keep seeded string values within database column limits. Do not infer runtime vi
 
 ## Code and tests
 
+- Hand-written application code, tests, migrations with executable logic, and
+  engineering scripts are limited to 800 physical lines per file. Declarative
+  configuration/data and machine-generated outputs are exempt. This is a hard
+  completion gate, not a style preference.
+- Never grow an already oversized source file. If a task touches one, extract
+  cohesive modules/components until every source file delivered by the task is
+  at most 800 lines. Pre-existing violations are technical debt, not a legacy
+  exemption or allowlist. Do not evade the rule with minified code, multiple
+  statements per line, giant strings, or misplaced logic in config files.
 - Imports belong at file scope unless avoiding a real circular dependency.
 - Do not run blanket formatters over pre-existing large files; keep formatting churn separate.
 - Tests assert observable inputs, outputs, persisted state, API responses, provider-adapter behavior, events, or UI.

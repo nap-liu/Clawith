@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadLocalSourceGraph } from './load-local-source-graph.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(resolve(__dirname, '../src/pages/h5/H5AgentChat.tsx'), 'utf8');
+const source = loadLocalSourceGraph(resolve(__dirname, '../src/pages/h5/H5AgentChat.tsx'));
 const match = source.match(/const\s+VIRTUALIZE_ENTRY_THRESHOLD\s*=\s*(\d+);/);
 
 assert.ok(match, 'H5 virtual scroll threshold constant must be declared');

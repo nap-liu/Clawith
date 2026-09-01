@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadCssEntry } from './load-css-entry.mjs';
+import { loadLocalSourceGraph } from './load-local-source-graph.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const css = readFileSync(resolve(__dirname, '../src/pages/h5/H5AgentChat.css'), 'utf8');
-const tsx = readFileSync(resolve(__dirname, '../src/pages/h5/H5AgentChat.tsx'), 'utf8');
+const css = loadCssEntry(resolve(__dirname, '../src/pages/h5/H5AgentChat.css'));
+const tsx = loadLocalSourceGraph(resolve(__dirname, '../src/pages/h5/H5AgentChat.tsx'));
 
 function blockFor(selector) {
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

@@ -114,22 +114,22 @@ ALLOWANCES = (
         "Filesystem, database credential defaults, and Docker network names are deployment identifiers.",
     ),
     _allow(
-        r"backend/app/(?:main\.py|services/llm/(?:compactor|caller|tool_output_store)\.py|services/agent_tools\.py)",
+        r"backend/app/(?:main\.py|services/llm/(?:compactor(?:_shared|_runtime_support)?|caller(?:_shared|_streaming_support)?|tool_output_store)\.py|services/agent_tools(?:_sql_support)?\.py)",
         rf"{_legacy}_[A-Z0-9_]+",
         "Environment variable names are stable operator contracts.",
     ),
     _allow(
-        r"backend/app/(?:core/token_cache\.py|services/(?:auth_provider|feishu_service|org_sync_adapter|dingtalk_token|webhook_security|toolscall/runtime)\.py|api/(?:wecom|teams)\.py)",
+        r"backend/app/(?:core/token_cache\.py|services/(?:auth_provider(?:_enterprise)?|feishu_service|org_sync_adapter|org_sync_wecom|dingtalk_token|webhook_security|toolscall/runtime)\.py|api/(?:wecom(?:_support)?|teams)\.py)",
         rf"{_legacy}[:.-]",
         "Redis and idempotency key namespaces must remain readable across rolling upgrades.",
     ),
     _allow(
-        r"backend/app/api/websocket\.py",
+        r"backend/app/api/websocket(?:_setup_ops)?\.py",
         rf"{_legacy}:project-subagent-web",
         "The project WebSocket Redis namespace is an internal rolling-upgrade contract.",
     ),
     _allow(
-        r"backend/app/services/agent_tools\.py",
+        r"backend/app/services/agent_tools(?:_(?:image_ops|temp_workspace|trigger_ops|web_ops|web_support))?\.py",
         rf"(?:{_legacy}-agent-|x-exa-integration.*{_legacy}|/sdk/{_legacy}\.js|window\.{_legacy}|\"/{_legacy}\")",
         "Temporary prefixes, integration IDs, SDK APIs, and the persisted CDN default path are compatibility identifiers.",
     ),
@@ -139,7 +139,7 @@ ALLOWANCES = (
         "Provider patch markers, client/session IDs, discovery identity, and playback cookie names are protocol state.",
     ),
     _allow(
-        r"backend/app/services/(?:media_url_source|dingtalk_stream|document_conversion/(?:chrome_renderer|html_to_pdf))\.py",
+        r"backend/app/services/(?:media_url_source|dingtalk_stream(?:_runner)?|document_conversion/(?:chrome_renderer|html_to_pdf))\.py",
         rf"(?:{_legacy}-(?:html-pdf|html-pptx|dingtalk-video|media-delivery|bg-capture-style|item-bg-capture-style)-?|data-{_legacy}-(?:item-id|slide-root)|{_legacy}(?:Chatbot|CardCallback)Handler)",
         "Temporary file prefixes, renderer DOM markers, and legacy handler class names are internal runtime identifiers.",
     ),
@@ -149,7 +149,7 @@ ALLOWANCES = (
         "Container labels/names and stripped transport-header names are operational compatibility contracts.",
     ),
     _allow(
-        r"backend/app/services/project_git_service\.py",
+        r"backend/app/services/project_git_(?:service|core|mutations|repository)\.py",
         rf"(?:frozenset\(\{{\"{_legacy}\", \"{_legacy} project\"\}}\)|\.{_legacy}-(?:clone|write)-|{_legacy}-project-sandboxes|{_legacy}-Milestone-Operation)",
         "Project repositories retain historical author aliases, trailers, and internal staging-path prefixes.",
     ),
@@ -199,7 +199,7 @@ ALLOWANCES = (
         "The reversible project rollback role, lock, and classifier names are database compatibility contracts.",
     ),
     _allow(
-        r"frontend/src/features/projects/ProjectWorkspacePage\.tsx",
+        r"frontend/src/features/projects/(?:ProjectWorkspacePage\.tsx|projectWorkspace/gitPanels\.tsx)",
         rf"normalizedAuthor\s*!==\s*\"{_legacy}(?: project)?\"",
         "Historical Git author aliases are normalized before rendering.",
     ),

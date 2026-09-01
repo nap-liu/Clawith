@@ -42,6 +42,18 @@ steps:
       - echo "上一个 tag $(git describe --tags --abbrev=0 2>/dev/null || echo '无 tag')"
 
   # --------------------------------------------------------
+  # Highest-priority engineering gate: every non-exempt
+  # hand-written source file must be at most 800 physical lines.
+  # --------------------------------------------------------
+  - name: source-line-limit
+    image: docker.m.daocloud.io/library/python:3.12-slim
+    pull: if-not-exists
+    depends_on:
+      - clone
+    commands:
+      - python scripts/check_source_line_limit.py
+
+  # --------------------------------------------------------
   # Step 2: 构建新旧版本 Docker 镜像
   # --------------------------------------------------------
   - name: build-images

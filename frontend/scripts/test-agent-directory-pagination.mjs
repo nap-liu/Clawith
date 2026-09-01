@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import ts from "typescript";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadTypeScriptModule } from "./load-typescript-module.mjs";
 
 globalThis.localStorage = {
   getItem() {
@@ -9,15 +10,22 @@ globalThis.localStorage = {
   removeItem() {},
 };
 
-const apiSource = await readFile(new URL("../src/services/api.ts", import.meta.url), "utf8");
-const apiJavaScript = ts.transpileModule(apiSource, {
-  compilerOptions: {
-    module: ts.ModuleKind.ESNext,
-    target: ts.ScriptTarget.ES2022,
+const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const { agentApi } = loadTypeScriptModule(
+  resolve(scriptDir, "../src/services/api.ts"),
+  {
+    fetch: (...args) => globalThis.fetch(...args),
+    localStorage: globalThis.localStorage,
+    window: {
+      location: {
+        href: "http://test",
+        pathname: "/agents",
+        replace() {},
+      },
+    },
+    Response,
+    AbortSignal,
   },
-}).outputText;
-const { agentApi } = await import(
-  `data:text/javascript;base64,${Buffer.from(apiJavaScript).toString("base64")}`
 );
 
 const makeAgent = (index) => ({

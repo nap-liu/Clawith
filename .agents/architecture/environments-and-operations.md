@@ -41,13 +41,20 @@ Production layout, credentials, and current image tags are operational secrets/c
 Stable production invariants are:
 
 - compose data/configuration lives on the data volume, not an ephemeral root filesystem;
-- application data, Redis, PostgreSQL, and agent workspaces require an explicit backup/rollback decision;
-- a cutover backup is taken after stopping writers;
+- application data, CLI upload state, Redis, PostgreSQL, object storage, and
+  agent workspaces each require an explicit change-impact and backup/rollback
+  decision;
+- prepare and validate candidate/rollback artifacts while the old release is
+  live; do not pre-stop or `down` the application;
+- take any required change-scoped snapshot online and close to cutover. If an
+  affected store cannot be captured consistently without stopped writers, the
+  default release is NO-GO until a compatible or explicitly approved topology
+  exists;
 - backend and frontend share one release SHA;
 - production images target `linux/amd64`;
 - frontend nginx configuration is baked from `frontend/nginx.conf.template`.
 
-The full production topology checklist, image-build path, stop-writer backup
-sequence, acceptance matrix, and rollback decision tree are canonical in
+The full production topology checklist, image-build/cache path, online backup
+decision, one-command replacement, acceptance matrix, and rollback tree are canonical in
 `.agents/runbooks/production_release.md`.  Do not reconstruct a release plan
 from this architecture summary alone.

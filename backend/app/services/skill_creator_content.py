@@ -32,9 +32,19 @@ _FILE_MAP = {
     "scripts__utils.py": "scripts/utils.py",
 }
 
+_FRAGMENTED_FILES = {
+    "eval-viewer__viewer.html": (
+        "eval-viewer__viewer.part1.html",
+        "eval-viewer__viewer.part2.html",
+    ),
+}
+
 
 def _load_file(flat_name: str) -> str:
     """Load a file from the skill_creator_files directory."""
+    fragments = _FRAGMENTED_FILES.get(flat_name)
+    if fragments is not None:
+        return "".join((_DIR / name).read_text(encoding="utf-8") for name in fragments)
     p = _DIR / flat_name
     if p.exists():
         return p.read_text(encoding="utf-8")

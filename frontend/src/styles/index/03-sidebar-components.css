@@ -1,0 +1,654 @@
+/* Collapse/expand toggle in logo row */
+.sidebar-collapse-btn {
+  transition: opacity 0.2s ease;
+}
+
+.sidebar.collapsed .sidebar-collapse-btn {
+  margin-left: 0 !important;
+}
+
+/* Account row trigger */
+.sidebar-account-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.sidebar-account-row:hover {
+  background: var(--bg-tertiary);
+}
+
+/* Account dropdown: main menu full width; language submenu cascades to the right (no squeeze) */
+.account-menus-container {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 100;
+}
+
+.account-dropdown {
+  position: relative;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 4px;
+  box-shadow: var(--shadow-lg);
+  animation: accountDropdownIn 0.15s ease;
+}
+
+.account-lang-submenu {
+  min-width: 148px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 4px;
+  box-shadow: var(--shadow-lg);
+  animation: accountDropdownIn 0.15s ease;
+}
+
+/* Portaled to document.body so it layers above main content (not clipped by sidebar) */
+.account-lang-submenu-portal {
+  position: fixed;
+  z-index: 9500;
+}
+
+.account-lang-submenu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.12s ease;
+  text-align: left;
+}
+
+.account-lang-submenu-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.account-lang-submenu-item.is-active {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.account-dropdown-language-hover-wrap {
+  width: 100%;
+}
+
+.account-dropdown-item.language-menu-trigger {
+  gap: 10px;
+}
+
+.account-dropdown-item.language-menu-trigger > .language-menu-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+}
+
+.account-dropdown-item.language-menu-trigger > .language-menu-chevron {
+  margin-left: auto;
+}
+
+.account-dropdown-item .language-menu-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+@keyframes accountDropdownIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.account-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.account-dropdown-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.account-dropdown-danger {
+  color: var(--error);
+}
+
+.account-dropdown-danger:hover {
+  background: var(--error-subtle);
+  color: var(--error);
+}
+
+.main-content {
+  margin-left: var(--sidebar-width);
+  flex: 1;
+  min-height: calc(100vh - var(--notification-bar-height));
+  padding: var(--space-8);
+  width: calc(100vw - var(--sidebar-width));
+  max-width: calc(100vw - var(--sidebar-width));
+  overflow-x: clip;
+  box-sizing: border-box;
+  transition: all var(--transition-default);
+  display: flex;
+  flex-direction: column;
+}
+
+/* Chat page needs a fixed viewport height so the inner chat-messages
+   can scroll independently. Without this, .main-content grows with content
+   (min-height: 100vh) and overflow-y: auto on .chat-messages never fires. */
+.main-content.chat-page {
+  height: calc(100vh - var(--notification-bar-height));
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+/* Override take-theirs AgentDetail's inline `margin: '0 8px 8px'` on the
+   chat shell so chat-page visual edge matches the 32px (--space-8) padding
+   used by every other .main-content variant (enterprise / agent-settings /
+   plaza / etc.). */
+.main-content.chat-page .agent-chat-shell {
+  margin: 0 var(--space-8) var(--space-8) !important;
+}
+
+.main-content.agent-settings-page {
+  padding-top: 8px;
+}
+
+/* Project workspaces provide their own project-level header and navigation. */
+.main-content.project-workspace-page {
+  padding: 0;
+  min-height: 0;
+}
+
+@media (max-width: 760px) {
+  .sidebar-collapse-btn {
+    display: none !important;
+  }
+}
+
+/* ─── Collapsed Sidebar Overrides ───────────────────── */
+.sidebar.collapsed {
+  --sidebar-width: var(--sidebar-width-collapsed);
+}
+
+.sidebar.collapsed .sidebar-logo {
+  justify-content: center;
+  padding: var(--space-3) 0;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sidebar.collapsed .sidebar-logo-switcher {
+  width: 36px;
+  flex: 0 0 36px;
+  justify-content: center;
+  padding: 5px;
+}
+
+.sidebar.collapsed .sidebar-workspace-row {
+  justify-content: center;
+  flex-direction: column;
+  padding: var(--space-3) 0;
+  gap: var(--space-2);
+}
+
+.sidebar.collapsed .workspace-switcher-trigger {
+  width: 36px;
+  flex: 0 0 36px;
+  justify-content: center;
+  padding: 6px;
+}
+
+.sidebar.collapsed .workspace-switcher-name,
+.sidebar.collapsed .workspace-switcher-chevron {
+  display: none;
+}
+
+.sidebar.collapsed .tenant-switcher-popover {
+  top: 76px;
+  left: calc(var(--sidebar-width-collapsed) + 8px);
+}
+
+.sidebar.collapsed .sidebar-logo-text {
+  display: none;
+}
+
+.sidebar.collapsed .sidebar-section-title {
+  opacity: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.sidebar.collapsed .sidebar-item {
+  justify-content: center;
+  padding: var(--space-2) 0;
+  padding-right: 0 !important;
+}
+
+.sidebar.collapsed .sidebar-item-text {
+  opacity: 0;
+  width: 0;
+  display: none;
+}
+
+.sidebar.collapsed .sidebar-item-icon {
+  margin: 0;
+}
+
+.sidebar.collapsed .tenant-switcher,
+.sidebar.collapsed .tenant-name {
+  display: none;
+}
+
+.sidebar.collapsed .sidebar-footer {
+  padding: var(--space-4) 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.sidebar.collapsed .sidebar-footer-controls {
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: 4px !important;
+}
+
+.sidebar.collapsed .sidebar-account-row {
+  justify-content: center;
+  padding: var(--space-2) 0;
+}
+
+.sidebar.collapsed .sidebar-footer-user-info,
+.sidebar.collapsed .sidebar-account-row > svg {
+  display: none;
+}
+
+.sidebar.collapsed .account-menus-container {
+  position: fixed;
+  left: calc(var(--sidebar-width-collapsed) + 8px);
+  right: auto;
+  bottom: 64px;
+  width: 220px;
+  z-index: 10020;
+}
+
+.sidebar.collapsed .btn-ghost span {
+  display: none;
+}
+
+/* ─── Components ────────────────────────────────────── */
+
+/* Button */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: 1;
+  height: var(--control-height-md);
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.btn-primary {
+  background: var(--accent-primary);
+  /* Dark theme: near-white bg → needs dark text for contrast */
+  color: #0a0a0f;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+  box-shadow: var(--shadow-sm);
+}
+
+.btn-secondary {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+}
+
+.btn-secondary:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.btn:disabled:hover {
+  background: inherit;
+  border-color: inherit;
+  box-shadow: none;
+}
+
+.btn-ghost {
+  color: var(--text-secondary);
+}
+
+.btn-ghost:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.btn-danger {
+  background: var(--error);
+  color: white;
+}
+
+.btn-danger:hover {
+  background: #dc2626;
+}
+
+/* Card */
+.card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  transition: all var(--transition-default);
+}
+
+.card:hover {
+  border-color: var(--border-default);
+  box-shadow: var(--shadow-sm);
+}
+
+.card-clickable {
+  cursor: pointer;
+}
+
+.card-clickable:hover {
+  border-color: var(--accent-primary);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+/* Metric tooltip */
+.metric-tooltip-trigger {
+  position: relative;
+}
+
+.metric-tooltip {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  white-space: normal;
+  width: 260px;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.metric-tooltip-trigger:hover .metric-tooltip {
+  display: block;
+}
+
+/* Status dot (used in Dashboard / AgentDetail) */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.status-dot.running {
+  background: var(--status-running);
+  box-shadow: 0 0 6px var(--status-running);
+}
+
+.status-dot.idle {
+  background: var(--status-idle);
+  box-shadow: 0 0 6px var(--status-idle);
+}
+
+.status-dot.stopped {
+  background: var(--status-stopped);
+}
+
+.status-dot.error {
+  background: var(--status-error);
+  box-shadow: 0 0 6px var(--status-error);
+}
+
+.status-dot.creating {
+  background: var(--info);
+  animation: pulse 1.5s infinite;
+}
+
+.status-dot.disconnected {
+  background: var(--warning);
+}
+
+/* Agent avatar — sidebar letter icon */
+.agent-avatar {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  flex-shrink: 0;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+/* OpenClaw agent — dashed border to indicate external/connected */
+.agent-avatar.openclaw {
+  border: 1.5px dashed var(--text-tertiary);
+  background: transparent;
+}
+
+/* OpenClaw link icon — top-right of avatar */
+.agent-avatar-link {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+}
+
+/* Small badge dot — absolute over avatar */
+.agent-avatar-badge {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--bg-secondary);
+}
+
+.agent-avatar-badge.error {
+  background: var(--status-error);
+}
+
+.agent-avatar-badge.creating {
+  background: var(--info);
+  animation: pulse 1.5s infinite;
+}
+
+.agent-avatar-badge.disconnected {
+  background: var(--warning, #f59e0b);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.badge-success {
+  background: var(--success-subtle);
+  color: var(--success);
+}
+
+.badge-warning {
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
+.badge-error {
+  background: var(--error-subtle);
+  color: var(--error);
+}
+
+.badge-info {
+  background: var(--accent-subtle);
+  color: var(--accent-text);
+}
+
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--space-6);
+  position: sticky;
+  top: var(--notification-bar-height);
+  background: var(--bg-primary);
+  z-index: 5;
+  padding-top: var(--space-2);
+}
+
+.tab {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  border-bottom: 2px solid transparent;
+  transition: all var(--transition-fast);
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--text-secondary);
+}
+
+.tab.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent-primary);
+}
+
+/* Session sidebar admin tabs — segment control style */
+.session-sidebar-segment-control {
+  display: flex;
+  margin: 0 12px 8px;
+  padding: 2px;
+  height: 28px;
+  background: var(--accent-subtle);
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  box-sizing: border-box;
+}
+
+.session-sidebar-segment-control .segment-item {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  user-select: none;
+  border: none;
+  background: none;
+  padding: 0;
+  line-height: 1;
+}
+
+.session-sidebar-segment-control .segment-item:hover {
+  color: var(--text-secondary);
+}
+
+.session-sidebar-segment-control .segment-item.active {
+  background: var(--segment-active-bg);
+  color: var(--segment-active-text);
+  font-weight: 500;
+}

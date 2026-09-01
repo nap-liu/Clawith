@@ -230,6 +230,7 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
     call_kw = mock_failover.call_args.kwargs
     assert call_kw["agent_id"] == target_agent.id
     assert call_kw["agent_name"] == "Bob"
+    assert call_kw["turn_anchor_agent_id"] == min(from_agent_id, target_id, key=str)
 
     # Verify on_tool_call callback was passed
     assert len(captured_on_tool_call) == 1

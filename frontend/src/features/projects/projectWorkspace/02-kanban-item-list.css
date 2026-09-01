@@ -1,0 +1,505 @@
+.project-workspace__kanban {
+  min-height: 0;
+  height: calc(100dvh - 250px);
+  max-height: 760px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(240px, 1fr));
+  gap: 11px;
+  overflow-x: auto;
+}
+
+.project-workspace__kanban > section {
+  min-height: 0;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+.project-workspace__kanban > section > header {
+  padding: 6px 5px 12px;
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.project-workspace__kanban > section > header span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.project-workspace__kanban > section > header i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+.project-workspace__kanban > section[data-column="doing"] > header i {
+  background: var(--info);
+}
+.project-workspace__kanban > section[data-column="review"] > header i {
+  background: var(--warning);
+}
+.project-workspace__kanban > section[data-column="done"] > header i {
+  background: var(--success);
+}
+.project-workspace__kanban > section > div {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.project-workspace__kanban > section > div > button {
+  width: 100%;
+  min-width: 0;
+  margin-bottom: 8px;
+  padding: 13px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color var(--transition-fast),
+    transform var(--transition-fast);
+}
+.project-workspace__kanban > section > div > button.btn {
+  display: block;
+  height: auto;
+  min-height: 150px;
+  overflow: hidden;
+}
+.project-workspace__kanban > section > div > button:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+.project-workspace__kanban-card-meta,
+.project-workspace__kanban-card footer {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.project-workspace__kanban-card-meta code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-workspace__kanban-card em {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-style: normal;
+  font-size: 9px;
+}
+.project-workspace__kanban-card em[data-priority="high"] {
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+.project-workspace__kanban-card em[data-priority="urgent"] {
+  background: var(--error-subtle);
+  color: var(--error);
+}
+.project-workspace__kanban-card h3 {
+  margin: 11px 0 7px;
+  overflow: hidden;
+  display: -webkit-box;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.project-workspace__kanban-card p {
+  min-height: 43px;
+  margin: 0 0 13px;
+  overflow: hidden;
+  display: -webkit-box;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.project-workspace__kanban-card footer {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+.project-workspace__kanban-card footer span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-workspace__kanban-card footer time {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.project-workspace__column-empty {
+  padding: 28px 8px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-align: center;
+}
+.project-workspace__graph-panel,
+.project-workspace__mesh-graph {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow: hidden;
+}
+
+.project-workspace__graph-panel {
+  width: 100%;
+  height: clamp(360px, 58dvh, 680px);
+  max-height: calc(100dvh - 220px);
+}
+.project-workspace__graph-panel .project-graph {
+  min-height: 0;
+  height: auto;
+  flex: 1 1 auto;
+}
+.project-workspace__mesh-graph {
+  width: 100%;
+  height: clamp(360px, 58dvh, 680px);
+  max-height: calc(100dvh - 220px);
+}
+
+.project-workspace__mesh-anomaly.btn {
+  width: 100%;
+  min-height: 48px;
+  margin-bottom: 12px;
+  justify-content: flex-start;
+  border: 1px solid color-mix(in srgb, var(--danger) 22%, var(--border));
+  color: var(--danger);
+}
+
+.project-workspace__mesh-anomaly > span {
+  display: grid;
+  gap: 2px;
+  margin-right: auto;
+  text-align: left;
+}
+
+.project-workspace__mesh-anomaly small {
+  color: var(--text-tertiary);
+  font-weight: 400;
+}
+
+.project-workspace__mesh-graph .project-graph {
+  min-height: 0;
+  height: auto;
+  flex: 1 1 auto;
+}
+.project-workspace__modal label > span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+.project-workspace__field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.project-workspace__timeline {
+  margin-top: 14px;
+}
+.project-workspace__timeline > article {
+  position: relative;
+  min-height: 70px;
+  padding: 13px 16px 13px 52px;
+  display: flex;
+  gap: 10px;
+}
+.project-workspace__timeline > article + article {
+  border-top: 1px solid var(--border-subtle);
+}
+.project-workspace__timeline > article > i {
+  position: absolute;
+  left: 28px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-default);
+}
+.project-workspace__timeline > article > span {
+  position: relative;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  margin-left: -37px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg-active);
+  font-size: 10px;
+}
+.project-workspace__timeline strong {
+  font-size: 10px;
+}
+.project-workspace__timeline strong em {
+  color: var(--info);
+  font-style: normal;
+}
+.project-workspace__timeline p {
+  margin: 5px 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+.project-workspace__timeline small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.project-event-content {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.project-event-content .markdown-renderer > :first-child {
+  margin-top: 5px !important;
+}
+.project-event-content .markdown-renderer > :last-child {
+  margin-bottom: 5px !important;
+}
+.project-event-content__trigger.btn {
+  width: max-content;
+  min-height: 24px;
+  height: 24px;
+  margin: 2px 0 5px;
+  padding: 0 5px;
+  color: var(--info);
+  font-size: 9px;
+  font-weight: 600;
+}
+.project-event-content__popover {
+  position: fixed;
+  z-index: 2200;
+  padding: 12px 14px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-lg);
+  font-size: 11px;
+  line-height: 1.65;
+}
+.project-event-content__popover .markdown-renderer > :first-child {
+  margin-top: 0 !important;
+}
+.project-event-content__popover .markdown-renderer > :last-child {
+  margin-bottom: 0 !important;
+}
+.project-workspace__audit-table .project-event-content {
+  max-width: 520px;
+}
+
+.project-workspace__detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 14px;
+}
+.project-workspace__detail-grid aside {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.project-workspace__prose {
+  padding: 18px 20px;
+}
+.project-workspace__prose h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+}
+.project-workspace__prose p {
+  margin: 0 0 22px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.project-workspace__definition-list {
+  margin: 0;
+  padding: 9px 16px 14px;
+}
+.project-workspace__definition-list div {
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 10px;
+}
+.project-workspace__definition-list div:last-child {
+  border: 0;
+}
+.project-workspace__definition-list dt {
+  color: var(--text-tertiary);
+}
+.project-workspace__definition-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.project-workspace__item-list {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+}
+.project-workspace__item-list > header,
+.project-workspace__item-list-row {
+  display: grid;
+  grid-template-columns:
+    minmax(260px, 1.8fr) minmax(130px, 0.7fr) minmax(100px, 0.62fr)
+    minmax(120px, 0.65fr) minmax(120px, 0.65fr) 110px 18px;
+  align-items: center;
+  gap: 14px;
+}
+.project-workspace__item-list > header {
+  min-width: 960px;
+  min-height: 40px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-tertiary);
+  color: var(--text-tertiary);
+  font-size: 9px;
+  font-weight: 600;
+}
+.project-workspace__item-list > div {
+  min-width: 0;
+}
+.project-workspace__item-list-row.btn {
+  width: 100%;
+  min-width: 960px;
+  height: auto;
+  min-height: 86px;
+  padding: 12px 16px;
+  border: 0;
+  border-radius: 0;
+  justify-content: stretch;
+  color: var(--text-secondary);
+  text-align: left;
+}
+.project-workspace__item-list-row + .project-workspace__item-list-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.project-workspace__item-list-row:hover {
+  background: var(--bg-hover);
+}
+.project-workspace__item-list-row:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--info);
+  outline-offset: -2px;
+}
+.project-workspace__item-list-copy,
+.project-workspace__item-list-progress,
+.project-workspace__item-list-acceptance {
+  min-width: 0;
+}
+.project-workspace__item-list-copy code,
+.project-workspace__item-list-copy strong,
+.project-workspace__item-list-copy small,
+.project-workspace__item-list-progress strong,
+.project-workspace__item-list-progress small,
+.project-workspace__item-list-acceptance strong,
+.project-workspace__item-list-acceptance small {
+  display: block;
+}
+.project-workspace__item-list-copy code {
+  margin-bottom: 5px;
+  color: var(--info);
+  font-size: 8px;
+}
+.project-workspace__item-list-copy strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-workspace__item-list-copy small {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 9px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-workspace__item-list-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.project-workspace__item-list-state em {
+  padding: 3px 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-active);
+  color: var(--text-secondary);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 600;
+}
+.project-workspace__item-list-state em[data-priority="high"] {
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+.project-workspace__item-list-state em[data-priority="urgent"] {
+  background: var(--error-subtle);
+  color: var(--error);
+}
+.project-workspace__item-list-owner {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-workspace__item-list-progress strong,
+.project-workspace__item-list-acceptance strong {
+  color: var(--text-primary);
+  font-size: 10px;
+}
+.project-workspace__item-list-progress small,
+.project-workspace__item-list-acceptance small {
+  margin-top: 4px;
+  color: var(--text-tertiary);
+  font-size: 8px;
+}
+.project-workspace__item-list-progress .project-progress {
+  width: 100%;
+  margin-top: 7px;
+}
+.project-workspace__item-list-progress .project-progress__track {
+  min-width: 72px;
+}
+.project-workspace__item-list-row time {
+  color: var(--text-tertiary);
+  font-size: 9px;
+  white-space: nowrap;
+}
+.project-workspace__item-list-row > svg {
+  color: var(--text-tertiary);
+}
