@@ -447,4 +447,3 @@ async def _web_screenshot(
     return f"Screenshot saved to workspace: {name}"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

@@ -117,4 +117,3 @@ async def _sync_okr_triggers_with_settings(db, agent_id: uuid.UUID, settings: OK
     if changed:
         logger.info("[AgentSeeder] Synced OKR system triggers with settings")
     return changed
-

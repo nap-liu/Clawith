@@ -176,4 +176,3 @@ class DingTalkRegistrationClient:
 
 def _default_registration_client() -> DingTalkRegistrationClient:
     return DingTalkRegistrationClient()
-

@@ -29,4 +29,3 @@ class WelcomeDeliveryClaim:
 
 class DingTalkRegistrationError(RuntimeError):
     """Raised when DingTalk registration API responses are malformed or failed."""
-

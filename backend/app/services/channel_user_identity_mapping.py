@@ -357,4 +357,3 @@ class ChannelUserIdentityMappingMethods:
             raise ChannelUserResolutionError(
                 f"Directory identity lookup failed closed for {channel_type}"
             ) from e
-

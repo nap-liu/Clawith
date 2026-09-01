@@ -28,7 +28,7 @@ async def verify_email(data: VerifyEmailRequest, db: AsyncSession = Depends(get_
     identity_id = token_data.get("identity_id")
     if not identity_id:
         raise HTTPException(status_code=400, detail="Token does not contain identity information")
-    
+
     # 1. Update Identity
     identity_result = await db.execute(select(Identity).where(Identity.id == identity_id))
     identity = identity_result.scalar_one_or_none()
@@ -37,7 +37,7 @@ async def verify_email(data: VerifyEmailRequest, db: AsyncSession = Depends(get_
 
     identity.email_verified = True
     identity.is_active = True
-    
+
     # 2. Activate all linked User accounts
     # email_verified is a proxy to Identity, so only update physical is_active column
     from sqlalchemy import update
@@ -46,7 +46,7 @@ async def verify_email(data: VerifyEmailRequest, db: AsyncSession = Depends(get_
         .where(User.identity_id == identity.id)
         .values(is_active=True)
     )
-    
+
     await db.flush()
     await db.commit()
 
@@ -110,7 +110,7 @@ async def resend_verification(
         select(User).where(User.identity_id == identity.id).order_by(User.created_at.desc()).limit(1)
     )
     user = u_result.scalar_one_or_none()
-    
+
     if user:
         await _send_verification_email_task(user, background_tasks, settings, db)
 

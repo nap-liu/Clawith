@@ -77,14 +77,14 @@ async def invite_users(
     _require_tenant_admin(current_user)
     if not data.emails:
         raise HTTPException(status_code=400, detail="No emails provided")
-        
+
     import random
     import string
 
     from app.models.tenant import Tenant
     from app.services.platform_service import platform_service
     from app.services.system_email_service import send_company_invitation_email
-    
+
     tenant_result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
     tenant = tenant_result.scalar_one_or_none()
     if not tenant:
@@ -95,15 +95,15 @@ async def invite_users(
     await _ensure_invitation_email_enabled(db)
 
     base_url = await resolve_base_url(db, request=request)
-    
+
     invited_count = 0
     codes = []
-    
+
     for email in data.emails:
         email = email.lower().strip()
         if not email:
             continue
-            
+
         code_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
         code = InvitationCode(
             code=code_str,
@@ -113,11 +113,11 @@ async def invite_users(
         )
         db.add(code)
         codes.append(code)
-        
+
         invite_url = f"{base_url}/login?code={code_str}&email={email}"
-        
+
         inviter_name = current_user.display_name or current_user.username
-        
+
         # Use background task to send email
         background_tasks.add_task(
             send_company_invitation_email,
@@ -130,7 +130,7 @@ async def invite_users(
 
     if invited_count > 0:
         await db.commit()
-        
+
     return {"invited": invited_count, "message": "Invitations sent successfully"}
 
 

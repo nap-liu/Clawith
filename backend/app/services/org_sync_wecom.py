@@ -190,6 +190,3 @@ class WeComOrgSyncAdapter(BaseOrgSyncAdapter):
                     break
 
         return user_stubs
-
-
-

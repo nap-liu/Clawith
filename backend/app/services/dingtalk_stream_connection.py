@@ -151,4 +151,3 @@ class DingTalkStreamConnectionMixin:
                     await asyncio.wait_for(async_stop_event.wait(), timeout=delay)
                 except TimeoutError:
                     pass
-

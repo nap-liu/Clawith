@@ -221,7 +221,7 @@ async def change_password(
 
     new_hash = await hash_password_async(new_password)
     identity.password_hash = new_hash
-    
+
     await db.flush()
     await db.commit()
     return {"ok": True}

@@ -339,9 +339,9 @@ class GeminiClient(LLMClient):
                     if dedup_key in seen_tool_calls:
                         continue
                     seen_tool_calls.add(dedup_key)
-                    
+
                     extra = {k: v for k, v in function_call.items() if k not in ["name", "args"]}
-                    
+
                     tool_calls.append({
                         "id": f"call_{len(tool_calls) + 1}",
                         "type": "function",
@@ -490,9 +490,9 @@ class GeminiClient(LLMClient):
                             if dedup_key in seen_tool_calls:
                                 continue
                             seen_tool_calls.add(dedup_key)
-                            
+
                             extra = {k: v for k, v in function_call.items() if k not in ["name", "args"]}
-                            
+
                             tool_calls.append({
                                 "id": f"call_{len(tool_calls) + 1}",
                                 "type": "function",

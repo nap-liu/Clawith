@@ -64,4 +64,3 @@ def _format_token_count(value: int) -> str:
                 formatted = formatted.rstrip("0").rstrip(".")
             return formatted + suffix
     return str(count)
-

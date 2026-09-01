@@ -613,4 +613,3 @@ async def _get_okr_settings_tool(agent_id: uuid.UUID | None) -> str:
         return f"Failed to get OKR settings: {str(e)[:200]}"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

@@ -125,4 +125,3 @@ class FeishuMessageResourceMethods:
             if on_result is not None:
                 await on_result("channel_file", result)
             return result
-

@@ -61,7 +61,7 @@ class FeishuProductAPIMethods:
                 headers={"Authorization": f"Bearer {tenant_token}"}
             )
             return resp.json()
-            
+
     async def bitable_delete_record(self, app_id: str, app_secret: str, app_token: str, table_id: str, record_id: str) -> dict:
         """Delete an existing record in a specific table."""
         tenant_token = await self.get_tenant_access_token(app_id, app_secret)

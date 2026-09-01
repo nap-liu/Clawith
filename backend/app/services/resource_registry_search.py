@@ -220,4 +220,3 @@ async def search_registries(query: str, max_results: int = 5, agent_id: uuid.UUI
 # Keep backward-compatible alias
 async def search_smithery(query: str, max_results: int = 5, agent_id: uuid.UUID | None = None) -> str:
     return await search_registries(query, max_results, agent_id=agent_id)
-

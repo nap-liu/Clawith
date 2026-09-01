@@ -259,4 +259,3 @@ async def start_trigger_daemon():
         await asyncio.sleep(TICK_INTERVAL)
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

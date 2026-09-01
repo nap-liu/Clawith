@@ -5,9 +5,9 @@ from app.api.feishu_shared import *  # noqa: F401,F403
 @router.get("/auth/feishu/callback")
 @router.post("/auth/feishu/callback", response_model=TokenResponse)
 async def feishu_oauth_callback(
-    code: str, 
+    code: str,
     request: Request,
-    state: str = None, 
+    state: str = None,
     db: AsyncSession = Depends(get_db)
 ):
     """Handle Feishu OAuth callback — exchange code for user session."""
@@ -126,7 +126,7 @@ async def configure_channel(
         existing.extra_config = data.extra_config or {}
         existing.is_configured = True
         await db.flush()
-        
+
         # Start/Stop WS client in background
         from app.services.feishu_ws import feishu_ws_manager
         import asyncio
@@ -135,7 +135,7 @@ async def configure_channel(
             asyncio.create_task(feishu_ws_manager.start_client(agent_id, existing.app_id, existing.app_secret))
         else:
             asyncio.create_task(feishu_ws_manager.stop_client(agent_id))
-        
+
         return ChannelConfigOut.model_validate(existing)
 
     config = ChannelConfig(

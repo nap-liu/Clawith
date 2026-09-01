@@ -21,21 +21,21 @@ async def get_email_hint(username: str, db: AsyncSession = Depends(get_db)):
     from app.models.user import Identity
     result = await db.execute(select(Identity).where(Identity.username == username))
     identity = result.scalar_one_or_none()
-    
+
     if not identity or not identity.email:
         raise HTTPException(status_code=404, detail="Account not found.")
-        
+
     email = identity.email
     parts = email.split("@")
     if len(parts) == 2:
         name, domain = parts
-        
+
         # Obfuscate name
         if len(name) <= 2:
             obs_name = name[0] + "***"
         else:
             obs_name = name[:2] + "***" + name[-1]
-            
+
         # Obfuscate domain
         domain_parts = domain.split(".")
         if len(domain_parts) >= 2:
@@ -50,7 +50,7 @@ async def get_email_hint(username: str, db: AsyncSession = Depends(get_db)):
             hint = f"{obs_name}@{domain}"
     else:
         hint = email[:3] + "***"
-        
+
     return {"hint": hint}
 
 
@@ -79,7 +79,7 @@ async def forgot_password(
     identity_query = select(Identity).where(Identity.email == data.email)
     identity_result = await db.execute(identity_query)
     identity = identity_result.scalar_one_or_none()
-    
+
     if not identity or not identity.is_active:
         return generic_response
 
@@ -118,7 +118,7 @@ async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(
     identity_id = token_data["identity_id"]
     result = await db.execute(select(Identity).where(Identity.id == identity_id))
     identity = result.scalar_one_or_none()
-    
+
     if not identity or not identity.is_active:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 

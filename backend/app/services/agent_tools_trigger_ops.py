@@ -674,4 +674,3 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         return f"❌ Failed to list triggers: {e}"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

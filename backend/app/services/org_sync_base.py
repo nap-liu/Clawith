@@ -132,7 +132,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
 
     async def _reconcile(self, db: AsyncSession, provider_id: uuid.UUID, sync_start: datetime):
         """Mark records that were not updated in this sync as deleted."""
-        
+
         # 1. Members reconciled
         await db.execute(
             update(OrgMember)
@@ -142,7 +142,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             .values(status="deleted", synced_at=_utcnow())
             .execution_options(synchronize_session=False)
         )
-        
+
         # 2. Departments reconciled
         await db.execute(
             update(OrgDepartment)
@@ -164,7 +164,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             .where(OrgMember.status == "active")
             .scalar_subquery()
         )
-        
+
         await db.execute(
             update(OrgDepartment)
             .where(OrgDepartment.provider_id == provider_id)
@@ -179,7 +179,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             .where(OrgDepartment.status == "active")
         )
         rows = result.all()
-        
+
         # Build tree structure and lookup
         dept_map = {row.id: {"parent_id": row.parent_id, "direct": row.member_count, "total": 0, "children": []} for row in rows}
         root_ids = []
@@ -189,7 +189,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
                 dept_map[parent_id]["children"].append(d_id)
             else:
                 root_ids.append(d_id)
-                
+
         # Recursive function to calculate total
         def compute_total(node_id):
             node = dept_map[node_id]
@@ -198,14 +198,14 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
                 total += compute_total(child_id)
             node["total"] = total
             return total
-            
+
         for root_id in root_ids:
             compute_total(root_id)
-            
+
         # 3. Bulk update all departments with their aggregated total counts
         # Skip if no updates needed to avoid unnecessary writes, but usually it's fast enough
         update_mappings = [{"id": d_id, "member_count": d_data["total"]} for d_id, d_data in dept_map.items()]
-        
+
         if update_mappings:
             # Execute individual UPDATE statements to avoid SQLAlchemy 2.x
             # "Bulk UPDATE by Primary Key" ambiguity when passing a list to execute().
@@ -234,7 +234,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             query = query.where(IdentityProvider.tenant_id == self.tenant_id)
         else:
             query = query.where(IdentityProvider.tenant_id.is_(None))
-            
+
         result = await db.execute(query)
         provider = result.scalars().first()
 
@@ -492,7 +492,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             # 2. anyascii handles remaining non-ASCII scripts (Korean, Japanese kana, Arabic, etc.)
             existing_member.name_translit_full = _anyascii("".join(lazy_pinyin(user.name, errors="default")))
             existing_member.name_translit_initial = "".join([i[0] for i in pinyin(user.name, style=Style.FIRST_LETTER)])
-            
+
             if email is not None:
                 existing_member.email = email
             existing_member.avatar_url = user.avatar_url
@@ -505,7 +505,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             if mobile is not None:
                 existing_member.phone = mobile
             existing_member.status = user.status
-            
+
             # Universal ID fields
             existing_member.external_id = user.external_id
             existing_member.open_id = user.open_id
@@ -521,7 +521,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             # 2. anyascii handles remaining non-ASCII scripts (Korean, Japanese kana, Arabic, etc.)
             translit_full = _anyascii("".join(lazy_pinyin(user.name, errors="default")))
             translit_initial = "".join([i[0] for i in pinyin(user.name, style=Style.FIRST_LETTER)])
-            
+
             new_member = OrgMember(
                 external_id=user.external_id,
                 open_id=user.open_id,
@@ -698,8 +698,3 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
                 return u
 
         return None
-
-
-
-
-

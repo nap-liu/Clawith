@@ -59,11 +59,11 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
             # Find any user record (just for the task)
             user_res = await db.execute(select(User).where(User.identity_id == identity.id).limit(1))
             user = user_res.scalar_one_or_none()
-            
+
             # Trigger email delivery in background
             if user:
                 await _send_verification_email_task(user, background_tasks, get_settings(), db)
-            
+
             # Consistent with identity-first flow: Return 403 Forbidden with verification intent
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -119,10 +119,10 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
         # Specific tenant requested (Dedicated Link flow)
         # Search for the user record in that tenant
         user = next((u for u in valid_users if u.tenant_id == data.tenant_id), None)
-        
+
         # Cross-tenant access check
         if not user:
-             # Even platform admins must have a valid record in the targeted tenant 
+             # Even platform admins must have a valid record in the targeted tenant
              # when logging in via a dedicated tenant URL / tenant_id.
              raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

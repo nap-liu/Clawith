@@ -30,7 +30,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
         self.client_secret = self.config.get("client_secret") or self.config.get("app_secret", "")
         self.authorize_url = self.config.get("authorize_url", "")
         self.scope = self.config.get("scope", "")
-        
+
         # 自动推导 token_url 和 user_info_url（如果为空）
         base = self.authorize_url.rsplit("/", 1)[0] if self.authorize_url else ""
         self.token_url = self.config.get("token_url") or f"{base}/token"
@@ -68,7 +68,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
         }
         if redirect_uri and self.config.get("token_exchange_redirect_uri", True) is not False:
             data["redirect_uri"] = redirect_uri
-        
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 self.token_url,
@@ -101,7 +101,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             resp_data = resp.json()
-            
+
             # Handle case where userinfo returns None or empty
             if not resp_data:
                 logger.warning(f"OAuth2 userinfo returned empty/null for {self.provider_type}")
@@ -110,15 +110,15 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 info = resp_data["data"]
             else:
                 info = resp_data
-            
+
             logger.info(f"OAuth2 user info: {info}")
-            
+
             # 通用字段解析（优先用户自定义映射，再 fallback 到标准字段）
             user_id = self._get_field(info, "user_id")
             name = self._get_field(info, "name")
             email = self._get_field(info, "email")
             mobile = self._get_field(info, "mobile")
-            
+
             return ExternalUserInfo(
                 provider_type=self.provider_type,
                 provider_user_id=str(user_id),

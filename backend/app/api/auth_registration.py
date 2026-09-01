@@ -90,7 +90,7 @@ async def _send_verification_email_task(
 
         raw_code, expires_at = await email_verification_service.create_email_verification_token(identity.id, identity.email)
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
-        
+
         background_tasks.add_task(
             email_verification_service.send_verification_email,
             identity.email,
@@ -323,7 +323,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
 
     # 1. Check for existing Identity/Tenant-User
     from app.services.registration_service import registration_service
-    
+
     # Check if this email is already registered globally
     identity_query = select(Identity).where(Identity.email == data.email)
     ident_res = await db.execute(identity_query)
@@ -334,7 +334,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
             status_code=status.HTTP_409_CONFLICT,
             detail="Email already registered, please login directly."
         )
-    
+
     # 2. Uniqueness Check (Already handled by Identity lookup above, but let's be explicit for Phone if needed)
     # conflicts = await registration_service.check_duplicate_identity(db, email=data.email)
     # ...
@@ -363,7 +363,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
             status_code=status.HTTP_409_CONFLICT,
             detail="Username already taken. Please choose a different username.",
         )
-    
+
     if is_first_user:
         identity.email_verified = True
         identity.is_active = True

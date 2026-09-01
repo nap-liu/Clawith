@@ -403,4 +403,3 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
         return f"Failed to upsert member daily report: {str(e)[:200]}"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

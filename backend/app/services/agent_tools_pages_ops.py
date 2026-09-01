@@ -490,4 +490,3 @@ async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID,
         return f"Failed to update page access: {exc}"
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

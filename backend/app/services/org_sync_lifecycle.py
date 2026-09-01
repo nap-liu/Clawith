@@ -131,7 +131,7 @@ class OrgSyncLifecycleMixin:
                 config["last_synced_at"] = _utcnow().isoformat()
                 self.provider.config = config
                 await db.flush()
-                
+
                 if partial_failure:
                     logger.warning(
                         f"[OrgSync] Skipping reconcile for provider {provider.id} because this sync had partial failures"
@@ -173,5 +173,3 @@ class OrgSyncLifecycleMixin:
             "provider": self.provider_type,
             "synced_at": _utcnow().isoformat()
         }
-
-

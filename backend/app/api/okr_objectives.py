@@ -433,6 +433,6 @@ async def delete_key_result(
         # Manual cascade delete logs
         await db.execute(delete(OKRProgressLog).where(OKRProgressLog.kr_id == kr_id))
         await db.execute(delete(OKRKeyResult).where(OKRKeyResult.id == kr_id))
-        
+
         await db.commit()
         return {"status": "success"}

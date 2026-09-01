@@ -286,4 +286,3 @@ class GoogleWorkspaceOrgSyncAdapter(BaseOrgSyncAdapter):
 
 
 # Adapter class mapping
-

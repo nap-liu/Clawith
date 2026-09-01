@@ -354,4 +354,3 @@ async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
 # ── Agent Invocation ────────────────────────────────────────────────
 
 __all__ = [name for name in globals() if not name.startswith("__")]
-

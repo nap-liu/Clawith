@@ -150,4 +150,3 @@ class ChannelUserPersistenceMethods:
         db.add(user)
         await db.flush()
         return user
-

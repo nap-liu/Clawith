@@ -272,7 +272,7 @@ async def create_identity_provider(
 
     # Validate config
     validate_provider_config(data.provider_type, data.config)
-    
+
     # Validate and determine tenant_id
     tid = data.tenant_id
     is_platform_admin = _is_platform_admin_user(current_user)
@@ -289,7 +289,7 @@ async def create_identity_provider(
 
     if not tid and not (is_platform_admin and data.provider_type in {"google", "github"}):
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
-        
+
     if data.sso_login_enabled:
         if not await sso_service.validate_sso_enablement(db, tid):
              raise HTTPException(
@@ -333,11 +333,11 @@ async def create_oauth2_provider(
 
     # Build config dict from validated model
     config_dict = data.config.model_dump(mode='json', exclude_unset=True)
-    
+
     # Handle field_mapping: None means no mapping, empty dict also means None
     if config_dict.get('field_mapping') == {}:
         config_dict['field_mapping'] = None
-    
+
     provider = IdentityProvider(
         provider_type="oauth2",
         name=data.name,
@@ -391,7 +391,7 @@ async def update_oauth2_provider(
     if data.config is not None:
         config_dict = data.config.model_dump(mode='json', exclude_unset=True)
         current_config = provider.config.copy()
-        
+
         # Merge config fields
         for key, value in config_dict.items():
             if key == 'field_mapping':
@@ -404,7 +404,7 @@ async def update_oauth2_provider(
                     current_config['field_mapping'] = value
             elif value is not None:
                 current_config[key] = value
-        
+
         validate_provider_config("oauth2", current_config)
         provider.config = current_config
 
@@ -429,10 +429,10 @@ async def update_identity_provider(
     provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-        
+
     if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
-        
+
     if data.name is not None:
         provider.name = data.name
     if data.is_active is not None:
@@ -451,12 +451,12 @@ async def update_identity_provider(
         # Merge config
         new_config = provider.config.copy()
         new_config.update(data.config)
-        
+
         # Validate merged config
         validate_provider_config(provider.provider_type, new_config)
-        
+
         provider.config = new_config
-        
+
     await db.commit()
     await db.refresh(provider)
     auth_provider_registry._clear_cache(provider.provider_type)
@@ -485,10 +485,10 @@ async def delete_identity_provider(
     provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-        
+
     if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this provider")
-        
+
     try:
         # Nullify references in synced org data before deleting the provider
         from sqlalchemy import update
@@ -498,7 +498,7 @@ async def delete_identity_provider(
         await db.execute(
             update(OrgDepartment).where(OrgDepartment.provider_id == provider_id).values(provider_id=None)
         )
-        
+
         await db.delete(provider)
         await db.commit()
     except SQLAlchemyError as e:

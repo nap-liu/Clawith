@@ -133,6 +133,3 @@ class ExternalUser:
     mobile: str = ""
     status: str = "active"
     raw_data: dict = field(default_factory=dict)
-
-
-

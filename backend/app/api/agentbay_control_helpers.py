@@ -293,22 +293,22 @@ async def _eval_cdp_script(client, script_body: str) -> dict:
     try:
         # Base64 encode the script to avoid shell escaping issues inside the container
         script_b64 = base64.b64encode(script_body.encode('utf-8')).decode('ascii')
-        
+
         # Write base64 to file and decode it to tc_action.js (in current working dir, since /tmp might be restricted)
         cmd_write = f"echo '{script_b64}' | /usr/bin/base64 -d > tc_action.js"
         await asyncio.to_thread(client._session.command.exec, cmd_write)
-        
+
         # Execute the script
         result = await asyncio.to_thread(client._session.command.exec, "node tc_action.js")
-        
+
         success = getattr(result, 'success', False)
         output = getattr(result, 'output', '') or getattr(result, 'stdout', '') or ''
         stderr = getattr(result, 'stderr', '') or ''
-        
+
         if not success:
             logger.error(f"[TakeControl] CDP execution failed. Output: {output}, Stderr: {stderr}")
             return {"success": False, "output": f"Node error: {stderr[:200]}"}
-            
+
         return {"success": True, "output": output}
     except Exception as e:
         logger.error(f"[TakeControl] CDP exception: {e}")

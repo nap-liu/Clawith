@@ -52,10 +52,10 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                 raw_data={"department_id": "0", "name": "Root"}
             )
         )
-        
+
         async with httpx.AsyncClient() as client:
             sem = asyncio.Semaphore(15)  # Limit concurrent requests to avoid rate limits
-            
+
             async def fetch_children(parent_id: str):
                 page_token = ""
                 tasks = []
@@ -70,8 +70,8 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
 
                     async with sem:
                         resp = await client.get(
-                            f"{self.FEISHU_DEPT_URL}/{parent_id}/children", 
-                            params=params, 
+                            f"{self.FEISHU_DEPT_URL}/{parent_id}/children",
+                            params=params,
                             headers={"Authorization": f"Bearer {token}"}
                         )
                     data = resp.json()
@@ -86,10 +86,10 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                         dept_id = item.get("open_department_id")
                         if not dept_id:
                             continue
-                        
+
                         # Since we fetched using parent_id, we intrinsically know the parent!
                         parent_external = parent_id if parent_id and parent_id != "0" else "0"
-                        
+
                         dept = ExternalDepartment(
                             external_id=dept_id,
                             name=item.get("name", ""),
@@ -98,19 +98,19 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                             raw_data=item,
                         )
                         all_depts.append(dept)
-                        
+
                         # Recursively fetch children for this department
                         tasks.append(fetch_children(dept_id))
 
                     page_token = res_data.get("page_token", "")
                     if not page_token:
                         break
-                        
+
                 if tasks:
                     await asyncio.gather(*tasks)
 
             await fetch_children("0")
-                        
+
         logger.info(f"Feishu fetched {len(all_depts)} departments total.")
         return all_depts
 
@@ -190,7 +190,7 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     # Collect all departments the user belongs to
                     raw_dept_ids = item.get("department_ids", [])
                     department_ids = [str(did) for did in raw_dept_ids] if raw_dept_ids else [department_external_id]
-                    
+
                     # When user_id_type=open_id, Feishu returns the open_id value in the
                     # "user_id" field of the response. So external_id == open_id == open_id field.
                     # The open_id field is also present for consistency.
@@ -224,6 +224,3 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     break
 
         return users
-
-
-

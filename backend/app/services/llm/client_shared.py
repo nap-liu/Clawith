@@ -80,11 +80,11 @@ class LLMMessage:
     def to_openai_format(self) -> dict:
         """Convert to OpenAI format."""
         msg: dict[str, Any] = {"role": self.role}
-        
+
         content = self.content
         if self.role == "system" and self.dynamic_content:
             content = f"{content}\n\n{self.dynamic_content}"
-            
+
         if content is not None:
             msg["content"] = content
         if self.tool_calls:
@@ -99,9 +99,9 @@ class LLMMessage:
         """Convert to Anthropic format (returns None for system messages)."""
         if self.role == "system":
             return None
-            
+
         role = self.role
-        
+
         # Tool response (from user to assistant)
         if role == "tool":
             # Build tool_result content: support both string and vision array formats
@@ -140,15 +140,15 @@ class LLMMessage:
                     }
                 ]
             }
-            
+
         content_blocks = []
-        
+
         # Add reasoning/thinking content if present
         if self.role == "assistant" and self.reasoning_content:
             content_blocks.append({
                 "type": "thinking",
                 "thinking": self.reasoning_content,
-                "signature": self.reasoning_signature or "synthetic_signature" 
+                "signature": self.reasoning_signature or "synthetic_signature"
             })
 
         if self.content:
@@ -171,7 +171,7 @@ class LLMMessage:
                             })
             else:
                 content_blocks.append({"type": "text", "text": self.content})
-            
+
         # Tool requests (from assistant to user)
         if self.tool_calls:
             for tc in self.tool_calls:
@@ -182,14 +182,14 @@ class LLMMessage:
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
-                
+
                 content_blocks.append({
                     "type": "tool_use",
                     "id": tc.get("id", ""),
                     "name": function_call.get("name", ""),
                     "input": args
                 })
-                
+
         # Handle the structure
         if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
             content = content_blocks[0]["text"]

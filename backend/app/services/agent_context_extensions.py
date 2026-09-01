@@ -201,4 +201,3 @@ async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
     mcp_blocks = await _collect_mcp_prompts_from_servers(agent_id)
     channel_blocks = await _collect_channel_prompts(agent_id)
     return mcp_blocks + channel_blocks
-
