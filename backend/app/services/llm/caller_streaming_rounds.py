@@ -378,7 +378,7 @@ async def _call_llm_execute_tool_round(
     try:
         persisted_running = await _persist_tool_call_events_strict(
             running_events,
-            agent_id=state.agent_id,
+            agent_id=state.anchor_agent_id,
             user_id=state.user_id,
             session_id=state.session_id,
             turn_anchor_id=state.turn_anchor_id,
@@ -422,6 +422,7 @@ async def _call_llm_execute_tool_round(
                 round_tool_index=tool_index,
                 assistant_content=(response.content or None) if tool_index == 0 else None,
                 recovery_prefix_messages=(recovery_prefix_messages if tool_index == 0 else None),
+                durable_agent_id=state.anchor_agent_id,
             )
         except Exception as e:
             logger.exception(f"[LLM] Tool execution or durable result persistence failed: {e}")
@@ -459,7 +460,7 @@ async def _call_llm_execute_tool_round(
         await _reconcile_round_tool_outputs(
             rewrites,
             round_done_records,
-            agent_id=state.agent_id,
+            agent_id=state.anchor_agent_id,
             user_id=state.user_id,
             session_id=state.session_id,
             turn_anchor_id=state.turn_anchor_id,

@@ -359,8 +359,10 @@ async def _process_tool_call(
     round_tool_index: int | None = None,
     assistant_content: str | None = None,
     recovery_prefix_messages: list[dict[str, str]] | None = None,
+    durable_agent_id=None,
 ) -> str:
     """Process a single tool call and return result."""
+    persistence_agent_id = durable_agent_id or agent_id
     args = _canonicalize_tc_arguments(tc, session_id)
     tool_name = tc["function"]["name"]
     logger.info(f"[LLM] Calling tool: {tool_name}({_observable_tool_args(tool_name, args)[:500]})")
@@ -382,7 +384,7 @@ async def _process_tool_call(
         }
         persisted = await _persist_tool_call_events_strict(
             [done_evt],
-            agent_id=agent_id,
+            agent_id=persistence_agent_id,
             user_id=user_id,
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
@@ -414,7 +416,7 @@ async def _process_tool_call(
         }
         persisted = await _persist_tool_call_events_strict(
             [done_evt],
-            agent_id=agent_id,
+            agent_id=persistence_agent_id,
             user_id=user_id,
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
@@ -453,7 +455,7 @@ async def _process_tool_call(
         }
         if await _persist_tool_call_events_strict(
             [running_evt],
-            agent_id=agent_id,
+            agent_id=persistence_agent_id,
             user_id=user_id,
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
@@ -537,7 +539,7 @@ async def _process_tool_call(
     else:
         persisted_done_rows = await _persist_tool_call_events_strict(
             [done_evt],
-            agent_id=agent_id,
+            agent_id=persistence_agent_id,
             user_id=user_id,
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,

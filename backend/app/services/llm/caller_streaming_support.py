@@ -139,10 +139,10 @@ def _call_llm_default_on_tool_call(state: CallLlmState):
     from app.services.chat_history import persist_tool_call
 
     async def _default_on_tool_call(data: dict):
-        if data.get("status") in {"running", "done"} and state.agent_id:
+        if data.get("status") in {"running", "done"} and (state.anchor_agent_id or state.agent_id):
             await persist_tool_call(
                 async_session,
-                agent_id=state.agent_id,
+                agent_id=state.anchor_agent_id or state.agent_id,
                 user_id=state.user_id,
                 conversation_id=state.session_id,
                 evt=data,
