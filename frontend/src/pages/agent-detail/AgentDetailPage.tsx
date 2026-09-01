@@ -104,6 +104,7 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
         agent,
         activeTab,
         currentUser,
+        dialog,
         livePanelVisible,
         setLivePanelVisible,
         sidePanelTab,

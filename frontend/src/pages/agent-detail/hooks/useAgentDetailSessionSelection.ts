@@ -23,6 +23,7 @@ export function useAgentDetailSessionSelection({
     writeSessionIdToUrl,
     t,
     toast,
+    dialog,
     chat,
     helpers,
 }: any) {
@@ -82,6 +83,7 @@ export function useAgentDetailSessionSelection({
         clearUnreadForSession,
         isWritableSession,
         buildSessionRuntimeKey,
+        closeSessionSocket,
         syncActiveSocketState,
         sessionUserIdStr,
         viewerUserIdStr,
@@ -310,6 +312,65 @@ export function useAgentDetailSessionSelection({
         }
     };
 
+    const createNewSession = async () => {
+        if (!id) return;
+        try {
+            const tkn = localStorage.getItem('token');
+            const res = await fetch(`/api/agents/${id}/sessions`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tkn}` },
+                body: JSON.stringify({}),
+            });
+            if (res.ok) {
+                const newSess = normalizeChatSession(await res.json());
+                setChatScope('mine');
+                setSessions((prev: any[]) => [
+                    newSess,
+                    ...prev.map((session: any) => (
+                        String(session.id) !== String(newSess.id)
+                        && sessionUserIdStr(session) === sessionUserIdStr(newSess)
+                        && session.source_channel === newSess.source_channel
+                            ? { ...session, is_primary: false }
+                            : session
+                    )),
+                ]);
+                setIsStreaming(false);
+                setIsWaiting(false);
+                setIsStopping(false);
+                await selectSession(newSess, 'mine');
+            } else {
+                const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+                console.error('Failed to create session:', err);
+                toast.error('创建会话失败', { details: String(err.detail || `HTTP ${res.status}`) });
+            }
+        } catch (err: any) {
+            console.error('Failed to create session:', err);
+            toast.error('创建会话失败', { details: String(err.message || err) });
+        }
+    };
+
+    const deleteSession = async (sessionId: string) => {
+        const ok = await dialog.confirm(
+            t('chat.deleteConfirm', 'Delete this session and all its messages? This cannot be undone.'),
+            { title: '删除会话', danger: true, confirmLabel: '删除' },
+        );
+        if (!ok) return;
+        const tkn = localStorage.getItem('token');
+        try {
+            await fetch(`/api/agents/${id}/sessions/${sessionId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${tkn}` } });
+            if (id) closeSessionSocket(buildSessionRuntimeKey(id, sessionId), true);
+            const deletedActiveSession = String(activeSession?.id || '') === String(sessionId);
+            if (deletedActiveSession) clearChatSelection();
+            const remainingMine = await fetchMySessions(false, id);
+            if (canViewAllAgentChatSessions) await fetchAllSessions();
+            if (deletedActiveSession && remainingMine.length > 0) {
+                setChatScope('mine');
+                await selectSession(remainingMine[0], 'mine');
+            }
+        } catch (error: any) {
+            toast.error('删除失败', { details: String(error?.message || error) });
+        }
+    };
+
     useEffect(() => {
         currentAgentIdRef.current = id;
     }, [id, currentAgentIdRef]);
@@ -457,5 +518,7 @@ export function useAgentDetailSessionSelection({
         fetchMySessions,
         fetchAllSessions,
         selectSession,
+        createNewSession,
+        deleteSession,
     };
 }

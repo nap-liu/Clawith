@@ -10,6 +10,7 @@ export function useAgentDetailChatController({
     agent,
     activeTab,
     currentUser,
+    dialog,
     livePanelVisible,
     setLivePanelVisible,
     sidePanelTab,
@@ -71,6 +72,7 @@ export function useAgentDetailChatController({
         writeSessionIdToUrl,
         t,
         toast,
+        dialog,
         chat,
         helpers,
     });
