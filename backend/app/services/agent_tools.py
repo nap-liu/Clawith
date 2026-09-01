@@ -139,6 +139,7 @@ from app.services.user_project_tools import (
     user_project_tool_error,
 )
 from app.services.agent_tools_catalog import AGENT_TOOLS
+from app.services import agent_tools_code_runtime as _agent_tools_code_runtime_module
 from app.services import agent_tools_document_tools as _agent_tools_document_tools_module
 from app.services import agent_tools_channel_file_receipts as _agent_tools_file_receipts_module
 from app.services import agent_tools_outbound_core as _agent_tools_outbound_core_module
@@ -405,6 +406,8 @@ def _sync_document_tool_bindings() -> None:
 
 MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
+_agent_tools_code_runtime_module.MAX_EXEC_STDOUT_CAPTURE_BYTES = MAX_EXEC_STDOUT_CAPTURE_BYTES
+_agent_tools_code_runtime_module.MAX_EXEC_STDERR_CAPTURE_BYTES = MAX_EXEC_STDERR_CAPTURE_BYTES
 
 
 install_facade_specs(__name__, MAIN_FACADE_SPECS)
