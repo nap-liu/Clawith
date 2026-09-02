@@ -78,6 +78,46 @@ async def test_gemini_usage_preserves_cache_and_multimodal_provider_details():
     assert "output_tokens_details" in persisted
 
 
+async def test_gemini_keeps_dynamic_system_context_before_tool_result_tail():
+    client = GeminiClient(api_key="test", model="gemini-test")
+    payload = client._build_payload(
+        [
+            LLMMessage(
+                role="system",
+                content="STATIC",
+                dynamic_content="CURRENT-SNAPSHOT",
+            ),
+            LLMMessage(
+                role="assistant",
+                tool_calls=[{
+                    "id": "external-1",
+                    "type": "function",
+                    "function": {
+                        "name": "wait_for_external_result",
+                        "arguments": "{}",
+                    },
+                }],
+            ),
+            LLMMessage(
+                role="tool",
+                content="completed",
+                tool_call_id="external-1",
+            ),
+        ],
+        tools=None,
+        temperature=0.2,
+        max_tokens=100,
+    )
+
+    assert payload["systemInstruction"]["parts"] == [
+        {"text": "STATIC\n\nCURRENT-SNAPSHOT"}
+    ]
+    assert payload["contents"][-1]["parts"][0]["functionResponse"] == {
+        "name": "wait_for_external_result",
+        "response": {"result": "completed"},
+    }
+
+
 async def test_authoritative_provider_count_enforces_ratio_and_output_reserve():
     common = dict(
         model=_model(context_window=1_000, usage_ratio=0.7),

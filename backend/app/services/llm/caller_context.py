@@ -1,5 +1,7 @@
 """Caller context and tool-processing helpers."""
 
+from dataclasses import replace
+
 from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
 
@@ -133,9 +135,16 @@ def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list
     - Does not persist the wrapper to ChatMessage; the next turn rebuilds a
       fresh snapshot around its own current user message.
 
-    When there is no user message, append a context-only user message so
-    unattended executions still receive the snapshot.  With no dynamic
-    context, return a shallow copy unchanged.  The input list is never mutated.
+    A tail tool result is a suspended tool-call continuation.  Keep that result
+    as the final message so the provider resumes the same turn instead of
+    interpreting runtime context as new user input.  In that shape the dynamic
+    snapshot travels on the system message's dedicated ``dynamic_content``
+    field.  This is tool-agnostic: confirmation cards are only one producer of
+    externally completed tool results.
+
+    When there is no user or tool result, append a context-only user message so
+    unattended executions still receive the snapshot.  With no dynamic context,
+    return a shallow copy unchanged.  The input list is never mutated.
 
     The returned list contains fresh ``LLMMessage`` instances for any message
     we modify, so the caller's ``api_messages`` stays byte-identical for the
@@ -145,9 +154,36 @@ def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list
     if not dynamic_prompt:
         return out
 
-    # Only the final message can be the current user turn.  Confirmation
-    # continuation and other resume paths intentionally end in assistant/tool;
-    # append a context-only tail there rather than modifying historical input.
+    if out and out[-1].role == "tool":
+        system_idx = next(
+            (idx for idx, message in enumerate(out) if message.role == "system"),
+            None,
+        )
+        if system_idx is None:
+            out.insert(
+                0,
+                LLMMessage(
+                    role="system",
+                    content="",
+                    dynamic_content=dynamic_prompt,
+                ),
+            )
+        else:
+            system_message = out[system_idx]
+            existing_dynamic = system_message.dynamic_content
+            out[system_idx] = replace(
+                system_message,
+                dynamic_content=(
+                    f"{existing_dynamic}\n\n{dynamic_prompt}"
+                    if existing_dynamic
+                    else dynamic_prompt
+                ),
+            )
+        return out
+
+    # Only the final message can be the current user turn. Non-tool unattended
+    # paths may need a context-only user tail; completed tool continuations were
+    # handled above and must retain their tool result as the tail.
     if not out or out[-1].role != "user":
         out.append(
             LLMMessage(

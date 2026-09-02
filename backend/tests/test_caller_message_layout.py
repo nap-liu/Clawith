@@ -90,7 +90,7 @@ def test_unattended_turn_without_user_message_still_receives_context():
     assert attached[-1].content == "<context>\nMEMORY-SNAPSHOT\n</context>"
 
 
-def test_confirmation_continuation_appends_context_without_rewriting_old_user():
+def test_suspended_tool_continuation_keeps_tool_result_as_message_tail():
     original = [
         LLMMessage(role="system", content="STATIC"),
         LLMMessage(role="user", content="historical request"),
@@ -108,12 +108,98 @@ def test_confirmation_continuation_appends_context_without_rewriting_old_user():
 
     attached = _attach_turn_context(original, "CURRENT-SNAPSHOT")
 
-    assert attached[: len(original)] == original
+    assert [message.role for message in attached] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
     assert attached[1].content == "historical request"
-    assert attached[-1] == LLMMessage(
-        role="user",
-        content="<context>\nCURRENT-SNAPSHOT\n</context>",
+    assert attached[0].content == "STATIC"
+    assert attached[0].dynamic_content == "CURRENT-SNAPSHOT"
+    assert attached[-1] == original[-1]
+
+
+def test_suspended_tool_continuation_without_user_still_keeps_tool_tail():
+    original = [
+        LLMMessage(role="system", content="STATIC"),
+        LLMMessage(
+            role="assistant",
+            tool_calls=[{
+                "id": "external-1",
+                "type": "function",
+                "function": {"name": "wait_for_external_result", "arguments": "{}"},
+            }],
+        ),
+        LLMMessage(role="tool", content="completed", tool_call_id="external-1"),
+    ]
+
+    attached = _attach_turn_context(original, "CURRENT-SNAPSHOT")
+
+    assert [message.role for message in attached] == ["system", "assistant", "tool"]
+    assert attached[0].dynamic_content == "CURRENT-SNAPSHOT"
+    assert attached[-1] == original[-1]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_dispatches_external_tool_result_as_continuation_tail(monkeypatch):
+    fake_client = _FakeClient()
+    monkeypatch.setattr(
+        "app.services.llm.caller.create_llm_client",
+        lambda **kwargs: fake_client,
     )
+    monkeypatch.setattr(
+        "app.services.llm.caller.get_max_tokens",
+        lambda *args, **kwargs: 1024,
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller.get_model_api_key",
+        lambda model: "fake-key",
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller._get_agent_config",
+        AsyncMock(return_value=(5, None)),
+    )
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[
+            {"role": "user", "content": "start the operation"},
+            {
+                "role": "assistant",
+                "content": "waiting",
+                "tool_calls": [{
+                    "id": "external-1",
+                    "type": "function",
+                    "function": {
+                        "name": "wait_for_external_result",
+                        "arguments": "{}",
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "content": '{"status":"completed"}',
+                "tool_call_id": "external-1",
+            },
+        ],
+        agent_name="TestAgent",
+        role_description="",
+        prepared_turn_context=("STATIC", "CURRENT-SNAPSHOT"),
+        prepared_tools=[],
+    )
+
+    assert result == "ok-final"
+    sent = fake_client.stream_calls[0]["messages"]
+    assert [message.role for message in sent] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert sent[0].dynamic_content == "CURRENT-SNAPSHOT"
+    assert sent[-1].tool_call_id == "external-1"
+    assert sent[-1].content == '{"status":"completed"}'
 
 
 @pytest.mark.asyncio

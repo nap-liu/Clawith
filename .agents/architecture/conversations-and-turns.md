@@ -56,6 +56,13 @@ preserve the assistant/tool ordering, and let channel adapters render buttons or
 cards. A confirmation response must not invent a new session or bypass the
 shared loop.
 
+Suspension and external completion are generic tool-loop capabilities, not
+confirmation-specific behavior. When an external actor fills a suspended tool
+result, provider history must still end with the matching
+`assistant(tool_call) -> tool(result)` pair. Runtime context must not append a
+synthetic user message after that result; otherwise the continuation becomes a
+new user turn instead of resuming the suspended tool call.
+
 ## Normalized outbound delivery
 
 One persisted outbound `ChatMessage` is the local lifecycle anchor. Ordinary replies and control text use an assistant row. A tool-created file or media artifact may reuse its exact outbound tool-call row, avoiding a second outbox model and preserving one idempotency key. Each durable externally visible outbound operation attaches a normalized delivery receipt to message metadata:

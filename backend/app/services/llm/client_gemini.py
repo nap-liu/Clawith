@@ -183,6 +183,8 @@ class GeminiClient(LLMClient):
                 text_chunks = [p.get("text", "") for p in parts if p.get("text")]
                 if text_chunks:
                     system_blocks.append("\n".join(text_chunks))
+                if msg.dynamic_content:
+                    system_blocks.append(msg.dynamic_content)
                 continue
 
             if msg.role == "user":

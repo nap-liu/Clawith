@@ -8,7 +8,7 @@ invariant below — "the tail is always covered" — makes that regression
 impossible to reintroduce silently.
 """
 
-from app.services.llm.client import select_cache_breakpoints
+from app.services.llm.client import LLMMessage, select_cache_breakpoints
 
 SYS = {"role": "system", "content": "you are X"}
 USR = {"role": "user", "content": "hi"}
@@ -101,6 +101,47 @@ def test_dashscope_marks_toolloop_tail_payload():
     tail = payload[-1]
     assert isinstance(tail["content"], list), "tool tail content must be wrapped to list form"
     assert any(b.get("cache_control") for b in tail["content"]), "tool tail must carry cache_control"
+
+
+def test_dashscope_serializes_external_tool_result_as_continuation_tail():
+    client = _dashscope_client()
+    payload = client._build_payload(
+        [
+            LLMMessage(
+                role="system",
+                content="STATIC",
+                dynamic_content="CURRENT-SNAPSHOT",
+            ),
+            LLMMessage(
+                role="assistant",
+                tool_calls=[{
+                    "id": "external-1",
+                    "type": "function",
+                    "function": {
+                        "name": "wait_for_external_result",
+                        "arguments": "{}",
+                    },
+                }],
+            ),
+            LLMMessage(
+                role="tool",
+                content="completed",
+                tool_call_id="external-1",
+            ),
+        ],
+        tools=None,
+        temperature=0.2,
+        max_tokens=100,
+    )
+
+    messages = payload["messages"]
+    assert [message["role"] for message in messages] == [
+        "system",
+        "assistant",
+        "tool",
+    ]
+    assert messages[0]["content"][-1]["text"] == "\n\nCURRENT-SNAPSHOT"
+    assert messages[-1]["tool_call_id"] == "external-1"
 
 
 def test_apply_cache_control_idempotent_skips_volatile_dynamic_block():
