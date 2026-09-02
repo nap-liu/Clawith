@@ -26,7 +26,10 @@ from app.services.trigger_runtime.cron_schedule import (
     compute_next_trigger_cron_occurrence,
     format_cron_timing_context,
 )
-from app.services.trigger_runtime.dispatch import enqueue_due_trigger
+from app.services.trigger_runtime.dispatch import (
+    claim_ready_trigger_invocations,
+    enqueue_due_trigger,
+)
 from app.services.trigger_runtime.executions import build_execution_runtime_trigger
 from app.services.trigger_runtime.keys import build_scheduled_execution_key
 from app.services.trigger_runtime.queue import enqueue_trigger_execution
@@ -458,51 +461,26 @@ async def test_concurrent_enqueue_uses_schedule_for_record_key_and_context():
         await _cleanup_seeded_cron(ids)
 
 
-async def test_recurring_trigger_does_not_enqueue_while_agent_run_is_active():
+async def test_recurring_trigger_enqueues_next_occurrence_while_prior_run_is_active():
     trigger, ids = await _seed_persisted_cron()
-    first_scheduled_for = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
-    second_scheduled_for = first_scheduled_for + timedelta(days=1)
     try:
-        await enqueue_due_trigger(
-            trigger,
-            first_scheduled_for,
-            scheduled_for=first_scheduled_for,
-            scheduled_timezone="Asia/Shanghai",
-        )
         async with async_session() as db:
-            await db.execute(
-                update(TriggerExecution)
-                .where(TriggerExecution.trigger_id == trigger.id)
-                .values(status="processing")
-            )
+            stored_trigger = await db.get(AgentTrigger, trigger.id)
+            stored_trigger.type = "interval"
+            stored_trigger.config = {"minutes": 5}
             await db.commit()
+            await db.refresh(stored_trigger)
+            db.expunge(stored_trigger)
 
-        await enqueue_due_trigger(
-            trigger,
-            second_scheduled_for,
-            scheduled_for=second_scheduled_for,
-            scheduled_timezone="Asia/Shanghai",
-        )
+        await enqueue_due_trigger(stored_trigger, stored_trigger.created_at)
+        await claim_ready_trigger_invocations(stored_trigger.created_at)
+
         async with async_session() as db:
-            executions = list(
-                (
-                    await db.execute(
-                        select(TriggerExecution).where(
-                            TriggerExecution.trigger_id == trigger.id
-                        )
-                    )
-                ).scalars()
-            )
-            assert len(executions) == 1
-            executions[0].status = "completed"
-            await db.commit()
+            stored_trigger = await db.get(AgentTrigger, trigger.id)
+            await db.refresh(stored_trigger)
+            db.expunge(stored_trigger)
 
-        await enqueue_due_trigger(
-            trigger,
-            second_scheduled_for,
-            scheduled_for=second_scheduled_for,
-            scheduled_timezone="Asia/Shanghai",
-        )
+        await enqueue_due_trigger(stored_trigger, stored_trigger.last_fired_at + timedelta(minutes=5))
         async with async_session() as db:
             executions = list(
                 (
@@ -514,11 +492,12 @@ async def test_recurring_trigger_does_not_enqueue_while_agent_run_is_active():
                 ).scalars()
             )
         assert len(executions) == 2
+        assert {execution.status for execution in executions} == {"pending", "processing"}
     finally:
         await _cleanup_seeded_cron(ids)
 
 
-async def test_different_recurring_triggers_for_one_agent_enqueue_one_at_a_time():
+async def test_different_recurring_triggers_for_one_agent_dispatch_independently():
     trigger, ids = await _seed_persisted_cron()
     sibling = _cron_trigger(
         agent_id=ids["agent"],
@@ -558,36 +537,26 @@ async def test_different_recurring_triggers_for_one_agent_enqueue_one_at_a_time(
                     )
                 ).scalars()
             )
-            assert len(executions) == 1
-            queued_trigger_ids = {execution.trigger_id for execution in executions}
-            executions[0].status = "completed"
-            await db.commit()
+        assert len(executions) == 2
+        assert {execution.trigger_id for execution in executions} == {
+            trigger.id,
+            sibling.id,
+        }
 
-        missing_trigger = sibling if trigger.id in queued_trigger_ids else trigger
-        missing_scheduled_for = (
+        invocations, _force_invoke = await claim_ready_trigger_invocations(
             scheduled_for + timedelta(minutes=5)
-            if missing_trigger.id == sibling.id
-            else scheduled_for
         )
-        await enqueue_due_trigger(
-            missing_trigger,
-            missing_scheduled_for,
-            scheduled_for=missing_scheduled_for,
-            scheduled_timezone="Asia/Shanghai",
-        )
-        async with async_session() as db:
-            count = len(
-                list(
-                    (
-                        await db.execute(
-                            select(TriggerExecution.id).where(
-                                TriggerExecution.agent_id == ids["agent"]
-                            )
-                        )
-                    ).scalars()
-                )
-            )
-        assert count == 2
+        agent_invocations = [
+            claimed
+            for key, claimed in invocations.items()
+            if key[0] == ids["agent"]
+        ]
+        assert len(agent_invocations) == 2
+        assert all(len(claimed) == 1 for claimed in agent_invocations)
+        assert {claimed[0].id for claimed in agent_invocations} == {
+            trigger.id,
+            sibling.id,
+        }
     finally:
         await _cleanup_seeded_cron(ids)
 

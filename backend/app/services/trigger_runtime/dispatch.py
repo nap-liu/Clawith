@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
 from app.database import async_session
-from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.services.trigger_runtime.executions import (
@@ -17,8 +16,6 @@ from app.services.trigger_runtime.executions import (
 )
 from app.services.trigger_runtime.keys import build_scheduled_execution_key
 from app.services.trigger_runtime.queue import enqueue_trigger_execution
-
-_NON_OVERLAPPING_RECURRING_SOURCES = ("cron", "interval")
 
 
 def runtime_execution_payload(trigger: AgentTrigger) -> dict:
@@ -69,43 +66,6 @@ async def enqueue_due_trigger(
     scheduled_timezone: str | None = None,
 ) -> None:
     async with async_session() as db:
-        if trigger.type in _NON_OVERLAPPING_RECURRING_SOURCES:
-            # Serialize the enqueue decision on the durable Agent row. A
-            # recurring scan that outlives its interval must finish before the
-            # same Agent receives another recurring execution; otherwise old
-            # rounds accumulate and contend for the shared workspace.
-            agent_exists = (
-                await db.execute(
-                    select(Agent.id)
-                    .where(Agent.id == trigger.agent_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if agent_exists is None:
-                return
-            fresh = (
-                await db.execute(
-                    select(AgentTrigger)
-                    .where(AgentTrigger.id == trigger.id)
-                )
-            ).scalar_one_or_none()
-            if fresh is None or not fresh.is_enabled:
-                return
-            active_execution = (
-                await db.execute(
-                    select(TriggerExecution.id)
-                    .where(
-                        TriggerExecution.agent_id == fresh.agent_id,
-                        TriggerExecution.source.in_(_NON_OVERLAPPING_RECURRING_SOURCES),
-                        TriggerExecution.status.in_(("pending", "processing")),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if active_execution is not None:
-                return
-            trigger = fresh
-
         cfg = trigger.config or {}
         webhook_mode = (
             cfg.get("webhook_mode", "legacy")
@@ -221,7 +181,7 @@ async def enqueue_due_trigger(
                 raise ValueError("scheduled_for must be timezone-aware")
             if not scheduled_timezone:
                 raise ValueError("cron enqueue requires scheduled_timezone")
-            scheduled_for = scheduled_for.astimezone(timezone.utc).replace(microsecond=0)
+            scheduled_for = scheduled_for.astimezone(UTC).replace(microsecond=0)
             execution_scheduled_at = scheduled_for
             payload_obj = {
                 **payload_obj,
@@ -250,13 +210,7 @@ InvocationKey = tuple[uuid.UUID, uuid.UUID | None, str, uuid.UUID | None, float 
 async def claim_ready_trigger_invocations(
     now: datetime,
 ) -> tuple[dict[InvocationKey, list[AgentTrigger]], set[InvocationKey]]:
-    """Claim executions without merging independent on_message replies.
-
-    Scheduled reflection triggers keep their historical per-agent merge bucket.
-    Each message execution receives its own bucket and is serialized later by
-    the exact origin-session guard.  Combining two replies merely because they
-    target the same agent/session destroys their individual idempotency boundary.
-    """
+    """Claim every durable execution as an independent invocation."""
     fired_by_invocation: dict[InvocationKey, list[AgentTrigger]] = {}
     force_invoke: set[InvocationKey] = set()
 
@@ -264,11 +218,10 @@ async def claim_ready_trigger_invocations(
 
     for execution, trigger in claimed_executions:
         runtime_trigger = build_execution_runtime_trigger(trigger, execution)
-        bucket = str(execution.id) if trigger.type == "on_message" else "reflection"
         key = (
             trigger.agent_id,
             execution.execution_user_id,
-            bucket,
+            str(execution.id),
             trigger.model_id,
             trigger.temperature,
             trigger.soul,

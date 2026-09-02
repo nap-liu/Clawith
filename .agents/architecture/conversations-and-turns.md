@@ -16,6 +16,13 @@ Subagents, tasks, schedules, and triggers persist optional model and temperature
 overrides; missing values inherit from the Agent. The UI names temperature
 “想象力” and constrains it to the supported 0–2 range.
 
+Each durable trigger execution dispatches as an independent invocation. Due
+cron and interval occurrences must not be suppressed, merged, or serialized
+merely because another recurring execution for the same Agent is pending or
+running. Occurrence idempotency prevents duplicate dispatch, shared workload
+capacity bounds system load, and workspace locks serialize only conflicting
+mutations rather than the complete model turn.
+
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
 ### Asynchronous Subagent events on parent turns
