@@ -315,6 +315,7 @@ async def serialize_project_run_member_snapshots(
             "configuration": {
                 "primary_model": model_summary(config, "primary_model_id"),
                 "fallback_model": model_summary(config, "fallback_model_id"),
+                "temperature": config.get("temperature"),
                 "max_tool_rounds": config.get("max_tool_rounds"),
                 "has_project_instruction": bool(str(config.get("project_instruction") or "").strip()),
             },

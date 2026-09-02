@@ -209,6 +209,7 @@ async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and
         member.config_snapshot = {
             **dict(member.config_snapshot or {}),
             "primary_model_id": str(frozen_model.id),
+            "temperature": 0.2,
             "max_tool_rounds": 7,
             "project_instruction": "Use the release checklist captured at run start.",
         }
@@ -229,6 +230,7 @@ async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and
         member.config_snapshot = {
             **dict(member.config_snapshot or {}),
             "primary_model_id": None,
+            "temperature": 1.1,
             "max_tool_rounds": 99,
             "project_instruction": "This later edit must not affect the old run.",
         }
@@ -250,9 +252,12 @@ async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and
     assert created is True
     async with async_session() as db:
         child_session = await db.get(ChatSession, child.id)
+        child_run = await db.get(SubagentRun, child.id)
         runtime_config = dict(child_session.im_config or {})
     assert runtime_config["project_run_frozen"] is True
     assert runtime_config["member_config_snapshot"]["primary_model_id"] == str(frozen_model.id)
+    assert runtime_config["member_config_snapshot"]["temperature"] == 0.2
+    assert child_run.temperature == 0.2
     assert runtime_config["member_config_snapshot"]["max_tool_rounds"] == 7
     assert "release checklist captured at run start" in build_project_runtime_context(runtime_config)
     tool_names = {

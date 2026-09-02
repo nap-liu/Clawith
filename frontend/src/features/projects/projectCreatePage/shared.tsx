@@ -54,6 +54,7 @@ export function initialAgentSettings(
     config_snapshot: {
       primary_model_id: agent.primary_model_id || null,
       fallback_model_id: agent.fallback_model_id || null,
+      temperature: agent.temperature ?? null,
       max_tool_rounds: agent.max_tool_rounds ?? 50,
       project_instruction: "",
     },

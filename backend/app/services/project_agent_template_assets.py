@@ -55,7 +55,12 @@ _RUNTIME_KEYS = {
     "max_tokens_per_day",
     "max_tokens_per_month",
 }
-_MEMBER_CONFIG_KEYS = {"project_instruction", "enabled_project_tools", "disabled_project_tools"}
+_MEMBER_CONFIG_KEYS = {
+    "temperature",
+    "project_instruction",
+    "enabled_project_tools",
+    "disabled_project_tools",
+}
 _UUID_PATTERN = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"
 )
@@ -425,7 +430,17 @@ def _validate_member_config(value: object, redactions: Sequence[str]) -> dict:
     instruction = value.get("project_instruction", "")
     if not isinstance(instruction, str) or len(instruction.encode("utf-8")) > MAX_CORE_MEMORY_BYTES:
         raise ProjectAgentTemplateAssetError("Project instruction must be bounded UTF-8 text")
-    result: dict = {"project_instruction": _sanitize_text(instruction, redactions)}
+    temperature = value.get("temperature")
+    if temperature is not None and (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not 0 <= temperature <= 2
+    ):
+        raise ProjectAgentTemplateAssetError("temperature is outside the supported range")
+    result: dict = {
+        "temperature": float(temperature) if temperature is not None else None,
+        "project_instruction": _sanitize_text(instruction, redactions),
+    }
     for key in ("enabled_project_tools", "disabled_project_tools"):
         raw_names = value.get(key, [])
         if not isinstance(raw_names, list) or len(raw_names) > 256:

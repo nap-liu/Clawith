@@ -55,12 +55,17 @@ async def _validate_project_create_inputs(
         members[0] = members[0].model_copy(update={"is_leader": True})
 
     if member_ids:
-        from app.core.permissions import build_visible_agents_query
+        from app.services.project_agent_service import (
+            build_selectable_project_source_agents_query,
+        )
 
         sources = (
             (
                 await db.execute(
-                    build_visible_agents_query(user, tenant_id=tenant_id).where(Agent.id.in_(set(member_ids)))
+                    build_selectable_project_source_agents_query(
+                        user,
+                        tenant_id=tenant_id,
+                    ).where(Agent.id.in_(set(member_ids)))
                 )
             )
             .scalars()

@@ -135,6 +135,13 @@ async def create_subagent(
                 agent_id=agent_id,
                 project_run_id=project_run_id,
             )
+            if temperature is None and "temperature" in project_member_config:
+                try:
+                    normalized_temperature = validate_temperature(
+                        project_member_config.get("temperature")
+                    )
+                except ValueError as exc:
+                    raise SubagentError("项目成员想象力必须在 0 到 2 之间。") from exc
             project_tool_policy_snapshot = (
                 dict(dict((project.settings or {}).get("policies") or {}).get("project_tools") or {})
                 if project is not None

@@ -102,6 +102,7 @@ async def add_member(
         config_snapshot={
             "primary_model_id": str(agent.primary_model_id) if agent.primary_model_id else None,
             "fallback_model_id": str(agent.fallback_model_id) if agent.fallback_model_id else None,
+            "temperature": agent.temperature,
             "autonomy_policy": dict(agent.autonomy_policy or {}),
             "max_tool_rounds": agent.max_tool_rounds,
             "project_instruction": "",

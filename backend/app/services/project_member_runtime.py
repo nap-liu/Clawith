@@ -334,6 +334,7 @@ class ProjectMemberRuntimeConfig(BaseModel):
 
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
     max_tool_rounds: int | None = Field(default=None, ge=1, le=200)
     project_instruction: str = Field(default="", max_length=20_000)
     enabled_project_tools: list[str] | None = None

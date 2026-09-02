@@ -57,6 +57,10 @@
   grid-column: 1 / -1;
 }
 
+.project-agent-settings__temperature .divergence-control {
+  max-width: none;
+}
+
 .project-agent-settings__config-form input,
 .project-agent-settings__config-form textarea,
 .project-agent-settings__config-form .project-select {

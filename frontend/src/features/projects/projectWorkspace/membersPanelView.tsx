@@ -211,6 +211,10 @@ export function MembersPanelView({
                 config={{
                   primary_model_id: text(configDraft, "primary_model_id") || null,
                   fallback_model_id: text(configDraft, "fallback_model_id") || null,
+                  temperature:
+                    typeof configDraft.temperature === "number"
+                      ? configDraft.temperature
+                      : null,
                   max_tool_rounds: text(configDraft, "max_tool_rounds"),
                   project_instruction: text(configDraft, "project_instruction"),
                 }}

@@ -460,6 +460,7 @@ async def test_run_event_and_dashboard_expose_frozen_product_summary(project_api
     assert summary["configuration"] == {
         "primary_model": {"name": "Project tenant default", "availability": "available"},
         "fallback_model": None,
+        "temperature": None,
         "max_tool_rounds": 23,
         "has_project_instruction": True,
     }

@@ -204,8 +204,9 @@ export function CapabilitiesStep({
             }
             modelOptions={modelOptions}
             counts={{
-              config: Object.values(activeSettings.config_snapshot).filter(Boolean)
-                .length,
+              config: Object.values(activeSettings.config_snapshot).filter(
+                (setting) => setting !== null && setting !== undefined && setting !== "",
+              ).length,
               tools: activeSettings.tools.length,
               skill: activeSettings.skill_capability_ids.length,
             }}

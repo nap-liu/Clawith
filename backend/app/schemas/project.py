@@ -407,6 +407,7 @@ class ProjectFrozenModelSummary(BaseModel):
 class ProjectFrozenMemberConfigSummary(BaseModel):
     primary_model: ProjectFrozenModelSummary | None = None
     fallback_model: ProjectFrozenModelSummary | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
     max_tool_rounds: int | None = None
     has_project_instruction: bool = False
 

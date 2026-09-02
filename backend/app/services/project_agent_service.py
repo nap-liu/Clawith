@@ -49,6 +49,23 @@ def _project_root(project: Project) -> Path:
     return project_repo_path(project.tenant_id, project.id)
 
 
+def build_selectable_project_source_agents_query(
+    user: User,
+    *,
+    tenant_id: uuid.UUID,
+):
+    """Return every visible Agent that can actually be copied into a project.
+
+    Visibility is the authorization boundary: both ``use`` and ``manage``
+    grants qualify. Project creation must not add a second management-permission
+    requirement after presenting an Agent as selectable.
+    """
+
+    return build_visible_agents_query(user, tenant_id=tenant_id).where(
+        Agent.agent_type == "native",
+    )
+
+
 async def _visible_standard_source(
     db: AsyncSession,
     user: User,
@@ -56,7 +73,10 @@ async def _visible_standard_source(
 ) -> Agent:
     source = (
         await db.execute(
-            build_visible_agents_query(user, tenant_id=project_tenant_id(user)).where(
+            build_selectable_project_source_agents_query(
+                user,
+                tenant_id=project_tenant_id(user),
+            ).where(
                 Agent.id == source_agent_id,
                 Agent.scope == "standard",
             )
@@ -162,6 +182,10 @@ async def create_project_agent(
         ProjectMemberCreate(agent_id=agent.id, is_leader=data.is_leader),
         actor_user_id=owner.id,
     )
+    member.config_snapshot = {
+        **dict(member.config_snapshot or {}),
+        "temperature": source.temperature if source is not None else None,
+    }
 
     default_soul, default_memory = build_project_agent_identity_defaults(
         project_name=project.name,

@@ -163,6 +163,7 @@ export interface ProjectAgentOption {
   mcp_count?: number;
   primary_model_id?: string | null;
   fallback_model_id?: string | null;
+  temperature?: number | null;
   max_tool_rounds?: number | null;
 }
 
@@ -189,6 +190,7 @@ export interface ProjectAgentSettingsDraft {
   config_snapshot: {
     primary_model_id?: string | null;
     fallback_model_id?: string | null;
+    temperature?: number | null;
     max_tool_rounds?: number | string | null;
     project_instruction?: string;
   };

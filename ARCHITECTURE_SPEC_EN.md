@@ -48,6 +48,11 @@ transaction or lock.
 
 The React/TypeScript frontend renders durable sessions and live events. Authorization to view, write, or monitor a session is decided by backend policy. Read-only monitoring may receive live events but must remain server-enforced read-only.
 
+Project creation may copy any selectable, visible native Agent in the tenant;
+an Agent `use` grant is sufficient and must not be upgraded to a management
+requirement. The bootstrap picker and create validation share this eligibility
+boundary so the UI cannot offer a source that the create API will reject.
+
 Production nginx configuration is built from `frontend/nginx.conf.template`; a similarly named deployment file is not automatically the production source.
 
 ## Conversation model

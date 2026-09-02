@@ -105,6 +105,7 @@ async def export_project_agents_for_template(
                 "max_tokens_per_month": agent.max_tokens_per_month,
             },
             member_config={
+                "temperature": dict(member.config_snapshot or {}).get("temperature"),
                 "project_instruction": str(dict(member.config_snapshot or {}).get("project_instruction") or ""),
                 "enabled_project_tools": list(
                     dict(member.config_snapshot or {}).get("enabled_project_tools") or []

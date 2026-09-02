@@ -8,6 +8,7 @@ import {
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 
+import DivergenceSlider from "../../../components/DivergenceSlider";
 import type { ProjectAgentSettingsDraft } from "../types";
 import {
   Button,
@@ -145,6 +146,24 @@ export default function ProjectAgentSettingsPanel({
                   disabled={disabled}
                 />
               </ProjectField>
+              <div className="project-agent-settings__temperature">
+                <DivergenceSlider
+                  value={config.temperature ?? null}
+                  onChange={(temperature) =>
+                    onConfigChange("temperature", temperature)
+                  }
+                  label={t("projectWorkspacePage.members.fields.temperature")}
+                  inheritedLabel={t(
+                    "projectWorkspacePage.members.fields.temperatureInherited",
+                  )}
+                  lowLabel={t("projectWorkspacePage.members.fields.temperatureLow")}
+                  middleLabel={t(
+                    "projectWorkspacePage.members.fields.temperatureMiddle",
+                  )}
+                  highLabel={t("projectWorkspacePage.members.fields.temperatureHigh")}
+                  disabled={disabled}
+                />
+              </div>
               <ProjectField
                 label={t("projectWorkspacePage.members.fields.maxToolRounds")}
               >

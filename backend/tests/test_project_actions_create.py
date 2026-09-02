@@ -57,6 +57,81 @@ async def test_project_create_removes_managed_storage_after_commit_failure(
     assert not tenant_storage.exists() or not any(tenant_storage.iterdir())
     assert await env.db.scalar(select(func.count()).select_from(Project)) == 0
 
+
+async def test_use_level_visible_agents_are_the_project_create_boundary(
+    project_api: ProjectApiEnv,
+):
+    from app.models.agent import AgentPermission
+
+    env = project_api
+    company_agent = Agent(
+        name="Company use Agent",
+        role_description="Available to the company with use access",
+        creator_id=env.owner_id,
+        tenant_id=env.tenant_id,
+        status="idle",
+        access_mode="company",
+        company_access_level="use",
+        agent_type="native",
+        temperature=0.4,
+    )
+    custom_agent = Agent(
+        name="Custom use Agent",
+        role_description="Shared directly with use access",
+        creator_id=env.owner_id,
+        tenant_id=env.tenant_id,
+        status="idle",
+        access_mode="custom",
+        agent_type="native",
+        temperature=0,
+    )
+    remote_agent = Agent(
+        name="Remote visible Agent",
+        role_description="Visible but not copyable into a project",
+        creator_id=env.owner_id,
+        tenant_id=env.tenant_id,
+        status="idle",
+        access_mode="company",
+        company_access_level="use",
+        agent_type="openclaw",
+    )
+    env.db.add_all([company_agent, custom_agent, remote_agent])
+    await env.db.flush()
+    env.db.add(
+        AgentPermission(
+            agent_id=custom_agent.id,
+            scope_type="user",
+            scope_id=env.viewer_id,
+            access_level="use",
+        )
+    )
+    await env.db.commit()
+    source_temperatures = {
+        str(company_agent.id): 0.4,
+        str(custom_agent.id): 0,
+    }
+
+    env.authenticate_as(env.viewer_id)
+    bootstrap = await env.client.get("/api/projects/bootstrap-options")
+    assert bootstrap.status_code == 200, bootstrap.text
+    selectable_ids = {item["id"] for item in bootstrap.json()["agents"]}
+    assert set(source_temperatures) <= selectable_ids
+    assert str(remote_agent.id) not in selectable_ids
+
+    for source_id, expected_temperature in source_temperatures.items():
+        created = await env.client.post(
+            "/api/projects",
+            json={
+                "name": f"Use-level source {source_id[:8]}",
+                "members": [{"agent_id": source_id, "is_leader": True}],
+            },
+        )
+        assert created.status_code == 201, created.text
+        members = await env.client.get(f"/api/projects/{created.json()['id']}/members")
+        assert members.status_code == 200, members.text
+        assert members.json()[0]["config_snapshot"]["temperature"] == expected_temperature
+
+
 async def test_project_create_applies_member_settings_only_to_project_agent(
     project_api: ProjectApiEnv,
 ):
@@ -166,6 +241,7 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
                     "settings": {
                         "config_snapshot": {
                             "primary_model_id": str(model.id),
+                            "temperature": 0,
                             "max_tool_rounds": 33,
                             "project_instruction": "Only for this project",
                         },
@@ -210,6 +286,7 @@ async def test_project_create_applies_member_settings_only_to_project_agent(
     project_agent_id = created_member.agent_id
     assert created_member.agent_id != env.source_leader_id
     assert created_member.config_snapshot["primary_model_id"] == str(model.id)
+    assert created_member.config_snapshot["temperature"] == 0
     assert created_member.config_snapshot["max_tool_rounds"] == 33
     assert created_member.config_snapshot["project_instruction"] == "Only for this project"
 

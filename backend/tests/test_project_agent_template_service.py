@@ -150,6 +150,7 @@ async def test_project_template_round_trip_creates_fresh_project_agents(
             name_snapshot=source_agent.name,
             role_snapshot=source_agent.role_description,
             is_leader=True,
+            config_snapshot={"temperature": 0},
         )
     )
     await db.flush()
@@ -161,6 +162,7 @@ async def test_project_template_round_trip_creates_fresh_project_agents(
 
     definition_agents = await export_project_agents_for_template(db, source_project)
     assert definition_agents[0]["runtime"]["daily_memory_load_days"] == 0
+    assert definition_agents[0]["member_config"]["temperature"] == 0
     assert str(source_project.id) not in str(definition_agents)
     created = await instantiate_project_agents_from_template(db, target_project, owner, definition_agents)
 
@@ -172,6 +174,7 @@ async def test_project_template_round_trip_creates_fresh_project_agents(
     assert created_agent.primary_model_id is not None
     assert created_agent.daily_memory_load_days == 0
     assert member.is_leader is True
+    assert member.config_snapshot["temperature"] == 0
     target_layout = project_agent_workspace(roots[target_project.id], created_agent.id)
     assert target_layout.memory.read_text(encoding="utf-8") == "durable product context\n"
     assert (target_layout.workspace / "brief.md").read_text(encoding="utf-8") == "safe brief\n"

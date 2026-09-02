@@ -91,6 +91,10 @@ async def get_project_bootstrap_options(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from app.services.project_agent_service import (
+        build_selectable_project_source_agents_query,
+    )
+
     tenant_id = _tenant_id(current_user)
     cache_key = f"projects:bootstrap:v1:{tenant_id}:{current_user.id}"
     try:
@@ -100,7 +104,14 @@ async def get_project_bootstrap_options(
     except Exception:
         logger.debug("Project bootstrap cache read failed; loading from the database")
     agents = (
-        (await db.execute(build_visible_agents_query(current_user, tenant_id=tenant_id).order_by(Agent.name)))
+        (
+            await db.execute(
+                build_selectable_project_source_agents_query(
+                    current_user,
+                    tenant_id=tenant_id,
+                ).order_by(Agent.name)
+            )
+        )
         .scalars()
         .all()
     )
@@ -165,6 +176,7 @@ async def get_project_bootstrap_options(
                 "agent_type": agent.agent_type,
                 "primary_model_id": str(agent.primary_model_id) if agent.primary_model_id else None,
                 "fallback_model_id": str(agent.fallback_model_id) if agent.fallback_model_id else None,
+                "temperature": agent.temperature,
                 "max_tool_rounds": agent.max_tool_rounds,
             }
             for agent in agents
