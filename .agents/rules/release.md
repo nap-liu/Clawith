@@ -14,10 +14,12 @@ the runbook.
   even when only one side changed. Pin deployment and rollback to digests.
 - Build production images for `linux/amd64`. Rebuild AIO only when its source or
   base image changed or the user explicitly requests it.
-- Production backend/frontend builds use the stable reviewed build arguments
-  and registry `cache-from` plus `cache-to`. Never use `docker compose build` or
-  `docker compose up --build` to produce production artifacts. An unexpected
-  dependency-cache miss is a stop-and-investigate condition.
+- For a backend code-only release, reuse the previous trusted backend image by
+  immutable digest as `CLAWITH_DEPS_IMAGE` after the runbook's dependency-input
+  equality gates pass. Mutable BuildKit cache tags are performance hints, never
+  dependency authority. A dependency refresh is an explicit release mode.
+  Never use `docker compose build` or `docker compose up --build` to produce
+  production artifacts.
 - Prepare, pull, render, and verify candidate and rollback images/configuration
   while the old release remains live. The cutover window contains no build,
   image download, or ad-hoc compose editing.
