@@ -120,7 +120,8 @@ def _resolve_dingtalk_directory_credentials(
     provider,
     channel_config: ChannelConfig | None,
 ) -> list[tuple[str, str, str]]:
-    """Return enterprise credentials followed by the current agent fallback."""
+    """Use the tenant enterprise app, independent of the receiving robot."""
+    del channel_config
     credentials: list[tuple[str, str, str]] = []
     if provider is not None:
         config = provider.config or {}
@@ -132,11 +133,6 @@ def _resolve_dingtalk_directory_credentials(
         )
         if app_key and app_secret:
             credentials.append((str(app_key), str(app_secret), "enterprise"))
-
-    if channel_config and channel_config.app_id and channel_config.app_secret:
-        robot_pair = (channel_config.app_id, channel_config.app_secret)
-        if not credentials or credentials[0][:2] != robot_pair:
-            credentials.append((*robot_pair, "robot_fallback"))
     return credentials
 
 
@@ -203,13 +199,13 @@ async def _get_dingtalk_user_detail_with_fallback(
     staff_id: str,
     provider_id: uuid.UUID | None = None,
 ) -> dict | None:
-    """Use enterprise credentials first and merge an agent fallback response."""
+    """Resolve directory fields from the configured provider credential chain."""
     merged: dict[str, str] = {}
     for app_key, app_secret, source in credentials:
         detail = await _get_dingtalk_user_detail(app_key, app_secret, staff_id)
         if not detail:
             logger.warning(
-                "[DingTalk] Directory enrichment failed via source={}; trying fallback if available",
+                "[DingTalk] Directory enrichment failed via source={}; trying next configured source",
                 source,
             )
             continue
@@ -232,7 +228,7 @@ async def _get_dingtalk_user_detail_with_fallback(
 
         logger.warning(
             "[DingTalk] Directory enrichment via source={} returned no mobile; "
-            "trying fallback if available",
+            "trying next configured source",
             source,
         )
 

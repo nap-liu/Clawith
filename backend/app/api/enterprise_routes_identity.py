@@ -1,6 +1,8 @@
 """Mechanically separated enterprise API route group."""
 
 from app.api.enterprise_api_shared import *  # noqa: F401,F403
+from fastapi import Query
+from sqlalchemy import text
 
 
 # ─── SSO Derived State Helper ───────────────────────────
@@ -103,7 +105,7 @@ async def list_identity_providers(
 ):
     """List identity providers configured for the tenant."""
     # Authorization: non-platform admins can only see their own tenant's providers
-    if tenant_id and not _is_platform_admin_user(current_user):
+    if tenant_id and not _is_global_platform_admin_user(current_user):
         if str(current_user.tenant_id) != tenant_id:
             raise HTTPException(status_code=403, detail="Cannot access other tenant's providers")
 
@@ -111,13 +113,13 @@ async def list_identity_providers(
     tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
 
     if global_only:
-        if not _is_platform_admin_user(current_user):
+        if not _is_global_platform_admin_user(current_user):
             raise HTTPException(status_code=403, detail="Only platform admin can access global identity providers")
         query = query.where(IdentityProvider.tenant_id.is_(None))
     elif tid:
         import uuid as _uuid
         query = query.where(IdentityProvider.tenant_id == _uuid.UUID(tid))
-    elif not _is_platform_admin_user(current_user):
+    elif not _is_global_platform_admin_user(current_user):
         raise HTTPException(status_code=400, detail="tenant_id is required for identity providers")
 
     result = await db.execute(query)
@@ -127,11 +129,63 @@ async def list_identity_providers(
     return providers
 
 
+@router.post("/identity-providers/{provider_id}/discover-field-paths")
+async def discover_identity_provider_field_paths(
+    provider_id: uuid.UUID,
+    capability: str,
+    target_account: str | None = Query(default=None, max_length=320),
+    current_user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Discover source paths and one bounded sample for administrator mapping."""
+    result = await db.execute(
+        select(IdentityProvider).where(IdentityProvider.id == provider_id)
+    )
+    provider = result.scalar_one_or_none()
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if (
+        not _is_global_platform_admin_user(current_user)
+        and provider.tenant_id != current_user.tenant_id
+    ):
+        raise HTTPException(status_code=403, detail="Not authorized to inspect this provider")
+    provider_type = provider.provider_type
+    provider_cache_id = str(provider.id)
+    config = dict(provider.config or {})
+    await db.rollback()
+
+    if capability == "login" and provider_type == "oauth2":
+        from app.services.provider_field_discovery import discover_oidc_field_samples
+
+        discovery = await discover_oidc_field_samples(
+            config,
+            provider_id=provider_cache_id,
+        )
+        return discovery
+    if capability == "directory" and (
+        provider_type == "scim"
+        or config.get("directory_protocol") == "scim"
+        or (config.get("capabilities") or {}).get("directory_protocol") == "scim"
+    ):
+        from app.services.scim_client import ScimClient
+
+        client = ScimClient.from_provider_config(config)
+        try:
+            fields = list(await client.discover_user_fields(target_account))
+            return {"fields": fields, "paths": [field["path"] for field in fields]}
+        finally:
+            await client.close()
+    raise HTTPException(status_code=400, detail="Field discovery is unavailable")
+
+
 class IdentityProviderCreate(BaseModel):
     provider_type: str
     name: str
     is_active: bool = True
     sso_login_enabled: bool = False
+    sync_enabled: bool = False
+    sync_interval_value: int | None = None
+    sync_interval_unit: str | None = None
     config: dict = {}
     tenant_id: uuid.UUID | None = None
 
@@ -140,6 +194,9 @@ class IdentityProviderUpdate(BaseModel):
     name: str | None = None
     is_active: bool | None = None
     sso_login_enabled: bool | None = None
+    sync_enabled: bool | None = None
+    sync_interval_value: int | None = None
+    sync_interval_unit: str | None = None
     config: dict | None = None
 
 
@@ -151,7 +208,10 @@ class OAuth2Config(BaseModel):
     token_url: str | None = None        # OAuth2 token endpoint
     user_info_url: str | None = None    # OAuth2 user info endpoint
     scope: str | None = "openid profile email"
+    scim_base_url: str | None = None
+    scim_page_size: int | None = 500
     field_mapping: dict | None = None   # Custom field name mapping
+    directory: dict | None = None
 
     def to_config_dict(self) -> dict:
         """Convert to config dict with both naming conventions for compatibility."""
@@ -170,8 +230,15 @@ class OAuth2Config(BaseModel):
             config["user_info_url"] = self.user_info_url
         if self.scope:
             config["scope"] = self.scope
+        if self.scim_base_url:
+            config["scim_base_url"] = self.scim_base_url
+            config["directory_protocol"] = "scim"
+        if self.scim_page_size:
+            config["scim_page_size"] = self.scim_page_size
         if self.field_mapping is not None:
             config["field_mapping"] = self.field_mapping
+        if self.directory is not None:
+            config["directory"] = self.directory
         return config
 
     @classmethod
@@ -184,7 +251,10 @@ class OAuth2Config(BaseModel):
             token_url=config.get("token_url"),
             user_info_url=config.get("user_info_url"),
             scope=config.get("scope"),
+            scim_base_url=config.get("scim_base_url"),
+            scim_page_size=config.get("scim_page_size"),
             field_mapping=config.get("field_mapping"),
+            directory=config.get("directory"),
         )
 
 
@@ -239,16 +309,83 @@ def validate_provider_config(provider_type: str, config: dict):
         client_secret = config.get("client_secret") or config.get("app_secret")
         if not client_id or not client_secret:
             raise HTTPException(status_code=422, detail=f"{provider_type} requires client_id and client_secret")
+    from app.services.provider_identity_policy import validate_identity_match_policy
+    from app.services.org_sync_models import validate_enterprise_root_mapping
+    from app.services.scim_directory import normalize_scim_user_field_mapping
+
+    try:
+        validate_identity_match_policy(config)
+        validate_enterprise_root_mapping(config)
+        directory = config.get("directory") or {}
+        if "field_mapping" in directory:
+            normalize_scim_user_field_mapping(directory.get("field_mapping"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return
+
+
+def _apply_sync_policy(
+    provider: IdentityProvider,
+    *,
+    enabled: bool | None,
+    interval_value: int | None,
+    interval_unit: str | None,
+) -> None:
+    """Apply one provider-neutral fixed-interval schedule."""
+    from app.services.directory_sync_policy import next_sync_time, validate_sync_policy
+
+    next_enabled = provider.sync_enabled if enabled is None else enabled
+    next_value = provider.sync_interval_value if interval_value is None else interval_value
+    next_unit = provider.sync_interval_unit if interval_unit is None else interval_unit
+    try:
+        validate_sync_policy(next_enabled, next_value, next_unit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    provider.sync_enabled = next_enabled
+    provider.sync_interval_value = next_value
+    provider.sync_interval_unit = next_unit
+    provider.next_sync_at = (
+        next_sync_time(datetime.now(timezone.utc), next_value, next_unit)
+        if next_enabled and next_value is not None and next_unit is not None
+        else None
+    )
 
 
 def _sanitize_identity_provider_config(provider_type: str, config: dict | None) -> dict | None:
     if config is None:
         return None
-    sanitized = dict(config)
-    if provider_type == "google_workspace":
-        sanitized.pop("google_admin_refresh_token", None)
-        sanitized.pop("google_admin_refresh_token_encrypted", None)
+    secret_fields = {
+        "app_secret",
+        "appsecret",
+        "client_secret",
+        "secret",
+        "bot_secret",
+        "verify_aes_key",
+        "google_admin_refresh_token",
+        "google_admin_refresh_token_encrypted",
+        "password",
+        "private_key",
+    }
+    configured: list[str] = []
+
+    def scrub(value, path: str = ""):
+        if isinstance(value, dict):
+            cleaned = {}
+            for key, item in value.items():
+                item_path = f"{path}.{key}" if path else key
+                if key.lower() in secret_fields:
+                    if item:
+                        configured.append(item_path)
+                    continue
+                cleaned[key] = scrub(item, item_path)
+            return cleaned
+        if isinstance(value, list):
+            return [scrub(item, path) for item in value]
+        return value
+
+    sanitized = scrub(config)
+    sanitized["secret_fields_configured"] = sorted(configured)
     return sanitized
 
 
@@ -259,6 +396,33 @@ def _identity_provider_response(provider: IdentityProvider, sso_domain: str | No
     if sso_domain is not None:
         data["sso_domain"] = sso_domain
     return data
+
+
+async def _ensure_provider_type_available(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID | None,
+    provider_type: str,
+) -> None:
+    """Serialize provider creation and reject a duplicate type in one tenant."""
+    lock_key = f"identity-provider-type:{tenant_id or 'global'}:{provider_type}"
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": lock_key},
+    )
+    query = select(IdentityProvider.id).where(
+        IdentityProvider.provider_type == provider_type,
+    )
+    query = query.where(
+        IdentityProvider.tenant_id == tenant_id
+        if tenant_id is not None
+        else IdentityProvider.tenant_id.is_(None)
+    )
+    if (await db.execute(query.limit(1))).scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This provider type is already configured for the tenant",
+        )
 
 
 @router.post("/identity-providers", response_model=IdentityProviderOut)
@@ -275,7 +439,7 @@ async def create_identity_provider(
 
     # Validate and determine tenant_id
     tid = data.tenant_id
-    is_platform_admin = _is_platform_admin_user(current_user)
+    is_platform_admin = _is_global_platform_admin_user(current_user)
     if is_platform_admin:
         # Platform admins can use any tenant_id (including None for global providers)
         pass
@@ -289,6 +453,12 @@ async def create_identity_provider(
 
     if not tid and not (is_platform_admin and data.provider_type in {"google", "github"}):
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
+
+    await _ensure_provider_type_available(
+        db,
+        tenant_id=tid,
+        provider_type=data.provider_type,
+    )
 
     if data.sso_login_enabled:
         if not await sso_service.validate_sso_enablement(db, tid):
@@ -305,6 +475,12 @@ async def create_identity_provider(
         sso_enabled_at=datetime.now(timezone.utc) if data.sso_login_enabled else None,
         config=data.config,
         tenant_id=tid
+    )
+    _apply_sync_policy(
+        provider,
+        enabled=data.sync_enabled,
+        interval_value=data.sync_interval_value,
+        interval_unit=data.sync_interval_unit,
     )
     db.add(provider)
     await db.commit()
@@ -323,7 +499,7 @@ async def create_oauth2_provider(
     # Validate and determine tenant_id: platform admins may target any tenant
     # (or global via None); others are restricted to their own tenant.
     tid = data.tenant_id
-    if not _is_platform_admin_user(current_user):
+    if not _is_global_platform_admin_user(current_user):
         if tid is None:
             tid = current_user.tenant_id
         elif str(tid) != str(current_user.tenant_id):
@@ -331,8 +507,24 @@ async def create_oauth2_provider(
     if not tid:
         raise HTTPException(status_code=400, detail="tenant_id is required")
 
+    await _ensure_provider_type_available(
+        db,
+        tenant_id=tid,
+        provider_type="oauth2",
+    )
+
     # Build config dict from validated model
     config_dict = data.config.model_dump(mode='json', exclude_unset=True)
+    if not config_dict.get("app_secret"):
+        raise HTTPException(status_code=422, detail="OAuth2 client secret is required")
+    if config_dict.get("scim_base_url"):
+        config_dict["directory_protocol"] = "scim"
+        config_dict["capabilities"] = {
+            "login_protocol": "oauth2",
+            "directory_protocol": "scim",
+            "channel_protocols": [],
+        }
+    validate_provider_config("oauth2", config_dict)
 
     # Handle field_mapping: None means no mapping, empty dict also means None
     if config_dict.get('field_mapping') == {}:
@@ -347,6 +539,12 @@ async def create_oauth2_provider(
         config=config_dict,
         tenant_id=tid if isinstance(tid, uuid.UUID) else uuid.UUID(tid) if tid else None,
     )
+    _apply_sync_policy(
+        provider,
+        enabled=data.sync_enabled,
+        interval_value=data.sync_interval_value,
+        interval_unit=data.sync_interval_unit,
+    )
     db.add(provider)
     await db.commit()
     await db.refresh(provider)
@@ -355,7 +553,7 @@ async def create_oauth2_provider(
     if provider.tenant_id:
         await _sync_tenant_sso_state(db, provider.tenant_id)
 
-    return IdentityProviderOut.model_validate(provider)
+    return _identity_provider_response(provider)
 
 
 @router.patch("/identity-providers/{provider_id}/oauth2", response_model=IdentityProviderOut)
@@ -374,7 +572,7 @@ async def update_oauth2_provider(
     if provider.provider_type != "oauth2":
         raise HTTPException(status_code=400, detail="Provider is not an OAuth2 provider")
 
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
+    if not _is_global_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
 
     # Update basic fields
@@ -386,10 +584,27 @@ async def update_oauth2_provider(
         if data.sso_login_enabled and not provider.sso_login_enabled:
             provider.sso_enabled_at = datetime.now(timezone.utc)
         provider.sso_login_enabled = data.sso_login_enabled
+    if any(
+        value is not None
+        for value in (data.sync_enabled, data.sync_interval_value, data.sync_interval_unit)
+    ):
+        _apply_sync_policy(
+            provider,
+            enabled=data.sync_enabled,
+            interval_value=data.sync_interval_value,
+            interval_unit=data.sync_interval_unit,
+        )
 
     # Update config if provided
     if data.config is not None:
         config_dict = data.config.model_dump(mode='json', exclude_unset=True)
+        if config_dict.get("scim_base_url"):
+            config_dict["directory_protocol"] = "scim"
+            config_dict["capabilities"] = {
+                "login_protocol": "oauth2",
+                "directory_protocol": "scim",
+                "channel_protocols": [],
+            }
         current_config = provider.config.copy()
 
         # Merge config fields
@@ -402,7 +617,12 @@ async def update_oauth2_provider(
                     current_config.pop('field_mapping', None)
                 else:
                     current_config['field_mapping'] = value
-            elif value is not None:
+            elif key == 'directory' and isinstance(value, dict):
+                current_config['directory'] = {
+                    **(current_config.get('directory') or {}),
+                    **value,
+                }
+            elif value not in (None, ""):
                 current_config[key] = value
 
         validate_provider_config("oauth2", current_config)
@@ -430,7 +650,7 @@ async def update_identity_provider(
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
+    if not _is_global_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
 
     if data.name is not None:
@@ -447,10 +667,26 @@ async def update_identity_provider(
                 )
             provider.sso_enabled_at = datetime.now(timezone.utc)
         provider.sso_login_enabled = data.sso_login_enabled
+    if any(
+        value is not None
+        for value in (data.sync_enabled, data.sync_interval_value, data.sync_interval_unit)
+    ):
+        _apply_sync_policy(
+            provider,
+            enabled=data.sync_enabled,
+            interval_value=data.sync_interval_value,
+            interval_unit=data.sync_interval_unit,
+        )
     if data.config is not None:
         # Merge config
         new_config = provider.config.copy()
-        new_config.update(data.config)
+        secret_fields = {"app_secret", "appsecret", "client_secret", "secret", "bot_secret", "verify_aes_key"}
+        for key, value in data.config.items():
+            if key == "secret_fields_configured":
+                continue
+            if key in secret_fields and value in (None, ""):
+                continue
+            new_config[key] = value
 
         # Validate merged config
         validate_provider_config(provider.provider_type, new_config)
@@ -480,31 +716,20 @@ async def delete_identity_provider(
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete an identity provider."""
+    """Retire a provider while preserving directory and sync audit facts."""
     result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
     provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
+    if not _is_global_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this provider")
 
-    try:
-        # Nullify references in synced org data before deleting the provider
-        from sqlalchemy import update
-        await db.execute(
-            update(OrgMember).where(OrgMember.provider_id == provider_id).values(provider_id=None)
-        )
-        await db.execute(
-            update(OrgDepartment).where(OrgDepartment.provider_id == provider_id).values(provider_id=None)
-        )
-
-        await db.delete(provider)
-        await db.commit()
-    except SQLAlchemyError as e:
-        await db.rollback()
-        logger.error(f"Failed to delete identity provider {provider_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete identity provider due to database constraints")
+    provider.is_active = False
+    provider.sso_login_enabled = False
+    provider.sync_enabled = False
+    provider.next_sync_at = None
+    await db.commit()
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

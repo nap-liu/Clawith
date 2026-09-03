@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -13,6 +13,7 @@ from app.core.security import create_access_token, verify_password_async
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import IdentityOut, MultiTenantResponse, TenantChoice, TokenResponse, UserLogin, UserOut
+from app.services.authentication_state import require_active_authentication_principal
 
 router = APIRouter()
 
@@ -20,6 +21,14 @@ router = APIRouter()
 @router.post("/login", response_model=Any)
 async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     """Login with email/phone/username and password. Supports multi-tenant selection."""
+    from app.services.platform_auth_policy import get_platform_auth_policy
+
+    auth_policy = await get_platform_auth_policy(db)
+    if not auth_policy.password_login_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password login is disabled. Use an enabled SSO provider.",
+        )
     from app.models.tenant import Tenant
     from app.models.user import Identity, User
 
@@ -75,7 +84,16 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
             )
 
     # 3. Find all User records (tenants)
-    result = await db.execute(select(User).where(User.identity_id == identity.id).options(selectinload(User.identity)))
+    result = await db.execute(
+        select(User)
+        .outerjoin(Tenant, Tenant.id == User.tenant_id)
+        .where(
+            User.identity_id == identity.id,
+            User.is_active.is_(True),
+            or_(User.tenant_id.is_(None), Tenant.is_active.is_(True)),
+        )
+        .options(selectinload(User.identity))
+    )
     valid_users = list(result.scalars().all())
 
     if not valid_users:
@@ -83,6 +101,11 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
         # Create a "tenant-less" user if needed, or redirect to company setup
         # For now, if no users, they need company setup.
         # But wait, register_init should have created one.
+        if data.tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This account cannot access the selected organization.",
+            )
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No organization associated with this account.")
 
     # 4. Handle Tenant Selection
@@ -148,6 +171,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
                 detail="This account does not belong to this organization.",
             )
 
+    await require_active_authentication_principal(db, user)
     needs_setup = user.tenant_id is None
     token = create_access_token(str(user.id), user.role)
     return TokenResponse(

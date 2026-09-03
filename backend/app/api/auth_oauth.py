@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, get_current_user
 from app.database import get_db
 from app.models.user import User
+from app.services.platform_auth_policy import AccountRegistrationDisabled
 from app.schemas.schemas import (
     AuthCodeExchangeRequest,
     IdentityBindRequest,
@@ -136,6 +137,8 @@ async def exchange_auth_code(
         user = login_result.user
     except OAuthCodeLoginError as e:
         raise HTTPException(status_code=e.status_code, detail=e.public_message) from e
+    except AccountRegistrationDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as e:

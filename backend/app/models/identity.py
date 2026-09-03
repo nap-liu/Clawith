@@ -4,7 +4,7 @@ from enum import Enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -27,6 +27,17 @@ class IdentityProvider(Base):
     """Configuration for external identity providers (Feishu, DingTalk, WeCom, etc.)."""
 
     __tablename__ = "identity_providers"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_identity_provider_tenant"),
+        CheckConstraint(
+            "sync_interval_unit IS NULL OR sync_interval_unit IN ('hour', 'day', 'week', 'month')",
+            name="ck_identity_providers_sync_interval_unit",
+        ),
+        CheckConstraint(
+            "sync_interval_value IS NULL OR sync_interval_value > 0",
+            name="ck_identity_providers_sync_interval_value",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Use plain String instead of PostgreSQL native Enum to stay compatible with the
@@ -38,6 +49,14 @@ class IdentityProvider(Base):
     sso_login_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     sso_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    # Directory scheduling is provider-scoped. Login enablement is independent.
+    sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    sync_interval_value: Mapped[int | None] = mapped_column(Integer)
+    sync_interval_unit: Mapped[str | None] = mapped_column(String(10))
+    next_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_sync_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sync_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Optional tenant_id for enterprise-specific providers (no FK - soft coupling)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

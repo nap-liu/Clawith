@@ -19,6 +19,7 @@ from app.schemas.schemas import (
     UserOut,
     UserRegister,
 )
+from app.services.authentication_state import require_active_authentication_principal
 
 router = APIRouter()
 
@@ -30,7 +31,24 @@ async def get_registration_config(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(SystemSetting).where(SystemSetting.key == "invitation_code_enabled"))
     setting = result.scalar_one_or_none()
     enabled = setting.value.get("enabled", False) if setting else False
-    return {"invitation_code_required": enabled}
+    from app.services.platform_auth_policy import get_platform_auth_policy
+
+    auth_policy = await get_platform_auth_policy(db)
+    return {
+        "invitation_code_required": enabled,
+        "password_login_enabled": auth_policy.password_login_enabled,
+        "account_registration_enabled": auth_policy.account_registration_enabled,
+    }
+
+
+async def _require_account_registration(db: AsyncSession) -> None:
+    from app.services.platform_auth_policy import get_platform_auth_policy
+
+    if not (await get_platform_auth_policy(db)).account_registration_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account registration is disabled.",
+        )
 
 
 @router.get("/check-duplicate")
@@ -119,6 +137,8 @@ async def register(
     from app.config import get_settings
     settings = get_settings()
 
+    await _require_account_registration(db)
+
     # Handle SSO registration if provider info provided
     if data.provider and data.provider_code:
         return await _handle_sso_register(data, db)
@@ -137,6 +157,7 @@ async def register_init(
 
     Creates/finds a global Identity and a tenant-scoped User.
     """
+    await _require_account_registration(db)
     from app.config import get_settings
     settings = get_settings()
     from app.services.registration_service import registration_service
@@ -249,9 +270,14 @@ async def register_sso(
     This endpoint handles OAuth-based registration/login via external providers.
     """
     from app.services.auth_registry import auth_provider_registry
+    from app.services.platform_auth_policy import get_platform_auth_policy
     from app.services.registration_service import registration_service
 
     logger.info(f"[REGISTER_SSO] Starting SSO registration: provider={data.provider}")
+
+    registration_allowed = (
+        await get_platform_auth_policy(db)
+    ).account_registration_enabled
 
     # Get provider
     auth_provider = await auth_provider_registry.get_provider(db, data.provider)
@@ -265,6 +291,9 @@ async def register_sso(
 
     if error:
         raise HTTPException(status_code=400, detail=error)
+    if is_new and not registration_allowed:
+        await db.rollback()
+        raise HTTPException(status_code=403, detail="Account registration is disabled.")
 
     # If no tenant, check for email domain match
     if not user.tenant_id and user.email:
@@ -275,6 +304,7 @@ async def register_sso(
             user.tenant_id = tenant.id
             await db.flush()
 
+    await require_active_authentication_principal(db, user)
     # Generate token
     token = create_access_token(str(user.id), user.role)
 

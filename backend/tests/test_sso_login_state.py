@@ -181,7 +181,12 @@ async def test_sso_provider_order_uses_enable_time_only():
 @pytest.mark.asyncio
 async def test_sso_start_binds_browser_and_exact_provider():
     async with async_session() as db:
-        tenant = Tenant(name="SSO Start Test", slug=f"start-{uuid.uuid4().hex[:8]}", im_provider="web_only")
+        tenant = Tenant(
+            name="SSO Start Test",
+            slug=f"start-{uuid.uuid4().hex[:8]}",
+            im_provider="web_only",
+            sso_domain="http://local-ai.yeyecha.com:3008",
+        )
         db.add(tenant)
         await db.flush()
         provider = IdentityProvider(
@@ -205,7 +210,13 @@ async def test_sso_start_binds_browser_and_exact_provider():
         assert started.status_code == 200
         payload = started.json()
         sid = uuid.UUID(payload["session_id"])
-        state = parse_qs(urlparse(payload["authorization_url"]).query)["state"][0]
+        authorization_url = payload["authorization_url"]
+        authorization_query = parse_qs(urlparse(authorization_url).query)
+        state = authorization_query["state"][0]
+        assert "scope=openid+profile" in authorization_url
+        assert authorization_query["redirect_uri"] == [
+            "http://local-ai.yeyecha.com:3008/api/auth/oauth2/callback"
+        ]
         assert parse_sso_login_state(state) == (sid, provider_id, query)
         assert sso_browser_cookie_name(sid) in started.headers["set-cookie"]
 

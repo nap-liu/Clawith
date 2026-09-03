@@ -13,6 +13,7 @@ def _sync_confirmation_dependencies() -> None:
     for module in (_confirmation_core, _confirmation_delivery):
         for name in (
             "_broadcast",
+            "_deliver_channel_card_unlocked",
             "_mark_card_expired",
             "_push_card_state",
             "_reenter_loop",

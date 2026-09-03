@@ -273,13 +273,17 @@ class FeishuService:
             u_result = await db.execute(select(User).where(User.id == member.user_id))
             user = u_result.scalars().first()
 
-        # 3. Fallback: find by email matching (exact match)
-        if not user and fs_email:
-            query = select(User).join(User.identity).where(Identity.email == fs_email)
-            if tenant_id:
-                query = query.where(User.tenant_id == tenant_id)
-            result = await db.execute(query)
-            user = result.scalars().first()
+        if not user and (fs_email or feishu_user.get("mobile")):
+            from app.services.canonical_user_resolver import canonical_user_resolver
+            from app.services.provider_identity_policy import identity_match_order
+            claims = await canonical_user_resolver.resolve_identity_claims(
+                db, email=fs_email, phone=feishu_user.get("mobile"),
+                ordered_fields=identity_match_order(provider),
+            )
+            if claims.identity:
+                user = await canonical_user_resolver.get_tenant_user(
+                    db, tenant_id=tenant_id, identity_id=claims.identity.id
+                )
 
         if user:
             # Existing user — sync latest profile from Feishu
@@ -324,6 +328,7 @@ class FeishuService:
                 phone=feishu_user.get("mobile"),
                 username=username,
                 password=None,
+                provider=provider,
             )
 
             # Step 2: Create tenant-scoped User linked to Identity

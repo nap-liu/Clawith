@@ -7,6 +7,7 @@ from typing import Tuple
 from fastapi import HTTPException, status
 from sqlalchemy import and_, false, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.agent import Agent, AgentPermission
 from app.models.org import (
@@ -15,10 +16,10 @@ from app.models.org import (
     OrgMember,
     RelationshipSuppression,
 )
-from app.models.user import User
+from app.models.user import Identity, User
 from app.services.org_directory import (
     agent_permission_department_subtree_cte,
-    same_directory_provider,
+    member_in_directory_group,
 )
 
 
@@ -80,10 +81,10 @@ def build_visible_agents_query(
                 OrgMember.user_id == user.id,
                 OrgMember.tenant_id == target_tenant_id,
                 OrgMember.status == "active",
-                OrgMember.department_id == department_grants.c.department_id,
-                same_directory_provider(
-                    OrgMember.provider_id,
-                    department_grants.c.provider_id,
+                member_in_directory_group(
+                    OrgMember,
+                    group_id=department_grants.c.department_id,
+                    provider_id=department_grants.c.provider_id,
                 ),
             ),
         )
@@ -258,9 +259,12 @@ async def get_agent_access_level_for_user_id(
     if not user_id:
         return None
 
-    user_result = await db.execute(select(User).where(User.id == user_id))
+    user_result = await db.execute(
+        select(User).where(User.id == user_id).options(selectinload(User.identity))
+    )
     user = user_result.scalar_one_or_none()
-    if not user or not user.is_active:
+    identity = getattr(user, "identity", None) if user else None
+    if not user or not user.is_active or (identity and not identity.is_active):
         return None
     if user.role == "org_admin" and user.tenant_id is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant scope assigned")
@@ -346,10 +350,10 @@ async def _get_department_permission_level(
                 OrgMember.user_id == user_id,
                 OrgMember.tenant_id == agent.tenant_id,
                 OrgMember.status == "active",
-                OrgMember.department_id == department_grants.c.department_id,
-                same_directory_provider(
-                    OrgMember.provider_id,
-                    department_grants.c.provider_id,
+                member_in_directory_group(
+                    OrgMember,
+                    group_id=department_grants.c.department_id,
+                    provider_id=department_grants.c.provider_id,
                 ),
             ),
         )
@@ -374,9 +378,11 @@ def build_agent_accessible_user_ids_query(
     base_conditions = [
         User.tenant_id == agent.tenant_id,
         User.is_active == True,  # noqa: E712
+        or_(Identity.id.is_(None), Identity.is_active.is_(True)),
     ]
+    base_query = select(User.id).outerjoin(Identity, Identity.id == User.identity_id)
     if access_mode == "company":
-        return select(User.id).where(*base_conditions)
+        return base_query.where(*base_conditions)
 
     if access_mode == "custom":
         explicit_user_ids = select(AgentPermission.scope_id).where(
@@ -403,10 +409,10 @@ def build_agent_accessible_user_ids_query(
                     and_(
                         OrgMember.tenant_id == agent.tenant_id,
                         OrgMember.status == "active",
-                        OrgMember.department_id == department_grants.c.department_id,
-                        same_directory_provider(
-                            OrgMember.provider_id,
-                            department_grants.c.provider_id,
+                        member_in_directory_group(
+                            OrgMember,
+                            group_id=department_grants.c.department_id,
+                            provider_id=department_grants.c.provider_id,
                         ),
                     ),
                 )
@@ -417,9 +423,9 @@ def build_agent_accessible_user_ids_query(
                 .distinct()
             )
             access_conditions.append(User.id.in_(department_user_ids))
-        return select(User.id).where(*base_conditions, or_(*access_conditions))
+        return base_query.where(*base_conditions, or_(*access_conditions))
 
-    return select(User.id).where(*base_conditions, User.id == agent.creator_id)
+    return base_query.where(*base_conditions, User.id == agent.creator_id)
 
 
 async def get_agent_accessible_user_ids(

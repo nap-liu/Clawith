@@ -15,12 +15,16 @@ class OAuth2FieldMapping(BaseModel):
 class OAuth2Config(BaseModel):
     """OAuth2 provider configuration."""
     app_id: str = Field(..., min_length=1, description='OAuth2 Client ID')
-    app_secret: str = Field(..., min_length=1, description='OAuth2 Client Secret')
+    app_secret: str = Field(default='', description='OAuth2 Client Secret; blank preserves on update')
     authorize_url: str = Field(..., description='OAuth2 Authorization Endpoint')
     token_url: str = Field(default='', description='OAuth2 Token Endpoint (optional)')
     user_info_url: str = Field(default='', description='OAuth2 UserInfo Endpoint (optional)')
     scope: str = Field(default='openid profile email', description='OAuth2 Scopes')
+    scim_base_url: str = Field(default='', description='SCIM 2.0 directory base URL')
+    scim_page_size: int = Field(default=500, ge=1, le=1000)
     field_mapping: Optional[OAuth2FieldMapping] = Field(default=None, description='Custom field name mapping')
+    directory: Optional[dict] = Field(default=None, description='SCIM directory configuration')
+    identity_match_policy: Optional[dict] = None
     
     @field_validator('authorize_url')
     @classmethod
@@ -36,6 +40,9 @@ class OAuth2ProviderCreate(BaseModel):
     config: OAuth2Config
     is_active: bool = True
     sso_login_enabled: bool = True
+    sync_enabled: bool = False
+    sync_interval_value: Optional[int] = None
+    sync_interval_unit: Optional[str] = None
     tenant_id: Optional[uuid.UUID] = None
 
 
@@ -44,4 +51,7 @@ class OAuth2ProviderUpdate(BaseModel):
     name: Optional[str] = None
     is_active: Optional[bool] = None
     sso_login_enabled: Optional[bool] = None
+    sync_enabled: Optional[bool] = None
+    sync_interval_value: Optional[int] = None
+    sync_interval_unit: Optional[str] = None
     config: Optional[OAuth2Config] = None

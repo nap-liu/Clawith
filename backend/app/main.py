@@ -209,6 +209,12 @@ async def lifespan(fastapi_app: FastAPI):
             import app.models.mcp_server     # noqa  # FK target of tools.mcp_server_id; fresh-DB create_all needs it registered
             import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
             import app.models.scene          # noqa
+            import app.models.channel_type_default  # noqa
+            import app.models.cli_tool_binary       # noqa
+            import app.models.dingtalk_provisioning # noqa
+            import app.models.personal_access_token # noqa
+            import app.models.speech_recognition_config  # noqa
+            import app.models.workspace      # noqa
             import app.models.project        # noqa
 
             import app.models.identity       # noqa
@@ -362,8 +368,10 @@ async def lifespan(fastapi_app: FastAPI):
 
         if _role_enabled("all", "worker"):
             from app.services.subagent_runtime import start_subagent_daemon
+            from app.services.directory_sync_scheduler import directory_sync_scheduler_loop
 
             task_specs.append(("trigger_daemon", start_trigger_daemon()))
+            task_specs.append(("directory_sync_scheduler", directory_sync_scheduler_loop()))
             task_specs.append(("subagent_daemon", start_subagent_daemon()))
             task_specs.append(("cli_tools_gc", cli_tools_gc_loop()))
         if _role_enabled("all", "connector"):

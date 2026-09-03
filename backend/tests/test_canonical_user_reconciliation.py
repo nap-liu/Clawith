@@ -87,23 +87,23 @@ async def _tenant_and_providers(
         return tenant.id, dingtalk.id, oauth.id
 
 
-async def test_email_and_phone_are_equal_claims_and_split_identity_fails_closed():
+async def test_split_claims_choose_configured_default_phone_and_flag_email():
     email = f"equal-{uuid.uuid4().hex[:8]}@example.com"
     phone = _phone()
     async with async_session() as db:
-        db.add_all(
-            [
-                Identity(username=f"email-{uuid.uuid4().hex[:8]}", email=email),
-                Identity(username=f"phone-{uuid.uuid4().hex[:8]}", phone=phone),
-            ]
-        )
+        email_identity = Identity(username=f"email-{uuid.uuid4().hex[:8]}", email=email)
+        phone_identity = Identity(username=f"phone-{uuid.uuid4().hex[:8]}", phone=phone)
+        db.add_all([email_identity, phone_identity])
         await db.commit()
+        phone_identity_id = phone_identity.id
 
     async with async_session() as db:
-        with pytest.raises(CanonicalIdentityConflict):
-            await canonical_user_resolver.resolve_identity_claims(
-                db, email=email.upper(), phone=f"+{phone[:2]} {phone[2:]}", enrich=True
-            )
+        claims = await canonical_user_resolver.resolve_identity_claims(
+            db, email=email.upper(), phone=f"+{phone[:2]} {phone[2:]}", enrich=True
+        )
+        assert claims.identity.id == phone_identity_id
+        assert claims.matched_by == "phone"
+        assert claims.conflicting_fields == ("email",)
 
 
 async def test_legacy_auto_repair_rejects_phone_only_fresh_claims():
@@ -158,6 +158,74 @@ async def test_single_email_match_safely_enriches_phone():
         assert resolved.id == identity_id
         assert resolved.email == email
         assert resolved.phone == phone
+
+
+async def test_sso_identity_creation_honors_provider_email_first_policy():
+    email = f"email-first-{uuid.uuid4().hex[:8]}@example.com"
+    phone = _phone()
+    provider = SimpleNamespace(
+        id=uuid.uuid4(),
+        provider_type="oauth2",
+        config={"identity_match_policy": {"ordered_fields": ["email", "phone"]}},
+    )
+    async with async_session() as db:
+        email_identity = Identity(username=f"email-{uuid.uuid4().hex[:8]}", email=email)
+        phone_identity = Identity(username=f"phone-{uuid.uuid4().hex[:8]}", phone=phone)
+        db.add_all([email_identity, phone_identity])
+        await db.commit()
+        expected_id = email_identity.id
+
+    async with async_session() as db:
+        resolved = await registration_service.find_or_create_identity(
+            db,
+            email=email,
+            phone=phone,
+            provider=provider,
+        )
+        assert resolved.id == expected_id
+
+
+async def test_provider_policy_can_disable_lower_priority_email_fallback():
+    email = f"phone-only-{uuid.uuid4().hex[:8]}@example.com"
+    async with async_session() as db:
+        email_identity = Identity(username=f"email-{uuid.uuid4().hex[:8]}", email=email)
+        db.add(email_identity)
+        await db.commit()
+
+    async with async_session() as db:
+        claims = await canonical_user_resolver.resolve_identity_claims(
+            db,
+            email=email,
+            phone=None,
+            enrich=False,
+            ordered_fields=["phone"],
+        )
+        assert claims.identity is None
+        assert claims.matched_by is None
+
+
+async def test_provider_policy_can_use_email_as_its_only_match_field():
+    email = f"email-only-{uuid.uuid4().hex[:8]}@example.com"
+    phone = _phone()
+    async with async_session() as db:
+        email_identity = Identity(username=f"email-{uuid.uuid4().hex[:8]}", email=email)
+        phone_identity = Identity(username=f"phone-{uuid.uuid4().hex[:8]}", phone=phone)
+        db.add_all([email_identity, phone_identity])
+        await db.commit()
+        expected_id = email_identity.id
+
+    async with async_session() as db:
+        claims = await canonical_user_resolver.resolve_identity_claims(
+            db,
+            email=email,
+            phone=phone,
+            enrich=False,
+            ordered_fields=["email"],
+        )
+        assert claims.identity is not None
+        assert claims.identity.id == expected_id
+        assert claims.matched_by == "email"
+        assert claims.conflicting_fields == ()
 
 
 async def test_fresh_org_email_repairs_strict_legacy_dingtalk_split():
@@ -489,7 +557,8 @@ async def test_directory_then_oauth_attaches_identity_to_same_tenant_user(
             provider=provider,
             fresh_claims=await fake_fetch(provider, external_id),
         )
-        assert provisioned.user.identity_id is None
+        assert provisioned.user.identity_id is not None
+        original_identity_id = provisioned.user.identity_id
         original_user_id = provisioned.user.id
         await db.commit()
 
@@ -511,7 +580,7 @@ async def test_directory_then_oauth_attaches_identity_to_same_tenant_user(
         await db.commit()
         assert created is False
         assert user.id == original_user_id
-        assert user.identity_id is not None
+        assert user.identity_id == original_identity_id
 
 
 async def test_enterprise_oauth_never_uses_provider_subject_as_local_password():

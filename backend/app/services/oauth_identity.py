@@ -9,7 +9,7 @@ import uuid
 
 from fastapi import HTTPException
 from pydantic import EmailStr, TypeAdapter, ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,11 +18,11 @@ from app.config import get_settings
 from app.models.audit import AuditLog
 from app.models.identity import IdentityProvider
 from app.models.org import ChannelUserBinding, OrgMember
-from app.models.user import Identity, User
+from app.models.user import User
 from app.services.canonical_user_resolver import (
-    CanonicalIdentityConflict,
     CanonicalUserConflict,
     normalize_email,
+    normalize_phone,
 )
 
 
@@ -136,20 +136,30 @@ class OAuthIdentityService:
         self.validate_enterprise_provider(provider, tenant_id)
         normalized_subject = normalize_oauth_subject(subject)
         scope = oauth_authority_scope(provider)
-        binding = (
+        bindings = (
             await db.execute(
                 select(ChannelUserBinding).where(
                     ChannelUserBinding.tenant_id == tenant_id,
                     ChannelUserBinding.provider_id == provider.id,
-                    ChannelUserBinding.installation_scope == scope,
                     ChannelUserBinding.channel_type == OAUTH_BINDING_CHANNEL,
                     ChannelUserBinding.id_type == OAUTH_BINDING_ID_TYPE,
                     ChannelUserBinding.subject == normalized_subject,
-                ).with_for_update()
+                )
+                .order_by(
+                    (ChannelUserBinding.installation_scope == scope).desc(),
+                    ChannelUserBinding.created_at,
+                )
+                .with_for_update()
             )
-        ).scalar_one_or_none()
-        if binding is None:
+        ).scalars().all()
+        if not bindings:
             return None
+        user_ids = {binding.user_id for binding in bindings}
+        if len(user_ids) != 1:
+            raise CanonicalUserConflict(
+                "OAuth subject is bound to multiple users for this provider"
+            )
+        binding = bindings[0]
         user = (
             await db.execute(
                 select(User)
@@ -212,7 +222,7 @@ class OAuthIdentityService:
             return False
         return True
 
-    async def refresh_authoritative_email(
+    async def refresh_authoritative_contacts(
         self,
         db: AsyncSession,
         *,
@@ -221,8 +231,9 @@ class OAuthIdentityService:
         subject: str,
         user: User,
         email: str | None,
+        phone: str | None,
     ) -> tuple[User, bool]:
-        """Refresh one already-bound canonical identity from trusted OAuth userinfo."""
+        """Refresh mutable contacts for one exact OAuth subject binding."""
 
         self.validate_enterprise_provider(provider, tenant_id)
         normalized_subject = normalize_oauth_subject(subject)
@@ -249,14 +260,6 @@ class OAuthIdentityService:
         ).scalar_one_or_none()
         if locked_user is None or locked_user.identity_id is None:
             raise CanonicalUserConflict("OAuth subject binding lost its canonical user")
-        identity = (
-            await db.execute(
-                select(Identity).where(Identity.id == locked_user.identity_id).with_for_update()
-            )
-        ).scalar_one_or_none()
-        if identity is None:
-            raise CanonicalUserConflict("OAuth subject binding lost its physical identity")
-
         oauth_members = (
             await db.execute(
                 select(OrgMember)
@@ -278,41 +281,36 @@ class OAuthIdentityService:
             if member.user_id is None:
                 member.user_id = locked_user.id
 
-        if normalized_email is None:
-            await db.flush()
-            return locked_user, False
+        old_email = normalize_email(locked_user.identity.email)
+        old_verified = bool(locked_user.identity.email_verified)
+        old_phone = locked_user.identity.phone
+        from app.services.provider_contact_refresh import (
+            refresh_provider_bound_contacts,
+        )
 
-        owner = (
-            await db.execute(
-                select(Identity.id)
-                .where(func.lower(func.btrim(Identity.email)) == normalized_email)
-                .limit(2)
-            )
-        ).scalars().all()
-        if any(identity_id != identity.id for identity_id in owner):
-            raise CanonicalIdentityConflict("OAuth email is already assigned to another identity")
-
-        old_email = normalize_email(identity.email)
-        old_verified = bool(identity.email_verified)
-        changed = old_email != normalized_email or not old_verified
-        if changed:
-            try:
-                async with db.begin_nested():
-                    identity.email = normalized_email
-                    identity.email_verified = True
-                    await db.flush()
-            except IntegrityError as exc:
-                raise CanonicalIdentityConflict("OAuth email is already assigned to another identity") from exc
-
+        refreshed = await refresh_provider_bound_contacts(
+            db,
+            user=locked_user,
+            provider=provider,
+            email=normalized_email,
+            phone=phone,
+            source="sso_login",
+            source_member_id=oauth_members[0].id if oauth_members else None,
+            verify_email=True,
+        )
         for member in oauth_members:
-            if member.user_id == locked_user.id and member.email != normalized_email:
+            if member.user_id != locked_user.id:
+                continue
+            if normalized_email and "email" not in refreshed.conflicting_fields:
                 member.email = normalized_email
+            normalized_phone = normalize_phone(phone)
+            if normalized_phone and "phone" not in refreshed.conflicting_fields:
+                member.phone = normalized_phone
 
-        locked_user.identity = identity
         from app.services.registration_service import registration_service
 
         await registration_service.ensure_web_org_member(db, locked_user)
-        if changed:
+        if "email" in refreshed.changed_fields:
             db.add(
                 AuditLog(
                     user_id=locked_user.id,
@@ -320,7 +318,7 @@ class OAuthIdentityService:
                     details={
                         "tenant_id": str(tenant_id),
                         "provider_id": str(provider.id),
-                        "identity_id": str(identity.id),
+                        "identity_id": str(locked_user.identity_id),
                         "subject_sha256": hashlib.sha256(normalized_subject.encode()).hexdigest(),
                         "old_email": old_email,
                         "new_email": normalized_email,
@@ -329,8 +327,44 @@ class OAuthIdentityService:
                     },
                 )
             )
+        if "phone" in refreshed.changed_fields:
+            db.add(
+                AuditLog(
+                    user_id=locked_user.id,
+                    action="oauth_identity_phone_refreshed",
+                    details={
+                        "tenant_id": str(tenant_id),
+                        "provider_id": str(provider.id),
+                        "identity_id": str(locked_user.identity_id),
+                        "subject_sha256": hashlib.sha256(normalized_subject.encode()).hexdigest(),
+                        "old_phone": old_phone,
+                        "new_phone": normalize_phone(phone),
+                    },
+                )
+            )
         await db.flush()
-        return locked_user, changed
+        return locked_user, bool(refreshed.changed_fields)
+
+    async def refresh_authoritative_email(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        provider: IdentityProvider,
+        subject: str,
+        user: User,
+        email: str | None,
+    ) -> tuple[User, bool]:
+        """Compatibility wrapper for callers that only refresh OAuth email."""
+        return await self.refresh_authoritative_contacts(
+            db,
+            tenant_id=tenant_id,
+            provider=provider,
+            subject=subject,
+            user=user,
+            email=email,
+            phone=None,
+        )
 
 
 oauth_identity_service = OAuthIdentityService()

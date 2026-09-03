@@ -10,6 +10,8 @@ from app.models.identity import IdentityProvider
 from app.models.org import (
     AgentAgentRelationship,
     AgentRelationship,
+    DirectoryAccountGroup,
+    DirectoryGroupEdge,
     OrgDepartment,
     OrgMember,
     RelationshipSuppression,
@@ -93,6 +95,8 @@ async def contact_session():
         IdentityProvider.__table__,
         OrgDepartment.__table__,
         OrgMember.__table__,
+        DirectoryGroupEdge.__table__,
+        DirectoryAccountGroup.__table__,
         AgentRelationship.__table__,
         AgentAgentRelationship.__table__,
         RelationshipSuppression.__table__,

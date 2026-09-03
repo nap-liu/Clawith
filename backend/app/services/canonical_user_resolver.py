@@ -1,13 +1,12 @@
 """Canonical identity and tenant-user reconciliation.
 
-Email and phone are equal, authoritative identity claims.  Channel identifiers
-are exact routing evidence inside one tenant/provider installation; names are
-never identity evidence.
+Contact claims are exact and evaluated in provider-configured order. Channel
+identifiers are routing evidence only; names are never identity evidence.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import uuid
 
@@ -21,6 +20,10 @@ from sqlalchemy.orm import selectinload
 from app.models.identity import IdentityProvider
 from app.models.org import OrgMember
 from app.models.user import Identity, User
+from app.services.provider_identity_policy import (
+    DEFAULT_IDENTITY_MATCH_ORDER,
+    normalize_identity_match_order,
+)
 
 
 class CanonicalIdentityConflict(ValueError):
@@ -50,6 +53,9 @@ class IdentityClaims:
     identity: Identity | None
     email: str | None
     phone: str | None
+    matched_by: str | None = None
+    conflicting_fields: tuple[str, ...] = ()
+    candidate_identity_ids: dict[str, uuid.UUID] = field(default_factory=dict)
 
 
 class CanonicalUserResolver:
@@ -60,26 +66,27 @@ class CanonicalUserResolver:
         email: str | None,
         phone: str | None,
         enrich: bool = True,
+        ordered_fields: tuple[str, ...] | list[str] = DEFAULT_IDENTITY_MATCH_ORDER,
     ) -> IdentityClaims:
-        """Resolve email and phone together, without preferring either claim."""
-        email = normalize_email(email)
-        phone = normalize_phone(phone)
+        """Resolve exact contacts in order; lower-priority conflicts are flagged."""
+        fields = normalize_identity_match_order(ordered_fields)
+        email = normalize_email(email) if "email" in fields else None
+        phone = normalize_phone(phone) if "phone" in fields else None
 
-        email_identity = None
-        phone_identity = None
-        if email:
-            email_identity = (
+        candidates: dict[str, Identity | None] = {"email": None, "phone": None}
+        if "email" in fields and email:
+            matches = (
                 await db.execute(
                     select(Identity)
                     .where(func.lower(func.btrim(Identity.email)) == email)
                     .limit(2)
                 )
             ).scalars().all()
-            if len(email_identity) > 1:
+            if len(matches) > 1:
                 raise CanonicalIdentityConflict("email maps to multiple identities")
-            email_identity = email_identity[0] if email_identity else None
-        if phone:
-            phone_identity = (
+            candidates["email"] = matches[0] if matches else None
+        if "phone" in fields and phone:
+            matches = (
                 await db.execute(
                     select(Identity)
                     .where(
@@ -91,53 +98,64 @@ class CanonicalUserResolver:
                     .limit(2)
                 )
             ).scalars().all()
-            if len(phone_identity) > 1:
+            if len(matches) > 1:
                 raise CanonicalIdentityConflict("phone maps to multiple identities")
-            phone_identity = phone_identity[0] if phone_identity else None
+            candidates["phone"] = matches[0] if matches else None
 
-        if email_identity and phone_identity and email_identity.id != phone_identity.id:
-            raise CanonicalIdentityConflict(
-                "verified email and phone belong to different identities"
-            )
-
-        identity = email_identity or phone_identity
+        matched_by = next(
+            (field for field in fields if candidates[field] is not None), None
+        )
+        identity = candidates[matched_by] if matched_by else None
+        conflicting_fields = tuple(
+            field
+            for field in fields
+            if identity is not None
+            and candidates[field] is not None
+            and candidates[field].id != identity.id
+        )
         if identity and enrich:
-            if (
-                email
-                and identity.email
-                and not _is_placeholder_email(identity.email)
-                and normalize_email(identity.email) != email
-            ):
-                raise CanonicalIdentityConflict("verified email conflicts with identity")
-            if phone and identity.phone and normalize_phone(identity.phone) != phone:
-                raise CanonicalIdentityConflict("verified phone conflicts with identity")
             try:
                 async with db.begin_nested():
-                    if email and (
+                    if "email" not in conflicting_fields and email and (
                         not identity.email
                         or _is_placeholder_email(identity.email)
-                        or identity.email != email
+                        or normalize_email(identity.email) == email
                     ):
                         identity.email = email
-                    if phone and identity.phone != phone:
+                    if "phone" not in conflicting_fields and phone and (
+                        not identity.phone or normalize_phone(identity.phone) == phone
+                    ):
                         identity.phone = phone
                     await db.flush()
             except IntegrityError as exc:
-                # Another request claimed one field after our initial read.
-                # Re-read both claims and either converge to this same identity
-                # or surface a deterministic conflict.
                 db.expire(identity)
                 reread = await self.resolve_identity_claims(
-                    db, email=email, phone=phone, enrich=False
+                    db,
+                    email=email,
+                    phone=phone,
+                    enrich=False,
+                    ordered_fields=fields,
                 )
                 if reread.identity and reread.identity.id == identity.id:
                     identity = reread.identity
+                    conflicting_fields = reread.conflicting_fields
                 else:
                     raise CanonicalIdentityConflict(
                         "concurrent identity claim resolved to another identity"
                     ) from exc
 
-        return IdentityClaims(identity=identity, email=email, phone=phone)
+        return IdentityClaims(
+            identity=identity,
+            email=email,
+            phone=phone,
+            matched_by=matched_by,
+            conflicting_fields=conflicting_fields,
+            candidate_identity_ids={
+                name: candidate.id
+                for name, candidate in candidates.items()
+                if candidate is not None
+            },
+        )
 
     async def get_tenant_user(
         self,

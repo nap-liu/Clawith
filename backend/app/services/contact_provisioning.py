@@ -11,6 +11,7 @@ import uuid
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,6 +21,11 @@ from app.models.participant import Participant
 from app.models.user import Identity, User
 from app.services.canonical_user_resolver import normalize_email, normalize_phone
 from app.services.directory_identity_claims import VerifiedDirectoryClaims
+from app.services.provider_identity_policy import (
+    identity_match_order,
+    record_identity_match_conflict,
+    record_subject_contact_conflict,
+)
 
 
 _LOCAL_EMAIL_SUFFIX = ".local"
@@ -34,6 +40,7 @@ class ContactProvisioningResult:
     global_identity_matched_no_tenant_user: bool = False
     external_only_user_created: bool = False
     legacy_split_repaired: bool = False
+    identity_conflict: bool = False
     skipped_reason: str | None = None
 
     @property
@@ -78,6 +85,7 @@ class ContactProvisioningService:
         provider: IdentityProvider | None = None,
         fresh_claims: VerifiedDirectoryClaims | None = None,
         subject_lock_held: bool = False,
+        directory_sync: bool = False,
     ) -> ContactProvisioningResult:
         if fresh_claims is not None:
             from app.services.dingtalk_identity_reconciliation import (
@@ -112,14 +120,21 @@ class ContactProvisioningService:
         tenant_id = org_member.tenant_id
         if tenant_id is None:
             return ContactProvisioningResult(skipped_reason="missing_tenant")
+        if org_member.status != "active" and not directory_sync:
+            return ContactProvisioningResult(skipped_reason="source_inactive")
 
         provider = provider or await self._get_provider(db, org_member.provider_id)
         provider_type = self._provider_type(provider)
         # Contact fields are identity evidence only when the provider contract
         # says they came from an authenticated corporate directory. Other
         # channel payloads remain profile data and must not merge people.
-        verified_contact = provider_type == "dingtalk" or bool(
-            (getattr(provider, "config", None) or {}).get("verified_contact_identity")
+        provider_config = (getattr(provider, "config", None) or {})
+        directory_protocol = (
+            (provider_config.get("capabilities") or {}).get("directory_protocol")
+            or provider_config.get("directory_protocol")
+        )
+        verified_contact = provider_type == "dingtalk" or directory_protocol == "scim" or bool(
+            provider_config.get("verified_contact_identity")
         )
         if provider_type == "dingtalk":
             claims_in_scope = bool(
@@ -149,7 +164,7 @@ class ContactProvisioningService:
             else None
         )
 
-        if linked_user and not linked_user.is_active:
+        if linked_user and not linked_user.is_active and not directory_sync:
             return ContactProvisioningResult(
                 skipped_reason="skipped_requires_confirmation"
             )
@@ -192,6 +207,42 @@ class ContactProvisioningService:
                     f"legacy DingTalk identity split requires repair: {legacy.reason or legacy.status}"
                 )
 
+        # Once this exact provider directory account is linked, its provider
+        # ID remains the identity anchor. Mutable contacts refresh that same
+        # identity; they never re-identify the account or create a second user.
+        if linked_user and linked_user.identity_id and provider is not None:
+            from app.services.provider_contact_refresh import (
+                refresh_provider_bound_contacts,
+            )
+
+            refreshed = await refresh_provider_bound_contacts(
+                db,
+                user=linked_user,
+                provider=provider,
+                email=email,
+                phone=mobile,
+                source="directory_contact",
+                source_member_id=org_member.id,
+                verify_email=verified_contact,
+            )
+            await self._sync_user_profile(
+                db,
+                linked_user,
+                org_member,
+                provider,
+                mobile,
+                email,
+                verified_contact,
+            )
+            await self._ensure_participant(db, linked_user)
+            await db.flush()
+            return ContactProvisioningResult(
+                user=linked_user,
+                user_linked=True,
+                tenant_user_matched=True,
+                identity_conflict=refreshed.has_conflict,
+            )
+
         from app.services.canonical_user_resolver import canonical_user_resolver
 
         claims = await canonical_user_resolver.resolve_identity_claims(
@@ -199,8 +250,77 @@ class ContactProvisioningService:
             email=email,
             phone=mobile,
             enrich=True,
+            ordered_fields=self._match_order(provider),
         )
         identity = claims.identity
+        identity_conflict = await record_identity_match_conflict(
+            db,
+            provider=provider,
+            tenant_id=tenant_id,
+            claims=claims,
+            source="directory_contact",
+            user_id=linked_user.id if linked_user else None,
+            source_member_id=org_member.id,
+        )
+
+        # An exact, established provider subject binding is stronger than a
+        # newly observed contact. Enrich its existing anchor when unclaimed;
+        # if the contact already belongs elsewhere, keep routing stable and
+        # require review instead of silently moving the provider account.
+        if linked_user and linked_user.identity_id:
+            if identity is None:
+                identity = linked_user.identity
+            elif identity.id != linked_user.identity_id:
+                subject_conflict = await record_subject_contact_conflict(
+                    db,
+                    provider=provider,
+                    tenant_id=tenant_id,
+                    user_id=linked_user.id,
+                    claims=claims,
+                    source="directory_contact",
+                    source_member_id=org_member.id,
+                )
+                await self._sync_user_profile(
+                    db, linked_user, org_member, provider, mobile, email, verified_contact
+                )
+                await self._ensure_participant(db, linked_user)
+                await db.flush()
+                return ContactProvisioningResult(
+                    user=linked_user,
+                    user_linked=True,
+                    tenant_user_matched=True,
+                    identity_conflict=identity_conflict or subject_conflict,
+                )
+
+        # A trusted directory account always receives the global platform
+        # anchor. Source IDs stay on OrgMember and never become login IDs.
+        can_mint_anchor = verified_contact and bool(
+            email
+            or mobile
+            or directory_protocol == "scim"
+            or (provider_type == "dingtalk" and fresh_claims is not None)
+        )
+        if identity is None and can_mint_anchor:
+            identity = Identity(
+                email=email,
+                phone=mobile,
+                is_active=True,
+            )
+            try:
+                async with db.begin_nested():
+                    db.add(identity)
+                    await db.flush()
+            except IntegrityError:
+                reread = await canonical_user_resolver.resolve_identity_claims(
+                    db,
+                    email=email,
+                    phone=mobile,
+                    enrich=False,
+                    ordered_fields=self._match_order(provider),
+                )
+                if reread.identity is None:
+                    raise
+                identity = reread.identity
 
         if identity:
             identity_user = await canonical_user_resolver.get_tenant_user(
@@ -209,7 +329,7 @@ class ContactProvisioningService:
                 identity_id=identity.id,
                 lock=True,
             )
-            if identity_user and not identity_user.is_active:
+            if identity_user and not identity_user.is_active and not directory_sync:
                 return ContactProvisioningResult(
                     skipped_reason="skipped_requires_confirmation"
                 )
@@ -231,10 +351,14 @@ class ContactProvisioningService:
                         registration_source=f"{provider_type}_org_sync",
                     )
                 )
-            if not resolved_user.is_active:
+            if not resolved_user.is_active and not directory_sync:
                 return ContactProvisioningResult(
                     skipped_reason="skipped_requires_confirmation"
                 )
+            if user_created:
+                resolved_user.source = provider_type
+                if directory_sync and org_member.status != "active":
+                    resolved_user.is_active = False
             org_member.user_id = resolved_user.id
             await self._sync_user_profile(
                 db,
@@ -253,9 +377,10 @@ class ContactProvisioningService:
                 user_linked=True,
                 tenant_user_matched=not user_created,
                 global_identity_matched_no_tenant_user=user_created,
+                identity_conflict=identity_conflict,
             )
 
-        if linked_user and linked_user.is_active:
+        if linked_user and (linked_user.is_active or directory_sync):
             await self._sync_user_profile(
                 db,
                 linked_user,
@@ -281,7 +406,7 @@ class ContactProvisioningService:
             role="member",
             source=provider_type,
             registration_source=f"{provider_type}_org_sync",
-            is_active=True,
+            is_active=not directory_sync or org_member.status == "active",
         )
         db.add(user)
         await db.flush()
@@ -327,6 +452,21 @@ class ContactProvisioningService:
         else:
             email = _clean_email(org_member.email) if verified_contact else None
             mobile = normalize_mobile(org_member.phone) if verified_contact else None
+        if provider is not None and user.identity_id is not None:
+            from app.services.provider_contact_refresh import (
+                refresh_provider_bound_contacts,
+            )
+
+            await refresh_provider_bound_contacts(
+                db,
+                user=user,
+                provider=provider,
+                email=email,
+                phone=mobile,
+                source="directory_profile_refresh",
+                source_member_id=org_member.id,
+                verify_email=verified_contact,
+            )
         await self._sync_user_profile(
             db,
             user,
@@ -351,6 +491,9 @@ class ContactProvisioningService:
     def _provider_type(self, provider: IdentityProvider | None) -> str:
         provider_type = (getattr(provider, "provider_type", None) or "contact").lower()
         return "teams" if provider_type == "microsoft_teams" else provider_type
+
+    def _match_order(self, provider: IdentityProvider | None) -> tuple[str, ...]:
+        return identity_match_order(provider)
 
     async def _get_tenant_user(
         self,

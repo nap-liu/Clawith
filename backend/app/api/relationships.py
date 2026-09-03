@@ -7,10 +7,9 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.orm import selectinload
 
 from app.core.permissions import (
-    build_agent_accessible_user_ids_query,
     build_visible_agents_query,
     check_agent_access,
     evaluate_agent_relationship_status,
@@ -28,6 +27,10 @@ from app.models.org import (
 )
 from app.models.user import User
 from app.services.access_relationships import ensure_access_granted_platform_relationships
+from app.services.org_directory import (
+    load_directory_identity_summaries,
+    permission_directory_members,
+)
 from app.services.org_sync_adapter import derive_member_department_paths
 
 router = APIRouter(prefix="/agents/{agent_id}/relationships", tags=["relationships"])
@@ -53,14 +56,6 @@ AGENT_RELATION_LABELS = {
 
 def _can_manage_relationships(current_user: User, access_level: str) -> bool:
     return access_level == "manage" or current_user.role in ("platform_admin", "org_admin")
-
-
-def _display_provider_name(provider_name: str | None, provider_type: str | None) -> str | None:
-    if not provider_name and not provider_type:
-        return None
-    if (provider_type or "").lower() in ("web", "platform") or (provider_name or "").lower() == "web":
-        return "Platform"
-    return provider_name
 
 
 # ─── Schemas ───────────────────────────────────────────
@@ -133,6 +128,9 @@ async def get_relationships(
         db,
         [profile.member for profile in profiles.values() if profile.member],
     )
+    source_map, binding_map = await load_directory_identity_summaries(
+        db, tenant_id=source_agent.tenant_id, user_ids={row.user_id for row in rows}
+    )
     out = []
     for r in rows:
         profile = profiles.get(r.user_id)
@@ -169,6 +167,8 @@ async def get_relationships(
                 "provider_type": profile.channels[0] if profile.channels else None,
                 "user_id": str(r.user_id),
                 "is_platform_user": bool(profile.user.identity_id),
+                "directory_sources": source_map.get(r.user_id, []),
+                "channel_bindings": binding_map.get(r.user_id, []),
             } if profile else None,
         })
     return out
@@ -182,109 +182,48 @@ async def search_human_relationship_candidates(
     db: AsyncSession = Depends(get_db),
 ):
     """Search org members that are eligible for this agent's human relationships."""
-    from app.models.identity import IdentityProvider
-
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     if not _can_manage_relationships(current_user, access_level):
         raise HTTPException(status_code=403, detail="Only org admins or managers can modify relationships")
 
-    search_text = (search or "").strip()
     access_mode = getattr(agent, "access_mode", None) or "company"
-    LinkedUser = aliased(User)
-
-    query = (
-        select(
-            OrgMember,
-            IdentityProvider.name.label("provider_name"),
-            IdentityProvider.provider_type,
-            LinkedUser.id.label("linked_user_id"),
-            LinkedUser.identity_id.label("linked_identity_id"),
-        )
-        .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
-        .outerjoin(
-            LinkedUser,
-            and_(
-                OrgMember.user_id == LinkedUser.id,
-                LinkedUser.tenant_id == agent.tenant_id,
-                LinkedUser.is_active == True,  # noqa: E712
-            ),
-        )
-        .where(
-            OrgMember.tenant_id == agent.tenant_id,
-            OrgMember.status == "active",
-            LinkedUser.id.isnot(None),
-        )
-    )
-    if search_text:
-        pattern = f"%{search_text}%"
-        query = query.where(
-            or_(
-                OrgMember.name.ilike(pattern),
-                OrgMember.nickname.ilike(pattern),
-                OrgMember.name_translit_full.ilike(pattern),
-                OrgMember.name_translit_initial.ilike(pattern),
-                OrgMember.email.ilike(pattern),
-            )
-        )
-
-    if access_mode != "company":
-        allowed_user_ids = build_agent_accessible_user_ids_query(agent)
-        query = query.where(
-            or_(
-                LinkedUser.identity_id.is_(None),
-                LinkedUser.id.in_(allowed_user_ids),
-            )
-        )
-
-    result = await db.execute(query.order_by(OrgMember.name).limit(200))
-    rows = result.all()
-    deduped_filtered = []
-    by_user_id: dict[
-        uuid.UUID,
-        tuple[OrgMember, str | None, str | None, uuid.UUID | None, uuid.UUID | None],
-    ] = {}
-    for row in rows:
-        member, provider_name, provider_type, linked_user_id, _linked_identity_id = row
-        if not linked_user_id:
-            deduped_filtered.append(row)
-            continue
-        existing = by_user_id.get(linked_user_id)
-        if not existing:
-            by_user_id[linked_user_id] = row
-            continue
-        existing_type = (existing[2] or "").lower()
-        current_type = (provider_type or "").lower()
-        if existing_type in ("", "web", "platform") and current_type not in ("", "web", "platform"):
-            by_user_id[linked_user_id] = row
-    filtered = [*deduped_filtered, *by_user_id.values()]
-
-    filtered = sorted(filtered, key=lambda row: (row[0].name or "").lower())[:100]
-    member_paths = await derive_member_department_paths(
+    directory = await permission_directory_members(
         db,
-        [m for m, _provider_name, _provider_type, _linked_user_id, _linked_identity_id in filtered],
+        tenant_id=agent.tenant_id,
+        search=(search or "").strip() or None,
+        page=1,
+        page_size=100,
     )
-    org_member_candidates = [
-        {
-            "user_id": str(linked_user_id),
-            "name": m.name,
-            "nickname": m.nickname,
-            "email": m.email,
-            "title": m.title,
-            "department_path": member_paths.get(m.id, m.department_path),
-            "avatar_url": m.avatar_url,
-            "provider_name": _display_provider_name(provider_name, provider_type) if m.provider_id else None,
-            "provider_type": "platform" if (provider_type or "").lower() == "web" else provider_type if m.provider_id else None,
-            "is_platform_user": bool(linked_identity_id),
-            "platform_access_level": (
-                await get_agent_access_level_for_user_id(db, linked_user_id, agent)
-                if linked_user_id
-                else None
+    candidates = []
+    for item in directory["items"]:
+        if not item.get("member_id"):
+            continue
+        user_id = uuid.UUID(item["id"])
+        platform_access_level = await get_agent_access_level_for_user_id(
+            db, user_id, agent
+        )
+        if access_mode != "company" and platform_access_level is None:
+            continue
+        sources = item.get("directory_sources") or []
+        preferred = next(
+            (
+                source for source in sources
+                if str(source.get("provider_type") or "").lower()
+                not in {"", "web", "platform"}
             ),
-        }
-        for m, provider_name, provider_type, linked_user_id, linked_identity_id in filtered
-    ]
-    return sorted(org_member_candidates, key=lambda item: (item.get("name") or "").lower())[:100]
+            sources[0] if sources else {},
+        )
+        candidates.append(
+            {
+                **item,
+                "user_id": item["id"],
+                "provider_name": preferred.get("provider_name"),
+                "provider_type": preferred.get("provider_type"),
+                "platform_access_level": platform_access_level,
+            }
+        )
+    return candidates
 
 
 @router.put("/")

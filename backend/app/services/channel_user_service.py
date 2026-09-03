@@ -5,9 +5,7 @@ external channels (DingTalk, WeCom, Feishu, etc.). It reuses the SSO service
 and OrgMember-based identity management.
 """
 
-import hashlib
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
@@ -24,7 +22,9 @@ from app.services.directory_identity_claims import VerifiedDirectoryClaims
 from app.services.channel_user_errors import ChannelUserResolutionError
 from app.services.channel_user_identity_mapping import ChannelUserIdentityMappingMethods
 from app.services.channel_user_persistence import ChannelUserPersistenceMethods
+from app.services.channel_user_provider_aliases import ChannelUserProviderAliasMethods
 from app.services.sso_service import sso_service
+from app.services.provider_identity_policy import identity_match_order, record_identity_match_conflict
 
 
 async def _load_user_with_identity(
@@ -46,172 +46,22 @@ class ChannelUserService:
         "microsoft_teams": "teams",
     }
 
-    @staticmethod
-    def _provider_alias_scope(provider: IdentityProvider) -> str:
-        return f"provider:{provider.id}"
-
-    @staticmethod
-    def _provider_alias_conflict_id_type(id_type: str) -> str:
-        return f"conflict:{id_type}"
-
-    async def remember_provider_user_alias(
-        self,
-        db: AsyncSession,
-        *,
-        provider: IdentityProvider,
-        channel_type: str,
-        id_type: str,
-        subject: str,
-        user: User,
-    ) -> bool:
-        """Attach one provider-level channel identifier to a canonical User.
-
-        Provider aliases are intentionally independent of any Agent or robot
-        installation.  They may only be learned from an already-attributed
-        ordinary inbound event; callers must not create them from quoted text.
-        """
-        normalized_channel = self._normalize_channel_type(channel_type)
-        normalized_id_type = str(id_type or "").strip()
-        normalized_subject = str(subject or "").strip()
-        provider_type = getattr(provider.provider_type, "value", provider.provider_type)
-        provider_channel = self._normalize_channel_type(str(provider_type or ""))
-        if (
-            provider.tenant_id is None
-            or user.tenant_id != provider.tenant_id
-            or provider_channel != normalized_channel
-            or not normalized_channel
-            or not normalized_id_type
-            or len(normalized_id_type) > 40
-            or not normalized_subject
-        ):
-            return False
-
-        scope = self._provider_alias_scope(provider)
-        conflict_id_type = self._provider_alias_conflict_id_type(normalized_id_type)
-        conflict_query = select(ChannelUserBinding).where(
-            ChannelUserBinding.tenant_id == provider.tenant_id,
-            ChannelUserBinding.provider_id == provider.id,
-            ChannelUserBinding.installation_scope == scope,
-            ChannelUserBinding.channel_type == normalized_channel,
-            ChannelUserBinding.id_type == conflict_id_type,
-            ChannelUserBinding.subject == normalized_subject,
-        )
-        if (await db.execute(conflict_query)).scalar_one_or_none() is not None:
-            return False
-
-        query = select(ChannelUserBinding).where(
-            ChannelUserBinding.tenant_id == provider.tenant_id,
-            ChannelUserBinding.provider_id == provider.id,
-            ChannelUserBinding.installation_scope == scope,
-            ChannelUserBinding.channel_type == normalized_channel,
-            ChannelUserBinding.id_type == normalized_id_type,
-            ChannelUserBinding.subject == normalized_subject,
-        )
-        existing = (await db.execute(query)).scalar_one_or_none()
-        if existing is not None:
-            if existing.user_id != user.id:
-                existing.id_type = conflict_id_type
-                await db.flush()
-                logger.error(
-                    "[{}] provider alias conflicts with another canonical user; "
-                    "persistently disabling resolution",
-                    normalized_channel,
-                )
-                return False
-            return True
-
-        try:
-            async with db.begin_nested():
-                db.add(
-                    ChannelUserBinding(
-                        tenant_id=provider.tenant_id,
-                        provider_id=provider.id,
-                        installation_scope=scope,
-                        channel_type=normalized_channel,
-                        id_type=normalized_id_type,
-                        subject=normalized_subject,
-                        user_id=user.id,
-                    )
-                )
-                await db.flush()
-            return True
-        except IntegrityError:
-            if (await db.execute(conflict_query)).scalar_one_or_none() is not None:
-                return False
-            existing = (await db.execute(query)).scalar_one_or_none()
-            if existing is not None and existing.user_id == user.id:
-                return True
-            if existing is not None:
-                existing.id_type = conflict_id_type
-                await db.flush()
-            logger.error(
-                "[{}] concurrent provider alias conflict persistently disabled resolution",
-                normalized_channel,
-            )
-            return False
-
-    async def resolve_provider_user_alias(
-        self,
-        db: AsyncSession,
-        *,
-        provider: IdentityProvider,
-        channel_type: str,
-        id_type: str,
-        subject: str,
-    ) -> User | None:
-        """Resolve one provider-level identifier to an active tenant User."""
-        normalized_channel = self._normalize_channel_type(channel_type)
-        normalized_id_type = str(id_type or "").strip()
-        normalized_subject = str(subject or "").strip()
-        provider_type = getattr(provider.provider_type, "value", provider.provider_type)
-        provider_channel = self._normalize_channel_type(str(provider_type or ""))
-        if (
-            provider.tenant_id is None
-            or provider_channel != normalized_channel
-            or not normalized_channel
-            or not normalized_id_type
-            or len(normalized_id_type) > 40
-            or not normalized_subject
-        ):
-            return None
-
-        scope = self._provider_alias_scope(provider)
-        conflict_id_type = self._provider_alias_conflict_id_type(normalized_id_type)
-        conflicted = (
-            await db.execute(
-                select(ChannelUserBinding.id).where(
-                    ChannelUserBinding.tenant_id == provider.tenant_id,
-                    ChannelUserBinding.provider_id == provider.id,
-                    ChannelUserBinding.installation_scope == scope,
-                    ChannelUserBinding.channel_type == normalized_channel,
-                    ChannelUserBinding.id_type == conflict_id_type,
-                    ChannelUserBinding.subject == normalized_subject,
-                )
-            )
-        ).scalar_one_or_none()
-        if conflicted is not None:
-            return None
-
-        binding = (
-            await db.execute(
-                select(ChannelUserBinding).where(
-                    ChannelUserBinding.tenant_id == provider.tenant_id,
-                    ChannelUserBinding.provider_id == provider.id,
-                    ChannelUserBinding.installation_scope == scope,
-                    ChannelUserBinding.channel_type == normalized_channel,
-                    ChannelUserBinding.id_type == normalized_id_type,
-                    ChannelUserBinding.subject == normalized_subject,
-                )
-            )
-        ).scalar_one_or_none()
-        if binding is None:
-            return None
-        user = await _load_user_with_identity(
-            db,
-            binding.user_id,
-            provider.tenant_id,
-        )
-        return user if user is not None and user.is_active else None
+    _load_user_with_identity = staticmethod(_load_user_with_identity)
+    _provider_alias_scope = staticmethod(
+        ChannelUserProviderAliasMethods._provider_alias_scope
+    )
+    _provider_alias_conflict_id_type = staticmethod(
+        ChannelUserProviderAliasMethods._provider_alias_conflict_id_type
+    )
+    remember_provider_user_alias = (
+        ChannelUserProviderAliasMethods.remember_provider_user_alias
+    )
+    resolve_provider_user_alias = (
+        ChannelUserProviderAliasMethods.resolve_provider_user_alias
+    )
+    _find_provider_alias_bindings = (
+        ChannelUserProviderAliasMethods._find_provider_alias_bindings
+    )
 
     _normalize_channel_type = ChannelUserIdentityMappingMethods._normalize_channel_type
     _legacy_provider_types_for_channel = ChannelUserIdentityMappingMethods._legacy_provider_types_for_channel
@@ -220,6 +70,9 @@ class ChannelUserService:
     _resolve_installation_scope = ChannelUserIdentityMappingMethods._resolve_installation_scope
     resolve_installation_scope = ChannelUserIdentityMappingMethods.resolve_installation_scope
     _binding_subjects = ChannelUserIdentityMappingMethods._binding_subjects
+    _mark_observed_source_account_active = (
+        ChannelUserIdentityMappingMethods._mark_observed_source_account_active
+    )
     _fresh_dingtalk_claims = ChannelUserIdentityMappingMethods._fresh_dingtalk_claims
 
     async def _find_bound_user(
@@ -240,7 +93,9 @@ class ChannelUserService:
             await db.execute(
                 select(ChannelUserBinding).where(
                     ChannelUserBinding.tenant_id == provider.tenant_id,
+                    ChannelUserBinding.provider_id == provider.id,
                     ChannelUserBinding.installation_scope == scope,
+                    ChannelUserBinding.channel_type == self._normalize_channel_type(channel_type),
                     or_(
                         *(
                             (ChannelUserBinding.id_type == id_type)
@@ -251,27 +106,57 @@ class ChannelUserService:
                 )
             )
         ).scalars().all()
-        user_ids = {row.user_id for row in rows}
-        if len(user_ids) > 1:
-            normalized = self._normalize_channel_type(channel_type)
-            priority = (
-                {"staff_id": 0, "union_id": 1, "open_id": 2}
-                if normalized == "dingtalk"
-                else {id_type: index for index, (id_type, _subject) in enumerate(subjects)}
+        if not rows:
+            rows = await self._find_provider_alias_bindings(
+                db,
+                provider=provider,
+                channel_type=channel_type,
+                subjects=subjects,
             )
-            rows.sort(key=lambda row: priority.get(row.id_type, 99))
+        if not rows:
+            return None
+
+        normalized = self._normalize_channel_type(channel_type)
+        type_priority = (
+            {"staff_id": 0, "union_id": 1, "open_id": 2, "sender_id": 3}
+            if normalized == "dingtalk"
+            else {
+                id_type: index
+                for index, (id_type, _subject) in enumerate(subjects)
+            }
+        )
+        ordered_subjects = sorted(
+            enumerate(subjects),
+            key=lambda item: (type_priority.get(item[1][0], 99), item[0]),
+        )
+        selected_user_id = None
+        all_user_ids = {row.user_id for row in rows}
+        for _index, (id_type, subject) in ordered_subjects:
+            subject_user_ids = {
+                row.user_id
+                for row in rows
+                if row.id_type == id_type and row.subject == subject
+            }
+            if not subject_user_ids:
+                continue
+            if len(subject_user_ids) > 1:
+                raise ChannelUserResolutionError(
+                    "Provider subject maps to multiple canonical users; repair required"
+                )
+            selected_user_id = next(iter(subject_user_ids))
+            break
+        if selected_user_id is None:
+            return None
+        if len(all_user_ids) > 1:
             logger.error(
-                "[{}] installation-scoped subjects map to multiple users; "
-                "routing by the current event's strongest exact subject and scheduling repair",
+                "[{}] provider subjects map to multiple users; routing by the "
+                "current event's strongest exact subject and scheduling repair",
                 channel_type,
             )
-            user_ids = {rows[0].user_id}
-        if not user_ids:
-            return None
-        user = await _load_user_with_identity(db, next(iter(user_ids)), provider.tenant_id)
-        if not user or not user.is_active:
-            raise ChannelUserResolutionError("Channel binding points to an unavailable user")
-        return user
+        user = await _load_user_with_identity(
+            db, selected_user_id, provider.tenant_id
+        )
+        return await self._validate_bound_channel_user(db, provider, subjects, user)
 
     async def _ensure_bindings(
         self,
@@ -294,7 +179,9 @@ class ChannelUserService:
         for id_type, subject in subjects:
             query = select(ChannelUserBinding).where(
                 ChannelUserBinding.tenant_id == provider.tenant_id,
+                ChannelUserBinding.provider_id == provider.id,
                 ChannelUserBinding.installation_scope == scope,
+                ChannelUserBinding.channel_type == self._normalize_channel_type(channel_type),
                 ChannelUserBinding.id_type == id_type,
                 ChannelUserBinding.subject == subject,
             )
@@ -366,15 +253,14 @@ class ChannelUserService:
         channel_type: str,
         external_user_id: str | None,
         extra_info: dict[str, Any] | None = None,
+        provider: IdentityProvider | None = None,
     ) -> User:
         """Resolve channel user identity, find or create platform User.
 
         Priority order:
         1. Existing installation-scoped binding → return canonical User
         2. Exact OrgMember identity → resolve/link canonical User and bind
-        3. Verified contact match → return User and link OrgMember
-        4. Historical channel principal → migrate only when no verified identity exists
-        5. No match → create new User and OrgMember (lazy registration)
+        3. Provider-policy contact match, then legacy/external-only fallback
 
         Args:
             db: Database session
@@ -387,14 +273,17 @@ class ChannelUserService:
             Resolved User instance
         """
         tenant_id = agent.tenant_id
-        extra_info = dict(extra_info or {})
         normalized_channel = self._normalize_channel_type(channel_type)
-        extra_info["_installation_scope"] = await self._resolve_installation_scope(
-            db, agent, channel_type, extra_info
+        provider, extra_info = await self.resolve_channel_provider(
+            db, agent, channel_type, extra_info, provider
         )
-
-        # Step 1: Ensure IdentityProvider exists
-        provider = await self._ensure_provider(db, channel_type, tenant_id)
+        await self._mark_observed_source_account_active(
+            db,
+            provider,
+            channel_type,
+            external_user_id,
+            extra_info,
+        )
         fresh_claims = (
             self._fresh_dingtalk_claims(provider, external_user_id, extra_info)
             if normalized_channel == "dingtalk"
@@ -569,8 +458,10 @@ class ChannelUserService:
                 try:
                     async with db.begin_nested():
                         claims = await canonical_user_resolver.resolve_identity_claims(
-                            db, email=email, phone=mobile, enrich=True
+                            db, email=email, phone=mobile, enrich=True,
+                            ordered_fields=identity_match_order(provider),
                         )
+                        await record_identity_match_conflict(db, provider=provider, tenant_id=tenant_id, claims=claims, source="im_inbound")
                         if claims.identity:
                             user = await canonical_user_resolver.get_tenant_user(
                                 db,
@@ -639,19 +530,14 @@ class ChannelUserService:
                 )
             return user
 
-        if not user and email:
-            user = await sso_service.match_user_by_email(db, email, tenant_id)
+        for field in identity_match_order(provider):
+            value = mobile if field == "phone" else email
+            if user or not value:
+                continue
+            matcher = sso_service.match_user_by_mobile if field == "phone" else sso_service.match_user_by_email
+            user = await matcher(db, value, tenant_id)
             if user:
-                logger.info(
-                    f"[{channel_type}] Matched user by email: {user.id}"
-                )
-
-        if not user and mobile:
-            user = await sso_service.match_user_by_mobile(db, mobile, tenant_id)
-            if user:
-                logger.info(
-                    f"[{channel_type}] Matched user by mobile: {user.id}"
-                )
+                logger.info("[{}] Matched user by configured {}", channel_type, field)
 
         # If found User by email/mobile, link OrgMember if exists
         if user:
@@ -732,7 +618,9 @@ class ChannelUserService:
             return None
         return await _load_user_with_identity(db, result.user.id, org_member.tenant_id)
 
+    resolve_channel_provider = ChannelUserPersistenceMethods.resolve_channel_provider
     _ensure_provider = ChannelUserPersistenceMethods._ensure_provider
+    _validate_bound_channel_user = ChannelUserPersistenceMethods._validate_bound_channel_user
     _find_org_member = ChannelUserIdentityMappingMethods._find_org_member
     _create_org_member_shell = ChannelUserPersistenceMethods._create_org_member_shell
     _find_existing_org_member_for_user = (

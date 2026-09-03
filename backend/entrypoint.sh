@@ -112,6 +112,12 @@ async def main():
     import app.models.chat_compaction # noqa  # FK target of chat_messages.compacted_into; fresh DB create_all needs it registered
     import app.models.focus          # noqa  # v1.9.3 AgentFocusItem table; fresh DB create_all needs it registered
     import app.models.scene          # noqa
+    import app.models.channel_type_default  # noqa
+    import app.models.cli_tool_binary       # noqa
+    import app.models.dingtalk_provisioning # noqa
+    import app.models.personal_access_token # noqa
+    import app.models.speech_recognition_config  # noqa
+    import app.models.workspace      # noqa
     # Mirror the main.py lifespan create_all set exactly so a fresh-DB bootstrap
     # via this entrypoint registers every table (no NoReferencedTableError, no
     # coverage drift vs the app's own startup path).
@@ -130,8 +136,22 @@ async def main():
     import app.models.project            # noqa
 
     # Create all tables that don't exist yet (safe to run on every startup)
+    # New directory tables depend on composite constraints added by their
+    # Alembic revision. On existing schemas, let that revision create them in
+    # the correct order; fresh schemas still create everything and stamp heads.
+    create_tables = None
+    if os.environ.get("SCHEMA_BOOTSTRAP_MODE") == "existing":
+        migration_owned = {
+            "directory_group_edges", "directory_account_groups", "directory_sync_runs"
+        }
+        create_tables = [
+            table for table in Base.metadata.tables.values()
+            if table.name not in migration_owned
+        ]
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(
+            lambda sync_conn: Base.metadata.create_all(sync_conn, tables=create_tables)
+        )
     print("[entrypoint] Tables created/verified")
 
     # Apply safe column patches for existing installs that may be missing columns.
@@ -216,6 +236,22 @@ PYEOF
     else
         echo "[entrypoint] Alembic migrations completed successfully."
     fi
+
+    echo "[entrypoint] Step 1c: Ensuring current database guards..."
+    python << 'PYEOF'
+import asyncio
+
+async def main():
+    from app.core.database_guards import ensure_current_database_guards
+    from app.database import engine
+
+    async with engine.begin() as conn:
+        await conn.run_sync(ensure_current_database_guards)
+    await engine.dispose()
+    print("[entrypoint] Database guards verified")
+
+asyncio.run(main())
+PYEOF
 else
     echo "[entrypoint] Step 1: Skipping alembic for PROCESS_ROLE=${PROCESS_ROLE}"
 fi

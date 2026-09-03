@@ -19,6 +19,7 @@ def serialize_chat_message_for_client(
     sender_name: str | None = None,
     sender_user_id: Any = None,
     sender_agent_id: Any = None,
+    sender_avatar_url: str | None = None,
 ) -> dict[str, Any]:
     raw_content = str(getattr(message, "content", "") or "")
     role = str(getattr(message, "role", "") or "")
@@ -71,6 +72,8 @@ def serialize_chat_message_for_client(
         entry["sender_user_id"] = str(sender_user_id)
     if sender_agent_id:
         entry["sender_agent_id"] = str(sender_agent_id)
+    if sender_avatar_url:
+        entry["sender_avatar_url"] = sender_avatar_url
     return entry
 
 
@@ -81,6 +84,7 @@ def serialize_tool_call_for_client(
     sender_name: str | None = None,
     sender_user_id: Any = None,
     sender_agent_id: Any = None,
+    sender_avatar_url: str | None = None,
 ) -> dict[str, Any]:
     """Serialize one durable tool event through the shared client contract.
 
@@ -96,6 +100,7 @@ def serialize_tool_call_for_client(
         sender_name=sender_name,
         sender_user_id=sender_user_id,
         sender_agent_id=sender_agent_id,
+        sender_avatar_url=sender_avatar_url,
     )
     entry["toolCallId"] = str(message.id)
     parsed = parse_tool_call_for_display(message.content)

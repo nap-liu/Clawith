@@ -19,6 +19,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.database import get_db
+from app.services.authentication_state import require_active_authentication_principal
 
 settings = get_settings()
 
@@ -168,9 +169,11 @@ async def get_current_user(
         .options(selectinload(User.identity))
     )
     user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
-    return user
+    return await require_active_authentication_principal(
+        db,
+        user,
+        status_code=status.HTTP_401_UNAUTHORIZED,
+    )
 
 
 async def get_authenticated_user(

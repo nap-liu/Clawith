@@ -1,17 +1,27 @@
 """Mechanically separated enterprise API route group."""
 
 from app.api.enterprise_api_shared import *  # noqa: F401,F403
+from sqlalchemy import case
 
 
 # ─── Org Structure ──────────────────────────────────────
 
-from app.models.org import OrgDepartment, OrgMember
+from app.models.org import DirectorySyncRun, OrgDepartment, OrgMember
+from app.models.user import Identity
+from app.services.org_directory import department_subtree_cte
+from app.services.provider_directory_browser import provider_directory_departments
+from app.services.org_sync_models import strip_virtual_root_path
+from app.services.org_sync_service import org_sync_service, serialize_sync_run
+from app.services.provider_identity_policy import mask_identity_claim
 
 
 @router.get("/org/departments")
 async def list_org_departments(
     tenant_id: str | None = None,
     provider_id: str | None = None,
+    parent_id: str | None = None,
+    search: str | None = None,
+    limit: int = 100,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -35,21 +45,46 @@ async def list_org_departments(
         # Auto-scope: use the user's own tenant when available
         tenant_id = effective_tenant_id  # None only for true global admin
 
+    tenant_uuid = uuid.UUID(tenant_id) if tenant_id else None
+    provider_uuid = uuid.UUID(provider_id) if provider_id else None
+    parent_uuid = uuid.UUID(parent_id) if parent_id else None
+
+    if provider_uuid and tenant_uuid:
+        return await provider_directory_departments(
+            db,
+            tenant_id=tenant_uuid,
+            provider_id=provider_uuid,
+            parent_id=parent_uuid,
+            search=search,
+            limit=max(1, min(limit, 200)),
+        )
+
     query = select(OrgDepartment, IdentityProvider.name.label("provider_name"), IdentityProvider.provider_type).outerjoin(
         IdentityProvider, OrgDepartment.provider_id == IdentityProvider.id
-    ).where(OrgDepartment.status == "active")
-    if tenant_id:
-        query = query.where(OrgDepartment.tenant_id == uuid.UUID(tenant_id))
-    if provider_id:
-        query = query.where(OrgDepartment.provider_id == uuid.UUID(provider_id))
+    ).where(
+        OrgDepartment.status == "active",
+        or_(OrgDepartment.provider_id.is_(None), IdentityProvider.is_active.is_(True)),
+    )
+    if tenant_uuid:
+        query = query.where(OrgDepartment.tenant_id == tenant_uuid)
+        query = query.where(OrgDepartment.member_count > 0)
+    if provider_uuid:
+        query = query.where(OrgDepartment.provider_id == provider_uuid)
     result = await db.execute(query.order_by(OrgDepartment.name))
     rows = result.all()
     # Calculate total members for this scope (for the "All" entry in frontend)
-    total_q = select(func.count(OrgMember.id)).where(OrgMember.status == "active")
-    if tenant_id:
-        total_q = total_q.where(OrgMember.tenant_id == uuid.UUID(tenant_id))
-    if provider_id:
-        total_q = total_q.where(OrgMember.provider_id == uuid.UUID(provider_id))
+    total_q = (
+        select(func.count(func.distinct(func.coalesce(OrgMember.user_id, OrgMember.id))))
+        .outerjoin(IdentityProvider, IdentityProvider.id == OrgMember.provider_id)
+        .where(
+            OrgMember.status == "active",
+            or_(OrgMember.provider_id.is_(None), IdentityProvider.is_active.is_(True)),
+        )
+    )
+    if tenant_uuid:
+        total_q = total_q.where(OrgMember.tenant_id == tenant_uuid)
+    if provider_uuid:
+        total_q = total_q.where(OrgMember.provider_id == provider_uuid)
     total_result = await db.execute(total_q)
     total_member = total_result.scalar() or 0
 
@@ -63,6 +98,7 @@ async def list_org_departments(
                 "provider_type": provider_type if d.provider_id else None,
                 "name": d.name,
                 "parent_id": str(d.parent_id) if d.parent_id else None,
+                "parent_ids": [str(d.parent_id)] if d.parent_id else [],
                 "path": d.path,
                 "member_count": d.member_count,
             }
@@ -105,59 +141,99 @@ async def list_org_members(
     tenant_uuid = uuid.UUID(tenant_id) if tenant_id else None
     provider_uuid = uuid.UUID(provider_id) if provider_id else None
 
+    directory_department_ids = None
+    if department_id:
+        requested_department_id = uuid.UUID(department_id)
+        department_query = (
+            select(OrgDepartment)
+            .join(IdentityProvider, IdentityProvider.id == OrgDepartment.provider_id)
+            .where(
+                OrgDepartment.id == requested_department_id,
+                OrgDepartment.status == "active",
+                IdentityProvider.is_active.is_(True),
+            )
+        )
+        if tenant_uuid:
+            department_query = department_query.where(
+                OrgDepartment.tenant_id == tenant_uuid
+            )
+        target_dept = await db.scalar(department_query)
+        if target_dept is None:
+            raise HTTPException(status_code=404, detail="Department not found")
+        subtree = department_subtree_cte(
+            tenant_id=target_dept.tenant_id,
+            department_id=requested_department_id,
+            name="enterprise_org_department_subtree",
+        )
+        directory_department_ids = select(subtree.c.department_id)
+
     canonical = canonical_org_member_id_subquery(
         tenant_id=tenant_uuid,
         provider_id=provider_uuid,
+        department_ids=directory_department_ids,
     )
     query = (
         select(
             OrgMember,
             IdentityProvider.name.label("provider_name"),
             IdentityProvider.provider_type,
+            IdentityProvider.config.label("provider_config"),
             User.display_name.label("user_display_name"),
         )
         .join(canonical, and_(OrgMember.id == canonical.c.om_id, canonical.c.rn == 1))
         .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
         .outerjoin(User, OrgMember.user_id == User.id)
-        .where(OrgMember.status == "active")
+        .outerjoin(Identity, User.identity_id == Identity.id)
+        .where(
+            OrgMember.status == "active",
+            or_(OrgMember.provider_id.is_(None), IdentityProvider.is_active.is_(True)),
+        )
     )
     if tenant_uuid:
         query = query.where(OrgMember.tenant_id == tenant_uuid)
-    if department_id:
-        # Get the department to find its path and then include all sub-departments
-        dept_result = await db.execute(select(OrgDepartment).where(OrgDepartment.id == uuid.UUID(department_id)))
-        target_dept = dept_result.scalar_one_or_none()
-        if target_dept:
-            # Build sub-department query: the selected dept itself, plus any dept whose path
-            # starts with its path followed by a "/" (i.e., all descendants).
-            sub_dept_conditions = [OrgDepartment.id == target_dept.id]
-            if target_dept.path:
-                # Use SQL LIKE to find all descendants based on path prefix
-                sub_dept_conditions.append(OrgDepartment.path.like(f"{target_dept.path}/%"))
-            sub_depts_query = select(OrgDepartment.id).where(or_(*sub_dept_conditions))
-            sub_dept_ids_result = await db.execute(sub_depts_query)
-            sub_dept_ids = [row[0] for row in sub_dept_ids_result.all()]
-            query = query.where(OrgMember.department_id.in_(sub_dept_ids))
-        else:
-            # Fallback: exact match
-            query = query.where(OrgMember.department_id == uuid.UUID(department_id))
     if provider_uuid:
         query = query.where(OrgMember.provider_id == provider_uuid)
-    if search:
-        query = query.where(
-            or_(
-                OrgMember.name.ilike(f"%{search}%"),
-                OrgMember.nickname.ilike(f"%{search}%"),
-                OrgMember.name_translit_full.ilike(f"%{search}%"),
-                OrgMember.name_translit_initial.ilike(f"%{search}%"),
-            )
+    search_rank = None
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        searchable_columns = (
+            OrgMember.name,
+            OrgMember.nickname,
+            OrgMember.name_translit_full,
+            OrgMember.name_translit_initial,
+            OrgMember.email,
+            OrgMember.phone,
+            User.display_name,
+            Identity.email,
+            Identity.phone,
         )
-    query = query.order_by(OrgMember.name).limit(100)
+        pattern = f"%{normalized_search}%"
+        query = query.where(
+            or_(*(column.ilike(pattern) for column in searchable_columns))
+        )
+        exact_value = normalized_search.casefold()
+        search_rank = case(
+            (
+                or_(
+                    *(func.lower(column) == exact_value for column in searchable_columns)
+                ),
+                0,
+            ),
+            else_=1,
+        )
+    ordering = [OrgMember.name.asc(), OrgMember.id.asc()]
+    if search_rank is not None:
+        ordering.insert(0, search_rank.asc())
+    query = query.order_by(*ordering).limit(100)
     result = await db.execute(query)
     rows = result.all()
     member_paths = await derive_member_department_paths(
         db,
-        [m for m, _provider_name, _provider_type, _user_display_name in rows],
+        [
+            m
+            for m, _provider_name, _provider_type, _provider_config, _user_display_name
+            in rows
+        ],
     )
     return [
         {
@@ -165,29 +241,40 @@ async def list_org_members(
             "name": m.name,
             "nickname": m.nickname,
             "email": m.email,
-            "phone": m.phone,
+            "phone_masked": mask_identity_claim("phone", m.phone),
             "title": m.title,
-            "department_path": member_paths.get(m.id, m.department_path),
+            "department_path": (
+                strip_virtual_root_path(member_paths.get(m.id, m.department_path))
+                if provider_type in {"dingtalk", "scim"}
+                or (provider_config or {}).get("directory_protocol") == "scim"
+                or ((provider_config or {}).get("capabilities") or {}).get(
+                    "directory_protocol"
+                ) == "scim"
+                else member_paths.get(m.id, m.department_path)
+            ),
             "avatar_url": m.avatar_url,
             "external_id": m.external_id,
             "provider_id": str(m.provider_id) if m.provider_id else None,
             "provider_name": provider_name if m.provider_id else None,
             "provider_type": provider_type if m.provider_id else None,
+            "directory_protocol": (
+                (provider_config or {}).get("directory_protocol")
+                if m.provider_id else None
+            ),
             "user_display_name": user_display_name,
         }
-        for m, provider_name, provider_type, user_display_name in rows
+        for m, provider_name, provider_type, provider_config, user_display_name in rows
     ]
 
 
-@router.post("/org/sync")
+@router.post("/org/sync", status_code=status.HTTP_202_ACCEPTED)
 async def trigger_org_sync(
+    background_tasks: BackgroundTasks,
     provider_id: str | None = None,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Manually trigger org structure sync from a specific identity provider."""
-    from app.services.org_sync_service import org_sync_service
-
+    """Queue one provider sync; duplicate requests return its active run."""
     if not provider_id:
         raise HTTPException(status_code=400, detail="provider_id is required")
 
@@ -204,10 +291,62 @@ async def trigger_org_sync(
     if not provider.tenant_id:
         raise HTTPException(status_code=400, detail="Provider must be bound to a tenant")
 
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
+    if not _is_global_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Cannot sync other tenant's provider")
 
-    return await org_sync_service.sync_provider(db, provider_id)
+    try:
+        run, created = await org_sync_service.request_sync(
+            db,
+            pid,
+            trigger_type="manual",
+            created_by_user_id=current_user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if created:
+        background_tasks.add_task(org_sync_service.execute_run, run.id)
+    response = serialize_sync_run(run)
+    response["created"] = created
+    return response
+
+
+@router.get("/org/sync-runs")
+async def list_org_sync_runs(
+    provider_id: uuid.UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List recent directory sync runs inside the caller's tenant scope."""
+    query = select(DirectorySyncRun).order_by(DirectorySyncRun.created_at.desc()).limit(50)
+    if provider_id is not None:
+        provider = await db.get(IdentityProvider, provider_id)
+        if provider is None:
+            raise HTTPException(status_code=404, detail="Provider not found")
+        if not _is_global_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
+            raise HTTPException(status_code=403, detail="Cannot access other tenant's provider")
+        query = query.where(DirectorySyncRun.provider_id == provider_id)
+    elif not _is_global_platform_admin_user(current_user):
+        if current_user.tenant_id is None:
+            raise HTTPException(status_code=403, detail="Tenant context is required")
+        query = query.where(DirectorySyncRun.tenant_id == current_user.tenant_id)
+    result = await db.execute(query)
+    return [serialize_sync_run(run) for run in result.scalars().all()]
+
+
+@router.get("/org/sync-runs/{run_id}")
+async def get_org_sync_run(
+    run_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll one sync run without exposing provider credentials or raw PII."""
+    run = await db.get(DirectorySyncRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Sync run not found")
+    if not _is_global_platform_admin_user(current_user) and run.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access other tenant's sync run")
+    return serialize_sync_run(run)
 
 
 @router.get("/org/wecom-verify/{provider_id}")

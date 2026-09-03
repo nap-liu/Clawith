@@ -1,23 +1,65 @@
 """Generic and public OAuth provider implementations."""
 
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import HTTPException
-from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
-from app.core.security import create_access_token, hash_password
 from app.models.identity import IdentityProvider
 from app.models.user import User, Identity
 from app.services.auth_provider import BaseAuthProvider, ExternalUserInfo
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
-from app.services.identity_provider_lookup import get_preferred_identity_provider
 from loguru import logger
+
+
+_OAUTH_CREDENTIAL_KEYS = frozenset(
+    {
+        "accesstoken",
+        "authorization",
+        "clientsecret",
+        "idtoken",
+        "refreshtoken",
+        "token",
+    }
+)
+
+
+def _read_oauth_field_path(data: dict, path: str) -> Any:
+    """Read a configured OAuth field from its complete dot-separated path."""
+    segments = tuple(part for part in str(path).split(".") if part)
+
+    def read(current: Any, remaining: tuple[str, ...]) -> Any:
+        if not remaining:
+            return current
+        if isinstance(current, list):
+            for item in current:
+                value = read(item, remaining)
+                if value not in (None, ""):
+                    return value
+            return None
+        if not isinstance(current, dict) or remaining[0] not in current:
+            return None
+        return read(current[remaining[0]], remaining[1:])
+
+    return read(data, segments)
+
+
+def _without_oauth_credentials(value):
+    """Recursively remove explicit OAuth credential fields from retained data."""
+    if isinstance(value, dict):
+        return {
+            key: _without_oauth_credentials(item)
+            for key, item in value.items()
+            if str(key).lower().replace("_", "").replace("-", "")
+            not in _OAUTH_CREDENTIAL_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_oauth_credentials(item) for item in value]
+    return value
+
 
 class OAuth2AuthProvider(BaseAuthProvider):
     """Generic OAuth2 provider implementation (RFC 6749 Authorization Code flow)."""
@@ -49,13 +91,15 @@ class OAuth2AuthProvider(BaseAuthProvider):
         }
 
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
-        from urllib.parse import quote
-        params = (
-            f"response_type=code"
-            f"&client_id={quote(self.client_id)}"
-            f"&redirect_uri={quote(redirect_uri)}"
-            f"&scope={quote(self.scope)}"
-            f"&state={state}"
+        scope = " ".join(self.scope.replace("+", " ").split())
+        params = urlencode(
+            {
+                "response_type": "code",
+                "client_id": self.client_id,
+                "redirect_uri": redirect_uri,
+                "scope": scope,
+                "state": state,
+            }
         )
         return f"{self.authorize_url}?{params}"
 
@@ -83,15 +127,20 @@ class OAuth2AuthProvider(BaseAuthProvider):
             return resp.json()
 
     def _get_field(self, data: dict, field_key: str) -> str:
-        """Get a field value using user-defined mapping first, then standard OIDC fallbacks."""
-        # 1. 优先用用户配置的映射字段
+        """Read a configured path exactly, or use standards only when unconfigured."""
+        def read(path: str) -> Any:
+            return _read_oauth_field_path(data, path)
+
+        # 1. 优先用用户配置的完整映射路径
         custom_key = self.field_mapping.get(field_key)
-        if custom_key and data.get(custom_key):
-            return str(data[custom_key])
-        # 2. 依次尝试标准 fallback 字段
+        if custom_key:
+            value = read(custom_key)
+            return "" if value in (None, "") else str(value)
+        # 2. 未配置时才依次尝试标准 OIDC 根路径。
         for std_key in self.FIELD_DEFAULTS.get(field_key, []):
-            if data.get(std_key):
-                return str(data[std_key])
+            value = read(std_key)
+            if value not in (None, ""):
+                return str(value)
         return ""
 
     async def get_user_info(self, access_token: str) -> ExternalUserInfo:
@@ -101,6 +150,16 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             resp_data = resp.json()
+            if (
+                200 <= getattr(resp, "status_code", 200) < 300
+                and self.provider is not None
+                and getattr(self.provider, "id", None)
+            ):
+                from app.services.provider_field_discovery import (
+                    cache_oidc_field_samples,
+                )
+
+                await cache_oidc_field_samples(str(self.provider.id), resp_data)
 
             # Handle case where userinfo returns None or empty
             if not resp_data:
@@ -111,13 +170,14 @@ class OAuth2AuthProvider(BaseAuthProvider):
             else:
                 info = resp_data
 
-            logger.info(f"OAuth2 user info: {info}")
+            logger.info("OAuth2 user info received for provider={}", self.provider_type)
 
             # 通用字段解析（优先用户自定义映射，再 fallback 到标准字段）
-            user_id = self._get_field(info, "user_id")
-            name = self._get_field(info, "name")
-            email = self._get_field(info, "email")
-            mobile = self._get_field(info, "mobile")
+            user_id = self._get_field(resp_data, "user_id")
+            name = self._get_field(resp_data, "name")
+            email = self._get_field(resp_data, "email")
+            mobile = self._get_field(resp_data, "mobile")
+            avatar_url = self._get_field(resp_data, "avatar")
 
             return ExternalUserInfo(
                 provider_type=self.provider_type,
@@ -125,38 +185,46 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 name=name,
                 email=email,
                 mobile=mobile,
+                avatar_url=avatar_url,
                 raw_data=info,
             )
 
     async def get_user_info_from_token_data(self, token_data: dict) -> ExternalUserInfo:
         """Extract user info from token exchange response (fallback when userinfo endpoint fails)."""
+        if self.provider is not None and getattr(self.provider, "id", None):
+            from app.services.provider_field_discovery import cache_oidc_field_samples
+
+            await cache_oidc_field_samples(str(self.provider.id), token_data)
         info = token_data.copy()
         if "userInfo" in info and isinstance(info["userInfo"], dict):
             info = {**info, **info["userInfo"]}
-        logger.info(f"OAuth2 user info from token_data: {info}")
+        logger.info(
+            "OAuth2 fallback user info received from token response for provider={}",
+            self.provider_type,
+        )
         user_id = self._get_field(info, "user_id") or info.get("openid", "")
         name = self._get_field(info, "name")
         email = self._get_field(info, "email")
         mobile = self._get_field(info, "mobile")
+        avatar_url = self._get_field(info, "avatar")
         return ExternalUserInfo(
             provider_type=self.provider_type,
             provider_user_id=str(user_id),
             name=name,
             email=email,
             mobile=mobile,
-            raw_data=info,
+            avatar_url=avatar_url,
+            raw_data=_without_oauth_credentials(info),
         )
 
     async def _create_new_user(self, db, user_info, tenant_id):
         """Override to use provider_user_id as username for OAuth2."""
         from app.services.registration_service import registration_service
-        from app.models.user import Identity as IdentityModel
-
         # 优先用 provider_user_id（如 userId="zhangsan"），再用 email 前缀，最后 fallback
         username = (
             user_info.provider_user_id
             or (user_info.email.split("@")[0] if user_info.email else None)
-            or f"oauth2_user"
+            or "oauth2_user"
         )
 
         # Check username uniqueness via Identity
@@ -184,6 +252,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
             phone=user_info.mobile,
             username=username,
             password=None,
+            provider=self.provider,
         )
 
         # Create tenant-scoped User

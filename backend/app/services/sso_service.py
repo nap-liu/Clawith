@@ -470,15 +470,19 @@ class SSOService:
                     member.name = incoming_name
 
                 incoming_email = identity_data.get("email") or identity_data.get("biz_mail")
-                if incoming_email and not member.email:
+                if incoming_email:
+                    from app.services.canonical_user_resolver import normalize_email
+
+                    incoming_email = normalize_email(incoming_email)
+                if incoming_email and member.email != incoming_email:
                     member.email = incoming_email
 
                 incoming_avatar = identity_data.get("avatar")
-                if incoming_avatar and not member.avatar_url:
+                if incoming_avatar and member.avatar_url != incoming_avatar:
                     member.avatar_url = incoming_avatar
 
                 incoming_mobile = identity_data.get("mobile")
-                if incoming_mobile and not member.phone:
+                if incoming_mobile and member.phone != incoming_mobile:
                     member.phone = incoming_mobile
 
         else:

@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import Text, UniqueConstraint
+from sqlalchemy import Index, Text, UniqueConstraint
 
 from app.api.relationships import AgentRelationshipIn, RelationshipIn
 from app.models.identity import IdentityProvider
@@ -23,6 +23,14 @@ def _unique_columns(model: type) -> set[tuple[str, ...]]:
         tuple(column.name for column in constraint.columns)
         for constraint in model.__table__.constraints
         if isinstance(constraint, UniqueConstraint)
+    }
+
+
+def _unique_index_columns(model: type) -> set[tuple[str, ...]]:
+    return {
+        tuple(column.name for column in index.columns)
+        for index in model.__table__.indexes
+        if isinstance(index, Index) and index.unique
     }
 
 
@@ -60,10 +68,19 @@ def test_channel_binding_uses_full_scoped_subject_contract():
     assert isinstance(AgentRelationship.metadata.tables["org_members"].c.external_id.type, Text)
     assert (
         "tenant_id",
+        "provider_id",
         "installation_scope",
+        "channel_type",
         "id_type",
         "subject",
-    ) in _unique_columns(ChannelUserBinding)
+    ) in _unique_index_columns(ChannelUserBinding)
+    assert (
+        "tenant_id",
+        "installation_scope",
+        "channel_type",
+        "id_type",
+        "subject",
+    ) in _unique_index_columns(ChannelUserBinding)
 
 
 @pytest.mark.asyncio

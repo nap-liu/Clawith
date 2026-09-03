@@ -21,6 +21,7 @@ from app.models.identity import IdentityProvider
 from app.models.user import User, Identity
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
 from app.services.identity_provider_lookup import get_preferred_identity_provider
+from app.services.provider_identity_policy import identity_match_order
 from app.services.auth_provider_models import ExternalUserInfo
 from loguru import logger
 
@@ -84,13 +85,8 @@ class BaseAuthProvider(ABC):
     async def find_or_create_user(
         self, db: AsyncSession, user_info: ExternalUserInfo, tenant_id: str | None = None
     ) -> tuple[User, bool]:
-        """Find existing user or create new one via Identity/OrgMember.
-
-        Args:
-            db: Database session
-            user_info: User info from provider
-            tenant_id: Optional tenant ID for association
-        """
+        """Find existing user or create new one via Identity/OrgMember."""
+        from app.services.platform_auth_policy import enforce_sso_login_policy
         from app.services.sso_service import sso_service
 
         # Ensure provider exists
@@ -100,11 +96,12 @@ class BaseAuthProvider(ABC):
         # claims through the shared canonical path so directory/OAuth/IM order
         # cannot create a second tenant User.
         if tenant_id:
-            return await self._find_or_create_enterprise_user(
+            result = await self._find_or_create_enterprise_user(
                 db, user_info, tenant_id
             )
+            await enforce_sso_login_policy(db, result[0], result[1])
+            return result
 
-        # 1. Try lookup via sso_service (which now uses OrgMember)
         provider_user_id = user_info.provider_user_id
         user = await sso_service.resolve_user_identity(
             db,
@@ -116,18 +113,23 @@ class BaseAuthProvider(ABC):
 
         is_new = False
         if not user:
-            # 2. Try matching by email/mobile (which now checks Identity too)
-            if user_info.email:
-                user = await sso_service.match_user_by_email(db, user_info.email, tenant_id)
-            if not user and user_info.mobile:
-                user = await sso_service.match_user_by_mobile(db, user_info.mobile, tenant_id)
-            
+            for field in identity_match_order(self.provider or self.config):
+                value = user_info.mobile if field == "phone" else user_info.email
+                if not value:
+                    continue
+                matcher = (
+                    sso_service.match_user_by_mobile
+                    if field == "phone"
+                    else sso_service.match_user_by_email
+                )
+                user = await matcher(db, value, tenant_id)
+                if user:
+                    break
             if user:
                 # If we found a user via email/mobile matching, it might be in a different tenant
                 if tenant_id and str(user.tenant_id) != tenant_id:
                     # Identity exists but no user in this tenant
                     user = None 
-
         # 5. 通过 provider_user_id 匹配现有用户 username（同租户下唯一登录凭证）
         if not user and user_info.provider_user_id:
             from sqlalchemy import and_
@@ -170,7 +172,9 @@ class BaseAuthProvider(ABC):
             # Update user info and ensure identity is loaded
             if not user.identity_id:
                  from app.services.registration_service import registration_service
-                 identity = await registration_service.find_or_create_identity(db, email=user_info.email, phone=user_info.mobile)
+                 identity = await registration_service.find_or_create_identity(
+                     db, email=user_info.email, phone=user_info.mobile, provider=self.provider
+                 )
                  user.identity_id = identity.id
 
             # Ensure identity is loaded for proxy field access
@@ -200,7 +204,7 @@ class BaseAuthProvider(ABC):
         # SSO users should also appear as Web members for tenant-side user management.
         from app.services.registration_service import registration_service
         await registration_service.ensure_web_org_member(db, user)
-
+        await enforce_sso_login_policy(db, user, is_new)
         return user, is_new
 
     async def _find_or_create_enterprise_user(
@@ -247,13 +251,14 @@ class BaseAuthProvider(ABC):
                         raise HTTPException(status_code=403, detail="Account is disabled")
                     # Validate the claim before any profile or projection write.
                     normalize_oauth_email(user_info.email)
-                    trusted_user, _ = await oauth_identity_service.refresh_authoritative_email(
+                    trusted_user, _ = await oauth_identity_service.refresh_authoritative_contacts(
                         db,
                         tenant_id=tenant_uuid,
                         provider=exact_provider_model,
                         subject=oauth_subject,
                         user=trusted_user,
                         email=user_info.email,
+                        phone=user_info.mobile,
                     )
                     await sso_service.link_identity(
                         db,
@@ -264,7 +269,9 @@ class BaseAuthProvider(ABC):
                         tenant_id=str(tenant_uuid),
                         provider_model=exact_provider_model,
                     )
-                    await self._update_existing_user(db, trusted_user, user_info)
+                    await self._update_existing_user(
+                        db, trusted_user, user_info, refresh_contacts=False
+                    )
                     await registration_service.ensure_web_org_member(db, trusted_user)
                     return trusted_user, False
 
@@ -307,13 +314,12 @@ class BaseAuthProvider(ABC):
                 identity_data=user_info.raw_data,
                 provider_model=exact_provider_model,
             )
-            if exact_user is not None and not (user_info.email or user_info.mobile):
+            if exact_user is not None:
                 if not exact_user.is_active:
                     raise HTTPException(
                         status_code=403, detail="User account is disabled"
                     )
-                await self._update_existing_user(db, exact_user, user_info)
-                await sso_service.link_identity(
+                exact_member = await sso_service.link_identity(
                     db,
                     str(exact_user.id),
                     self.provider_type,
@@ -321,6 +327,13 @@ class BaseAuthProvider(ABC):
                     user_info.raw_data,
                     tenant_id=str(tenant_uuid),
                     provider_model=exact_provider_model,
+                )
+                await self._update_existing_user(
+                    db,
+                    exact_user,
+                    user_info,
+                    authoritative_contacts=True,
+                    source_member_id=exact_member.id,
                 )
                 await registration_service.ensure_web_org_member(db, exact_user)
                 if oauth_subject is not None:
@@ -339,6 +352,7 @@ class BaseAuthProvider(ABC):
                 phone=user_info.mobile,
                 username=user_info.email.split("@")[0] if user_info.email else None,
                 password=None,
+                provider=provider_model,
             )
 
             user = None
@@ -603,6 +617,7 @@ class BaseAuthProvider(ABC):
                     else None
                 ),
                 password=None,
+                provider=provider,
             )
             resolved = await canonical_user_resolver.reconcile_identity_user(
                 db,
@@ -663,32 +678,27 @@ class BaseAuthProvider(ABC):
         return None  # Override in subclasses for backward compatibility
 
     async def _update_existing_user(
-        self, db: AsyncSession, user: User, user_info: ExternalUserInfo
+        self,
+        db: AsyncSession,
+        user: User,
+        user_info: ExternalUserInfo,
+        *,
+        authoritative_contacts: bool = False,
+        refresh_contacts: bool = True,
+        source_member_id=None,
     ):
         """Update existing user with new info from provider."""
-        if user_info.name and not user.display_name:
-            user.display_name = user_info.name
-        if user_info.avatar_url and not user.avatar_url:
-            user.avatar_url = user_info.avatar_url
+        from app.services.provider_contact_refresh import refresh_provider_user_profile
 
-        # Identity fields are authoritative claims and must be checked together.
-        identity = user.identity
-        if identity:
-            from app.services.canonical_user_resolver import canonical_user_resolver
-
-            claims = await canonical_user_resolver.resolve_identity_claims(
-                db,
-                email=user_info.email,
-                phone=user_info.mobile,
-                enrich=True,
-            )
-            if claims.identity and claims.identity.id != identity.id:
-                from app.services.canonical_user_resolver import CanonicalIdentityConflict
-
-                raise CanonicalIdentityConflict(
-                    "OAuth claims resolve to another identity"
-                )
-        # Update legacy fields if applicable
+        await refresh_provider_user_profile(
+            db,
+            user=user,
+            user_info=user_info,
+            provider=self.provider,
+            authoritative_contacts=authoritative_contacts,
+            refresh_contacts=refresh_contacts,
+            source_member_id=source_member_id,
+        )
         await self._update_legacy_user_fields(user, user_info)
 
     async def _create_new_user(
@@ -707,6 +717,7 @@ class BaseAuthProvider(ABC):
             phone=user_info.mobile,
             username=user_info.email.split("@")[0] if user_info.email else None,
             password=None,
+            provider=self.provider,
         )
 
         # 2. Prepare Tenant user fields

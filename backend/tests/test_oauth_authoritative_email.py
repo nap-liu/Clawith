@@ -187,13 +187,13 @@ async def test_exact_oauth_binding_is_idempotent_without_duplicate_audit():
         assert audit_count == 0
 
 
-async def test_first_login_without_trust_binding_does_not_overwrite_conflicting_email():
+async def test_existing_provider_account_refreshes_email_before_binding_exists():
     suffix = uuid.uuid4().hex[:10]
     old_email = f"first-old-{suffix}@example.com"
     new_email = f"first-new-{suffix}@example.com"
     subject = f"subject-{suffix}"
     phone = f"8618{uuid.uuid4().int % 10**9:09d}"
-    tenant_id, provider_id, identity_id, _user_id = await _seed_bound_user(
+    tenant_id, provider_id, identity_id, user_id = await _seed_bound_user(
         email=old_email,
         subject=subject,
         phone=phone,
@@ -207,28 +207,30 @@ async def test_first_login_without_trust_binding_does_not_overwrite_conflicting_
         )
         await db.commit()
 
-    with pytest.raises(HTTPException) as exc_info:
-        await _login(tenant_id, provider_id, subject=subject, email=new_email, phone=phone)
-    assert exc_info.value.status_code == 409
+    resolved_user_id, created = await _login(
+        tenant_id, provider_id, subject=subject, email=new_email, phone=phone
+    )
+    assert resolved_user_id == user_id
+    assert created is False
 
     async with async_session() as db:
-        assert (await db.get(Identity, identity_id)).email == old_email
+        assert (await db.get(Identity, identity_id)).email == new_email
         binding_count = await db.scalar(
             select(func.count(ChannelUserBinding.id)).where(
                 ChannelUserBinding.provider_id == provider_id,
                 ChannelUserBinding.subject == subject,
             )
         )
-        assert binding_count == 0
+        assert binding_count == 1
 
 
-async def test_provider_authority_change_invalidates_old_binding_for_email_refresh():
+async def test_provider_config_change_keeps_subject_anchor_and_refreshes_email():
     suffix = uuid.uuid4().hex[:10]
     old_email = f"scope-old-{suffix}@example.com"
     new_email = f"scope-new-{suffix}@example.com"
     subject = f"subject-{suffix}"
     phone = f"8618{uuid.uuid4().int % 10**9:09d}"
-    tenant_id, provider_id, identity_id, _user_id = await _seed_bound_user(
+    tenant_id, provider_id, identity_id, user_id = await _seed_bound_user(
         email=old_email,
         subject=subject,
         phone=phone,
@@ -239,12 +241,14 @@ async def test_provider_authority_change_invalidates_old_binding_for_email_refre
         provider.config = {"field_mapping": {"user_id": "employeeId", "email": "workEmail"}}
         await db.commit()
 
-    with pytest.raises(HTTPException) as exc_info:
-        await _login(tenant_id, provider_id, subject=subject, email=new_email, phone=phone)
-    assert exc_info.value.status_code == 409
+    resolved_user_id, created = await _login(
+        tenant_id, provider_id, subject=subject, email=new_email, phone=phone
+    )
+    assert resolved_user_id == user_id
+    assert created is False
 
     async with async_session() as db:
-        assert (await db.get(Identity, identity_id)).email == old_email
+        assert (await db.get(Identity, identity_id)).email == new_email
         binding_count = await db.scalar(
             select(func.count(ChannelUserBinding.id)).where(
                 ChannelUserBinding.provider_id == provider_id,
@@ -292,7 +296,7 @@ async def test_concurrent_first_logins_converge_to_one_subject_binding_and_user(
         assert binding_count == 1
 
 
-async def test_exact_oauth_binding_rejects_email_owned_by_another_identity_without_partial_writes():
+async def test_exact_oauth_binding_keeps_user_when_email_is_owned_by_another_identity():
     suffix = uuid.uuid4().hex[:10]
     old_email = f"owner-old-{suffix}@example.com"
     occupied_email = f"occupied-{suffix}@example.com"
@@ -307,25 +311,26 @@ async def test_exact_oauth_binding_rejects_email_owned_by_another_identity_witho
         db.add(Identity(username=f"other-{suffix}", email=occupied_email, email_verified=True))
         await db.commit()
 
-    with pytest.raises(HTTPException) as exc_info:
-        await _login(
-            tenant_id,
-            provider_id,
-            subject=subject,
-            email=occupied_email,
-            phone=phone,
-        )
-    assert exc_info.value.status_code == 409
+    resolved_user_id, created = await _login(
+        tenant_id,
+        provider_id,
+        subject=subject,
+        email=occupied_email,
+        phone=phone,
+    )
+    assert resolved_user_id == user_id
+    assert created is False
 
     async with async_session() as db:
         identity = await db.get(Identity, identity_id)
         assert identity.email == old_email
-        member_emails = set(
-            (
-                await db.execute(select(OrgMember.email).where(OrgMember.user_id == user_id))
-            ).scalars().all()
+        provider_member_email = await db.scalar(
+            select(OrgMember.email).where(
+                OrgMember.user_id == user_id,
+                OrgMember.provider_id == provider_id,
+            )
         )
-        assert member_emails == {old_email}
+        assert provider_member_email == occupied_email
         audit_count = await db.scalar(
             select(func.count(AuditLog.id)).where(
                 AuditLog.user_id == user_id,
@@ -333,6 +338,18 @@ async def test_exact_oauth_binding_rejects_email_owned_by_another_identity_witho
             )
         )
         assert audit_count == 0
+        conflict_count = await db.scalar(
+            select(func.count(AuditLog.id)).where(
+                AuditLog.user_id == user_id,
+                AuditLog.action.in_(
+                    (
+                        "provider_subject_contact_conflict",
+                        "identity_match_lower_priority_conflict",
+                    )
+                ),
+            )
+        )
+        assert conflict_count == 1
 
 
 async def test_same_subject_is_isolated_between_exact_oauth_providers():
@@ -442,19 +459,17 @@ async def test_exact_subject_with_different_user_projection_is_rejected():
         )
         db.add(other_user)
         await db.flush()
-        db.add(
-            OrgMember(
-                tenant_id=tenant_id,
-                provider_id=provider_id,
-                external_id=subject,
-                name="Projection Conflict",
-                email=other_identity.email,
-                phone=other_identity.phone,
-                user_id=other_user.id,
-                status="active",
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider_id,
+                    OrgMember.external_id == subject,
+                )
             )
-        )
+        ).scalar_one()
+        member.user_id = other_user.id
         await db.commit()
+        other_user_id = other_user.id
 
     with pytest.raises(HTTPException) as exc_info:
         await _login(
@@ -467,6 +482,13 @@ async def test_exact_subject_with_different_user_projection_is_rejected():
     assert exc_info.value.status_code == 409
     async with async_session() as db:
         assert (await db.get(Identity, identity_id)).email == email
+        member_user_id = await db.scalar(
+            select(OrgMember.user_id).where(
+                OrgMember.provider_id == provider_id,
+                OrgMember.external_id == subject,
+            )
+        )
+        assert member_user_id == other_user_id
 
 
 async def test_single_wrong_user_projection_is_rejected_before_it_can_be_rebound():

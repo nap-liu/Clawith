@@ -54,6 +54,11 @@ def _is_platform_admin_user(user: User) -> bool:
     return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
 
 
+def _is_global_platform_admin_user(user: User) -> bool:
+    """Only a platform-admin principal without tenant context may cross tenants."""
+    return user.role == "platform_admin" and user.tenant_id is None
+
+
 def _assert_tenant_scope(user: User, tenant_id: uuid.UUID | None) -> None:
     """Reject cross-tenant model access for every non-platform admin."""
     if _is_platform_admin_user(user):

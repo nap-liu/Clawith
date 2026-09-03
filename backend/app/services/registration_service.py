@@ -20,6 +20,7 @@ from app.core.security import hash_password_async
 from app.models.identity import IdentityProvider
 from app.models.tenant import Tenant
 from app.models.user import User, Identity
+from app.services.provider_identity_policy import DEFAULT_IDENTITY_MATCH_ORDER
 from app.services.sso_service import sso_service
 from loguru import logger
 
@@ -141,17 +142,32 @@ class RegistrationService:
         password: str | None = None,
         is_platform_admin: bool = False,
         email_config: Any = None,
+        ordered_fields: tuple[str, ...] | list[str] = DEFAULT_IDENTITY_MATCH_ORDER,
+        provider: IdentityProvider | None = None,
     ) -> Identity:
         """Find an existing identity or create a new one.
 
-        Email and phone are equal authoritative claims.  If both are supplied
-        they must resolve to the same physical Identity.
+        Contact claims are evaluated in the calling provider's configured order.
         """
         from app.services.canonical_user_resolver import canonical_user_resolver
+        from app.services.provider_identity_policy import (
+            identity_match_order,
+            record_identity_match_conflict,
+        )
+
+        if provider is not None:
+            ordered_fields = identity_match_order(provider)
 
         claims = await canonical_user_resolver.resolve_identity_claims(
-            db, email=email, phone=phone, enrich=False
+            db, email=email, phone=phone, enrich=False, ordered_fields=ordered_fields
         )
+        await record_identity_match_conflict(
+            db,
+            provider=provider,
+            tenant_id=getattr(provider, "tenant_id", None),
+            claims=claims,
+            source="account_registration",
+        ) if provider is not None else None
         identity = claims.identity
 
         if identity:
@@ -165,7 +181,8 @@ class RegistrationService:
                     identity.email_verified = True
                     db.add(identity)
             enriched = await canonical_user_resolver.resolve_identity_claims(
-                db, email=claims.email, phone=claims.phone, enrich=True
+                db, email=claims.email, phone=claims.phone, enrich=True,
+                ordered_fields=ordered_fields,
             )
             return enriched.identity or identity
 
@@ -217,7 +234,8 @@ class RegistrationService:
                 return identity
 
             claims = await canonical_user_resolver.resolve_identity_claims(
-                db, email=claims.email, phone=claims.phone, enrich=True
+                db, email=claims.email, phone=claims.phone, enrich=True,
+                ordered_fields=ordered_fields,
             )
             if claims.identity:
                 return claims.identity
@@ -290,6 +308,8 @@ class RegistrationService:
         provider_user_id: str,
         user_info: dict,
         existing_user: User | None = None,
+        provider: IdentityProvider | None = None,
+        ordered_fields: tuple[str, ...] | list[str] = DEFAULT_IDENTITY_MATCH_ORDER,
     ) -> tuple[User, bool]:
         """Handle SSO-based registration flow.
 
@@ -354,6 +374,8 @@ class RegistrationService:
             phone=user_info.get("mobile") or user_info.get("phone"),
             username=username,
             password=None,
+            ordered_fields=ordered_fields,
+            provider=provider,
         )
 
 
@@ -428,9 +450,18 @@ class RegistrationService:
                 # Update last login
                 return existing_user, False, None
 
-            # Also try matching by email
-            if user_info_obj.email:
-                existing_by_email = await sso_service.match_user_by_email(db, user_info_obj.email, tenant_id=tenant_id)
+            provider_model = getattr(auth_provider, "provider", None)
+            from app.services.provider_identity_policy import identity_match_order
+            ordered_fields = identity_match_order(
+                provider_model or getattr(auth_provider, "config", None)
+            )
+            for field in ordered_fields:
+                value = user_info_obj.mobile if field == "phone" else user_info_obj.email
+                if value:
+                    matcher = sso_service.match_user_by_mobile if field == "phone" else sso_service.match_user_by_email
+                    existing_by_email = await matcher(db, value, tenant_id=tenant_id)
+                else:
+                    existing_by_email = None
                 if existing_by_email:
                     # Link identity to existing user
                     await sso_service.link_identity(
@@ -449,6 +480,8 @@ class RegistrationService:
                 provider_type,
                 lookup_provider_user_id,
                 user_info,
+                provider=provider_model,
+                ordered_fields=ordered_fields,
             )
 
             # Bind to OrgMember via email/phone if possible

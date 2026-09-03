@@ -64,6 +64,9 @@ class _FakeDB:
     async def flush(self):
         self.flush_calls += 1
 
+    async def commit(self):
+        return None
+
 
 class _RecordingExecuteDB:
     def __init__(self):
@@ -164,6 +167,19 @@ class _FakeDingTalkScopeFallbackClient:
         })
 
 
+class _FakeDingTalkScopeFailureClient:
+    def __init__(self):
+        self.calls = []
+
+    async def post(self, url, params=None, json=None):
+        self.calls.append(("POST", url))
+        return _FakeDingTalkResponse({"errcode": 15, "errmsg": "topapi unavailable"})
+
+    async def get(self, url, params=None):
+        self.calls.append(("GET", url))
+        return _FakeDingTalkResponse({"errcode": 16, "errmsg": "legacy unavailable"})
+
+
 class _FakeDingTalkLargeDepartmentClient:
     def __init__(self):
         self.department_list_requests = []
@@ -182,6 +198,13 @@ class _FakeDingTalkLargeDepartmentClient:
                     "authed_dept": [1],
                     "authed_user": [],
                 },
+            })
+
+        if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_GET_URL:
+            assert json == {"dept_id": 1}
+            return _FakeDingTalkResponse({
+                "errcode": 0,
+                "result": {"dept_id": 1, "name": "Example Corp"},
             })
 
         if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_LIST_URL:
@@ -226,6 +249,13 @@ class _FakeDingTalkRateLimitClient:
                     "authed_dept": [1],
                     "authed_user": [],
                 },
+            })
+
+        if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_GET_URL:
+            assert json == {"dept_id": 1}
+            return _FakeDingTalkResponse({
+                "errcode": 0,
+                "result": {"dept_id": 1, "name": "Example Corp"},
             })
 
         if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_LIST_URL:
@@ -316,6 +346,7 @@ class _DingTalkSyncAdapterWithSkippedDepartments(DingTalkOrgSyncAdapter):
 
     async def fetch_departments(self):
         return [
+            ExternalDepartment(external_id="1", name="Root"),
             ExternalDepartment(external_id="2", name="Large Department", parent_external_id="1"),
             ExternalDepartment(external_id="3", name="Large Department Team", parent_external_id="2"),
             ExternalDepartment(external_id="4", name="Small Department", parent_external_id="1"),
@@ -323,6 +354,8 @@ class _DingTalkSyncAdapterWithSkippedDepartments(DingTalkOrgSyncAdapter):
 
     async def fetch_users(self, department_external_id: str):
         self.fetched_department_ids.append(department_external_id)
+        if department_external_id == "1":
+            return []
         return [
             ExternalUser(
                 external_id=f"user-{department_external_id}",
@@ -330,6 +363,28 @@ class _DingTalkSyncAdapterWithSkippedDepartments(DingTalkOrgSyncAdapter):
                 unionid=f"union-{department_external_id}",
             )
         ]
+
+
+class _MultiGroupSnapshotAdapter(_SyncAdapterWithFailure):
+    provider_type = "wecom"
+
+    def __init__(self):
+        super().__init__()
+        self.provider.provider_type = "wecom"
+        self.applied_user = None
+
+    async def fetch_departments(self):
+        return [
+            ExternalDepartment(external_id="dept-a", name="A"),
+            ExternalDepartment(external_id="dept-b", name="B"),
+        ]
+
+    async def fetch_users(self, department_external_id: str):
+        return [ExternalUser(external_id="same-user", name="Same User")]
+
+    async def _upsert_member(self, db, provider, user, department_external_id):
+        self.applied_user = user
+        return {}
 
 
 def test_validate_member_identifiers_requires_unionid_for_feishu():
@@ -375,11 +430,22 @@ def test_dingtalk_sync_skips_configured_department_user_fetch():
 
     result = asyncio.run(adapter.sync_org_structure(db))
 
-    assert adapter.fetched_department_ids == ["4"]
-    assert result["members"] == 1
+    assert adapter.fetched_department_ids == ["1", "4"]
+    assert result["departments"] == 0
+    assert result["members"] == 0
     assert result["user_fetch_skipped_departments"] == 2
+    assert adapter.member_counts_updated is False
     assert adapter.reconcile_called is False
-    assert "Reconcile skipped because department user fetch was intentionally skipped" in result["errors"]
+    assert any("snapshot fetch was incomplete" in error for error in result["errors"])
+
+
+def test_provider_snapshot_merges_repeated_user_group_memberships():
+    adapter = _MultiGroupSnapshotAdapter()
+
+    result = asyncio.run(adapter.sync_org_structure(_FakeDB()))
+
+    assert result["members"] == 1
+    assert adapter.applied_user.department_ids == ["dept-a", "dept-b"]
 
 
 def test_dingtalk_sync_skip_department_names_default_to_empty():
@@ -449,6 +515,8 @@ def test_dingtalk_fetch_departments_starts_from_authorized_scope(monkeypatch):
     departments = asyncio.run(adapter.fetch_departments())
 
     assert [dept.external_id for dept in departments] == ["42", "43"]
+    assert departments[0].parent_external_id is None
+    assert departments[1].parent_external_id == "42"
     assert fake_client.department_list_requests == [42, 43]
     assert adapter._dept_path_map == {"42": "研发部", "43": "研发部/平台组"}
 
@@ -463,6 +531,21 @@ def test_dingtalk_authorized_scope_falls_back_to_legacy_auth_scopes():
     assert fake_client.calls == [
         ("POST", DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL),
         ("GET", "https://oapi.dingtalk.com/auth/scopes"),
+    ]
+
+
+def test_dingtalk_authorized_scope_failure_never_expands_to_root():
+    fake_client = _FakeDingTalkScopeFailureClient()
+    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
+
+    with pytest.raises(RuntimeError, match="authorization scope could not be determined"):
+        asyncio.run(
+            adapter._fetch_authorized_department_ids(fake_client, "access-token")
+        )
+
+    assert fake_client.calls == [
+        ("POST", DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL),
+        ("GET", DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_LEGACY_URL),
     ]
 
 
@@ -485,10 +568,10 @@ def test_dingtalk_fetch_departments_expands_departments_by_default(monkeypatch):
     assert [dept.external_id for dept in departments] == ["1", "2", "4", "3"]
     assert fake_client.department_list_requests == [1, 2, 4, 3]
     assert adapter._dept_path_map == {
-        "1": "Root",
-        "2": "Root/Large Department",
-        "3": "Root/Large Department/Large Department Team",
-        "4": "Root/Small Department",
+        "1": "Example Corp",
+        "2": "Example Corp/Large Department",
+        "3": "Example Corp/Large Department/Large Department Team",
+        "4": "Example Corp/Small Department",
     }
 
 
@@ -515,9 +598,9 @@ def test_dingtalk_fetch_departments_does_not_expand_configured_skipped_departmen
     assert [dept.external_id for dept in departments] == ["1", "2", "4"]
     assert fake_client.department_list_requests == [1, 4]
     assert adapter._dept_path_map == {
-        "1": "Root",
-        "2": "Root/Large Department",
-        "4": "Root/Small Department",
+        "1": "Example Corp",
+        "2": "Example Corp/Large Department",
+        "4": "Example Corp/Small Department",
     }
 
 
@@ -566,13 +649,14 @@ def test_build_department_path_map_reconstructs_name_chain_from_internal_tree():
     assert path_map[leaf_id] == "总部/研发部/平台组"
 
 
-def test_build_department_path_map_treats_external_zero_root_as_empty_path():
+@pytest.mark.parametrize("external_id", ["0", "1", "root"])
+def test_build_department_path_map_treats_transport_root_as_empty_path(external_id):
     root_id = uuid.uuid4()
     child_id = uuid.uuid4()
 
     departments = [
         SimpleNamespace(id=child_id, external_id="200", name="研发部", parent_id=root_id),
-        SimpleNamespace(id=root_id, external_id="0", name="Root", parent_id=None),
+        SimpleNamespace(id=root_id, external_id=external_id, name="Root", parent_id=None),
     ]
 
     path_map = build_department_path_map(departments)

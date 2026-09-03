@@ -163,11 +163,30 @@ async def exchange_oauth_code_for_user(
         )
 
     user_info = await _get_user_info(auth_provider, access_token, token_data)
-    user, is_new = await auth_provider.find_or_create_user(
-        db,
-        user_info,
-        tenant_id=tenant_id,
-    )
+    from app.services.platform_auth_policy import AccountRegistrationDisabled
+
+    try:
+        user, is_new = await auth_provider.find_or_create_user(
+            db,
+            user_info,
+            tenant_id=tenant_id,
+        )
+    except AccountRegistrationDisabled as exc:
+        raise OAuthCodeLoginError(
+            "account_registration_disabled",
+            "Account registration is disabled",
+            403,
+        ) from exc
+    if is_new:
+        from app.services.platform_auth_policy import get_platform_auth_policy
+
+        if not (await get_platform_auth_policy(db)).account_registration_enabled:
+            await db.rollback()
+            raise OAuthCodeLoginError(
+                "account_registration_disabled",
+                "Account registration is disabled",
+                403,
+            )
     if not user:
         raise OAuthCodeLoginError(
             "user_resolution_failed",

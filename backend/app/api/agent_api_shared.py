@@ -25,6 +25,7 @@ from app.database import get_db
 from app.models.agent import Agent, AgentPermission
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.identity import IdentityProvider
 from app.models.org import OrgDepartment, OrgMember
 from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
@@ -37,9 +38,12 @@ from app.schemas.schemas import (
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.org_directory import (
     canonical_org_member_id_subquery,
+    directory_memberships_subquery,
     department_subtree_cte,
+    load_directory_identity_summaries,
     permission_directory_departments,
     permission_directory_members,
+    same_directory_provider,
 )
 
 router = APIRouter(prefix="/agents", tags=["agents"])

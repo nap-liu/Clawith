@@ -78,7 +78,10 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
 
                     if data.get("code") != 0:
                         logger.error(f"Feishu fetch departments list error for parent {parent_id}: {data}")
-                        break
+                        raise RuntimeError(
+                            "Feishu department list error for "
+                            f"parent {parent_id}: {data.get('msg') or data}"
+                        )
 
                     res_data = data.get("data", {})
                     items = res_data.get("items", []) or []
@@ -187,6 +190,16 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                 res_data = data.get("data", {})
                 items = res_data.get("items", []) or []
                 for item in items:
+                    avatar = item.get("avatar") or {}
+                    avatar_url = item.get("avatar_url", "") or ""
+                    if isinstance(avatar, dict):
+                        avatar_url = (
+                            avatar.get("avatar_origin")
+                            or avatar.get("avatar_640")
+                            or avatar.get("avatar_240")
+                            or avatar.get("avatar_72")
+                            or avatar_url
+                        )
                     # Collect all departments the user belongs to
                     raw_dept_ids = item.get("department_ids", [])
                     department_ids = [str(did) for did in raw_dept_ids] if raw_dept_ids else [department_external_id]
@@ -209,7 +222,7 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                         unionid=item.get("union_id", ""),
                         name=item.get("name", ""),
                         email=item.get("email", ""),
-                        avatar_url=item.get("avatar_url", ""),
+                        avatar_url=avatar_url,
                         title=item.get("title", ""),
                         department_external_id=department_external_id,
                         department_ids=department_ids,

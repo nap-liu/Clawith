@@ -106,7 +106,7 @@ def _make_login_data(login_identifier="test@example.com", password="correctpassw
 @pytest.mark.asyncio
 async def test_login_invalid_credentials_no_identity():
     """Login with a nonexistent user returns 401."""
-    db = RecordingDB(responses=[DummyResult()])  # no identity found
+    db = RecordingDB(responses=[DummyResult(), DummyResult()])  # settings, no identity
     data = _make_login_data(login_identifier="nobody@example.com", password="whatever")
     bg = AsyncMock()
 
@@ -119,7 +119,7 @@ async def test_login_invalid_credentials_no_identity():
 async def test_login_invalid_credentials_wrong_password():
     """Login with wrong password returns 401."""
     identity = _make_identity(password="correctpassword")
-    db = RecordingDB(responses=[DummyResult(values=[identity])])
+    db = RecordingDB(responses=[DummyResult(), DummyResult(values=[identity])])
     data = _make_login_data(password="wrongpassword")
     bg = AsyncMock()
 
@@ -132,7 +132,7 @@ async def test_login_invalid_credentials_wrong_password():
 async def test_login_disabled_account():
     """Login with a disabled account returns 403."""
     identity = _make_identity(is_active=False)
-    db = RecordingDB(responses=[DummyResult(values=[identity])])
+    db = RecordingDB(responses=[DummyResult(), DummyResult(values=[identity])])
     data = _make_login_data()
     bg = AsyncMock()
 
@@ -143,11 +143,27 @@ async def test_login_disabled_account():
 
 
 @pytest.mark.asyncio
+async def test_login_rejects_password_before_reading_identity_when_disabled():
+    setting = SimpleNamespace(
+        key="password_login_enabled",
+        value={"enabled": False},
+    )
+    db = RecordingDB(responses=[DummyResult(values=[setting])])
+
+    with pytest.raises(HTTPException) as exc:
+        await auth_api.login(_make_login_data(), AsyncMock(), db)
+
+    assert exc.value.status_code == 403
+    assert "Password login is disabled" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_login_unverified_email():
     """Login with unverified email returns 403 with verification info."""
     identity = _make_identity(email_verified=False)
     user = _make_user(identity.id)
     db = RecordingDB(responses=[
+        DummyResult(),                      # platform auth settings
         DummyResult(values=[identity]),  # identity lookup
         DummyResult(values=[user]),       # user lookup for email task
     ])

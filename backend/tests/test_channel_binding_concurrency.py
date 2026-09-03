@@ -42,7 +42,13 @@ async def _dispose_engine_between_cases():
 
 @pytest.mark.parametrize(
     ("channel_type", "expected_binding_count"),
-    [("wechat", 1), ("dingtalk", 3)],
+    [
+        ("wechat", 1),
+        ("dingtalk", 3),
+        ("feishu", 1),
+        ("wecom", 1),
+        ("slack", 1),
+    ],
 )
 @pytest.mark.asyncio
 async def test_identical_channel_ingress_100_way_converges_to_one_user_and_shell(
@@ -74,7 +80,7 @@ async def test_identical_channel_ingress_100_way_converges_to_one_user_and_shell
             tenant_id=tenant.id,
             provider_type=channel_type,
             name=f"{channel_type} {suffix}",
-            config={"installation_scope": f"{channel_type}-installation-{suffix}"},
+            config={},
             is_active=True,
         )
         db.add_all([agent, provider])
@@ -222,6 +228,20 @@ async def test_same_subject_in_two_bot_installations_does_not_cross_bind():
         ).scalars().all()
     assert len(bindings) == 2
     assert len({binding.installation_scope for binding in bindings}) == 2
+    assert len({binding.provider_id for binding in bindings}) == 2
+
+    async with async_session() as db:
+        providers = (
+            await db.execute(
+                select(IdentityProvider).where(
+                    IdentityProvider.id.in_(binding.provider_id for binding in bindings)
+                )
+            )
+        ).scalars().all()
+    assert {
+        str((provider.config or {}).get("installation_scope"))
+        for provider in providers
+    } == {binding.installation_scope for binding in bindings}
 
     async with async_session() as db:
         for source_agent_id, user_id in zip(
@@ -257,7 +277,7 @@ async def test_same_subject_in_two_bot_installations_does_not_cross_bind():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_dingtalk_directory_subject_routes_without_guessing():
+async def test_same_dingtalk_subject_in_two_providers_routes_exact_provider():
     suffix = uuid.uuid4().hex[:12]
     subject = f"staff-{suffix}"
     async with async_session() as db:
@@ -291,8 +311,24 @@ async def test_duplicate_dingtalk_directory_subject_routes_without_guessing():
             config={},
             is_active=True,
         )
-        db.add_all([agent, provider])
+        other_provider = IdentityProvider(
+            tenant_id=tenant.id,
+            provider_type="dingtalk",
+            name=f"Other DingTalk {suffix}",
+            config={},
+            is_active=True,
+        )
+        db.add_all([agent, provider, other_provider])
         await db.flush()
+        db.add(
+            ChannelConfig(
+                agent_id=agent.id,
+                channel_type="dingtalk",
+                app_id=f"exact-{suffix}",
+                is_configured=True,
+                extra_config={"identity_provider_id": str(provider.id)},
+            )
+        )
         db.add_all(
             [
                 OrgMember(
@@ -305,7 +341,7 @@ async def test_duplicate_dingtalk_directory_subject_routes_without_guessing():
                 ),
                 OrgMember(
                     tenant_id=tenant.id,
-                    provider_id=provider.id,
+                    provider_id=other_provider.id,
                     external_id=subject,
                     name="Duplicate B",
                     status="active",
@@ -326,12 +362,12 @@ async def test_duplicate_dingtalk_directory_subject_routes_without_guessing():
             {"external_id": subject},
         )
         await db.commit()
-        assert routed.id not in {first_user.id, second_user.id}
-        assert routed.identity_id is None
+        assert routed.id == first_user.id
         binding = (
             await db.execute(
                 select(ChannelUserBinding).where(
                     ChannelUserBinding.user_id == routed.id,
+                    ChannelUserBinding.provider_id == provider.id,
                     ChannelUserBinding.id_type == "staff_id",
                     ChannelUserBinding.subject == subject,
                 )

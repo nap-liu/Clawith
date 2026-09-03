@@ -184,14 +184,38 @@ async def _get_session_messages_page(
             agent_ids_seen.add(getattr(message, "agent_id", None) or agent_id)
 
     user_name_cache: dict[str, str] = {}
+    user_avatar_cache: dict[str, str] = {}
     needs_sender_names = bool(getattr(session, "is_group", False)) or session.source_channel == "agent"
-    if needs_sender_names and user_ids_seen:
-        u_rows = await db.execute(select(User.id, User.display_name).where(User.id.in_(user_ids_seen)))
-        user_name_cache = {str(uid): (name or "Unknown") for uid, name in u_rows.all()}
+    if user_ids_seen:
+        u_rows = await db.execute(
+            select(User.id, User.display_name, User.avatar_url).where(
+                User.id.in_(user_ids_seen)
+            )
+        )
+        user_profiles = list(u_rows.all())
+        if needs_sender_names:
+            user_name_cache = {
+                str(uid): (name or "Unknown") for uid, name, _avatar in user_profiles
+            }
+        user_avatar_cache = {
+            str(uid): avatar for uid, _name, avatar in user_profiles if avatar
+        }
     agent_name_cache: dict[str, str] = {}
-    if needs_sender_names and agent_ids_seen:
-        a_rows = await db.execute(select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids_seen)))
-        agent_name_cache = {str(aid): (name or "Unknown") for aid, name in a_rows.all()}
+    agent_avatar_cache: dict[str, str] = {}
+    if agent_ids_seen:
+        a_rows = await db.execute(
+            select(Agent.id, Agent.name, Agent.avatar_url).where(
+                Agent.id.in_(agent_ids_seen)
+            )
+        )
+        agent_profiles = list(a_rows.all())
+        if needs_sender_names:
+            agent_name_cache = {
+                str(aid): (name or "Unknown") for aid, name, _avatar in agent_profiles
+            }
+        agent_avatar_cache = {
+            str(aid): avatar for aid, _name, avatar in agent_profiles if avatar
+        }
 
     out = []
     tool_call_positions: dict[str, int] = {}
@@ -223,10 +247,13 @@ async def _get_session_messages_page(
             elif m.role in {"assistant", "tool_call"}:
                 sender_agent_id = getattr(m, "agent_id", None) or agent_id
         sender_name = legacy_sender_name
+        sender_avatar_url = None
         if sender_user_id:
             sender_name = user_name_cache.get(str(sender_user_id), sender_name)
+            sender_avatar_url = user_avatar_cache.get(str(sender_user_id))
         elif sender_agent_id:
             sender_name = agent_name_cache.get(str(sender_agent_id), sender_name)
+            sender_avatar_url = agent_avatar_cache.get(str(sender_agent_id))
 
         if m.role == "tool_call":
             entry = serialize_tool_call_for_client(
@@ -235,6 +262,7 @@ async def _get_session_messages_page(
                 sender_name=sender_name,
                 sender_user_id=sender_user_id,
                 sender_agent_id=sender_agent_id,
+                sender_avatar_url=sender_avatar_url,
             )
             # Canonical tool events persist the model call_id, shared by their append-only
             # running/done rows. Pending confirmation rows intentionally have no call_id;
@@ -271,6 +299,8 @@ async def _get_session_messages_page(
                     part["sender_user_id"] = str(sender_user_id)
                 if sender_agent_id:
                     part["sender_agent_id"] = str(sender_agent_id)
+                if sender_avatar_url:
+                    part["sender_avatar_url"] = sender_avatar_url
                 out.append(part)
         else:
             entry = serialize_chat_message_for_client(
@@ -279,6 +309,7 @@ async def _get_session_messages_page(
                 sender_name=sender_name,
                 sender_user_id=sender_user_id,
                 sender_agent_id=sender_agent_id,
+                sender_avatar_url=sender_avatar_url,
             )
             out.append(entry)
 

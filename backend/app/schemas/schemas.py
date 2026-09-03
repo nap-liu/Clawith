@@ -177,6 +177,13 @@ class IdentityProviderOut(BaseModel):
     name: str
     is_active: bool
     sso_login_enabled: bool = False
+    sync_enabled: bool = False
+    sync_interval_value: int | None = None
+    sync_interval_unit: str | None = None
+    next_sync_at: datetime | None = None
+    last_sync_attempt_at: datetime | None = None
+    last_sync_success_at: datetime | None = None
+    last_synced_at: str | None = None
     config: dict | None = None
     tenant_id: uuid.UUID | None = None
     updated_at: datetime | None = None

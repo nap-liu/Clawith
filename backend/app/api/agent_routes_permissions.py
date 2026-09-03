@@ -1,6 +1,7 @@
 """Mechanically separated Agent API route group."""
 
 from app.api.agent_api_shared import *  # noqa: F401,F403
+from app.services.provider_identity_policy import mask_identity_claim
 
 
 @router.get("/{agent_id}/permissions")
@@ -46,7 +47,8 @@ async def get_agent_permissions(
     department_access = []
     if department_perms:
         departments_result = await db.execute(
-            select(OrgDepartment)
+            select(OrgDepartment, IdentityProvider)
+            .outerjoin(IdentityProvider, IdentityProvider.id == OrgDepartment.provider_id)
             .where(
                 OrgDepartment.id.in_([p.scope_id for p in department_perms]),
                 OrgDepartment.tenant_id == agent.tenant_id,
@@ -55,17 +57,21 @@ async def get_agent_permissions(
             .order_by(OrgDepartment.path.asc())
         )
         departments_by_id = {
-            department.id: department
-            for department in departments_result.scalars().all()
+            department.id: (department, provider)
+            for department, provider in departments_result.all()
         }
         for perm in department_perms:
-            department = departments_by_id.get(perm.scope_id)
-            if department:
+            department_row = departments_by_id.get(perm.scope_id)
+            if department_row:
+                department, provider = department_row
                 department_access.append(
                     {
                         "id": str(department.id),
                         "name": department.name,
                         "path": department.path,
+                        "provider_id": str(department.provider_id) if department.provider_id else None,
+                        "provider_name": provider.name if provider else None,
+                        "provider_type": provider.provider_type if provider else None,
                         "access_level": perm.access_level or "use",
                         "include_descendants": True,
                     }
@@ -107,6 +113,9 @@ async def get_agent_permissions(
             if perm.scope_type == "user" and perm.scope_id
         }
         ordered_user_ids = [str(uid) for uid in display_user_ids]
+        source_map, binding_map = await load_directory_identity_summaries(
+            db, tenant_id=agent.tenant_id, user_ids=display_user_ids
+        )
         ordered_user_ids.sort(key=lambda sid: (users_by_id.get(sid).display_name or users_by_id.get(sid).username or "") if users_by_id.get(sid) else "")
         for perm in perms:
             if perm.scope_type != "user" or not perm.scope_id:
@@ -128,6 +137,11 @@ async def get_agent_permissions(
                 "name": u.display_name or u.username,
                 "username": u.username,
                 "email": u.email,
+                "phone_masked": mask_identity_claim(
+                    "phone",
+                    (u.identity.phone if u.identity else None)
+                    or (member.phone if member else None),
+                ),
                 "title": member.title if member else u.title,
                 "avatar_url": member.avatar_url if member else u.avatar_url,
                 "department_path": member.department_path if member else "",
@@ -135,6 +149,8 @@ async def get_agent_permissions(
                 "access_level": "manage" if is_required else access_by_user_id.get(sid, "use"),
                 "is_required": is_required,
                 "required_reason": "creator" if is_creator else "company_admin" if is_admin else None,
+                "directory_sources": source_map.get(u.id, []),
+                "channel_bindings": binding_map.get(u.id, []),
             }
             scope_names.append({"id": sid, "name": item["name"]})
             user_access.append(item)
@@ -367,6 +383,7 @@ async def get_agent_permission_members(
         candidate_filters = [
             User.tenant_id == agent.tenant_id,
             User.is_active == True,  # noqa: E712
+            or_(Identity.id.is_(None), Identity.is_active == True),  # noqa: E712
             or_(
                 User.id.in_(select(accessible_user_ids.c.id)),
                 User.role == "platform_admin",
@@ -374,15 +391,49 @@ async def get_agent_permission_members(
             ),
         ]
         normalized_search = (search or "").strip()
+        search_rank = None
         if normalized_search:
             pattern = f"%{normalized_search}%"
+            source_columns = (
+                OrgMember.name,
+                OrgMember.nickname,
+                OrgMember.email,
+                OrgMember.phone,
+            )
+            source_base = select(OrgMember.user_id).outerjoin(
+                IdentityProvider, IdentityProvider.id == OrgMember.provider_id
+            ).where(
+                OrgMember.tenant_id == agent.tenant_id,
+                OrgMember.status == "active",
+                OrgMember.user_id.is_not(None),
+                IdentityProvider.is_active.is_(True),
+            )
+            matching_source_users = source_base.where(
+                or_(*(column.ilike(pattern) for column in source_columns))
+            )
             candidate_filters.append(
                 or_(
                     User.display_name.ilike(pattern),
-                    User.identity.has(
-                        or_(Identity.email.ilike(pattern), Identity.username.ilike(pattern))
-                    ),
+                    Identity.email.ilike(pattern),
+                    Identity.phone.ilike(pattern),
+                    User.id.in_(matching_source_users),
                 )
+            )
+            exact_value = normalized_search.casefold()
+            exact_source_users = source_base.where(
+                or_(*(func.lower(column) == exact_value for column in source_columns))
+            )
+            search_rank = case(
+                (
+                    or_(
+                        func.lower(User.display_name) == exact_value,
+                        func.lower(Identity.email) == exact_value,
+                        func.lower(Identity.phone) == exact_value,
+                        User.id.in_(exact_source_users),
+                    ),
+                    0,
+                ),
+                else_=1,
             )
         elif department_id:
             department_result = await db.execute(
@@ -403,11 +454,23 @@ async def get_agent_permission_members(
                     name="execution_picker_department_subtree",
                 )
                 department_ids = select(subtree.c.department_id)
-            department_user_ids = select(OrgMember.user_id).where(
-                OrgMember.tenant_id == agent.tenant_id,
-                OrgMember.status == "active",
-                OrgMember.department_id.in_(department_ids),
-                OrgMember.user_id.is_not(None),
+            memberships = directory_memberships_subquery(
+                tenant_id=agent.tenant_id,
+                name="execution_picker_memberships",
+            )
+            department_user_ids = (
+                select(OrgMember.user_id)
+                .join(memberships, memberships.c.account_id == OrgMember.id)
+                .where(
+                    OrgMember.tenant_id == agent.tenant_id,
+                    OrgMember.status == "active",
+                    memberships.c.group_id.in_(department_ids),
+                    same_directory_provider(
+                        memberships.c.provider_id,
+                        OrgMember.provider_id,
+                    ),
+                    OrgMember.user_id.is_not(None),
+                )
             )
             candidate_filters.append(User.id.in_(department_user_ids))
 
@@ -416,10 +479,13 @@ async def get_agent_permission_members(
             select(func.count()).select_from(candidate_query.subquery())
         )
         total = int(count_result.scalar_one() or 0)
+        ordering = [User.display_name.asc(), User.id.asc()]
+        if search_rank is not None:
+            ordering.insert(0, search_rank.asc())
         candidates_result = await db.execute(
             candidate_query
             .options(selectinload(User.identity))
-            .order_by(User.display_name.asc(), User.id.asc())
+            .order_by(*ordering)
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
@@ -427,19 +493,31 @@ async def get_agent_permission_members(
 
         profile_map: dict[uuid.UUID, OrgMember] = {}
         if candidates:
+            canonical_profiles = canonical_org_member_id_subquery(
+                tenant_id=agent.tenant_id,
+                prefer_directory_profile=True,
+            )
             profile_result = await db.execute(
                 select(OrgMember)
-                .where(
-                    OrgMember.tenant_id == agent.tenant_id,
-                    OrgMember.status == "active",
-                    OrgMember.user_id.in_([candidate.id for candidate in candidates]),
+                .join(
+                    canonical_profiles,
+                    and_(
+                        OrgMember.id == canonical_profiles.c.om_id,
+                        canonical_profiles.c.rn == 1,
+                    ),
                 )
+                .where(OrgMember.user_id.in_([candidate.id for candidate in candidates]))
                 .order_by(OrgMember.user_id.asc(), OrgMember.id.asc())
             )
             for profile in profile_result.scalars().all():
                 if profile.user_id and profile.user_id not in profile_map:
                     profile_map[profile.user_id] = profile
 
+        source_map, binding_map = await load_directory_identity_summaries(
+            db,
+            tenant_id=agent.tenant_id,
+            user_ids=[candidate.id for candidate in candidates],
+        )
         return {
             "items": [
                 {
@@ -452,6 +530,13 @@ async def get_agent_permission_members(
                     "title": (profile.title or candidate.title or "") if profile else (candidate.title or ""),
                     "avatar_url": (profile.avatar_url if profile else None) or candidate.avatar_url,
                     "email": candidate.email,
+                    "phone_masked": mask_identity_claim(
+                        "phone",
+                        (candidate.identity.phone if candidate.identity else None)
+                        or (profile.phone if profile else None),
+                    ),
+                    "directory_sources": source_map.get(candidate.id, []),
+                    "channel_bindings": binding_map.get(candidate.id, []),
                 }
                 for candidate in candidates
             ],

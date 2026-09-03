@@ -44,7 +44,7 @@ from tests.test_canonical_user_reconciliation import (
 
 pytestmark = pytest.mark.asyncio
 
-async def test_dingtalk_identity_conflict_still_routes_message_to_identityless_user():
+async def test_dingtalk_identity_conflict_routes_by_provider_default_phone():
     tenant_id, _dingtalk_id, _oauth_id = await _tenant_and_providers()
     email = f"conflict-{uuid.uuid4().hex[:8]}@example.com"
     phone = _phone()
@@ -57,25 +57,23 @@ async def test_dingtalk_identity_conflict_still_routes_message_to_identityless_u
         )
         db.add_all([email_identity, phone_identity])
         await db.flush()
-        db.add_all(
-            [
-                User(
+        email_user = User(
                     identity_id=email_identity.id,
                     tenant_id=tenant_id,
                     display_name="Email Owner",
                     role="member",
                     is_active=True,
-                ),
-                User(
+                )
+        phone_user = User(
                     identity_id=phone_identity.id,
                     tenant_id=tenant_id,
                     display_name="Phone Owner",
                     role="member",
                     is_active=True,
-                ),
-            ]
-        )
+                )
+        db.add_all([email_user, phone_user])
         await db.commit()
+        phone_user_id = phone_user.id
 
     service = ChannelUserService()
     agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
@@ -94,7 +92,8 @@ async def test_dingtalk_identity_conflict_still_routes_message_to_identityless_u
             },
         )
         await db.commit()
-        assert routed.identity_id is None
+        assert routed.id == phone_user_id
+        assert routed.identity_id is not None
 
 
 async def test_dingtalk_bound_user_keeps_routing_when_new_contact_conflicts():
@@ -157,16 +156,25 @@ async def test_dingtalk_bound_user_keeps_routing_when_new_contact_conflicts():
         assert routed.id == first_id
 
 
-async def test_dingtalk_ambiguous_directory_rows_still_route_exact_sender():
+async def test_dingtalk_same_subject_in_two_providers_routes_exact_sender():
     tenant_id, dingtalk_id, _oauth_id = await _tenant_and_providers()
     external_id = f"staff-{uuid.uuid4().hex[:8]}"
     unionid = f"union-{uuid.uuid4().hex[:8]}"
     async with async_session() as db:
+        other_provider = IdentityProvider(
+            tenant_id=tenant_id,
+            provider_type="dingtalk",
+            name=f"Other DingTalk {uuid.uuid4().hex[:8]}",
+            config={},
+            is_active=True,
+        )
+        db.add(other_provider)
+        await db.flush()
         db.add_all(
             [
                 OrgMember(
                     tenant_id=tenant_id,
-                    provider_id=dingtalk_id,
+                    provider_id=other_provider.id,
                     external_id=external_id,
                     name="Duplicate A",
                     status="active",
@@ -186,12 +194,14 @@ async def test_dingtalk_ambiguous_directory_rows_still_route_exact_sender():
     agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
     scope = f"test:dingtalk:{uuid.uuid4()}"
     async with async_session() as db:
+        provider = await db.get(IdentityProvider, dingtalk_id)
         routed = await service.resolve_channel_user(
             db,
             agent,
             "dingtalk",
             external_id,
             {"unionid": unionid, "_installation_scope": scope},
+            provider=provider,
         )
         await db.commit()
         assert routed.identity_id is None
@@ -199,6 +209,7 @@ async def test_dingtalk_ambiguous_directory_rows_still_route_exact_sender():
             await db.execute(
                 select(ChannelUserBinding).where(
                     ChannelUserBinding.installation_scope == scope,
+                    ChannelUserBinding.provider_id == dingtalk_id,
                     ChannelUserBinding.id_type == "staff_id",
                     ChannelUserBinding.subject == external_id,
                 )

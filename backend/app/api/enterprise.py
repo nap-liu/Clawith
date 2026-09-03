@@ -3,6 +3,7 @@
 from app.api.enterprise_api_shared import *  # noqa: F401,F403
 from app.api.enterprise_routes_core import *  # noqa: F401,F403
 from app.api.enterprise_routes_identity import *  # noqa: F401,F403
+from app.api.enterprise_routes_identity_conflicts import *  # noqa: F401,F403
 from app.api.enterprise_routes_org import *  # noqa: F401,F403
 from app.api.enterprise_routes_invitations import *  # noqa: F401,F403
 

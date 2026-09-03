@@ -5,12 +5,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
 from app.models.identity import IdentityProvider
 from app.models.org import ChannelUserBinding, OrgMember
+from app.models.user import User
 from app.services.channel_user_errors import ChannelUserResolutionError
 from app.services.directory_identity_claims import VerifiedDirectoryClaims
 
@@ -95,6 +96,9 @@ class ChannelUserIdentityMappingMethods:
             return f"agent:{agent.id}:channel:{normalized}"
 
         extra_config = config.extra_config if isinstance(config.extra_config, dict) else {}
+        configured_provider_id = extra_config.get("identity_provider_id")
+        if configured_provider_id:
+            extra_info.setdefault("_identity_provider_id", configured_provider_id)
         issuer = str(
             extra_info.get("_issuer")
             or config.app_id
@@ -141,6 +145,10 @@ class ChannelUserIdentityMappingMethods:
             ("open_id", open_id),
             (external_type, external_id),
         ]
+        if normalized == "dingtalk":
+            candidates.append(
+                ("sender_id", str(extra_info.get("sender_id") or "").strip() or None)
+            )
         seen: set[tuple[str, str]] = set()
         subjects: list[tuple[str, str]] = []
         for id_type, subject in candidates:
@@ -150,6 +158,62 @@ class ChannelUserIdentityMappingMethods:
                 seen.add(key)
                 subjects.append(key)
         return subjects
+
+    async def _mark_observed_source_account_active(
+        self,
+        db: AsyncSession,
+        provider: IdentityProvider,
+        channel_type: str,
+        external_user_id: str | None,
+        extra_info: dict[str, Any],
+    ) -> None:
+        """Apply fresh provider evidence before rejecting a stale source row."""
+        if extra_info.get("source_account_active") is not True:
+            return
+        source_columns = {
+            "union_id": OrgMember.unionid,
+            "open_id": OrgMember.open_id,
+            "staff_id": OrgMember.external_id,
+            "user_id": OrgMember.external_id,
+            "external_id": OrgMember.external_id,
+        }
+        matches = [
+            source_columns[id_type] == subject
+            for id_type, subject in self._binding_subjects(
+                provider, channel_type, external_user_id, extra_info
+            )
+            if id_type in source_columns
+        ]
+        if not matches or provider.tenant_id is None:
+            return
+        members = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.tenant_id == provider.tenant_id,
+                    OrgMember.provider_id == provider.id,
+                    or_(*matches),
+                )
+            )
+        ).scalars().all()
+        linked_user_ids = {member.user_id for member in members if member.user_id}
+        for member in members:
+            member.status = "active"
+        if linked_user_ids:
+            users = (
+                await db.execute(
+                    select(User).where(
+                        User.tenant_id == provider.tenant_id,
+                        User.id.in_(linked_user_ids),
+                    )
+                )
+            ).scalars().all()
+            for user in users:
+                if user.identity_id is None or (
+                    user.identity is not None and user.identity.is_active
+                ):
+                    user.is_active = True
+        if members:
+            await db.flush()
 
     def _fresh_dingtalk_claims(
         self,
@@ -193,6 +257,17 @@ class ChannelUserIdentityMappingMethods:
         channel_type: str,
         extra_info: dict[str, Any],
     ) -> None:
+        unionid, open_id, external_id = self._get_channel_ids(
+            channel_type,
+            extra_info.get("external_id"),
+            extra_info,
+        )
+        if external_id and not org_member.external_id:
+            org_member.external_id = external_id
+        if unionid and not org_member.unionid:
+            org_member.unionid = unionid
+        if open_id and not org_member.open_id:
+            org_member.open_id = open_id
         identity_seed = org_member.external_id or org_member.open_id or org_member.id.hex
         generated_name = f"{channel_type.capitalize()} User {identity_seed[:8]}"
         incoming_name = (extra_info.get("name") or "").strip()

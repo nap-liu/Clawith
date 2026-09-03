@@ -41,7 +41,9 @@ async def resolve_base_url(
         if tenant:
             # Level 1: complete custom domain
             if tenant.sso_domain:
-                domain = tenant.sso_domain
+                domain = tenant.sso_domain.strip()
+                if domain.startswith(("http://", "https://")):
+                    return domain.rstrip("/")
                 return f"https://{domain}".rstrip("/")
 
             # Level 2: subdomain prefix + global hostname (skip for default tenant)

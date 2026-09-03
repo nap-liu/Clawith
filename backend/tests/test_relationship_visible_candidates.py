@@ -202,9 +202,12 @@ async def session():
     _register_all_models()
     from app.database import Base
     from app.models.agent import Agent, AgentPermission
+    from app.models.identity import IdentityProvider
     from app.models.org import (
         AgentAgentRelationship,
         AgentRelationship,
+        DirectoryAccountGroup,
+        DirectoryGroupEdge,
         OrgDepartment,
         OrgMember,
         RelationshipSuppression,
@@ -217,8 +220,11 @@ async def session():
         User.__table__,
         Agent.__table__,
         AgentPermission.__table__,
+        IdentityProvider.__table__,
         OrgDepartment.__table__,
         OrgMember.__table__,
+        DirectoryGroupEdge.__table__,
+        DirectoryAccountGroup.__table__,
         AgentRelationship.__table__,
         AgentAgentRelationship.__table__,
         RelationshipSuppression.__table__,

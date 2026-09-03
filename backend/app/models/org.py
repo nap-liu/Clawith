@@ -3,8 +3,9 @@
 import uuid
 from datetime import datetime
 
+import sqlalchemy as sa
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSON, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -14,9 +15,22 @@ class OrgDepartment(Base):
     """Department from Feishu org structure."""
 
     __tablename__ = "org_departments"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", "provider_id", name="uq_org_department_scope"),
+        sa.Index(
+            "uq_org_departments_provider_external_id",
+            "provider_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sa.text(
+                "provider_id IS NOT NULL AND external_id IS NOT NULL "
+                "AND external_id <> ''"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    external_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    external_id: Mapped[str | None] = mapped_column(Text, index=True)
     provider_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # No FK - soft coupling
 
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -35,6 +49,19 @@ class OrgMember(Base):
     """Person from an identity provider's org structure."""
 
     __tablename__ = "org_members"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", "provider_id", name="uq_org_member_scope"),
+        sa.Index(
+            "uq_org_members_provider_external_id",
+            "provider_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sa.text(
+                "provider_id IS NOT NULL AND external_id IS NOT NULL "
+                "AND external_id <> ''"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
@@ -62,6 +89,139 @@ class OrgMember(Base):
     department: Mapped["OrgDepartment | None"] = relationship(back_populates="members")
 
 
+class DirectoryGroupEdge(Base):
+    """Provider-scoped SCIM Group nesting; parent_id remains a compatibility projection."""
+
+    __tablename__ = "directory_group_edges"
+    __table_args__ = (
+        UniqueConstraint("provider_id", "parent_group_id", "child_group_id", name="uq_directory_group_edge"),
+        CheckConstraint("parent_group_id <> child_group_id", name="ck_directory_group_edge_not_self"),
+        sa.ForeignKeyConstraint(
+            ["parent_group_id", "tenant_id", "provider_id"],
+            ["org_departments.id", "org_departments.tenant_id", "org_departments.provider_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["child_group_id", "tenant_id", "provider_id"],
+            ["org_departments.id", "org_departments.tenant_id", "org_departments.provider_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["provider_id", "tenant_id"],
+            ["identity_providers.id", "identity_providers.tenant_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    parent_group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    child_group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DirectoryAccountGroup(Base):
+    """Provider-scoped SCIM User-to-Group membership."""
+
+    __tablename__ = "directory_account_groups"
+    __table_args__ = (
+        UniqueConstraint("provider_id", "account_id", "group_id", name="uq_directory_account_group"),
+        sa.ForeignKeyConstraint(
+            ["account_id", "tenant_id", "provider_id"],
+            ["org_members.id", "org_members.tenant_id", "org_members.provider_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["group_id", "tenant_id", "provider_id"],
+            ["org_departments.id", "org_departments.tenant_id", "org_departments.provider_id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["provider_id", "tenant_id"],
+            ["identity_providers.id", "identity_providers.tenant_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )
+    is_primary: Mapped[bool] = mapped_column(sa.Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DirectorySyncRun(Base):
+    """Durable progress and audit record for one provider directory sync."""
+
+    __tablename__ = "directory_sync_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_type IN ('manual', 'scheduled')",
+            name="ck_directory_sync_runs_trigger_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'needs_review', 'partial_failed', 'failed', 'cancelled')",
+            name="ck_directory_sync_runs_status",
+        ),
+        CheckConstraint(
+            "progress_percent IS NULL OR (progress_percent >= 0 AND progress_percent <= 100)",
+            name="ck_directory_sync_runs_progress",
+        ),
+        sa.Index(
+            "uq_directory_sync_runs_active_provider",
+            "provider_id",
+            unique=True,
+            postgresql_where=sa.text("status IN ('pending', 'running')"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["provider_id", "tenant_id"],
+            ["identity_providers.id", "identity_providers.tenant_id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("identity_providers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    trigger_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending", index=True)
+    stage: Mapped[str] = mapped_column(String(50), nullable=False, default="queued")
+    processed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_items: Mapped[int | None] = mapped_column(Integer)
+    progress_percent: Mapped[int | None] = mapped_column(Integer, default=0)
+    stats: Mapped[dict] = mapped_column(JSON().with_variant(JSONB, "postgresql"), default=dict, nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class ChannelUserBinding(Base):
     """Internal mapping from a channel-scoped subject to a canonical User.
 
@@ -73,12 +233,28 @@ class ChannelUserBinding(Base):
 
     __tablename__ = "channel_user_bindings"
     __table_args__ = (
-        UniqueConstraint(
+        sa.Index(
+            "uq_channel_user_binding_subject_provider",
             "tenant_id",
+            "provider_id",
             "installation_scope",
+            "channel_type",
             "id_type",
             "subject",
-            name="uq_channel_user_binding_subject",
+            unique=True,
+            postgresql_where=sa.text("provider_id IS NOT NULL"),
+            sqlite_where=sa.text("provider_id IS NOT NULL"),
+        ),
+        sa.Index(
+            "uq_channel_user_binding_subject_providerless",
+            "tenant_id",
+            "installation_scope",
+            "channel_type",
+            "id_type",
+            "subject",
+            unique=True,
+            postgresql_where=sa.text("provider_id IS NULL"),
+            sqlite_where=sa.text("provider_id IS NULL"),
         ),
         CheckConstraint(
             "channel_type <> 'oauth2' OR (provider_id IS NOT NULL AND id_type = 'subject')",

@@ -20,6 +20,7 @@ from app.services.org_sync_models import (
     _utcnow,
     build_department_path_map,
     derive_member_department_paths,
+    is_virtual_directory_root_values,
     normalize_contact_for_match,
 )
 from app.services.org_sync_wecom import WeComOrgSyncAdapter
@@ -159,11 +160,11 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                 )
 
             for dept_id in authorized_dept_ids:
-                if dept_id == 1:
-                    dept_detail = {"dept_id": 1, "name": "Root"}
-                else:
-                    dept_detail = await self._fetch_department_detail(client, token, dept_id)
-                    dept_detail = dept_detail or {"dept_id": dept_id, "name": f"Department {dept_id}"}
+                dept_detail = await self._fetch_department_detail(client, token, dept_id)
+                if not dept_detail:
+                    raise RuntimeError(
+                        f"DingTalk authorized department {dept_id} detail is unavailable"
+                    )
                 add_department(dept_detail)
                 if not self._is_user_fetch_skipped_department_name(dept_detail.get("name")):
                     queue.append(dept_id)
@@ -186,13 +187,6 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                     {"dept_id": parent_id},
                 )
                 if data.get("errcode") != 0:
-                    if self._is_not_in_authorized_scope(data):
-                        logger.warning(
-                            "[OrgSync][DingTalk] Skipping department %s outside app authorization scope: %s",
-                            parent_id,
-                            data.get("errmsg") or data,
-                        )
-                        continue
                     raise RuntimeError(f"DingTalk department list error: {data.get('errmsg') or data}")
 
                 result = data.get("result")
@@ -216,6 +210,16 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                         continue
                     if dept_id not in seen:
                         queue.append(dept_id)
+
+        authorized_external_ids = {str(dept_id) for dept_id in authorized_dept_ids}
+        for department in all_depts:
+            if (
+                department.external_id in authorized_external_ids
+                and department.parent_external_id
+                and department.parent_external_id not in added_dept_ids
+            ):
+                department.parent_external_id = None
+                dept_index[department.external_id] = (department.name, None)
 
         self._dept_path_map = self._build_dept_paths(dept_index)
         return all_depts
@@ -248,13 +252,15 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
         if legacy_data.get("errcode") == 0:
             return self._extract_authorized_department_ids(legacy_data)
 
-        logger.warning(
-            "[OrgSync][DingTalk] Failed to fetch authorization scope, falling back to root department. "
+        logger.error(
+            "[OrgSync][DingTalk] Failed to fetch authorization scope; refusing root fallback. "
             "topapi={}, legacy={}",
             data.get("errmsg") or data,
             legacy_data.get("errmsg") or legacy_data,
         )
-        return [1]
+        raise RuntimeError(
+            "DingTalk authorization scope could not be determined; directory sync stopped"
+        )
 
     async def _post_dingtalk_with_retry(
         self,
@@ -400,6 +406,13 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                 return dept_id
             visited.add(dept_id)
             name, parent_id = dept_index.get(dept_id, ("", None))
+            if is_virtual_directory_root_values(
+                external_id=dept_id,
+                name=name,
+                parent_id=parent_id,
+            ):
+                paths[dept_id] = ""
+                return ""
             if not parent_id or parent_id not in dept_index:
                 paths[dept_id] = name
                 return name
@@ -426,6 +439,7 @@ async def get_org_sync_adapter(
     provider_type: str,
     tenant_id: uuid.UUID | None = None,
     provider_id: uuid.UUID | None = None,
+    provider: IdentityProvider | None = None,
 ) -> BaseOrgSyncAdapter | None:
     """Factory function to create org sync adapter.
 
@@ -438,8 +452,11 @@ async def get_org_sync_adapter(
     Returns:
         Adapter instance or None if not supported
     """
-    # Get provider config from database - prefer specific provider_id if provided
-    if provider_id:
+    # A supplied provider avoids opening a database read transaction before the
+    # adapter performs potentially slow provider network requests.
+    if provider is not None:
+        pass
+    elif provider_id:
         result = await db.execute(
             select(IdentityProvider).where(IdentityProvider.id == provider_id)
         )
@@ -450,11 +467,30 @@ async def get_org_sync_adapter(
         else:
             query = query.where(IdentityProvider.tenant_id.is_(None))
         result = await db.execute(query)
-    provider = result.scalar_one_or_none()
+    if provider is None:
+        provider = result.scalar_one_or_none()
+
+    config = provider.config if provider else {}
+    directory_protocol = ((config or {}).get("capabilities") or {}).get(
+        "directory_protocol"
+    ) or (config or {}).get("directory_protocol") or (
+        "scim" if provider_type == "scim" else None
+    )
+    if provider_type in {"oauth2", "scim"} and directory_protocol == "scim":
+        from app.services.scim_org_sync_adapter import ScimOrgSyncAdapter
+
+        return ScimOrgSyncAdapter(
+            provider=provider,
+            config=config,
+            tenant_id=provider.tenant_id if provider else tenant_id,
+        )
 
     adapter_class = SYNC_ADAPTER_CLASSES.get(provider_type)
     if not adapter_class:
         return None
 
-    config = provider.config if provider else {}
-    return adapter_class(provider=provider, config=config, tenant_id=tenant_id)
+    return adapter_class(
+        provider=provider,
+        config=config,
+        tenant_id=provider.tenant_id if provider else tenant_id,
+    )

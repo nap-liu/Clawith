@@ -10,17 +10,114 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.org import OrgDepartment, OrgMember
 from app.services.canonical_user_resolver import normalize_email, normalize_phone
 
+
+_VIRTUAL_ROOT_EXTERNAL_IDS = frozenset({"0", "1", "root"})
+PLATFORM_ENTERPRISE_ROOT_EXTERNAL_ID = "__platform_enterprise_root__"
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def is_virtual_directory_root_values(
+    *, external_id: str | None, name: str | None, parent_id: object | None
+) -> bool:
+    """Identify a provider transport root from its stable projection."""
+    return (
+        not parent_id
+        and str(external_id or "").strip().casefold() in _VIRTUAL_ROOT_EXTERNAL_IDS
+        and str(name or "").strip().casefold() == "root"
+    )
+
+
+def is_virtual_directory_root(department: OrgDepartment) -> bool:
+    """Identify provider transport roots that are not business departments."""
+    return is_virtual_directory_root_values(
+        external_id=department.external_id,
+        name=department.name,
+        parent_id=department.parent_id,
+    )
+
+
+def strip_virtual_root_path(path: str | None) -> str:
+    """Hide the transport-only Root segment from a legacy display path."""
+    parts = [part.strip() for part in str(path or "").split("/") if part.strip()]
+    if parts and parts[0].casefold() == "root":
+        parts = parts[1:]
+    return "/".join(parts)
+
+
+def configured_enterprise_root_name(config: dict | None) -> str | None:
+    """Return the provider-neutral platform root mapping target."""
+    directory = (config or {}).get("directory") or {}
+    root_mapping = directory.get("root_mapping") or {}
+    value = str(root_mapping.get("root_name") or "").strip()
+    return value or None
+
+
+def validate_enterprise_root_mapping(config: dict | None) -> None:
+    """Validate the canonical enterprise name as one organization path segment."""
+    root_name = configured_enterprise_root_name(config)
+    if root_name is None:
+        return
+    if len(root_name) > 200:
+        raise ValueError("Enterprise root name must be at most 200 characters")
+    if "/" in root_name:
+        raise ValueError("Enterprise root name cannot contain '/'")
+
+
+def normalize_enterprise_root(
+    departments: list["ExternalDepartment"],
+    *,
+    root_name: str | None,
+) -> list["ExternalDepartment"]:
+    """Map one provider forest into a stable platform enterprise root."""
+    normalized_name = str(root_name or "").strip()
+    if not normalized_name or not departments:
+        return departments
+
+    department_ids = {str(department.external_id) for department in departments}
+    roots = [
+        department
+        for department in departments
+        if not any(
+            parent_id in department_ids
+            for parent_id in [
+                department.parent_external_id,
+                *department.parent_external_ids,
+            ]
+            if parent_id
+        )
+    ]
+    if len(roots) == 1:
+        roots[0].name = normalized_name
+        return departments
+
+    if PLATFORM_ENTERPRISE_ROOT_EXTERNAL_ID in department_ids:
+        synthetic_root = next(
+            department
+            for department in departments
+            if department.external_id == PLATFORM_ENTERPRISE_ROOT_EXTERNAL_ID
+        )
+        synthetic_root.name = normalized_name
+        return departments
+
+
+    synthetic_root = ExternalDepartment(
+        external_id=PLATFORM_ENTERPRISE_ROOT_EXTERNAL_ID,
+        name=normalized_name,
+        raw_data={"platform_synthetic_enterprise_root": True},
+    )
+    for root in roots:
+        root.parent_external_id = PLATFORM_ENTERPRISE_ROOT_EXTERNAL_ID
+        root.parent_external_ids = [PLATFORM_ENTERPRISE_ROOT_EXTERNAL_ID]
+    return [synthetic_root, *departments]
 
 
 def build_department_path_map(departments: list[OrgDepartment]) -> dict[uuid.UUID, str]:
     """Build department name paths by walking the internal department tree."""
     dept_by_id = {dept.id: dept for dept in departments}
     paths: dict[uuid.UUID, str] = {}
-
-    def is_virtual_root(dept: OrgDepartment) -> bool:
-        return not dept.parent_id and str(getattr(dept, "external_id", "") or "") == "0"
 
     def compute_path(dept_id: uuid.UUID, visited: set[uuid.UUID] | None = None) -> str:
         if dept_id in paths:
@@ -38,7 +135,7 @@ def build_department_path_map(departments: list[OrgDepartment]) -> dict[uuid.UUI
         if not dept:
             return ""
 
-        if is_virtual_root(dept):
+        if is_virtual_directory_root(dept):
             paths[dept_id] = ""
             return ""
 
@@ -111,6 +208,7 @@ class ExternalDepartment:
     external_id: str
     name: str
     parent_external_id: str | None = None
+    parent_external_ids: list[str] = field(default_factory=list)
     member_count: int = 0
     raw_data: dict = field(default_factory=dict)
 

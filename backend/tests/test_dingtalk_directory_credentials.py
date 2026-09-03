@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from app.models.org import ChannelUserBinding, OrgMember
 from app.models.participant import Participant  # noqa: F401 - register FK metadata
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
+from app.services.channel_user_service import ChannelUserService
 
 
 @pytest.fixture(autouse=True)
@@ -31,23 +33,20 @@ async def _dispose_engine_between_tests():
     await engine.dispose()
 
 
-def test_directory_credentials_prefer_enterprise_then_agent_robot():
+def test_directory_credentials_use_enterprise_app_only():
     provider = SimpleNamespace(config={"app_key": "enterprise-key", "app_secret": "enterprise-secret"})
     channel = SimpleNamespace(app_id="robot-key", app_secret="robot-secret")
 
     assert _resolve_dingtalk_directory_credentials(provider, channel) == [
         ("enterprise-key", "enterprise-secret", "enterprise"),
-        ("robot-key", "robot-secret", "robot_fallback"),
     ]
 
 
-def test_directory_credentials_fall_back_when_enterprise_config_is_incomplete():
+def test_directory_credentials_do_not_depend_on_robot_permissions():
     provider = SimpleNamespace(config={"app_key": "enterprise-key"})
     channel = SimpleNamespace(app_id="robot-key", app_secret="robot-secret")
 
-    assert _resolve_dingtalk_directory_credentials(provider, channel) == [
-        ("robot-key", "robot-secret", "robot_fallback")
-    ]
+    assert _resolve_dingtalk_directory_credentials(provider, channel) == []
 
 
 def test_directory_credentials_do_not_call_the_same_app_twice():
@@ -55,6 +54,118 @@ def test_directory_credentials_do_not_call_the_same_app_twice():
     channel = SimpleNamespace(app_id="shared-key", app_secret="shared-secret")
 
     assert _resolve_dingtalk_directory_credentials(provider, channel) == [("shared-key", "shared-secret", "enterprise")]
+
+
+@pytest.mark.asyncio
+async def test_sender_id_only_registration_converges_when_staff_id_arrives():
+    suffix = uuid.uuid4().hex[:10]
+    opaque_sender_id = f"opaque-{suffix}"
+    staff_id = f"staff-{suffix}"
+    union_id = f"union-{suffix}"
+    scope = f"test:dingtalk:{suffix}"
+
+    async with async_session() as db:
+        tenant = Tenant(name=f"DingTalk {suffix}", slug=f"dt-fallback-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        creator = User(
+            tenant_id=tenant.id,
+            display_name="Creator",
+            role="member",
+            is_active=True,
+        )
+        provider = IdentityProvider(
+            tenant_id=tenant.id,
+            provider_type="dingtalk",
+            name=f"DingTalk {suffix}",
+            config={},
+            is_active=True,
+        )
+        db.add_all([creator, provider])
+        await db.flush()
+        agent = Agent(
+            name=f"DingTalk Agent {suffix}",
+            creator_id=creator.id,
+            tenant_id=tenant.id,
+            status="idle",
+        )
+        db.add(agent)
+        await db.commit()
+        tenant_id = tenant.id
+        provider_id = provider.id
+        agent_id = agent.id
+
+    service = ChannelUserService()
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        provider = await db.get(IdentityProvider, provider_id)
+        provisional = await service.resolve_channel_user(
+            db,
+            agent,
+            "dingtalk",
+            None,
+            {
+                "sender_id": opaque_sender_id,
+                "nickname": "Fallback Sender",
+                "_installation_scope": scope,
+            },
+            provider=provider,
+        )
+        provisional_id = provisional.id
+        await db.commit()
+
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        provider = await db.get(IdentityProvider, provider_id)
+        resolved = await service.resolve_channel_user(
+            db,
+            agent,
+            "dingtalk",
+            staff_id,
+            {
+                "external_id": staff_id,
+                "sender_id": opaque_sender_id,
+                "unionid": union_id,
+                "nickname": "Resolved Sender",
+                "_installation_scope": scope,
+            },
+            provider=provider,
+        )
+        await db.commit()
+        assert resolved.id == provisional_id
+
+        users = (
+            await db.execute(
+                select(User).where(
+                    User.tenant_id == tenant_id,
+                    User.registration_source == "dingtalk_channel",
+                )
+            )
+        ).scalars().all()
+        members = (
+            await db.execute(
+                select(OrgMember).where(OrgMember.provider_id == provider_id)
+            )
+        ).scalars().all()
+        bindings = (
+            await db.execute(
+                select(ChannelUserBinding).where(
+                    ChannelUserBinding.provider_id == provider_id,
+                    ChannelUserBinding.installation_scope == scope,
+                )
+            )
+        ).scalars().all()
+
+    assert [user.id for user in users] == [provisional_id]
+    assert len(members) == 1
+    assert members[0].user_id == provisional_id
+    assert members[0].external_id == staff_id
+    assert members[0].unionid == union_id
+    assert {(binding.id_type, binding.subject) for binding in bindings} == {
+        ("sender_id", opaque_sender_id),
+        ("staff_id", staff_id),
+        ("union_id", union_id),
+    }
 
 
 @pytest.mark.asyncio
@@ -128,9 +239,11 @@ async def test_directory_lookup_stops_when_enterprise_returns_mobile(monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("email_already_claimed", [False, True])
+@pytest.mark.parametrize("conversation_type", ["1", "2"])
 async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
     monkeypatch,
     email_already_claimed,
+    conversation_type,
 ):
     suffix = uuid.uuid4().hex[:10]
     sender_staff_id = f"staff_{suffix}"
@@ -228,8 +341,21 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
                 "app_secret": enterprise_secret,
                 "auto_repair_legacy_identity_split": True,
             },
+            updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
-        db.add(provider)
+        decoy_provider = IdentityProvider(
+            tenant_id=tenant.id,
+            provider_type="dingtalk",
+            name=f"Wrong DingTalk Provider {suffix}",
+            is_active=True,
+            config={
+                "app_key": f"wrong-key-{suffix}",
+                "app_secret": f"wrong-secret-{suffix}",
+            },
+            updated_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
+        db.add_all([provider, decoy_provider])
+        await db.flush()
         db.add(
             ChannelConfig(
                 agent_id=agent.id,
@@ -237,6 +363,7 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
                 app_id=robot_key,
                 app_secret=robot_secret,
                 is_configured=True,
+                extra_config={"identity_provider_id": str(provider.id)},
             )
         )
         await db.commit()
@@ -294,7 +421,7 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         sender_id=f"opaque-{suffix}",
         user_text="please enrich my identity",
         conversation_id=f"conversation-{suffix}",
-        conversation_type="1",
+        conversation_type=conversation_type,
         sender_nick="DingTalk Nickname",
         message_id=f"message-{suffix}",
     )
@@ -304,7 +431,7 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         sender_id=f"opaque-{suffix}",
         user_text="refresh my bound identity",
         conversation_id=f"conversation-{suffix}",
-        conversation_type="1",
+        conversation_type=conversation_type,
         sender_nick="Updated DingTalk Nickname",
         message_id=f"message-bound-{suffix}",
     )
@@ -312,7 +439,6 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
     assert captured == {
         "credentials": [
             (enterprise_key, enterprise_secret, "enterprise"),
-            (robot_key, robot_secret, "robot_fallback"),
         ],
         "staff_id": sender_staff_id,
         "provider_id": provider_id,

@@ -11,6 +11,7 @@ from app.core.security import create_access_token, get_authenticated_user, get_c
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import TenantChoice, TenantSwitchRequest, TenantSwitchResponse, UserOut, UserUpdate
+from app.services.authentication_state import require_active_authentication_principal
 
 router = APIRouter()
 
@@ -159,6 +160,7 @@ async def switch_tenant(
             detail="This organization is currently unavailable."
         )
 
+    await require_active_authentication_principal(db, target_user)
     # 3. Generate new token
     token = create_access_token(str(target_user.id), target_user.role)
 

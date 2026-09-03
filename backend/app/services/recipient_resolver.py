@@ -34,6 +34,7 @@ from app.models.org import (
     RelationshipSuppression,
 )
 from app.models.user import User
+from app.services.channel_user_errors import ChannelUserResolutionError
 from app.services.channel_user_service import channel_user_service
 
 MESSAGE_OUTBOUND_CHANNELS = frozenset(
@@ -46,6 +47,28 @@ def _normalize_channel(value: str | None) -> str | None:
     if not channel:
         return None
     return "teams" if channel == "microsoft_teams" else channel
+
+
+async def _resolve_outbound_scope_provider(
+    db: AsyncSession,
+    source: Agent,
+    config: ChannelConfig,
+    channel: str,
+) -> tuple[str, uuid.UUID | None] | None:
+    """Resolve an exact configured provider while retaining legacy scope-only routes."""
+    extra = config.extra_config if isinstance(config.extra_config, dict) else {}
+    if not extra.get("identity_provider_id"):
+        scope = await channel_user_service.resolve_installation_scope(
+            db, source, channel
+        )
+        return scope, None
+    try:
+        provider, info = await channel_user_service.resolve_channel_provider(
+            db, source, channel
+        )
+    except ChannelUserResolutionError:
+        return None
+    return info["_installation_scope"], provider.id
 
 
 class RecipientResolutionError(ValueError):
@@ -367,19 +390,27 @@ async def resolve_human_channel_recipient(
         normalized_channel = _normalize_channel(config.channel_type)
         if normalized_channel in {None, "web", "platform"}:
             continue
-        scope = await channel_user_service.resolve_installation_scope(
-            db, source, normalized_channel
+        route_scope = await _resolve_outbound_scope_provider(
+            db, source, config, normalized_channel
         )
+        if route_scope is None:
+            continue
+        scope, route_provider_id = route_scope
+        binding_query = select(ChannelUserBinding).where(
+            ChannelUserBinding.tenant_id == source.tenant_id,
+            ChannelUserBinding.user_id == user.id,
+            ChannelUserBinding.installation_scope == scope,
+            ChannelUserBinding.channel_type.in_(
+                [normalized_channel, config.channel_type]
+            ),
+        )
+        if route_provider_id is not None:
+            binding_query = binding_query.where(
+                ChannelUserBinding.provider_id == route_provider_id
+            )
         bindings = (
             await db.execute(
-                select(ChannelUserBinding).where(
-                    ChannelUserBinding.tenant_id == source.tenant_id,
-                    ChannelUserBinding.user_id == user.id,
-                    ChannelUserBinding.installation_scope == scope,
-                    ChannelUserBinding.channel_type.in_(
-                        [normalized_channel, config.channel_type]
-                    ),
-                )
+                binding_query
             )
         ).scalars().all()
 
@@ -411,22 +442,27 @@ async def resolve_human_channel_recipient(
         # Directory-stable IDs are safe across app installations. App-scoped
         # identifiers (open_id and generic external_id) never use this fallback.
         if not member_ids and normalized_channel in {"feishu", "dingtalk", "wecom"}:
-            stable_member_rows = (
-                await db.execute(
-                    select(OrgMember)
-                    .join(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
-                    .where(
-                        OrgMember.user_id == user.id,
-                        OrgMember.tenant_id == source.tenant_id,
-                        OrgMember.status == "active",
-                        OrgMember.external_id.is_not(None),
-                        OrgMember.external_id != "",
-                        or_(
-                            IdentityProvider.provider_type == normalized_channel,
-                            IdentityProvider.provider_type == config.channel_type,
-                        ),
-                    )
+            stable_query = (
+                select(OrgMember)
+                .join(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
+                .where(
+                    OrgMember.user_id == user.id,
+                    OrgMember.tenant_id == source.tenant_id,
+                    OrgMember.status == "active",
+                    OrgMember.external_id.is_not(None),
+                    OrgMember.external_id != "",
+                    or_(
+                        IdentityProvider.provider_type == normalized_channel,
+                        IdentityProvider.provider_type == config.channel_type,
+                    ),
                 )
+            )
+            if route_provider_id is not None:
+                stable_query = stable_query.where(
+                    IdentityProvider.id == route_provider_id
+                )
+            stable_member_rows = (
+                await db.execute(stable_query)
             ).scalars().all()
             member_ids.update(member.id for member in stable_member_rows)
 
@@ -551,17 +587,22 @@ async def load_human_recipient_profiles(
             )
         ).scalars().all()
     )
-    scoped_configs: list[tuple[str, ChannelConfig, str]] = []
+    scoped_configs: list[
+        tuple[str, ChannelConfig, str, uuid.UUID | None]
+    ] = []
     for config in configs:
         channel = _normalize_channel(config.channel_type)
         if channel not in MESSAGE_OUTBOUND_CHANNELS:
             continue
-        scope = await channel_user_service.resolve_installation_scope(
-            db, source_agent, channel
+        route_scope = await _resolve_outbound_scope_provider(
+            db, source_agent, config, channel
         )
-        scoped_configs.append((channel, config, scope))
+        if route_scope is None:
+            continue
+        scope, provider_id = route_scope
+        scoped_configs.append((channel, config, scope, provider_id))
 
-    scopes = [scope for _channel, _config, scope in scoped_configs]
+    scopes = [scope for _channel, _config, scope, _provider_id in scoped_configs]
     bindings = []
     if scopes:
         bindings = list(
@@ -610,11 +651,17 @@ async def load_human_recipient_profiles(
         if access_status == "active":
             if user.identity_id is not None:
                 channels.add("platform")
-            for channel, config, scope in scoped_configs:
+            for channel, config, scope, route_provider_id in scoped_configs:
                 route_bindings = [
                     *bindings_by_route.get((user.id, channel, scope), []),
                     *bindings_by_route.get((user.id, config.channel_type, scope), []),
                 ]
+                if route_provider_id is not None:
+                    route_bindings = [
+                        binding
+                        for binding in route_bindings
+                        if binding.provider_id == route_provider_id
+                    ]
                 member_ids: set[uuid.UUID] = set()
                 for binding in route_bindings:
                     attr = {
@@ -637,6 +684,10 @@ async def load_human_recipient_profiles(
                     for member, _provider_name, provider_type in rows:
                         if (
                             _normalize_channel(provider_type) == channel
+                            and (
+                                route_provider_id is None
+                                or member.provider_id == route_provider_id
+                            )
                             and bool((member.external_id or "").strip())
                         ):
                             member_ids.add(member.id)

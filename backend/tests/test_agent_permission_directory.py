@@ -12,7 +12,13 @@ from app.core.permissions import get_agent_access_level_for_user_id
 from app.database import Base
 from app.models.agent import AgentPermission
 from app.models.identity import IdentityProvider
-from app.models.org import OrgDepartment, OrgMember
+from app.models.org import (
+    ChannelUserBinding,
+    DirectoryAccountGroup,
+    DirectoryGroupEdge,
+    OrgDepartment,
+    OrgMember,
+)
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 
@@ -27,6 +33,9 @@ async def directory_session():
         IdentityProvider.__table__,
         OrgDepartment.__table__,
         OrgMember.__table__,
+        DirectoryGroupEdge.__table__,
+        DirectoryAccountGroup.__table__,
+        ChannelUserBinding.__table__,
     ]
     async with engine.begin() as conn:
         await conn.run_sync(lambda connection: Base.metadata.create_all(connection, tables=tables))
@@ -67,6 +76,13 @@ async def test_permission_departments_are_lazy_and_include_my_department(
         role="member",
         is_active=True,
     )
+    inactive_identity = Identity(
+        id=uuid.uuid4(), username=f"inactive-{uuid.uuid4().hex}", is_active=False,
+    )
+    inactive_user = User(
+        id=uuid.uuid4(), identity_id=inactive_identity.id, tenant_id=tenant_id,
+        display_name="Inactive identity", role="member", is_active=True,
+    )
     provider = IdentityProvider(
         id=uuid.uuid4(), tenant_id=tenant_id, name="DingTalk", provider_type="dingtalk"
     )
@@ -75,7 +91,7 @@ async def test_permission_departments_are_lazy_and_include_my_department(
     )
     root = OrgDepartment(
         id=uuid.uuid4(), tenant_id=tenant_id, provider_id=provider.id,
-        name="Root", path="Root", status="active"
+        external_id="1", name="Root", path="Root", status="active", member_count=3,
     )
     center = OrgDepartment(
         id=uuid.uuid4(),
@@ -85,6 +101,7 @@ async def test_permission_departments_are_lazy_and_include_my_department(
         path="Root/营运中心",
         parent_id=root.id,
         status="active",
+        member_count=3,
     )
     team = OrgDepartment(
         id=uuid.uuid4(),
@@ -94,6 +111,7 @@ async def test_permission_departments_are_lazy_and_include_my_department(
         path="Root/营运中心/广东营运部",
         parent_id=center.id,
         status="active",
+        member_count=3,
     )
     malformed_cross_provider_child = OrgDepartment(
         id=uuid.uuid4(),
@@ -110,6 +128,8 @@ async def test_permission_departments_are_lazy_and_include_my_department(
             provider,
             other_provider,
             current_user,
+            inactive_identity,
+            inactive_user,
             root,
             center,
             team,
@@ -123,6 +143,10 @@ async def test_permission_departments_are_lazy_and_include_my_department(
                 department_id=team.id,
                 department_path=team.path,
                 status="active",
+            ),
+            OrgMember(
+                tenant_id=tenant_id, provider_id=provider.id, user_id=inactive_user.id,
+                name="Inactive identity", department_id=team.id, status="active",
             ),
             OrgMember(
                 id=uuid.uuid4(),
@@ -145,19 +169,22 @@ async def test_permission_departments_are_lazy_and_include_my_department(
         db=directory_session,
     )
 
-    assert [item["id"] for item in root_response["items"]] == [str(root.id)]
+    assert [item["id"] for item in root_response["items"]] == [str(center.id)]
     assert root_response["items"][0]["has_children"] is True
+    assert root_response["items"][0]["provider_id"] == str(provider.id)
+    assert root_response["items"][0]["provider_name"] == "DingTalk"
+    assert root_response["items"][0]["provider_type"] == "dingtalk"
     assert root_response["my_department"]["id"] == str(team.id)
     assert root_response["my_department"]["direct_member_count"] == 1
 
     children_response = await agents_api.get_agent_permission_departments(
         agent_id=uuid.uuid4(),
-        parent_id=root.id,
+        parent_id=center.id,
         limit=100,
         current_user=current_user,
         db=directory_session,
     )
-    assert [item["id"] for item in children_response["items"]] == [str(center.id)]
+    assert [item["id"] for item in children_response["items"]] == [str(team.id)]
     assert children_response["my_department"] is None
 
 
@@ -266,9 +293,27 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
             "department_id": str(team.id),
             "department_path": team.path,
             "title": "平台注册职务",
-            "avatar_url": None,
-            "email": None,
-        }
+                "avatar_url": None,
+                "email": None,
+                "phone_masked": None,
+                "directory_sources": [
+                    {
+                        "member_id": str(directory_member.id),
+                        "provider_id": str(directory_provider.id),
+                        "provider_type": "dingtalk",
+                        "provider_name": "DingTalk",
+                        "group_ids": [str(team.id)],
+                    },
+                    {
+                        "member_id": str(old_member.id),
+                        "provider_id": str(old_provider.id),
+                        "provider_type": "oauth2",
+                        "provider_name": "OAuth",
+                        "group_ids": [],
+                    },
+                ],
+                "channel_bindings": [],
+            }
     ]
 
     search_response = await agents_api.get_agent_permission_members(
@@ -280,6 +325,92 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
         db=directory_session,
     )
     assert [item["id"] for item in search_response["items"]] == [str(user_id)]
+
+
+@pytest.mark.asyncio
+async def test_execution_picker_includes_secondary_directory_group(
+    directory_session,
+    monkeypatch,
+):
+    tenant_id = uuid.uuid4()
+    manager = User(
+        id=uuid.uuid4(), tenant_id=tenant_id, display_name="Manager",
+        role="member", is_active=True,
+    )
+    target = User(
+        id=uuid.uuid4(), tenant_id=tenant_id, display_name="Multi Group",
+        role="member", is_active=True,
+    )
+    inactive_identity = Identity(
+        id=uuid.uuid4(), username=f"disabled-{uuid.uuid4().hex}", is_active=False,
+    )
+    inactive_target = User(
+        id=uuid.uuid4(), identity_id=inactive_identity.id, tenant_id=tenant_id,
+        display_name="Disabled Identity", role="member", is_active=True,
+    )
+    provider = IdentityProvider(
+        id=uuid.uuid4(), tenant_id=tenant_id, name="Directory", provider_type="wecom"
+    )
+    primary = OrgDepartment(
+        id=uuid.uuid4(), tenant_id=tenant_id, provider_id=provider.id,
+        name="Primary", path="Primary", status="active",
+    )
+    secondary = OrgDepartment(
+        id=uuid.uuid4(), tenant_id=tenant_id, provider_id=provider.id,
+        name="Secondary", path="Secondary", status="active",
+    )
+    member = OrgMember(
+        id=uuid.uuid4(), tenant_id=tenant_id, provider_id=provider.id,
+        user_id=target.id, name="Multi Group", department_id=primary.id,
+        status="active",
+    )
+    inactive_member = OrgMember(
+        tenant_id=tenant_id, provider_id=provider.id, user_id=inactive_target.id,
+        name="Disabled Identity", department_id=secondary.id, status="active",
+    )
+    directory_session.add_all([
+        Tenant(id=tenant_id, name="Acme", slug=f"acme-{uuid.uuid4().hex[:8]}"),
+        manager, target, inactive_identity, inactive_target, provider,
+        primary, secondary, member, inactive_member,
+    ])
+    await directory_session.flush()
+    directory_session.add_all([
+        DirectoryAccountGroup(
+            tenant_id=tenant_id,
+            provider_id=provider.id,
+            account_id=member.id,
+            group_id=secondary.id,
+            is_primary=False,
+        ),
+        ChannelUserBinding(
+            tenant_id=tenant_id, provider_id=provider.id, user_id=target.id,
+            installation_scope="corp", channel_type="wecom",
+            id_type="user_id", subject="target-channel-id",
+        ),
+    ])
+    await directory_session.flush()
+    await _allow_manage(monkeypatch, tenant_id)
+
+    response = await agents_api.get_agent_permission_members(
+        agent_id=uuid.uuid4(),
+        department_id=secondary.id,
+        include_descendants=False,
+        execution_assignable=True,
+        search=None,
+        page=1,
+        page_size=50,
+        current_user=manager,
+        db=directory_session,
+    )
+
+    assert response["total"] == 1
+    assert response["items"][0]["id"] == str(target.id)
+    assert response["items"][0]["directory_sources"][0]["provider_name"] == "Directory"
+    assert response["items"][0]["channel_bindings"] == [{
+        "provider_id": str(provider.id), "provider_name": "Directory",
+        "provider_type": "wecom", "channel_type": "wecom",
+        "installation_scope": "corp", "id_type": "user_id",
+    }]
 
 
 @pytest.mark.asyncio
@@ -348,9 +479,12 @@ async def test_permission_members_include_active_tenant_users_without_org_profil
             "department_id": None,
             "department_path": "",
             "title": "Product",
-            "avatar_url": None,
-            "email": "registered@example.test",
-        }
+                "avatar_url": None,
+                "email": "registered@example.test",
+                "phone_masked": None,
+                "directory_sources": [],
+                "channel_bindings": [],
+            }
     ]
 
 
@@ -459,6 +593,9 @@ async def test_department_node_is_saved_and_grants_descendant_access(
             "id": str(parent.id),
             "name": "信息技术部",
             "path": parent.path,
+            "provider_id": None,
+            "provider_name": None,
+            "provider_type": None,
             "access_level": "use",
             "include_descendants": True,
         }

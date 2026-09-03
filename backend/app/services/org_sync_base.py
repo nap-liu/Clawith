@@ -7,11 +7,11 @@ from typing import Any
 
 import httpx
 from loguru import logger
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
-from app.models.org import OrgDepartment, OrgMember
+from app.models.org import DirectoryAccountGroup, DirectoryGroupEdge, OrgDepartment, OrgMember
 from app.models.user import Identity, User
 from app.services.directory_identity_claims import VerifiedDirectoryClaims
 from app.services.org_sync_lifecycle import OrgSyncLifecycleMixin
@@ -269,18 +269,25 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
         # Path is rebuilt from the internal department tree after sync.
         path = dept.name
 
-        # Resolve parent_id from parent_external_id
-        parent_id = None
-        if dept.parent_external_id:
+        # Preserve the legacy primary parent while recording every provider edge.
+        parent_external_ids = list(
+            dict.fromkeys(
+                value
+                for value in [dept.parent_external_id, *dept.parent_external_ids]
+                if value and value != dept.external_id
+            )
+        )
+        parent_ids: list[uuid.UUID] = []
+        if parent_external_ids:
             parent_result = await db.execute(
-                select(OrgDepartment).where(
-                    OrgDepartment.external_id == dept.parent_external_id,
+                select(OrgDepartment.external_id, OrgDepartment.id).where(
+                    OrgDepartment.external_id.in_(parent_external_ids),
                     OrgDepartment.provider_id == provider.id,
                 )
             )
-            parent_dept = parent_result.scalars().first()
-            if parent_dept:
-                parent_id = parent_dept.id
+            resolved = dict(parent_result.all())
+            parent_ids = [resolved[value] for value in parent_external_ids if value in resolved]
+        parent_id = parent_ids[0] if parent_ids else None
 
         if existing:
             existing.name = dept.name
@@ -291,6 +298,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             existing.parent_id = parent_id
             existing.status = "active"
             existing.synced_at = now
+            persisted_department = existing
         else:
             new_dept = OrgDepartment(
                 external_id=dept.external_id,
@@ -303,8 +311,28 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
                 synced_at=now,
             )
             db.add(new_dept)
+            persisted_department = new_dept
 
         await db.flush()
+        await db.execute(
+            delete(DirectoryGroupEdge).where(
+                DirectoryGroupEdge.provider_id == provider.id,
+                DirectoryGroupEdge.child_group_id == persisted_department.id,
+            )
+        )
+        edge_tenant_id = self.tenant_id or provider.tenant_id
+        if edge_tenant_id:
+            for resolved_parent_id in parent_ids:
+                db.add(
+                    DirectoryGroupEdge(
+                        tenant_id=edge_tenant_id,
+                        provider_id=provider.id,
+                        parent_group_id=resolved_parent_id,
+                        child_group_id=persisted_department.id,
+                    )
+                )
+        if parent_ids:
+            await db.flush()
 
     async def _rebuild_department_paths(self, db: AsyncSession, provider_id: uuid.UUID) -> dict[uuid.UUID, str]:
         """Normalize OrgDepartment.path using parent_id/name reverse derivation."""
@@ -547,9 +575,44 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
             stats["profile_synced"] = True
             member = new_member
 
+        await db.flush()
+        await db.execute(
+            delete(DirectoryAccountGroup).where(
+                DirectoryAccountGroup.provider_id == provider.id,
+                DirectoryAccountGroup.account_id == member.id,
+            )
+        )
+        group_external_ids = list(dict.fromkeys(user.department_ids or []))
+        if not group_external_ids and user.department_external_id:
+            group_external_ids = [user.department_external_id]
+        if group_external_ids and member_tenant_id:
+            group_rows = (
+                await db.execute(
+                    select(OrgDepartment).where(
+                        OrgDepartment.provider_id == provider.id,
+                        OrgDepartment.tenant_id == member_tenant_id,
+                        OrgDepartment.external_id.in_(group_external_ids),
+                    )
+                )
+            ).scalars().all()
+            for group in group_rows:
+                db.add(
+                    DirectoryAccountGroup(
+                        tenant_id=member_tenant_id,
+                        provider_id=provider.id,
+                        account_id=member.id,
+                        group_id=group.id,
+                        is_primary=bool(department and group.id == department.id),
+                    )
+                )
+
         auto_create_users = (provider.config or {}).get("auto_create_users_on_sync")
         if auto_create_users is None:
-            auto_create_users = provider_type == "dingtalk"
+            capabilities = (provider.config or {}).get("capabilities") or {}
+            directory_protocol = capabilities.get("directory_protocol") or (
+                provider.config or {}
+            ).get("directory_protocol")
+            auto_create_users = provider_type == "dingtalk" or directory_protocol == "scim"
 
         if auto_create_users:
             from app.services.contact_provisioning import contact_provisioning
@@ -569,6 +632,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
                         provider=provider,
                         fresh_claims=fresh_claims,
                         subject_lock_held=fresh_claims is not None,
+                        directory_sync=True,
                     )
                 stats["user_created"] = provisioning.user_created
                 stats["user_linked"] = provisioning.user_linked
@@ -580,6 +644,7 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
                 )
                 stats["user_skipped_no_phone"] = provisioning.skipped_missing_mobile
                 stats["legacy_split_repaired"] = provisioning.legacy_split_repaired
+                stats["identity_conflict"] = provisioning.identity_conflict
             except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
                 stats["identity_conflict"] = True
                 logger.warning(
@@ -628,44 +693,42 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
         provider: IdentityProvider,
         user: ExternalUser,
     ) -> OrgMember | None:
-        if user.unionid:
+        # The provider-scoped directory ID is the durable account anchor.
+        # Mutable contacts and secondary channel IDs must never redirect an
+        # established account to another tenant user.
+        if user.external_id:
             result = await db.execute(
                 select(OrgMember).where(
                     OrgMember.provider_id == provider.id,
-                    OrgMember.unionid == user.unionid,
+                    OrgMember.external_id == user.external_id,
                 )
             )
             existing_member = result.scalars().first()
             if existing_member:
                 return existing_member
 
-        fallback_conditions = []
-        if user.external_id:
-            fallback_conditions.append(OrgMember.external_id == user.external_id)
-        if user.open_id:
-            fallback_conditions.append(OrgMember.open_id == user.open_id)
-
-        if not fallback_conditions:
-            return None
-
-        fallback_query = select(OrgMember).where(
-            OrgMember.provider_id == provider.id,
-            or_(*fallback_conditions),
-        )
-
-        # When unionid is required, only allow external/open id fallback to attach
-        # shell records that do not have a conflicting unionid yet.
-        if self._provider_requires_unionid(provider) and user.unionid:
-            fallback_query = fallback_query.where(
-                or_(
-                    OrgMember.unionid.is_(None),
-                    OrgMember.unionid == "",
-                    OrgMember.unionid == user.unionid,
-                )
+        # Secondary IDs only repair legacy shell rows that have never acquired
+        # a provider directory ID.  A differing non-empty external_id denotes a
+        # different provider account and is not eligible for fallback matching.
+        for condition in (
+            OrgMember.unionid == user.unionid if user.unionid else None,
+            OrgMember.open_id == user.open_id if user.open_id else None,
+        ):
+            if condition is None:
+                continue
+            fallback_query = select(OrgMember).where(
+                OrgMember.provider_id == provider.id,
+                condition,
             )
-
-        result = await db.execute(fallback_query)
-        return result.scalars().first()
+            if user.external_id:
+                fallback_query = fallback_query.where(
+                    or_(OrgMember.external_id.is_(None), OrgMember.external_id == "")
+                )
+            result = await db.execute(fallback_query)
+            existing_member = result.scalars().first()
+            if existing_member:
+                return existing_member
+        return None
 
     async def _resolve_platform_user(
         self,
@@ -674,27 +737,23 @@ class BaseOrgSyncAdapter(OrgSyncLifecycleMixin, ABC):
         tenant_id: uuid.UUID | None = None,
         allow_email: bool = True,
     ) -> User | None:
-        """Resolve platform user from external user info."""
-        # 1. Try by Email matching (primary way now)
+        """Resolve an existing tenant user in configured exact-match order."""
         email = _normalize_contact(user.email)
-        if allow_email and email:
-            query = select(User).join(User.identity).where(Identity.email == email)
-            if tenant_id:
-                query = query.where(User.tenant_id == tenant_id)
-            result = await db.execute(query)
-            u = result.scalars().first()
-            if u:
-                return u
-
-        # 2. Try by mobile matching
         mobile = _normalize_contact(user.mobile)
-        if mobile:
-            query = select(User).join(User.identity).where(Identity.phone == mobile)
+        from app.services.provider_identity_policy import identity_match_order
+
+        fields = identity_match_order(self.config)
+        for field in fields:
+            value = mobile if field == "phone" else email
+            if value is None or (field == "email" and not allow_email):
+                continue
+            condition = Identity.phone == value if field == "phone" else Identity.email == value
+            query = select(User).join(User.identity).where(condition)
             if tenant_id:
                 query = query.where(User.tenant_id == tenant_id)
             result = await db.execute(query)
-            u = result.scalars().first()
-            if u:
-                return u
+            matched = result.scalars().first()
+            if matched:
+                return matched
 
         return None

@@ -4,20 +4,34 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database import async_session
 from app.models.identity import IdentityProvider
-from app.models.org import OrgMember
+from app.models.org import (
+    DirectoryAccountGroup,
+    DirectoryGroupEdge,
+    DirectorySyncRun,
+    OrgDepartment,
+    OrgMember,
+)
 from app.models.user import Identity, User
 from app.services.dingtalk_identity_reconciliation import dingtalk_legacy_identity_reconciler
-from app.services.org_sync_adapter import DingTalkOrgSyncAdapter, ExternalUser
-from tests.test_org_sync_adapter import (
+from app.services.org_sync_adapter import (
+    DingTalkOrgSyncAdapter,
+    ExternalDepartment,
+    ExternalUser,
+)
+from app.services.org_sync_service import org_sync_service
+from app.services.scim_directory import ScimDirectorySnapshot
+from app.services.scim_org_sync_adapter import ScimOrgSyncAdapter
+from test_org_sync_adapter import (
     _DummyAdapter,
     _FakeDingTalkResponse,
-    _isolate_async_engine_between_tests,
+    _isolate_async_engine_between_tests,  # noqa: F401 - imported autouse fixture
     _seed_dingtalk_provider,
     _seed_tenant,
 )
@@ -151,6 +165,192 @@ async def _seed_user(tenant_id: uuid.UUID, *, email: str | None = None, phone: s
         await db.commit()
         await db.refresh(user)
         return user
+
+
+@pytest.mark.asyncio
+async def test_directory_run_is_durable_deduplicated_and_marks_conflict_review(monkeypatch):
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    async with async_session() as db:
+        run, created = await org_sync_service.request_sync(
+            db, provider.id, trigger_type="manual"
+        )
+        duplicate, duplicate_created = await org_sync_service.request_sync(
+            db, provider.id, trigger_type="manual"
+        )
+        assert created is True
+        assert duplicate_created is False
+        assert duplicate.id == run.id
+        run_id = run.id
+
+    class ConflictAdapter:
+        async def sync_org_structure(self, _db):
+            return {
+                "departments": 1,
+                "members": 1,
+                "identity_conflicts": 1,
+                "errors": [],
+            }
+
+    async def adapter_factory(*_args, **_kwargs):
+        return ConflictAdapter()
+
+    monkeypatch.setattr(
+        "app.services.org_sync_adapter.get_org_sync_adapter", adapter_factory
+    )
+    await org_sync_service.execute_run(run_id)
+
+    async with async_session() as db:
+        persisted = await db.get(DirectorySyncRun, run_id)
+        provider = await db.get(IdentityProvider, provider.id)
+        assert persisted.status == "needs_review"
+        assert persisted.progress_percent == 100
+        assert provider.last_sync_success_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("departments", "members", "expected_status"),
+    [(1, 1, "partial_failed"), (0, 0, "failed")],
+)
+async def test_directory_run_prioritizes_sync_errors_over_identity_review(
+    monkeypatch,
+    departments,
+    members,
+    expected_status,
+):
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    async with async_session() as db:
+        run, _created = await org_sync_service.request_sync(
+            db, provider.id, trigger_type="manual"
+        )
+        run_id = run.id
+
+    class FailedAndConflictedAdapter:
+        async def sync_org_structure(self, _db):
+            return {
+                "departments": departments,
+                "members": members,
+                "identity_conflicts": 2,
+                "errors": ["group apply failed"],
+            }
+
+    async def adapter_factory(*_args, **_kwargs):
+        return FailedAndConflictedAdapter()
+
+    monkeypatch.setattr(
+        "app.services.org_sync_adapter.get_org_sync_adapter", adapter_factory
+    )
+    await org_sync_service.execute_run(run_id)
+
+    async with async_session() as db:
+        persisted = await db.get(DirectorySyncRun, run_id)
+        assert persisted.status == expected_status
+        assert persisted.stage == "completed_with_errors"
+        assert "1 error(s)" in persisted.error_summary
+        assert "2 identity match(es) require review" in persisted.error_summary
+
+
+@pytest.mark.asyncio
+async def test_scim_adapter_persists_dag_multi_group_and_opaque_user_anchor(monkeypatch):
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id, "oauth2")
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        provider.config = {
+            "capabilities": {"directory_protocol": "scim"},
+            "client_id": "test",
+            "client_secret": "test",
+            "directory": {"base_url": "https://scim.test/v2"},
+        }
+        await db.commit()
+
+    user_schema = "urn:ietf:params:scim:schemas:core:2.0:User"
+    group_schema = "urn:ietf:params:scim:schemas:core:2.0:Group"
+    snapshot = ScimDirectorySnapshot.from_resources(
+        [
+            {
+                "schemas": [user_schema],
+                "id": "user-without-contact",
+                "userName": "opaque-user",
+                "active": True,
+                "photos": [{"value": "https://cdn.example/opaque.png"}],
+            }
+        ],
+        [
+            {
+                "schemas": [group_schema],
+                "id": "root-a",
+                "displayName": "Root A",
+                "members": [{"value": "child", "type": "Group"}],
+            },
+            {
+                "schemas": [group_schema],
+                "id": "root-b",
+                "displayName": "Root B",
+                "members": [{"value": "child", "type": "Group"}],
+            },
+            {
+                "schemas": [group_schema],
+                "id": "child",
+                "displayName": "Child",
+                "members": [{"value": "user-without-contact", "type": "User"}],
+            },
+        ],
+    )
+
+    class FakeClient:
+        async def fetch_snapshot(self):
+            return snapshot
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.scim_org_sync_adapter.ScimClient.from_provider_config",
+        lambda _config: FakeClient(),
+    )
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        result = await ScimOrgSyncAdapter(
+            provider=provider, tenant_id=tenant.id
+        ).sync_org_structure(db)
+        member = await db.scalar(
+            select(OrgMember).where(OrgMember.provider_id == provider.id)
+        )
+        assert result["errors"] == []
+        assert member.user_id is not None
+        assert member.avatar_url == "https://cdn.example/opaque.png"
+        platform_user = await db.get(User, member.user_id)
+        assert platform_user.avatar_url == "https://cdn.example/opaque.png"
+        assert platform_user.identity_id is not None
+        assert platform_user.is_active is True
+        assert await db.scalar(
+            select(func.count()).select_from(DirectoryGroupEdge).where(
+                DirectoryGroupEdge.provider_id == provider.id
+            )
+        ) == 2
+        assert await db.scalar(
+            select(func.count()).select_from(DirectoryAccountGroup).where(
+                DirectoryAccountGroup.provider_id == provider.id
+            )
+        ) == 1
+        assert await db.scalar(
+            select(func.count()).select_from(OrgDepartment).where(
+                OrgDepartment.provider_id == provider.id
+            )
+        ) == 3
+
+        snapshot = ScimDirectorySnapshot(
+            users=(replace(snapshot.users[0], active=False),),
+            groups=snapshot.groups,
+        )
+        await ScimOrgSyncAdapter(
+            provider=provider, tenant_id=tenant.id
+        ).sync_org_structure(db)
+        await db.refresh(platform_user)
+        assert platform_user.is_active is False
 
 
 @pytest.mark.asyncio
@@ -288,7 +488,7 @@ async def test_org_sync_persists_contact_when_identity_reconciliation_conflicts(
 
 
 @pytest.mark.asyncio
-async def test_org_sync_missing_mobile_creates_external_only_canonical_user():
+async def test_org_sync_missing_mobile_creates_verified_email_anchor():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)
     adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
@@ -318,7 +518,7 @@ async def test_org_sync_missing_mobile_creates_external_only_canonical_user():
         assert stats["user_skipped_no_phone"] is False
         assert member.user_id is not None
         canonical_user = await db.get(User, member.user_id)
-        assert canonical_user.identity_id is None
+        assert canonical_user.identity_id is not None
 
 
 @pytest.mark.asyncio
@@ -397,7 +597,9 @@ async def test_org_sync_dingtalk_missing_mobile_preserves_display_phone_without_
         assert member.phone == old_phone
         assert member.user_id is not None
         canonical_user = await db.get(User, member.user_id)
-        assert canonical_user.identity_id is None
+        assert canonical_user.identity_id is not None
+        identity = await db.get(Identity, canonical_user.identity_id)
+        assert identity.phone is None
 
 
 @pytest.mark.asyncio
@@ -539,3 +741,50 @@ async def test_org_sync_dingtalk_auto_create_disabled_does_not_link_by_email():
         assert stats["user_linked"] is False
         assert member.user_id is None
         assert member.user_id != existing_user.id
+
+
+@pytest.mark.asyncio
+async def test_base_adapter_persists_multiple_parent_groups_for_any_provider():
+    tenant = await _seed_tenant()
+    seeded_provider = await _seed_provider(tenant.id, "feishu")
+    adapter = _DummyAdapter(provider=seeded_provider, tenant_id=tenant.id)
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, seeded_provider.id)
+        await adapter._upsert_department(
+            db, provider, ExternalDepartment(external_id="root-a", name="Root A")
+        )
+        await adapter._upsert_department(
+            db, provider, ExternalDepartment(external_id="root-b", name="Root B")
+        )
+        await adapter._upsert_department(
+            db,
+            provider,
+            ExternalDepartment(
+                external_id="child",
+                name="Child",
+                parent_external_ids=["root-a", "root-b"],
+            ),
+        )
+        await db.commit()
+
+        child = await db.scalar(
+            select(OrgDepartment).where(
+                OrgDepartment.provider_id == provider.id,
+                OrgDepartment.external_id == "child",
+            )
+        )
+        root_a = await db.scalar(
+            select(OrgDepartment).where(
+                OrgDepartment.provider_id == provider.id,
+                OrgDepartment.external_id == "root-a",
+            )
+        )
+        edge_count = await db.scalar(
+            select(func.count()).select_from(DirectoryGroupEdge).where(
+                DirectoryGroupEdge.provider_id == provider.id,
+                DirectoryGroupEdge.child_group_id == child.id,
+            )
+        )
+        assert child.parent_id == root_a.id
+        assert edge_count == 2

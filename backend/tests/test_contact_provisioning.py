@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.database import async_session, engine
+from app.models.audit import AuditLog
 from app.models.identity import IdentityProvider
 from app.models.org import OrgMember
 from app.models.participant import Participant
@@ -94,7 +95,7 @@ def _fresh_claims(member: OrgMember) -> VerifiedDirectoryClaims:
     )
 
 
-async def test_provision_org_member_creates_external_only_user_and_participant():
+async def test_provision_org_member_creates_global_anchor_user_and_participant():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     phone = _phone()
@@ -118,7 +119,7 @@ async def test_provision_org_member_creates_external_only_user_and_participant()
         await db.commit()
 
         assert result.user_created is True
-        assert result.external_only_user_created is True
+        assert result.external_only_user_created is False
         assert result.skipped_reason is None
         assert member.user_id == result.user.id
 
@@ -134,7 +135,8 @@ async def test_provision_org_member_creates_external_only_user_and_participant()
         assert user.role == "member"
         assert user.registration_source == "dingtalk_org_sync"
         assert user.source == "dingtalk"
-        assert user.identity is None
+        assert user.identity is not None
+        assert user.identity.phone == phone
         assert member.phone == raw_phone
 
         participant_count = (
@@ -237,7 +239,7 @@ async def test_provision_org_member_links_existing_user_by_normalized_mobile():
         assert member.user_id == user_id
 
 
-async def test_provision_org_member_rejects_stale_nonempty_identity_link():
+async def test_provision_org_member_flags_stale_nonempty_identity_link():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     stale_phone = _phone()
@@ -285,16 +287,30 @@ async def test_provision_org_member_rejects_stale_nonempty_identity_link():
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
         member_id = member.id
-        with pytest.raises(CanonicalUserConflict):
-            await contact_provisioning.ensure_user_for_org_member(
-                db,
-                member,
-                fresh_claims=_fresh_claims(member),
-            )
-        await db.rollback()
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db, member, fresh_claims=_fresh_claims(member)
+        )
+        await db.commit()
 
         member = await db.get(OrgMember, member_id)
+        assert result.identity_conflict is True
+        assert result.user.id == stale_user_id
         assert member.user_id == stale_user_id
+        conflict = (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "provider_subject_contact_conflict",
+                    AuditLog.user_id == stale_user_id,
+                )
+            )
+        ).scalar_one()
+        assert conflict.details["source_member_id"] == str(member_id)
+        assert conflict.details["bound_user_id"] == str(stale_user_id)
+        assert conflict.details["candidate_user_ids"]["phone"] == str(correct_user.id)
+        assert conflict.details["claim_values_masked"]["phone"].endswith(
+            correct_phone[-4:]
+        )
+        assert correct_phone not in str(conflict.details)
 
 
 async def test_provision_org_member_keeps_existing_active_link_when_no_phone_match_exists():
@@ -389,7 +405,7 @@ async def test_provision_org_member_normalizes_existing_link_phone():
         assert result.user.identity.phone == normalized_phone
 
 
-async def test_provision_org_member_rejects_phone_owned_by_other_identity():
+async def test_provision_org_member_flags_phone_owned_by_other_identity():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     owned_phone = _phone()
@@ -429,15 +445,14 @@ async def test_provision_org_member_rejects_phone_owned_by_other_identity():
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
         member_id = member.id
-        with pytest.raises(CanonicalUserConflict):
-            await contact_provisioning.ensure_user_for_org_member(
-                db,
-                member,
-                fresh_claims=_fresh_claims(member),
-            )
-        await db.rollback()
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db, member, fresh_claims=_fresh_claims(member)
+        )
+        await db.commit()
 
         member = await db.get(OrgMember, member_id)
+        assert result.identity_conflict is True
+        assert result.user.id == user_id
         assert member.user_id == user_id
 
 
@@ -483,7 +498,7 @@ async def test_provision_org_member_does_not_link_inactive_tenant_user():
         assert member.user_id is None
 
 
-async def test_provision_org_member_without_mobile_still_gets_exact_external_user():
+async def test_provision_org_member_without_mobile_uses_verified_email_anchor():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     member = await _seed_org_member(tenant.id, provider.id, phone=None, email="nomobile@example.com")
@@ -499,9 +514,9 @@ async def test_provision_org_member_without_mobile_still_gets_exact_external_use
 
         assert result.user is not None
         assert result.user_created is True
-        assert result.external_only_user_created is True
+        assert result.external_only_user_created is False
         assert result.skipped_reason is None
-        assert result.user.identity is None
+        assert result.user.identity.email == "nomobile@example.com"
         assert member.user_id == result.user.id
 
 
@@ -557,7 +572,7 @@ async def test_provision_org_member_upserts_participant_idempotently():
         assert participant_count == 1
 
 
-async def test_provision_org_member_never_mints_login_identity_from_directory_email():
+async def test_provision_org_member_creates_and_enriches_one_platform_anchor():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     member = await _seed_org_member(
@@ -575,7 +590,8 @@ async def test_provision_org_member_never_mints_login_identity_from_directory_em
             member,
             fresh_claims=_fresh_claims(member),
         )
-        assert first.user.identity is None
+        assert first.user.identity is not None
+        anchor_id = first.user.identity_id
 
         real_email = f"real-{uuid.uuid4().hex[:10]}@example.com"
         member.email = real_email
@@ -585,7 +601,8 @@ async def test_provision_org_member_never_mints_login_identity_from_directory_em
             fresh_claims=_fresh_claims(member),
         )
         assert second.user.id == first.user.id
-        assert second.user.identity is None
+        assert second.user.identity_id == anchor_id
+        assert second.user.identity.email == real_email
 
         member.email = None
         third = await contact_provisioning.ensure_user_for_org_member(
@@ -595,4 +612,50 @@ async def test_provision_org_member_never_mints_login_identity_from_directory_em
         )
         await db.commit()
         assert third.user.id == first.user.id
-        assert third.user.identity is None
+        assert third.user.identity_id == anchor_id
+
+
+async def test_directory_contact_honors_provider_email_first_policy():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    email = f"directory-policy-{uuid.uuid4().hex[:8]}@example.com"
+    phone = _phone()
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        provider.config = {
+            "identity_match_policy": {"ordered_fields": ["email", "phone"]}
+        }
+        email_identity = Identity(email=email)
+        phone_identity = Identity(phone=phone)
+        db.add_all([email_identity, phone_identity])
+        await db.flush()
+        email_user = User(
+            identity_id=email_identity.id,
+            tenant_id=tenant.id,
+            display_name="Email owner",
+            role="member",
+            is_active=True,
+        )
+        phone_user = User(
+            identity_id=phone_identity.id,
+            tenant_id=tenant.id,
+            display_name="Phone owner",
+            role="member",
+            is_active=True,
+        )
+        db.add_all([email_user, phone_user])
+        await db.commit()
+        email_user_id = email_user.id
+        provider_id = provider.id
+
+    member = await _seed_org_member(
+        tenant.id, provider_id, phone=phone, email=email
+    )
+    async with async_session() as db:
+        member = await db.get(OrgMember, member.id)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db, member, fresh_claims=_fresh_claims(member)
+        )
+        await db.commit()
+        assert result.user.id == email_user_id
+        assert result.identity_conflict is True
