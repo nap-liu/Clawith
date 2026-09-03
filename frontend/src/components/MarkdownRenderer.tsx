@@ -29,10 +29,11 @@ function prepareUrl(
     let finalUrl = url.trim().replace(/^<|>$/g, '');
     const normalizedAgentId = agentId?.trim();
     if (kind === 'image' && normalizedAgentId) {
-        if (isSafeAgentRelativePath(finalUrl)) {
-            return `/api/agents/${encodeURIComponent(normalizedAgentId)}/files/download?path=${encodeURIComponent(finalUrl)}&inline=1`;
-        }
         if (finalUrl.startsWith('/api/agents/')) return finalUrl;
+        const agentPath = normalizeAgentRelativePath(finalUrl);
+        if (agentPath) {
+            return `/api/agents/${encodeURIComponent(normalizedAgentId)}/files/download?path=${encodeURIComponent(agentPath)}&inline=1`;
+        }
     }
     const lower = finalUrl.toLowerCase();
     const isAllowed =
@@ -54,10 +55,13 @@ function prepareUrl(
     return finalUrl;
 }
 
-function isSafeAgentRelativePath(path: string): boolean {
-    if (!path || path.startsWith('/') || path.includes('\\')) return false;
-    if (/^[a-z][a-z\d+.-]*:/i.test(path) || /[\u0000-\u001f\u007f]/.test(path)) return false;
-    return path.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..');
+function normalizeAgentRelativePath(path: string): string | null {
+    if (!path || path.startsWith('//') || path.includes('\\')) return null;
+    if (/^[a-z][a-z\d+.-]*:/i.test(path) || /[\u0000-\u001f\u007f]/.test(path)) return null;
+    if (path.includes('?') || path.includes('#')) return null;
+    const parts = path.replace(/^\/+/, '').split('/').filter(segment => segment !== '' && segment !== '.');
+    if (parts.length === 0 || parts.some(segment => segment === '..')) return null;
+    return parts.join('/');
 }
 
 function renderLink(url: string, label: string): string {

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import re
+import time
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from pathlib import PurePosixPath
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
+from jose import JWTError, jwt
 from loguru import logger
 
+from app.config import get_settings
 from app.database import async_session
 from app.services.chat_attachments import sniff_image_mime_bytes
 from app.services.platform_service import platform_service
@@ -23,6 +27,13 @@ _MARKDOWN_IMAGE_RE = re.compile(
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(?P<run>`{3,}|~{3,})")
 _BACKTICK_RUN_RE = re.compile(r"`+")
 _MAX_FAILURE_LOGS_PER_MESSAGE = 3
+_IM_IMAGE_TICKET_PURPOSE = "agent_im_image"
+
+
+@dataclass(frozen=True, slots=True)
+class IMImageTicket:
+    path: str
+    storage_key: str
 
 
 def _code_ranges(markdown: str) -> list[tuple[int, int]]:
@@ -76,10 +87,10 @@ def _canonical_agent_path(raw_destination: str) -> str | None:
     parsed = urlsplit(destination)
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
         return None
-    if not destination or destination.startswith(("/", "\\")) or "\\" in destination:
+    if not destination or "\\" in destination or re.search(r"[\x00-\x1f\x7f]", destination):
         return None
-    parts = destination.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
+    parts = [part for part in destination.lstrip("/").split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
         return None
     canonical = PurePosixPath(*parts).as_posix()
     if canonical in {"", "."}:
@@ -90,6 +101,51 @@ def _canonical_agent_path(raw_destination: str) -> str | None:
 async def _public_base_url() -> str:
     async with async_session() as db:
         return (await platform_service.get_public_base_url(db=db)).rstrip("/")
+
+
+def _create_im_image_ticket(agent_id: uuid.UUID, path: str, storage_key: str) -> str:
+    settings = get_settings()
+    return jwt.encode(
+        {
+            "purpose": _IM_IMAGE_TICKET_PURPOSE,
+            "agent_id": str(agent_id),
+            "path": path,
+            "storage_key": storage_key,
+            "exp": int(time.time()) + settings.S3_PRESIGN_TTL_SECONDS,
+        },
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def verify_im_image_ticket(
+    agent_id: uuid.UUID,
+    requested_path: str,
+    ticket: str,
+) -> IMImageTicket | None:
+    """Verify one short-lived ticket bound to an exact Agent image path."""
+    canonical_path = _canonical_agent_path(requested_path)
+    if canonical_path is None:
+        return None
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            ticket,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
+    except JWTError:
+        return None
+    storage_key = payload.get("storage_key")
+    if (
+        payload.get("purpose") != _IM_IMAGE_TICKET_PURPOSE
+        or payload.get("agent_id") != str(agent_id)
+        or payload.get("path") != canonical_path
+        or not isinstance(storage_key, str)
+        or not storage_key
+    ):
+        return None
+    return IMImageTicket(path=canonical_path, storage_key=storage_key)
 
 
 async def _presign_agent_image(agent_id: uuid.UUID, relative_path: str) -> str | None:
@@ -107,7 +163,13 @@ async def _presign_agent_image(agent_id: uuid.UUID, relative_path: str) -> str |
         content_type=mime_type,
     )
     if not url:
-        return None
+        ticket = _create_im_image_ticket(agent_id, relative_path, key)
+        base_url = await _public_base_url()
+        return (
+            f"{base_url}/api/agents/{agent_id}/files/download"
+            f"?path={quote(relative_path, safe='')}&inline=1"
+            f"&im_ticket={quote(ticket, safe='')}"
+        )
     parsed = urlsplit(url)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return url
@@ -175,4 +237,4 @@ async def project_agent_images_for_im(agent_id: uuid.UUID, markdown: str) -> str
     return "".join(rendered)
 
 
-__all__ = ["project_agent_images_for_im"]
+__all__ = ["project_agent_images_for_im", "verify_im_image_ticket"]

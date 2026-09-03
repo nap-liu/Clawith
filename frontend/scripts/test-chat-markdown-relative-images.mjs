@@ -36,6 +36,21 @@ try {
     );
     assert.doesNotMatch(chatImage, /legacy-query-token|[?&]token=/);
 
+    for (const [prefix, expectedPath] of [
+        ['/workspace/reports/chart.png', 'workspace%2Freports%2Fchart.png'],
+        ['./workspace/reports/chart.png', 'workspace%2Freports%2Fchart.png'],
+        ['chart.png', 'chart.png'],
+    ]) {
+        const normalizedImage = renderMarkdown(
+            `![normalized](${prefix})`,
+            '00000000-0000-0000-0000-000000000001',
+        );
+        assert.match(
+            normalizedImage,
+            new RegExp(`src="/api/agents/00000000-0000-0000-0000-000000000001/files/download\\?path=${expectedPath}&amp;inline=1"`),
+        );
+    }
+
     const existingAgentImage = renderMarkdown(
         '![existing](/api/agents/existing/files/download?path=workspace/chart.png)',
         '00000000-0000-0000-0000-000000000001',
@@ -63,11 +78,11 @@ try {
     );
     assert.doesNotMatch(unsafeImage, /<img|\/api\/agents\//);
 
-    const absoluteImage = renderMarkdown(
+    const slashPrefixedImage = renderMarkdown(
         '![asset](/assets/chart.png)',
         '00000000-0000-0000-0000-000000000001',
     );
-    assert.match(absoluteImage, /src="\/assets\/chart\.png"/);
+    assert.match(slashPrefixedImage, /path=assets%2Fchart\.png&amp;inline=1/);
 
     console.log('chat markdown relative image tests passed');
 } finally {

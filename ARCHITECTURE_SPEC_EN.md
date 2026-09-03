@@ -110,16 +110,21 @@ download route. Browser image requests use the same login JWT carried in an
 HttpOnly cookie; the Authorization header and cookie are two transports for
 the same credential, not separate authorization systems. The download route
 continues to enforce the current user, Agent access, safe workspace resolution,
-and inline file response policy.
+and inline file response policy. Image paths use POSIX AgentDir-relative
+semantics: no prefix, `/`, and `./` normalize to the same relative path. The
+resolver never guesses or prepends a product directory such as `workspace/`.
 
 IM delivery rewrites relative image references only in the outbound provider
-payload. It validates the referenced workspace image and uses the configured
+payload. It validates the referenced AgentDir image and uses the configured
 storage backend's existing `presign_download_url` policy to produce an absolute
 temporary URL with an inline response and correct image content type. That URL
 is neither uploaded to the provider nor written back to the message. External
 HTTP(S) image references pass through unchanged. Markdown parsing, workspace
 validation, and projection are shared capabilities; channel adapters must not
-implement independent copies.
+implement independent copies. If the local storage backend cannot create an
+object-store URL, the same projection emits a short-lived JWT-scoped image URL;
+the route serves only the signed Agent, exact normalized path, storage key, and
+image content.
 
 ## Environment and validation
 

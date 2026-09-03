@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from unittest.mock import AsyncMock
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -16,6 +18,7 @@ from app.models.agent import Agent
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.storage import agent_storage_key, get_storage_backend
+from app.services import im_markdown_media
 
 pytestmark = pytest.mark.asyncio
 
@@ -158,6 +161,18 @@ async def test_workspace_download_accepts_cookie_and_keeps_query_token_compatibi
         assert cookie_download.status_code == 200
         assert cookie_download.content == payload
         assert cookie_download.headers["content-type"] == "image/png"
+        for prefixed_path in ("/workspace/report.png", "./workspace/report.png"):
+            normalized_download = await client.get(
+                f"/api/agents/{agent_id}/files/download",
+                params={"path": prefixed_path, "inline": "true"},
+            )
+            assert normalized_download.status_code == 200
+            assert normalized_download.content == payload
+        root_path_is_not_guessed = await client.get(
+            f"/api/agents/{agent_id}/files/download",
+            params={"path": "report.png", "inline": "true"},
+        )
+        assert root_path_is_not_guessed.status_code == 404
 
         rejected_header = await client.get(
             url,
@@ -169,6 +184,41 @@ async def test_workspace_download_accepts_cookie_and_keeps_query_token_compatibi
         query_download = await client.get(f"{url}&token={token}")
         assert query_download.status_code == 200
         assert query_download.content == payload
+
+    await storage.delete(key)
+
+
+async def test_im_image_ticket_serves_local_image_without_login(monkeypatch):
+    _user_id, _email, agent_id = await _seed_user_and_agent()
+    storage = get_storage_backend()
+    key = agent_storage_key(agent_id, "workspace/ticket.png")
+    payload = b"\x89PNG\r\n\x1a\nlocal-ticket-test"
+    await storage.write_bytes(key, payload, content_type="image/png")
+    monkeypatch.setattr(
+        im_markdown_media,
+        "_public_base_url",
+        AsyncMock(return_value="http://test"),
+    )
+    projected = await im_markdown_media.project_agent_images_for_im(
+        agent_id,
+        "![ticket](./workspace/ticket.png)",
+    )
+    signed_url = projected.removeprefix("![ticket](").removesuffix(")")
+    parsed = urlsplit(signed_url)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_test_app()),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(f"{parsed.path}?{parsed.query}")
+        assert response.status_code == 200
+        assert response.content == payload
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        tampered = await client.get(
+            f"{parsed.path}?{parsed.query.replace('workspace%2Fticket.png', 'workspace%2Fother.png')}"
+        )
+        assert tampered.status_code == 404
 
     await storage.delete(key)
 

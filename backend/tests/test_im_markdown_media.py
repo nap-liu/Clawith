@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -28,6 +29,12 @@ class _PresigningStorage:
         return f"/minio/{key}?existing-signature=yes"
 
 
+class _LocalLikeStorage(_PresigningStorage):
+    async def presign_download_url(self, key: str, **kwargs) -> None:
+        self.presign_calls.append({"key": key, **kwargs})
+        return None
+
+
 async def test_agent_relative_images_become_existing_absolute_presigned_urls(monkeypatch):
     agent_id = uuid.uuid4()
     image_key = f"{agent_id}/workspace/reports/chart one.png"
@@ -49,6 +56,8 @@ async def test_agent_relative_images_become_existing_absolute_presigned_urls(mon
         "报告如下：\n"
         "![趋势图](<workspace/reports/chart%20one.png> \"九月\")\n"
         "![再次引用](<workspace/reports/chart%20one.png>)\n"
+        "![斜杠前缀](/workspace/reports/chart%20one.png)\n"
+        "![点前缀](./workspace/reports/chart%20one.png)\n"
         "![外部图](https://cdn.example.com/public.png)\n"
         "![伪图片](workspace/reports/not-image.jpg)\n"
         "![越界](../secret.png)\n"
@@ -63,6 +72,8 @@ async def test_agent_relative_images_become_existing_absolute_presigned_urls(mon
     )
     assert f'![趋势图](<{signed}> "九月")' in projected
     assert f"![再次引用](<{signed}>)" in projected
+    assert f"![斜杠前缀]({signed})" in projected
+    assert f"![点前缀]({signed})" in projected
     assert "![外部图](https://cdn.example.com/public.png)" in projected
     assert "![伪图片](workspace/reports/not-image.jpg)" in projected
     assert "![越界](../secret.png)" in projected
@@ -75,6 +86,68 @@ async def test_agent_relative_images_become_existing_absolute_presigned_urls(mon
             "content_type": "image/png",
         }
     ]
+
+
+async def test_local_storage_images_use_existing_short_lived_ticket_route(monkeypatch):
+    agent_id = uuid.uuid4()
+    image_key = f"{agent_id}/workspace/chart.png"
+    storage = _LocalLikeStorage({image_key: b"\x89PNG\r\n\x1a\nimage-bytes"})
+    monkeypatch.setattr(im_markdown_media, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(
+        im_markdown_media,
+        "_public_base_url",
+        AsyncMock(return_value="https://chat.example.com"),
+    )
+
+    projected = await im_markdown_media.project_agent_images_for_im(
+        agent_id,
+        "![图](/workspace/chart.png)",
+    )
+
+    destination = projected.removeprefix("![图](").removesuffix(")")
+    parsed = urlsplit(destination)
+    query = parse_qs(parsed.query)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "chat.example.com"
+    assert parsed.path == f"/api/agents/{agent_id}/files/download"
+    assert query["path"] == ["workspace/chart.png"]
+    ticket = im_markdown_media.verify_im_image_ticket(
+        agent_id,
+        query["path"][0],
+        query["im_ticket"][0],
+    )
+    assert ticket is not None
+    assert ticket.path == "workspace/chart.png"
+    assert ticket.storage_key == image_key
+    assert im_markdown_media.verify_im_image_ticket(
+        agent_id,
+        "workspace/other.png",
+        query["im_ticket"][0],
+    ) is None
+
+
+async def test_path_normalization_never_guesses_workspace_prefix(monkeypatch):
+    agent_id = uuid.uuid4()
+    presign = AsyncMock(side_effect=lambda _agent_id, path: f"https://signed.example/{path}")
+    monkeypatch.setattr(im_markdown_media, "_presign_agent_image", presign)
+
+    projected = await im_markdown_media.project_agent_images_for_im(
+        agent_id,
+        "\n".join(
+            (
+                "![plain](workspace/chart.png)",
+                "![slash](/workspace/chart.png)",
+                "![dot](./workspace/chart.png)",
+                "![root](chart.png)",
+                "![escape](../workspace/chart.png)",
+            )
+        ),
+    )
+
+    assert projected.count("https://signed.example/workspace/chart.png") == 3
+    assert "![root](https://signed.example/chart.png)" in projected
+    assert "![escape](../workspace/chart.png)" in projected
+    assert presign.await_count == 2
 
 
 async def test_shared_im_exit_projects_markdown_without_changing_history_channels(monkeypatch):
