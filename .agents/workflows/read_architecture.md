@@ -22,6 +22,7 @@ facts from the current repository and authorized local Docker environment.
 |---|---|---|
 | sessions, turns, WebSocket, A2A, triggers, history, recovery, active-turn control | `.agents/architecture/conversations-and-turns.md` | — |
 | IM channels, delivery, files/media, confirmation lifecycle, recall | `.agents/architecture/conversations-and-turns.md` | — |
+| identity, SSO, SCIM, organization directories, user normalization, channel-user binding | `.agents/architecture/identity-directory-and-channel-bindings.md` | — |
 | context budgets, compaction, summaries, model usage, memory loading, LLM timeouts | `.agents/architecture/context-and-memory.md` | — |
 | builtin tools, MCP, CLI uploads, sandbox execution, enablement | `.agents/architecture/tools-and-sandboxes.md` | — |
 | Docker, tests, local stack, browser E2E | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md` |

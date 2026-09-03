@@ -14,6 +14,7 @@ facts must be inspected rather than remembered.
 | Standard diagnose/change/verify lifecycle | `.agents/workflows/engineering_change.md` |
 | Design, security, testing, Git, deploy, and release policy | `.agents/rules/` |
 | Conversation, context, tools, sandbox, and environment boundaries | `.agents/architecture/` |
+| Identity, multi-SSO, SCIM directories, organization graphs, and channel bindings | `.agents/architecture/identity-directory-and-channel-bindings.md` |
 | Executable production release and rollback procedure | `.agents/runbooks/production_release.md` |
 
 The external-memory migration record is historical evidence, not an instruction

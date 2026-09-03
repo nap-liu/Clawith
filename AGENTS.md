@@ -54,6 +54,8 @@ Before inspecting implementation code or making changes:
 2. For an implementation task, also read
    `.agents/workflows/engineering_change.md`.
 3. Read every additional rule selected by the task:
+   - identity, SSO, SCIM, organization directories, user normalization, or
+     channel-user binding: `.agents/architecture/identity-directory-and-channel-bindings.md`
    - environment, Docker, tests, browser validation, or deployment:
      `.agents/rules/deploy.md`
    - Git, branches, commits, merges, or pull requests:
@@ -85,6 +87,19 @@ Before inspecting implementation code or making changes:
   completed tool change.
 - Product code, prompts, UI, fixtures, and examples must not hard-code
   tenant-specific tool or CLI names.
+- Build product UI from the repository's existing shared components and design
+  primitives. Search for and reuse a standard component before implementing a
+  control locally; when a reusable capability is missing, extend or add it in
+  the shared component layer instead of creating a page-specific duplicate.
+  Do not recreate controls, interaction patterns, or styling that the project
+  already provides.
+- Route every user-visible string through the repository's standard i18n
+  resources, including labels, button text, status and progress text, empty
+  states, validation and error messages, tooltips, and accessibility labels.
+  Do not implement language switching with inline literals or language-specific
+  conditionals in product components. Product copy must name standard product
+  capabilities and user actions directly; do not expose implementation-oriented
+  narration or conversational setup prose as labels or descriptions.
 - Do not clean/reset unrelated changes, stop shared stacks, push, tag, deploy,
   or mutate production without the authorization required by the relevant
   workflow.

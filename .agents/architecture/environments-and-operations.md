@@ -25,6 +25,11 @@ docker run --rm --entrypoint python \
 - Create/clone only an isolated test database. Never drop, migrate, or seed the local development database as test setup.
 - Runtime images may omit pytest/ruff; create or reuse a dedicated test image instead of installing on the host.
 - Import the complete relevant SQLAlchemy model graph in standalone scripts when foreign-key resolution requires it.
+- The bootstrap entrypoint detects a truly empty database, creates current metadata,
+  then stamps Alembic heads; existing databases run Alembic upgrades. Validate both
+  paths. Do not rewrite historical revisions to accommodate fresh `create_all`
+  collisions; keep ordering compatibility in the bootstrap boundary or the new
+  revision that introduces the schema.
 
 For a compile/import check, use the same mounted container and run `python -m compileall` or a focused import there. This rule applies even when host Python happens to be available.
 
