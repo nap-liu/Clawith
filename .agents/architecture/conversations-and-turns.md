@@ -108,6 +108,9 @@ Fully recalled messages remain in the audit trail and render as a tombstone. LLM
   transports must remain explicit; a product-approved safe link fallback may
   be used where native upload is unavailable.
 - Web live monitoring is distinct from write permission. A read-only viewer may receive events, but server-side writes remain denied.
+- A durable message from a human always continues through the ordinary
+  conversation lifecycle. An `on_message` trigger may observe and enqueue work,
+  but it must never consume the human message or suppress its terminal reply.
 - Reaction/thinking anchors move only when an inbound message is actually
   consumed by the running turn. A merely pending interjection must not steal the
   visible anchor.

@@ -53,8 +53,9 @@ async def match_incoming_chat_message(db, message, session) -> OnMessageMatchRes
     """Atomically enqueue the exact on_message binding for one durable row.
 
     Channel/Web entry points call this after flushing the inbound ChatMessage and
-    before running the remote session's LLM turn.  The daemon poll remains a
-    recovery fallback for the send→set_trigger gap.
+    before running the remote session's LLM turn. Human messages may enqueue an
+    observer execution but always continue through the ordinary conversation.
+    The daemon poll remains a recovery fallback for the send→set_trigger gap.
     """
     from app.models.audit import ChatMessage
     from app.models.trigger import AgentTrigger
@@ -185,7 +186,11 @@ async def match_incoming_chat_message(db, message, session) -> OnMessageMatchRes
             payload_obj=runtime_execution_payload(runtime_trigger),
             commit=False,
         )
-        consume_requested = consume_requested or bool(cfg.get("_consume_remote"))
+        consume_requested = consume_requested or bool(
+            cfg.get("_consume_remote")
+            and actual_actor_pair
+            and actual_actor_pair[0] == "agent"
+        )
         if created and execution is not None:
             execution_ids.append(execution.id)
             matched_trigger_ids.append(trigger.id)
