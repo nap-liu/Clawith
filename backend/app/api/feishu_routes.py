@@ -7,6 +7,7 @@ from app.api.feishu_shared import *  # noqa: F401,F403
 async def feishu_oauth_callback(
     code: str,
     request: Request,
+    response: Response,
     state: str = None,
     db: AsyncSession = Depends(get_db)
 ):
@@ -95,6 +96,7 @@ async def feishu_oauth_callback(
         except Exception as e:
             logger.exception("Failed to update SSO session (feishu) %s", e)
 
+    set_access_token_cookie(response, request, token)
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 

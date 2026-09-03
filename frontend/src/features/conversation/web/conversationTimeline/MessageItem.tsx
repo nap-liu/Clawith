@@ -218,7 +218,7 @@ export function MessageItem({
                   </div>
                 )}
                 {quotedMessage.text ? (
-                  <MarkdownRenderer content={quotedMessage.text} />
+                  <MarkdownRenderer agentId={agentId} content={quotedMessage.text} />
                 ) : null}
                 {!quotedMessage.text &&
                   quotedMessage.attachments.length === 0 && (
@@ -293,7 +293,7 @@ export function MessageItem({
                 </span>
               </div>
             ) : (
-              <MarkdownRenderer content={content} />
+              <MarkdownRenderer agentId={agentId} content={content} />
             )}
           </div>
         </div>

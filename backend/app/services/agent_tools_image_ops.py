@@ -230,15 +230,11 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
         full_save_path.write_bytes(image_bytes)
         size_kb = len(image_bytes) / 1024
 
-        # Build the API path for inline display in chat
-        # The MarkdownRenderer will auto-inject the auth token for /api/agents/ paths
-        api_image_path = f"/api/agents/{agent_id}/files/download?path={save_path}"
-
         return (
             f"✅ Image generated and saved to: {save_path}\n"
             f"Size: {size_kb:.1f} KB | Provider: {provider} | Model: {model or '(default)'}\n\n"
             f"Display this image to the user using this exact markdown:\n"
-            f"![generated image]({api_image_path})"
+            f"![generated image]({save_path})"
         )
     except httpx.TimeoutException:
         logger.error(f"[GenerateImage] Timeout ({provider}): took longer than 120 seconds or network unreachable.")

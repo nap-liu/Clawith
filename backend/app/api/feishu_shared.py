@@ -12,7 +12,7 @@ from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator
-from app.core.security import get_current_user
+from app.core.security import get_current_user, set_access_token_cookie
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
@@ -172,6 +172,27 @@ def _build_card(
         },
         "elements": elements,
     }
+
+
+async def _build_projected_stream_card(
+    agent_id: uuid.UUID,
+    answer_text: str,
+    *,
+    thinking_text: str = "",
+    tool_status_lines: list[str] | None = None,
+    agent_name: str = "AI 回复",
+) -> dict:
+    """Build an intermediate card with transient IM image URLs."""
+    from app.services.im_markdown_media import project_agent_images_for_im
+
+    projected = await project_agent_images_for_im(agent_id, answer_text)
+    return _build_card(
+        answer_text=projected,
+        thinking_text=thinking_text,
+        streaming=True,
+        tool_status_lines=tool_status_lines,
+        agent_name=agent_name,
+    )
 
 
 def _looks_like_error_text(text: str) -> bool:

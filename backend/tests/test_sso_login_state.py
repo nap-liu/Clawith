@@ -10,6 +10,7 @@ from starlette.responses import Response
 
 from app.api.sso import SSO_SESSION_HOURS, create_sso_session
 from app.config import get_settings
+from app.core.security import ACCESS_TOKEN_COOKIE_NAME
 from app.database import async_session, engine
 from app.main import app
 from app.models.identity import IdentityProvider, SSOScanSession
@@ -137,6 +138,7 @@ async def test_authorized_sso_status_returns_token_once_and_clears_browser_bindi
         assert completed.status_code == 200
         assert completed.json()["status"] == "authorized"
         assert completed.json()["access_token"] == "one-time-token"
+        assert owner.cookies.get(ACCESS_TOKEN_COOKIE_NAME) == "one-time-token"
         assert owner.cookies.get(cookie_name) is None
 
         async with async_session() as db:

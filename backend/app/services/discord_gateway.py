@@ -24,6 +24,7 @@ from app.services.channel_dispatch import (
     channel_session_lock_key,
     run_channel_message,
 )
+from app.services.im_markdown_media import project_agent_images_for_im
 
 try:
     import discord
@@ -172,6 +173,7 @@ class DiscordGatewayManager:
                 if handled is None:
                     return ""
                 reply, assistant_message_id = handled
+                delivery_reply = await project_agent_images_for_im(agent_id, reply)
                 # Send reply, chunked if needed
                 from app.services.im_delivery import (
                     IMDeliveryPart,
@@ -181,9 +183,9 @@ class DiscordGatewayManager:
                 )
 
                 delivery_result = IMDeliveryResult.failed("discord", "send_failed")
-                if reply:
+                if delivery_reply:
                     try:
-                        chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
+                        chunks = [delivery_reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(delivery_reply), DISCORD_MSG_LIMIT)]
                         sent_messages = []
                         for chunk in chunks:
                             sent = await message.reply(chunk, mention_author=False)

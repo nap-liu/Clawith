@@ -24,8 +24,16 @@ function escapeAttribute(str: string): string {
 function prepareUrl(
     url: string,
     kind: 'link' | 'image' = 'link',
+    agentId?: string,
 ): string | null {
     let finalUrl = url.trim().replace(/^<|>$/g, '');
+    const normalizedAgentId = agentId?.trim();
+    if (kind === 'image' && normalizedAgentId) {
+        if (isSafeAgentRelativePath(finalUrl)) {
+            return `/api/agents/${encodeURIComponent(normalizedAgentId)}/files/download?path=${encodeURIComponent(finalUrl)}&inline=1`;
+        }
+        if (finalUrl.startsWith('/api/agents/')) return finalUrl;
+    }
     const lower = finalUrl.toLowerCase();
     const isAllowed =
         lower.startsWith('http://') ||
@@ -44,6 +52,12 @@ function prepareUrl(
         }
     }
     return finalUrl;
+}
+
+function isSafeAgentRelativePath(path: string): boolean {
+    if (!path || path.startsWith('/') || path.includes('\\')) return false;
+    if (/^[a-z][a-z\d+.-]*:/i.test(path) || /[\u0000-\u001f\u007f]/.test(path)) return false;
+    return path.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..');
 }
 
 function renderLink(url: string, label: string): string {
@@ -78,6 +92,7 @@ function triggerImageDownload(url: string, alt: string) {
 type MarkdownImagePolicy = {
     allowDownload: boolean;
     protectImages: boolean;
+    agentId?: string;
 };
 
 function renderInline(text: string, imagePolicy: MarkdownImagePolicy): string {
@@ -96,7 +111,7 @@ function renderInline(text: string, imagePolicy: MarkdownImagePolicy): string {
         .replace(/`([^`]+)`/g, (_match, code) => stash(`<code style="background:var(--bg-secondary);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:0.9em">${escapeHtml(code)}</code>`))
         // Images
         .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
-            const finalUrl = prepareUrl(url, 'image');
+            const finalUrl = prepareUrl(url, 'image', imagePolicy.agentId);
             if (!finalUrl) return escapeHtml(match);
             const safeUrl = escapeAttribute(finalUrl);
             const safeAlt = escapeAttribute(alt);
@@ -277,6 +292,7 @@ function markdownToHtml(md: string, imagePolicy: MarkdownImagePolicy): string {
 
 interface MarkdownRendererProps {
     content: string;
+    agentId?: string;
     style?: React.CSSProperties;
     className?: string;
     imagePreviewMode?: 'desktop' | 'mobile';
@@ -288,6 +304,7 @@ interface MarkdownRendererProps {
 
 export const MarkdownRenderer = React.memo(function MarkdownRenderer({
     content,
+    agentId,
     style,
     className,
     imagePreviewMode = 'desktop',
@@ -298,7 +315,8 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({
     const html = useMemo(() => markdownToHtml(content, {
         allowDownload: allowImageDownload,
         protectImages,
-    }), [allowImageDownload, content, protectImages]);
+        agentId,
+    }), [agentId, allowImageDownload, content, protectImages]);
     const toast = useToast();
     const [preview, setPreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 

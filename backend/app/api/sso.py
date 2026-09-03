@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.core.security import set_access_token_cookie
 from loguru import logger
 from app.models.identity import SSOScanSession, IdentityProvider
 from app.schemas.schemas import UserOut
@@ -203,6 +204,7 @@ async def get_sso_session_status(
         user = user_result.scalar_one_or_none()
         
         response_payload["access_token"] = session.access_token
+        set_access_token_cookie(response, request, session.access_token)
         if user:
             response_payload["user"] = UserOut.model_validate(user).model_dump()
             

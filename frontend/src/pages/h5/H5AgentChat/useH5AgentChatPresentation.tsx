@@ -7,7 +7,6 @@ import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
 import ChatMediaCard from '../../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../../components/ChatToolCallRenderer';
 import MarkdownRenderer from '../../../components/MarkdownRenderer';
-import Avatar from '../../../components/ui/Avatar';
 import { useConversationAutoFollow } from '../../../features/conversation/useConversationAutoFollow';
 import {
     buildPreviewImage,
@@ -90,7 +89,6 @@ export function useH5AgentChatPresentation(
         markAttachmentUnavailable,
         handleAttachmentDownload,
         token,
-        currentUser,
         isReadOnly,
         confirmationPending,
         messageRuntimeBlockedRef,
@@ -337,10 +335,6 @@ export function useH5AgentChatPresentation(
         }
 
         const msg = entry.msg;
-        const messageAvatarUrl = msg.sender_avatar_url
-            || (msg.role === 'user' ? currentUser?.avatar_url : agent?.avatar_url);
-        const messageAvatarName = msg.sender_name
-            || (msg.role === 'user' ? currentUser?.display_name : agent?.name);
         const rawDisplayContent = msg.fileName ? stripAttachmentDisplayPrefix(msg.content) : msg.content;
         const displayContent = stripChatImageDataMarkers(rawDisplayContent);
         const quotedMessage = msg.quoted_message;
@@ -388,11 +382,6 @@ export function useH5AgentChatPresentation(
         if (entry.type === 'special_render') {
             return (
                 <article className={`h5-chat__message h5-chat__message--assistant h5-chat__message--special-render h5-chat__message--${entry.renderType}`}>
-                    <Avatar
-                        className="h5-chat__message-avatar"
-                        src={messageAvatarUrl}
-                        name={messageAvatarName}
-                    />
                     <div className={`h5-chat__special-render h5-chat__${entry.renderType}-card`}>
                         <ChatToolCallRenderer
                             agentId={agentId || ''}
@@ -416,13 +405,6 @@ export function useH5AgentChatPresentation(
 
         return (
             <article className={`h5-chat__message h5-chat__message--${msg.role}`}>
-                {msg.role !== 'user' && msg.role !== 'system' ? (
-                    <Avatar
-                        className="h5-chat__message-avatar"
-                        src={messageAvatarUrl}
-                        name={messageAvatarName}
-                    />
-                ) : null}
                 <div className="h5-chat__bubble">
                     {quotedMessage ? (
                         <div className="conversation-quoted-message">
@@ -449,7 +431,7 @@ export function useH5AgentChatPresentation(
                                     {quotedFileChips.map((file, index) => <button key={`${file.path}-${index}`} type="button" className="h5-chat__file-chip" disabled={unavailableAttachmentKeys.has(file.path)} onClick={() => void handleAttachmentDownload(file.path, file.name)}><ChatAttachmentIcon name={file.name} kind={file.kind} mimeType={file.mimeType} /><span>{file.name}</span></button>)}
                                 </div>
                             ) : null}
-                            {quotedMessage.text ? <MarkdownRenderer className="h5-chat__markdown" content={quotedMessage.text} imagePreviewMode="mobile" allowImageDownload={false} protectImages onLinkClick={handleMarkdownLinkClick} /> : null}
+                            {quotedMessage.text ? <MarkdownRenderer agentId={agentId || undefined} className="h5-chat__markdown" content={quotedMessage.text} imagePreviewMode="mobile" allowImageDownload={false} protectImages onLinkClick={handleMarkdownLinkClick} /> : null}
                             {!quotedMessage.text && quotedMessage.attachments.length === 0 ? <div className="conversation-quoted-message__unavailable">{quotedMessage.content_status === 'failed' ? '引用内容获取失败' : '引用内容不可用'}</div> : null}
                             {quotedMessage.content_status === 'partial' ? <div className="conversation-quoted-message__unavailable">部分引用内容未能获取</div> : null}
                         </div>
@@ -522,6 +504,7 @@ export function useH5AgentChatPresentation(
                     ) : null}
                     {displayContent ? (
                         <MarkdownRenderer
+                            agentId={agentId || undefined}
                             className="h5-chat__markdown"
                             content={displayContent}
                             imagePreviewMode="mobile"
@@ -533,22 +516,11 @@ export function useH5AgentChatPresentation(
                         <div className="h5-chat__typing"><span /><span /><span /></div>
                     ) : null}
                 </div>
-                {msg.role === 'user' ? (
-                    <Avatar
-                        className="h5-chat__message-avatar"
-                        src={messageAvatarUrl}
-                        name={messageAvatarName}
-                    />
-                ) : null}
             </article>
         );
     }, [
         agentId,
-        agent?.avatar_url,
-        agent?.name,
         analysisExpanded,
-        currentUser?.avatar_url,
-        currentUser?.display_name,
         handleAttachmentDownload,
         handleMarkdownLinkClick,
         markAttachmentUnavailable,

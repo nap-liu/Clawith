@@ -3,12 +3,12 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import create_access_token, verify_password_async
+from app.core.security import create_access_token, set_access_token_cookie, verify_password_async
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import (
@@ -126,6 +126,8 @@ async def register(
     data: UserRegister,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
 ):
     """Legacy registration endpoint - kept for backward compatibility.
 
@@ -141,10 +143,14 @@ async def register(
 
     # Handle SSO registration if provider info provided
     if data.provider and data.provider_code:
-        return await _handle_sso_register(data, db)
+        result = await _handle_sso_register(data, db)
+        set_access_token_cookie(response, request, result.access_token)
+        return result
 
     # Regular username/password registration - delegate to new flow
-    return await _handle_normal_register(data, background_tasks, db, settings)
+    result = await _handle_normal_register(data, background_tasks, db, settings)
+    set_access_token_cookie(response, request, result.access_token)
+    return result
 
 
 @router.post("/register/init", response_model=RegisterInitResponse, status_code=status.HTTP_201_CREATED)
@@ -152,6 +158,8 @@ async def register_init(
     data: RegisterInitRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
 ):
     """Step 1: Initialize registration with account credentials.
 
@@ -244,6 +252,7 @@ async def register_init(
 
     # Generate token
     token = create_access_token(str(user.id), user.role)
+    set_access_token_cookie(response, request, token)
 
     # Send verification email if not verified
     if not identity.email_verified:
@@ -264,6 +273,8 @@ async def register_init(
 async def register_sso(
     data: SSORegisterRequest,
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
 ):
     """SSO registration - completely separate from normal registration flow.
 
@@ -307,6 +318,7 @@ async def register_sso(
     await require_active_authentication_principal(db, user)
     # Generate token
     token = create_access_token(str(user.id), user.role)
+    set_access_token_cookie(response, request, token)
 
     logger.info(f"[REGISTER_SSO] SSO successful: user_id={user.id}, is_new={is_new}")
 

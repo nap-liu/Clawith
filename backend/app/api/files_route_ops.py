@@ -9,15 +9,17 @@ from pathlib import Path
 from typing import Any
 
 import aiofiles
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import decode_access_token, request_access_token
 from app.models.agent import Agent
 from app.models.user import User
 from app.models.workspace import WorkspaceFileRevision
+from app.services.authentication_state import require_active_authentication_principal
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.focus_service import is_focus_file_path
 from app.services.storage import ensure_local_path, guess_content_type
@@ -267,6 +269,7 @@ async def download_file_impl(
     *,
     agent_id: uuid.UUID,
     path: str,
+    request: Request,
     token: str,
     inline: bool,
     credentials: HTTPAuthorizationCredentials | None,
@@ -274,9 +277,7 @@ async def download_file_impl(
 ):
     """Download / serve a file from the agent workspace (browser-friendly)."""
 
-    from app.core.security import decode_access_token
-
-    jwt_token = credentials.credentials if credentials else (token or None)
+    jwt_token = request_access_token(request, credentials, query_token=token)
     if not jwt_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     payload = decode_access_token(jwt_token)
@@ -284,9 +285,11 @@ async def download_file_impl(
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    user = await require_active_authentication_principal(
+        db,
+        result.scalar_one_or_none(),
+        status_code=status.HTTP_401_UNAUTHORIZED,
+    )
     agent, _access = await api.check_agent_access(db, user, agent_id)
     is_creator = (agent.creator_id == user.id) or (user.role == "platform_admin")
     filename = Path(path).name

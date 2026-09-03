@@ -2,14 +2,14 @@
 
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.auth_registration import _send_verification_email_task
-from app.core.security import create_access_token, verify_password_async
+from app.core.security import create_access_token, set_access_token_cookie, verify_password_async
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import IdentityOut, MultiTenantResponse, TenantChoice, TokenResponse, UserLogin, UserOut
@@ -19,7 +19,13 @@ router = APIRouter()
 
 
 @router.post("/login", response_model=Any)
-async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def login(
+    data: UserLogin,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
+):
     """Login with email/phone/username and password. Supports multi-tenant selection."""
     from app.services.platform_auth_policy import get_platform_auth_policy
 
@@ -174,6 +180,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
     await require_active_authentication_principal(db, user)
     needs_setup = user.tenant_id is None
     token = create_access_token(str(user.id), user.role)
+    set_access_token_cookie(response, request, token)
     return TokenResponse(
         access_token=token,
         user=UserOut.model_validate(user),

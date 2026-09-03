@@ -138,3 +138,30 @@ async def test_s3_write_local_file_uses_streaming_upload(tmp_path, monkeypatch):
         "agents/agent-id/workspace/media/clip.mp4",
         ExtraArgs={"ContentType": "video/mp4"},
     )
+
+
+@pytest.mark.asyncio
+async def test_s3_presign_inline_image_sets_verified_response_type(monkeypatch):
+    client = Mock()
+    client.generate_presigned_url.return_value = "https://storage.example/signed"
+    backend = S3StorageBackend(bucket="bucket", prefix="agents")
+    monkeypatch.setattr(backend, "_client_or_raise", lambda: client)
+
+    url = await backend.presign_download_url(
+        "agent-id/workspace/chart.bin",
+        filename="chart.bin",
+        inline=True,
+        content_type="image/png",
+    )
+
+    assert url == "https://storage.example/signed"
+    client.generate_presigned_url.assert_called_once_with(
+        "get_object",
+        Params={
+            "Bucket": "bucket",
+            "Key": "agents/agent-id/workspace/chart.bin",
+            "ResponseContentDisposition": 'inline; filename="chart.bin"',
+            "ResponseContentType": "image/png",
+        },
+        ExpiresIn=3600,
+    )

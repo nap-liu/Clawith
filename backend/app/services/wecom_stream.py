@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.im_markdown_media import project_agent_images_for_im
 
 
 def _disable_wecom_sdk_proxy() -> None:
@@ -334,9 +335,10 @@ class WeComStreamManager:
                             IMDeliveryResult,
                             register_delivery,
                         )
+                        delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
 
                         try:
-                            await client.reply_stream(frame, _stream_id, reply_text, finish=True)
+                            await client.reply_stream(frame, _stream_id, delivery_reply_text, finish=True)
                             delivery_result = IMDeliveryResult.unsupported_delivery(
                                 "wecom",
                                 "wecom_aibot_stream",

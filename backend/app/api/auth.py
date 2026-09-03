@@ -26,7 +26,7 @@ from app.api.auth_oauth import (
     router as oauth_router,
     unbind_identity,
 )
-from app.api.auth_profile import change_password, get_me, get_my_tenants, switch_tenant, update_me, router as profile_router
+from app.api.auth_profile import change_password, get_me, get_my_tenants, logout, switch_tenant, update_me, router as profile_router
 from app.api.auth_recovery import forgot_password, get_email_hint, reset_password, router as recovery_router
 from app.api.auth_registration import (
     _handle_normal_register,
@@ -87,7 +87,7 @@ _prepare_auth_module(
 _prepare_auth_module(
     _auth_profile,
     proxy_names=("create_access_token", "UserOut"),
-    endpoint_names=("get_me", "update_me", "get_my_tenants", "switch_tenant", "change_password"),
+    endpoint_names=("get_me", "update_me", "get_my_tenants", "switch_tenant", "change_password", "logout"),
 )
 _prepare_auth_module(
     _auth_oauth,

@@ -32,6 +32,7 @@ from app.services.channel_llm import _call_agent_llm
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.wecom_stream import wecom_stream_manager
+from app.services.im_markdown_media import project_agent_images_for_im
 from app.api.wecom_support import (
     _decrypt_msg,
     _encrypt_msg,
@@ -680,10 +681,11 @@ async def _process_wecom_text(
                 turn_anchor_id=ingested.message.id,
                 required=True,
             )
+            delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
 
             # 通过企微 API 发送回复
             try:
-                send_result = await _send_wecom_text(reply_text)
+                send_result = await _send_wecom_text(delivery_reply_text)
                 msgid = str(send_result.get("msgid") or "")
                 transport = "wecom_kf" if is_kf else "wecom_app"
                 delivery_result = IMDeliveryResult.sent(

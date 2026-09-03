@@ -1,4 +1,5 @@
 import base64
+import uuid
 
 import pytest
 
@@ -7,6 +8,7 @@ from app.services.agent_tools import (
     _json_path_get,
     _render_json_template,
 )
+from app.services import agent_tools_image_ops
 
 
 def test_render_json_template_replaces_placeholders_after_json_parse():
@@ -79,3 +81,26 @@ async def test_custom_image_reference_to_bytes_decodes_data_url():
     data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
 
     assert await _custom_image_reference_to_bytes(data_url, client=None) == raw
+
+
+@pytest.mark.asyncio
+async def test_generate_image_returns_agent_relative_markdown(tmp_path, monkeypatch):
+    async def config(*_args, **_kwargs):
+        return {"api_key": "configured", "model": "image-model"}
+
+    async def generate(*_args, **_kwargs):
+        return b"\x89PNG\r\n\x1a\nimage-bytes"
+
+    monkeypatch.setattr(agent_tools_image_ops, "_get_tool_config", config)
+    monkeypatch.setattr(agent_tools_image_ops, "_generate_image_openai", generate)
+
+    result = await agent_tools_image_ops._generate_image(
+        uuid.uuid4(),
+        tmp_path,
+        {"prompt": "draw a chart", "save_path": "workspace/images/chart.png"},
+        "openai",
+    )
+
+    assert "![generated image](workspace/images/chart.png)" in result
+    assert "/api/agents/" not in result
+    assert (tmp_path / "workspace/images/chart.png").read_bytes().startswith(b"\x89PNG")

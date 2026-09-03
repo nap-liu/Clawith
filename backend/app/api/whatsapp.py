@@ -19,6 +19,7 @@ from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
+from app.services.im_markdown_media import project_agent_images_for_im
 
 
 router = APIRouter(tags=["whatsapp"])
@@ -459,6 +460,7 @@ async def whatsapp_event_webhook(
                         turn_anchor_id=ingested.message.id,
                         required=True,
                     )
+                    delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
                     async def _record_whatsapp_part(response: dict) -> None:
                         wamid = str((((response.get("messages") or [{}])[0]).get("id")) or "")
                         part = IMDeliveryPart(
@@ -475,7 +477,7 @@ async def whatsapp_event_webhook(
                         responses = await _send_whatsapp_messages(
                             config,
                             _sender_phone,
-                            reply_text,
+                            delivery_reply_text,
                             on_result=_record_whatsapp_part,
                         )
                         config.is_connected = True

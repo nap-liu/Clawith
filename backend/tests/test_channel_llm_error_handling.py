@@ -531,6 +531,11 @@ async def test_broadcast_channel_user_message_emits_event(monkeypatch):
         captured.append((agent_id, session_id, payload))
 
     monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake_send_to_session)
+    monkeypatch.setattr(
+        channel_llm,
+        "_resolve_web_sender_profile",
+        AsyncMock(return_value=("Canonical User", "/api/users/u-7/avatar")),
+    )
 
     message = SimpleNamespace(
         id=uuid.uuid4(),
@@ -553,6 +558,7 @@ async def test_broadcast_channel_user_message_emits_event(monkeypatch):
     assert payload["display_content"] == "只看 report 的数据"
     assert [item["display_name"] for item in payload["attachments"]] == ["a.jpg"]
     assert payload["sender_name"] == "刘喜"
+    assert payload["sender_avatar_url"] == "/api/users/u-7/avatar"
     assert payload["user_id"] == "u-7"
 
 

@@ -509,19 +509,6 @@ body.h5-chat-active #root {
     max-width: 88%;
     min-width: 0;
     display: flex;
-    align-items: flex-end;
-    gap: 7px;
-}
-
-.h5-chat__message-avatar {
-    width: 28px;
-    height: 28px;
-    flex: 0 0 28px;
-    color: var(--text-secondary);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-subtle);
-    font-size: 11px;
-    font-weight: 650;
 }
 
 .h5-chat__message--assistant,

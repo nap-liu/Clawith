@@ -27,6 +27,7 @@ from app.services.im_delivery import (
     MentionIntent,
     ProviderResponseUncertainError,
 )
+from app.services.im_markdown_media import project_agent_images_for_im
 
 DeliveryPartObserver = Callable[[IMDeliveryPart], Awaitable[None]]
 HISTORY_ONLY_CHANNELS = frozenset({"agent", "trigger", "subagent", "project"})
@@ -289,6 +290,10 @@ async def deliver_message_with_receipt(
         return IMDeliveryResult.failed(channel, "native_mention_not_supported")
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
+    if channel in HISTORY_ONLY_CHANNELS:
+        return await _deliver_web(agent_id, runtime, message)
+    if content_format == "markdown":
+        message = await project_agent_images_for_im(agent_id, message)
     if channel == "dingtalk":
         if content_format not in {"markdown", "plain_text"}:
             return IMDeliveryResult.failed(channel, "unsupported_content_format")
@@ -337,12 +342,6 @@ async def deliver_message_with_receipt(
         delivered = await _deliver_wechat(agent_id, runtime, message, on_part=on_part)
     elif channel == "discord":
         delivered = await _deliver_discord(agent_id, runtime, message)
-    elif channel in HISTORY_ONLY_CHANNELS:
-        # Durable child Sessions have no external transport adapter. Their DB
-        # history is the authoritative delivery surface (and the normal parent
-        # event dispatcher consumes terminal child rows). Treat the persisted
-        # reply exactly like Web/Agent history instead of retrying forever.
-        return await _deliver_web(agent_id, runtime, message)
 
     if delivered is not None:
         return delivered

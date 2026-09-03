@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy import select
@@ -23,8 +23,10 @@ from app.services.authentication_state import require_active_authentication_prin
 
 settings = get_settings()
 
-# Bearer token scheme
-security = HTTPBearer()
+# Bearer token scheme. Browser media requests cannot attach this header, so
+# authentication dependencies also accept the same JWT from the login cookie.
+security = HTTPBearer(auto_error=False)
+ACCESS_TOKEN_COOKIE_NAME = "access_token"
 
 # Thread pool for CPU-intensive bcrypt operations (avoids blocking the event loop)
 _bcrypt_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bcrypt")
@@ -151,14 +153,69 @@ def decode_access_token(token: str) -> dict:
         )
 
 
+def request_access_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+    *,
+    query_token: str | None = None,
+) -> str | None:
+    """Resolve one login JWT without allowing a fallback to override Bearer."""
+    if credentials:
+        return credentials.credentials
+    cookie_token = request.cookies.get(ACCESS_TOKEN_COOKIE_NAME)
+    return cookie_token or query_token or None
+
+
+def _request_is_secure(request: Request | None) -> bool:
+    if request is None:
+        return False
+    forwarded_scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return forwarded_scheme.split(",", 1)[0].strip() == "https"
+
+
+def set_access_token_cookie(
+    response: Response | None,
+    request: Request | None,
+    token: str | None,
+) -> None:
+    """Mirror an issued login JWT into the browser's HttpOnly cookie jar."""
+    if response is None or not token:
+        return
+    response.set_cookie(
+        ACCESS_TOKEN_COOKIE_NAME,
+        token,
+        max_age=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        httponly=True,
+        secure=_request_is_secure(request),
+        samesite="lax",
+        path="/",
+    )
+
+
+def clear_access_token_cookie(response: Response, request: Request | None = None) -> None:
+    """Remove the mirrored login JWT using the same cookie scope."""
+    response.delete_cookie(
+        ACCESS_TOKEN_COOKIE_NAME,
+        httponly=True,
+        secure=_request_is_secure(request),
+        samesite="lax",
+        path="/",
+    )
+
+
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    response: Response,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncSession = Depends(get_db),
 ):
     """Dependency to get the current authenticated and active user."""
     from app.models.user import User
 
-    payload = decode_access_token(credentials.credentials)
+    token = request_access_token(request, credentials)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    payload = decode_access_token(token)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
@@ -168,22 +225,29 @@ async def get_current_user(
         .where(User.id == uuid.UUID(user_id))
         .options(selectinload(User.identity))
     )
-    user = result.scalar_one_or_none()
-    return await require_active_authentication_principal(
+    user = await require_active_authentication_principal(
         db,
-        user,
+        result.scalar_one_or_none(),
         status_code=status.HTTP_401_UNAUTHORIZED,
     )
+    if credentials and request.cookies.get(ACCESS_TOKEN_COOKIE_NAME) != token:
+        set_access_token_cookie(response, request, token)
+    return user
 
 
 async def get_authenticated_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    response: Response,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncSession = Depends(get_db),
 ):
     """Dependency to get the current authenticated user (even if not active yet)."""
     from app.models.user import User
 
-    payload = decode_access_token(credentials.credentials)
+    token = request_access_token(request, credentials)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    payload = decode_access_token(token)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
@@ -196,6 +260,8 @@ async def get_authenticated_user(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    if credentials and request.cookies.get(ACCESS_TOKEN_COOKIE_NAME) != token:
+        set_access_token_cookie(response, request, token)
     return user
 
 

@@ -6,7 +6,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import BackgroundTasks, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -88,9 +88,10 @@ async def test_existing_token_rejects_each_inactive_principal_layer(disabled_lay
     )
     token = create_access_token(str(user_id), "member")
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    request = Request({"type": "http", "scheme": "http", "path": "/", "headers": []})
     async with async_session() as db:
         with pytest.raises(HTTPException) as exc_info:
-            await get_current_user(credentials, db)
+            await get_current_user(request, Response(), credentials, db)
     assert exc_info.value.status_code == 401
 
 

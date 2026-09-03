@@ -27,6 +27,7 @@ from app.services.channel_dispatch import (
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
+from app.services.im_markdown_media import project_agent_images_for_im
 
 
 WECHAT_ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -412,6 +413,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 turn_anchor_id=ingested.message.id,
                 required=True,
             )
+            delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
             async def _record_wechat_part(response: dict) -> None:
                 part = IMDeliveryPart(
                     transport="wechat_ilink",
@@ -429,7 +431,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                     base_url=base_url,
                     to_user_id=from_user_id,
                     context_token=context_token,
-                    text=reply_text,
+                    text=delivery_reply_text,
                     route_tag=route_tag,
                     on_result=_record_wechat_part,
                 )

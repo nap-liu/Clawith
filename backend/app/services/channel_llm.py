@@ -68,6 +68,28 @@ async def _broadcast_to_web_session(agent_id, session_id, payload: dict) -> None
         pass
 
 
+async def _resolve_web_sender_profile(agent_id, user_id) -> tuple[str | None, str | None]:
+    """Resolve the canonical sender profile within the Agent's tenant."""
+    try:
+        resolved_agent_id = uuid.UUID(str(agent_id))
+        resolved_user_id = uuid.UUID(str(user_id))
+    except (TypeError, ValueError):
+        return None, None
+
+    from app.models.agent import Agent
+    from app.models.user import User
+
+    async with async_session() as db:
+        row = (
+            await db.execute(
+                select(User.display_name, User.avatar_url)
+                .join(Agent, Agent.tenant_id == User.tenant_id)
+                .where(Agent.id == resolved_agent_id, User.id == resolved_user_id)
+            )
+        ).one_or_none()
+    return (row[0], row[1]) if row else (None, None)
+
+
 async def broadcast_channel_user_message(
     agent_id,
     session_id,
@@ -84,10 +106,12 @@ async def broadcast_channel_user_message(
     history so the live bubble matches what a reload would render."""
     from app.services.chat_message_serializer import serialize_chat_message_for_client
 
+    resolved_name, sender_avatar_url = await _resolve_web_sender_profile(agent_id, user_id)
     payload = serialize_chat_message_for_client(
         message,
-        sender_name=sender_name,
+        sender_name=sender_name or resolved_name,
         sender_user_id=user_id,
+        sender_avatar_url=sender_avatar_url,
     )
     payload["type"] = "channel_user_message"
     # One-release compatibility for older Web clients.

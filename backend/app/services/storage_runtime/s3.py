@@ -372,12 +372,20 @@ class S3StorageBackend(StorageBackend):
         data = await self.read_bytes(key)
         await asyncio.to_thread(path.write_bytes, data)
 
-    async def presign_download_url(self, key: str, filename: str | None = None, inline: bool = False) -> str | None:
+    async def presign_download_url(
+        self,
+        key: str,
+        filename: str | None = None,
+        inline: bool = False,
+        content_type: str | None = None,
+    ) -> str | None:
         client = self._client_or_raise()
         params: dict[str, Any] = {"Bucket": self.bucket, "Key": self._object_key(key)}
         if filename:
             disposition = "inline" if inline else "attachment"
             params["ResponseContentDisposition"] = f'{disposition}; filename="{filename}"'
+        if content_type:
+            params["ResponseContentType"] = content_type
         url = await asyncio.to_thread(
             client.generate_presigned_url,
             "get_object",

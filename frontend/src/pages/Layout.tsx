@@ -385,7 +385,7 @@ export default function Layout() {
     await fetch("/api/pages/session", { method: "DELETE" }).catch(
       () => undefined,
     );
-    logout();
+    await logout();
     navigate("/login");
   };
 

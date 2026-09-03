@@ -20,6 +20,7 @@ from app.services.im_delivery import (
     IMDeliveryResult,
     register_delivery,
 )
+from app.services.im_markdown_media import project_agent_images_for_im
 from app.services.recipient_resolver import (
     RecipientResolutionError,
     resolve_human_channel_recipient,
@@ -94,13 +95,14 @@ async def _send_feishu_message(
             await db.commit()
             if not should_deliver:
                 return _duplicate_outbound_claim_result(receipt)
+            delivery_text = await project_agent_images_for_im(agent_id, message_text)
             try:
                 resp = await feishu_service.send_message(
                     config.app_id,
                     config.app_secret,
                     receive_id=receive_id,
                     msg_type="text",
-                    content=json.dumps({"text": message_text}, ensure_ascii=False),
+                    content=json.dumps({"text": delivery_text}, ensure_ascii=False),
                     receive_id_type=receive_id_type,
                 )
             except FeishuAPIError as exc:
@@ -218,13 +220,14 @@ async def _send_dingtalk_message(
             await db.commit()
             if not should_deliver:
                 return _duplicate_outbound_claim_result(receipt)
+            delivery_text = await project_agent_images_for_im(agent_id, message_text)
 
             # 3. Send message via DingTalk service
             result = await send_dingtalk_message(
                 app_id=config.app_id,
                 app_secret=config.app_secret,
                 user_id=user_id,
-                message=message_text,
+                message=delivery_text,
                 agent_id=agent_id_dingtalk,
             )
 
@@ -330,13 +333,14 @@ async def _send_wecom_message(
             await db.commit()
             if not should_deliver:
                 return _duplicate_outbound_claim_result(receipt)
+            delivery_text = await project_agent_images_for_im(agent_id, message_text)
 
             # 3. Send message via WeCom service
             result = await send_wecom_message(
                 config.app_id,
                 config.app_secret,
                 user_id,
-                message_text,
+                delivery_text,
                 agent_id=str((config.extra_config or {}).get("wecom_agent_id") or "") or None,
             )
 
@@ -456,6 +460,7 @@ async def _send_slack_message(
             await db.commit()
             if not should_deliver:
                 return _duplicate_outbound_claim_result(receipt)
+            delivery_text = await project_agent_images_for_im(agent_id, message_text)
 
             async def _record_slack_part(response: dict) -> None:
                 part = IMDeliveryPart(
@@ -471,7 +476,7 @@ async def _send_slack_message(
                 slack_responses = await _send_slack_messages(
                     bot_token,
                     channel_id,
-                    message_text,
+                    delivery_text,
                     on_result=_record_slack_part,
                 )
             except Exception as exc:

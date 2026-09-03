@@ -185,7 +185,13 @@ class StorageBackend:
     async def local_path_for(self, key: str) -> Path | None:
         return None
 
-    async def presign_download_url(self, key: str, filename: str | None = None, inline: bool = False) -> str | None:
+    async def presign_download_url(
+        self,
+        key: str,
+        filename: str | None = None,
+        inline: bool = False,
+        content_type: str | None = None,
+    ) -> str | None:
         return None
 
 

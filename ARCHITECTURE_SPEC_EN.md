@@ -96,6 +96,31 @@ The pending anchor commits before provider I/O. Commands, acknowledgements, welc
 
 Provider operations such as recall act through transport adapters over receipt parts. Unsupported capability is explicit data, not a silent success. Provider-native P2P/group mechanics can differ while sharing the same lifecycle contract.
 
+## Inline workspace images
+
+An Agent expresses an inline workspace image with ordinary Markdown and an
+Agent-directory-relative path, for example
+`![chart](workspace/reports/chart.png)`. The durable `ChatMessage` keeps that
+relative reference; platform hosts, login credentials, and expiring storage
+signatures are transport projections and must never be persisted into message
+content.
+
+Web and H5 render the relative reference through the existing Agent file
+download route. Browser image requests use the same login JWT carried in an
+HttpOnly cookie; the Authorization header and cookie are two transports for
+the same credential, not separate authorization systems. The download route
+continues to enforce the current user, Agent access, safe workspace resolution,
+and inline file response policy.
+
+IM delivery rewrites relative image references only in the outbound provider
+payload. It validates the referenced workspace image and uses the configured
+storage backend's existing `presign_download_url` policy to produce an absolute
+temporary URL with an inline response and correct image content type. That URL
+is neither uploaded to the provider nor written back to the message. External
+HTTP(S) image references pass through unchanged. Markdown parsing, workspace
+validation, and projection are shared capabilities; channel adapters must not
+implement independent copies.
+
 ## Environment and validation
 
 The supported local integration entry point is the Docker stack exposed through the frontend proxy on port 3008. Backend validation uses containers with the repository mounted at `/app` and an isolated PostgreSQL test database. Host Python/venv validation is unsupported.
