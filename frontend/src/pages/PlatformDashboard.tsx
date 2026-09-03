@@ -220,7 +220,7 @@ export default function PlatformDashboard() {
             </div>
             <div style={{ height: '240px', width: '100%' }}>
                 {loadingStats ? (
-                    <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>Loading...</div>
+                    <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>{t('platformDashboard.loading')}</div>
                 ) : (
                     <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={timeSeriesData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
@@ -228,8 +228,8 @@ export default function PlatformDashboard() {
                             <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickLine={false} axisLine={false} tickFormatter={(val) => val.substring(5)} />
                             <YAxis yAxisId="left" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickLine={false} axisLine={false} tickFormatter={formatTokens} />
                             <Tooltip content={<CustomTooltip />} />
-                            <Line yAxisId="left" type="monotone" dataKey={dataKeyTotal} name="Cumulative" stroke={color} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                            <Line yAxisId="left" type="monotone" dataKey={dataKeyNew} name="New" stroke={color} opacity={0.3} strokeWidth={2} dot={false} strokeDasharray="4 4" />
+                            <Line yAxisId="left" type="monotone" dataKey={dataKeyTotal} name={t('platformDashboard.charts.legend.cumulative')} stroke={color} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                            <Line yAxisId="left" type="monotone" dataKey={dataKeyNew} name={t('platformDashboard.charts.legend.new')} stroke={color} opacity={0.3} strokeWidth={2} dot={false} strokeDasharray="4 4" />
                         </LineChart>
                     </ResponsiveContainer>
                 )}
@@ -250,7 +250,7 @@ export default function PlatformDashboard() {
             </div>
             <div style={{ height: '240px', width: '100%' }}>
                 {loadingStats ? (
-                    <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>Loading...</div>
+                    <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>{t('platformDashboard.loading')}</div>
                 ) : (
                     <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={timeSeriesData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
@@ -277,14 +277,14 @@ export default function PlatformDashboard() {
         return (
             <div className="card" style={{ flex: 1, minWidth: '300px', padding: '20px' }}>
                 <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '20px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center' }}>
-                    Channel Distribution
-                    <InfoTooltip text="Distribution of chat sessions by source channel in the last 30 days" />
+                    {t('platformDashboard.charts.channelDistribution.title')}
+                    <InfoTooltip text={t('platformDashboard.charts.channelDistribution.tooltip')} />
                 </div>
                 <div style={{ height: '280px', width: '100%' }}>
                     {loadingEnhanced ? (
-                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>Loading...</div>
+                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>{t('platformDashboard.loading')}</div>
                     ) : data.length === 0 ? (
-                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>No data</div>
+                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>{t('platformDashboard.noData')}</div>
                     ) : (
                         <ResponsiveContainer width="100%" height="100%">
                             <PieChart>
@@ -320,14 +320,14 @@ export default function PlatformDashboard() {
         return (
             <div className="card" style={{ flex: 1, minWidth: '300px', padding: '20px' }}>
                 <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '20px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center' }}>
-                    Top 10 Tool Categories
-                    <InfoTooltip text="Most popular tool categories across all active agent configurations" />
+                    {t('platformDashboard.charts.toolCategories.title')}
+                    <InfoTooltip text={t('platformDashboard.charts.toolCategories.tooltip')} />
                 </div>
                 <div style={{ height: '280px', width: '100%' }}>
                     {loadingEnhanced ? (
-                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>Loading...</div>
+                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>{t('platformDashboard.loading')}</div>
                     ) : data.length === 0 ? (
-                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>No data</div>
+                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>{t('platformDashboard.noData')}</div>
                     ) : (
                         <ResponsiveContainer width="100%" height="100%">
                             <BarChart data={data} layout="vertical" margin={{ top: 5, right: 20, left: 60, bottom: 5 }}>
@@ -335,7 +335,7 @@ export default function PlatformDashboard() {
                                 <XAxis type="number" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickLine={false} axisLine={false} />
                                 <YAxis dataKey="category" type="category" tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} tickLine={false} axisLine={false} width={55} />
                                 <Tooltip content={<CustomTooltip />} />
-                                <Bar dataKey="count" name="Enabled" fill="#3b82f6" radius={[0, 4, 4, 0]} barSize={18} />
+                                <Bar dataKey="count" name={t('platformDashboard.charts.legend.enabled')} fill="#3b82f6" radius={[0, 4, 4, 0]} barSize={18} />
                             </BarChart>
                         </ResponsiveContainer>
                     )}
@@ -359,21 +359,21 @@ export default function PlatformDashboard() {
                     display: 'flex',
                     alignItems: 'center',
                 }}>
-                    Churn Warning
-                    <InfoTooltip text="Companies that consumed >10M tokens but have had no activity in the past 14 days" />
+                    {t('platformDashboard.churn.title')}
+                    <InfoTooltip text={t('platformDashboard.churn.tooltip')} />
                 </div>
                 {loadingEnhanced ? (
-                    <div style={{ padding: '40px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>Loading...</div>
+                    <div style={{ padding: '40px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('platformDashboard.loading')}</div>
                 ) : data.length === 0 ? (
-                    <div style={{ padding: '40px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>No churn warnings — all active companies are healthy</div>
+                    <div style={{ padding: '40px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('platformDashboard.churn.noWarnings')}</div>
                 ) : (
                     <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
                         <thead>
                             <tr style={{ borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-tertiary)', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                                <th style={{ padding: '12px 20px', textAlign: 'left', fontWeight: 600 }}>Company</th>
-                                <th style={{ padding: '12px 20px', textAlign: 'right', fontWeight: 600 }}>Total Tokens</th>
-                                <th style={{ padding: '12px 20px', textAlign: 'right', fontWeight: 600 }}>Last Active</th>
-                                <th style={{ padding: '12px 20px', textAlign: 'right', fontWeight: 600 }}>Days Inactive</th>
+                                <th style={{ padding: '12px 20px', textAlign: 'left', fontWeight: 600 }}>{t('platformDashboard.churn.company')}</th>
+                                <th style={{ padding: '12px 20px', textAlign: 'right', fontWeight: 600 }}>{t('platformDashboard.churn.totalTokens')}</th>
+                                <th style={{ padding: '12px 20px', textAlign: 'right', fontWeight: 600 }}>{t('platformDashboard.churn.lastActive')}</th>
+                                <th style={{ padding: '12px 20px', textAlign: 'right', fontWeight: 600 }}>{t('platformDashboard.churn.daysInactive')}</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -384,7 +384,7 @@ export default function PlatformDashboard() {
                                         {formatTokens(row.total_tokens)}
                                     </td>
                                     <td style={{ padding: '12px 20px', textAlign: 'right', color: 'var(--text-tertiary)', fontSize: '12px' }}>
-                                        {row.last_active ? new Date(row.last_active).toLocaleDateString() : 'Never'}
+                                        {row.last_active ? new Date(row.last_active).toLocaleDateString() : t('platformDashboard.churn.never')}
                                     </td>
                                     <td style={{ padding: '12px 20px', textAlign: 'right' }}>
                                         <span style={{
@@ -395,7 +395,9 @@ export default function PlatformDashboard() {
                                             fontSize: '12px',
                                             fontWeight: 600,
                                         }}>
-                                            {row.days_inactive ?? '—'}d
+                                            {row.days_inactive == null
+                                                ? '—'
+                                                : t('platformDashboard.churn.dayCount', { count: row.days_inactive })}
                                         </span>
                                     </td>
                                 </tr>
@@ -427,11 +429,11 @@ export default function PlatformDashboard() {
                 <InfoTooltip text={tooltip} />
             </div>
             {loadingLeaders ? (
-                <div style={{ padding: '40px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>Loading...</div>
+                <div style={{ padding: '40px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('platformDashboard.loading')}</div>
             ) : (
                 <div>
                     {items.map((item, i) => renderItem(item, i))}
-                    {items.length === 0 && <div style={{ padding: '20px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>No data</div>}
+                    {items.length === 0 && <div style={{ padding: '20px', textAlign: 'center', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('platformDashboard.noData')}</div>}
                 </div>
             )}
         </div>
@@ -456,7 +458,9 @@ export default function PlatformDashboard() {
                                 border: 'none', cursor: 'pointer', transition: 'all 0.2s'
                             }}
                         >
-                            Last {d} Days
+                            {d === 7
+                                ? t('platformDashboard.timeRange.last7Days')
+                                : t('platformDashboard.timeRange.last30Days')}
                         </button>
                     ))}
                 </div>
@@ -465,40 +469,45 @@ export default function PlatformDashboard() {
             {/* Summary Cards */}
             <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
                 <MetricCard
-                    label="Avg Tokens / Session"
+                    label={t('platformDashboard.metrics.avgTokensPerSession.label')}
                     value={enhanced ? formatTokens(enhanced.avg_tokens_per_session_30d) : '-'}
-                    tooltip="Average token consumption per chat session in the last 30 days. Calculated as total tokens / total sessions."
+                    tooltip={t('platformDashboard.metrics.avgTokensPerSession.tooltip')}
                 />
                 <MetricCard
-                    label="7-Day Retention"
+                    label={t('platformDashboard.metrics.retention7Day.label')}
                     value={enhanced ? `${enhanced.retention_rate_7d}%` : '-'}
-                    tooltip={`Percentage of established companies (>14 days old) that were active last week and remain active this week. ${enhanced ? `${enhanced.retained_companies} of ${enhanced.last_week_active_companies} companies retained.` : ''}`}
+                    tooltip={enhanced
+                        ? t('platformDashboard.metrics.retention7Day.tooltipWithCount', {
+                            retained: enhanced.retained_companies,
+                            total: enhanced.last_week_active_companies,
+                        })
+                        : t('platformDashboard.metrics.retention7Day.tooltip')}
                 />
             </div>
 
             {/* Existing Trend Charts */}
             <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
-                <ChartCard title="Companies" tooltip="Cumulative and daily new company registrations" dataKeyTotal="total_companies" dataKeyNew="new_companies" color="#3b82f6" />
-                <ChartCard title="Users" tooltip="Cumulative and daily new user registrations" dataKeyTotal="total_users" dataKeyNew="new_users" color="#10b981" />
-                <ChartCard title="Token Usage" tooltip="Cumulative and daily token consumption across all agents" dataKeyTotal="total_tokens" dataKeyNew="new_tokens" color="#8b5cf6" />
+                <ChartCard title={t('platformDashboard.charts.companies.title')} tooltip={t('platformDashboard.charts.companies.tooltip')} dataKeyTotal="total_companies" dataKeyNew="new_companies" color="#3b82f6" />
+                <ChartCard title={t('platformDashboard.charts.users.title')} tooltip={t('platformDashboard.charts.users.tooltip')} dataKeyTotal="total_users" dataKeyNew="new_users" color="#10b981" />
+                <ChartCard title={t('platformDashboard.charts.tokenUsage.title')} tooltip={t('platformDashboard.charts.tokenUsage.tooltip')} dataKeyTotal="total_tokens" dataKeyNew="new_tokens" color="#8b5cf6" />
             </div>
 
             {/* New Trend Charts: Sessions + Active Users */}
             <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
                 <ChartCard
-                    title="Daily Sessions"
-                    tooltip="Number of new chat sessions created per day and cumulative total"
+                    title={t('platformDashboard.charts.dailySessions.title')}
+                    tooltip={t('platformDashboard.charts.dailySessions.tooltip')}
                     dataKeyTotal="total_sessions"
                     dataKeyNew="new_sessions"
                     color="#f59e0b"
                 />
                 <MultiLineChart
-                    title="Active Users"
-                    tooltip="DAU: distinct users who sent at least 1 message that day. WAU: distinct users active in a rolling 7-day window. MAU: distinct users active in a rolling 30-day window."
+                    title={t('platformDashboard.charts.activeUsers.title')}
+                    tooltip={t('platformDashboard.charts.activeUsers.tooltip')}
                     lines={[
-                        { key: 'dau', name: 'DAU', color: '#10b981' },
-                        { key: 'wau', name: 'WAU', color: '#3b82f6' },
-                        { key: 'mau', name: 'MAU', color: '#8b5cf6' },
+                        { key: 'dau', name: t('platformDashboard.charts.legend.dau'), color: '#10b981' },
+                        { key: 'wau', name: t('platformDashboard.charts.legend.wau'), color: '#3b82f6' },
+                        { key: 'mau', name: t('platformDashboard.charts.legend.mau'), color: '#8b5cf6' },
                     ]}
                 />
             </div>
@@ -512,8 +521,8 @@ export default function PlatformDashboard() {
             {/* Leaderboards */}
             <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
                 <LeaderboardCard
-                    title="Top 20 Companies by Tokens"
-                    tooltip="Companies ranked by total cumulative token consumption across all their agents"
+                    title={t('platformDashboard.leaderboards.topCompanies.title')}
+                    tooltip={t('platformDashboard.leaderboards.topCompanies.tooltip')}
                     items={topCompanies}
                     renderItem={(c, i) => (
                         <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 20px', borderBottom: '1px solid var(--border-subtle)', fontSize: '13px' }}>
@@ -524,15 +533,18 @@ export default function PlatformDashboard() {
                             <div style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-secondary)' }}>
                                 <div>{formatTokens(c.tokens)}</div>
                                 <div style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
-                                    Cache {formatTokens(c.cache_read_tokens || 0)} · {Math.round((c.cache_hit_rate || 0) * 100)}%
+                                    {t('platformDashboard.cacheUsage', {
+                                        tokens: formatTokens(c.cache_read_tokens || 0),
+                                        rate: Math.round((c.cache_hit_rate || 0) * 100),
+                                    })}
                                 </div>
                             </div>
                         </div>
                     )}
                 />
                 <LeaderboardCard
-                    title="Top 20 Agents by Tokens"
-                    tooltip="Individual agents ranked by total cumulative token consumption"
+                    title={t('platformDashboard.leaderboards.topAgents.title')}
+                    tooltip={t('platformDashboard.leaderboards.topAgents.tooltip')}
                     items={topAgents}
                     renderItem={(a, i) => (
                         <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 20px', borderBottom: '1px solid var(--border-subtle)', fontSize: '13px' }}>
@@ -546,7 +558,10 @@ export default function PlatformDashboard() {
                             <div style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-secondary)' }}>
                                 <div>{formatTokens(a.tokens)}</div>
                                 <div style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
-                                    Cache {formatTokens(a.cache_read_tokens || 0)} · {Math.round((a.cache_hit_rate || 0) * 100)}%
+                                    {t('platformDashboard.cacheUsage', {
+                                        tokens: formatTokens(a.cache_read_tokens || 0),
+                                        rate: Math.round((a.cache_hit_rate || 0) * 100),
+                                    })}
                                 </div>
                             </div>
                         </div>

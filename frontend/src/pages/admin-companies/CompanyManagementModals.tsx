@@ -367,7 +367,9 @@ export default function CompanyManagementModals(props: any) {
               }}
             >
               <h2 style={{ fontSize: "16px", fontWeight: 600 }}>
-                邀请码 — {codesModal.companyName}
+                {t("admin.invitationCodesForCompany", "Invitation codes — {{name}}", {
+                  name: codesModal.companyName,
+                })}
               </h2>
               <button
                 onClick={() => {
@@ -380,6 +382,7 @@ export default function CompanyManagementModals(props: any) {
                   cursor: "pointer",
                   color: "var(--text-tertiary)",
                 }}
+                aria-label={t("common.close", "Close")}
               >
                 <svg
                   width="20"
@@ -415,7 +418,7 @@ export default function CompanyManagementModals(props: any) {
                     marginBottom: "6px",
                   }}
                 >
-                  新生成的邀请码
+                  {t("admin.newInvitationCode", "New invitation code")}
                 </div>
                 <div
                   style={{ display: "flex", alignItems: "center", gap: "8px" }}
@@ -448,7 +451,9 @@ export default function CompanyManagementModals(props: any) {
                         });
                     }}
                   >
-                    {codeCopied2 ? "已复制" : "复制"}
+                    {codeCopied2
+                      ? t("admin.copied", "Copied")
+                      : t("admin.copyCode", "Copy code")}
                   </button>
                 </div>
               </div>
@@ -463,7 +468,7 @@ export default function CompanyManagementModals(props: any) {
                   marginBottom: "8px",
                 }}
               >
-                有效邀请码
+                {t("admin.validInvitationCodes", "Valid invitation codes")}
               </div>
               {loadingCodes ? (
                 <div
@@ -473,7 +478,7 @@ export default function CompanyManagementModals(props: any) {
                     padding: "12px 0",
                   }}
                 >
-                  加载中...
+                  {t("common.loading", "Loading...")}
                 </div>
               ) : companyCodes.length === 0 ? (
                 <div
@@ -483,7 +488,7 @@ export default function CompanyManagementModals(props: any) {
                     padding: "12px 0",
                   }}
                 >
-                  暂无有效邀请码
+                  {t("admin.noValidInvitationCodes", "No valid invitation codes")}
                 </div>
               ) : (
                 <div
@@ -524,8 +529,10 @@ export default function CompanyManagementModals(props: any) {
                           fontSize: "11px",
                         }}
                       >
-                        {c.used_count}/{c.max_uses === 0 ? "∞" : c.max_uses}{" "}
-                        次使用
+                        {t("admin.invitationCodeUsage", "{{used}}/{{max}} uses", {
+                          used: c.used_count,
+                          max: c.max_uses === 0 ? "∞" : c.max_uses,
+                        })}
                       </span>
                     </div>
                   ))}
@@ -539,7 +546,7 @@ export default function CompanyManagementModals(props: any) {
                 onClick={handleGenerateCode}
                 style={{ flex: 1 }}
               >
-                生成新邀请码
+                {t("admin.generateInvitationCode", "Generate invitation code")}
               </button>
               <button
                 className="btn btn-secondary"
@@ -549,7 +556,7 @@ export default function CompanyManagementModals(props: any) {
                 }}
                 style={{ padding: "0 20px" }}
               >
-                关闭
+                {t("common.close", "Close")}
               </button>
             </div>
           </div>

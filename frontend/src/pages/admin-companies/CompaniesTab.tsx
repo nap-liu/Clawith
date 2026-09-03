@@ -150,7 +150,7 @@ export default function CompaniesTab() {
       setShowCreate(false);
       loadCompanies();
     } catch (e: any) {
-      showToast(e.message || "Failed", "error");
+      showToast(e.message || t("admin.createCompanyFailed", "Failed to create company"), "error");
     }
     setCreating(false);
   };
@@ -178,12 +178,11 @@ export default function CompaniesTab() {
       const listRes = await adminApi.listCompanyCodes(codesModal.companyId);
       setCompanyCodes(listRes.codes || []);
     } catch (e: any) {
-      showToast(e.message || "Failed", "error");
+      showToast(e.message || t("admin.invitationCodeCreateFailed", "Failed to create invitation code"), "error");
     }
   };
 
   const handleToggle = async (id: string, currentlyActive: boolean) => {
-    const action = currentlyActive ? "disable" : "enable";
     if (currentlyActive) {
       const ok = await dialog.confirm(
         t("common.dialog.disableCompanyConfirm"),
@@ -198,9 +197,13 @@ export default function CompaniesTab() {
     try {
       await adminApi.toggleCompany(id);
       loadCompanies();
-      showToast(`Company ${action}d`);
+      showToast(
+        currentlyActive
+          ? t("admin.companyDisabledSuccess", "Company disabled")
+          : t("admin.companyEnabledSuccess", "Company enabled"),
+      );
     } catch (e: any) {
-      showToast(e.message || "Failed", "error");
+      showToast(e.message || t("admin.companyStatusUpdateFailed", "Failed to update company status"), "error");
     }
   };
 
@@ -209,9 +212,9 @@ export default function CompaniesTab() {
     try {
       await adminApi.deleteCompany(company.id);
       loadCompanies();
-      showToast(`Company "${company.name}" deleted`);
+      showToast(t("admin.companyDeletedSuccess", "Company “{{name}}” deleted", { name: company.name }));
     } catch (e: any) {
-      showToast(e.message || "Failed to delete", "error");
+      showToast(e.message || t("admin.deleteCompanyFailed", "Failed to delete company"), "error");
     }
     setDeletingCompanyId(null);
     setDeleteConfirmCompany(null);
@@ -239,7 +242,7 @@ export default function CompaniesTab() {
 
   const columns: { key: SortKey; label: string; flex: string }[] = [
     { key: "name", label: t("admin.company", "Company"), flex: "2fr" },
-    { key: "sso_enabled", label: "SSO", flex: "100px" },
+    { key: "sso_enabled", label: t("admin.sso", "SSO"), flex: "100px" },
     {
       key: "org_admin_email",
       label: t("admin.orgAdmin", "Admin Email"),

@@ -5,6 +5,7 @@ import { IconAlertTriangle } from "@tabler/icons-react";
 import ChatAttachmentIcon from "../../../../components/ChatAttachmentIcon";
 import ChatMediaCard from "../../../../components/ChatMediaCard";
 import MarkdownRenderer from "../../../../components/MarkdownRenderer";
+import Avatar from "../../../../components/ui/Avatar";
 import { copyToClipboard } from "../../../../utils/clipboard";
 import {
   buildPreviewImage,
@@ -152,12 +153,12 @@ export function MessageItem({
     });
   return (
     <div className={`chat-msg-row${view.isLeft ? "" : " chat-msg-row--user"}`}>
-      <div
+      <Avatar
         className={`chat-msg-avatar${view.isLeft ? "" : " chat-msg-avatar--user"}`}
+        src={view.avatarUrl || msg.sender_avatar_url}
+        name={avatar}
         style={view.hideAvatar ? { visibility: "hidden" } : undefined}
-      >
-        {avatar}
-      </div>
+      />
       <div className="chat-msg-col">
         <div className="chat-msg-content-line">
           <div

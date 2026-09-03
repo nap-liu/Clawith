@@ -35,6 +35,22 @@ export default function PlatformGeneralSettings(props: any) {
         <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
           {[
             {
+              key: "password_login_enabled",
+              label: t("admin.passwordLoginEnabled", "Enable password login"),
+              desc: t(
+                "admin.passwordLoginEnabledDesc",
+                "When disabled, password login is rejected by the API and hidden from the login page; enabled SSO remains available.",
+              ),
+            },
+            {
+              key: "account_registration_enabled",
+              label: t("admin.accountRegistrationEnabled", "Enable account registration"),
+              desc: t(
+                "admin.accountRegistrationEnabledDesc",
+                "When disabled, self-service account registration is rejected by the API and hidden from the login page.",
+              ),
+            },
+            {
               key: "allow_self_create_company",
               label: t(
                 "admin.allowSelfCreate",
@@ -86,6 +102,7 @@ export default function PlatformGeneralSettings(props: any) {
                   checked={!!settings[s.key]}
                   onChange={(e) => handleToggleSetting(s.key, e.target.checked)}
                   disabled={settingsLoading}
+                  aria-label={s.label}
                   style={{ opacity: 0, width: 0, height: 0 }}
                 />
                 <span style={switchTrack(!!settings[s.key])}>
@@ -106,7 +123,7 @@ export default function PlatformGeneralSettings(props: any) {
             color: "var(--text-secondary)",
           }}
         >
-          OAuth Login
+          {t("admin.oauth.title", "OAuth login")}
         </div>
         <p
           style={{
@@ -115,8 +132,10 @@ export default function PlatformGeneralSettings(props: any) {
             marginBottom: "16px",
           }}
         >
-          Configure platform-wide social login providers. Once enabled, users
-          can sign in from the main login page with Google or GitHub.
+          {t(
+            "admin.oauth.description",
+            "Configure platform-wide social login providers. Enabled providers appear on the login page.",
+          )}
         </p>
         <div
           style={{
@@ -158,7 +177,9 @@ export default function PlatformGeneralSettings(props: any) {
                         marginTop: "4px",
                       }}
                     >
-                      Scope: {provider?.scope || meta.scope}
+                      {t("admin.oauth.scopeSummary", "Scope: {{scope}}", {
+                        scope: provider?.scope || meta.scope,
+                      })}
                     </div>
                   </div>
                   <label
@@ -178,6 +199,11 @@ export default function PlatformGeneralSettings(props: any) {
                         )
                       }
                       disabled={!!oauthSaving[providerType]}
+                      aria-label={t(
+                        "admin.oauth.toggleProvider",
+                        "Enable {{provider}} login",
+                        { provider: meta.name },
+                      )}
                       style={{ opacity: 0, width: 0, height: 0 }}
                     />
                     <span style={switchTrack(!!provider?.is_active)}>
@@ -192,7 +218,7 @@ export default function PlatformGeneralSettings(props: any) {
                       className="form-label"
                       style={{ fontSize: "12px", marginBottom: "6px" }}
                     >
-                      Client ID
+                      {t("admin.oauth.clientId", "Client ID")}
                     </label>
                     <input
                       className="form-input"
@@ -203,7 +229,10 @@ export default function PlatformGeneralSettings(props: any) {
                       placeholder={
                         providerType === "google"
                           ? "xxxxxxxx.apps.googleusercontent.com"
-                          : "GitHub OAuth App Client ID"
+                          : t(
+                              "admin.oauth.githubClientIdPlaceholder",
+                              "GitHub OAuth app client ID",
+                            )
                       }
                       style={{ fontSize: "13px" }}
                     />
@@ -213,7 +242,7 @@ export default function PlatformGeneralSettings(props: any) {
                       className="form-label"
                       style={{ fontSize: "12px", marginBottom: "6px" }}
                     >
-                      Client Secret
+                      {t("admin.oauth.clientSecret", "Client secret")}
                     </label>
                     <input
                       className="form-input"
@@ -226,7 +255,11 @@ export default function PlatformGeneralSettings(props: any) {
                           e.target.value,
                         )
                       }
-                      placeholder={`${meta.name} Client Secret`}
+                      placeholder={t(
+                        "admin.oauth.clientSecretPlaceholder",
+                        "{{provider}} client secret",
+                        { provider: meta.name },
+                      )}
                       style={{ fontSize: "13px" }}
                     />
                   </div>
@@ -235,7 +268,7 @@ export default function PlatformGeneralSettings(props: any) {
                       className="form-label"
                       style={{ fontSize: "12px", marginBottom: "6px" }}
                     >
-                      Scope
+                      {t("admin.oauth.scope", "Scope")}
                     </label>
                     <input
                       className="form-input"
@@ -288,8 +321,8 @@ export default function PlatformGeneralSettings(props: any) {
                           whiteSpace: "nowrap",
                         }}
                         textToCopy={callbackUrl}
-                        label="Copy"
-                        copiedLabel="Copied"
+                        label={t("common.copy", "Copy")}
+                        copiedLabel={t("common.copied", "Copied")}
                       />
                     </div>
                   </div>
@@ -317,8 +350,14 @@ export default function PlatformGeneralSettings(props: any) {
                         }}
                       >
                         {provider.is_active
-                          ? "Enabled on login page"
-                          : "Saved but disabled"}
+                          ? t(
+                              "admin.oauth.enabledStatus",
+                              "Enabled on login page",
+                            )
+                          : t(
+                              "admin.oauth.disabledStatus",
+                              "Saved but disabled",
+                            )}
                       </span>
                     )}
                   </div>
@@ -367,6 +406,10 @@ export default function PlatformGeneralSettings(props: any) {
               checked={nbEnabled}
               onChange={(e) => handleNotificationBarToggle(e.target.checked)}
               disabled={nbSaving}
+              aria-label={t(
+                "enterprise.notificationBar.enabled",
+                "Enable notification bar",
+              )}
               style={{ opacity: 0, width: 0, height: 0 }}
             />
             <span style={switchTrack(nbEnabled)}>
@@ -443,7 +486,10 @@ export default function PlatformGeneralSettings(props: any) {
             className="form-input"
             value={publicBaseUrl}
             onChange={(e) => setPublicBaseUrl(e.target.value)}
-            placeholder="https://your-domain.com"
+            placeholder={t(
+              "admin.publicUrl.placeholder",
+              "https://your-domain.com",
+            )}
             style={{ fontSize: "13px" }}
           />
         </div>

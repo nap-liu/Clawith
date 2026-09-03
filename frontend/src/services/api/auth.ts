@@ -2,6 +2,13 @@ import type { TokenResponse, User } from "../../types";
 import { request } from "./core";
 
 export const authApi = {
+  registrationConfig: () =>
+    request<{
+      invitation_code_required: boolean;
+      password_login_enabled: boolean;
+      account_registration_enabled: boolean;
+    }>("/auth/registration-config"),
+
   register: (data: {
     username?: string;
     email: string;

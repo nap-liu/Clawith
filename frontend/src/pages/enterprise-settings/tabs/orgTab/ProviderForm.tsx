@@ -1,6 +1,47 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { IconSettings } from '@tabler/icons-react';
 import LinearCopyButton from '../../../../components/LinearCopyButton';
+import OrderedFieldListEditor from '../../../../components/OrderedFieldListEditor';
+import ProviderFieldMappingEditor, {
+    type ProviderDiscoveredField,
+} from '../../../../components/ProviderFieldMappingEditor';
+import ToggleSwitch from '../../../../components/ToggleSwitch';
+import Button from '../../../../components/ui/Button';
+import TextInput from '../../../../components/ui/TextInput';
+import { fetchJson } from '../../utils/fetchJson';
+
+const IDENTITY_MATCH_FIELDS = ['phone', 'email'] as const;
+type IdentityMatchField = typeof IDENTITY_MATCH_FIELDS[number];
+const OAUTH_FIELD_MAPPING_KEYS = ['user_id', 'name', 'email', 'mobile', 'avatar'] as const;
+const OAUTH_FIELD_DEFAULTS: Record<string, string> = {
+    user_id: 'sub',
+    name: 'name',
+    email: 'email',
+    mobile: 'phone_number',
+    avatar: 'picture',
+};
+const SCIM_FIELD_DEFAULTS: Record<string, string> = {
+    name: '/displayName',
+    email: '/emails',
+    mobile: '/phoneNumbers',
+    avatar: '/photos',
+    title: '/title',
+    employee_number: '/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/employeeNumber',
+    organization: '/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/organization',
+    division: '/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/division',
+    department: '/urn:ietf:params:scim:schemas:extension:enterprise:2.0:User/department',
+};
+
+function normalizeIdentityMatchFields(fields: unknown): IdentityMatchField[] {
+    if (!Array.isArray(fields)) return [...IDENTITY_MATCH_FIELDS];
+    const normalized = fields.filter(
+        (field, index): field is IdentityMatchField => (
+            IDENTITY_MATCH_FIELDS.includes(field as IdentityMatchField)
+            && fields.indexOf(field) === index
+        ),
+    );
+    return normalized.length > 0 ? normalized : [...IDENTITY_MATCH_FIELDS];
+}
 
 const FEISHU_SYNC_PERM_JSON = `{
   "scopes": {
@@ -45,6 +86,61 @@ export default function ProviderForm({
     dialog,
     deleteProvider,
 }: ProviderFormProps) {
+        const [discoveredFields, setDiscoveredFields] = useState<Record<string, ProviderDiscoveredField[]>>({});
+        const [discoveringCapability, setDiscoveringCapability] = useState<string | null>(null);
+        const [fieldDiscoveryError, setFieldDiscoveryError] = useState<Record<string, string>>({});
+        const [directoryDiscoveryAccount, setDirectoryDiscoveryAccount] = useState('');
+        useEffect(() => {
+            setDiscoveredFields({});
+            setFieldDiscoveryError({});
+            setDirectoryDiscoveryAccount('');
+        }, [existingProvider?.id]);
+
+        const discoverFieldPaths = async (capability: 'login' | 'directory') => {
+            if (!existingProvider?.id) {
+                setFieldDiscoveryError((current) => ({
+                    ...current,
+                    [capability]: t('enterprise.identity.fieldDiscovery.saveFirst'),
+                }));
+                return;
+            }
+            setDiscoveringCapability(capability);
+            setFieldDiscoveryError((current) => ({ ...current, [capability]: '' }));
+            try {
+                const params = new URLSearchParams({ capability });
+                if (capability === 'directory' && directoryDiscoveryAccount.trim()) {
+                    params.set('target_account', directoryDiscoveryAccount.trim());
+                }
+                const result = await fetchJson<{
+                    source?: string;
+                    fields?: ProviderDiscoveredField[];
+                    paths?: string[];
+                }>(
+                    `/enterprise/identity-providers/${existingProvider.id}/discover-field-paths?${params}`,
+                    { method: 'POST' },
+                );
+                const fields = result.fields || (result.paths || []).map((path) => ({
+                    path,
+                    sample_value: '',
+                }));
+                if (capability === 'login' && result.source === 'authorization_required') {
+                    setDiscoveredFields((current) => ({ ...current, login: [] }));
+                    return;
+                }
+                setDiscoveredFields((current) => ({
+                    ...current,
+                    [capability]: fields,
+                }));
+            } catch (error) {
+                setFieldDiscoveryError((current) => ({
+                    ...current,
+                    [capability]: t('enterprise.identity.fieldDiscovery.failed'),
+                }));
+            } finally {
+                setDiscoveringCapability(null);
+            }
+        };
+
         const providerBaseUrl = (() => {
             const rawDomain = existingProvider?.sso_domain || tenant?.sso_domain || '';
             if (rawDomain) {
@@ -53,14 +149,50 @@ export default function ProviderForm({
             return window.location.origin;
         })();
         const providerCallbackUrl = `${providerBaseUrl}/api/auth/${type}/callback`;
+        const identityMatchFields = normalizeIdentityMatchFields(
+            form.config?.identity_match_policy?.ordered_fields,
+        );
+        const enterpriseRootName = form.config?.directory?.root_mapping?.root_name
+            ?? tenant?.name
+            ?? '';
+        const updateEnterpriseRootName = (rootName: string) => {
+            setForm((current: any) => ({
+                ...current,
+                config: {
+                    ...(current.config || {}),
+                    directory: {
+                        ...(current.config?.directory || {}),
+                        root_mapping: {
+                            ...(current.config?.directory?.root_mapping || {}),
+                            root_name: rootName,
+                        },
+                    },
+                },
+            }));
+        };
+        const updateIdentityMatchFields = (orderedFields: IdentityMatchField[]) => {
+            setForm((current: any) => ({
+                ...current,
+                config: {
+                    ...(current.config || {}),
+                    identity_match_policy: {
+                        version: 1,
+                        ordered_fields: orderedFields,
+                        match_mode: 'normalized_exact',
+                        on_lower_priority_conflict: 'bind_highest_priority_and_flag',
+                        allow_name_match: false,
+                    },
+                },
+            }));
+        };
 
         return (
             <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border-subtle)' }}>
                 {/* Setup Guide moved to the top */}
-                {['feishu', 'dingtalk', 'google_workspace'].includes(type) && (
+                {['feishu', 'dingtalk', 'google_workspace', 'wecom'].includes(type) && (
                     <div style={{ background: 'var(--bg-primary)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-subtle)', marginBottom: '20px', fontSize: '12px' }}>
                         <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <IconSettings size={15} stroke={1.8} /> {t('enterprise.org.syncSetupGuide', 'Setup Guide & Required Permissions')}
+                            <IconSettings size={15} stroke={1.8} /> {t('enterprise.org.syncSetupGuide')}
                         </div>
                         <div style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
                             {type === 'feishu' && (
@@ -71,20 +203,20 @@ export default function ProviderForm({
                                         </div>
                                     ))}
                                     <div style={{ marginTop: '16px', marginBottom: '8px' }}>
-                                        {t('enterprise.org.feishuGuideText', 'Permission JSON (bulk import)')}
+                                        {t('enterprise.org.feishuGuideText')}
                                     </div>
                                     <div style={{ position: 'relative', background: '#282c34', borderRadius: '6px', padding: '12px', paddingRight: '40px', color: '#abb2bf', fontFamily: 'monospace', fontSize: '11px', whiteSpace: 'pre-wrap', overflowX: 'auto' }}>
                                         <LinearCopyButton
                                             className="btn btn-ghost"
                                             style={{ position: 'absolute', top: '8px', right: '8px', fontSize: '10px', color: '#abb2bf', padding: '4px 8px', background: 'rgba(255,255,255,0.1)', cursor: 'pointer', border: 'none', borderRadius: '4px', height: 'fit-content', minWidth: '60px' }}
                                             textToCopy={FEISHU_SYNC_PERM_JSON}
-                                            label="Copy"
-                                            copiedLabel="Copied✓"
+                                            label={t('common.copy')}
+                                            copiedLabel={t('common.copied')}
                                         />
                                         {FEISHU_SYNC_PERM_JSON}
                                     </div>
                                     <div style={{ marginTop: '8px', color: 'var(--text-secondary)' }}>
-                                        {t('enterprise.org.feishuGuideWarning', 'Note: You must re-publish the app each time you add new permissions.')}
+                                        {t('enterprise.org.feishuGuideWarning')}
                                     </div>
                                 </>
                             )}
@@ -119,42 +251,93 @@ export default function ProviderForm({
                     </div>
                 )}
 
-                {/* Name field only for oauth2 */}
+                {/* Connection name for generic standards-based providers. */}
                 {type === 'oauth2' && (
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '16px' }}>
                         <div className="form-group">
                             <label className="form-label">{t('enterprise.identity.name')}</label>
-                            <input className="form-input" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+                            <TextInput value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
                         </div>
                     </div>
                 )}
 
                 {type === 'oauth2' ? (
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-                        <div className="form-group">
-                            <label className="form-label">Client ID</label>
-                            <input className="form-input" value={form.app_id} onChange={e => setForm({ ...form, app_id: e.target.value })} />
+                        <div style={{ gridColumn: '1 / -1', fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                            {t('enterprise.identity.providerHints.oauth2')}
                         </div>
                         <div className="form-group">
-                            <label className="form-label">Client Secret</label>
-                            <input className="form-input" type="password" value={form.app_secret} onChange={e => setForm({ ...form, app_secret: e.target.value })} />
+                            <label className="form-label">{t('enterprise.identity.clientId')}</label>
+                            <TextInput value={form.app_id} onChange={e => setForm({ ...form, app_id: e.target.value })} />
+                        </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.identity.clientSecret')}</label>
+                            <TextInput type="password" value={form.app_secret} onChange={e => setForm({ ...form, app_secret: e.target.value })} />
                         </div>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                            <label className="form-label">Authorize URL</label>
-                            <input className="form-input" value={form.authorize_url} onChange={e => setForm({ ...form, authorize_url: e.target.value })} />
+                            <label className="form-label">{t('enterprise.identity.authorizeUrl')}</label>
+                            <TextInput value={form.authorize_url} onChange={e => setForm({ ...form, authorize_url: e.target.value })} placeholder={t('enterprise.identity.authorizeUrlPlaceholder')} />
                         </div>
                         <div className="form-group">
-                            <label className="form-label">Token URL</label>
-                            <input className="form-input" value={form.token_url} onChange={e => setForm({ ...form, token_url: e.target.value })} placeholder="optional · auto-derived from Authorize URL" />
+                            <label className="form-label">{t('enterprise.identity.tokenUrl')}</label>
+                            <TextInput value={form.token_url} onChange={e => setForm({ ...form, token_url: e.target.value })} placeholder={t('enterprise.identity.tokenUrlPlaceholder')} />
                         </div>
                         <div className="form-group">
-                            <label className="form-label">UserInfo URL</label>
-                            <input className="form-input" value={form.user_info_url} onChange={e => setForm({ ...form, user_info_url: e.target.value })} placeholder="optional · auto-derived from Authorize URL" />
+                            <label className="form-label">{t('enterprise.identity.userInfoUrl')}</label>
+                            <TextInput value={form.user_info_url} onChange={e => setForm({ ...form, user_info_url: e.target.value })} placeholder={t('enterprise.identity.userInfoUrlPlaceholder')} />
                         </div>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                            <label className="form-label">Scope</label>
-                            <input className="form-input" value={form.scope} onChange={e => setForm({ ...form, scope: e.target.value })} placeholder="e.g. openid,profile,email" />
+                            <label className="form-label">{t('enterprise.identity.scope')}</label>
+                            <TextInput value={form.scope} onChange={e => setForm({ ...form, scope: e.target.value })} placeholder={t('enterprise.identity.scopePlaceholder')} />
                         </div>
+                        <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                            <label className="form-label">{t('enterprise.identity.scimBaseUrl')}</label>
+                            <TextInput value={form.scim_base_url || ''} onChange={e => setForm({ ...form, scim_base_url: e.target.value })} placeholder={t('enterprise.identity.scimBaseUrlPlaceholder')} />
+                            <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                                {t('enterprise.identity.scimBaseUrlHint')}
+                            </div>
+                        </div>
+                        <ProviderFieldMappingEditor
+                            title={t('enterprise.identity.loginFieldMapping')}
+                            hint={t('enterprise.identity.loginFieldMappingHint')}
+                            fields={OAUTH_FIELD_MAPPING_KEYS.map((field) => ({
+                                key: field,
+                                label: t(`enterprise.identity.${field === 'user_id' ? 'userId' : field}Field`),
+                                defaultPath: OAUTH_FIELD_DEFAULTS[field],
+                            }))}
+                            value={form.field_mapping || {}}
+                            onChange={(fieldMapping) => setForm({ ...form, field_mapping: fieldMapping })}
+                            discoveredFields={discoveredFields.login || []}
+                            onDiscover={() => void discoverFieldPaths('login')}
+                            discovering={discoveringCapability === 'login'}
+                            discoverLabel={t('enterprise.identity.fieldDiscovery.action')}
+                            discoveringLabel={t('enterprise.identity.fieldDiscovery.running')}
+                            discoveryError={fieldDiscoveryError.login}
+                        />
+                        <ProviderFieldMappingEditor
+                            title={t('enterprise.identity.directoryFieldMapping')}
+                            hint={t('enterprise.identity.directoryFieldMappingHint')}
+                            fields={Object.entries(SCIM_FIELD_DEFAULTS).map(([field, defaultPath]) => ({
+                                key: field,
+                                label: t(`enterprise.identity.directoryFields.${field}`),
+                                defaultPath,
+                            }))}
+                            value={form.directory_field_mapping || {}}
+                            onChange={(fieldMapping) => setForm({
+                                ...form,
+                                directory_field_mapping: fieldMapping,
+                            })}
+                            discoveredFields={discoveredFields.directory || []}
+                            onDiscover={() => void discoverFieldPaths('directory')}
+                            discovering={discoveringCapability === 'directory'}
+                            discoverLabel={t('enterprise.identity.fieldDiscovery.action')}
+                            discoveringLabel={t('enterprise.identity.fieldDiscovery.running')}
+                            discoveryError={fieldDiscoveryError.directory}
+                            discoveryTarget={directoryDiscoveryAccount}
+                            onDiscoveryTargetChange={setDirectoryDiscoveryAccount}
+                            discoveryTargetPlaceholder={t('enterprise.identity.fieldDiscovery.targetAccountPlaceholder')}
+                            discoveryTargetLabel={t('enterprise.identity.fieldDiscovery.targetAccount')}
+                        />
                     </div>
                 ) : type === 'wecom' ? (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
@@ -201,6 +384,16 @@ export default function ProviderForm({
                                 {t('enterprise.identity.wecomNotice.footerText')}
                             </div>
                         </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px' }}>
+                            <div className="form-group">
+                                <label className="form-label">{t('enterprise.identity.corpId')}</label>
+                                <input className="form-input" value={form.config.corp_id || ''} onChange={e => setForm({ ...form, config: { ...form.config, corp_id: e.target.value } })} />
+                            </div>
+                            <div className="form-group">
+                                <label className="form-label">{t('enterprise.identity.directorySecret')}</label>
+                                <input className="form-input" type="password" value={form.config.secret || ''} onChange={e => setForm({ ...form, config: { ...form.config, secret: e.target.value } })} />
+                            </div>
+                        </div>
                     </div>
 
 
@@ -210,34 +403,34 @@ export default function ProviderForm({
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('enterprise.identity.providerHints.dingtalk')}</div>
                             <div style={{ marginTop: '8px', padding: '10px 12px', borderRadius: '6px', border: '1px solid var(--border-subtle)', background: 'var(--bg-primary)' }}>
                                 <div style={{ fontWeight: 500, fontSize: '12px', color: 'var(--text-primary)', marginBottom: '4px' }}>
-                                    {t('enterprise.identity.dingtalkSyncOnlyNoticeTitle', 'Directory sync works without DingTalk login')}
+                                    {t('enterprise.identity.dingtalkSyncOnlyNoticeTitle')}
                                 </div>
                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
-                                    {t('enterprise.identity.dingtalkSyncOnlyNoticeDesc', 'Use AppKey/AppSecret to sync DingTalk contacts. Turn on SSO Login only when users also need to sign in with DingTalk.')}
+                                    {t('enterprise.identity.dingtalkSyncOnlyNoticeDesc')}
                                 </div>
                             </div>
                         </div>
                         <div className="form-group">
-                            <label className="form-label">App Key</label>
+                            <label className="form-label">{t('enterprise.identity.appKey')}</label>
                             <input className="form-input" value={form.config.app_key || ''} onChange={e => setForm({ ...form, config: { ...form.config, app_key: e.target.value } })} placeholder="dingxxxxxxxxxxxx" />
                         </div>
                         <div className="form-group">
-                            <label className="form-label">App Secret</label>
+                            <label className="form-label">{t('enterprise.identity.appSecret')}</label>
                             <input className="form-input" type="password" value={form.config.app_secret || ''} onChange={e => setForm({ ...form, config: { ...form.config, app_secret: e.target.value } })} />
                         </div>
                     </div>
                 ) : type === 'google_workspace' ? (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                         <div style={{ padding: '14px', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-primary)' }}>
-                            <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>Google OAuth</div>
+                            <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '10px' }}>{t('enterprise.identity.googleOAuthTitle')}</div>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                                 <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                        {t('enterprise.identity.providerHints.google_workspace', 'Google Workspace: use one Client ID and Client Secret for both SSO and admin-authorized directory sync.')}
+                                        {t('enterprise.identity.providerHints.google_workspace')}
                                     </div>
                                 </div>
                                 <div className="form-group">
-                                    <label className="form-label">Client ID</label>
+                                    <label className="form-label">{t('enterprise.identity.clientId')}</label>
                                     <input
                                         className="form-input"
                                         value={form.config.client_id || ''}
@@ -246,7 +439,7 @@ export default function ProviderForm({
                                     />
                                 </div>
                                 <div className="form-group">
-                                    <label className="form-label">Client Secret</label>
+                                    <label className="form-label">{t('enterprise.identity.clientSecret')}</label>
                                     <input
                                         className="form-input"
                                         type="password"
@@ -255,7 +448,7 @@ export default function ProviderForm({
                                     />
                                 </div>
                                 <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                                    <label className="form-label">{t('enterprise.identity.callbackUrl', 'Redirect URL (paste this in your app settings)')}</label>
+                                    <label className="form-label">{t('enterprise.identity.callbackUrl')}</label>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                         <div style={{
                                             flex: 1,
@@ -276,16 +469,16 @@ export default function ProviderForm({
                                             className="btn btn-ghost btn-sm"
                                             style={{ fontSize: '11px', width: 'auto', minWidth: '70px', height: '33px' }}
                                             textToCopy={providerCallbackUrl}
-                                            label={t('common.copy', 'Copy')}
-                                            copiedLabel="Copied"
+                                            label={t('common.copy')}
+                                            copiedLabel={t('common.copied')}
                                         />
                                     </div>
                                     <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                        {t('enterprise.identity.callbackUrlHint', "Add this URL as the OAuth redirect URI in your identity provider's app configuration.")}
+                                        {t('enterprise.identity.callbackUrlHint')}
                                     </div>
                                 </div>
                                 <div className="form-group" style={{ gridColumn: '1 / -1' }}>
-                                    <label className="form-label">Directory Sync Authorization</label>
+                                    <label className="form-label">{t('enterprise.identity.googleDirectoryAuthorization')}</label>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                         <button
                                             className="btn btn-secondary btn-sm"
@@ -293,21 +486,25 @@ export default function ProviderForm({
                                             onClick={() => existingProvider && handleGoogleAdminAuthorize(existingProvider.id)}
                                             disabled={!existingProvider}
                                         >
-                                            {existingProvider?.config?.google_admin_authorized_email ? 'Re-authorize Admin Sync' : 'Authorize Admin Sync'}
+                                            {existingProvider?.config?.google_admin_authorized_email
+                                                ? t('enterprise.identity.googleReauthorizeAdminSync')
+                                                : t('enterprise.identity.googleAuthorizeAdminSync')}
                                         </button>
                                         {!existingProvider && (
                                             <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                                Please save the provider first.
+                                                {t('enterprise.identity.googleSaveFirst')}
                                             </span>
                                         )}
                                         {existingProvider?.config?.google_admin_authorized_email && (
                                             <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
-                                                Authorized as {existingProvider.config.google_admin_authorized_email}
+                                                {t('enterprise.identity.googleAuthorizedAs', {
+                                                    email: existingProvider.config.google_admin_authorized_email,
+                                                })}
                                             </span>
                                         )}
                                     </div>
                                     <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                        Sign in with a Google Workspace admin account to grant directory read access. The platform will securely store a refresh token and use it for scheduled sync.
+                                        {t('enterprise.identity.googleDirectoryAuthorizationHint')}
                                     </div>
                                 </div>
                             </div>
@@ -319,79 +516,87 @@ export default function ProviderForm({
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('enterprise.identity.providerHints.feishu')}</div>
                         </div>
                         <div className="form-group">
-                            <label className="form-label">App ID</label>
+                            <label className="form-label">{t('enterprise.identity.appId')}</label>
                             <input className="form-input" value={form.config.app_id || ''} onChange={e => setForm({ ...form, config: { ...form.config, app_id: e.target.value } })} placeholder="cli_xxxxxxxxxxxx" />
                         </div>
                         <div className="form-group">
-                            <label className="form-label">App Secret</label>
+                            <label className="form-label">{t('enterprise.identity.appSecret')}</label>
                             <input className="form-input" type="password" value={form.config.app_secret || ''} onChange={e => setForm({ ...form, config: { ...form.config, app_secret: e.target.value } })} />
                         </div>
                     </div>
                 ) : null}
 
-                {/* Hide save/delete for WeCom while config is disabled */}
-                {type !== 'wecom' && (
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '16px' }}>
-                        <button className="btn btn-primary btn-sm" onClick={save} disabled={savingProvider}>
-                            {savingProvider ? t('common.loading') : t('common.save', 'Save')}
-                        </button>
-                        {saveProviderOk && (
-                            <span style={{ fontSize: '12px', color: 'var(--success)' }}>Saved</span>
-                        )}
-                        {existingProvider && (
-                            <button className="btn btn-ghost btn-sm" style={{ color: 'var(--error)' }} onClick={async () => { const ok = await dialog.confirm(t('common.dialog.deleteConfigConfirm'), { title: t('common.dialog.deleteConfig'), danger: true, confirmLabel: t('common.confirmActions.deleteLabel') }); if (ok) deleteProvider.mutate(existingProvider.id); }}>
-                                {t('common.delete', 'Delete')}
-                            </button>
-                        )}
+                <div style={{ marginTop: '16px', maxWidth: '520px' }}>
+                    <label className="form-label">
+                        {t('enterprise.identity.enterpriseRootMapping.title')}
+                    </label>
+                    <TextInput
+                        aria-label={t('enterprise.identity.enterpriseRootMapping.title')}
+                        value={enterpriseRootName}
+                        onChange={(event) => updateEnterpriseRootName(event.target.value)}
+                        placeholder={t('enterprise.identity.enterpriseRootMapping.placeholder')}
+                    />
+                    <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                        {t('enterprise.identity.enterpriseRootMapping.hint')}
                     </div>
-                )}
-                {/* WeCom App IP Whitelist verification URL — hidden while WeCom config is disabled */}
-                {type === 'wecom' && false && editingId && (existingProvider?.config?.verify_token || form.config?.verify_token) && (() => {
-                    const verifyToken = form.config?.verify_token || existingProvider?.config?.verify_token || '';
-                    const aesKey = form.config?.verify_aes_key || existingProvider?.config?.verify_aes_key || '';
-                    // Use window.location.origin as the base, but if it's a private/non-standard URL let user know
-                    const base = window.location.origin;
-                    const callbackUrl = aesKey
-                        ? `${base}/api/enterprise/org/wecom-callback/${verifyToken}?aes_key=${aesKey}`
-                        : `${base}/api/enterprise/org/wecom-callback/${verifyToken}?aes_key=(configure EncodingAESKey above first)`;
-                    return (
-                        <div style={{ marginTop: '16px', padding: '12px', background: 'var(--bg-primary)', borderRadius: '6px', border: '1px solid var(--border-subtle)' }}>
-                            <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px' }}>
-                                WeCom Receive Message Server URL
-                            </div>
-                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '8px' }}>
-                                Step 1: Go to WeCom App Management (AgentID 1000010) → App Settings → Set Receive Message Server URL.
-                                Use this URL. In the Token field, enter your Verify Token. In EncodingAESKey, enter your key below.
-                            </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                <code style={{ flex: 1, fontSize: '11px', padding: '6px 10px', background: 'var(--bg-secondary)', borderRadius: '4px', wordBreak: 'break-all', color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
-                                    {callbackUrl}
-                                </code>
-                                {aesKey && (
-                                    <LinearCopyButton
-                                        className="btn btn-ghost"
-                                        style={{ fontSize: '11px', padding: '4px 8px', whiteSpace: 'nowrap', flexShrink: 0 }}
-                                        textToCopy={callbackUrl}
-                                        label="Copy"
-                                        copiedLabel="Copied"
-                                    />
-                                )}
-                            </div>
-                            {!aesKey && (
-                                <div style={{ marginTop: '6px', fontSize: '11px', color: 'var(--warning, #f59e0b)' }}>
-                                    Configure the Verify Token and EncodingAESKey fields above, then Save to generate the final URL.
-                                </div>
-                            )}
-                            <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                Step 2: After URL verification passes, configure Enterprise Trusted IP with your server IPs in the WeCom console.
-                            </div>
-                            <div style={{ marginTop: '4px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                Step 3: Paste the App Secret (from that same app page) into the App Secret field above.
-                            </div>
-                        </div>
-                    );
-                })()}
+                </div>
 
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '16px' }}>
+                    <ToggleSwitch
+                        checked={form.is_active !== false}
+                        onChange={(checked) => setForm({ ...form, is_active: checked })}
+                        ariaLabel={t('enterprise.identity.providerEnabled')}
+                    />
+                    <div>
+                        <div style={{ fontSize: '12px', fontWeight: 500 }}>
+                            {t('enterprise.identity.providerEnabled')}
+                        </div>
+                        <div style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
+                            {t('enterprise.identity.providerEnabledHint')}
+                        </div>
+                    </div>
+                </div>
+
+                <div style={{ marginTop: '16px', maxWidth: '520px' }}>
+                    <label className="form-label">
+                        {t('enterprise.identity.identityMatchPriority.title')}
+                    </label>
+                    <OrderedFieldListEditor
+                        values={identityMatchFields}
+                        options={IDENTITY_MATCH_FIELDS.map((field) => ({
+                            value: field,
+                            label: t(`enterprise.identity.identityMatchPriority.fields.${field}`),
+                        }))}
+                        onChange={updateIdentityMatchFields}
+                        addLabel={t('enterprise.identity.identityMatchPriority.addField')}
+                        fieldAriaLabel={(position) => t(
+                            'enterprise.identity.identityMatchPriority.fieldAriaLabel',
+                            { position },
+                        )}
+                        moveUpLabel={t('enterprise.identity.identityMatchPriority.moveUp')}
+                        moveDownLabel={t('enterprise.identity.identityMatchPriority.moveDown')}
+                        removeLabel={t('enterprise.identity.identityMatchPriority.remove')}
+                    />
+                    <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                        {t('enterprise.identity.identityMatchPriority.hint')}
+                    </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '16px' }}>
+                    <Button type="button" variant="primary" className="btn-sm" onClick={save} disabled={savingProvider}>
+                        {savingProvider ? t('common.loading') : t('common.save')}
+                    </Button>
+                    {saveProviderOk && (
+                        <span style={{ fontSize: '12px', color: 'var(--success)' }}>
+                            {t('enterprise.identity.savedStatus')}
+                        </span>
+                    )}
+                    {existingProvider && (
+                        <Button type="button" variant="ghost" className="btn-sm" style={{ color: 'var(--error)' }} onClick={async () => { const ok = await dialog.confirm(t('common.dialog.deleteConfigConfirm'), { title: t('common.dialog.deleteConfig'), danger: true, confirmLabel: t('common.confirmActions.deleteLabel') }); if (ok) deleteProvider.mutate(existingProvider.id); }}>
+                            {t('common.delete')}
+                        </Button>
+                    )}
+                </div>
             </div>
         );
 }

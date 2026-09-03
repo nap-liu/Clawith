@@ -133,7 +133,10 @@ export default function PlatformEmailSettings(props: any) {
                   SYSTEM_EMAIL_FROM_ADDRESS: e.target.value,
                 })
               }
-              placeholder="noreply@yourcompany.com"
+              placeholder={t(
+                "enterprise.systemEmail.fromAddressPlaceholder",
+                "noreply@yourcompany.com",
+              )}
               style={{ fontSize: "13px" }}
             />
           </div>
@@ -153,7 +156,10 @@ export default function PlatformEmailSettings(props: any) {
                   SYSTEM_EMAIL_FROM_NAME: e.target.value,
                 })
               }
-              placeholder="Digital Employee Platform"
+              placeholder={t(
+                "enterprise.systemEmail.fromNamePlaceholder",
+                "Digital Employee Platform",
+              )}
               style={{ fontSize: "13px" }}
             />
           </div>
@@ -173,7 +179,10 @@ export default function PlatformEmailSettings(props: any) {
                   SYSTEM_SMTP_HOST: e.target.value,
                 })
               }
-              placeholder="smtp.gmail.com"
+              placeholder={t(
+                "enterprise.systemEmail.smtpHostPlaceholder",
+                "smtp.gmail.com",
+              )}
               style={{ fontSize: "13px" }}
             />
           </div>
@@ -214,7 +223,10 @@ export default function PlatformEmailSettings(props: any) {
                   SYSTEM_SMTP_USERNAME: e.target.value,
                 })
               }
-              placeholder="your-email@gmail.com"
+              placeholder={t(
+                "enterprise.systemEmail.usernamePlaceholder",
+                "your-email@gmail.com",
+              )}
               style={{ fontSize: "13px" }}
             />
           </div>

@@ -83,7 +83,10 @@ export default function EditCompanyModal({
       onUpdated();
       onClose();
     } catch (e: any) {
-      setError(e.message || "Failed to update");
+      setError(
+        e.message ||
+          t("admin.companyUpdateFailed", "Failed to update company"),
+      );
     }
     setSaving(false);
   };

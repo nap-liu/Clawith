@@ -12,12 +12,18 @@ export default function PlatformTab() {
     google: {
       name: "Google",
       scope: "openid profile email",
-      authorizeLabel: "Authorized redirect URI",
+      authorizeLabel: t(
+        "admin.oauth.authorizedRedirectUri",
+        "Authorized redirect URI",
+      ),
     },
     github: {
       name: "GitHub",
       scope: "read:user user:email",
-      authorizeLabel: "Authorization callback URL",
+      authorizeLabel: t(
+        "admin.oauth.authorizationCallbackUrl",
+        "Authorization callback URL",
+      ),
     },
   } as const;
 
@@ -40,7 +46,10 @@ export default function PlatformTab() {
   const [systemEmailConfig, setSystemEmailConfig] = useState({
     SYSTEM_EMAIL_ENABLED: false,
     SYSTEM_EMAIL_FROM_ADDRESS: "",
-    SYSTEM_EMAIL_FROM_NAME: "Digital Employee Platform",
+    SYSTEM_EMAIL_FROM_NAME: t(
+      "enterprise.systemEmail.defaultSenderName",
+      "Digital Employee Platform",
+    ),
     SYSTEM_SMTP_HOST: "",
     SYSTEM_SMTP_PORT: 465,
     SYSTEM_SMTP_USERNAME: "",
@@ -133,7 +142,11 @@ export default function PlatformTab() {
                   ),
             SYSTEM_EMAIL_FROM_ADDRESS: d.value.SYSTEM_EMAIL_FROM_ADDRESS || "",
             SYSTEM_EMAIL_FROM_NAME:
-              d.value.SYSTEM_EMAIL_FROM_NAME || "Digital Employee Platform",
+              d.value.SYSTEM_EMAIL_FROM_NAME ||
+              t(
+                "enterprise.systemEmail.defaultSenderName",
+                "Digital Employee Platform",
+              ),
             SYSTEM_SMTP_HOST: d.value.SYSTEM_SMTP_HOST || "",
             SYSTEM_SMTP_PORT: d.value.SYSTEM_SMTP_PORT || 465,
             SYSTEM_SMTP_USERNAME: d.value.SYSTEM_SMTP_USERNAME || "",
@@ -209,16 +222,19 @@ export default function PlatformTab() {
         });
       })
       .catch(() => {});
-  }, []);
+  }, [t]);
 
   const handleToggleSetting = async (key: string, value: boolean) => {
     setSettingsLoading(true);
     try {
       await adminApi.updatePlatformSettings({ [key]: value });
       setSettings((s: any) => ({ ...s, [key]: value }));
-      showToast("Setting updated");
+      showToast(t("admin.settingUpdated", "Setting updated"));
     } catch (e: any) {
-      showToast(e.message || "Failed", "error");
+      showToast(
+        e.message || t("admin.settingsUpdateFailed", "Failed to update setting"),
+        "error",
+      );
     }
     setSettingsLoading(false);
   };
@@ -287,7 +303,7 @@ export default function PlatformTab() {
       setUrlSaved(true);
       setTimeout(() => setUrlSaved(false), 2000);
     } catch (e) {
-      showToast("Failed to save", "error");
+      showToast(t("common.saveFailed", "Save failed"), "error");
     }
     setUrlSaving(false);
   };
@@ -301,10 +317,19 @@ export default function PlatformTab() {
       });
       setEmailConfigSaved(true);
       setTimeout(() => setEmailConfigSaved(false), 2000);
-      showToast("Email config saved");
+      showToast(
+        t("enterprise.systemEmail.saved", "Email configuration saved"),
+      );
     } catch (e: any) {
       showToast(
-        "Failed to save email config: " + (e.message || "Unknown error"),
+        t(
+          "enterprise.systemEmail.saveFailed",
+          "Failed to save email configuration: {{reason}}",
+          {
+            reason:
+              e.message || t("common.unknownError", "Unknown error"),
+          },
+        ),
         "error",
       );
     } finally {
@@ -331,7 +356,12 @@ export default function PlatformTab() {
     } catch (e: any) {
       setTestEmailResult({
         ok: false,
-        msg: e.message || "Failed to send test email",
+        msg:
+          e.message ||
+          t(
+            "enterprise.systemEmail.testFailed",
+            "Failed to send test email",
+          ),
       });
     }
     setTestEmailSending(false);
@@ -348,7 +378,14 @@ export default function PlatformTab() {
       setTimeout(() => setTemplatesSaved(false), 2000);
       showToast(t("enterprise.emailTemplates.saved", "Email templates saved"));
     } catch (e: any) {
-      showToast(e.message || "Failed to save templates", "error");
+      showToast(
+        e.message ||
+          t(
+            "enterprise.emailTemplates.saveFailed",
+            "Failed to save email templates",
+          ),
+        "error",
+      );
     }
     setTemplatesSaving(false);
   };
@@ -396,7 +433,11 @@ export default function PlatformTab() {
     const provider = oauthProviders[providerType];
     if (!provider?.client_id?.trim() || !provider?.client_secret?.trim()) {
       showToast(
-        `${socialProviderMeta[providerType].name} Client ID and Client Secret are required`,
+        t(
+          "admin.oauth.credentialsRequired",
+          "{{provider}} client ID and client secret are required",
+          { provider: socialProviderMeta[providerType].name },
+        ),
         "error",
       );
       return;
@@ -442,11 +483,19 @@ export default function PlatformTab() {
           is_active: !!result.is_active,
         },
       }));
-      showToast(`${socialProviderMeta[providerType].name} OAuth saved`);
+      showToast(
+        t("admin.oauth.saved", "{{provider}} OAuth settings saved", {
+          provider: socialProviderMeta[providerType].name,
+        }),
+      );
     } catch (e: any) {
       showToast(
         e.message ||
-          `Failed to save ${socialProviderMeta[providerType].name} OAuth`,
+          t(
+            "admin.oauth.saveFailed",
+            "Failed to save {{provider}} OAuth settings",
+            { provider: socialProviderMeta[providerType].name },
+          ),
         "error",
       );
     } finally {

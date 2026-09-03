@@ -45,6 +45,10 @@ export default function Login() {
     const [verificationCode, setVerificationCode] = useState('');
     const [verificationEntryMode, setVerificationEntryMode] = useState<'create' | 'join' | 'home'>('home');
     const [ssoAutoStarted, setSsoAutoStarted] = useState(false);
+    const [authPolicy, setAuthPolicy] = useState({
+        password_login_enabled: true,
+        account_registration_enabled: true,
+    });
     const loginTenantId = resolveLoginTenantId(requestedTenantId, tenant?.id);
 
     const [form, setForm] = useState({
@@ -55,6 +59,10 @@ export default function Login() {
 
     useEffect(() => {
         applyDocumentTheme(readSavedTheme());
+
+        authApi.registrationConfig()
+            .then((config) => setAuthPolicy(config))
+            .catch(() => { });
 
         // If arriving via invitation link with email, check whether the email is already registered
         // to decide whether to show login or register form.
@@ -93,6 +101,12 @@ export default function Login() {
             .catch(() => { })
             .finally(() => setResolving(false));
     }, []);
+
+    useEffect(() => {
+        if (!authPolicy.account_registration_enabled && isRegister) {
+            setIsRegister(false);
+        }
+    }, [authPolicy.account_registration_enabled, isRegister]);
 
     useEffect(() => {
         let cancelled = false;
@@ -503,12 +517,11 @@ export default function Login() {
 
                     {loginTenantId && ssoProviders.length > 0 && !isRegister && !showVerification && (
                         <SsoLoginOptions
-                            loginTenantId={loginTenantId}
-                            tenant={tenant}
                             providers={ssoProviders}
                             loading={ssoLoading}
                             error={ssoError}
                             onStart={startSsoLogin}
+                            showDivider={authPolicy.password_login_enabled}
                             t={t}
                         />
                     )}
@@ -519,6 +532,7 @@ export default function Login() {
                             loading={oauthLoading}
                             error={oauthError}
                             onStart={startOAuthLogin}
+                            showDivider={authPolicy.password_login_enabled}
                             t={t}
                         />
                     )}
@@ -569,6 +583,8 @@ export default function Login() {
                             </div>
                         </form>
                     ) : (
+                        ((isRegister && authPolicy.account_registration_enabled)
+                            || (!isRegister && authPolicy.password_login_enabled)) ? (
                         <form onSubmit={handleSubmit} className="login-form">
                             <div className="login-field">
                                 <label>{t('auth.email')}</label>
@@ -615,6 +631,7 @@ export default function Login() {
                                 )}
                             </button>
                         </form>
+                        ) : null
                     )}
 
                     {/* Multi-tenant selection modal */}
@@ -762,7 +779,7 @@ export default function Login() {
                         </div>
                     )}
 
-                    {!showVerification && (
+                    {!showVerification && authPolicy.account_registration_enabled && (
                     <div className="login-switch">
                         {isRegister ? t('auth.hasAccount') : t('auth.noAccount')}{' '}
                         <a href="#" onClick={(e) => { e.preventDefault(); setIsRegister(!isRegister); setError(''); }}>

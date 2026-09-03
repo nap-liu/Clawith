@@ -8,6 +8,7 @@ export type ConversationMessageView = {
   isLeft: boolean;
   senderLabel?: string;
   avatarText?: string;
+  avatarUrl?: string | null;
   forceSenderLabel?: boolean;
   hideAvatar?: boolean;
 };

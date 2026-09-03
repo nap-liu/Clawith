@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import ChatToolCallRenderer from "../../../components/ChatToolCallRenderer";
+import Avatar from "../../../components/ui/Avatar";
 import {
   buildConversationEntries,
   projectConversationTurnProgress,
@@ -184,9 +185,11 @@ export default function ConversationTimeline({
         <div
           className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? "" : " chat-msg-row--user"}`}
         >
-          <div className="chat-msg-avatar">
-            {ownerView.avatarText || agentName[0] || "A"}
-          </div>
+          <Avatar
+            className="chat-msg-avatar"
+            src={ownerView.avatarUrl || owner?.msg.sender_avatar_url}
+            name={ownerView.avatarText || agentName}
+          />
           <AnalysisCard
             items={entry.items}
             running={running}
@@ -208,9 +211,11 @@ export default function ConversationTimeline({
         <div
           className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}
         >
-          <div className="chat-msg-avatar">
-            {view.avatarText || agentName[0] || "A"}
-          </div>
+          <Avatar
+            className="chat-msg-avatar"
+            src={view.avatarUrl || entry.msg.sender_avatar_url}
+            name={view.avatarText || agentName}
+          />
           <ChatToolCallRenderer
             agentId={messageAgentId}
             message={entry.msg}

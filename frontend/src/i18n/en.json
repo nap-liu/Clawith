@@ -1270,6 +1270,7 @@
     "roleFallback": "Restored as a Project Digital Employee",
     "roleFallbackLegacy": "Choose a corresponding Digital Employee during creation",
     "required": "Required",
+    "clearSearch": "Clear search",
     "sharedSkill": "Shared Skills",
     "noSkill": "No shared Skills are preset",
     "sharedMcp": "Shared MCP",
@@ -2001,7 +2002,11 @@
     "selectOrganization": "Select Company",
     "ssoLoadFailed": "Failed to load SSO providers.",
     "ssoLoading": "Loading SSO providers...",
-    "ssoNoProviders": "No SSO providers configured."
+    "ssoNoProviders": "No SSO providers configured.",
+    "oauthLoading": "Loading social login providers...",
+    "continueWithProvider": "Continue with {{provider}}",
+    "passwordLoginDisabled": "Password login is disabled. Use an enabled SSO provider.",
+    "accountRegistrationDisabled": "Account registration is disabled."
   },
   "roles": {
     "platformAdmin": "Platform Admin",
@@ -3205,6 +3210,9 @@
     "systemEmail": {
       "title": "System Email Configuration",
       "description": "Configure SMTP settings for sending system emails such as password resets and notifications.",
+      "enabled": "Enable system email",
+      "enabledHint": "System emails are enabled. New email and password registrations require email verification.",
+      "disabledHint": "System emails are disabled. SMTP settings can still be saved and tested, but registration email verification is skipped.",
       "fromAddress": "From Email Address",
       "fromName": "From Name",
       "smtpHost": "SMTP Host",
@@ -3217,7 +3225,15 @@
       "sendTest": "Send Test Email",
       "send": "Send",
       "testPlaceholder": "Enter recipient email...",
-      "testSuccess": "Test email sent successfully!"
+      "testSuccess": "Test email sent successfully!",
+      "testFailed": "Failed to send test email",
+      "saved": "Email configuration saved",
+      "saveFailed": "Failed to save email configuration: {{reason}}",
+      "defaultSenderName": "Digital Employee Platform",
+      "fromAddressPlaceholder": "noreply@yourcompany.com",
+      "fromNamePlaceholder": "Digital Employee Platform",
+      "smtpHostPlaceholder": "smtp.gmail.com",
+      "usernamePlaceholder": "your-email@gmail.com"
     },
     "quotas": {
       "defaultUserQuotas": "Default User Quotas",
@@ -3535,9 +3551,136 @@
       "syncing": "Syncing...",
       "syncNow": "Sync Now",
       "syncComplete": "Sync complete: {{departments}} departments, {{members}} members",
+      "directorySync": {
+        "autoSync": "Automatic sync",
+        "intervalValueAria": "Sync interval value",
+        "intervalUnitAria": "Sync interval unit",
+        "providerInactive": "Provider inactive",
+        "scheduleSaveFailed": "Failed to save the automatic sync schedule. Try again.",
+        "progress": "{{stage}} · {{percent}}% ({{processed}}/{{total}})",
+        "needsReview": "Needs review: {{reason}}",
+        "identityMatchingConflict": "identity matching conflict",
+        "identityMatchingConflicts": "{{count}} identity matching conflicts",
+        "cancelled": "Sync cancelled.",
+        "completedWithErrors": "Completed with errors: {{reason}}",
+        "syncFailed": "Sync failed: {{reason}}",
+        "unknownError": "unknown error",
+        "unknownStatus": "Sync status is unavailable.",
+        "units": {
+          "hour": "hour(s)",
+          "day": "day(s)",
+          "week": "week(s)",
+          "month": "month(s)"
+        },
+        "stages": {
+          "queued": "Queued",
+          "fetching": "Fetching directory",
+          "fetchingAccounts": "Fetching accounts",
+          "validating": "Validating data",
+          "applyingGroups": "Updating groups",
+          "applyingAccounts": "Updating users",
+          "reconciling": "Reconciling users",
+          "processing": "Processing"
+        }
+      },
+      "identityConflicts": {
+        "title": "Identity conflicts requiring review",
+        "viewDetails": "Review identity conflicts",
+        "safeReviewHint": "Review the conflicting fields, choose the retained user and contact values, then normalize the identity. Merging is limited to this tenant and preserves historical business records.",
+        "loadFailed": "Failed to load identity conflicts. Try again.",
+        "reviewFailed": "Failed to save the review status. Try again.",
+        "resolveFailed": "The conflict could not be repaired. Its evidence may have changed; synchronize and review it again.",
+        "empty": "No identity conflicts were found for this provider.",
+        "unknownProvider": "Unknown identity provider",
+        "reasonLabel": "Conflict reason",
+        "matchedByLabel": "Highest-priority match",
+        "conflictingFieldsLabel": "Conflicting evidence",
+        "recommendationLabel": "Recommended next step",
+        "currentBinding": "Currently bound platform user",
+        "evidenceTitle": "Source values and matching platform users",
+        "pointsTo": "Points to platform user",
+        "highestPriority": "highest priority",
+        "noTenantCandidate": "No matching user membership in this tenant",
+        "userDisabled": "This platform user is disabled",
+        "noContact": "No contact details",
+        "sourceAccount": "Source account",
+        "selectRetainedUser": "Merge result",
+        "recommendedTarget": "Recommended",
+        "willMerge": "Will merge into retained user",
+        "mergeScope": "Choose the primary user and the phone and email sources. Directory accounts, channel bindings, and digital employee relationships will be reassigned.",
+        "masterUser": "Primary user",
+        "masterUserHint": "Retain this user's name, avatar, title, role, and historical business ownership.",
+        "phoneSource": "Phone number",
+        "phoneSourceHint": "Choose the phone number used for login and identity matching after the merge.",
+        "emailSource": "Email",
+        "emailSourceHint": "Choose the email used for login and identity matching after the merge.",
+        "mergePreview": "Primary user after merge",
+        "crossTenantContact": "The selected contact belongs to an identity shared with another tenant. A platform administrator must complete this merge.",
+        "mergeInto": "Merge and retain {{name}}",
+        "processing": "Processing...",
+        "confirmAction": "Confirm action",
+        "outcomeLabel": "Review outcome",
+        "fieldSeparator": ", ",
+        "markReviewing": "Start review",
+        "markReviewed": "Record review outcome",
+        "reviewedOutcome": "Recorded outcome: {{outcome}}. No account data was changed.",
+        "statuses": {
+          "pending": "Pending",
+          "reviewing": "Reviewing",
+          "reviewed": "Reviewed",
+          "resolved": "Resolved"
+        },
+        "sources": {
+          "directory_contact": "Directory synchronization",
+          "sso_login": "SSO login",
+          "im_inbound": "Inbound IM",
+          "account_registration": "Account registration",
+          "unknown": "Identity normalization"
+        },
+        "fields": {
+          "phone": "Phone number",
+          "email": "Email"
+        },
+        "reasons": {
+          "lower_priority_identity_mismatch": "A lower-priority identity field points to a different platform user.",
+          "bound_subject_contact_mismatch": "A newly observed contact points away from the user already bound to this provider subject."
+        },
+        "recommendations": {
+          "correct_source_and_resync": "Verify the source directory contact, correct it upstream when needed, then run synchronization again.",
+          "verify_login_claim_mapping": "Verify the configured login claim mapping and the identity provider account, then sign in again.",
+          "verify_channel_binding": "Verify the channel installation and sender binding before accepting any contact change.",
+          "keep_binding_and_verify_contact": "Keep the existing subject binding and verify the new contact with the identity provider administrator.",
+          "choose_binding_owner": "Choose which platform user owns this source account. The current binding remains unchanged until you confirm an action.",
+          "verify_registration_claims": "Verify the configured registration claims before keeping these platform users separate.",
+          "inspect_identity_evidence": "Verify the source evidence before requesting any identity repair."
+        },
+        "actions": {
+          "rebind_source_to_highest_priority": "Rebind current source only",
+          "merge_users": "Merge users",
+          "keep_people_separate": "Keep users separate"
+        },
+        "confirmations": {
+          "rebind_source_to_highest_priority": "This rebinds this directory source account, its exact channel subjects, and source-linked relationships to the highest-priority matching user. It does not merge or delete either platform user.",
+          "merge_users": "Merge these users and retain “{{name}}”? The phone number will be “{{phone}}” and the email will be “{{email}}”. Other conflicting users in this tenant will be disabled, and their directory accounts, channel bindings, and digital employee relationships will move to the retained user.",
+          "keep_people_separate": "This confirms that the platform users are different people and keeps the source binding unchanged. The same evidence will not be reported again; changed source evidence will open a new conflict."
+        },
+        "unavailable": {
+          "missing_verified_evidence": "This historical record does not contain enough tenant-verified evidence for direct repair. Synchronize the provider to create a new actionable conflict.",
+          "evidence_changed": "The current source values no longer match this conflict snapshot. Synchronize the provider and review the new evidence before repairing.",
+          "invalid_source_scope": "The source account is no longer available in this tenant and provider, so this record cannot be repaired directly."
+        },
+        "resolvedWith": "Resolved: {{action}}",
+        "outcomes": {
+          "source_correction_requested": "Source correction requested; resync required",
+          "confirmed_distinct_people": "Confirmed as different people; keep separate",
+          "manual_identity_repair_required": "Manual identity repair required"
+        }
+      },
       "orgBrowser": "Organization Browser",
       "allDepartments": "All",
-      "searchMembers": "Search members...",
+      "directoryLoading": "Loading organization…",
+      "directoryLoadRetry": "Load failed. Try again",
+      "searchMembers": "Search by name, phone, or email...",
       "member": "Member",
       "admin": "Admin",
       "noMembers": "No members",
@@ -3651,7 +3794,7 @@
         "dingtalk": "DingTalk: Requires app_key and app_secret for directory sync. DingTalk login is optional.",
         "wecom": "WeCom: Requires corp_id, secret, agent_id.",
         "google_workspace": "Google Workspace: one Client ID, one Client Secret, and one Redirect URL for both SSO and admin-authorized directory sync.",
-        "oauth2": "OAuth2: Enter App ID, App Secret, Authorize URL, Token URL, User Info URL",
+        "oauth2": "OAuth 2.0 / OpenID Connect SSO and SCIM 2.0 directory synchronization",
         "saml": "SAML: Requires entry_point, issuer, cert (public key).",
         "microsoft_teams": "Microsoft Teams: Requires client_id, client_secret, tenant_id."
       },
@@ -3676,9 +3819,14 @@
           "desc": "Google Directory Sync + SSO"
         },
         "oauth2": {
-          "name": "OAuth2",
-          "desc": "Generic OIDC Provider"
+          "name": "OAuth 2.0 / SCIM 2.0",
+          "desc": "Single sign-on and directory synchronization"
         }
+      },
+      "addNamedProvider": "Add {{name}}",
+      "providerConnection": "Identity provider connection",
+      "directoryProtocols": {
+        "scim": "SCIM 2.0"
       },
       "ssoLoginToggle": "SSO Login",
       "ssoLoginToggleHint": "Allow users to log in via this identity provider.",
@@ -3695,13 +3843,32 @@
       "authorizeUrl": "Authorize URL",
       "tokenUrl": "Token URL",
       "userInfoUrl": "UserInfo URL",
+      "scimBaseUrl": "SCIM 2.0 Base URL",
+      "scimBaseUrlPlaceholder": "https://example.com/scim/v2",
+      "scimBaseUrlHint": "SCIM directory sync and OAuth login share the same Client ID and Client Secret using HTTP Basic authentication.",
+      "providerEnabled": "Enable this provider",
+      "providerEnabledHint": "Disabling the provider pauses both login and directory synchronization.",
+      "enterpriseRootMapping": {
+        "title": "Enterprise root",
+        "placeholder": "Enter the platform enterprise root name",
+        "hint": "Maps this provider's top-level organization to the platform directory. Multiple upstream roots are grouped under this enterprise root."
+      },
       "corpId": "Corp ID",
+      "directorySecret": "Directory secret",
       "secret": "Secret",
       "agentId": "Agent ID (Optional)",
       "botId": "Bot ID (Intelligent Robot)",
       "botSecret": "Bot Secret",
       "appKey": "App Key",
+      "appId": "App ID",
       "appSecret": "App Secret",
+      "googleOAuthTitle": "Google OAuth",
+      "googleDirectoryAuthorization": "Directory sync authorization",
+      "googleAuthorizeAdminSync": "Authorize admin sync",
+      "googleReauthorizeAdminSync": "Re-authorize admin sync",
+      "googleSaveFirst": "Save the identity provider first.",
+      "googleAuthorizedAs": "Authorized account: {{email}}",
+      "googleDirectoryAuthorizationHint": "Authorize directory access with a Google Workspace administrator account. The platform stores the refresh token for scheduled synchronization.",
       "wecomNotice": {
         "title": "Prerequisites for WeCom Integration",
         "syncTitle": "1. User Directory Sync",
@@ -3713,7 +3880,9 @@
         "footerText": "Due to the above constraints, WeCom integration currently cannot be easily set up by most users. We are actively exploring alternative approaches — including WeCom ISV (service provider) registration and lower-friction API options — or we may advocate for WeCom to relax these restrictions for SaaS platforms. Configuration will be re-enabled once a viable path is available."
       },
       "statusActive": "Active",
+      "statusInactive": "Inactive",
       "statusNotConfigured": "Not configured",
+      "lastSynced": "Synced: {{date}}",
       "syncDirectory": "Sync Directory",
       "syncSyncing": "Syncing...",
       "syncComplete": "Sync complete: {{departments}} depts · {{members}} members · {{users_created}} new users · {{profiles_synced}} profiles synced",
@@ -3728,11 +3897,48 @@
       "oauth2": "OAuth2",
       "scope": "Scope",
       "fieldMapping": "Field Mapping",
+      "loginFieldMapping": "Login field mapping",
+      "loginFieldMappingHint": "Enter complete upstream response paths. The platform reads each path exactly as entered.",
+      "directoryFieldMapping": "Directory field mapping",
+      "directoryFieldMappingHint": "Map platform organization member fields to SCIM 2.0 User attribute paths.",
+      "fieldDiscovery": {
+        "action": "Discover fields",
+        "running": "Discovering...",
+        "targetAccount": "Target account",
+        "targetAccountPlaceholder": "Username, email, or user ID",
+        "saveFirst": "Save the identity provider before discovering fields.",
+        "failed": "Field discovery failed. Check the service URL, credentials, and protocol configuration."
+      },
+      "directoryFields": {
+        "name": "Name",
+        "email": "Email",
+        "mobile": "Mobile",
+        "avatar": "Avatar",
+        "title": "Title",
+        "employee_number": "Employee number",
+        "organization": "Organization",
+        "division": "Division",
+        "department": "Department"
+      },
+      "identityMatchPriority": {
+        "title": "Identity match priority",
+        "hint": "The platform performs normalized exact matching in list order. Lower-priority conflicts are flagged for review without merging accounts.",
+        "addField": "Add match field",
+        "fieldAriaLabel": "Match field at priority {{position}}",
+        "moveUp": "Move up",
+        "moveDown": "Move down",
+        "remove": "Remove match field",
+        "fields": {
+          "phone": "Phone number",
+          "email": "Email"
+        }
+      },
       "fieldMappingHint": "Optional, leave empty to use standard OIDC fields",
       "userIdField": "User ID Field",
       "nameField": "Name Field",
       "emailField": "Email Field",
       "mobileField": "Mobile Field",
+      "avatarField": "Avatar Field",
       "clearField": "Clear this field",
       "clearAllMappings": "Clear All Field Mappings",
       "hasCustomMapping": "Custom field mapping configured",
@@ -3773,6 +3979,7 @@
       "body": "Body",
       "resetDefault": "Reset to Default",
       "saved": "Email templates saved",
+      "saveFailed": "Failed to save email templates",
       "emailVerification": "Email Verification Code",
       "emailVerificationDesc": "Sent when a user registers and needs to verify their email address.",
       "emailVerificationSubject": "Verify your platform email address",
@@ -3958,7 +4165,7 @@
     "executionTitle": "Choose execution user",
     "subtitle": "New members receive Use access by default",
     "executionSubtitle": "Choose whose permissions future background runs use",
-    "search": "Search by name, transliteration, or department...",
+    "search": "Search by name, phone, or email...",
     "organization": "Organization",
     "allMembers": "All members",
     "myDepartment": "My department",
@@ -3991,7 +4198,13 @@
     "companySearchResults": "Company search results",
     "members": "members",
     "nickname": "Nickname",
-    "required": "Required"
+    "required": "Required",
+    "clearSearch": "Clear search",
+    "accessLevel": "Access level for {{name}}",
+    "linkedProviders": "Linked identity providers",
+    "providerNames": {
+      "platform": "Platform"
+    }
   },
   "common": {
     "pagination": {
@@ -4124,6 +4337,7 @@
     "minutes": "min",
     "saveFailed": "Save failed",
     "saved": "Saved",
+    "unknownError": "Unknown error",
     "switchLanguage": "Switch language"
   },
   "openclaw": {
@@ -4317,6 +4531,8 @@
       "totalTokens": "Total Tokens",
       "lastActive": "Last Active",
       "daysInactive": "Days Inactive",
+      "never": "Never",
+      "dayCount": "{{count}}d",
       "noWarnings": "No churn warnings — all active companies are healthy"
     },
     "leaderboards": {
@@ -4329,6 +4545,7 @@
         "tooltip": "Individual agents ranked by total cumulative token consumption"
       }
     },
+    "cacheUsage": "Cache {{tokens}} · {{rate}}%",
     "loading": "Loading...",
     "noData": "No data"
   },
@@ -4358,6 +4575,7 @@
     "platformSettings": "Platform Settings",
     "platformSettingsDesc": "Manage platform-wide settings and company tenants.",
     "settingUpdated": "Setting updated",
+    "settingsUpdateFailed": "Failed to update setting",
     "company": "Company",
     "sso": "SSO",
     "orgAdmin": "Admin Email",
@@ -4390,8 +4608,30 @@
     "next": "Next",
     "allowSelfCreate": "Allow users to create their own companies",
     "allowSelfCreateDesc": "When disabled, only platform admins can create companies.",
+    "passwordLoginEnabled": "Enable password login",
+    "passwordLoginEnabledDesc": "When disabled, the API rejects password login and the login page hides the password form. Enabled SSO providers remain available.",
+    "accountRegistrationEnabled": "Allow account registration",
+    "accountRegistrationEnabledDesc": "When disabled, the API rejects self-service account registration and the login page hides the registration option.",
     "ssoCustomDomainRedirect": "Enable tenant SSO custom domain redirect",
     "ssoCustomDomainRedirectDesc": "When disabled, all tenants will be blocked from using custom domains or dedicated links to redirect to SSO providers.",
+    "oauth": {
+      "title": "OAuth login",
+      "description": "Configure platform-wide social login providers. Enabled providers appear on the login page.",
+      "scopeSummary": "Scope: {{scope}}",
+      "toggleProvider": "Enable {{provider}} login",
+      "clientId": "Client ID",
+      "clientSecret": "Client secret",
+      "scope": "Scope",
+      "githubClientIdPlaceholder": "GitHub OAuth app client ID",
+      "clientSecretPlaceholder": "{{provider}} client secret",
+      "authorizedRedirectUri": "Authorized redirect URI",
+      "authorizationCallbackUrl": "Authorization callback URL",
+      "enabledStatus": "Enabled on login page",
+      "disabledStatus": "Saved but disabled",
+      "credentialsRequired": "{{provider}} client ID and client secret are required",
+      "saved": "{{provider}} OAuth settings saved",
+      "saveFailed": "Failed to save {{provider}} OAuth settings"
+    },
     "editCompany": "Edit Company",
     "ssoConfigTitle": "SSO & Domain Configuration",
     "ssoConfigDesc": "Configure SSO and custom domain for this company.",
@@ -4400,8 +4640,26 @@
     "ssoDomainPlaceholder": "e.g. login.example.com",
     "publicUrl": {
       "title": "Public URL",
-      "desc": "The external URL used for webhook callbacks and published page links. Include the protocol (e.g. https://example.com)."
+      "desc": "The external URL used for webhook callbacks and published page links. Include the protocol (e.g. https://example.com).",
+      "placeholder": "https://your-domain.com"
     },
+    "createCompanyFailed": "Failed to create company",
+    "companyUpdateFailed": "Failed to update company",
+    "companyStatusUpdateFailed": "Failed to update company status",
+    "companyEnabledSuccess": "Company enabled",
+    "companyDisabledSuccess": "Company disabled",
+    "companyDeletedSuccess": "Company “{{name}}” deleted",
+    "deleteCompanyFailed": "Failed to delete company",
+    "ssoStatusEnabled": "SSO enabled",
+    "ssoStatusDisabled": "SSO disabled",
+    "invitationCodes": "Invitation codes",
+    "invitationCodesForCompany": "Invitation codes — {{name}}",
+    "newInvitationCode": "New invitation code",
+    "validInvitationCodes": "Valid invitation codes",
+    "noValidInvitationCodes": "No valid invitation codes",
+    "invitationCodeUsage": "{{used}}/{{max}} uses",
+    "generateInvitationCode": "Generate invitation code",
+    "invitationCodeCreateFailed": "Failed to create invitation code",
     "edit": "Edit",
     "domainConfig": "Domain Configuration",
     "domainConfigDesc": "Configure a dedicated access domain for this company.",

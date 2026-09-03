@@ -1,0 +1,72 @@
+/* Mobile login keeps the atlas signature while making the form immediately reachable. */
+@media (max-width: 900px) {
+  .atlas-login-split {
+    min-height: 100svh;
+  }
+
+  .atlas-login-hero {
+    box-sizing: border-box;
+    display: grid;
+    grid-template-columns: minmax(150px, 0.72fr) minmax(260px, 1.28fr);
+    gap: clamp(24px, 6vw, 56px);
+    align-items: end;
+    min-height: clamp(340px, 42svh, 440px);
+    padding: 82px 32px 32px;
+  }
+
+  .atlas-login-compass {
+    min-height: 0;
+    margin: 0;
+    align-self: end;
+  }
+
+  .atlas-login-compass .atlas-illustration {
+    width: min(100%, 280px);
+    height: auto;
+  }
+
+  .atlas-login-welcome {
+    margin: 0 0 8px;
+  }
+
+  .atlas-login-welcome .atlas-h1 {
+    font-size: clamp(34px, 6vw, 46px);
+  }
+
+  .atlas-login-form-pane {
+    justify-content: flex-start;
+    min-height: 58svh;
+    padding: 40px 32px calc(56px + env(safe-area-inset-bottom));
+  }
+}
+
+@media (max-width: 600px) {
+  .atlas-login-hero {
+    grid-template-columns: minmax(96px, 0.54fr) minmax(180px, 1.46fr);
+    gap: 18px;
+    min-height: 300px;
+    padding: 72px 20px 24px;
+  }
+
+  .atlas-login-compass .atlas-illustration {
+    width: min(100%, 170px);
+  }
+
+  .atlas-login-welcome .atlas-h1 {
+    font-size: clamp(28px, 9vw, 36px);
+    line-height: 1.02;
+  }
+
+  .atlas-login-welcome .atlas-body {
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .atlas-login-form-pane {
+    padding: 32px 20px calc(44px + env(safe-area-inset-bottom));
+  }
+
+  .atlas-page .login-form-title {
+    font-size: 32px;
+  }
+}

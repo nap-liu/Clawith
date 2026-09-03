@@ -457,7 +457,10 @@ export default function ChatTabContent(props: Props) {
                                                     : isGroupChat
                                                         ? (m.role === 'assistant' ? (((agent?.name || 'Agent')[0]) || 'A') : ((m.sender_name && m.sender_name[0]) || 'U'))
                                                         : undefined;
-                                                return { isLeft, senderLabel, avatarText, forceSenderLabel: isHumanReadonly || isGroupChat };
+                                                const avatarUrl = m.sender_avatar_url
+                                                    || (m.sender_user_id === viewerId ? currentUser?.avatar_url : undefined)
+                                                    || (m.sender_agent_id === id ? agent?.avatar_url : undefined);
+                                                return { isLeft, senderLabel, avatarText, avatarUrl, forceSenderLabel: isHumanReadonly || isGroupChat };
                                             }}
                                         />
                                     );
@@ -498,6 +501,7 @@ export default function ChatTabContent(props: Props) {
                                                 isLeft: m.role === 'assistant',
                                                 senderLabel: m.role === 'assistant' ? (agent?.name || 'Agent') : (currentUser?.display_name || undefined),
                                                 avatarText: m.role === 'assistant' ? ((agent?.name || 'Agent')[0]) : (currentUser?.display_name?.[0] || undefined),
+                                                avatarUrl: m.sender_avatar_url || (m.role === 'assistant' ? agent?.avatar_url : currentUser?.avatar_url),
                                             })}
                                         />
                                     );

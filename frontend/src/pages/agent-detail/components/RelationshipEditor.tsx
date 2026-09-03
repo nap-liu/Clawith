@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { fetchAuth } from '../utils/fetchAuth';
 import { getAgentRelationOptions, getRelationOptions } from '../shared';
+import OrgMemberIdentitySummary from '../../../components/OrgMemberIdentitySummary';
 
 export default function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; readOnly?: boolean }) {
     const { t, i18n } = useTranslation();
@@ -355,6 +356,10 @@ export default function RelationshipEditor({ agentId, readOnly = false }: { agen
                                             {renderHumanMemberSourceBadge(r.member)}
                                             {r.member?.department_path || ''} · {r.member?.email || ''}
                                         </div>
+                                        <OrgMemberIdentitySummary
+                                            directorySources={r.member?.directory_sources}
+                                            channelBindings={r.member?.channel_bindings}
+                                        />
                                         {r.description && editingId !== r.id && <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>{r.description}</div>}
                                     </div>
                                     {!readOnly && editingId !== r.id && (
@@ -469,6 +474,10 @@ export default function RelationshipEditor({ agentId, readOnly = false }: { agen
                                                         {renderHumanMemberSourceBadge(m)}
                                                         {m.department_path} · {m.email}
                                                     </div>
+                                                    <OrgMemberIdentitySummary
+                                                        directorySources={m.directory_sources}
+                                                        channelBindings={m.channel_bindings}
+                                                    />
                                                 </div>
                                             </div>
                                         );
@@ -509,6 +518,10 @@ export default function RelationshipEditor({ agentId, readOnly = false }: { agen
                                                 </div>
                                             )}
                                             <div style={{ color: 'var(--text-tertiary)', fontSize: '11px' }}>{member.department_path || member.email || ''}</div>
+                                            <OrgMemberIdentitySummary
+                                                directorySources={member.directory_sources}
+                                                channelBindings={member.channel_bindings}
+                                            />
                                         </div>
                                         <button className="btn btn-ghost" type="button" style={{ fontSize: '12px', padding: 0, minWidth: 'auto', marginLeft: '2px' }} onClick={() => toggleMemberSelection(member)}>×</button>
                                     </div>

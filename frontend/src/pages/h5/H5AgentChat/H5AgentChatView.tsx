@@ -16,6 +16,7 @@ import {
 import ChatImageLightbox from '../../../components/ChatImageLightbox';
 import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
 import SessionViewerDrawer from '../../../components/SessionViewerDrawer';
+import Avatar from '../../../components/ui/Avatar';
 import ConversationScrollToBottomButton from '../../../features/conversation/ConversationScrollToBottomButton';
 import { horizontalSceneQuickActionStyle } from '../../../utils/sceneQuickActions';
 import {
@@ -146,11 +147,12 @@ export default function H5AgentChatView({
         >
             <header className="h5-chat__header">
                 <div className="h5-chat__agent">
-                    <div className="h5-chat__avatar">
-                        {agentAvatarUrl
-                            ? <img src={agentAvatarUrl} alt={agent?.name || 'Agent'} />
-                            : <span>{(agent?.name || 'A').slice(0, 1).toUpperCase()}</span>}
-                    </div>
+                    <Avatar
+                        className="h5-chat__avatar"
+                        src={agentAvatarUrl}
+                        name={agent?.name || 'Agent'}
+                        alt={agent?.name || 'Agent'}
+                    />
                     <div className="h5-chat__agent-copy">
                         <div className="h5-chat__agent-name">{agent?.name || 'Agent'}</div>
                         <div className={`h5-chat__status h5-chat__status--${connectionStatus}`}>

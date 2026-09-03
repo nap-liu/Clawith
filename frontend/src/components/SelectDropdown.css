@@ -47,6 +47,14 @@
     transition: transform var(--transition-fast);
 }
 
+.select-dropdown__trigger > span:first-child,
+.select-dropdown__option > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .select-dropdown__trigger[data-state="open"] svg {
     transform: rotate(180deg);
 }

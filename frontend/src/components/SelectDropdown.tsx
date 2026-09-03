@@ -7,6 +7,7 @@ import './SelectDropdown.css';
 export type SelectDropdownOption<T extends string> = {
     value: T;
     label: string;
+    title?: string;
 };
 
 type SelectDropdownProps<T extends string> = {
@@ -36,6 +37,7 @@ export default function SelectDropdown<T extends string>({
     const selectValue = value === ''
         ? (hasEmptyOption ? EMPTY_OPTION_VALUE : undefined)
         : value;
+    const selectedOption = options.find((option) => option.value === value);
 
     return (
         <div className={`select-dropdown ${className}`.trim()} style={style}>
@@ -46,7 +48,11 @@ export default function SelectDropdown<T extends string>({
                 )}
                 disabled={disabled}
             >
-                <Select.Trigger className="select-dropdown__trigger" aria-label={ariaLabel}>
+                <Select.Trigger
+                    className="select-dropdown__trigger"
+                    aria-label={ariaLabel}
+                    title={selectedOption?.title || selectedOption?.label}
+                >
                     <Select.Value placeholder={placeholder} />
                     <Select.Icon asChild>
                         <IconChevronDown size={16} />
@@ -65,6 +71,7 @@ export default function SelectDropdown<T extends string>({
                                     key={option.value}
                                     value={option.value === '' ? EMPTY_OPTION_VALUE : option.value}
                                     className="select-dropdown__option"
+                                    title={option.title || option.label}
                                 >
                                     <Select.ItemText>{option.label}</Select.ItemText>
                                     <Select.ItemIndicator className="select-dropdown__indicator">

@@ -13,6 +13,11 @@ import {
 } from '@tabler/icons-react';
 
 import { fetchJson } from '../services/api';
+import OrgMemberIdentitySummary, {
+    type ChannelBindingSummary,
+    type DirectorySourceSummary,
+} from './OrgMemberIdentitySummary';
+import Avatar from './ui/Avatar';
 import './OrgMemberAccessPicker.css';
 
 export type AgentAccessUser = {
@@ -21,12 +26,15 @@ export type AgentAccessUser = {
     nickname?: string;
     username?: string;
     email?: string;
+    phone_masked?: string | null;
     title?: string;
     avatar_url?: string | null;
     department_path?: string;
     access_level: 'use' | 'manage';
     is_required?: boolean;
     required_reason?: 'creator' | 'company_admin' | string | null;
+    directory_sources?: DirectorySourceSummary[];
+    channel_bindings?: ChannelBindingSummary[];
 };
 
 export type AgentAccessDepartment = {
@@ -35,6 +43,9 @@ export type AgentAccessDepartment = {
     path: string;
     access_level: 'use' | 'manage';
     include_descendants?: boolean;
+    provider_id?: string | null;
+    provider_name?: string | null;
+    provider_type?: string | null;
 };
 
 type DirectoryDepartment = {
@@ -44,6 +55,9 @@ type DirectoryDepartment = {
     path: string;
     has_children: boolean;
     direct_member_count: number;
+    provider_id?: string | null;
+    provider_name?: string | null;
+    provider_type?: string | null;
 };
 
 type DirectoryDepartmentsResponse = {
@@ -61,6 +75,9 @@ type DirectoryMember = {
     title: string;
     avatar_url: string | null;
     email?: string | null;
+    phone_masked?: string | null;
+    directory_sources?: DirectorySourceSummary[];
+    channel_bindings?: ChannelBindingSummary[];
 };
 
 type DirectoryMembersResponse = {
@@ -154,6 +171,7 @@ export default function OrgMemberAccessPicker({
         members: t('accessPicker.members'),
         nickname: t('accessPicker.nickname'),
         required: t('accessPicker.required'),
+        clearSearch: t('accessPicker.clearSearch'),
     };
 
     const directoryUrl = directoryBaseUrl || `/agents/${agentId}/permissions/directory`;
@@ -170,7 +188,7 @@ export default function OrgMemberAccessPicker({
     const [selectedDepartmentId, setSelectedDepartmentId] = useState<string | null>(null);
     const [departmentSearch, setDepartmentSearch] = useState('');
     const [memberSearch, setMemberSearch] = useState('');
-    const [includeDescendants, setIncludeDescendants] = useState(false);
+    const [includeDescendants, setIncludeDescendants] = useState(true);
     const [page, setPage] = useState(1);
     const [saving, setSaving] = useState(false);
     const [saveError, setSaveError] = useState<string | null>(null);
@@ -237,7 +255,7 @@ export default function OrgMemberAccessPicker({
         setSelectedDepartmentId(null);
         setDepartmentSearch('');
         setMemberSearch('');
-        setIncludeDescendants(false);
+        setIncludeDescendants(true);
         setPage(1);
         setSaveError(null);
         setTreeError(null);
@@ -306,7 +324,7 @@ export default function OrgMemberAccessPicker({
         mergeDepartments([department]);
         setSelectedDepartmentId(department.id);
         setMemberSearch('');
-        setIncludeDescendants(false);
+        setIncludeDescendants(true);
     };
 
     const toggleExpanded = async (department: DirectoryDepartment) => {
@@ -330,10 +348,13 @@ export default function OrgMemberAccessPicker({
                     name: member.name,
                     nickname: member.nickname || undefined,
                     email: member.email || undefined,
+                    phone_masked: member.phone_masked,
                     title: member.title,
                     avatar_url: member.avatar_url,
                     department_path: member.department_path,
                     access_level: 'use',
+                    directory_sources: member.directory_sources,
+                    channel_bindings: member.channel_bindings,
                 }]]);
             }
             const next = new Map(current);
@@ -344,10 +365,13 @@ export default function OrgMemberAccessPicker({
                     name: member.name,
                     nickname: member.nickname || undefined,
                     email: member.email || undefined,
+                    phone_masked: member.phone_masked,
                     title: member.title,
                     avatar_url: member.avatar_url,
                     department_path: member.department_path,
                     access_level: 'use',
+                    directory_sources: member.directory_sources,
+                    channel_bindings: member.channel_bindings,
                 });
             }
             return next;
@@ -365,10 +389,13 @@ export default function OrgMemberAccessPicker({
                         name: member.name,
                         nickname: member.nickname || undefined,
                         email: member.email || undefined,
+                        phone_masked: member.phone_masked,
                         title: member.title,
                         avatar_url: member.avatar_url,
                         department_path: member.department_path,
                         access_level: 'use',
+                        directory_sources: member.directory_sources,
+                        channel_bindings: member.channel_bindings,
                     });
                 }
             });
@@ -404,6 +431,9 @@ export default function OrgMemberAccessPicker({
                     path: department.path,
                     access_level: 'use',
                     include_descendants: true,
+                    provider_id: department.provider_id,
+                    provider_name: department.provider_name,
+                    provider_type: department.provider_type,
                 });
             }
             return next;
@@ -517,7 +547,7 @@ export default function OrgMemberAccessPicker({
                         aria-label={labels.search}
                     />
                     {memberSearch && (
-                        <button type="button" onClick={() => setMemberSearch('')} aria-label="Clear search"><IconX size={14} /></button>
+                        <button type="button" onClick={() => setMemberSearch('')} aria-label={labels.clearSearch}><IconX size={14} /></button>
                     )}
                 </div>
 
@@ -567,7 +597,7 @@ export default function OrgMemberAccessPicker({
                                             onClick={() => {
                                                 setSelectedDepartmentId(null);
                                                 setMemberSearch('');
-                                                setIncludeDescendants(false);
+                                                setIncludeDescendants(true);
                                             }}
                                         >
                                             <span className="org-access-picker__tree-spacer" />
@@ -641,13 +671,21 @@ export default function OrgMemberAccessPicker({
                                                     disabled={required}
                                                     onChange={() => addMember(member)}
                                                 />
-                                                {member.avatar_url ? <img src={member.avatar_url} alt="" /> : <span className="org-access-picker__avatar">{initials(member.name)}</span>}
+                                                <Avatar
+                                                    className="org-access-picker__avatar"
+                                                    src={member.avatar_url}
+                                                    name={initials(member.name)}
+                                                />
                                                 <span className="org-access-picker__member-copy">
-                                                    <strong>{member.name}</strong>
+                                                    <strong>{[member.name, member.phone_masked].filter(Boolean).join(' · ')}</strong>
                                                     {member.nickname && member.nickname !== member.name && (
                                                         <small>{labels.nickname}: {member.nickname}</small>
                                                     )}
                                                     <small>{[compactDepartmentPath(member.department_path), member.title].filter(Boolean).join(' · ')}</small>
+                                                    <OrgMemberIdentitySummary
+                                                        directorySources={member.directory_sources}
+                                                        channelBindings={member.channel_bindings}
+                                                    />
                                                 </span>
                                                 {required && <span className="badge">{labels.required}</span>}
                                             </label>
@@ -677,7 +715,7 @@ export default function OrgMemberAccessPicker({
                                     <select
                                         value={department.access_level}
                                         onChange={event => updateDepartmentLevel(department.id, event.target.value as 'use' | 'manage')}
-                                        aria-label={`${department.name} access`}
+                                        aria-label={t('accessPicker.accessLevel', { name: department.name })}
                                     >
                                         <option value="use">{labels.use}</option>
                                         <option value="manage">{labels.manage}</option>
@@ -690,14 +728,23 @@ export default function OrgMemberAccessPicker({
                         <div className="org-access-picker__selected-list">
                             {selectedCount > 0 ? Array.from(draftUsers.values()).map(user => (
                                 <div key={user.id} className="org-access-picker__selected-row">
+                                    <Avatar
+                                        className="org-access-picker__avatar"
+                                        src={user.avatar_url}
+                                        name={initials(user.name)}
+                                    />
                                     <div className="org-access-picker__selected-copy">
-                                        <strong>{user.name}</strong>
+                                        <strong>{[user.name, user.phone_masked].filter(Boolean).join(' · ')}</strong>
                                         <small>{compactDepartmentPath(user.department_path) || user.email || ''}</small>
+                                        <OrgMemberIdentitySummary
+                                            directorySources={user.directory_sources}
+                                            channelBindings={user.channel_bindings}
+                                        />
                                     </div>
                                     {!membersOnly && <select
                                         value={user.access_level}
                                         onChange={event => updateLevel(user.id, event.target.value as 'use' | 'manage')}
-                                        aria-label={`${user.name} access`}
+                                        aria-label={t('accessPicker.accessLevel', { name: user.name })}
                                     >
                                         <option value="use">{labels.use}</option>
                                         <option value="manage">{labels.manage}</option>

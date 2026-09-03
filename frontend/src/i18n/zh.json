@@ -1265,6 +1265,7 @@
     "roleFallback": "恢复为项目专用数字员工",
     "roleFallbackLegacy": "创建时选择对应数字员工",
     "required": "必需",
+    "clearSearch": "清除搜索",
     "sharedSkill": "共享 Skill",
     "noSkill": "此模板未预设共享 Skill",
     "sharedMcp": "共享 MCP",
@@ -1958,7 +1959,11 @@
     "selectOrganization": "选择公司",
     "ssoLoadFailed": "加载 SSO 提供商失败",
     "ssoLoading": "正在加载 SSO 提供商...",
-    "ssoNoProviders": "未配置 SSO 提供商"
+    "ssoNoProviders": "未配置 SSO 提供商",
+    "oauthLoading": "正在加载第三方登录方式...",
+    "continueWithProvider": "使用 {{provider}} 登录",
+    "passwordLoginDisabled": "平台已关闭账号密码登录，请使用已启用的 SSO 登录。",
+    "accountRegistrationDisabled": "平台已关闭账号注册。"
   },
   "roles": {
     "platformAdmin": "超级管理员",
@@ -3210,6 +3215,9 @@
     "systemEmail": {
       "title": "系统邮件配置",
       "description": "配置 SMTP 设置以发送系统邮件，如密码重置和通知。",
+      "enabled": "启用系统邮件",
+      "enabledHint": "系统邮件已启用，使用邮箱和密码注册的新账号需要完成邮箱验证。",
+      "disabledHint": "系统邮件已关闭。SMTP 配置仍可保存和测试，但注册时将跳过邮箱验证。",
       "fromAddress": "发件人邮箱地址",
       "fromName": "发件人名称",
       "smtpHost": "SMTP 主机",
@@ -3222,7 +3230,15 @@
       "sendTest": "发送测试邮件",
       "send": "发送",
       "testPlaceholder": "输入收件人邮箱...",
-      "testSuccess": "测试邮件发送成功!"
+      "testSuccess": "测试邮件发送成功！",
+      "testFailed": "测试邮件发送失败",
+      "saved": "邮件配置已保存",
+      "saveFailed": "保存邮件配置失败：{{reason}}",
+      "defaultSenderName": "数字员工平台",
+      "fromAddressPlaceholder": "noreply@yourcompany.com",
+      "fromNamePlaceholder": "数字员工平台",
+      "smtpHostPlaceholder": "smtp.example.com",
+      "usernamePlaceholder": "your-email@example.com"
     },
     "quotas": {
       "defaultUserQuotas": "默认用户配额",
@@ -3584,9 +3600,136 @@
       "syncing": "同步中...",
       "syncNow": "同步",
       "syncComplete": "同步完成：{{departments}} 个部门，{{members}} 个成员",
+      "directorySync": {
+        "autoSync": "自动同步",
+        "intervalValueAria": "同步间隔数值",
+        "intervalUnitAria": "同步间隔单位",
+        "providerInactive": "身份源已停用",
+        "scheduleSaveFailed": "保存自动同步设置失败，请重试。",
+        "progress": "{{stage}} · {{percent}}%（{{processed}}/{{total}}）",
+        "needsReview": "需要人工检查：{{reason}}",
+        "identityMatchingConflict": "身份匹配冲突",
+        "identityMatchingConflicts": "{{count}} 个身份匹配冲突",
+        "cancelled": "同步已取消。",
+        "completedWithErrors": "同步完成但存在错误：{{reason}}",
+        "syncFailed": "同步失败：{{reason}}",
+        "unknownError": "未知错误",
+        "unknownStatus": "暂时无法获取同步状态。",
+        "units": {
+          "hour": "小时",
+          "day": "天",
+          "week": "周",
+          "month": "月"
+        },
+        "stages": {
+          "queued": "等待同步",
+          "fetching": "读取目录",
+          "fetchingAccounts": "读取账号",
+          "validating": "校验数据",
+          "applyingGroups": "更新组织",
+          "applyingAccounts": "更新用户",
+          "reconciling": "归一化用户",
+          "processing": "正在处理"
+        }
+      },
+      "identityConflicts": {
+        "title": "需要人工检查的身份冲突",
+        "viewDetails": "查看身份冲突",
+        "safeReviewHint": "核对冲突字段，选择保留用户及联系方式后完成身份归一化。合并只作用于当前租户，历史业务记录保持不变。",
+        "loadFailed": "身份冲突加载失败，请重试。",
+        "reviewFailed": "审核状态保存失败，请重试。",
+        "resolveFailed": "冲突修复失败，可能是证据已经变化。请重新同步后再检查。",
+        "empty": "当前身份源没有需要展示的身份冲突。",
+        "unknownProvider": "未知身份源",
+        "reasonLabel": "冲突原因",
+        "matchedByLabel": "最高优先级命中",
+        "conflictingFieldsLabel": "冲突证据",
+        "recommendationLabel": "推荐处理方式",
+        "currentBinding": "当前绑定的平台用户",
+        "evidenceTitle": "来源字段值与指向的平台用户",
+        "pointsTo": "指向的平台用户",
+        "highestPriority": "最高优先级",
+        "noTenantCandidate": "当前租户内没有对应的用户成员关系",
+        "userDisabled": "该平台用户已停用",
+        "noContact": "暂无联系方式",
+        "sourceAccount": "来源账号",
+        "selectRetainedUser": "合并结果",
+        "recommendedTarget": "系统建议保留",
+        "willMerge": "将合并到保留用户",
+        "mergeScope": "管理员选择主用户及手机号、邮箱来源；目录账号、通道绑定和数字员工关系将统一归属。",
+        "masterUser": "主用户",
+        "masterUserHint": "保留该用户的名称、头像、职位、角色及历史业务归属。",
+        "phoneSource": "保留手机号",
+        "phoneSourceHint": "选择合并后用于登录和身份匹配的手机号。",
+        "emailSource": "保留邮箱",
+        "emailSourceHint": "选择合并后用于登录和身份匹配的邮箱。",
+        "mergePreview": "合并后的主用户",
+        "crossTenantContact": "所选联系方式属于跨租户共享身份，当前企业管理员不能迁移。请由平台管理员处理。",
+        "mergeInto": "合并并保留 {{name}}",
+        "processing": "正在处理...",
+        "confirmAction": "确认执行",
+        "outcomeLabel": "审核结论",
+        "fieldSeparator": "、",
+        "markReviewing": "开始审核",
+        "markReviewed": "记录审核结论",
+        "reviewedOutcome": "已记录结论：{{outcome}}。平台账号数据未发生变更。",
+        "statuses": {
+          "pending": "待处理",
+          "reviewing": "审核中",
+          "reviewed": "已审核",
+          "resolved": "已解决"
+        },
+        "sources": {
+          "directory_contact": "组织架构同步",
+          "sso_login": "SSO 登录",
+          "im_inbound": "IM 入站",
+          "account_registration": "账号注册",
+          "unknown": "身份归一化"
+        },
+        "fields": {
+          "phone": "手机号",
+          "email": "邮箱"
+        },
+        "reasons": {
+          "lower_priority_identity_mismatch": "低优先级身份字段指向了另一个平台用户。",
+          "bound_subject_contact_mismatch": "新获取的联系方式与该身份源主体已绑定的平台用户不一致。"
+        },
+        "recommendations": {
+          "correct_source_and_resync": "核对来源通讯录中的联系方式，必要时在上游修正后重新同步。",
+          "verify_login_claim_mapping": "核对登录字段映射和身份源账号信息，再重新登录验证。",
+          "verify_channel_binding": "先核对通道安装范围和发送者绑定，再决定是否接受联系方式变更。",
+          "keep_binding_and_verify_contact": "保留现有主体绑定，并请身份源管理员核验新的联系方式。",
+          "choose_binding_owner": "请选择该来源账号应归属的平台用户；确认操作前，现有绑定保持不变。",
+          "verify_registration_claims": "保持人员分离前，请核对注册字段映射和来源声明。",
+          "inspect_identity_evidence": "核实来源证据后，再申请人工身份修复。"
+        },
+        "actions": {
+          "rebind_source_to_highest_priority": "仅重绑当前来源",
+          "merge_users": "合并用户",
+          "keep_people_separate": "确认两人保持分离"
+        },
+        "confirmations": {
+          "rebind_source_to_highest_priority": "此操作会把该目录来源账号、其精确通道标识及来源关联关系重绑到最高优先级命中的用户，不会合并或删除任何平台用户。",
+          "merge_users": "确认合并并保留“{{name}}”？手机号将使用“{{phone}}”，邮箱将使用“{{email}}”。当前租户内其他冲突用户将停用，其目录账号、通道绑定和数字员工关系会统一迁移。",
+          "keep_people_separate": "此操作确认两个平台用户是不同人员并保留来源绑定；相同证据后续不再重复告警，来源证据变化时会重新产生冲突。"
+        },
+        "unavailable": {
+          "missing_verified_evidence": "该历史记录缺少可在当前租户内验证的修复证据，无法直接操作。请重新同步该身份源以生成新的可处理冲突。",
+          "evidence_changed": "当前来源字段已与本条冲突快照不一致，请重新同步并核对新证据后再处理。",
+          "invalid_source_scope": "该来源账号已不属于当前租户和身份源，无法直接修复本条记录。"
+        },
+        "resolvedWith": "已解决：{{action}}",
+        "outcomes": {
+          "source_correction_requested": "已要求修正来源数据，修正后需重新同步",
+          "confirmed_distinct_people": "已确认是不同人员，保持分离",
+          "manual_identity_repair_required": "需要人工身份修复"
+        }
+      },
       "orgBrowser": "组织架构浏览",
       "allDepartments": "全部",
-      "searchMembers": "搜索成员...",
+      "directoryLoading": "正在加载组织架构…",
+      "directoryLoadRetry": "加载失败，点击重试",
+      "searchMembers": "搜索姓名、手机号或邮箱...",
       "member": "成员",
       "admin": "管理员",
       "noMembers": "暂无成员",
@@ -3719,6 +3862,7 @@
       "body": "正文",
       "resetDefault": "重置为默认值",
       "saved": "邮件模板已保存",
+      "saveFailed": "保存邮件模板失败",
       "emailVerification": "邮箱验证码",
       "emailVerificationDesc": "用户注册并需要验证邮箱地址时发送。",
       "emailVerificationSubject": "验证您的平台邮箱地址",
@@ -3786,16 +3930,21 @@
           "desc": "Google 目录同步 + SSO"
         },
         "oauth2": {
-          "name": "OAuth2",
-          "desc": "通用 OIDC 提供商"
+          "name": "OAuth 2.0 / SCIM 2.0",
+          "desc": "单点登录与组织架构同步"
         }
+      },
+      "addNamedProvider": "添加 {{name}}",
+      "providerConnection": "身份源连接",
+      "directoryProtocols": {
+        "scim": "SCIM 2.0"
       },
       "providerHints": {
         "feishu": "飞书：需填写 app_id, app_secret（可选：encrypt_key, verification_token）",
         "dingtalk": "钉钉：通讯录同步需填写 app_key 和 app_secret；钉钉登录可选开启。",
         "wecom": "企业微信：传统模式需 corp_id, secret, agent_id；智能机器人模式需 bot_id, bot_secret",
         "google_workspace": "Google Workspace：同一套 Client ID、Client Secret 和同一个 Redirect URL 同时用于 SSO 与管理员授权的目录同步",
-        "oauth2": "OAuth2：填写 App ID、App Secret、授权地址、Token地址、用户信息地址",
+        "oauth2": "OAuth 2.0 / OpenID Connect 单点登录与 SCIM 2.0 组织架构同步",
         "saml": "SAML：需填写 entry_point, issuer, cert (公钥)",
         "microsoft_teams": "Microsoft Teams：需填写 client_id, client_secret, tenant_id"
       },
@@ -3814,13 +3963,32 @@
       "authorizeUrl": "授权地址",
       "tokenUrl": "Token 地址",
       "userInfoUrl": "用户信息地址",
+      "scimBaseUrl": "SCIM 2.0 服务地址",
+      "scimBaseUrlPlaceholder": "https://example.com/scim/v2",
+      "scimBaseUrlHint": "SCIM 目录同步与 OAuth 登录共用同一组 Client ID 和 Client Secret，并使用 HTTP Basic 鉴权。",
+      "providerEnabled": "启用此身份源",
+      "providerEnabledHint": "停用后将暂停此身份源的登录和组织架构同步。",
+      "enterpriseRootMapping": {
+        "title": "企业根组织",
+        "placeholder": "输入平台企业根名称",
+        "hint": "将此身份源的顶层组织映射到平台标准组织树；上游没有唯一根时，平台自动归入该企业根。"
+      },
       "corpId": "企业 ID",
+      "directorySecret": "通讯录密钥",
       "secret": "密钥",
       "agentId": "应用 ID（可选）",
       "botId": "机器人 ID（智能机器人）",
       "botSecret": "机器人密钥",
       "appKey": "App Key",
+      "appId": "App ID",
       "appSecret": "App Secret",
+      "googleOAuthTitle": "Google OAuth",
+      "googleDirectoryAuthorization": "目录同步授权",
+      "googleAuthorizeAdminSync": "授权管理员同步",
+      "googleReauthorizeAdminSync": "重新授权管理员同步",
+      "googleSaveFirst": "请先保存身份源配置。",
+      "googleAuthorizedAs": "已授权账号：{{email}}",
+      "googleDirectoryAuthorizationHint": "使用 Google Workspace 管理员账号授权目录读取；平台将保存刷新令牌用于定时同步。",
       "wecomNotice": {
         "title": "企业微信集成前置条件",
         "syncTitle": "1. 通讯录同步",
@@ -3832,7 +4000,9 @@
         "footerText": "由于上述限制，目前大多数用户无法轻松完成企业微信集成配置。我们正在积极探索替代方案——包括申请企微服务商（ISV）资质及寻找限制更少的接入方式——同时也希望企微能够降低对 SaaS 平台的接入门槛。待可行路径明确后，配置入口将重新开启。"
       },
       "statusActive": "已配置",
+      "statusInactive": "已停用",
       "statusNotConfigured": "未配置",
+      "lastSynced": "同步于：{{date}}",
       "syncDirectory": "同步通讯录",
       "syncSyncing": "同步中...",
       "syncComplete": "同步完成：{{departments}} 部门 · {{members}} 成员 · 新建 {{users_created}} 用户 · 同步 {{profiles_synced}} 档案",
@@ -3847,11 +4017,48 @@
       "oauth2": "OAuth2",
       "scope": "Scope",
       "fieldMapping": "字段映射",
+      "loginFieldMapping": "登录字段映射",
+      "loginFieldMappingHint": "输入上游响应中的完整字段路径；平台按原路径读取，不自动拼接字段层级。",
+      "directoryFieldMapping": "目录字段映射",
+      "directoryFieldMappingHint": "配置平台组织成员字段对应的 SCIM 2.0 用户属性路径。",
+      "fieldDiscovery": {
+        "action": "探测字段",
+        "running": "探测中...",
+        "targetAccount": "目标账号",
+        "targetAccountPlaceholder": "用户名、邮箱或用户 ID",
+        "saveFirst": "请先保存身份源配置，再探测字段。",
+        "failed": "字段探测失败，请检查服务地址、凭据和协议配置。"
+      },
+      "directoryFields": {
+        "name": "姓名",
+        "email": "邮箱",
+        "mobile": "手机号",
+        "avatar": "头像",
+        "title": "职位",
+        "employee_number": "员工编号",
+        "organization": "组织",
+        "division": "事业部",
+        "department": "部门"
+      },
+      "identityMatchPriority": {
+        "title": "身份匹配优先级",
+        "hint": "系统严格按照列表顺序执行规范化精确匹配；低优先级字段冲突时只标记待处理，不自动合并账号。",
+        "addField": "添加匹配字段",
+        "fieldAriaLabel": "第 {{position}} 优先级匹配字段",
+        "moveUp": "上移",
+        "moveDown": "下移",
+        "remove": "删除此匹配字段",
+        "fields": {
+          "phone": "手机号",
+          "email": "邮箱"
+        }
+      },
       "fieldMappingHint": "可选，留空使用标准 OIDC 字段",
       "userIdField": "用户 ID 字段",
       "nameField": "姓名字段",
       "emailField": "邮箱字段",
       "mobileField": "手机号字段",
+      "avatarField": "头像字段",
       "clearField": "清空此字段",
       "clearAllMappings": "清空所有字段映射",
       "hasCustomMapping": "当前已配置自定义字段映射",
@@ -3971,7 +4178,7 @@
     "executionTitle": "选择执行人",
     "subtitle": "新增成员默认获得“使用”权限",
     "executionSubtitle": "选择后续后台执行所使用的用户权限",
-    "search": "搜索姓名、拼音或部门路径...",
+    "search": "搜索姓名、手机号或邮箱...",
     "organization": "组织架构",
     "allMembers": "全部成员",
     "myDepartment": "我的部门",
@@ -4004,7 +4211,13 @@
     "companySearchResults": "全公司搜索结果",
     "members": "人",
     "nickname": "昵称",
-    "required": "系统保留"
+    "required": "系统保留",
+    "clearSearch": "清除搜索",
+    "accessLevel": "{{name}}的访问级别",
+    "linkedProviders": "已关联身份源",
+    "providerNames": {
+      "platform": "平台"
+    }
   },
   "common": {
     "pagination": {
@@ -4137,6 +4350,7 @@
     "minutes": "分钟",
     "saveFailed": "保存失败",
     "saved": "已保存",
+    "unknownError": "未知错误",
     "switchLanguage": "切换语言"
   },
   "admin": {
@@ -4144,10 +4358,34 @@
     "desc": "管理所有公司，创建新公司，配置平台级设置。",
     "createCompany": "创建公司",
     "platformSettings": "平台设置",
+    "settingUpdated": "设置已更新",
+    "settingsUpdateFailed": "更新设置失败",
     "allowSelfCreate": "允许用户自行创建公司",
     "allowSelfCreateDesc": "关闭后，仅平台管理员可以创建公司。",
+    "passwordLoginEnabled": "启用账号密码登录",
+    "passwordLoginEnabledDesc": "关闭后，接口将拒绝账号密码登录，登录页也会隐藏密码登录入口；已启用的 SSO 登录不受影响。",
+    "accountRegistrationEnabled": "允许用户注册账号",
+    "accountRegistrationEnabledDesc": "关闭后，接口将拒绝用户自行注册账号，登录页也会隐藏注册入口。",
     "ssoCustomDomainRedirect": "启用租户 SSO 自定义域名重定向",
     "ssoCustomDomainRedirectDesc": "关闭后，整个平台所有的租户都无法使用自定义域名或专属链接跳转到单点登录提供商。",
+    "oauth": {
+      "title": "OAuth 登录",
+      "description": "配置平台统一使用的第三方登录方式；启用后会显示在登录页。",
+      "scopeSummary": "授权范围：{{scope}}",
+      "toggleProvider": "启用 {{provider}} 登录",
+      "clientId": "客户端 ID",
+      "clientSecret": "客户端密钥",
+      "scope": "授权范围",
+      "githubClientIdPlaceholder": "GitHub OAuth 应用客户端 ID",
+      "clientSecretPlaceholder": "{{provider}} 客户端密钥",
+      "authorizedRedirectUri": "授权重定向地址",
+      "authorizationCallbackUrl": "授权回调地址",
+      "enabledStatus": "已显示在登录页",
+      "disabledStatus": "配置已保存，当前未启用",
+      "credentialsRequired": "请填写 {{provider}} 客户端 ID 和客户端密钥",
+      "saved": "{{provider}} OAuth 设置已保存",
+      "saveFailed": "保存 {{provider}} OAuth 设置失败"
+    },
     "inviteCodeRequired": "注册需要邀请码",
     "inviteCodeRequiredDesc": "开启后，新用户必须提供有效的邀请码才能注册。",
     "companyNamePlaceholder": "公司名称",
@@ -4184,7 +4422,6 @@
       "companies": "公司"
     },
     "platformSettingsDesc": "管理平台级设置和公司租户。",
-    "settingUpdated": "设置已更新",
     "sso": "SSO",
     "orgAdmin": "管理员邮箱",
     "createdAt": "创建时间",
@@ -4195,8 +4432,26 @@
     "noFilterResults": "当前筛选条件下没有公司。",
     "publicUrl": {
       "title": "公开访问地址",
-      "desc": "用于 Webhook 回调和发布页面链接的外部 URL。请包含协议（如 https://example.com）。"
+      "desc": "用于 Webhook 回调和发布页面链接的外部 URL。请包含协议（如 https://example.com）。",
+      "placeholder": "https://your-domain.com"
     },
+    "createCompanyFailed": "创建公司失败",
+    "companyUpdateFailed": "更新公司失败",
+    "companyStatusUpdateFailed": "更新公司状态失败",
+    "companyEnabledSuccess": "公司已启用",
+    "companyDisabledSuccess": "公司已停用",
+    "companyDeletedSuccess": "公司“{{name}}”已删除",
+    "deleteCompanyFailed": "删除公司失败",
+    "ssoStatusEnabled": "SSO 已启用",
+    "ssoStatusDisabled": "SSO 未启用",
+    "invitationCodes": "邀请码",
+    "invitationCodesForCompany": "邀请码 — {{name}}",
+    "newInvitationCode": "新生成的邀请码",
+    "validInvitationCodes": "有效邀请码",
+    "noValidInvitationCodes": "暂无有效邀请码",
+    "invitationCodeUsage": "已使用 {{used}}/{{max}} 次",
+    "generateInvitationCode": "生成新邀请码",
+    "invitationCodeCreateFailed": "生成邀请码失败",
     "domainConfig": "域名配置",
     "domainConfigDesc": "为企业配置专属访问域名。",
     "subdomainPrefix": "子域名前缀",
@@ -4452,6 +4707,8 @@
       "totalTokens": "总 Token 数",
       "lastActive": "最后活跃",
       "daysInactive": "未活跃天数",
+      "never": "从未活跃",
+      "dayCount": "{{count}} 天",
       "noWarnings": "无流失预警 — 所有活跃公司状态健康"
     },
     "leaderboards": {
@@ -4464,6 +4721,7 @@
         "tooltip": "按累计 Token 消耗排名的数字员工"
       }
     },
+    "cacheUsage": "缓存 {{tokens}} · {{rate}}%",
     "loading": "加载中...",
     "noData": "暂无数据"
   },

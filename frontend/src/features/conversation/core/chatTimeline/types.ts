@@ -29,6 +29,7 @@ export type ConversationMessage = {
   sender_name?: string;
   sender_user_id?: string;
   sender_agent_id?: string;
+  sender_avatar_url?: string;
   confirmationToolCalls?: ConversationMessage[];
   turnAnchorId?: string;
   turnGeneration?: number;

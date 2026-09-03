@@ -335,7 +335,7 @@ export default function CompanyListPanel(props: any) {
                           color: "var(--accent-primary)",
                           fontSize: "14px",
                         }}
-                        title="SSO Enabled"
+                        title={t("admin.ssoStatusEnabled", "SSO enabled")}
                       >
                         <ShieldCheck size={14} />
                       </span>
@@ -360,7 +360,7 @@ export default function CompanyListPanel(props: any) {
                   ) : (
                     <span
                       style={{ color: "var(--text-tertiary)", opacity: 0.3 }}
-                      title="SSO Disabled"
+                      title={t("admin.ssoStatusDisabled", "SSO disabled")}
                     >
                       —
                     </span>
@@ -423,7 +423,7 @@ export default function CompanyListPanel(props: any) {
                     }}
                     onClick={() => handleViewCodes(c.id, c.name)}
                   >
-                    邀请码
+                    {t("admin.invitationCodes", "Invitation codes")}
                   </button>
                   <button
                     className="btn btn-ghost"

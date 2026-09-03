@@ -70,6 +70,7 @@ export function useH5AgentChatState() {
     const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime | 'detecting'>('detecting');
 
     const token = useAuthStore((s) => s.token);
+    const currentUser = useAuthStore((s) => s.user);
     const setAuth = useAuthStore((s) => s.setAuth);
 
     const [authStatus, setAuthStatus] = useState<AuthStatus>('checking');
@@ -436,6 +437,7 @@ export function useH5AgentChatState() {
         containerRuntime,
         setContainerRuntime,
         token,
+        currentUser,
         setAuth,
         authStatus,
         setAuthStatus,

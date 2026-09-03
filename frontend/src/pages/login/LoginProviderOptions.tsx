@@ -1,47 +1,32 @@
 import type { TFunction } from 'i18next';
 
-const ssoMeta: Record<string, { label: string; icon: string }> = {
-    feishu: { label: 'Feishu', icon: '/feishu.png' },
-    dingtalk: { label: 'DingTalk', icon: '/dingtalk.png' },
-    wecom: { label: 'WeCom', icon: '/wecom.png' },
-    google: { label: 'Google', icon: '/google.svg' },
-    google_workspace: { label: 'Google', icon: '/google.svg' },
+const ssoMeta: Record<string, { labelKey: string; fallback: string; icon: string }> = {
+    feishu: { labelKey: 'enterprise.identity.providers.feishu.name', fallback: 'Feishu', icon: '/feishu.png' },
+    dingtalk: { labelKey: 'enterprise.identity.providers.dingtalk.name', fallback: 'DingTalk', icon: '/dingtalk.png' },
+    wecom: { labelKey: 'enterprise.identity.providers.wecom.name', fallback: 'WeCom', icon: '/wecom.png' },
+    google: { labelKey: 'enterprise.identity.providers.google_workspace.name', fallback: 'Google', icon: '/google.svg' },
+    google_workspace: { labelKey: 'enterprise.identity.providers.google_workspace.name', fallback: 'Google', icon: '/google.svg' },
 };
 
 interface SsoLoginOptionsProps {
-    loginTenantId: string;
-    tenant: any;
     providers: any[];
     loading: boolean;
     error: string;
     onStart: (providerType: string) => void | Promise<void>;
+    showDivider: boolean;
     t: TFunction;
 }
 
 export function SsoLoginOptions({
-    loginTenantId,
-    tenant,
     providers,
     loading,
     error,
     onStart,
+    showDivider,
     t,
 }: SsoLoginOptionsProps) {
     return (
         <div style={{ marginBottom: '24px' }}>
-            <div style={{
-                padding: '16px', borderRadius: '12px', background: 'rgba(59,130,246,0.08)',
-                border: '1px solid rgba(59,130,246,0.15)', marginBottom: '16px',
-                textAlign: 'center'
-            }}>
-                <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '4px' }}>
-                    {(tenant?.id === loginTenantId && tenant?.name) || t('auth.enterpriseLogin', 'Enterprise login')}
-                </div>
-                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                    {t('auth.ssoNotice', 'Enterprise SSO is enabled for this domain.')}
-                </div>
-            </div>
-
             {loading && (
                 <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
                     {t('auth.ssoLoading', 'Loading SSO providers...')}
@@ -51,7 +36,10 @@ export function SsoLoginOptions({
             {!loading && providers.length > 0 && (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
                     {providers.map(p => {
-                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
+                        const meta = ssoMeta[p.provider_type];
+                        const label = meta
+                            ? t(meta.labelKey, meta.fallback)
+                            : p.name || p.provider_type;
                         return (
                             <button
                                 key={p.provider_type}
@@ -67,14 +55,14 @@ export function SsoLoginOptions({
                                 }}
                                 onClick={() => onStart(p.provider_type)}
                             >
-                                {meta.icon ? (
-                                    <img src={meta.icon} alt={meta.label} width={18} height={18} />
+                                {meta?.icon ? (
+                                    <img src={meta.icon} alt="" aria-hidden="true" width={18} height={18} />
                                 ) : (
                                     <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
-                                        {(meta.label || '').slice(0, 1).toUpperCase()}
+                                        {label.slice(0, 1).toUpperCase()}
                                     </span>
                                 )}
-                                {meta.label || p.name || p.provider_type}
+                                {label}
                             </button>
                         );
                     })}
@@ -87,14 +75,7 @@ export function SsoLoginOptions({
                 </div>
             )}
 
-            <div style={{
-                display: 'flex', alignItems: 'center', gap: '12px',
-                margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
-            }}>
-                <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
-                {t('auth.or', 'or')}
-                <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
-            </div>
+            {showDivider && <LoginOptionDivider t={t} />}
         </div>
     );
 }
@@ -104,22 +85,26 @@ interface OAuthLoginOptionsProps {
     loading: boolean;
     error: string;
     onStart: (providerType: string) => void | Promise<void>;
+    showDivider: boolean;
     t: TFunction;
 }
 
-export function OAuthLoginOptions({ providers, loading, error, onStart, t }: OAuthLoginOptionsProps) {
+export function OAuthLoginOptions({ providers, loading, error, onStart, showDivider, t }: OAuthLoginOptionsProps) {
     return (
         <div style={{ marginBottom: '24px' }}>
             {loading && (
                 <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
-                    Loading social login providers...
+                    {t('auth.oauthLoading', 'Loading social login providers...')}
                 </div>
             )}
 
             {!loading && providers.length > 0 && (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
                     {providers.map(p => {
-                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
+                        const meta = ssoMeta[p.provider_type];
+                        const label = meta
+                            ? t(meta.labelKey, meta.fallback)
+                            : p.name || p.provider_type;
                         return (
                             <button
                                 key={p.provider_type}
@@ -136,7 +121,7 @@ export function OAuthLoginOptions({ providers, loading, error, onStart, t }: OAu
                                 }}
                                 onClick={() => onStart(p.provider_type)}
                             >
-                                {meta.icon ? (
+                                {meta?.icon ? (
                                     <img
                                         src={meta.icon}
                                         width={18}
@@ -146,10 +131,10 @@ export function OAuthLoginOptions({ providers, loading, error, onStart, t }: OAu
                                     />
                                 ) : (
                                     <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
-                                        {(meta.label || '').slice(0, 1).toUpperCase()}
+                                        {label.slice(0, 1).toUpperCase()}
                                     </span>
                                 )}
-                                Continue with {meta.label || p.name || p.provider_type}
+                                {t('auth.continueWithProvider', 'Continue with {{provider}}', { provider: label })}
                             </button>
                         );
                     })}
@@ -162,16 +147,20 @@ export function OAuthLoginOptions({ providers, loading, error, onStart, t }: OAu
                 </div>
             )}
 
-            {!loading && providers.length > 0 && (
-                <div style={{
-                    display: 'flex', alignItems: 'center', gap: '12px',
-                    margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
-                }}>
-                    <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
-                    {t('auth.or', 'or')}
-                    <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
-                </div>
-            )}
+            {!loading && providers.length > 0 && showDivider && <LoginOptionDivider t={t} />}
+        </div>
+    );
+}
+
+function LoginOptionDivider({ t }: { t: TFunction }) {
+    return (
+        <div style={{
+            display: 'flex', alignItems: 'center', gap: '12px',
+            margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
+        }}>
+            <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+            {t('auth.or', 'or')}
+            <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
         </div>
     );
 }
