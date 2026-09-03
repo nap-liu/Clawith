@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -19,6 +20,7 @@ from app.services.dingtalk_provisioning_types import (
     DingTalkRegistrationError,
     PollingWindow,
 )
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -43,6 +45,44 @@ def _extract_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _as_string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _normalized_source_key(value: str) -> str:
+    return "".join(character.lower() for character in value if character.isalnum())
+
+
+def _authorization_url_with_bootstrap(url: str, *, source: str) -> str:
+    """Restore the DingTalk registration bootstrap for its new app-page URL."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "open-dev.dingtalk.com"
+        or parsed.path != "/fe/app"
+        or parsed.fragment
+    ):
+        return url
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    hash_values = query.get("hash", [])
+    user_code_values = query.get("user_code", [])
+    source_values = query.get("source", [])
+    if not (
+        hash_values == ["createClawRobot"]
+        and len(user_code_values) == 1
+        and 0 < len(user_code_values[0]) <= 128
+        and len(source_values) == 1
+        and _normalized_source_key(source_values[0]) == _normalized_source_key(source)
+    ):
+        return url
+
+    bootstrap_path = f"/openapp/registration/{quote(source, safe='')}"
+    bootstrap_query = urlencode(
+        {
+            "user_code": user_code_values[0],
+            "source": source_values[0],
+        }
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, bootstrap_path, bootstrap_query, ""))
 
 
 def _configured_dingtalk_fingerprint(config: ChannelConfig | None) -> str | None:
@@ -153,7 +193,10 @@ class DingTalkRegistrationClient:
             raise DingTalkRegistrationError("DingTalk registration begin response missing verification_uri_complete")
         return {
             "device_code": device_code,
-            "verification_uri_complete": authorization_url,
+            "verification_uri_complete": _authorization_url_with_bootstrap(
+                authorization_url,
+                source=self.source,
+            ),
             "verification_uri": _as_string(begin_data.get("verification_uri")) or None,
             "expires_in": begin_data.get("expires_in", 7200),
             "interval": begin_data.get("interval", 3),
