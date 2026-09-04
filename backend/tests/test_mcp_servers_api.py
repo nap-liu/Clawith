@@ -1,14 +1,16 @@
 """CRUD + ACL + cred-masking tests for /api/admin/mcp-servers."""
 import uuid
-import pytest
+
 import httpx
+import pytest
 from sqlalchemy import select
-from app.database import async_session, engine
-from app.models.user import User, Identity
-from app.models.mcp_server import MCPServer
-from app.models.agent import Agent
-from app.models.tool import AgentTool, Tool
+
 from app.core.security import create_access_token
+from app.database import async_session, engine
+from app.models.agent import Agent
+from app.models.mcp_server import MCPServer
+from app.models.tool import AgentTool, Tool
+from app.models.user import Identity, User
 
 pytestmark = pytest.mark.asyncio
 
@@ -300,13 +302,15 @@ async def test_test_connection_rejects_non_owner_member(client):
 # Credential safety: PATCH with credential_template=null must not clear value
 # ---------------------------------------------------------------------------
 
-async def test_patch_credential_none_does_not_clear(client):
+async def test_patch_masks_do_not_clear_stored_secrets(client):
     _, admin_token = await _make_user("platform_admin")
     suffix = uuid.uuid4().hex[:6]
     async with async_session() as db:
         srv = MCPServer(
             name=f"keep_{suffix}", display_name="k", base_url_template="https://k",
             headers_template={}, credential_template="must-not-vanish",
+            transport="stdio", command_template="npx",
+            env_template={"API_TOKEN": "must-also-survive", "MODE": "safe"},
         )
         db.add(srv)
         await db.commit()
@@ -316,12 +320,18 @@ async def test_patch_credential_none_does_not_clear(client):
     # Send credential_template: null — should be ignored per schema contract
     r = await client.patch(
         f"/api/admin/mcp-servers/{srv_id}",
-        json={"credential_template": None, "display_name": "k2"},
+        json={
+            "credential_template": None,
+            "display_name": "k2",
+            "env_template": {"API_TOKEN": "***", "MODE": "safe"},
+        },
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert r.status_code == 200
     assert r.json()["credential_state"] == "set"  # NOT cleared
+    assert r.json()["env_template"]["API_TOKEN"] == "***"
 
     async with async_session() as db:
         srv2 = (await db.execute(select(MCPServer).where(MCPServer.id == srv_id))).scalar_one()
         assert srv2.credential_template == "must-not-vanish"
+        assert srv2.env_template["API_TOKEN"] == "must-also-survive"
