@@ -10,6 +10,7 @@ from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_featur
 from app.core.plaza_feature import PLAZA_TOOL_NAMES
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
+from app.services.mcp_permissions import assert_can_manage_tenant_tools
 from app.services.tool_config import (
     decrypt_sensitive_fields,
     encrypt_sensitive_fields,
@@ -48,12 +49,7 @@ def _require_platform_admin(user: User) -> None:
 
 
 def _require_tenant_tool_admin(user: User, tenant_id: uuid.UUID | None) -> None:
-    """Allow platform admins everywhere and org admins only in their tenant."""
-    if _is_platform_admin(user):
-        return
-    if user.role == "org_admin" and tenant_id is not None and user.tenant_id == tenant_id:
-        return
-    raise HTTPException(status_code=403, detail="Organization admin required")
+    assert_can_manage_tenant_tools(user, tenant_id)
 
 
 def _can_view_unmasked_company_config(user: User, tenant_id: uuid.UUID | None) -> bool:

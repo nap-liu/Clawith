@@ -2,6 +2,8 @@ import { fetchJson } from './api';
 import type {
   MCPServer,
   MCPServerCreatePayload,
+  MCPServerImportPayload,
+  MCPServerImportResult,
   MCPServerUpdatePayload,
   TestConnectionResult,
   MCPToolRefreshResult,
@@ -20,6 +22,11 @@ export const mcpServersApi = {
   },
   create: (data: MCPServerCreatePayload) =>
     fetchJson<MCPServer>('/admin/mcp-servers', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  import: (data: MCPServerImportPayload) =>
+    fetchJson<MCPServerImportResult>('/admin/mcp-servers/import', {
       method: 'POST',
       body: JSON.stringify(data),
     }),

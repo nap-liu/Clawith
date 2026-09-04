@@ -6,13 +6,6 @@ from fastapi import Depends, HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_current_user
-from app.database import get_db
-from app.models.mcp_server import MCPServer
-from app.models.tool import AgentTool, Tool
-from app.models.user import User
-from app.services.user_output import sanitize_user_visible_text
-
 from app.api.tools_models import BulkToolUpdateItem, MCPServerUpdate, ToolCreate, ToolUpdate
 from app.api.tools_shared import (
     _can_view_unmasked_company_config,
@@ -31,6 +24,12 @@ from app.api.tools_shared import (
     set_tenant_tool_config,
     tool_is_required,
 )
+from app.core.security import get_current_user
+from app.database import get_db
+from app.models.mcp_server import MCPServer
+from app.models.tool import AgentTool, Tool
+from app.models.user import User
+from app.services.user_output import sanitize_user_visible_text
 
 
 @router.get("")
@@ -41,7 +40,8 @@ async def list_tools(
 ):
     """List platform tools scoped by tenant (builtin + tenant-specific)."""
     query = (
-        select(Tool)
+        select(Tool, MCPServer.display_name.label("mcp_server_display_name"))
+        .outerjoin(MCPServer, MCPServer.id == Tool.mcp_server_id)
         .where(_feature_visible_tool_clause(), Tool.source.in_(["builtin", "admin"]))
         .order_by(Tool.category, Tool.name)
     )
@@ -51,9 +51,8 @@ async def list_tools(
         from sqlalchemy import or_ as _or
         query = query.where(_or(Tool.tenant_id == None, Tool.tenant_id == target_tenant_id))
     result = await db.execute(query)
-    tools = result.scalars().all()
     response = []
-    for t in tools:
+    for t, mcp_server_display_name in result.all():
         company_config = await get_tool_company_config(db, t, target_tenant_id)
         visible_company_config = (
             company_config
@@ -71,6 +70,7 @@ async def list_tools(
             "parameters_schema": t.parameters_schema,
             "mcp_server_url": t.mcp_server_url,
             "mcp_server_name": t.mcp_server_name,
+            "mcp_server_display_name": mcp_server_display_name,
             "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "mcp_tool_name": t.mcp_tool_name,
             "enabled": True if tool_is_required(t.name) else t.enabled,
@@ -205,14 +205,14 @@ async def update_mcp_server(
     # the create branch.
     from app.services.mcp_permissions import (
         assert_can_create_server_in_tenant,
-        assert_can_edit_server,
+        assert_can_patch_server,
     )
     srv_q = await db.execute(
         select(MCPServer).where(MCPServer.name == data.server_name).limit(1)
     )
     srv = srv_q.scalar_one_or_none()
     if srv is not None:
-        assert_can_edit_server(current_user, srv)
+        await assert_can_patch_server(current_user, srv, db)
     else:
         assert_can_create_server_in_tenant(current_user, target_tenant_id)
 

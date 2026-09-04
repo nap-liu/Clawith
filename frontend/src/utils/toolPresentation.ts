@@ -12,6 +12,7 @@ export interface ToolPresentationSource {
     type?: string | null;
     mcp_server_id?: string | null;
     mcp_server_name?: string | null;
+    mcp_server_display_name?: string | null;
 }
 
 export interface LocalizedToolCategoryPresentation {
@@ -87,7 +88,8 @@ export function getLocalizedToolPresentation(
     const fallbackName = text(tool.display_name) || text(tool.tool_display_name) || identifier;
     const fallbackDescription = text(tool.description);
     const category = getLocalizedToolCategoryPresentation(t, tool.category);
-    const serverName = text(tool.mcp_server_name);
+    const internalServerName = text(tool.mcp_server_name);
+    const serverName = text(tool.mcp_server_display_name) || internalServerName;
     const isMcpGroup = tool.type === 'mcp' && Boolean(serverName);
     const groupKey = isMcpGroup
         ? `mcp:${text(tool.mcp_server_id) || serverName.toLocaleLowerCase()}`
@@ -125,6 +127,7 @@ export function getLocalizedToolPresentation(
             fallbackDescription,
             description,
             serverName,
+            internalServerName,
             category.key,
             category.label,
         ].filter(Boolean).join(' ').toLocaleLowerCase(),

@@ -35,6 +35,9 @@ class _Result:
     def scalars(self):
         return _Scalars(self._values)
 
+    def all(self):
+        return [(value, None) for value in self._values]
+
     def scalar_one_or_none(self):
         return self._scalar
 

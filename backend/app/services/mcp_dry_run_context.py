@@ -9,10 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
 from app.models.user import User
+from app.services.mcp_secret_fields import mask_sensitive_headers
 from app.services.placeholder_engine import PlaceholderContext
-
-
-_AUTH_HEADER_KEYS = {"authorization", "x-api-key", "x-auth-token"}
 
 
 async def _build_user_ctx(
@@ -50,10 +48,4 @@ async def _build_user_ctx(
 
 
 def _mask_auth_headers(headers: dict[str, str]) -> dict[str, str]:
-    out = {}
-    for k, v in headers.items():
-        if k.lower() in _AUTH_HEADER_KEYS:
-            out[k] = "Bearer ***" if v else ""
-        else:
-            out[k] = v
-    return out
+    return mask_sensitive_headers(headers)

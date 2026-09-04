@@ -31,6 +31,25 @@ export interface MCPServerCreatePayload {
   env_template?: Record<string, string> | null;
 }
 
+export interface MCPServerImportPayload {
+  display_name: string;
+  tenant_id?: string | null;
+  transport: 'http' | 'stdio';
+  base_url_template?: string;
+  headers_template?: Record<string, string>;
+  credential_template?: string | null;
+  command_template?: string | null;
+  args_template?: string[];
+  env_template?: Record<string, string>;
+}
+
+export interface MCPServerImportResult {
+  server: MCPServer;
+  discovered: number;
+  created: number;
+  effective: 'next_turn';
+}
+
 export interface MCPServerUpdatePayload {
   display_name?: string;
   transport?: 'http' | 'stdio';

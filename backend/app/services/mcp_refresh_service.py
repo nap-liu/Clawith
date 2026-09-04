@@ -8,7 +8,6 @@ delete tools that are absent from a later ``tools/list`` response.
 
 from __future__ import annotations
 
-import hashlib
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -22,6 +21,7 @@ from app.models.mcp_server import MCPServer
 from app.models.project import ProjectCapabilityBinding
 from app.models.tool import AgentTool, Tool
 from app.services.mcp_client import MCPClient
+from app.services.mcp_naming import tool_function_name
 from app.services.mcp_server_service import (
     agent_private_server_name,
     build_placeholder_context_for_call,
@@ -51,11 +51,7 @@ def _platform_context(server: MCPServer) -> PlaceholderContext:
 
 def _tool_name(server: MCPServer, remote_name: str) -> str:
     """Build a stable Tool.name that fits the database's varchar(100)."""
-    value = f"mcp_{server.name}_{remote_name}"
-    if len(value) <= 100:
-        return value
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
-    return f"{value[:89]}_{digest}"
+    return tool_function_name(server, remote_name)
 
 
 def _agent_workspace_root(agent_id: uuid.UUID):
