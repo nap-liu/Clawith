@@ -164,6 +164,7 @@ export interface ProjectAgentOption {
   primary_model_id?: string | null;
   fallback_model_id?: string | null;
   temperature?: number | null;
+  reasoning_effort?: string | null;
   max_tool_rounds?: number | null;
 }
 
@@ -191,6 +192,7 @@ export interface ProjectAgentSettingsDraft {
     primary_model_id?: string | null;
     fallback_model_id?: string | null;
     temperature?: number | null;
+    reasoning_effort?: string | null;
     max_tool_rounds?: number | string | null;
     project_instruction?: string;
   };

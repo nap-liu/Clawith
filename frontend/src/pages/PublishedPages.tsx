@@ -13,6 +13,7 @@ import Pagination from "../components/Pagination";
 import ConfirmModal from "../components/ConfirmModal";
 import PublishedPageAttribution from "../components/PublishedPageAttribution";
 import PublishedPageFilters, {
+  type PublishedPageAccessModeFilter,
   type PublishedPageAgentOption,
 } from "../components/PublishedPageFilters";
 import SelectDropdown from "../components/SelectDropdown";
@@ -61,6 +62,14 @@ export default function PublishedPages() {
     ]),
   ).sort();
   const selectedAgentIdsKey = selectedAgentIds.join(",");
+  const rawAccessMode = searchParams.get("access_mode") || "";
+  const accessMode: PublishedPageAccessModeFilter = [
+    "public",
+    "authenticated",
+    "restricted",
+  ].includes(rawAccessMode)
+    ? (rawAccessMode as PublishedPageAccessModeFilter)
+    : "";
   const searchQuery = searchParams.get("q") || "";
   const pageNo = readPageNumber(searchParams.get("page_no"));
   const pageSize = readPageSize(searchParams.get("page_size"));
@@ -90,6 +99,7 @@ export default function PublishedPages() {
     page_size: String(pageSize),
   });
   selectedAgentIds.forEach((id) => listParams.append("agent_ids", id));
+  if (accessMode) listParams.set("access_mode", accessMode);
   if (searchQuery) listParams.set("q", searchQuery);
   const { data: agentOptions = [] } = useQuery({
     queryKey: ["published-pages", "agent-options"],
@@ -103,6 +113,7 @@ export default function PublishedPages() {
       pageNo,
       pageSize,
       selectedAgentIdsKey,
+      accessMode,
       searchQuery,
     ],
     queryFn: () => fetchJson<Paged<PublishedPage>>(`/pages/mine?${listParams}`),
@@ -132,7 +143,7 @@ export default function PublishedPages() {
     setSelectedPages({});
     setBulkPeople([]);
     setShowBulkConfirm(false);
-  }, [selectedAgentIdsKey, searchQuery]);
+  }, [selectedAgentIdsKey, accessMode, searchQuery]);
 
   useEffect(() => {
     if (!selected) return;
@@ -373,9 +384,11 @@ export default function PublishedPages() {
   }, [visitorData?.total, visitorPage]);
   const pendingUsers =
     selected?.access_users.filter((user) => user.status === "pending") || [];
-  const hasAppliedFilters = Boolean(searchQuery || selectedAgentIds.length);
+  const hasAppliedFilters = Boolean(
+    searchQuery || selectedAgentIds.length || accessMode,
+  );
   const hasResettableFilters = Boolean(
-    searchDraft.trim() || selectedAgentIds.length,
+    searchDraft.trim() || selectedAgentIds.length || accessMode,
   );
 
   return (
@@ -390,9 +403,17 @@ export default function PublishedPages() {
       <PublishedPageFilters
         agents={agentOptions}
         selectedAgentIds={selectedAgentIds}
+        accessMode={accessMode}
         query={searchDraft}
         hasActiveFilters={hasResettableFilters}
         onAgentChange={updateAgentFilter}
+        onAccessModeChange={(nextMode) =>
+          updateSearch({
+            access_mode: nextMode || null,
+            page_no: null,
+            page: null,
+          })
+        }
         onQueryChange={setSearchDraft}
         onSearch={searchPages}
         onReset={() => {
@@ -401,6 +422,7 @@ export default function PublishedPages() {
             q: null,
             agent_id: null,
             agent_ids: null,
+            access_mode: null,
             page_no: null,
             page: null,
           });

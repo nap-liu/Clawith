@@ -52,6 +52,11 @@ class Agent(Base):
             "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
             name="ck_agents_temperature",
         ),
+        CheckConstraint(
+            "reasoning_effort IS NULL OR reasoning_effort IN "
+            "('none','minimal','low','medium','high','xhigh','max')",
+            name="ck_agents_reasoning_effort",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -97,6 +102,7 @@ class Agent(Base):
     primary_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
     fallback_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Autonomy policy (L1/L2/L3)
     autonomy_policy: Mapped[dict] = mapped_column(

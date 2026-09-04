@@ -27,6 +27,7 @@ type MultiSelectDropdownProps = {
   noMatchesLabel: string;
   ariaLabel: string;
   clearLabel?: string;
+  quickClearLabel?: string;
   className?: string;
   portal?: boolean;
   disabled?: boolean;
@@ -43,6 +44,7 @@ export default function MultiSelectDropdown({
   noMatchesLabel,
   ariaLabel,
   clearLabel = "清空",
+  quickClearLabel,
   className = "",
   portal = true,
   disabled = false,
@@ -107,6 +109,7 @@ export default function MultiSelectDropdown({
         : [...values, value],
     );
   };
+  const canQuickClear = values.length > 0 && Boolean(quickClearLabel);
 
   const menu = open ? (
     <div
@@ -191,7 +194,10 @@ export default function MultiSelectDropdown({
   ) : null;
 
   return (
-    <div ref={rootRef} className={`ui-multi-select ${className}`.trim()}>
+    <div
+      ref={rootRef}
+      className={`ui-multi-select${canQuickClear ? " ui-multi-select--quick-clear" : ""} ${className}`.trim()}
+    >
       <Button
         ref={triggerRef}
         type="button"
@@ -212,6 +218,23 @@ export default function MultiSelectDropdown({
         <span className="ui-multi-select__label">{label}</span>
         <IconChevronDown size={16} aria-hidden="true" />
       </Button>
+
+      {canQuickClear && (
+        <Button
+          type="button"
+          variant="ghost"
+          className="ui-multi-select__quick-clear"
+          aria-label={quickClearLabel}
+          title={quickClearLabel}
+          onClick={() => {
+            onChange([]);
+            setQuery("");
+            setOpen(false);
+          }}
+        >
+          <IconX size={16} aria-hidden="true" />
+        </Button>
+      )}
 
       {portal ? menu && createPortal(menu, document.body) : menu}
     </div>

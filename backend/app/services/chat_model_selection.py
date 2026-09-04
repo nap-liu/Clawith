@@ -13,8 +13,10 @@ from app.models.audit import ChatMessage
 from app.models.llm import LLMModel
 from app.models.tenant import Tenant
 from app.services.llm.runtime_model import RuntimeLLMModel
+from app.services.llm.reasoning import validate_reasoning_effort
 
 MODEL_SESSION_CONFIG_KEY = "model_id"
+REASONING_SESSION_CONFIG_KEY = "reasoning_effort"
 
 MODEL_STATUS_OK = "ok"
 MODEL_STATUS_NOT_FOUND = "not_found"
@@ -59,6 +61,7 @@ def _runtime_snapshot(
     *,
     agent: Agent,
     override_temperature: float | None = None,
+    override_reasoning_effort: str | None = None,
 ) -> RuntimeLLMModel | None:
     if model is None:
         return None
@@ -68,7 +71,17 @@ def _runtime_snapshot(
         if override_temperature is not None
         else validate_temperature(getattr(agent, "temperature", None))
     )
-    return replace(snapshot, temperature=effective_temperature) if effective_temperature is not None else snapshot
+    effective_reasoning_effort = (
+        validate_reasoning_effort(override_reasoning_effort)
+        if override_reasoning_effort is not None
+        else validate_reasoning_effort(getattr(agent, "reasoning_effort", None))
+    )
+    changes = {}
+    if effective_temperature is not None:
+        changes["temperature"] = effective_temperature
+    if effective_reasoning_effort is not None:
+        changes["reasoning_effort"] = effective_reasoning_effort
+    return replace(snapshot, **changes) if changes else snapshot
 
 
 def _normalized_model_name(value: str) -> str:
@@ -170,6 +183,7 @@ async def resolve_runtime_models(
     agent: Agent,
     override_model_id: str | uuid.UUID | None = None,
     override_temperature: float | None = None,
+    override_reasoning_effort: str | None = None,
 ) -> RuntimeModelResolution:
     """Resolve the effective primary/fallback pair used by both Web and IM."""
 
@@ -185,8 +199,18 @@ async def resolve_runtime_models(
         primary_orm = fallback_orm
         fallback_orm = None
 
-    primary = _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature)
-    fallback = _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature)
+    primary = _runtime_snapshot(
+        primary_orm,
+        agent=agent,
+        override_temperature=override_temperature,
+        override_reasoning_effort=override_reasoning_effort,
+    )
+    fallback = _runtime_snapshot(
+        fallback_orm,
+        agent=agent,
+        override_temperature=override_temperature,
+        override_reasoning_effort=override_reasoning_effort,
+    )
 
     if not override_model_id:
         return RuntimeModelResolution(primary, fallback)
@@ -205,7 +229,12 @@ async def resolve_runtime_models(
     if not override.enabled:
         return RuntimeModelResolution(primary, fallback, MODEL_OVERRIDE_DISABLED)
 
-    effective = _runtime_snapshot(override, agent=agent, override_temperature=override_temperature)
+    effective = _runtime_snapshot(
+        override,
+        agent=agent,
+        override_temperature=override_temperature,
+        override_reasoning_effort=override_reasoning_effort,
+    )
     if fallback is not None and fallback.id == effective.id:
         fallback = None
     return RuntimeModelResolution(effective, fallback, MODEL_OVERRIDE_OK)
@@ -230,6 +259,7 @@ async def resolve_project_runtime_models(
     agent: Agent,
     project_settings: dict | None,
     override_temperature: float | None = None,
+    override_reasoning_effort: str | None = None,
 ) -> RuntimeModelResolution:
     """Resolve one project turn without crossing the tenant model boundary.
 
@@ -253,8 +283,8 @@ async def resolve_project_runtime_models(
         primary_orm, fallback_orm = fallback_orm, None
     if primary_orm is not None:
         return RuntimeModelResolution(
-            _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature),
-            _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature),
+            _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
+            _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
         )
 
     runtime_settings = dict(dict(project_settings or {}).get("runtime") or {})
@@ -275,7 +305,7 @@ async def resolve_project_runtime_models(
                 project_model = named[0]
     if project_model is not None:
         return RuntimeModelResolution(
-            _runtime_snapshot(project_model, agent=agent, override_temperature=override_temperature),
+            _runtime_snapshot(project_model, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
             None,
         )
 
@@ -283,7 +313,7 @@ async def resolve_project_runtime_models(
     tenant_default = by_id.get(tenant.default_model_id) if tenant is not None else None
     selected = tenant_default or (enabled_models[0] if enabled_models else None)
     return RuntimeModelResolution(
-        _runtime_snapshot(selected, agent=agent, override_temperature=override_temperature),
+        _runtime_snapshot(selected, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
         None,
     )
 
@@ -295,6 +325,7 @@ async def resolve_project_member_runtime_models(
     member_config: dict | None,
     project_settings: dict | None,
     override_temperature: float | None = None,
+    override_reasoning_effort: str | None = None,
 ) -> RuntimeModelResolution:
     """Resolve models only from the frozen member config and project defaults."""
 
@@ -331,8 +362,8 @@ async def resolve_project_member_runtime_models(
         primary_orm, fallback_orm = fallback_orm, None
     if primary_orm is not None:
         return RuntimeModelResolution(
-            _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature),
-            _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature),
+            _runtime_snapshot(primary_orm, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
+            _runtime_snapshot(fallback_orm, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
         )
 
     # An intentionally empty member override uses project/tenant defaults, but
@@ -349,7 +380,7 @@ async def resolve_project_member_runtime_models(
                 project_model = named[0]
     if project_model is not None:
         return RuntimeModelResolution(
-            _runtime_snapshot(project_model, agent=agent, override_temperature=override_temperature),
+            _runtime_snapshot(project_model, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
             None,
         )
 
@@ -357,7 +388,7 @@ async def resolve_project_member_runtime_models(
     tenant_default = by_id.get(tenant.default_model_id) if tenant is not None else None
     selected = tenant_default or (sorted(enabled_models, key=lambda model: str(model.id))[0] if enabled_models else None)
     return RuntimeModelResolution(
-        _runtime_snapshot(selected, agent=agent, override_temperature=override_temperature),
+        _runtime_snapshot(selected, agent=agent, override_temperature=override_temperature, override_reasoning_effort=override_reasoning_effort),
         None,
     )
 
@@ -384,3 +415,23 @@ async def load_turn_model_id(
         return str(uuid.UUID(model_id)) if model_id else None
     except ValueError:
         return None
+
+
+async def load_turn_reasoning_effort(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    session_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> str | None:
+    """Read the reasoning choice snapshotted on one accepted user turn."""
+    if turn_anchor_id is None:
+        return None
+    get_row = getattr(db, "get", None)
+    if not callable(get_row):
+        return None
+    anchor = await get_row(ChatMessage, turn_anchor_id)
+    if anchor is None or anchor.agent_id != agent_id or anchor.conversation_id != str(session_id):
+        return None
+    meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+    return validate_reasoning_effort(meta.get("reasoning_effort"))

@@ -25,7 +25,6 @@ from tests.test_published_page_access import (
     Tenant,
     Tool,
     User,
-    _dispose_engine,
     _list_page_access_requests,
     _list_published_pages,
     _make_restricted_page,
@@ -404,18 +403,25 @@ async def test_historical_page_reports_unrecorded_last_publication():
     assert "Last published at: historical data not recorded" in agent_view
 
 
-async def test_page_list_filters_multiple_agents_and_fuzzy_searches_title_or_path():
-    _short_id, page_id, agent_id, owner_id, _viewer_id = await _make_restricted_page()
+async def test_page_list_filters_agents_access_mode_and_fuzzy_search_fields():
+    short_id, page_id, agent_id, owner_id, viewer_id = await _make_restricted_page()
     marker = uuid.uuid4().hex[:10]
     agent_term = f"agent-{marker}"
     title_term = f"title-{marker}"
     path_term = f"path-{marker}"
+    publisher_term = f"publisher-{marker}"
+    modifier_term = f"modifier-{marker}"
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
         page = await db.get(PublishedPage, page_id)
+        owner = await db.get(User, owner_id)
+        modifier = await db.get(User, viewer_id)
         agent.name = f"Search {agent_term}"
         page.title = f"Search {title_term}"
         page.source_path = f"reports/{path_term}.html"
+        owner.display_name = f"Search {publisher_term}"
+        modifier.display_name = f"Search {modifier_term}"
+        page.last_published_by_user_id = modifier.id
         second_agent = Agent(
             name=f"Second {marker}", role_description="", creator_id=owner_id,
             tenant_id=page.tenant_id, agent_type="native",
@@ -434,7 +440,13 @@ async def test_page_list_filters_multiple_agents_and_fuzzy_searches_title_or_pat
     token = create_access_token(str(owner_id), "member")
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        for term in (title_term.upper(), path_term):
+        for term in (
+            title_term.upper(),
+            path_term,
+            f"https://example.test/p/{short_id}",
+            publisher_term,
+            modifier_term.upper(),
+        ):
             response = await client.get(
                 "/api/pages/mine",
                 params={"q": term},
@@ -442,6 +454,25 @@ async def test_page_list_filters_multiple_agents_and_fuzzy_searches_title_or_pat
             )
             assert response.status_code == 200
             assert any(item["id"] == str(page_id) for item in response.json()["items"])
+
+        for access_mode, expected_id in (
+            ("restricted", page_id),
+            ("authenticated", second_page_id),
+        ):
+            response = await client.get(
+                "/api/pages/mine",
+                params={"access_mode": access_mode},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status_code == 200
+            assert {item["id"] for item in response.json()["items"]} == {str(expected_id)}
+
+        invalid_mode = await client.get(
+            "/api/pages/mine",
+            params={"access_mode": "company"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert invalid_mode.status_code == 422
 
         agent_name_is_not_part_of_fuzzy_search = await client.get(
             "/api/pages/mine",

@@ -22,6 +22,7 @@ _CLEARABLE_SETTINGS = frozenset({
     "bio",
     "fallback_model",
     "imagination",
+    "reasoning_effort",
     "max_tokens_per_day",
     "max_tokens_per_month",
     "primary_model",
@@ -186,6 +187,7 @@ async def update_agent_impl(
     timezone=None,
     expires_at=None,
     imagination=None,
+    reasoning_effort=None,
     daily_memory_load_days=None,
     im_thinking_output_enabled=None,
     clear_fields=None,
@@ -244,6 +246,7 @@ async def update_agent_impl(
                 "primary_model": primary_model,
                 "fallback_model": fallback_model,
                 "imagination": imagination,
+                "reasoning_effort": reasoning_effort,
                 "context_window_size": context_window_size,
                 "daily_memory_load_days": daily_memory_load_days,
                 "max_tool_rounds": max_tool_rounds,
@@ -393,6 +396,7 @@ async def update_agent(  # noqa: D401
     timezone: str | None = None,
     expires_at: str | None = None,
     imagination: float | None = None,
+    reasoning_effort: str | None = None,
     daily_memory_load_days: int | None = None,
     im_thinking_output_enabled: bool | None = None,
     clear_fields: list[str] | None = None,
@@ -401,6 +405,7 @@ async def update_agent(  # noqa: D401
     agent: id or name. Only the fields you pass are changed.
     primary_model/fallback_model accept a model id or label (see list_models).
     imagination ranges from 0 (stable) to 2 (rich); omit it to keep the current value.
+    reasoning_effort uses none/minimal/low/medium/high/xhigh/max; none disables thinking.
     daily_memory_load_days=0 disables Daily Memory loading while retaining Core Memory.
     clear_fields explicitly clears nullable ordinary settings such as primary_model, fallback_model,
     imagination, avatar_url, bio, welcome_message, timezone, and token limits.
@@ -433,6 +438,7 @@ async def update_agent(  # noqa: D401
         timezone=timezone,
         expires_at=expires_at,
         imagination=imagination,
+        reasoning_effort=reasoning_effort,
         daily_memory_load_days=daily_memory_load_days,
         im_thinking_output_enabled=im_thinking_output_enabled,
         clear_fields=clear_fields,

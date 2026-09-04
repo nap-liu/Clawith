@@ -1,14 +1,19 @@
 .published-page-filters {
     display: grid;
-    grid-template-columns: 200px minmax(0, 1fr) auto auto;
+    grid-template-columns: 200px 148px minmax(0, 1fr) auto auto;
     align-items: center;
-    gap: 8px;
+    column-gap: var(--space-3);
+    row-gap: var(--space-3);
     width: 100%;
-    margin-bottom: 14px;
+    margin-bottom: var(--space-4);
 }
 
 .published-page-filters__agent {
     width: 200px;
+}
+
+.published-page-filters__access-mode {
+    width: 148px;
 }
 
 @media (max-width: 680px) {
@@ -17,6 +22,7 @@
     }
 
     .published-page-filters__agent,
+    .published-page-filters__access-mode,
     .published-page-filters__query {
         grid-column: 1 / -1;
         width: 100%;

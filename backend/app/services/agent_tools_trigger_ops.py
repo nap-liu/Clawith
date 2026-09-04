@@ -65,8 +65,10 @@ async def _handle_set_trigger(
     memory = arguments.get("memory", True) is not False
     try:
         from app.services.chat_model_selection import validate_temperature
+        from app.services.llm.reasoning import validate_reasoning_effort
 
         temperature = validate_temperature(arguments.get("temperature"))
+        reasoning_effort = validate_reasoning_effort(arguments.get("reasoning_effort"))
         async with async_session() as model_db:
             model_id = await _resolve_trigger_model_id(model_db, agent_id, arguments.get("model"))
     except ValueError as exc:
@@ -334,6 +336,7 @@ async def _handle_set_trigger(
                 existing.is_enabled = True
                 existing.model_id = model_id
                 existing.temperature = temperature
+                existing.reasoning_effort = reasoning_effort
                 existing.soul = soul
                 existing.memory = memory
                 # Keep fire_count and last_fired_at — they are cumulative stats,
@@ -354,6 +357,7 @@ async def _handle_set_trigger(
                     focus_ref=focus_ref,
                     model_id=model_id,
                     temperature=temperature,
+                    reasoning_effort=reasoning_effort,
                     soul=soul,
                     memory=memory,
                 )
@@ -468,6 +472,7 @@ async def _handle_update_trigger(
     new_webhook_mode = arguments.get("webhook_mode")
     model_supplied = "model" in arguments
     temperature_supplied = "temperature" in arguments
+    reasoning_effort_supplied = "reasoning_effort" in arguments
     soul_supplied = "soul" in arguments
     memory_supplied = "memory" in arguments
 
@@ -477,6 +482,7 @@ async def _handle_update_trigger(
         and new_webhook_mode is None
         and not model_supplied
         and not temperature_supplied
+        and not reasoning_effort_supplied
         and not soul_supplied
         and not memory_supplied
     ):
@@ -515,6 +521,16 @@ async def _handle_update_trigger(
                 except ValueError as exc:
                     return f"❌ {exc}"
                 changes.append("temperature updated")
+            if reasoning_effort_supplied:
+                try:
+                    from app.services.llm.reasoning import validate_reasoning_effort
+
+                    trigger.reasoning_effort = validate_reasoning_effort(
+                        arguments.get("reasoning_effort")
+                    )
+                except ValueError as exc:
+                    return f"❌ {exc}"
+                changes.append("reasoning effort updated")
             if soul_supplied:
                 trigger.soul = arguments.get("soul") is not False
                 changes.append("soul updated")

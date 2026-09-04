@@ -140,6 +140,7 @@ async def _execute_task_impl(
         task_type = task.type  # 'todo' or 'supervision'
         task_model_id = getattr(task, "model_id", None)
         task_temperature = getattr(task, "temperature", None)
+        task_reasoning_effort = getattr(task, "reasoning_effort", None)
         task_soul = getattr(task, "soul", True)
         task_memory = getattr(task, "memory", True)
 
@@ -217,6 +218,7 @@ async def _execute_task_impl(
                 task_type=task_type,
                 task_model_id=task_model_id,
                 task_temperature=task_temperature,
+                task_reasoning_effort=task_reasoning_effort,
                 task_soul=task_soul,
                 task_memory=task_memory,
                 agent_name=agent_name,
@@ -260,6 +262,7 @@ async def _execute_admitted_task(
     task_type: str,
     task_model_id: uuid.UUID | None,
     task_temperature: float | None,
+    task_reasoning_effort: str | None,
     task_soul: bool,
     task_memory: bool,
     agent_name: str,
@@ -330,6 +333,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             turn_type="task",
             model_override_id=task_model_id,
             temperature_override=task_temperature,
+            reasoning_effort_override=task_reasoning_effort,
         )
 
     logger.info(f"[TaskExec] LLM reply: {reply[:80]}")

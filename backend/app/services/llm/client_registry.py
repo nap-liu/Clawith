@@ -322,6 +322,7 @@ def create_llm_client(
             supports_tool_choice=supports_tool_choice,
             supports_cache_control=normalized_provider == "qwen",
             provider_managed_timeout=provider_managed_timeout,
+            provider=normalized_provider,
         )
     else:
         # Default to OpenAI-compatible for unknown providers
@@ -333,6 +334,7 @@ def create_llm_client(
             supports_tool_choice=True,
             supports_cache_control=False,
             provider_managed_timeout=provider_managed_timeout,
+            provider=normalized_provider,
         )
 
 
@@ -348,6 +350,7 @@ async def chat_complete(
     base_url: str | None = None,
     tools: list[dict] | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
     max_tokens: int | None = None,
     timeout: float = 120.0,
 ) -> dict:
@@ -363,6 +366,7 @@ async def chat_complete(
             messages=llm_messages,
             tools=tools,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
             max_tokens=max_tokens or get_max_tokens(provider, model),
         )
 
@@ -390,6 +394,7 @@ async def chat_stream(
     base_url: str | None = None,
     tools: list[dict] | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
     max_tokens: int | None = None,
     timeout: float = 120.0,
     on_chunk: ChunkCallback | None = None,
@@ -407,6 +412,7 @@ async def chat_stream(
             messages=llm_messages,
             tools=tools,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
             max_tokens=max_tokens or get_max_tokens(provider, model),
             on_chunk=on_chunk,
             on_thinking=on_thinking,

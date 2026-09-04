@@ -24,6 +24,7 @@ UPDATE_SELF_SETTINGS_FUNCTION_TOOL = {
         "description": (
             "Update ordinary settings for myself, the current Digital Employee. "
             "Only provided fields change. Use imagination for creative variation. "
+            "Use reasoning_effort to trade latency for deeper reasoning; none disables it. "
             "This cannot target another Digital Employee or modify permissions, "
             "approval policy, credentials, Soul, or Core Memory."
         ),

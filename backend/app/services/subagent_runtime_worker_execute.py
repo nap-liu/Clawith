@@ -174,6 +174,7 @@ async def execute_claimed_subagent(
                 model_name = run.model
                 model_id = run.model_id
                 temperature = run.temperature
+                reasoning_effort = run.reasoning_effort
                 include_soul = run.soul
                 include_memory = run.memory
                 member_runtime_config = dict(dict(child.im_config or {}).get("member_config_snapshot") or {})
@@ -294,6 +295,7 @@ async def execute_claimed_subagent(
                     model_name=model_name,
                     model_override_id=model_id,
                     temperature_override=temperature,
+                    reasoning_effort_override=reasoning_effort,
                     include_soul=include_soul,
                     include_memory=include_memory,
                     prepared_tools=tools,
@@ -369,6 +371,7 @@ async def execute_claimed_subagent(
                             model_name=model_name,
                             model_override_id=model_id,
                             temperature_override=temperature,
+                            reasoning_effort_override=reasoning_effort,
                             include_soul=include_soul,
                             include_memory=include_memory,
                             # Correction may improve prose only. It cannot replay

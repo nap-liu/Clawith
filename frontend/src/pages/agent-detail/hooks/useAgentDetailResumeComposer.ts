@@ -24,6 +24,7 @@ export function useAgentDetailResumeComposer({
     activeTab,
     token,
     effectiveChatModelId,
+    reasoningEffortOverride,
     showNoModelState,
     toast,
     t,
@@ -235,6 +236,7 @@ export function useAgentDetailResumeComposer({
             file_name: payload.fileName,
             attachments: payload.attachments,
             model_id: payload.modelId,
+            reasoning_effort: payload.reasoningEffort,
         }));
     };
     dispatchChatMessageRef.current = dispatchChatMessage;
@@ -590,6 +592,7 @@ export function useAgentDetailResumeComposer({
             previewImages: attachmentPayload.previewImages,
             attachments: attachmentPayload.attachments,
             modelId: effectiveChatModelId,
+            reasoningEffort: reasoningEffortOverride || null,
             messageId: createClientId(),
         };
         setChatInput('');

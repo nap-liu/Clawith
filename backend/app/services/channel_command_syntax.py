@@ -10,13 +10,14 @@ COMMANDS = {
     "/think",
     "/scene",
     "/model",
+    "/reasoning",
 }
 
 
 def _parse_command(text: str) -> tuple[str, str | None]:
     raw_parts = text.strip().split(maxsplit=1)
-    if raw_parts and raw_parts[0].lower() == "/model":
-        return "/model", raw_parts[1].strip() if len(raw_parts) == 2 else None
+    if raw_parts and raw_parts[0].lower() in {"/model", "/reasoning"}:
+        return raw_parts[0].lower(), raw_parts[1].strip() if len(raw_parts) == 2 else None
     parts = text.strip().lower().split()
     if not parts:
         return "", None
@@ -39,6 +40,8 @@ def _help_message() -> str:
         "/model list：查看可用模型；/model <模型名>：切换当前会话模型\n"
         "/model use <模型名>：切换名称为 list、status、default 的模型\n"
         "/model status：查看当前模型；/model default：恢复默认模型\n"
+        "/reasoning <档位>：设置当前会话思考强度（none/minimal/low/medium/high/xhigh/max）\n"
+        "/reasoning status：查看当前思考强度；/reasoning auto：恢复自动设置\n"
         "/stop：停止当前这轮正在执行的工作\n"
         "/status：查看当前数字员工和会话状态\n"
         "/help：查看帮助"

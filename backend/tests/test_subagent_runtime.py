@@ -210,6 +210,7 @@ async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and
             **dict(member.config_snapshot or {}),
             "primary_model_id": str(frozen_model.id),
             "temperature": 0.2,
+            "reasoning_effort": "high",
             "max_tool_rounds": 7,
             "project_instruction": "Use the release checklist captured at run start.",
         }
@@ -231,6 +232,7 @@ async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and
             **dict(member.config_snapshot or {}),
             "primary_model_id": None,
             "temperature": 1.1,
+            "reasoning_effort": "none",
             "max_tool_rounds": 99,
             "project_instruction": "This later edit must not affect the old run.",
         }
@@ -258,6 +260,8 @@ async def test_project_run_child_uses_frozen_config_model_rounds_instruction_and
     assert runtime_config["member_config_snapshot"]["primary_model_id"] == str(frozen_model.id)
     assert runtime_config["member_config_snapshot"]["temperature"] == 0.2
     assert child_run.temperature == 0.2
+    assert runtime_config["member_config_snapshot"]["reasoning_effort"] == "high"
+    assert child_run.reasoning_effort == "high"
     assert runtime_config["member_config_snapshot"]["max_tool_rounds"] == 7
     assert "release checklist captured at run start" in build_project_runtime_context(runtime_config)
     tool_names = {

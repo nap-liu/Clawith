@@ -24,6 +24,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.subagent_run import SubagentRun
 from app.services.chat_model_selection import validate_temperature
+from app.services.llm.reasoning import validate_reasoning_effort
 from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,

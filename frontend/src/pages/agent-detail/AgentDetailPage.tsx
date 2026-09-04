@@ -65,6 +65,7 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
     }, [navigate]);
 
     const [overrideModelId, setOverrideModelId] = useState<string | null>(null);
+    const [reasoningEffortOverride, setReasoningEffortOverride] = useState<string>('');
     useEffect(() => {
         if (agent.primary_model_id && agent.primary_model_id !== overrideModelId) {
             setOverrideModelId(agent.primary_model_id);
@@ -119,6 +120,7 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
         onboardingRequestsRef,
         setOnboardingKickoffRequest,
         resources,
+        reasoningEffortOverride,
     });
 
     const handleOnboardingStart = useCallback(() => {
@@ -152,6 +154,8 @@ function AgentDetailPageLoaded({ id, agent }: { id: string; agent: any }) {
             setSceneConfigDirty={setSceneConfigDirty}
             overrideModelId={overrideModelId}
             handleModelChange={handleModelChange}
+            reasoningEffortOverride={reasoningEffortOverride}
+            setReasoningEffortOverride={setReasoningEffortOverride}
             currentUser={currentUser}
             {...resources}
             {...chat}

@@ -55,6 +55,7 @@ class AgentTrigger(Base):
         nullable=True,
     )
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     soul: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
     )
@@ -81,5 +82,10 @@ class AgentTrigger(Base):
         CheckConstraint(
             "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
             name="ck_agent_triggers_temperature",
+        ),
+        CheckConstraint(
+            "reasoning_effort IS NULL OR reasoning_effort IN "
+            "('none','minimal','low','medium','high','xhigh','max')",
+            name="ck_agent_triggers_reasoning_effort",
         ),
     )

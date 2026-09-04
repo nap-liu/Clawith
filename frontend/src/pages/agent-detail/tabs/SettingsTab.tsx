@@ -12,6 +12,7 @@ import { useDialog } from '../../../components/Dialog/DialogProvider';
 import DivergenceSlider from '../../../components/DivergenceSlider';
 import BlurValidatedNumberInput from '../../../components/BlurValidatedNumberInput';
 import SelectDropdown from '../../../components/SelectDropdown';
+import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
 import { sortLlmModels } from '../../../utils/llmModels';
 import { getLlmModelLabel } from '../../../utils/llmModels';
 
@@ -19,6 +20,7 @@ type SettingsFormState = {
     primary_model_id: string;
     fallback_model_id: string;
     temperature: number | null;
+    reasoning_effort: string;
     context_window_size: string | number;
     daily_memory_load_days: string | number;
     max_tool_rounds: string | number;
@@ -257,6 +259,19 @@ export default function SettingsTab(props: Props) {
                         highLabel={i18n.language?.startsWith('zh') ? '丰富' : 'Imaginative'}
                         disabled={!canManage}
                     />
+                    <div>
+                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>
+                            {t('reasoning.label')}
+                        </label>
+                        <ReasoningEffortSelect
+                            value={settingsForm.reasoning_effort as ReasoningEffortValue}
+                            onChange={(reasoning_effort) => setSettingsForm((form) => ({ ...form, reasoning_effort }))}
+                            supportedEfforts={llmModels.find((model: any) => model.id === settingsForm.primary_model_id)?.reasoning_efforts}
+                            inheritLabel={t('reasoning.inherit')}
+                            disabled={!canManage}
+                            style={{ width: 'min(100%, 360px)' }}
+                        />
+                    </div>
                 </div>
             </div>
 

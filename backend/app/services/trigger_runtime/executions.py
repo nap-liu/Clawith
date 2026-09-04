@@ -266,6 +266,7 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
         execution_user_id=execution.execution_user_id or trigger.execution_user_id,
         model_id=trigger.model_id,
         temperature=trigger.temperature,
+        reasoning_effort=trigger.reasoning_effort,
         soul=trigger.soul,
         memory=trigger.memory,
         name=trigger.name,

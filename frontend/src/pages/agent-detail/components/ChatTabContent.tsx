@@ -2,6 +2,7 @@ import React from 'react';
 import AgentSidePanel from '../../../components/AgentSidePanel';
 import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
 import ModelSwitcher from '../../../components/ModelSwitcher';
+import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
 import ConversationScrollToBottomButton from '../../../features/conversation/ConversationScrollToBottomButton';
 import ConversationTimeline from '../../../features/conversation/web/ConversationTimeline';
 import {
@@ -143,6 +144,10 @@ type Props = {
     handleChatFile: (event: React.ChangeEvent<HTMLInputElement>) => void;
     overrideModelId: string | null;
     handleModelChange: (newModelId: string | null) => void;
+    reasoningEffortOverride: string;
+    setReasoningEffortOverride: React.Dispatch<React.SetStateAction<string>>;
+    effectiveChatModelId: string | null;
+    llmModels: any[];
     myTenant: any;
     chatUploadAbortRef: React.MutableRefObject<Map<string, () => void>>;
     wsMapRef: React.MutableRefObject<Record<string, WebSocket>>;
@@ -280,6 +285,10 @@ export default function ChatTabContent(props: Props) {
         handleChatFile,
         overrideModelId,
         handleModelChange,
+        reasoningEffortOverride,
+        setReasoningEffortOverride,
+        effectiveChatModelId,
+        llmModels,
         myTenant,
         wsMapRef,
         setSessionUiState,
@@ -559,6 +568,13 @@ export default function ChatTabContent(props: Props) {
                                         <input type="file" multiple ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
                                         <button type="button" className="chat-composer-btn" onClick={() => fileInputRef.current?.click()} disabled={showNoModelState || confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10} title={t('agent.workspace.uploadFile')}><IconPaperclip size={16} stroke={1.75} /></button>
                                         <ModelSwitcher value={overrideModelId} onChange={handleModelChange} tenantDefaultId={myTenant?.default_model_id || null} disabled={showNoModelState || !wsConnected} />
+                                        <ReasoningEffortSelect
+                                            value={reasoningEffortOverride as ReasoningEffortValue}
+                                            onChange={setReasoningEffortOverride}
+                                            supportedEfforts={llmModels.find((model: any) => model.id === effectiveChatModelId)?.reasoning_efforts}
+                                            compact
+                                            disabled={showNoModelState || !wsConnected}
+                                        />
                                         <div style={{ flex: 1 }} />
                                         {(isStreaming || isWaiting || isStopping) ? (
                                             <button

@@ -15,6 +15,7 @@ async def create_subagent(
     mode: str = "sync",
     model: str | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
     fork: bool = False,
     soul: bool = True,
     memory: bool = True,
@@ -106,6 +107,10 @@ async def create_subagent(
             normalized_temperature = validate_temperature(temperature)
         except ValueError as exc:
             raise SubagentError("temperature 必须在 0 到 2 之间。") from exc
+        try:
+            normalized_reasoning_effort = validate_reasoning_effort(reasoning_effort)
+        except ValueError as exc:
+            raise SubagentError(str(exc)) from exc
         model_id, canonical_model = await _resolve_model_override(db, agent, model)
         now = datetime.now(UTC)
         child_id = uuid.uuid4()
@@ -142,6 +147,13 @@ async def create_subagent(
                     )
                 except ValueError as exc:
                     raise SubagentError("项目成员想象力必须在 0 到 2 之间。") from exc
+            if reasoning_effort is None and "reasoning_effort" in project_member_config:
+                try:
+                    normalized_reasoning_effort = validate_reasoning_effort(
+                        project_member_config.get("reasoning_effort")
+                    )
+                except ValueError as exc:
+                    raise SubagentError(str(exc)) from exc
             project_tool_policy_snapshot = (
                 dict(dict((project.settings or {}).get("policies") or {}).get("project_tools") or {})
                 if project is not None
@@ -215,6 +227,7 @@ async def create_subagent(
             model=canonical_model,
             model_id=model_id,
             temperature=normalized_temperature,
+            reasoning_effort=normalized_reasoning_effort,
             soul=bool(soul),
             memory=bool(memory),
             status=RUN_QUEUED,

@@ -253,3 +253,95 @@ async def test_model_default_clears_only_model_preference(monkeypatch):
     assert result["action"] == "model_default"
     assert "qwen3.5-plus" in result["message"]
     assert session.im_config == {"scene_key": "warranty"}
+
+
+@pytest.mark.asyncio
+async def test_reasoning_command_sets_and_resets_only_session_reasoning(monkeypatch):
+    from app.services import chat_model_selection
+
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_runtime(*_args, **_kwargs):
+        return chat_model_selection.RuntimeModelResolution(
+            SimpleNamespace(
+                provider="qwen",
+                model="qwen3.8-plus",
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                reasoning_effort=None,
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
+
+    updated = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/reasoning high",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_1",
+        source_channel="feishu",
+    )
+    assert updated["action"] == "reasoning_updated"
+    assert "深入 (high)" in updated["message"]
+    assert session.im_config["reasoning_effort"] == "high"
+
+    reset = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/reasoning auto",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_1",
+        source_channel="feishu",
+    )
+    assert reset["action"] == "reasoning_default"
+    assert "自动" in reset["message"]
+    assert session.im_config == {"model_id": session.im_config["model_id"], "scene_key": "warranty"}
+
+
+@pytest.mark.asyncio
+async def test_reasoning_command_rejects_off_for_always_on_model(monkeypatch):
+    from app.services import chat_model_selection
+
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(im_config={})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_runtime(*_args, **_kwargs):
+        return chat_model_selection.RuntimeModelResolution(
+            SimpleNamespace(
+                provider="moonshot",
+                model="kimi-k3",
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/reasoning off",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="dingtalk_p2p_1",
+        source_channel="dingtalk",
+    )
+    assert result["action"] == "reasoning_unsupported"
+    assert session.im_config == {}

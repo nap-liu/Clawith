@@ -71,6 +71,11 @@ BUILTIN_TOOLS_PART_1 = [
                     "maximum": 2,
                     "description": "Optional imagination override. Omit to inherit the Digital Employee setting.",
                 },
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    "description": "Optional reasoning override. none disables thinking; omit to inherit.",
+                },
                 "fork": {
                     "type": "boolean",
                     "default": False,

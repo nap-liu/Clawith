@@ -379,6 +379,42 @@
   flex-shrink: 0;
 }
 
+@media (max-width: 760px) {
+  .agent-detail-page--settings > .tabs {
+    width: 100%;
+    min-height: 48px;
+    margin-bottom: var(--space-4);
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .agent-detail-page--settings > .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .agent-detail-page--settings > .tabs .tab,
+  .agent-detail-page--settings > .tabs .agent-tabs-chat-action {
+    flex: 0 0 auto;
+    min-height: 44px;
+    white-space: nowrap;
+    scroll-snap-align: center;
+  }
+
+  .agent-detail-page--settings > .tabs .tab {
+    display: inline-flex;
+    align-items: center;
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .agent-detail-page--settings > .tabs .agent-tabs-chat-action {
+    margin-left: var(--space-2);
+  }
+}
+
 .agent-settings-savebar {
   display: flex;
   align-items: center;

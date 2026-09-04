@@ -1,0 +1,18 @@
+.reasoning-effort-select--compact {
+    min-width: 104px;
+}
+
+.reasoning-effort-select--compact .select-dropdown__trigger {
+    height: 28px;
+    padding: 0 8px 0 10px;
+    border-color: var(--border-subtle);
+    border-radius: 999px;
+    background: var(--bg-primary);
+    font-size: 12px;
+}
+
+.reasoning-effort-select--compact .select-dropdown__trigger:hover:not(:disabled),
+.reasoning-effort-select--compact .select-dropdown__trigger[data-state="open"] {
+    border-color: var(--border-default);
+    background: var(--bg-elevated);
+}

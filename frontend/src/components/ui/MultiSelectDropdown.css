@@ -3,6 +3,12 @@
   min-width: 0;
 }
 
+.ui-multi-select--quick-clear {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 4px;
+}
+
 .ui-multi-select__trigger {
   width: 100%;
   justify-content: space-between;
@@ -67,6 +73,14 @@
   min-height: 28px;
   padding: 0 7px;
   font-size: var(--text-xs);
+}
+
+.ui-multi-select__quick-clear {
+  width: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  color: var(--text-secondary);
 }
 
 .ui-multi-select__options {

@@ -360,8 +360,14 @@ class WebSocketChatHandler:
     async def _resolve_effective_model(
         self,
         override_model_id: str | None,
+        reasoning_effort: str | None = None,
     ) -> RuntimeLLMModel | None:
-        return await websocket_turn_ops.resolve_effective_model_impl(MODULE, self, override_model_id)
+        return await websocket_turn_ops.resolve_effective_model_impl(
+            MODULE,
+            self,
+            override_model_id,
+            reasoning_effort,
+        )
 
     async def _check_quotas(self) -> bool:
         return await websocket_turn_ops.check_quotas_impl(MODULE, self)
@@ -374,6 +380,7 @@ class WebSocketChatHandler:
         is_onboarding_trigger: bool,
         client_message_id: str | None = None,
         model_id: str | None = None,
+        reasoning_effort: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[
         uuid.UUID | None,
@@ -392,6 +399,7 @@ class WebSocketChatHandler:
             is_onboarding_trigger,
             client_message_id=client_message_id,
             model_id=model_id,
+            reasoning_effort=reasoning_effort,
             attachments=attachments,
         )
 

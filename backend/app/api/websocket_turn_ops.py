@@ -213,7 +213,12 @@ async def wait_for_normal_turn_onboarding_impl(api, self) -> None:
         await api.asyncio.sleep(0.2)
 
 
-async def resolve_effective_model_impl(api, self, override_model_id: str | None):
+async def resolve_effective_model_impl(
+    api,
+    self,
+    override_model_id: str | None,
+    reasoning_effort: str | None = None,
+):
     from app.services.chat_model_selection import MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK, resolve_runtime_models
 
     async with api.async_session() as _mdb:
@@ -223,7 +228,12 @@ async def resolve_effective_model_impl(api, self, override_model_id: str | None)
             self.llm_model = None
             self.fallback_llm_model = None
             return None
-        resolved = await resolve_runtime_models(_mdb, agent=_agent_cur, override_model_id=override_model_id)
+        resolved = await resolve_runtime_models(
+            _mdb,
+            agent=_agent_cur,
+            override_model_id=override_model_id,
+            override_reasoning_effort=reasoning_effort,
+        )
 
     self.llm_model = resolved.primary_model
     self.fallback_llm_model = resolved.fallback_model
@@ -255,6 +265,7 @@ async def save_user_message_impl(
     *,
     client_message_id: str | None = None,
     model_id: str | None = None,
+    reasoning_effort: str | None = None,
     attachments: list[dict] | None = None,
 ):
     from app.services.chat_attachments import strip_image_data_markers
@@ -291,6 +302,7 @@ async def save_user_message_impl(
                     "kind": HIDDEN_ONBOARDING_ANCHOR_KIND,
                     **self._scene_message_meta(),
                     **({"model_id": model_id} if model_id else {}),
+                    **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
                 },
             )
             db.add(anchor)
@@ -345,6 +357,7 @@ async def save_user_message_impl(
             message_meta={
                 **self._scene_message_meta(),
                 **({"model_id": model_id} if model_id else {}),
+                **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
                 **({"attachments": attachments, "display_content": display_content} if attachments is not None else {}),
             },
             created_at=first_user_created_at,

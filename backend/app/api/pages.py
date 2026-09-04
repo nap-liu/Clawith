@@ -5,11 +5,12 @@ import hmac
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
-from sqlalchemy import String, and_, func, literal, or_, select, union_all, update
+from sqlalchemy import String, func, literal, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,8 +21,8 @@ from app.api.page_admin_helpers import (
     _validate_access_mode,
     _validated_allowed_user_ids,
 )
+from app.api.page_admin_queries import list_manageable_pages
 from app.api.page_models import (
-    MAX_BULK_PAGE_ACCESS_UPDATES,
     PageAccessUpdate,
     PageBulkAccessUpdate,
     PageRequestResolution,
@@ -496,47 +497,21 @@ async def list_my_pages(
     page_size: int = Query(default=20, ge=1, le=100),
     agent_id: uuid.UUID | None = None,
     agent_ids: list[uuid.UUID] = Query(default=[]),
+    access_mode: Literal["public", "authenticated", "restricted"] | None = None,
     q: str | None = Query(default=None, max_length=200),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    base_conditions = [or_(
-        PublishedPage.tenant_id == current_user.tenant_id,
-        and_(PublishedPage.tenant_id.is_(None), Agent.tenant_id == current_user.tenant_id),
-    )]
-    if not (is_platform_admin_user(current_user) or current_user.role == "org_admin"):
-        base_conditions.append(or_(Agent.creator_id == current_user.id, PublishedPage.user_id == current_user.id))
-    conditions = list(base_conditions)
-    selected_agent_ids = set(agent_ids)
-    if agent_id:
-        selected_agent_ids.add(agent_id)
-    if selected_agent_ids:
-        conditions.append(PublishedPage.agent_id.in_(selected_agent_ids))
-    search_text = (q or "").strip()
-    if search_text:
-        escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        pattern = f"%{escaped}%"
-        conditions.append(or_(
-            PublishedPage.title.ilike(pattern, escape="\\"),
-            PublishedPage.source_path.ilike(pattern, escape="\\"),
-        ))
-    total = await db.scalar(
-        select(func.count()).select_from(PublishedPage).join(Agent, Agent.id == PublishedPage.agent_id).where(*conditions)
+    return await list_manageable_pages(
+        db,
+        current_user=current_user,
+        page=page,
+        page_size=page_size,
+        agent_id=agent_id,
+        agent_ids=agent_ids,
+        access_mode=access_mode,
+        search=q,
     )
-    rows = (await db.execute(
-        select(PublishedPage, Agent.name)
-        .join(Agent, Agent.id == PublishedPage.agent_id)
-        .where(*conditions)
-        .order_by(PublishedPage.updated_at.desc(), PublishedPage.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )).all()
-    return {
-        "items": await _page_summaries(db, rows),
-        "total": int(total or 0),
-        "page": page,
-        "page_size": page_size,
-    }
 
 
 @router.get("/{page_id}/detail")

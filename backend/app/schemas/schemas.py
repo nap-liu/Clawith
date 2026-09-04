@@ -5,6 +5,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.services.llm.reasoning import ReasoningEffort
+
 
 # ─── Auth ───────────────────────────────────────────────
 
@@ -250,6 +252,7 @@ class AgentCreate(BaseModel):
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     # Permissions
     permission_scope_type: str = "company"  # company | user | custom
     permission_scope_ids: list[uuid.UUID] = []
@@ -281,6 +284,7 @@ class AgentOut(BaseModel):
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
     temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
     autonomy_policy: dict
     tokens_used_today: int
     tokens_used_month: int
@@ -365,6 +369,7 @@ class AgentUpdate(BaseModel):
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     context_window_size: int | None = Field(default=None, ge=1, le=500)
     daily_memory_load_days: int | None = Field(default=None, ge=0, le=30)
     max_tokens_per_day: int | None = None
@@ -402,6 +407,7 @@ class TaskCreate(BaseModel):
     due_date: datetime | None = None
     model_id: uuid.UUID | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
     # Supervision fields
@@ -445,6 +451,7 @@ class TaskOut(BaseModel):
     execution_user_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
     creator_username: str | None = None
@@ -478,6 +485,7 @@ class TaskUpdate(BaseModel):
     expected_execution_user_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
 
@@ -506,6 +514,7 @@ class LLMModelCreate(BaseModel):
     base_url: str | None = None
     label: str
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     max_tokens_per_day: int | None = None
     enabled: bool = True
     supports_vision: bool = False
@@ -522,6 +531,7 @@ class LLMModelUpdate(BaseModel):
     base_url: str | None = None
     label: str | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     max_tokens_per_day: int | None = None
     enabled: bool | None = None
     supports_vision: bool | None = None
@@ -544,6 +554,10 @@ class LLMModelOut(BaseModel):
     base_url: str | None = None
     label: str
     temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    reasoning_profile: str = "unsupported"
+    reasoning_efforts: list[ReasoningEffort] = Field(default_factory=list)
+    reasoning_can_disable: bool = False
     api_key_masked: str = ""
     max_tokens_per_day: int | None = None
     enabled: bool

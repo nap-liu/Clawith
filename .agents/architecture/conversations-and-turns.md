@@ -13,8 +13,11 @@ session idle in transaction.
 Model generation settings use one precedence rule across foreground and
 background work: execution override, then Agent override, then model default.
 Subagents, tasks, schedules, and triggers persist optional model and temperature
-overrides; missing values inherit from the Agent. The UI names temperature
-“想象力” and constrains it to the supported 0–2 range.
+and reasoning-effort overrides; missing values inherit from the Agent. The UI
+names temperature “想象力” and constrains it to the supported 0–2 range.
+Reasoning uses the contract in `model-reasoning-controls.md`; in particular,
+explicit `none` disables thinking where the selected model supports it and is
+not interchangeable with a missing value.
 
 Each durable trigger execution dispatches as an independent invocation. Due
 cron and interval occurrences must not be suppressed, merged, or serialized

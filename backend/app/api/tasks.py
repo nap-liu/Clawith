@@ -124,6 +124,7 @@ async def create_task(
         execution_user_id=current_user.id,
         model_id=data.model_id,
         temperature=data.temperature,
+        reasoning_effort=data.reasoning_effort,
         soul=data.soul,
         memory=data.memory,
         supervision_target_user_id=data.supervision_target_user_id,

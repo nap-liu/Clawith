@@ -27,14 +27,19 @@ _CONSTRAINTS = (
     ("llm_models", "ck_llm_models_context_usage_ratio", "c"),
     ("agents", "ck_agents_daily_memory_load_days", "c"),
     ("agents", "ck_agents_temperature", "c"),
+    ("agents", "ck_agents_reasoning_effort", "c"),
     ("tasks", "fk_tasks_model_id_llm_models", "f"),
     ("tasks", "ck_tasks_temperature", "c"),
+    ("tasks", "ck_tasks_reasoning_effort", "c"),
     ("agent_schedules", "fk_agent_schedules_model_id_llm_models", "f"),
     ("agent_schedules", "ck_agent_schedules_temperature", "c"),
+    ("agent_schedules", "ck_agent_schedules_reasoning_effort", "c"),
     ("agent_triggers", "fk_agent_triggers_model_id_llm_models", "f"),
     ("agent_triggers", "ck_agent_triggers_temperature", "c"),
+    ("agent_triggers", "ck_agent_triggers_reasoning_effort", "c"),
     ("subagent_runs", "fk_subagent_runs_model_id_llm_models", "f"),
     ("subagent_runs", "ck_subagent_runs_temperature", "c"),
+    ("subagent_runs", "ck_subagent_runs_reasoning_effort", "c"),
 )
 
 _STATE_SQL = text(

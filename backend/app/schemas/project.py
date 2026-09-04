@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.services.llm.reasoning import ReasoningEffort
+
 
 class ProjectAgentToolSetting(BaseModel):
     tool_id: uuid.UUID
@@ -408,6 +410,7 @@ class ProjectFrozenMemberConfigSummary(BaseModel):
     primary_model: ProjectFrozenModelSummary | None = None
     fallback_model: ProjectFrozenModelSummary | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
+    reasoning_effort: ReasoningEffort | None = None
     max_tool_rounds: int | None = None
     has_project_instruction: bool = False
 

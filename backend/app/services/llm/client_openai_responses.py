@@ -193,18 +193,22 @@ class OpenAIResponsesClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build request payload."""
+        from app.services.llm.reasoning import openai_responses_reasoning_options
+
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
         payload: dict[str, Any] = {
             "model": self.model,
             "input": self._messages_to_input(messages),
-            "temperature": temperature,
             "stream": stream,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
 
         if max_tokens:
             payload["max_output_tokens"] = max_tokens
@@ -214,6 +218,15 @@ class OpenAIResponsesClient(LLMClient):
             payload["tools"] = converted_tools
             if self.supports_tool_choice:
                 payload["tool_choice"] = "auto"
+
+        payload.update(
+            openai_responses_reasoning_options(
+                provider="openai",
+                model=self.model,
+                base_url=self.base_url,
+                effort=reasoning_effort,
+            )
+        )
 
         payload.update(kwargs)
         return payload

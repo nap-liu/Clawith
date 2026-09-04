@@ -372,6 +372,7 @@ async def _generate_llm_report_content(
             ],
             base_url=model.base_url,
             temperature=model.temperature,
+            reasoning_effort=model.reasoning_effort,
             max_tokens=min(get_max_tokens(model.provider, model.model, getattr(model, "max_output_tokens", None)), 1800),
             timeout=float(getattr(model, "request_timeout", None) or 120.0),
         )

@@ -14,6 +14,7 @@ class OpenAICompatibleClient(LLMClient):
         supports_tool_choice: bool = True,
         supports_cache_control: bool = False,
         provider_managed_timeout: bool = False,
+        provider: str | None = None,
     ):
         super().__init__(
             api_key,
@@ -24,6 +25,7 @@ class OpenAICompatibleClient(LLMClient):
         )
         self.supports_tool_choice = supports_tool_choice
         self.supports_cache_control = supports_cache_control
+        self.provider = provider
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -117,6 +119,9 @@ class OpenAICompatibleClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build request payload."""
+        from app.services.llm.reasoning import openai_chat_reasoning_options
+
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
         messages_payload = self._messages_to_openai_payload(messages)
         if self._is_dashscope_channel():
             self._apply_dashscope_cache_markers(messages_payload)
@@ -149,6 +154,16 @@ class OpenAICompatibleClient(LLMClient):
             if self.supports_tool_choice:
                 payload["tool_choice"] = "auto"
                 payload["parallel_tool_calls"] = True
+
+        payload.update(
+            openai_chat_reasoning_options(
+                provider=self.provider,
+                model=self.model,
+                base_url=self.base_url,
+                effort=reasoning_effort,
+                max_output_tokens=max_tokens,
+            )
+        )
 
         # Add any additional kwargs
         payload.update(kwargs)

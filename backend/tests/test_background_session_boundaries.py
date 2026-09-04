@@ -156,6 +156,7 @@ async def test_schedule_releases_read_session_before_context_and_llm() -> None:
         assert read_session.closed
         assert kwargs["model_override_id"] == model_id
         assert kwargs["temperature_override"] == 1.1
+        assert kwargs["reasoning_effort_override"] == "high"
         llm_checked = True
         return "scheduled result"
 
@@ -183,6 +184,7 @@ async def test_schedule_releases_read_session_before_context_and_llm() -> None:
             owner_id,
             model_id=model_id,
             temperature=1.1,
+            reasoning_effort="high",
             soul=False,
             memory=False,
         )
@@ -257,6 +259,7 @@ async def test_task_releases_snapshots_before_context_and_llm() -> None:
         completed_at=None,
         model_id=model_id,
         temperature=1.4,
+        reasoning_effort="none",
         soul=False,
         memory=False,
     )
@@ -298,6 +301,7 @@ async def test_task_releases_snapshots_before_context_and_llm() -> None:
         assert all(session.closed for session in sessions[:3])
         assert kwargs["model_override_id"] == model_id
         assert kwargs["temperature_override"] == 1.4
+        assert kwargs["reasoning_effort_override"] == "none"
         llm_checked = True
         return "task result"
 

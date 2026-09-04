@@ -3,6 +3,29 @@
     "name": "Digital Employee Platform",
     "tagline": "Enterprise Digital Employee Platform"
   },
+  "reasoning": {
+    "label": "Reasoning depth",
+    "inherit": "Auto",
+    "inheritDescription": "Use inherited or model-default behavior; the model decides actual reasoning length, while reasoning-only models always reason",
+    "levels": {
+      "none": "Off",
+      "minimal": "Fastest",
+      "low": "Fast",
+      "medium": "Balanced",
+      "high": "Deep",
+      "xhigh": "Intensive",
+      "max": "Maximum"
+    },
+    "descriptions": {
+      "none": "Skip additional reasoning for the quickest response",
+      "minimal": "Make only essential checks for simple questions",
+      "low": "Use light reasoning while prioritizing speed",
+      "medium": "Balance response speed and quality for everyday work",
+      "high": "Reason more deeply for complex tasks",
+      "xhigh": "Analyze thoroughly for difficult tasks",
+      "max": "Use the greatest reasoning depth the model allows"
+    }
+  },
   "projectTerminology": {
     "owner": "Project owner",
     "projectOwner": "Project owner",
@@ -1825,6 +1848,29 @@
     "projects": "Projects",
     "skillMarket": "Skill Market"
   },
+  "publishedPages": {
+    "filters": {
+      "allAgents": "All digital employees",
+      "selectedAgents": "{{count}} digital employees selected",
+      "agentSearchPlaceholder": "Search digital employees",
+      "noAgentOptions": "No digital employees available to filter",
+      "noAgentMatches": "No matching digital employees",
+      "clearAgents": "Clear selected",
+      "quickClearAgents": "Quickly clear the digital employee filter",
+      "agentAriaLabel": "Filter by digital employee",
+      "allAccessModes": "All authorization types",
+      "accessModeAriaLabel": "Filter published pages by authorization type",
+      "searchPlaceholder": "Search URL, title, publisher, or editor",
+      "searchAriaLabel": "Search published pages by URL, title, publisher, or editor",
+      "searchAction": "Search",
+      "resetAction": "Reset"
+    },
+    "accessModes": {
+      "public": "Public",
+      "authenticated": "Signed-in users",
+      "restricted": "Selected people"
+    }
+  },
   "sidebar": {
     "agents": "Agents",
     "agentSearchPlaceholder": "Search name or creator",
@@ -2082,6 +2128,7 @@
       "pending": "Pending"
     },
     "tabs": {
+      "navigation": "Digital employee settings sections",
       "status": "Status",
       "tasks": "Tasks",
       "aware": "Aware",

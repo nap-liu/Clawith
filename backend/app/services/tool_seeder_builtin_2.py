@@ -255,6 +255,7 @@ BUILTIN_TOOLS_PART_2 = [
                 "focus_ref": {"type": "string", "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason."},
                 "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Omit to inherit the Agent model."},
                 "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override. Omit to inherit the Digital Employee setting."},
+                "reasoning_effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning override. none disables thinking; omit to inherit."},
                 "soul": {"type": "boolean", "default": True, "description": "Whether to use the Agent's Soul for this trigger."},
                 "memory": {"type": "boolean", "default": True, "description": "Whether to use the Agent's memory for this trigger."},
                 "webhook_mode": {
@@ -283,6 +284,7 @@ BUILTIN_TOOLS_PART_2 = [
                 "reason": {"type": "string", "description": "New reason text"},
                 "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Empty means inherit the Agent model."},
                 "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override."},
+                "reasoning_effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning override. none disables thinking."},
                 "soul": {"type": "boolean", "description": "Whether to use the Agent's Soul."},
                 "memory": {"type": "boolean", "description": "Whether to use the Agent's memory."},
                 "webhook_mode": {

@@ -59,6 +59,7 @@ class SubagentRun(Base):
         nullable=True,
     )
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     soul: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -84,5 +85,10 @@ class SubagentRun(Base):
         CheckConstraint(
             "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
             name="ck_subagent_runs_temperature",
+        ),
+        CheckConstraint(
+            "reasoning_effort IS NULL OR reasoning_effort IN "
+            "('none','minimal','low','medium','high','xhigh','max')",
+            name="ck_subagent_runs_reasoning_effort",
         ),
     )

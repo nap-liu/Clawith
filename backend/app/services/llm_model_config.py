@@ -73,6 +73,7 @@ async def clone_tenant_llm_model(
         enabled=source.enabled,
         supports_vision=source.supports_vision,
         temperature=source.temperature,
+        reasoning_effort=source.reasoning_effort,
         request_timeout=source.request_timeout,
         max_output_tokens=source.max_output_tokens,
         context_window=source.context_window,

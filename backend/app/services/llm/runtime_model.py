@@ -34,6 +34,7 @@ class RuntimeLLMModel:
     compact_trigger_ratio: float
     keep_recent_turns: int
     compact_summary_max_tokens: int
+    reasoning_effort: str | None = None
 
     @classmethod
     def from_orm(cls, model: LLMModel) -> "RuntimeLLMModel":
@@ -49,6 +50,7 @@ class RuntimeLLMModel:
             enabled=model.enabled,
             supports_vision=model.supports_vision,
             temperature=model.temperature,
+            reasoning_effort=getattr(model, "reasoning_effort", None),
             request_timeout=model.request_timeout,
             max_output_tokens=model.max_output_tokens,
             context_window=model.context_window,

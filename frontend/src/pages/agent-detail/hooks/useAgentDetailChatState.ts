@@ -303,6 +303,7 @@ export function useAgentDetailChatState({
         previewImages: ChatPreviewImage[];
         attachments: ChatMessageAttachment[];
         modelId?: string | null;
+        reasoningEffort?: string | null;
         messageId: string;
     };
     const [attachedFiles, setAttachedFiles] = useState<ChatAttachedFile[]>([]);

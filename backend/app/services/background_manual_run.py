@@ -174,6 +174,7 @@ async def run_background_resource(
                 actor_user_id,
                 item.model_id,
                 item.temperature,
+                item.reasoning_effort,
                 item.soul,
                 item.memory,
             )
@@ -194,6 +195,7 @@ async def _execute_and_track_schedule(
     execution_user_id: uuid.UUID,
     model_id: uuid.UUID | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
     soul: bool = True,
     memory: bool = True,
 ) -> None:
@@ -201,7 +203,7 @@ async def _execute_and_track_schedule(
     from app.database import async_session
     from app.services.scheduler import ScheduleExecutionOutcome, _execute_schedule
 
-    if model_id is None and temperature is None and soul and memory:
+    if model_id is None and temperature is None and reasoning_effort is None and soul and memory:
         outcome = await _execute_schedule(
             schedule_id,
             agent_id,
@@ -216,6 +218,7 @@ async def _execute_and_track_schedule(
             execution_user_id,
             model_id,
             temperature,
+            reasoning_effort,
             soul,
             memory,
         )

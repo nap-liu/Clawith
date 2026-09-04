@@ -80,6 +80,7 @@ async def call_agent_llm_with_tools(
     turn_type: str = "background",
     model_override_id: uuid.UUID | str | None = None,
     temperature_override: float | None = None,
+    reasoning_effort_override: str | None = None,
 ) -> str:
     """Call agent LLM with tool-calling loop (for background services)."""
     from app.models.agent import Agent
@@ -117,6 +118,7 @@ async def call_agent_llm_with_tools(
         agent=agent,
         override_model_id=model_override_id,
         override_temperature=temperature_override,
+        override_reasoning_effort=reasoning_effort_override,
     )
     if model_override_id and resolved_models.override_status not in {
         MODEL_OVERRIDE_NONE,
@@ -219,6 +221,7 @@ async def call_agent_llm_with_tools(
                         messages=api_messages,
                         tools=tools_for_llm if tools_for_llm else None,
                         temperature=model.temperature,
+                        reasoning_effort=model.reasoning_effort,
                         max_tokens=max_tokens,
                     )
                 except Exception as e:

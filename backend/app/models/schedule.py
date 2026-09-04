@@ -19,6 +19,11 @@ class AgentSchedule(Base):
             "temperature IS NULL OR (temperature >= 0 AND temperature <= 2)",
             name="ck_agent_schedules_temperature",
         ),
+        CheckConstraint(
+            "reasoning_effort IS NULL OR reasoning_effort IN "
+            "('none','minimal','low','medium','high','xhigh','max')",
+            name="ck_agent_schedules_reasoning_effort",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -46,6 +51,7 @@ class AgentSchedule(Base):
         nullable=True,
     )
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     soul: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
     )

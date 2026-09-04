@@ -9,6 +9,7 @@ import {
 import { useTranslation } from "react-i18next";
 
 import DivergenceSlider from "../../../components/DivergenceSlider";
+import ReasoningEffortSelect, { type ReasoningEffortValue } from "../../../components/ReasoningEffortSelect";
 import type { ProjectAgentSettingsDraft } from "../types";
 import {
   Button,
@@ -164,6 +165,15 @@ export default function ProjectAgentSettingsPanel({
                   disabled={disabled}
                 />
               </div>
+              <ProjectField label={t("reasoning.label")}>
+                <ReasoningEffortSelect
+                  value={(config.reasoning_effort || "") as ReasoningEffortValue}
+                  onChange={(reasoningEffort) =>
+                    onConfigChange("reasoning_effort", reasoningEffort || null)
+                  }
+                  disabled={disabled}
+                />
+              </ProjectField>
               <ProjectField
                 label={t("projectWorkspacePage.members.fields.maxToolRounds")}
               >

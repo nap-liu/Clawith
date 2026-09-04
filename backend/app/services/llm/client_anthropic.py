@@ -68,6 +68,9 @@ class AnthropicClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build Anthropic request payload."""
+        from app.services.llm.reasoning import anthropic_reasoning_options
+
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
         system_blocks = []
         anthropic_messages = []
 
@@ -124,14 +127,19 @@ class AnthropicClient(LLMClient):
         if system_blocks:
             payload["system"] = system_blocks
 
-        # Handle Extended Thinking
+        payload.update(anthropic_reasoning_options(model=self.model, effort=reasoning_effort))
+
+        # Handle Extended Thinking (legacy direct caller override)
         thinking = kwargs.pop("thinking", None)
         if thinking:
             payload["thinking"] = thinking
             # For thinking models, temperature must be 1.0 or omitted in some cases
             # But usually it's best to let user specify or default to 1.0 if not set
-            if "temperature" not in kwargs:
+            if "temperature" not in payload:
                 payload["temperature"] = 1.0
+
+        if payload.get("thinking") and "temperature" in payload:
+            payload["temperature"] = 1.0
 
         if tools:
             anthropic_tools = []

@@ -42,6 +42,22 @@ class LLMTestRequest(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
     model_id: str | None = None  # existing model ID to use stored API key
+    reasoning_effort: str | None = None
+
+
+def _llm_model_out(model: LLMModel) -> LLMModelOut:
+    from app.services.llm.reasoning import capability_metadata
+
+    out = LLMModelOut.model_validate(model)
+    metadata = capability_metadata(
+        provider=model.provider,
+        model=model.model,
+        base_url=model.base_url,
+    )
+    out.reasoning_profile = metadata["reasoning_profile"]
+    out.reasoning_efforts = metadata["reasoning_efforts"]
+    out.reasoning_can_disable = metadata["reasoning_can_disable"]
+    return out
 
 
 async def _load_llm_test_api_key(model_id: str | None, current_user: User) -> str | None:
@@ -84,8 +100,9 @@ async def test_llm_model(
         # Simple test: ask model to say "ok"
         try:
             response = await client.complete(
-                messages=[LLMMessage(role="user", content="Say 'ok' and nothing else.")],
-                max_tokens=16,
+            messages=[LLMMessage(role="user", content="Say 'ok' and nothing else.")],
+            max_tokens=16,
+            reasoning_effort=data.reasoning_effort,
             )
         finally:
             close = getattr(client, "close", None)
@@ -121,7 +138,7 @@ async def list_llm_models(
     result = await db.execute(query)
     models = []
     for m in result.scalars().all():
-        out = LLMModelOut.model_validate(m)
+        out = _llm_model_out(m)
         # Mask API key: show last 4 chars
         key = get_model_api_key(m)
         out.api_key_masked = f"****{key[-4:]}" if len(key) > 4 else "****"
@@ -147,6 +164,7 @@ async def add_llm_model(
         base_url=data.base_url,
         label=data.label,
         temperature=data.temperature,
+        reasoning_effort=data.reasoning_effort,
         max_tokens_per_day=data.max_tokens_per_day,
         enabled=data.enabled,
         supports_vision=data.supports_vision,
@@ -170,7 +188,7 @@ async def add_llm_model(
         if tenant and tenant.default_model_id is None:
             tenant.default_model_id = model.id
 
-    return LLMModelOut.model_validate(model)
+    return _llm_model_out(model)
 
 
 @router.post("/llm-models/{source_model_id}/clone", response_model=LLMModelOut)
@@ -205,7 +223,7 @@ async def clone_llm_model(
         )
     except LLMModelConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return LLMModelOut.model_validate(cloned)
+    return _llm_model_out(cloned)
 
 
 @router.post("/llm-models/{model_id}/set-default", status_code=status.HTTP_204_NO_CONTENT)
@@ -327,8 +345,10 @@ async def update_llm_model(
             model.base_url = data.base_url
         if data.api_key and data.api_key.strip() and not data.api_key.startswith('****'):  # Skip masked values
             model.api_key_encrypted = encrypt_data(data.api_key.strip(), settings.SECRET_KEY)
-        if data.temperature is not None:
+        if "temperature" in data.model_fields_set:
             model.temperature = data.temperature
+        if "reasoning_effort" in data.model_fields_set:
+            model.reasoning_effort = data.reasoning_effort
         if data.max_tokens_per_day is not None:
             model.max_tokens_per_day = data.max_tokens_per_day
         if data.enabled is not None:
@@ -350,7 +370,7 @@ async def update_llm_model(
 
         await db.commit()
         await db.refresh(model)
-        return LLMModelOut.model_validate(model)
+        return _llm_model_out(model)
     except SQLAlchemyError as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail="Failed to update model")

@@ -38,6 +38,11 @@ The FastAPI backend is organized under `backend/app/`:
 
 The central execution path is `call_llm` / `call_llm_with_failover`. Web, IM, A2A, trigger, and task behavior should converge on this core. Long-running turns must be connection-independent; WebSocket disconnects are delivery events, not authorization to destroy a turn.
 
+Model generation settings use provider-neutral runtime values.  Reasoning uses
+the nullable seven-level `reasoning_effort` contract and is translated only by
+the selected provider adapter; see
+`.agents/architecture/model-reasoning-controls.md`.
+
 Read-only runtime configuration is snapshotted before dispatch and the inbound
 database transaction ends before provider waits or the tool loop. Tool results,
 usage, compaction, delivery state, and other intermediate outcomes use explicit

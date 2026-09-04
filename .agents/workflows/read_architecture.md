@@ -24,6 +24,8 @@ facts from the current repository and authorized local Docker environment.
 | IM channels, delivery, files/media, confirmation lifecycle, recall | `.agents/architecture/conversations-and-turns.md` | — |
 | identity, SSO, SCIM, organization directories, user normalization, channel-user binding | `.agents/architecture/identity-directory-and-channel-bindings.md` | — |
 | context budgets, compaction, summaries, model usage, memory loading, LLM timeouts | `.agents/architecture/context-and-memory.md` | — |
+| model selection, imagination, reasoning effort, provider generation parameters | `.agents/architecture/model-reasoning-controls.md` | — |
+| published pages, page management, page authorization filters or search | `.agents/architecture/published-page-management.md` | — |
 | builtin tools, MCP, CLI uploads, sandbox execution, enablement | `.agents/architecture/tools-and-sandboxes.md` | — |
 | Docker, tests, local stack, browser E2E | `.agents/architecture/environments-and-operations.md` | `.agents/rules/deploy.md` |
 | implementation or multi-file engineering change | all documents selected for its surfaces | `.agents/workflows/engineering_change.md` |

@@ -140,6 +140,7 @@ async def _call_agent_llm(
     max_tool_rounds_override: int | None = None,
     model_override_id: str | uuid.UUID | None = None,
     temperature_override: float | None = None,
+    reasoning_effort_override: str | None = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -157,6 +158,7 @@ async def _call_agent_llm(
         MODEL_OVERRIDE_NONE,
         MODEL_OVERRIDE_OK,
         load_turn_model_id,
+        load_turn_reasoning_effort,
         resolve_runtime_models,
     )
     from app.services.llm import call_llm_with_failover
@@ -228,6 +230,12 @@ async def _call_agent_llm(
         session_id=session_id,
         turn_anchor_id=turn_anchor_id,
     )
+    turn_reasoning_effort = await load_turn_reasoning_effort(
+        db,
+        agent_id=agent_id,
+        session_id=session_id,
+        turn_anchor_id=turn_anchor_id,
+    )
     from app.models.chat_session import ChatSession
 
     if runtime_session is None:
@@ -237,12 +245,18 @@ async def _call_agent_llm(
             runtime_session = None
     runtime_config = dict(runtime_session.im_config or {}) if runtime_session is not None else {}
     effective_override_id = model_override_id or turn_model_id
+    effective_reasoning_effort = (
+        reasoning_effort_override
+        if reasoning_effort_override is not None
+        else turn_reasoning_effort
+    )
     if effective_override_id:
         resolved_models = await resolve_runtime_models(
             db,
             agent=agent,
             override_model_id=effective_override_id,
             override_temperature=temperature_override,
+            override_reasoning_effort=effective_reasoning_effort,
         )
     elif (
         runtime_session is not None
@@ -260,6 +274,7 @@ async def _call_agent_llm(
             member_config=runtime_config.get("member_config_snapshot"),
             project_settings=project.settings if project is not None else {},
             override_temperature=temperature_override,
+            override_reasoning_effort=effective_reasoning_effort,
         )
     else:
         # Compatibility for project child inputs created before per-turn model
@@ -278,12 +293,14 @@ async def _call_agent_llm(
                 agent=agent,
                 project_settings=project.settings if project is not None else {},
                 override_temperature=temperature_override,
+                override_reasoning_effort=effective_reasoning_effort,
             )
         else:
             resolved_models = await resolve_runtime_models(
                 db,
                 agent=agent,
                 override_temperature=temperature_override,
+                override_reasoning_effort=effective_reasoning_effort,
             )
     if effective_override_id and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}:
         if model_override_id:

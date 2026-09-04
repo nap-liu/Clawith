@@ -39,6 +39,7 @@ class AgentProvisionInput:
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
     temperature: float | None = None
+    reasoning_effort: str | None = None
     permission_scope_type: str = "company"     # company | user | custom
     permission_scope_ids: list = field(default_factory=list)
     permission_access_level: str = "use"
@@ -138,6 +139,7 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
         primary_model_id=effective_primary_model_id,
         fallback_model_id=data.fallback_model_id,
         temperature=data.temperature,
+        reasoning_effort=data.reasoning_effort,
         max_tokens_per_day=data.max_tokens_per_day,
         max_tokens_per_month=data.max_tokens_per_month,
         template_id=data.template_id,

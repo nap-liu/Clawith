@@ -591,6 +591,21 @@ async def ingest_incoming_chat_message(
                 "Ignoring invalid session model override session={}",
                 locked_session.id,
             )
+    if "reasoning_effort" not in meta:
+        from app.services.chat_model_selection import REASONING_SESSION_CONFIG_KEY
+        from app.services.llm.reasoning import validate_reasoning_effort
+
+        active_reasoning_effort = (locked_session.im_config or {}).get(
+            REASONING_SESSION_CONFIG_KEY
+        )
+        if active_reasoning_effort is not None:
+            try:
+                meta["reasoning_effort"] = validate_reasoning_effort(active_reasoning_effort)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid session reasoning override session={}",
+                    locked_session.id,
+                )
     if reply_to_external_message_id:
         meta["reply_to_external_message_id"] = str(reply_to_external_message_id)
 

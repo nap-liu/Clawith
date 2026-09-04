@@ -54,9 +54,11 @@ _RUNTIME_KEYS = {
     "daily_memory_load_days",
     "max_tokens_per_day",
     "max_tokens_per_month",
+    "reasoning_effort",
 }
 _MEMBER_CONFIG_KEYS = {
     "temperature",
+    "reasoning_effort",
     "project_instruction",
     "enabled_project_tools",
     "disabled_project_tools",
@@ -421,6 +423,12 @@ def _validate_runtime(value: object) -> dict:
             raise ProjectAgentTemplateAssetError("autonomy_policy levels must be L1, L2, or L3")
         policy[key] = level
     result["autonomy_policy"] = policy
+    reasoning_effort = value.get("reasoning_effort")
+    if reasoning_effort not in {
+        None, "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    }:
+        raise ProjectAgentTemplateAssetError("reasoning_effort is unsupported")
+    result["reasoning_effort"] = reasoning_effort
     return result
 
 
@@ -439,8 +447,13 @@ def _validate_member_config(value: object, redactions: Sequence[str]) -> dict:
         raise ProjectAgentTemplateAssetError("temperature is outside the supported range")
     result: dict = {
         "temperature": float(temperature) if temperature is not None else None,
+        "reasoning_effort": value.get("reasoning_effort"),
         "project_instruction": _sanitize_text(instruction, redactions),
     }
+    if result["reasoning_effort"] not in {
+        None, "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    }:
+        raise ProjectAgentTemplateAssetError("reasoning_effort is unsupported")
     for key in ("enabled_project_tools", "disabled_project_tools"):
         raw_names = value.get(key, [])
         if not isinstance(raw_names, list) or len(raw_names) > 256:

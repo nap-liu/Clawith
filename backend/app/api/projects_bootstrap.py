@@ -177,6 +177,7 @@ async def get_project_bootstrap_options(
                 "primary_model_id": str(agent.primary_model_id) if agent.primary_model_id else None,
                 "fallback_model_id": str(agent.fallback_model_id) if agent.fallback_model_id else None,
                 "temperature": agent.temperature,
+                "reasoning_effort": agent.reasoning_effort,
                 "max_tool_rounds": agent.max_tool_rounds,
             }
             for agent in agents

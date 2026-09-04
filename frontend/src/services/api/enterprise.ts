@@ -83,6 +83,7 @@ export const scheduleApi = {
       cron_expr: string;
       model_id?: string | null;
       temperature?: number | null;
+      reasoning_effort?: string | null;
       soul?: boolean;
       memory?: boolean;
     },

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { IconEdit } from '@tabler/icons-react';
+import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import { useToast } from '../../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../../stores';
@@ -20,6 +21,8 @@ interface LLMModel {
     max_output_tokens?: number;
     request_timeout?: number;
     temperature?: number;
+    reasoning_effort?: string | null;
+    reasoning_efforts?: string[];
     context_window: number;
     context_usage_ratio: number;
     keep_recent_turns: number;
@@ -75,6 +78,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
         max_output_tokens: '' as string,
         request_timeout: '' as string,
         temperature: '' as string,
+        reasoning_effort: '' as ReasoningEffortValue,
         context_window: '32000' as string,
         context_usage_percent: '70' as string,
         keep_recent_turns: '3' as string,
@@ -183,6 +187,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
             max_output_tokens: defaultSpec ? String(defaultSpec.default_max_tokens) : '4096',
             request_timeout: '',
             temperature: '',
+            reasoning_effort: '',
             context_window: '32000',
             context_usage_percent: '70',
             keep_recent_turns: '3',
@@ -200,6 +205,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                 provider: modelForm.provider,
                 model: modelForm.model,
                 base_url: modelForm.base_url || undefined,
+                reasoning_effort: modelForm.reasoning_effort || undefined,
             };
             if (modelForm.api_key) testData.api_key = modelForm.api_key;
             if (modelId) testData.model_id = modelId;
@@ -319,6 +325,15 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                             <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.temperatureDesc', 'Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0')}</div>
                         </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('reasoning.label')}</label>
+                            <ReasoningEffortSelect
+                                value={modelForm.reasoning_effort}
+                                onChange={(reasoning_effort) => setModelForm({ ...modelForm, reasoning_effort })}
+                                inheritLabel={t('reasoning.inherit')}
+                                style={{ width: '100%' }}
+                            />
+                        </div>
                     </div>
                     <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
                         <button className="btn btn-secondary" onClick={() => { setShowAddModel(false); setEditingModelId(null); }}>{t('common.cancel')}</button>
@@ -329,6 +344,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                 max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
                                 request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                 temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null,
+                                reasoning_effort: modelForm.reasoning_effort || null,
                                 context_window: Number(modelForm.context_window),
                                 context_usage_ratio: Number(modelForm.context_usage_percent) / 100,
                                 keep_recent_turns: Number(modelForm.keep_recent_turns),
@@ -413,6 +429,16 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                         <label className="form-label">{t('enterprise.llm.temperature', 'Imagination')}</label>
                                         <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                                     </div>
+                                    <div className="form-group">
+                                        <label className="form-label">{t('reasoning.label')}</label>
+                                        <ReasoningEffortSelect
+                                            value={modelForm.reasoning_effort}
+                                            onChange={(reasoning_effort) => setModelForm({ ...modelForm, reasoning_effort })}
+                                            supportedEfforts={m.reasoning_efforts}
+                                            inheritLabel={t('reasoning.inherit')}
+                                            style={{ width: '100%' }}
+                                        />
+                                    </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
                                     <button className="btn btn-secondary" onClick={() => { setShowAddModel(false); setEditingModelId(null); }}>{t('common.cancel')}</button>
@@ -425,6 +451,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                                 max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
                                                 request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                                 temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null,
+                                                reasoning_effort: modelForm.reasoning_effort || null,
                                                 context_window: Number(modelForm.context_window),
                                                 context_usage_ratio: Number(modelForm.context_usage_percent) / 100,
                                                 keep_recent_turns: Number(modelForm.keep_recent_turns),
@@ -506,6 +533,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                             max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '',
                                             request_timeout: m.request_timeout ? String(m.request_timeout) : '',
                                             temperature: m.temperature !== null && m.temperature !== undefined ? String(m.temperature) : '',
+                                            reasoning_effort: (m.reasoning_effort || '') as ReasoningEffortValue,
                                             context_window: String(m.context_window || 32000),
                                             context_usage_percent: String(Math.round((m.context_usage_ratio ?? 0.7) * 100)),
                                             keep_recent_turns: String(m.keep_recent_turns ?? 3),

@@ -362,6 +362,7 @@ AGENT_TOOL_CORE = [
                     },
                     "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Omit to inherit the Agent model."},
                     "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override. Omit to inherit the Digital Employee setting."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning override. none disables thinking; omit to inherit."},
                     "soul": {"type": "boolean", "default": True, "description": "Whether to use the Agent's Soul for this trigger."},
                     "memory": {"type": "boolean", "default": True, "description": "Whether to use the Agent's memory for this trigger."},
                     "webhook_mode": {
@@ -396,6 +397,7 @@ AGENT_TOOL_CORE = [
                     },
                     "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Empty means inherit the Agent model."},
                     "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override."},
+                    "reasoning_effort": {"type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "Optional reasoning override. none disables thinking."},
                     "soul": {"type": "boolean", "description": "Whether to use the Agent's Soul."},
                     "memory": {"type": "boolean", "description": "Whether to use the Agent's memory."},
                     "webhook_mode": {

@@ -103,9 +103,11 @@ async def export_project_agents_for_template(
                 "daily_memory_load_days": agent.daily_memory_load_days,
                 "max_tokens_per_day": agent.max_tokens_per_day,
                 "max_tokens_per_month": agent.max_tokens_per_month,
+                "reasoning_effort": agent.reasoning_effort,
             },
             member_config={
                 "temperature": dict(member.config_snapshot or {}).get("temperature"),
+                "reasoning_effort": dict(member.config_snapshot or {}).get("reasoning_effort"),
                 "project_instruction": str(dict(member.config_snapshot or {}).get("project_instruction") or ""),
                 "enabled_project_tools": list(
                     dict(member.config_snapshot or {}).get("enabled_project_tools") or []
@@ -537,6 +539,7 @@ def _agent_from_template(
         status="idle",
         primary_model_id=requested_primary if requested_primary in available_model_ids else default_model_id,
         fallback_model_id=requested_fallback if requested_fallback in available_model_ids else None,
+        reasoning_effort=runtime.get("reasoning_effort"),
         autonomy_policy=dict(runtime.get("autonomy_policy") or {}),
         context_window_size=int(runtime.get("context_window_size") or 100),
         max_tool_rounds=int(runtime.get("max_tool_rounds") or 50),

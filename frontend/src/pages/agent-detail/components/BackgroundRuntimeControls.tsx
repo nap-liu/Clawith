@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import DivergenceSlider from '../../../components/DivergenceSlider';
 import SelectDropdown from '../../../components/SelectDropdown';
+import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
 import { getLlmModelLabel, sortLlmModels } from '../../../utils/llmModels';
 
 type Props = {
@@ -12,28 +14,33 @@ type Props = {
 };
 
 export default function BackgroundRuntimeControls({ resource, models, disabled, onSave, isZh }: Props) {
+    const { t } = useTranslation();
     const [open, setOpen] = useState(false);
     const [saving, setSaving] = useState(false);
     const [modelId, setModelId] = useState(resource.model_id || '');
     const [temperature, setTemperature] = useState<number | null>(resource.temperature ?? null);
+    const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffortValue>(resource.reasoning_effort || '');
     const [soul, setSoul] = useState(resource.soul !== false);
     const [memory, setMemory] = useState(resource.memory !== false);
 
     useEffect(() => {
         setModelId(resource.model_id || '');
         setTemperature(resource.temperature ?? null);
+        setReasoningEffort(resource.reasoning_effort || '');
         setSoul(resource.soul !== false);
         setMemory(resource.memory !== false);
-    }, [resource.model_id, resource.temperature, resource.soul, resource.memory]);
+    }, [resource.model_id, resource.temperature, resource.reasoning_effort, resource.soul, resource.memory]);
 
     const resetDraft = () => {
         setModelId(resource.model_id || '');
         setTemperature(resource.temperature ?? null);
+        setReasoningEffort(resource.reasoning_effort || '');
         setSoul(resource.soul !== false);
         setMemory(resource.memory !== false);
     };
     const dirty = modelId !== (resource.model_id || '')
         || temperature !== (resource.temperature ?? null)
+        || reasoningEffort !== (resource.reasoning_effort || '')
         || soul !== (resource.soul !== false)
         || memory !== (resource.memory !== false);
     const modelOptions = [
@@ -63,6 +70,17 @@ export default function BackgroundRuntimeControls({ resource, models, disabled, 
                         middleLabel={isZh ? '均衡' : 'Balanced'}
                         highLabel={isZh ? '丰富' : 'Imaginative'}
                     />
+                    <div style={{ marginTop: 12 }}>
+                        <label style={{ display: 'block', fontSize: 12, fontWeight: 500, marginBottom: 6 }}>
+                            {t('reasoning.label')}
+                        </label>
+                        <ReasoningEffortSelect
+                            value={reasoningEffort}
+                            onChange={setReasoningEffort}
+                            supportedEfforts={models.find((model) => model.id === modelId)?.reasoning_efforts}
+                            inheritLabel={t('reasoning.inherit')}
+                        />
+                    </div>
                     <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
                         <label style={{ fontSize: 12 }}><input type="checkbox" checked={soul} onChange={(event) => setSoul(event.target.checked)} /> {isZh ? '使用 Soul' : 'Use Soul'}</label>
                         <label style={{ fontSize: 12 }}><input type="checkbox" checked={memory} onChange={(event) => setMemory(event.target.checked)} /> {isZh ? '使用记忆' : 'Use memory'}</label>
@@ -72,7 +90,7 @@ export default function BackgroundRuntimeControls({ resource, models, disabled, 
                         <button className="btn btn-primary" disabled={saving || !dirty} onClick={async () => {
                             setSaving(true);
                             try {
-                                await onSave({ model_id: modelId || null, temperature, soul, memory });
+                                await onSave({ model_id: modelId || null, temperature, reasoning_effort: reasoningEffort || null, soul, memory });
                                 setOpen(false);
                             } catch {
                                 // The shared mutation renders the actionable error toast.

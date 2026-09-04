@@ -515,6 +515,7 @@ export function MembersPanel({
     text(configDraft, "primary_model_id"),
     text(configDraft, "fallback_model_id"),
     typeof configDraft.temperature === "number" ? "temperature" : "",
+    text(configDraft, "reasoning_effort"),
     text(configDraft, "project_instruction"),
     text(configDraft, "max_tool_rounds"),
   ].filter(Boolean).length;

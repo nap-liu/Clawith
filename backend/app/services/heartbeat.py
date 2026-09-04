@@ -147,6 +147,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         model_model = ""
         model_base_url = None
         model_temperature = None
+        model_reasoning_effort = None
         model_max_output_tokens = None
         model_context_window = 0
         model_context_usage_ratio = 0.7
@@ -182,6 +183,11 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             model_model = model.model
             model_base_url = model.base_url
             model_temperature = agent.temperature if agent.temperature is not None else model.temperature
+            model_reasoning_effort = (
+                agent.reasoning_effort
+                if agent.reasoning_effort is not None
+                else model.reasoning_effort
+            )
             model_max_output_tokens = getattr(model, 'max_output_tokens', None)
             model_request_timeout = getattr(model, 'request_timeout', None)
             model_context_window = getattr(model, "context_window", 0)
@@ -369,6 +375,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
+                    reasoning_effort=model_reasoning_effort,
                     max_tokens=round_max_tokens,
                 )
                 logger.info(

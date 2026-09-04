@@ -3,6 +3,29 @@
     "name": "数字员工平台",
     "tagline": "企业数字员工平台"
   },
+  "reasoning": {
+    "label": "思考强度",
+    "inherit": "自动",
+    "inheritDescription": "使用继承或模型默认策略；实际思考长度由模型决定，仅思考模型仍会始终思考",
+    "levels": {
+      "none": "关闭",
+      "minimal": "极速",
+      "low": "快速",
+      "medium": "均衡",
+      "high": "深入",
+      "xhigh": "强化",
+      "max": "极致"
+    },
+    "descriptions": {
+      "none": "不进行额外思考，响应最快",
+      "minimal": "只做必要判断，适合简单问答",
+      "low": "少量思考，优先响应速度",
+      "medium": "兼顾速度和质量，适合日常使用",
+      "high": "投入更多思考，适合复杂任务",
+      "xhigh": "进行充分分析，适合高难度任务",
+      "max": "使用模型允许的最高思考强度"
+    }
+  },
   "projectTerminology": {
     "owner": "负责人",
     "projectOwner": "项目负责人",
@@ -2039,6 +2062,7 @@
       "pending": "待处理"
     },
     "tabs": {
+      "navigation": "数字员工设置分区",
       "status": "状态",
       "tasks": "任务",
       "aware": "自我意识",
@@ -4907,6 +4931,29 @@
     "scopeWrite": "可写",
     "scopeHint": "只读：查看数字员工并与其对话。可写：还可创建和配置数字员工。",
     "colScope": "范围"
+  },
+  "publishedPages": {
+    "filters": {
+      "allAgents": "全部数字员工",
+      "selectedAgents": "已选 {{count}} 个数字员工",
+      "agentSearchPlaceholder": "搜索数字员工",
+      "noAgentOptions": "暂无可筛选的数字员工",
+      "noAgentMatches": "没有匹配的数字员工",
+      "clearAgents": "清空已选",
+      "quickClearAgents": "快速清空数字员工筛选",
+      "agentAriaLabel": "筛选数字员工",
+      "allAccessModes": "全部授权类型",
+      "accessModeAriaLabel": "按授权类型筛选发布页面",
+      "searchPlaceholder": "搜索地址、标题、发布人或修改人",
+      "searchAriaLabel": "按地址、标题、发布人或修改人搜索发布页面",
+      "searchAction": "搜索",
+      "resetAction": "重置"
+    },
+    "accessModes": {
+      "public": "公开",
+      "authenticated": "仅登录",
+      "restricted": "指定人员"
+    }
   },
   "sidebar": {
     "agents": "数字员工",

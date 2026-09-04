@@ -67,6 +67,7 @@ async def message_loop_impl(api, self):
         file_name = data.get("file_name", "")
         raw_attachments = data.get("attachments") if "attachments" in data else None
         override_model_id = data.get("model_id")
+        reasoning_effort = data.get("reasoning_effort")
         is_onboarding_trigger = data.get("kind") == "onboarding_trigger"
         api.logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
 
@@ -93,7 +94,14 @@ async def message_loop_impl(api, self):
             continue
 
         await self._load_scene_manifest()
-        effective_llm_model = await self._resolve_effective_model(override_model_id)
+        try:
+            effective_llm_model = await self._resolve_effective_model(
+                override_model_id,
+                reasoning_effort,
+            )
+        except ValueError as exc:
+            await self._send_current_turn_event({"type": "error", "content": str(exc)})
+            continue
 
         if not await self._check_quotas():
             continue
@@ -150,6 +158,7 @@ async def message_loop_impl(api, self):
                 is_onboarding_trigger,
                 client_message_id=client_message_id,
                 model_id=(str(effective_llm_model.id) if effective_llm_model is not None else None),
+                reasoning_effort=(effective_llm_model.reasoning_effort if effective_llm_model is not None else None),
                 attachments=validated_attachments,
             )
         except (api.SessionTurnBusyError, api.ConversationTurnConflict):

@@ -204,7 +204,16 @@ async def enqueue_due_trigger(
         )
 
 
-InvocationKey = tuple[uuid.UUID, uuid.UUID | None, str, uuid.UUID | None, float | None, bool, bool]
+InvocationKey = tuple[
+    uuid.UUID,
+    uuid.UUID | None,
+    str,
+    uuid.UUID | None,
+    float | None,
+    str | None,
+    bool,
+    bool,
+]
 
 
 async def claim_ready_trigger_invocations(
@@ -224,6 +233,7 @@ async def claim_ready_trigger_invocations(
             str(execution.id),
             trigger.model_id,
             trigger.temperature,
+            trigger.reasoning_effort,
             trigger.soul,
             trigger.memory,
         )

@@ -14,6 +14,7 @@ from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.participant import Participant
 from app.models.tenant import Tenant
+from app.services.llm.reasoning import ReasoningEffort
 
 
 class AgentSettingsPatch(BaseModel):
@@ -39,6 +40,10 @@ class AgentSettingsPatch(BaseModel):
         ge=0,
         le=2,
         description="Imagination from 0 (stable) to 2 (rich); null inherits the model default.",
+    )
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None,
+        description="Reasoning level; none disables it and null inherits the model default.",
     )
     context_window_size: int | None = Field(
         default=None, ge=10, le=500, description="Conversation context rounds."
@@ -246,6 +251,7 @@ def public_setting_name(db_field: str) -> str:
         "primary_model_id": "primary_model",
         "fallback_model_id": "fallback_model",
         "temperature": "imagination",
+        "reasoning_effort": "reasoning_effort",
     }.get(db_field, db_field)
 
 

@@ -168,11 +168,14 @@ class GeminiClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build Gemini request payload."""
+        from app.services.llm.reasoning import gemini_reasoning_options
+
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
         system_blocks: list[str] = []
         contents: list[dict[str, Any]] = []
         tool_name_map = self._extract_tool_name_map(messages)
@@ -252,10 +255,13 @@ class GeminiClient(LLMClient):
 
         payload: dict[str, Any] = {
             "contents": contents or [{"role": "user", "parts": [{"text": ""}]}],
-            "generationConfig": {
-                "temperature": temperature,
-            },
+            "generationConfig": {},
         }
+        if temperature is not None:
+            payload["generationConfig"]["temperature"] = temperature
+        payload["generationConfig"].update(
+            gemini_reasoning_options(model=self.model, effort=reasoning_effort)
+        )
 
         if max_tokens:
             payload["generationConfig"]["maxOutputTokens"] = max_tokens

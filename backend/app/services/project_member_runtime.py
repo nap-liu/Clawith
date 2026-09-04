@@ -15,6 +15,7 @@ from app.models.llm import LLMModel
 from app.models.mcp_server import MCPServer
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 from app.models.tool import AgentTool, Tool
+from app.services.llm.reasoning import ReasoningEffort
 from app.services.tool_config import strip_sensitive_fields
 from app.services.tool_enablement import tool_is_required
 
@@ -335,6 +336,7 @@ class ProjectMemberRuntimeConfig(BaseModel):
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
+    reasoning_effort: ReasoningEffort | None = None
     max_tool_rounds: int | None = Field(default=None, ge=1, le=200)
     project_instruction: str = Field(default="", max_length=20_000)
     enabled_project_tools: list[str] | None = None

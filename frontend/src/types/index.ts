@@ -29,6 +29,7 @@ export interface Agent {
     primary_model_id?: string;
     fallback_model_id?: string;
     temperature?: number | null;
+    reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
     autonomy_policy: Record<string, string>;
     tokens_used_today: number;
     tokens_used_month: number;
@@ -104,6 +105,7 @@ export interface Task {
     execution_user_id?: string;
     model_id?: string | null;
     temperature?: number | null;
+    reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
     soul?: boolean;
     memory?: boolean;
     creator_username?: string;

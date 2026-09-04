@@ -23,6 +23,11 @@ class LLMModel(Base):
             "keep_recent_turns >= 3 AND keep_recent_turns <= 50",
             name="ck_llm_models_keep_recent_turns",
         ),
+        CheckConstraint(
+            "reasoning_effort IS NULL OR reasoning_effort IN "
+            "('none','minimal','low','medium','high','xhigh','max')",
+            name="ck_llm_models_reasoning_effort",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -36,6 +41,7 @@ class LLMModel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     supports_vision: Mapped[bool] = mapped_column(Boolean, default=False)
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Transport connection/pool timeout only. Model generation/read duration is
     # never capped by the platform.
     request_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)

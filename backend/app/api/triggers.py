@@ -12,6 +12,7 @@ from app.database import async_session
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import User
+from app.services.llm.reasoning import ReasoningEffort
 
 router = APIRouter(prefix="/api/agents", tags=["triggers"])
 
@@ -37,6 +38,7 @@ class TriggerResponse(BaseModel):
     execution_user_display_name: str | None = None
     model_id: str | None = None
     temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
 
@@ -52,6 +54,7 @@ class TriggerUpdate(BaseModel):
     expected_execution_user_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
 
@@ -189,6 +192,7 @@ async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user
             execution_user_display_name=user_names.get(t.execution_user_id),
             model_id=str(t.model_id) if t.model_id else None,
             temperature=t.temperature,
+            reasoning_effort=t.reasoning_effort,
             soul=t.soul,
             memory=t.memory,
         )
@@ -275,6 +279,7 @@ async def update_trigger(
             "expected_execution_user_id",
             "model_id",
             "temperature",
+            "reasoning_effort",
             "soul",
             "memory",
         }:
@@ -352,6 +357,8 @@ async def update_trigger(
             if body.temperature is not None and not 0 <= body.temperature <= 2:
                 raise HTTPException(422, "temperature must be between 0 and 2")
             trigger.temperature = body.temperature
+        if "reasoning_effort" in changed_fields:
+            trigger.reasoning_effort = body.reasoning_effort
         if "soul" in changed_fields:
             trigger.soul = body.soul
         if "memory" in changed_fields:

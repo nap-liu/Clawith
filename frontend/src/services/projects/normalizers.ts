@@ -427,6 +427,9 @@ export function normalizeBootstrapOptions(
         mcp_count: number(agent.mcp_count),
         primary_model_id: string(agent.primary_model_id) || null,
         fallback_model_id: string(agent.fallback_model_id) || null,
+        temperature:
+          typeof agent.temperature === "number" ? agent.temperature : null,
+        reasoning_effort: string(agent.reasoning_effort) || null,
         max_tool_rounds:
           typeof agent.max_tool_rounds === "number"
             ? agent.max_tool_rounds

@@ -25,6 +25,7 @@ export function useAgentDetailChatController({
     onboardingRequestsRef,
     setOnboardingKickoffRequest,
     resources,
+    reasoningEffortOverride,
 }: any) {
     const parseChatMsgRef = useRef<any>(() => undefined);
     const scheduleComposerFocusRef = useRef<() => void>(() => undefined);
@@ -92,6 +93,7 @@ export function useAgentDetailChatController({
         activeTab,
         token: chat.token,
         effectiveChatModelId: resources.effectiveChatModelId,
+        reasoningEffortOverride,
         showNoModelState: resources.showNoModelState,
         toast,
         t,

@@ -75,6 +75,12 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
         workspacePath,
         unavailableAttachmentKeys,
     } = props;
+    const activeSettingsTabRef = React.useRef<HTMLButtonElement | null>(null);
+
+    React.useEffect(() => {
+        if (activeTab === 'chat') return;
+        activeSettingsTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'center' });
+    }, [activeTab]);
 
     const workspaceApi: FileBrowserApi = {
         list: (path) => fileApi.list(id, path),
@@ -237,7 +243,7 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                 )}
 
                 {activeTab !== 'chat' && (
-                    <div className="tabs">
+                    <div className="tabs" role="tablist" aria-label={t('agent.tabs.navigation')}>
                         {AGENT_DETAIL_TABS.filter((tab) => {
                             if (['workspace', 'chat'].includes(tab)) return false;
                             if (tab === 'scenes' && (!canManage || !agent.scene_config_enabled)) return false;
@@ -249,9 +255,17 @@ export default function AgentDetailPageContent(props: Record<string, any>) {
                             }
                             return true;
                         }).map((tab) => (
-                            <div key={tab} className={`tab ${activeTab === tab ? 'active' : ''}`} onClick={() => props.setActiveTab(tab)}>
+                            <button
+                                key={tab}
+                                ref={activeTab === tab ? activeSettingsTabRef : undefined}
+                                type="button"
+                                role="tab"
+                                aria-selected={activeTab === tab}
+                                className={`tab ${activeTab === tab ? 'active' : ''}`}
+                                onClick={() => props.setActiveTab(tab)}
+                            >
                                 {t(`agent.tabs.${tab}`)}
-                            </div>
+                            </button>
                         ))}
                         <button className="btn btn-ghost agent-top-action agent-tabs-chat-action" onClick={() => props.setActiveTab('chat')}>
                             <IconMessageCircle size={16} stroke={1.7} />

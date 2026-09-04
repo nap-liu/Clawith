@@ -46,6 +46,7 @@ class _DueSchedule:
     execution_user_id: uuid.UUID | None
     model_id: uuid.UUID | None
     temperature: float | None
+    reasoning_effort: str | None
     soul: bool
     memory: bool
     occurrence_at: datetime
@@ -73,6 +74,7 @@ async def _execute_schedule(
     execution_user_id: uuid.UUID | None = None,
     model_id: uuid.UUID | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
     soul: bool = True,
     memory: bool = True,
 ) -> ScheduleExecutionOutcome:
@@ -176,6 +178,7 @@ async def _execute_schedule(
                     turn_type="schedule",
                     model_override_id=model_id,
                     temperature_override=temperature,
+                    reasoning_effort_override=reasoning_effort,
                 )
 
             from app.services.activity_logger import log_activity
@@ -256,6 +259,7 @@ async def _claim_due_schedules_for_scope(
                     execution_user_id=schedule.execution_user_id,
                     model_id=getattr(schedule, "model_id", None),
                     temperature=getattr(schedule, "temperature", None),
+                    reasoning_effort=getattr(schedule, "reasoning_effort", None),
                     soul=getattr(schedule, "soul", True),
                     memory=getattr(schedule, "memory", True),
                     occurrence_at=occurrence_at,
@@ -316,6 +320,7 @@ async def _execute_claimed_schedule(schedule: _DueSchedule) -> None:
         schedule.execution_user_id,
         schedule.model_id,
         schedule.temperature,
+        schedule.reasoning_effort,
         schedule.soul,
         schedule.memory,
     )

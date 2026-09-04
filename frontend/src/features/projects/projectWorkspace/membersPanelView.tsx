@@ -215,6 +215,7 @@ export function MembersPanelView({
                     typeof configDraft.temperature === "number"
                       ? configDraft.temperature
                       : null,
+                  reasoning_effort: text(configDraft, "reasoning_effort") || null,
                   max_tool_rounds: text(configDraft, "max_tool_rounds"),
                   project_instruction: text(configDraft, "project_instruction"),
                 }}

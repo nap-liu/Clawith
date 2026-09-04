@@ -162,6 +162,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 agent=agent,
                 override_model_id=triggers[0].model_id,
                 override_temperature=triggers[0].temperature,
+                override_reasoning_effort=triggers[0].reasoning_effort,
             )
             if triggers[0].model_id and runtime_models.override_status != MODEL_OVERRIDE_OK:
                 raise RuntimeError("Trigger model override is unavailable")

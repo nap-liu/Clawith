@@ -185,6 +185,7 @@ async def create_project_agent(
     member.config_snapshot = {
         **dict(member.config_snapshot or {}),
         "temperature": source.temperature if source is not None else None,
+        "reasoning_effort": source.reasoning_effort if source is not None else None,
     }
 
     default_soul, default_memory = build_project_agent_identity_defaults(

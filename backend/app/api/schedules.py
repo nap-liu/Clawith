@@ -20,6 +20,7 @@ from app.models.schedule import AgentSchedule
 from app.models.user import User
 from app.services.scheduler import compute_next_run
 from app.services.user_output import sanitize_user_visible_text
+from app.services.llm.reasoning import ReasoningEffort
 
 router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
 
@@ -31,6 +32,7 @@ class ScheduleCreate(BaseModel):
     is_enabled: bool = True
     model_id: uuid.UUID | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
 
@@ -44,6 +46,7 @@ class ScheduleUpdate(BaseModel):
     expected_execution_user_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     temperature: float | None = Field(None, ge=0.0, le=2.0)
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
 
@@ -63,6 +66,7 @@ class ScheduleOut(BaseModel):
     execution_user_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     temperature: float | None = None
+    reasoning_effort: ReasoningEffort | None = None
     soul: bool = True
     memory: bool = True
     creator_username: str | None = None
@@ -141,6 +145,7 @@ async def create_schedule(
         execution_user_id=current_user.id,
         model_id=data.model_id,
         temperature=data.temperature,
+        reasoning_effort=data.reasoning_effort,
         soul=data.soul,
         memory=data.memory,
     )

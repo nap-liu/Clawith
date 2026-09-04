@@ -3,19 +3,16 @@
 Supports slash commands like /new to reset session context.
 """
 
-import hashlib
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import user_can_manage_agent_id
 from app.models.agent import Agent
-from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.services.channel_command_syntax import (
-    COMMANDS,
     _format_token_count,
     _help_message,
     _parse_command,
@@ -31,6 +28,7 @@ from app.services.im_thinking_output import (
     THINKING_OFF,
     THINKING_ON,
 )
+from app.services.llm.reasoning import reasoning_effort_display_name
 
 
 def is_channel_command(text: str) -> bool:
@@ -42,7 +40,7 @@ def is_channel_command(text: str) -> bool:
         return arg in {"on", "off", "status"}
     # Invalid scene/model syntax must still stay on the control plane so it receives
     # an explicit usage error instead of being sent to the LLM as dialogue.
-    return command in {"/scene", "/model"}
+    return command in {"/scene", "/model", "/reasoning"}
 
 
 async def _load_channel_session(
@@ -162,6 +160,7 @@ async def handle_channel_command(
         from app.services.chat_model_selection import (
             MODEL_OVERRIDE_OK,
             MODEL_SESSION_CONFIG_KEY,
+            REASONING_SESSION_CONFIG_KEY,
             resolve_runtime_models,
         )
         from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
@@ -180,10 +179,12 @@ async def handle_channel_command(
         )
         config = dict((session.im_config if session else None) or {})
         override_model_id = str(config.get(MODEL_SESSION_CONFIG_KEY) or "")
+        reasoning_override = config.get(REASONING_SESSION_CONFIG_KEY)
         resolved = await resolve_runtime_models(
             db,
             agent=agent,
             override_model_id=override_model_id or None,
+            override_reasoning_effort=reasoning_override,
         )
 
         if resolved.primary_model is None:
@@ -258,6 +259,7 @@ async def handle_channel_command(
                 f"数字员工：{agent.name}\n"
                 f"运行状态：{runtime_status}\n"
                 f"模型：{model_status}\n"
+                f"思考：{reasoning_effort_display_name(getattr(resolved.primary_model, 'reasoning_effort', None))}\n"
                 f"场景：{scene_status}\n"
                 f"会话：{session_status}\n"
                 f"通道：{source_channel} · {conversation_type}\n"
@@ -266,6 +268,115 @@ async def handle_channel_command(
                 f"输出 {_format_token_count(session_usage.output_tokens)} / "
                 f"总计 {_format_token_count(session_usage.total_tokens)}{estimated_suffix} / "
                 f"缓存命中率 {cache_status}"
+            ),
+        }
+
+    if parsed_cmd == "/reasoning":
+        from app.services.channel_session import find_or_create_channel_session
+        from app.services.chat_model_selection import (
+            MODEL_SESSION_CONFIG_KEY,
+            REASONING_SESSION_CONFIG_KEY,
+            resolve_runtime_models,
+        )
+        from app.services.llm.reasoning import (
+            REASONING_EFFORTS,
+            resolve_reasoning_capability,
+            validate_reasoning_effort,
+        )
+
+        agent = await _load_agent(db, agent_id=agent_id)
+        if agent is None:
+            return {"action": "reasoning_failed", "message": "❌ 无法读取数字员工的思考设置。"}
+        normalized_arg = str(arg or "status").strip().lower()
+        aliases = {"off": "none", "reset": "default", "auto": "default"}
+        normalized_arg = aliases.get(normalized_arg, normalized_arg)
+        allowed = {*REASONING_EFFORTS, "status", "default"}
+        if normalized_arg not in allowed:
+            return {
+                "action": "reasoning_usage",
+                "message": "❌ 用法：/reasoning none|minimal|low|medium|high|xhigh|max|status|default。",
+            }
+
+        session = await _load_channel_session(
+            db,
+            agent_id=agent_id,
+            external_conv_id=external_conv_id,
+            source_channel=source_channel,
+            for_update=normalized_arg != "status",
+        )
+        config = dict((session.im_config if session else None) or {})
+        current = config.get(REASONING_SESSION_CONFIG_KEY)
+        if normalized_arg == "status":
+            resolved = await resolve_runtime_models(
+                db,
+                agent=agent,
+                override_model_id=config.get(MODEL_SESSION_CONFIG_KEY),
+                override_reasoning_effort=current,
+            )
+            if resolved.primary_model is None:
+                return {"action": "reasoning_status", "message": "当前数字员工未配置可用模型。"}
+            source = "会话临时设置" if current is not None else "自动"
+            effort = reasoning_effort_display_name(resolved.primary_model.reasoning_effort)
+            return {"action": "reasoning_status", "message": f"当前思考强度：{effort}（{source}）。"}
+
+        if normalized_arg == "default":
+            if session is not None:
+                config.pop(REASONING_SESSION_CONFIG_KEY, None)
+                session.im_config = config
+                await db.flush()
+            return {
+                "action": "reasoning_default",
+                "message": "✅ 已恢复自动思考设置，从下一条消息起生效。",
+            }
+
+        effort = validate_reasoning_effort(normalized_arg)
+        resolved = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=config.get(MODEL_SESSION_CONFIG_KEY),
+        )
+        if resolved.primary_model is None:
+            return {"action": "reasoning_failed", "message": "❌ 当前数字员工未配置可用模型。"}
+        capability = resolve_reasoning_capability(
+            provider=resolved.primary_model.provider,
+            model=resolved.primary_model.model,
+            base_url=resolved.primary_model.base_url,
+        )
+        if effort not in capability.supported_efforts:
+            return {
+                "action": "reasoning_unsupported",
+                "message": f"❌ 模型「{resolved.primary_model.model}」不支持思考档位 {effort}。",
+            }
+        if session is None:
+            await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=user_id,
+                external_conv_id=external_conv_id,
+                source_channel=source_channel,
+                first_message_title="New Session",
+                is_group=is_group,
+                group_name=group_name,
+                allow_unresolved_user=True,
+            )
+            session = await _load_channel_session(
+                db,
+                agent_id=agent_id,
+                external_conv_id=external_conv_id,
+                source_channel=source_channel,
+                for_update=True,
+            )
+        if session is None:
+            return {"action": "reasoning_failed", "message": "❌ 思考设置失败，请稍后重试。"}
+        config = dict(session.im_config or {})
+        config[REASONING_SESSION_CONFIG_KEY] = effort
+        session.im_config = config
+        await db.flush()
+        return {
+            "action": "reasoning_updated",
+            "message": (
+                f"✅ 当前会话思考强度已设为 {reasoning_effort_display_name(effort)}，"
+                "从下一条消息起生效。"
             ),
         }
 
@@ -328,7 +439,10 @@ async def handle_channel_command(
             if current_model_id and resolved.override_status != MODEL_OVERRIDE_OK:
                 return {
                     "action": "model_status_unavailable",
-                    "message": "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，或 /model default 恢复默认模型。",
+                    "message": (
+                        "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，"
+                        "或 /model default 恢复默认模型。"
+                    ),
                 }
             if resolved.primary_model is None:
                 return {"action": "model_status", "message": "当前数字员工未配置可用模型。"}
@@ -617,44 +731,6 @@ async def handle_channel_command(
     return {"action": "unknown", "message": f"未知命令: {cmd}"}
 
 
-async def _lock_command_event(db: AsyncSession, event_key: str) -> None:
-    if db.get_bind().dialect.name != "postgresql":
-        return
-    lock_id = int.from_bytes(
-        hashlib.blake2b(event_key.encode("utf-8"), digest_size=8).digest(),
-        byteorder="big",
-        signed=True,
-    )
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": lock_id},
-    )
-
-
-async def _load_command_replay(
-    db: AsyncSession,
-    event_key: str,
-) -> dict | None:
-    existing = (
-        await db.execute(
-            select(ChatMessage).where(ChatMessage.external_event_key == event_key)
-        )
-    ).scalar_one_or_none()
-    if existing is None:
-        return None
-    meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
-    return {
-        "action": str(meta.get("command_action") or "replayed"),
-        "message": existing.content,
-        "message_id": str(existing.id),
-        "external_event_key": event_key,
-        "conversation_id": str(existing.conversation_id),
-        "user_id": str(existing.user_id) if existing.user_id else None,
-        "should_deliver": False,
-        "replayed": True,
-    }
-
-
 async def prepare_channel_command_reply(
     db: AsyncSession,
     *,
@@ -669,123 +745,18 @@ async def prepare_channel_command_reply(
     group_name: str | None = None,
     external_user_info: dict | None = None,
 ) -> dict:
-    """Execute a command and durably prepare its one normalized reply anchor.
+    from app.services.channel_command_reply import prepare_channel_command_reply
 
-    The adapter may have resolved or enriched the channel identity in this same
-    session before reaching the command path. Persist that work in a separate
-    transaction before locking a chat session. Normal message ingress locks the
-    chat session before inserting a message that references the user, so mixing
-    both orders in one transaction can deadlock the two paths.
-    """
-    if not provider_event_id:
-        raise ValueError("provider_event_id is required for channel commands")
-    event_digest = hashlib.sha256(str(provider_event_id).encode("utf-8")).hexdigest()
-    event_key = f"channel-command:{source_channel}:{agent_id}:{event_digest}"
-    await _lock_command_event(db, event_key)
-    replay = await _load_command_replay(db, event_key)
-    if replay is not None:
-        return replay
-
-    agent = await _load_agent(db, agent_id=agent_id)
-    resolved_user_id = user_id
-    if resolved_user_id is None and agent is not None and external_user_id:
-        from app.services.channel_user_service import channel_user_service
-
-        platform_user = await channel_user_service.resolve_channel_user(
-            db=db,
-            agent=agent,
-            channel_type=source_channel,
-            external_user_id=external_user_id,
-            extra_info=dict(external_user_info or {}),
-        )
-        resolved_user_id = platform_user.id
-
-    # This is an intentional command-ingress transaction boundary. It releases
-    # any identity/user locks acquired by the adapter or resolver before /new
-    # and /stop perform cancellation and lock the channel session. Reacquire the
-    # event lock and recheck the receipt because another replica may have won
-    # the command while this transaction boundary was crossed.
-    if db.in_transaction():
-        await db.commit()
-    await _lock_command_event(db, event_key)
-    replay = await _load_command_replay(db, event_key)
-    if replay is not None:
-        return replay
-
-    result = await handle_channel_command(
-        db=db,
+    return await prepare_channel_command_reply(
+        db,
         command=command,
         agent_id=agent_id,
-        user_id=resolved_user_id,
+        user_id=user_id,
+        external_user_id=external_user_id,
         external_conv_id=external_conv_id,
         source_channel=source_channel,
+        provider_event_id=provider_event_id,
         is_group=is_group,
         group_name=group_name,
+        external_user_info=external_user_info,
     )
-    from app.services.user_output import sanitize_user_visible_text
-
-    result["message"] = sanitize_user_visible_text(result["message"]).strip()
-    if not result["message"]:
-        result["message"] = "命令已处理。"
-
-    session = None
-    delivery_session_id = result.pop("_delivery_session_id", None)
-    if delivery_session_id:
-        session = await db.get(ChatSession, uuid.UUID(delivery_session_id))
-    if session is None:
-        session = await _load_channel_session(
-            db,
-            agent_id=agent_id,
-            external_conv_id=external_conv_id,
-            source_channel=source_channel,
-            for_update=True,
-        )
-    if session is None:
-        from app.services.channel_session import find_or_create_channel_session
-
-        event_fragment = hashlib.sha256(
-            str(provider_event_id or uuid.uuid4()).encode("utf-8")
-        ).hexdigest()[:20]
-        session = await find_or_create_channel_session(
-            db=db,
-            agent_id=agent_id,
-            user_id=resolved_user_id,
-            external_conv_id=f"{external_conv_id}__control_{event_fragment}",
-            source_channel=source_channel,
-            first_message_title=result["message"][:40],
-            is_group=is_group,
-            group_name=group_name,
-            allow_unresolved_user=True,
-        )
-
-    from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
-
-    reply = ChatMessage(
-        agent_id=agent_id,
-        user_id=resolved_user_id,
-        role="assistant",
-        conversation_id=str(session.id),
-        content=result["message"],
-        external_event_key=event_key,
-        message_meta=attach_delivery_to_meta(
-            {
-                "artifact_role": "command_reply",
-                "source_channel": source_channel,
-                "command_action": str(result.get("action") or "unknown"),
-                "provider_event_id_hash": event_digest,
-            },
-            IMDeliveryResult.pending(source_channel),
-        ),
-    )
-    db.add(reply)
-    await db.flush()
-    session.last_message_at = datetime.now(UTC)
-    return {
-        **result,
-        "message_id": str(reply.id),
-        "external_event_key": event_key,
-        "conversation_id": str(session.id),
-        "user_id": str(resolved_user_id) if resolved_user_id else None,
-        "should_deliver": True,
-        "replayed": False,
-    }

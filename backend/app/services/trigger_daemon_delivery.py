@@ -486,6 +486,7 @@ async def _resume_origin_session_for_on_message(
                 storage_agent_id=history_agent_id,
                 model_override_id=trigger.model_id,
                 temperature_override=trigger.temperature,
+                reasoning_effort_override=trigger.reasoning_effort,
                 include_soul=trigger.soul,
                 include_memory=trigger.memory,
             )
