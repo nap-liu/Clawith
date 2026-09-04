@@ -1,6 +1,7 @@
 """Triggers REST API — CRUD endpoints for the Aware page frontend."""
 
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -71,6 +72,16 @@ class TriggerExecutionResponse(BaseModel):
     finished_at: str | None = None
     last_error: str | None = None
     execution_user_id: str | None = None
+
+
+class ScheduleValidationRequest(BaseModel):
+    kind: Literal["cron", "datetime", "timezone"]
+    value: str
+    timezone: str | None = None
+
+
+class ScheduleValidationResponse(BaseModel):
+    valid: bool
 
 
 _PRIVATE_CONFIG_PARTS = ("token", "secret", "password", "api_key", "webhook_queue")
@@ -240,6 +251,25 @@ async def list_trigger_executions(
         )
         for execution, trigger_name in rows
     ]
+
+
+@router.post(
+    "/{agent_id}/scheduling/validate",
+    response_model=ScheduleValidationResponse,
+)
+async def validate_scheduling_value(
+    agent_id: uuid.UUID,
+    body: ScheduleValidationRequest,
+    user=Depends(get_current_user),
+):
+    """Validate editable values with the runtime scheduling parsers."""
+    from app.services.schedule_config_validation import validate_schedule_value
+
+    async with async_session() as db:
+        await _require_manage(db, user, agent_id)
+    return ScheduleValidationResponse(
+        valid=validate_schedule_value(body.kind, body.value, body.timezone),
+    )
 
 
 @router.patch("/{agent_id}/triggers/{trigger_id}")

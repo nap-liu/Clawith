@@ -58,7 +58,6 @@ export function useAgentDetailResources({
     queryClient,
     toast,
     t,
-    i18n,
     location,
     navigate,
     overrideModelId,
@@ -84,6 +83,18 @@ export function useAgentDetailResources({
         queryKey: ['background-execution-users', currentUser?.tenant_id],
         queryFn: () => enterpriseApi.listMembers(),
         enabled: !!id && awareDataActive && canReassignExecutionUser,
+        staleTime: 60_000,
+    });
+    const { data: supervisionHumanTargets = [] } = useQuery({
+        queryKey: ['relationships', id],
+        queryFn: () => fetchAuth<any[]>(`/agents/${id}/relationships/`),
+        enabled: !!id && awareDataActive,
+        staleTime: 60_000,
+    });
+    const { data: supervisionAgentTargets = [] } = useQuery({
+        queryKey: ['agent-relationships', id],
+        queryFn: () => fetchAuth<any[]>(`/agents/${id}/relationships/agents`),
+        enabled: !!id && awareDataActive,
         staleTime: 60_000,
     });
     const [executionUserPickerTarget, setExecutionUserPickerTarget] = useState<{
@@ -121,10 +132,10 @@ export function useAgentDetailResources({
         onSuccess: (_data, variables) => {
             const key = variables.resourceType === 'trigger' ? 'triggers' : `${variables.resourceType}s`;
             queryClient.invalidateQueries({ queryKey: [key, id] });
-            toast.success(i18n.language?.startsWith('zh') ? '运行配置已更新' : 'Runtime settings updated');
+            toast.success(t('agent.aware.workspace.config.runtimeSaved'));
         },
         onError: (err: any) => toast.error(
-            i18n.language?.startsWith('zh') ? '运行配置更新失败' : 'Runtime settings update failed',
+            t('agent.aware.workspace.config.runtimeSaveFailed'),
             { details: String(err?.detail || err?.message || err) },
         ),
     });
@@ -154,7 +165,7 @@ export function useAgentDetailResources({
     const { data: triggerExecutions = [] } = useQuery({
         queryKey: ['trigger-executions', id],
         queryFn: () => triggerApi.executions(id, 200),
-        enabled: !!id && awareDataActive,
+        enabled: !!id && awareDataActive && agent?.access_level === 'manage',
         refetchInterval: awareDataActive ? 10000 : false,
     });
     const reflectionSessions = useMemo(() => {
@@ -248,8 +259,8 @@ export function useAgentDetailResources({
     const { data: activityLogs = [] } = useQuery({
         queryKey: ['activity', id],
         queryFn: () => activityApi.list(id, 100),
-        enabled: !!id && (activeTab === 'activityLog' || activeTab === 'status'),
-        refetchInterval: activeTab === 'activityLog' ? 10000 : false,
+        enabled: !!id && (awareDataActive || activeTab === 'activityLog' || activeTab === 'status'),
+        refetchInterval: awareDataActive || activeTab === 'activityLog' ? 10000 : false,
     });
 
     const [showExpiryModal, setShowExpiryModal] = useState(false);
@@ -281,7 +292,7 @@ export function useAgentDetailResources({
             queryClient.invalidateQueries({ queryKey: ['agent', id] });
             setShowExpiryModal(false);
         } catch (e: any) {
-            toast.error('保存失败', { details: String(e?.message || e) });
+            toast.error(t('agent.aware.workspace.config.saveFailed'), { details: String(e?.message || e) });
         }
         setExpirySaving(false);
     };
@@ -316,15 +327,11 @@ export function useAgentDetailResources({
             void queryClient.invalidateQueries({ queryKey: ['agent', id] });
             const clamped = result?._clamped_fields;
             if (clamped && clamped.length > 0) {
-                const isCh = i18n.language?.startsWith('zh');
-                const fieldNames: Record<string, string> = isCh
-                    ? { min_poll_interval_min: 'Poll 最短间隔', webhook_rate_limit: 'Webhook 频率限制', heartbeat_interval_minutes: '心跳间隔' }
-                    : { min_poll_interval_min: 'Min Poll Interval', webhook_rate_limit: 'Webhook Rate Limit', heartbeat_interval_minutes: 'Heartbeat Interval' };
                 const msgs = clamped.map((c: any) => {
-                    const name = fieldNames[c.field] || c.field;
-                    return isCh ? `${name}: ${c.requested} -> ${c.applied} (公司策略限制)` : `${name}: ${c.requested} -> ${c.applied} (company policy)`;
+                    const name = t(`agent.aware.workspace.config.policyFields.${c.field}`, { defaultValue: c.field });
+                    return t('agent.aware.workspace.config.policyAdjustedValue', { name, requested: c.requested, applied: c.applied });
                 });
-                setSettingsError((isCh ? 'Some values were adjusted:\n' : 'Some values were adjusted:\n') + msgs.join('\n'));
+                setSettingsError(`${t('agent.aware.workspace.config.policyAdjusted')}\n${msgs.join('\n')}`);
                 setTimeout(() => setSettingsError(''), 5000);
             }
             setSettingsSaved(true);
@@ -388,7 +395,7 @@ export function useAgentDetailResources({
         },
         onError: (err: any) => {
             const msg = err?.detail || err?.message || String(err);
-            toast.error('创建计划任务失败', { details: String(msg) });
+            toast.error(t('agent.aware.workspace.config.scheduleCreateFailed'), { details: String(msg) });
         },
     });
     const toggleScheduleMut = useMutation({
@@ -589,6 +596,8 @@ export function useAgentDetailResources({
         awareTriggers,
         refetchTriggers,
         executionUsers,
+        supervisionHumanTargets,
+        supervisionAgentTargets,
         canReassignExecutionUser,
         executionUserPickerTarget,
         setExecutionUserPickerTarget,

@@ -147,6 +147,13 @@ export const triggerApi = {
   list: (agentId: string) => request<any[]>(`/agents/${agentId}/triggers`),
   executions: (agentId: string, limit = 100) =>
     request<any[]>(`/agents/${agentId}/trigger-executions?limit=${limit}`),
+  validateSchedule: (
+    agentId: string,
+    data: { kind: "cron" | "datetime" | "timezone"; value: string; timezone?: string },
+  ) => request<{ valid: boolean }>(`/agents/${agentId}/scheduling/validate`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  }),
   update: (agentId: string, triggerId: string, data: any) =>
     request<any>(`/agents/${agentId}/triggers/${triggerId}`, {
       method: "PATCH",
