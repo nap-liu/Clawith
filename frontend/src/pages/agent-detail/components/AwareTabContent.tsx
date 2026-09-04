@@ -12,7 +12,8 @@ import { resourceCreator } from './aware/awareFormatters';
 import type { BackgroundResourceTarget, BackgroundResourceType, ExecutionUserPickerTarget } from './aware/types';
 import './aware/AwareWorkspace.css';
 
-type Props = {
+export type AwareTabContentProps = {
+    embedded?: boolean;
     focusRecords: any[];
     awareTriggers: any[];
     activityLogs: any[];
@@ -54,6 +55,7 @@ type Props = {
 type WorkspaceTab = 'focus' | 'resources' | 'executions';
 
 export default function AwareTabContent({
+    embedded = false,
     focusRecords,
     awareTriggers,
     activityLogs,
@@ -90,7 +92,7 @@ export default function AwareTabContent({
     upsertToolCallMessage,
     i18n,
     t,
-}: Props) {
+}: AwareTabContentProps) {
     const [tab, setTab] = useState<WorkspaceTab>('focus');
     const [configTarget, setConfigTarget] = useState<BackgroundResourceTarget>(null);
     const locale = i18n.language;
@@ -156,11 +158,13 @@ export default function AwareTabContent({
     ];
 
     return (
-        <div className="aware-workspace">
-            <header className="aware-workspace-heading">
-                <h2>{t('agent.aware.workspace.title')}</h2>
-                <span>{canManage ? t('agent.aware.workspace.manageView') : t('agent.aware.workspace.memberView')}</span>
-            </header>
+        <div className={`aware-workspace${embedded ? ' aware-workspace--embedded' : ''}`}>
+            {!embedded && (
+                <header className="aware-workspace-heading">
+                    <h2>{t('agent.aware.workspace.title')}</h2>
+                    <span>{canManage ? t('agent.aware.workspace.manageView') : t('agent.aware.workspace.memberView')}</span>
+                </header>
+            )}
             <section className="aware-workspace-card">
                 <nav className="aware-workspace-tabs" role="tablist" aria-label={t('agent.aware.workspace.navigation')}>
                     {tabs.filter((item) => !item.hidden).map((item) => {

@@ -6,6 +6,14 @@
     color: var(--text-primary);
 }
 
+.aware-side-preview--workspace {
+    padding: 16px;
+}
+
+.aware-side-preview--workspace .aware-workspace-card {
+    min-width: 0;
+}
+
 .aware-workspace-heading {
     display: flex;
     align-items: flex-end;

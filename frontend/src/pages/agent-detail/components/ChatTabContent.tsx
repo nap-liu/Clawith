@@ -619,41 +619,7 @@ export default function ChatTabContent(props: Props) {
                     activeTab={sidePanelTab}
                     onTabChange={setSidePanelTab}
                     awareContent={(
-                        <AwarePreviewPanel
-                            focusRecords={focusRecords}
-                            awareTriggers={awareTriggers}
-                            i18n={i18n}
-                            expandedFocusIds={expandedFocusIds}
-                            toggleExpandedFocus={toggleExpandedFocus}
-                            t={t}
-                            awareCalendarDate={awareCalendarDate}
-                            awareCalendarMode={awareCalendarMode}
-                            setAwareCalendarDate={setAwareCalendarDate}
-                            setAwareCalendarMode={setAwareCalendarMode}
-                            awareView={awareView}
-                            setAwareView={setAwareView}
-                            showAllSideActive={showAllSideActive}
-                            setShowAllSideActive={setShowAllSideActive}
-                            showAllSideSystem={showAllSideSystem}
-                            setShowAllSideSystem={setShowAllSideSystem}
-                            showCompletedFocus={showCompletedFocus}
-                            setShowCompletedFocus={setShowCompletedFocus}
-                            showAllSideCompleted={showAllSideCompleted}
-                            setShowAllSideCompleted={setShowAllSideCompleted}
-                            reflectionSessions={reflectionSessions}
-                            expandedReflection={expandedReflection}
-                            setExpandedReflection={setExpandedReflection}
-                            reflectionMessages={reflectionMessages}
-                            loadReflectionMessages={loadReflectionMessages}
-                            id={id}
-                            agent={agent}
-                            openSubagentSession={openSubagentSession}
-                            unavailableAttachmentKeys={unavailableAttachmentKeys}
-                            handleAttachmentDownload={handleAttachmentDownload}
-                            markAttachmentUnavailable={markAttachmentUnavailable}
-                            setChatImagePreview={setChatImagePreview}
-                            upsertToolCallMessage={upsertToolCallMessage}
-                        />
+                        <AwarePreviewPanel {...(props as any)} />
                     )}
                     workspaceLocked={workspacePreviewLocked}
                     onWorkspaceSelectPath={handleWorkspaceSelectPath}
