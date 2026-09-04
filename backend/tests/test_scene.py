@@ -554,7 +554,7 @@ async def test_scene_tool_denies_non_manager_in_current_direct_session(monkeypat
         is_group=False,
         source_channel="miniprogram",
     )
-    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
+    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id, timezone="UTC")
     user = SimpleNamespace(id=user_id, tenant_id=tenant_id, is_active=True, role="member")
     db = _FakeDb([session, agent, user])
 
@@ -587,7 +587,7 @@ async def test_scene_tool_allows_verified_manager_from_any_direct_human_channel(
         is_group=False,
         source_channel=source_channel,
     )
-    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
+    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id, timezone="UTC")
     user = SimpleNamespace(id=user_id, tenant_id=tenant_id, is_active=True, role="member")
     db = _FakeDb([session, agent, user])
 

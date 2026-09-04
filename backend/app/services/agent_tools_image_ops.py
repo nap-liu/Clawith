@@ -146,7 +146,7 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
     global tool config (admin-set) -> per-agent tool config override.
     """
     import httpx
-    from datetime import datetime
+    from app.services.timezone_utils import get_agent_timezone, now_in_timezone
 
     prompt = arguments.get("prompt")
     if not prompt:
@@ -170,7 +170,7 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
 
     # Generate the save path if not provided
     if not save_path:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = now_in_timezone(await get_agent_timezone(agent_id)).strftime("%Y%m%d_%H%M%S")
         # Derive a short slug from the prompt for a more descriptive filename
         slug = "_".join(prompt.split()[:4]).lower()
         slug = "".join(c for c in slug if c.isalnum() or c == "_")[:40]

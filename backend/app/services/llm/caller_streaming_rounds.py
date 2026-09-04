@@ -38,7 +38,10 @@ async def _call_llm_resume_truncated_response(
     recovery_prefix_messages: list[dict[str, str]] = []
     recovery_count_this_round = 0
     durable_partial_count = 0
-    round_visible_joiner = "\n\n" if state.visible_response_segments else ""
+    # Only already-completed plain replies participate in the terminal return
+    # prefix. Tool-round narration is durable on its tool row but is excluded
+    # from the terminal reply, so it must not influence tail splitting.
+    round_visible_joiner = "\n\n" if state.terminal_response_segments else ""
 
     while _response_was_truncated_by_length(response) and state.max_output_recoveries < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT:
         state.max_output_recoveries += 1
@@ -221,6 +224,10 @@ async def _call_llm_handle_plain_text_round(
             )
             for msg in prepared_injected
         )
+        if round_outcome.complete_response_content.strip():
+            state.terminal_response_segments.append(
+                round_outcome.complete_response_content
+            )
         return _CallLlmPlainTextResult(
             advance_round=True,
             skip_before_round_once=True,
@@ -255,7 +262,21 @@ async def _call_llm_handle_plain_text_round(
     _call_llm_log_turn_timing(state, "reply", round_i + 1)
     return _CallLlmPlainTextResult(
         advance_round=False,
-        result=_join_visible_response_segments(*state.visible_response_segments) or "[LLM returned empty content]",
+        # A response carrying tool calls is an intermediate protocol round, not
+        # part of the terminal user reply. Its exact assistant text remains in
+        # the durable tool-call row and provider history; only this final plain
+        # text round is returned for terminal assistant persistence/delivery.
+        result=(
+            "\n\n".join(
+                segment
+                for segment in (
+                    *state.terminal_response_segments,
+                    round_outcome.complete_response_content,
+                )
+                if segment and segment.strip()
+            )
+            or "[LLM returned empty content]"
+        ),
     )
 
 
@@ -283,7 +304,7 @@ async def _call_llm_execute_tool_round(
                 chat_session_id=None,
                 source_channel="web",
                 user_id=state.user_id,
-                intro_text=_join_visible_response_segments(*state.visible_response_segments),
+                intro_text=_latest_visible_response_segment(*state.visible_response_segments),
                 title=conf_call.title,
                 summary=conf_call.summary,
                 action=conf_call.action,
@@ -338,7 +359,7 @@ async def _call_llm_execute_tool_round(
             await record_token_usage(state.agent_id, state.unsaved_usage)
         await state.client_guard.close()
         _call_llm_log_turn_timing(state, "repeat_guard", round_i + 1)
-        return _join_visible_response_segments(*state.visible_response_segments) or REPEAT_TOOL_CALL_BREAK_MESSAGE
+        return REPEAT_TOOL_CALL_BREAK_MESSAGE
 
     await _call_llm_before_tool_execution_guard(state)
 
@@ -391,8 +412,14 @@ async def _call_llm_execute_tool_round(
         _call_llm_log_turn_timing(state, "tool_round_persist_error", round_i + 1)
         return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
     for event in running_events:
-        if persisted_running:
+        durable_message_id = (
+            persisted_running.get(str(event.get("call_id") or ""))
+            if isinstance(persisted_running, dict)
+            else None
+        )
+        if durable_message_id is not None:
             event["_durable_persisted"] = True
+            event["_durable_message_id"] = str(durable_message_id)
         if state.on_tool_call is not None:
             try:
                 await state.on_tool_call(event)

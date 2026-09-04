@@ -244,7 +244,7 @@ async def test_tool_round_then_plain_text(monkeypatch, tmp_path):
         agent_id="agent-x", user_id="user-x", session_id="s",
     )
 
-    assert result == "我先读取文件。\n\n文件里写着 hello"
+    assert result == "文件里写着 hello"
     assert len(client.stream_calls) == 2, "tool round + answer round, nothing more"
 
 

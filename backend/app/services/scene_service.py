@@ -25,6 +25,10 @@ from app.schemas.scene import (
     SceneToolSaveRequest,
     validate_scene_key,
 )
+from app.services.timezone_utils import (
+    add_local_datetime_projections,
+    get_agent_timezone_in_session,
+)
 
 SCENE_TOOL_NAME = "manage_scene"
 SCENE_SESSION_CONFIG_KEY = "scene_key"
@@ -758,4 +762,8 @@ async def execute_scene_management_tool(
             scene_key=str(scene_key) if scene_key else None,
         )
         await db.commit()
-        return json.dumps(result_payload, ensure_ascii=False)
+        timezone_name = await get_agent_timezone_in_session(db, agent)
+        return json.dumps(
+            add_local_datetime_projections(result_payload, timezone_name),
+            ensure_ascii=False,
+        )

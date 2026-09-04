@@ -28,6 +28,35 @@ mutations rather than the complete model turn.
 
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
+A provider response that sends no bytes within the selected model's request
+timeout ends as `model_response_idle_timeout`. This failure never triggers an
+automatic retry or fallback. The shared LLM boundary returns one string-
+compatible typed failure; each existing workload finalizer records its own
+failed state and every user-facing channel renders the same localized failure
+message. The LLM client never writes conversation or workload terminal state.
+
+Model text emitted in a response that also carries tool calls belongs to that
+intermediate tool round. Persist it with the tool-call audit record and replay
+it to the provider unchanged, but do not concatenate it into the terminal
+assistant reply. The terminal reply contains only completed plain-text response
+rounds; plain-text output durably completed before a late user interjection may
+remain a separate terminal segment. This separation preserves raw model and
+tool history without exposing repeated tool narration as the final answer.
+Legacy terminal rows that already contain an exact copy of their same-turn
+durable tool narration remain unchanged in storage and UI history; provider
+replay projects only their terminal tail so old sessions stop reinforcing the
+obsolete merge behavior.
+
+External IM transports may project non-empty `assistant_content` as one
+independent progress message per tool round. The existing tool-call row remains
+the single durable source and delivery anchor; the projection must not create a
+second assistant history row. Empty and repeated text is suppressed, and final
+assistant delivery remains a separate message. Web and transports with an
+updateable streaming card may use their existing transient projection.
+The Agent-level `im_thinking_output_enabled` compatibility setting controls
+this public progress projection; despite its legacy name, it never authorizes
+delivery of provider reasoning or hidden chain-of-thought.
+
 ### Asynchronous Subagent events on parent turns
 
 Ordinary Web, IM, trigger, and non-project A2A parent Sessions use one durable Subagent-event drain rather than one wake turn per child event. A child `ChatMessage` with `subagent_wake=true` remains the notification source, and its parent projection is idempotent through `external_event_key=subagent-parent:<child_message_id>`.

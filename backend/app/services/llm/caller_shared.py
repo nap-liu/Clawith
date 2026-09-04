@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,12 +52,13 @@ from app.services.token_tracker import (
     record_token_usage,
 )
 
-from .client import LLMClientCloseGuard, LLMError
+from .client import LLMClientCloseGuard, LLMError, ModelResponseIdleTimeout
 from .confirmation_tool import find_request_confirmation_call
 from .failover import FailoverErrorType, classify_error
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import ToolOutputRewrite, enforce_message_budget, finalize_tool_output
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
+from .failure_outcome import model_response_idle_timeout_failure
 
 if TYPE_CHECKING:
     from app.models.agent import Agent
@@ -91,9 +93,12 @@ TOOLS_REQUIRING_ARGS = frozenset(
 )
 
 
-def _join_visible_response_segments(*segments: str | None) -> str:
-    """Join model text emitted across the tool rounds of one logical turn."""
-    return "\n\n".join(segment for segment in segments if segment and segment.strip())
+def _latest_visible_response_segment(*segments: str | None) -> str:
+    """Return the latest non-blank model text without merging tool rounds."""
+    return next(
+        (segment for segment in reversed(segments) if segment and segment.strip()),
+        "",
+    )
 
 
 async def _invoke_before_round(
@@ -189,6 +194,20 @@ def _response_was_truncated_by_length(response) -> bool:
 
 class ProviderThrottleExhausted(Exception):
     """Raised after bounded retries for transient provider throttling."""
+
+
+def _as_model_response_idle_timeout(error: BaseException) -> ModelResponseIdleTimeout | None:
+    """Normalize a nested HTTP read timeout without classifying other failures."""
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, ModelResponseIdleTimeout):
+            return current
+        if isinstance(current, httpx.ReadTimeout):
+            return ModelResponseIdleTimeout()
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _is_provider_throttle_error(error: Exception) -> bool:

@@ -246,9 +246,9 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     return next;
   }
 
-  // done.content is the canonical reply for the whole logical turn. Remove
-  // all temporary stream bubbles so A + tool + B becomes one durable A+B
-  // reply, while ordinary non-stream assistant rows (for example a media
+  // done.content is the terminal reply for the logical turn. Remove temporary
+  // tool-round narration streams; their raw text remains attached to durable
+  // tool events, while ordinary committed assistant rows (for example a media
   // caption) remain independent.
   const next = messages.filter(
     (message, index) =>

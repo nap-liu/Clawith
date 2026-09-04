@@ -87,6 +87,7 @@ async def _finish_subagent_turn(
     anchor_id: uuid.UUID,
     reply: str,
     failed: bool,
+    failure_code: str | None = None,
     thinking: str | None = None,
     reply_quality: dict | None = None,
 ) -> bool:
@@ -338,6 +339,7 @@ async def _finish_subagent_turn(
             thinking=thinking,
             message_meta={
                 "kind": kind,
+                **({"error_code": failure_code} if failure_code else {}),
                 "subagent_wake": terminal and run.mode == "async",
                 **(
                     {"subagent_dispatch_state": SUBAGENT_DISPATCH_PENDING}

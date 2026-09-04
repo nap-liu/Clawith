@@ -67,6 +67,11 @@ from app.services.user_project_tool_catalog import (
     _parameters,
     _seed,
 )
+from app.services.timezone_utils import (
+    add_local_datetime_projections,
+    get_agent_timezone_in_session,
+    normalize_datetime_arguments,
+)
 
 
 from app.services.user_project_tool_support import (
@@ -732,7 +737,11 @@ async def execute_user_project_tool(
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
         )
-        handler_arguments = {**arguments, "_turn_anchor_id": str(turn_anchor_id)}
+        timezone_name = await get_agent_timezone_in_session(db, agent)
+        handler_arguments = {
+            **normalize_datetime_arguments(arguments, timezone_name, "due_at"),
+            "_turn_anchor_id": str(turn_anchor_id),
+        }
         result = await _HANDLERS[tool_name](db, actor, handler_arguments)
         project_id = _optional_uuid(arguments.get("project_id"), "project_id")
         if project_id is not None and tool_name in USER_PROJECT_MUTATION_TOOL_NAMES:
@@ -779,7 +788,7 @@ async def execute_user_project_tool(
             tool_call_id=tool_call_id,
             project_id=project_id,
         )
-        return _json(result)
+        return _json(add_local_datetime_projections(result, timezone_name))
 
 
 def user_project_tool_error(exc: Exception) -> str:

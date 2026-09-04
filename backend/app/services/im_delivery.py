@@ -12,7 +12,7 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import quote
@@ -348,6 +348,7 @@ async def deliver_persisted_message(
     agent_id: uuid.UUID,
     runtime,
     message: str,
+    receipt_recallable: bool | None = None,
     **delivery_kwargs,
 ) -> IMDeliveryResult:
     """Deliver one already-pending ChatMessage and durably finalize its receipt."""
@@ -431,6 +432,8 @@ async def deliver_persisted_message(
         await db.commit()
 
     async def _record_part(part: IMDeliveryPart) -> None:
+        if receipt_recallable is not None:
+            part = replace(part, recallable=receipt_recallable)
         await append_delivery_part(message_id, part)
 
     try:
@@ -461,6 +464,11 @@ async def deliver_persisted_message(
         result = IMDeliveryResult.from_exception(
             str(getattr(runtime, "source_channel", "") or "im"),
             exc,
+        )
+    if receipt_recallable is not None:
+        result = replace(
+            result,
+            parts=tuple(replace(part, recallable=receipt_recallable) for part in result.parts),
         )
     if not await register_delivery(message_id, result):
         raise DeliveryReceiptPersistenceError(
@@ -522,6 +530,8 @@ async def update_delivery_message_content(
     content: str,
     thinking: str | None = None,
     complete_turn: bool = False,
+    turn_terminal_status: str = "completed",
+    error_code: str | None = None,
 ) -> bool:
     """Update an already-pending anchor without creating a second outbox row."""
     try:
@@ -551,8 +561,10 @@ async def update_delivery_message_content(
         row.thinking = sanitized_thinking
         if complete_turn:
             meta = dict(row.message_meta or {})
+            if error_code:
+                meta["error_code"] = error_code
             if meta.get("turn_anchor_id"):
-                meta["turn_status"] = "completed"
+                meta["turn_status"] = turn_terminal_status
                 try:
                     turn_anchor_id = uuid.UUID(str(meta["turn_anchor_id"]))
                 except (TypeError, ValueError):
@@ -565,7 +577,7 @@ async def update_delivery_message_content(
                         agent_id=agent_id,
                         conversation_id=row.conversation_id,
                         turn_anchor_id=turn_anchor_id,
-                        status="completed",
+                        status=turn_terminal_status,
                     )
             row.message_meta = meta
         await db.commit()

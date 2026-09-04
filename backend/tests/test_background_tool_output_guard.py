@@ -250,7 +250,7 @@ async def test_large_read_file_result_is_materialized_before_second_model_round(
     finally:
         get_settings.cache_clear()
 
-    assert result == "reading\n\ndone"
+    assert result == "done"
     db.commit.assert_awaited_once()
     tool_message = next(msg for msg in client.requests[1] if msg.role == "tool")
     assert PERSISTED_OPEN in tool_message.content

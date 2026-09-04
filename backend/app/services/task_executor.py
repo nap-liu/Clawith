@@ -336,17 +336,34 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             reasoning_effort_override=task_reasoning_effort,
         )
 
+    from app.services.llm.failure_outcome import llm_failure_code
+
+    failure_code = llm_failure_code(reply)
     logger.info(f"[TaskExec] LLM reply: {reply[:80]}")
 
     async with async_session() as db:
-        result = await db.execute(select(Task).where(Task.id == task_id))
+        result = await db.execute(select(Task).where(Task.id == task_id).with_for_update())
         persisted_task = result.scalar_one_or_none()
         if persisted_task:
-            persisted_task.status = "done"
-            persisted_task.completed_at = datetime.now(UTC)
-            db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
+            if failure_code:
+                persisted_task.status = "pending"
+                persisted_task.completed_at = None
+                db.add(
+                    TaskLog(
+                        task_id=task_id,
+                        content=f"❌ {reply}",
+                        execution_user_id=task_execution_user_id,
+                    )
+                )
+            else:
+                persisted_task.status = "done"
+                persisted_task.completed_at = datetime.now(UTC)
+                db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
             await db.commit()
-            logger.info(f"[TaskExec] Task {task_id} completed!")
+            logger.info(
+                f"[TaskExec] Task {task_id} "
+                f"{'failed with ' + failure_code if failure_code else 'completed'}"
+            )
 
     from app.services.activity_logger import log_activity
 
@@ -359,6 +376,8 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             "task_type": task_type,
             "title": task_title,
             "reply": reply[:500],
+            "status": "failed" if failure_code else "completed",
+            **({"error_code": failure_code} if failure_code else {}),
         },
         related_id=task_id,
     )

@@ -119,11 +119,17 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             trigger_config = dict(triggers[0].config or {})
             trigger_config["_execution_user_id"] = str(execution_user_id)
             triggers[0].config = trigger_config
-            await _resume_origin_session_for_on_message(
+            reply = await _resume_origin_session_for_on_message(
                 agent_id,
                 triggers[0],
                 tenant_id=tenant_key,
             )
+            from app.services.llm.failure_outcome import llm_failure_code
+
+            failure_code = llm_failure_code(reply)
+            if failure_code:
+                invocation_error = str(reply)
+                invocation_retryable = False
             return
 
         # Admission is deliberately outside the identity transaction. A busy
@@ -394,13 +400,19 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         # persisted below (Reflection / A2A mirror / delivery). UI-only field.
         from app.services.chat_history import (
             cap_thinking,
-            lock_turn_anchor_for_finalization,
+            persist_assistant_reply_row,
         )
 
         _capped_thinking = cap_thinking("".join(collected_thinking))
 
         # Compute final reply text once
+        from app.services.llm.failure_outcome import llm_failure_code
+
+        failure_code = llm_failure_code(reply)
         final_reply = reply or "".join(collected_content)
+        if failure_code:
+            invocation_error = str(final_reply)
+            invocation_retryable = False
 
         # Save assistant reply to Reflection session
         async with async_session() as db:
@@ -409,26 +421,16 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             )
             agent_participant = result.scalar_one_or_none()
 
-            await lock_turn_anchor_for_finalization(
+            await persist_assistant_reply_row(
                 db,
                 agent_id=agent_id,
+                user_id=agent.creator_id,
                 conversation_id=str(session_id),
+                content=final_reply,
+                thinking=_capped_thinking,
                 turn_anchor_id=turn_anchor.id,
-            )
-            db.add(
-                ChatMessage(
-                    agent_id=agent_id,
-                    conversation_id=str(session_id),
-                    role="assistant",
-                    content=final_reply,
-                    user_id=agent.creator_id,
-                    participant_id=agent_participant.id if agent_participant else None,
-                    thinking=_capped_thinking,
-                    message_meta={
-                        "turn_anchor_id": str(turn_anchor.id),
-                        "turn_status": "completed",
-                    },
-                )
+                participant_id=agent_participant.id if agent_participant else None,
+                turn_terminal_status="failed" if failure_code else "completed",
             )
 
             # NOTE: trigger state (last_fired_at, fire_count, auto-disable)

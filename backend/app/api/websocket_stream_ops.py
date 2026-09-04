@@ -439,6 +439,11 @@ async def run_llm_and_stream_impl(
             api.set_active_turn_cancel_task(None)
         aborted = _turn_outcome == "aborted"
         self.client_disconnected = _turn_outcome == "disconnected"
+        from app.services.llm.failure_outcome import LLMFailure, localize_llm_failure
+
+        if isinstance(assistant_response, LLMFailure):
+            assistant_response = localize_llm_failure(assistant_response, self.lang)
+            return assistant_response, thinking_content, queued_messages, "failed", bool(partial_chunks)
         if self.client_disconnected:
             api.logger.info(
                 f"[WS] Client disconnected mid-turn — turn finished detached, "
@@ -637,6 +642,9 @@ async def save_assistant_reply_impl(
     turn_status: str = "completed",
     complete_onboarding: bool = False,
 ) -> bool:
+    from app.services.llm.failure_outcome import llm_failure_code
+
+    failure_code = llm_failure_code(assistant_response)
     async with api.async_session() as db:
         if message_id is not None and await db.get(api.ChatMessage, message_id):
             return False
@@ -684,6 +692,7 @@ async def save_assistant_reply_impl(
                 {
                     "turn_anchor_id": str(turn_anchor_id),
                     "turn_status": turn_status,
+                    **({"error_code": failure_code} if failure_code else {}),
                     **({"intermediate_assistant_ids": [str(value) for value in intermediate_ids]} if intermediate_ids else {}),
                     **self._scene_message_meta(),
                 }

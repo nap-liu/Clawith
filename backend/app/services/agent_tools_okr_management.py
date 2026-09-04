@@ -277,9 +277,9 @@ async def _update_any_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID
                 else:
                     kr.status = "behind"
 
-            from datetime import datetime
+            from datetime import datetime, timezone
 
-            kr.last_updated_at = datetime.utcnow()
+            kr.last_updated_at = datetime.now(timezone.utc)
 
             note = arguments.get("note", "Updated by OKR Agent after check-in")
             log_entry = OKRProgressLog(

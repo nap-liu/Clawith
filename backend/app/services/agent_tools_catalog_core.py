@@ -350,7 +350,7 @@ AGENT_TOOL_CORE = [
                     },
                     "config": {
                         "type": "object",
-                        "description": 'Type-specific config. cron: {"expr": "0 9 * * *"}. once: {"at": "2026-03-10T09:00:00+08:00"}. interval: {"minutes": 30}. poll: {"url": "...", "json_path": "$.status", "fire_on": "change", "interval_min": 5}. on_message must contain exactly one canonical actor: {"from_agent_id": "<agent_id>"} or {"from_user_id": "<user_id>"}. webhook: {"secret": "optional_hmac_secret"} (system auto-generates the URL)',
+                        "description": 'Type-specific config. cron: {"expr": "0 9 * * *", "timezone": "optional IANA name"}. once: {"at": "2026-03-10T09:00:00"}; an offset is honored when present, otherwise the effective Agent timezone is used. interval: {"minutes": 30}. poll: {"url": "...", "json_path": "$.status", "fire_on": "change", "interval_min": 5}. on_message must contain exactly one canonical actor: {"from_agent_id": "<agent_id>"} or {"from_user_id": "<user_id>"}. webhook: {"secret": "optional_hmac_secret"} (system auto-generates the URL)',
                     },
                     "reason": {
                         "type": "string",
@@ -389,7 +389,7 @@ AGENT_TOOL_CORE = [
                     },
                     "config": {
                         "type": "object",
-                        "description": "New config. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged.",
+                        "description": "New config. once.at accepts ISO 8601; values without an offset use the effective Agent timezone. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged.",
                     },
                     "reason": {
                         "type": "string",

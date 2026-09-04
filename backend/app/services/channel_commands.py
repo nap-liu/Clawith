@@ -640,25 +640,25 @@ async def handle_channel_command(
         if agent is None:
             return {
                 "action": "thinking_output_missing_agent",
-                "message": "数字员工不存在，无法切换思考输出。",
+                "message": "数字员工不存在，无法切换过程反馈。",
             }
         if arg == "status":
             current_value = bool(getattr(agent, "im_thinking_output_enabled", False))
             return {
                 "action": "thinking_output_status",
-                "message": f"数字员工 IM 思考输出当前为：{_thinking_status_label(current_value)}。",
+                "message": f"数字员工 IM 过程反馈当前为：{_thinking_status_label(current_value)}。",
             }
         if not await user_can_manage_agent_id(db, user_id, agent):
             return {
                 "action": "thinking_output_denied",
-                "message": "没有权限切换该数字员工的 IM 思考输出。",
+                "message": "没有权限切换该数字员工的 IM 过程反馈。",
             }
         if arg in {THINKING_ON, THINKING_OFF}:
             agent.im_thinking_output_enabled = arg == THINKING_ON
             await db.flush()
             return {
                 "action": "thinking_output",
-                "message": f"已{_thinking_status_label(agent.im_thinking_output_enabled)}数字员工 IM 思考输出。",
+                "message": f"已{_thinking_status_label(agent.im_thinking_output_enabled)}数字员工 IM 过程反馈。",
             }
 
     if cmd in ("/new", "/reset"):

@@ -4,6 +4,13 @@
 
 The database is the normal runtime source for LLM tool name, description, and parameter schema. Startup seeding synchronizes builtin rows from `backend/app/services/tool_seeder.py::BUILTIN_TOOLS`; definitions in `agent_tools.py` are fallback/implementation metadata and are not sufficient by themselves.
 
+First-party tools interpret offset-free datetime inputs in the Agent's effective
+timezone (Agent override, then tenant default, then UTC). Human-readable tool
+results include the numeric offset and IANA timezone name. Durable database
+timestamps, audit records, cursors, and machine contracts remain canonical UTC;
+when a machine result needs local context, it keeps the original field and adds
+a sibling `*_local` projection instead of rewriting or dropping source data.
+
 For every builtin schema change, validate in Docker:
 
 1. seed against PostgreSQL;

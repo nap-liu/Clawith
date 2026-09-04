@@ -265,11 +265,11 @@ AGENT_TOOL_FEISHU = [
                 "properties": {
                     "start_time": {
                         "type": "string",
-                        "description": "查询起始时间，ISO 8601 格式，例如 '2026-03-13T00:00:00+08:00'。默认：当前时间。",
+                        "description": "Query start in ISO 8601. A value without an offset uses the Agent effective timezone; an offset-bearing value keeps its absolute instant. Defaults to now.",
                     },
                     "end_time": {
                         "type": "string",
-                        "description": "查询截止时间，ISO 8601 格式。默认：7天后。",
+                        "description": "Query end in ISO 8601. A value without an offset uses the Agent effective timezone; an offset-bearing value keeps its absolute instant. Defaults to 7 days from now.",
                     },
                     "user_id": {
                         "type": "string",
@@ -298,11 +298,11 @@ AGENT_TOOL_FEISHU = [
                     },
                     "start_time": {
                         "type": "string",
-                        "description": "Event start in ISO 8601 with timezone, e.g. '2026-03-15T14:00:00+08:00'",
+                        "description": "Event start in ISO 8601. A value without an offset uses timezone (or the Agent effective timezone); an offset-bearing value keeps its absolute instant.",
                     },
                     "end_time": {
                         "type": "string",
-                        "description": "Event end in ISO 8601 with timezone, e.g. '2026-03-15T15:00:00+08:00'",
+                        "description": "Event end in ISO 8601. A value without an offset uses timezone (or the Agent effective timezone); an offset-bearing value keeps its absolute instant.",
                     },
                     "description": {
                         "type": "string",
@@ -319,7 +319,7 @@ AGENT_TOOL_FEISHU = [
                     },
                     "timezone": {
                         "type": "string",
-                        "description": "Timezone, e.g. 'Asia/Shanghai'. Defaults to Asia/Shanghai.",
+                        "description": "Optional IANA timezone for event display and naive time inputs. Defaults to the Agent effective timezone (Agent override, then tenant, then UTC).",
                     },
                 },
                 "required": ["summary", "start_time", "end_time"],
@@ -337,9 +337,10 @@ AGENT_TOOL_FEISHU = [
                     "event_id": {"type": "string", "description": "Event ID from feishu_calendar_list"},
                     "summary": {"type": "string", "description": "New title"},
                     "description": {"type": "string", "description": "New description"},
-                    "start_time": {"type": "string", "description": "New start time (ISO 8601)"},
-                    "end_time": {"type": "string", "description": "New end time (ISO 8601)"},
+                    "start_time": {"type": "string", "description": "New start in ISO 8601. A value without an offset uses timezone (or the Agent effective timezone); an offset-bearing value keeps its absolute instant."},
+                    "end_time": {"type": "string", "description": "New end in ISO 8601. A value without an offset uses timezone (or the Agent effective timezone); an offset-bearing value keeps its absolute instant."},
                     "location": {"type": "string", "description": "New location"},
+                    "timezone": {"type": "string", "description": "Optional IANA timezone for event display and naive time inputs. Defaults to the Agent effective timezone (Agent override, then tenant, then UTC)."},
                 },
                 "required": ["event_id"],
             },

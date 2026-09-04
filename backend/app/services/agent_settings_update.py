@@ -72,7 +72,13 @@ class AgentSettingsPatch(BaseModel):
     max_triggers: int | None = Field(default=None, ge=1, le=100)
     min_poll_interval_min: int | None = Field(default=None, ge=1, le=60)
     webhook_rate_limit: int | None = Field(default=None, ge=1, le=60)
-    im_thinking_output_enabled: bool | None = None
+    im_thinking_output_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Show public Agent-authored tool-round progress in external IM. "
+            "This never exposes raw provider reasoning."
+        ),
+    )
     timezone: str | None = Field(default=None, max_length=50)
     heartbeat_enabled: bool | None = None
     heartbeat_interval_minutes: int | None = Field(default=None, ge=1, le=10080)

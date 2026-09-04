@@ -36,6 +36,18 @@ _IM_LLM_RECOVERY_HINT = (
     "\n\n———\n如果反复出现此问题，请在当前聊天中单独发送一条消息：/new。"
     "请不要在同一条消息中添加其他文字或附件；重置成功后再重新发送需求和附件。"
 )
+_INDEPENDENT_PROGRESS_CHANNELS = frozenset(
+    {
+        "dingtalk",
+        "slack",
+        "wecom",
+        "teams",
+        "microsoft_teams",
+        "whatsapp",
+        "wechat",
+        "discord",
+    }
+)
 
 
 def _apply_recovery_hint(reply: str, hint: str | None) -> str:
@@ -520,6 +532,64 @@ async def _call_agent_llm(
     from app.database import async_session as _persist_session_factory
     from app.services.chat_history import persist_tool_call as _persist_tool_call
 
+    delivered_progress_texts: set[str] = set()
+    delivered_progress_rounds: set[str] = set()
+
+    async def _deliver_tool_round_progress(evt: dict, message_id: str | None) -> None:
+        if runtime_session is None or evt.get("status") != "running":
+            return
+        from app.services.im_thinking_output import resolve_im_progress_enabled
+
+        if not resolve_im_progress_enabled(agent, runtime_session):
+            return
+        channel = str(runtime_session.source_channel or "").lower()
+        if channel not in _INDEPENDENT_PROGRESS_CHANNELS:
+            return
+        from app.services.user_output import sanitize_user_visible_text
+
+        progress = sanitize_user_visible_text(str(evt.get("assistant_content") or "")).strip()
+        round_id = str(evt.get("round_id") or "")
+        if (
+            not message_id
+            or not progress
+            or progress in delivered_progress_texts
+            or (round_id and round_id in delivered_progress_rounds)
+        ):
+            return
+        # Mark before the provider wait. A timeout or uncertain receipt must not
+        # cause the same model round to fan out multiple visible messages.
+        delivered_progress_texts.add(progress)
+        if round_id:
+            delivered_progress_rounds.add(round_id)
+        try:
+            from app.services.im_delivery import (
+                IMDeliveryResult,
+                deliver_persisted_message,
+                register_delivery,
+            )
+            from app.services.turn_runtime import TurnRuntime
+
+            if not await register_delivery(message_id, IMDeliveryResult.pending(channel)):
+                raise RuntimeError("tool_round_progress_anchor_not_found")
+            await deliver_persisted_message(
+                message_id=message_id,
+                agent_id=history_agent_id,
+                runtime=TurnRuntime(
+                    session_found=True,
+                    source_channel=channel,
+                    conversation_id=str(session_id),
+                    external_conv_id=runtime_session.external_conv_id,
+                    is_group=bool(runtime_session.is_group),
+                ),
+                message=progress,
+                receipt_recallable=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - progress must not fail the tool turn
+            logger.warning(
+                "[Channel] independent assistant progress delivery failed: "
+                f"channel={channel} error={type(exc).__name__}"
+            )
+
     # Mirror this turn to any web client viewing the SAME session in real time.
     # IM apps render only the final reply, but a person watching the conversation
     # in the web UI expects the live stream — so broadcast every event to the
@@ -587,11 +657,12 @@ async def _call_agent_llm(
         await _emit_thinking(thinking_guard.feed(text))
 
     async def _on_tool_call_persisted(evt: dict):
+        durable_message_id = str(evt.get("_durable_message_id") or "") or None
         public_evt = {k: v for k, v in evt.items() if not k.startswith("_")}
         # Persist only when we have a real session + user (FK-safe). IM channels
         # always pass both; guard keeps stray callers from writing orphan rows.
         if session_id and user_id is not None and not evt.get("_durable_persisted"):
-            await _persist_tool_call(
+            persisted_id = await _persist_tool_call(
                 _persist_session_factory,
                 agent_id=history_agent_id,
                 user_id=user_id,
@@ -599,6 +670,9 @@ async def _call_agent_llm(
                 evt=public_evt,
                 turn_anchor_id=turn_anchor_id,
             )
+            if persisted_id is not None:
+                durable_message_id = str(persisted_id)
+        await _deliver_tool_round_progress(public_evt, durable_message_id)
         # Mirror to web viewers, masking secrets at the output boundary exactly
         # like the WebSocket path (raw args stay in the persisted row for replay).
         from app.utils.sanitize import sanitize_tool_args
@@ -686,11 +760,24 @@ async def _call_agent_llm(
             logger.warning(f"[Channel] session token usage persistence failed: {exc}")
     await _emit_chunk(chunk_guard.flush())
     await _emit_thinking(thinking_guard.flush())
-    reply = sanitize_user_visible_text(_context_reply(reply))
+    from app.services.llm.failure_outcome import LLMFailure, localize_llm_failure
+
+    contextual_reply = _context_reply(reply)
+    if isinstance(contextual_reply, LLMFailure):
+        reply = localize_llm_failure(contextual_reply, "zh")
+    else:
+        reply = sanitize_user_visible_text(contextual_reply)
 
     # IM channels render this reply directly to the end user. Keep the original
     # error sentinel visible (it carries the concrete failure reason) and append
     # a short recovery hint that guides the user to reset the session with /new.
+    if isinstance(reply, LLMFailure):
+        logger.error(
+            f"[Channel] LLM failure surfaced on channel "
+            f"(agent_id={agent_id}, code={reply.code}, "
+            f"model={getattr(model, 'model', 'unknown')})"
+        )
+        return reply
     if reply and any(reply.startswith(p) for p in _LLM_ERROR_PREFIXES):
         logger.error(
             f"[Channel] LLM error surfaced on IM channel "

@@ -12,6 +12,7 @@ import { useDialog } from '../../../components/Dialog/DialogProvider';
 import DivergenceSlider from '../../../components/DivergenceSlider';
 import BlurValidatedNumberInput from '../../../components/BlurValidatedNumberInput';
 import SelectDropdown from '../../../components/SelectDropdown';
+import ToggleSwitch from '../../../components/ToggleSwitch';
 import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
 import { sortLlmModels } from '../../../utils/llmModels';
 import { getLlmModelLabel } from '../../../utils/llmModels';
@@ -321,44 +322,28 @@ export default function SettingsTab(props: Props) {
                 </div>
             </div>
 
-            {(() => {
-                const isChinese = i18n.language?.startsWith('zh');
-                const enabled = !!settingsForm.im_thinking_output_enabled;
-                return (
-                    <div className="card" style={{ marginBottom: '12px' }}>
-                        <h4 style={{ marginBottom: '4px' }}>{isChinese ? 'IM 通道' : 'IM Channels'}</h4>
-                        <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
-                            {isChinese
-                                ? '配置数字员工在钉钉、飞书等 IM 对话中的默认表现。'
-                                : 'Configure default behavior for DingTalk, Feishu, and other IM conversations.'}
-                        </p>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px', padding: '10px 14px', background: 'var(--bg-elevated)', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
-                            <div>
-                                <div style={{ fontWeight: 500, fontSize: '13px' }}>
-                                    {isChinese ? '输出思考过程' : 'Show Thinking Progress'}
-                                </div>
-                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
-                                    {isChinese
-                                        ? '开启后，IM 对话会收到数字员工的思考进度；当前 IM 对话可用 /thinking on/off 临时覆盖。'
-                                        : 'When enabled, IM conversations receive thinking progress. Use /thinking on/off in an IM conversation to override it there.'}
-                                </div>
-                            </div>
-                            <label style={{ position: 'relative', display: 'inline-block', width: '44px', height: '24px', cursor: canManage ? 'pointer' : 'default', flexShrink: 0 }}>
-                                <input
-                                    type="checkbox"
-                                    checked={enabled}
-                                    disabled={!canManage}
-                                    onChange={(e) => setSettingsForm((form) => ({ ...form, im_thinking_output_enabled: e.target.checked }))}
-                                    style={{ opacity: 0, width: 0, height: 0 }}
-                                />
-                                <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: enabled ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '12px', transition: 'background 0.2s', opacity: canManage ? 1 : 0.6 }}>
-                                    <span style={{ position: 'absolute', top: '3px', left: enabled ? '23px' : '3px', width: '18px', height: '18px', background: 'white', borderRadius: '50%', transition: 'left 0.2s' }} />
-                                </span>
-                            </label>
+            <div className="card" style={{ marginBottom: '12px' }}>
+                <h4 style={{ marginBottom: '4px' }}>{t('agent.settings.imProgress.title')}</h4>
+                <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
+                    {t('agent.settings.imProgress.description')}
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px', padding: '10px 14px', background: 'var(--bg-elevated)', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
+                    <div>
+                        <div style={{ fontWeight: 500, fontSize: '13px' }}>
+                            {t('agent.settings.imProgress.label')}
+                        </div>
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
+                            {t('agent.settings.imProgress.hint')}
                         </div>
                     </div>
-                );
-            })()}
+                    <ToggleSwitch
+                        checked={!!settingsForm.im_thinking_output_enabled}
+                        disabled={!canManage}
+                        onChange={(checked) => setSettingsForm((form) => ({ ...form, im_thinking_output_enabled: checked }))}
+                        ariaLabel={t('agent.settings.imProgress.label')}
+                    />
+                </div>
+            </div>
 
             <div className="card" style={{ marginBottom: '12px' }}>
                 <h4 style={{ marginBottom: '12px' }}>{t('agent.settings.tokenLimits')}</h4>

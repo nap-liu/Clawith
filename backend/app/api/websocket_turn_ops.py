@@ -99,7 +99,7 @@ async def execute_web_turn_impl(
                     return "disconnect"
                 return "continue"
 
-            if task_match:
+            if task_match and turn_outcome != "failed":
                 assistant_response = await self._create_task_record(
                     task_match.group(1).strip(),
                     assistant_response,

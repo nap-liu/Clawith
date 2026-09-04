@@ -377,7 +377,7 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
 
 
 @pytest.mark.asyncio
-async def test_thinking_on_updates_agent_im_config(monkeypatch):
+async def test_thinking_on_enables_agent_im_process_feedback(monkeypatch):
     agent_id = uuid.uuid4()
     agent = SimpleNamespace(id=agent_id, im_thinking_output_enabled=False)
     db = FakeDB(lookup_result=agent)
@@ -400,11 +400,12 @@ async def test_thinking_on_updates_agent_im_config(monkeypatch):
     assert agent.im_thinking_output_enabled is True
     assert db.flushes == 1
     assert "数字员工" in result["message"]
+    assert "过程反馈" in result["message"]
     assert "开启" in result["message"]
 
 
 @pytest.mark.asyncio
-async def test_thinking_off_updates_agent_im_config(monkeypatch):
+async def test_thinking_off_disables_agent_im_process_feedback(monkeypatch):
     agent_id = uuid.uuid4()
     agent = SimpleNamespace(id=agent_id, im_thinking_output_enabled=True)
     db = FakeDB(lookup_result=agent)

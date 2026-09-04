@@ -156,6 +156,78 @@ async def test_callback_delivery_cancellation_marks_unknown():
     assert stored.message_meta["delivery"]["status"] == "unknown"
 
 
+async def test_tool_round_progress_reuses_tool_row_without_creating_assistant_history(monkeypatch):
+    from app.services import turn_runtime
+    from app.services.turn_runtime import TurnRuntime
+
+    agent, user = await _seed_agent()
+    conversation_id = str(uuid.uuid4())
+    tool_content = (
+        '{"name":"read_file","call_id":"call-progress","args":{},'
+        '"status":"running","assistant_content":"I will inspect the file."}'
+    )
+    async with async_session() as db:
+        row = ChatMessage(
+            agent_id=agent.id,
+            user_id=user.id,
+            role="tool_call",
+            content=tool_content,
+            conversation_id=conversation_id,
+        )
+        db.add(row)
+        await db.commit()
+        row_id = row.id
+    assert await im_delivery.register_delivery(
+        row_id,
+        IMDeliveryResult.pending("slack"),
+    )
+
+    async def deliver_message_with_receipt(*, on_part, **_kwargs):
+        part = IMDeliveryPart(
+            transport="slack",
+            provider_message_id="progress-ts",
+            conversation_ref="C123",
+            artifact_role="chunk",
+            recallable=True,
+        )
+        await on_part(part)
+        return IMDeliveryResult.sent("slack", part)
+
+    monkeypatch.setattr(
+        turn_runtime,
+        "deliver_message_with_receipt",
+        deliver_message_with_receipt,
+    )
+    await im_delivery.deliver_persisted_message(
+        message_id=row_id,
+        agent_id=agent.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="slack",
+            conversation_id=conversation_id,
+            external_conv_id="slack_C123",
+            is_group=False,
+        ),
+        message="I will inspect the file.",
+        receipt_recallable=False,
+    )
+
+    async with async_session() as db:
+        rows = list(
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id == conversation_id
+                    )
+                )
+            ).scalars()
+        )
+    assert len(rows) == 1
+    assert rows[0].role == "tool_call"
+    assert rows[0].content == tool_content
+    assert rows[0].message_meta["delivery"]["parts"][0]["recall_status"] == "unsupported"
+
+
 async def test_durable_thinking_progress_does_not_complete_interrupted_turn():
     from app.services.chat_history import load_recoverable_messages_for_turn
     from app.services.turn_recovery import _latest_row_needs_recovery

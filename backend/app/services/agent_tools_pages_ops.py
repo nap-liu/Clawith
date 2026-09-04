@@ -11,6 +11,7 @@ from app.database import async_session
 from app.models.audit import AuditLog
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.storage import get_storage_backend
+from app.services.timezone_utils import format_datetime_for_agent, get_agent_timezone
 
 
 async def _resolve_public_base_url() -> str:
@@ -174,6 +175,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         url_note = ""
     management_path = f"/published-pages?page={page_id}" if page_id else "/published-pages"
     management_url = f"{public_base}{management_path}" if public_base else management_path
+    timezone_name = await get_agent_timezone(agent_id)
 
     headline = (
         "Updated in place — the page already had a published link, so the SAME URL "
@@ -187,7 +189,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Management URL: {management_url}\n"
         f"Title: {title}\n\n"
         f"Published by: {publication_actor_label}\n"
-        f"Published at: {publication_time.isoformat() if publication_time else 'not recorded'}\n\n"
+        f"Published at: {format_datetime_for_agent(publication_time, timezone_name) or 'not recorded'}\n\n"
         f"Access: {effective_access_mode}.\n"
         f"Platform watermark: enabled automatically ({'anonymous visitor ID and access time' if effective_access_mode == 'public' else 'signed-in user identity'}).\n"
         "Automatic SSO: off by default; append ?auto_login=1 only when explicitly requested, "
@@ -202,6 +204,7 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
     from app.models.user import User
 
     public_base = await _resolve_public_base_url()
+    timezone_name = await get_agent_timezone(agent_id)
 
     try:
         async with async_session() as db:
@@ -254,13 +257,13 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
             lines.append(f"  Management: {page_management_url}")
             lines.append(f"  Source: {p.source_path}")
             lines.append(f"  Created by: {actors.get(p.user_id, 'unknown user')}")
-            lines.append(f"  Created at: {p.created_at.isoformat() if p.created_at else 'not recorded'}")
+            lines.append(f"  Created at: {format_datetime_for_agent(p.created_at, timezone_name) or 'not recorded'}")
             lines.append(
                 f"  Last published by: {actors.get(p.last_published_by_user_id, 'historical data not recorded')}"
             )
             lines.append(
                 "  Last published at: "
-                f"{p.last_published_at.isoformat() if p.last_published_at else 'historical data not recorded'}"
+                f"{format_datetime_for_agent(p.last_published_at, timezone_name) or 'historical data not recorded'}"
             )
             lines.append(f"  Views: {p.view_count}")
             lines.append(f"  Access: {p.access_mode}")
@@ -290,6 +293,7 @@ async def _list_page_access_requests(agent_id: uuid.UUID, user_id: uuid.UUID, ar
         return "Invalid pagination; page and page_size must be integers"
 
     try:
+        timezone_name = await get_agent_timezone(agent_id)
         async with async_session() as db:
             published_page = await db.scalar(
                 select(PublishedPage).where(
@@ -354,8 +358,8 @@ async def _list_page_access_requests(agent_id: uuid.UUID, user_id: uuid.UUID, ar
                     f"- {requester.display_name} ({requester_email})",
                     f"  User ID: {requester.id}",
                     f"  Status: {access_request.status}",
-                    f"  Requested at: {access_request.requested_at.isoformat()}",
-                    f"  Resolved at: {access_request.resolved_at.isoformat() if access_request.resolved_at else 'not resolved'}",
+                    f"  Requested at: {format_datetime_for_agent(access_request.requested_at, timezone_name)}",
+                    f"  Resolved at: {format_datetime_for_agent(access_request.resolved_at, timezone_name) or 'not resolved'}",
                 ]
             )
         return "\n".join(lines)

@@ -499,6 +499,10 @@ class OpenAICompatibleClient(LLMClient):
 
                 break  # Success
 
+            except httpx.ReadTimeout:
+                # Response inactivity is terminal for this turn.  Let the
+                # shared caller normalize it without replaying the request.
+                raise
             except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
                 if meaningful_progress:
                     raise LLMError(f"Connection interrupted after streaming started: {e}") from e

@@ -407,6 +407,8 @@ async def update_agent(  # noqa: D401
     imagination ranges from 0 (stable) to 2 (rich); omit it to keep the current value.
     reasoning_effort uses none/minimal/low/medium/high/xhigh/max; none disables thinking.
     daily_memory_load_days=0 disables Daily Memory loading while retaining Core Memory.
+    im_thinking_output_enabled controls clear Agent-authored work updates in IM; despite the
+    legacy field name it never exposes raw provider reasoning.
     clear_fields explicitly clears nullable ordinary settings such as primary_model, fallback_model,
     imagination, avatar_url, bio, welcome_message, timezone, and token limits.
     expires_at: ISO8601 datetime string — ADMIN ONLY (platform_admin/org_admin).

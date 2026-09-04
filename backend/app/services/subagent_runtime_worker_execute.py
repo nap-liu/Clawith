@@ -312,6 +312,9 @@ async def execute_claimed_subagent(
                     runtime_workspace=runtime_workspace,
                     max_tool_rounds_override=max_tool_rounds_override,
                 )
+            from app.services.llm.failure_outcome import llm_failure_code
+
+            failure_code = llm_failure_code(reply)
             if not str(reply or "").strip() and await _park_subagent_confirmation(
                 run_id,
                 anchor_id,
@@ -324,7 +327,8 @@ async def execute_claimed_subagent(
                 return
             reply_text = str(reply or "")
             failed = (
-                is_error_result(reply_text)
+                bool(failure_code)
+                or is_error_result(reply_text)
                 or reply_text.startswith(
                     (
                         "⚠️ 数字员工未找到",
@@ -385,11 +389,20 @@ async def execute_claimed_subagent(
                             runtime_workspace=runtime_workspace,
                             max_tool_rounds_override=max_tool_rounds_override,
                         )
+                    corrected_failure_code = llm_failure_code(corrected_reply)
                     corrected_text = str(corrected_reply or "").strip()
                     corrected_failed = (
-                        not corrected_text or is_error_result(corrected_text) or corrected_text.startswith("⚠️ ")
+                        bool(corrected_failure_code)
+                        or not corrected_text
+                        or is_error_result(corrected_text)
+                        or corrected_text.startswith("⚠️ ")
                     )
-                    if not corrected_failed:
+                    if corrected_failure_code:
+                        reply = corrected_reply
+                        reply_text = corrected_text
+                        failure_code = corrected_failure_code
+                        failed = True
+                    elif not corrected_failed:
                         reply = corrected_reply
                         reply_text = corrected_text
                     reply_quality = {
@@ -403,6 +416,7 @@ async def execute_claimed_subagent(
                 anchor_id=anchor_id,
                 reply=reply,
                 failed=failed,
+                failure_code=failure_code,
                 thinking="".join(thinking_parts) or None,
                 reply_quality=reply_quality,
             )

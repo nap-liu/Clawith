@@ -355,7 +355,7 @@ async def _update_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID | N
     try:
         from app.models.okr import OKRObjective, OKRKeyResult, OKRProgressLog
         from sqlalchemy import select as _select
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         async with async_session() as db:
             ctx = await _load_okr_request_context(db, agent_id, user_id)
@@ -381,7 +381,7 @@ async def _update_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID | N
 
             prev_value = kr.current_value
             kr.current_value = float(value)
-            kr.last_updated_at = datetime.utcnow()
+            kr.last_updated_at = datetime.now(timezone.utc)
 
             # Auto-determine status based on progress ratio
             ratio = kr.current_value / kr.target_value if kr.target_value else 0

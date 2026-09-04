@@ -250,7 +250,7 @@ BUILTIN_TOOLS_PART_2 = [
             "properties": {
                 "name": {"type": "string", "description": "Unique name for this trigger, e.g. 'daily_briefing' or 'wait_<name>_reply'"},
                 "type": {"type": "string", "enum": ["cron", "once", "interval", "poll", "on_message", "webhook"], "description": "Trigger type"},
-                "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message must contain exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}. webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)"},
+                "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\", \"timezone\": \"optional IANA name\"}. once: {\"at\": \"2026-03-10T09:00:00\"}; an offset is honored when present, otherwise the effective Agent timezone is used. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message must contain exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}. webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)"},
                 "reason": {"type": "string", "description": "What you should do when this trigger fires. This will be shown to you as context when you wake up."},
                 "focus_ref": {"type": "string", "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason."},
                 "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Omit to inherit the Agent model."},
@@ -280,7 +280,7 @@ BUILTIN_TOOLS_PART_2 = [
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Name of the trigger to update"},
-                "config": {"type": "object", "description": "New config. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged."},
+                "config": {"type": "object", "description": "New config. once.at accepts ISO 8601; values without an offset use the effective Agent timezone. For webhook triggers this is a partial patch: omitted URL token, secret, webhook mode, and internal queue state remain unchanged."},
                 "reason": {"type": "string", "description": "New reason text"},
                 "model": {"type": "string", "description": "Optional model UUID, key, or unique label. Empty means inherit the Agent model."},
                 "temperature": {"type": "number", "minimum": 0, "maximum": 2, "description": "Optional imagination override."},

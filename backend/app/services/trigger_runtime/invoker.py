@@ -380,33 +380,25 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             include_memory=triggers[0].memory,
         )
 
-        from app.services.chat_history import lock_turn_anchor_for_finalization
+        from app.services.chat_history import persist_assistant_reply_row
+        from app.services.llm.failure_outcome import llm_failure_code
 
+        failure_code = llm_failure_code(reply)
         final_reply = reply or "".join(collected_content)
         async with async_session() as db:
             result = await db.execute(
                 select(Participant).where(Participant.type == "agent", Participant.ref_id == agent_id)
             )
             agent_participant = result.scalar_one_or_none()
-            await lock_turn_anchor_for_finalization(
+            await persist_assistant_reply_row(
                 db,
                 agent_id=agent_id,
+                user_id=agent.creator_id,
                 conversation_id=str(session_id),
                 turn_anchor_id=turn_anchor.id,
-            )
-            db.add(
-                ChatMessage(
-                    agent_id=agent_id,
-                    conversation_id=str(session_id),
-                    role="assistant",
-                    content=final_reply,
-                    user_id=agent.creator_id,
-                    participant_id=agent_participant.id if agent_participant else None,
-                    message_meta={
-                        "turn_anchor_id": str(turn_anchor.id),
-                        "turn_status": "completed",
-                    },
-                )
+                content=final_reply,
+                participant_id=agent_participant.id if agent_participant else None,
+                turn_terminal_status="failed" if failure_code else "completed",
             )
             await db.commit()
 
@@ -510,7 +502,10 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
         )
 
         if execution_ids:
-            await mark_trigger_executions_completed(execution_ids)
+            if failure_code:
+                await mark_trigger_executions_failed(execution_ids, str(final_reply)[:2000])
+            else:
+                await mark_trigger_executions_completed(execution_ids)
     except asyncio.CancelledError:
         execution_ids = [
             uuid.UUID(str((t.config or {}).get("_execution_id")))

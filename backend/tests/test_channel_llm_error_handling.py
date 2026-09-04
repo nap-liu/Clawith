@@ -104,6 +104,7 @@ def _make_agent_and_model(request_timeout=None):
         primary_model_id=model.id,
         fallback_model_id=None,
         context_window_size=100,
+        im_thinking_output_enabled=False,
     )
     return agent, model
 
@@ -179,6 +180,124 @@ async def test_successful_reply_passes_through(monkeypatch):
         _make_db(agent, model), agent.id, "你好", session_id=str(agent.id), user_id=agent.id
     )
     assert reply == "你好，我可以帮你做什么？"
+
+
+async def test_im_tool_round_content_is_delivered_once_as_independent_progress(monkeypatch):
+    from app.services import im_delivery
+
+    agent, model = _make_agent_and_model()
+    agent.im_thinking_output_enabled = True
+    session_id = str(uuid.uuid4())
+    runtime_session = SimpleNamespace(
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_p2p_user-1",
+        is_group=False,
+        im_config={},
+        project_id=None,
+    )
+    progress_row_id = uuid.uuid4()
+    mark_pending = AsyncMock(return_value=True)
+    deliver_progress = AsyncMock(return_value=SimpleNamespace(ok=True))
+    monkeypatch.setattr(
+        im_delivery,
+        "register_delivery",
+        mark_pending,
+    )
+    monkeypatch.setattr(
+        im_delivery,
+        "deliver_persisted_message",
+        deliver_progress,
+    )
+
+    async def tool_llm(*_args, on_tool_call=None, **_kwargs):
+        assert on_tool_call is not None
+        for round_id in ("round-1", "round-2"):
+            await on_tool_call(
+                {
+                    "name": "read_file",
+                    "call_id": round_id,
+                    "status": "running",
+                    "round_id": round_id,
+                    "assistant_content": "我先读取文件。",
+                    "_durable_persisted": True,
+                    "_durable_message_id": str(progress_row_id),
+                }
+            )
+        return "文件内容已核对完成。"
+
+    _patch_llm(monkeypatch, tool_llm)
+
+    reply = await channel_llm._call_agent_llm(
+        _make_db(agent, model),
+        agent.id,
+        "检查文件",
+        session_id=session_id,
+        user_id=agent.id,
+        runtime_session=runtime_session,
+    )
+
+    assert reply == "文件内容已核对完成。"
+    deliver_progress.assert_awaited_once()
+    progress = deliver_progress.await_args.kwargs
+    assert progress["message_id"] == str(progress_row_id)
+    assert progress["message"] == "我先读取文件。"
+    assert progress["receipt_recallable"] is False
+    assert progress["runtime"].source_channel == "dingtalk"
+    mark_pending.assert_awaited_once()
+    assert mark_pending.await_args.args[0] == str(progress_row_id)
+
+
+async def test_im_tool_round_content_is_hidden_when_progress_output_is_disabled(monkeypatch):
+    from app.services import im_delivery
+
+    agent, model = _make_agent_and_model()
+    runtime_session = SimpleNamespace(
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_p2p_user-1",
+        is_group=False,
+        im_config={},
+        project_id=None,
+    )
+    mark_pending = AsyncMock()
+    deliver_progress = AsyncMock()
+    monkeypatch.setattr(
+        im_delivery,
+        "register_delivery",
+        mark_pending,
+    )
+    monkeypatch.setattr(
+        im_delivery,
+        "deliver_persisted_message",
+        deliver_progress,
+    )
+
+    async def tool_llm(*_args, on_tool_call=None, **_kwargs):
+        await on_tool_call(
+            {
+                "name": "read_file",
+                "call_id": "round-disabled",
+                "status": "running",
+                "round_id": "round-disabled",
+                "assistant_content": "我先读取文件。",
+                "_durable_persisted": True,
+            }
+        )
+        return "文件内容已核对完成。"
+
+    _patch_llm(monkeypatch, tool_llm)
+
+    reply = await channel_llm._call_agent_llm(
+        _make_db(agent, model),
+        agent.id,
+        "检查文件",
+        session_id=str(uuid.uuid4()),
+        user_id=agent.id,
+        runtime_session=runtime_session,
+    )
+
+    assert reply == "文件内容已核对完成。"
+    deliver_progress.assert_not_awaited()
+    mark_pending.assert_not_awaited()
 
 
 async def test_channel_turn_persists_accumulated_session_usage(monkeypatch):

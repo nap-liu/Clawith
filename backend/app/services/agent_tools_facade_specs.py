@@ -358,17 +358,23 @@ FEISHU_COLLAB_FACADE_SPECS: tuple[FacadeSpec, ...] = (
         "agent_tools_feishu_collab_ops",
         """
         _feishu_drive_share _feishu_drive_delete _resolve_feishu_open_id
-        _feishu_calendar_list _feishu_calendar_create _feishu_calendar_update
-        _feishu_calendar_delete _feishu_approval_create _feishu_approval_query
-        _feishu_approval_get _feishu_user_search
+        _feishu_approval_create _feishu_approval_query _feishu_approval_get
+        _feishu_user_search
         """,
         """
         async_session select selectinload AgentModel AgentRelationship
-        OrgMember UserModel channel_feishu_sender_open_id _check_feishu_err
-        _get_agent_calendar_id _get_feishu_credentials _iso_to_ts
+        OrgMember UserModel _check_feishu_err _get_feishu_credentials
         _feishu_wiki_get_node RecipientResolutionError
         resolve_human_channel_recipient
         """,
+    ),
+    _spec(
+        "agent_tools_feishu_calendar",
+        """
+        _feishu_calendar_list _feishu_calendar_create _feishu_calendar_update
+        _feishu_calendar_delete
+        """,
+        "channel_feishu_sender_open_id _resolve_feishu_open_id",
     ),
 )
 

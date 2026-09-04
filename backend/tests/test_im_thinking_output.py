@@ -7,32 +7,35 @@ import pytest
 
 from app.services.im_thinking_output import (
     BufferedIMThinkingSender,
+    resolve_im_progress_enabled,
     resolve_im_thinking_enabled,
 )
 
 
-def test_resolve_im_thinking_enabled_defaults_to_agent_setting():
+def test_agent_setting_enables_public_progress_but_never_raw_reasoning():
     agent = SimpleNamespace(im_thinking_output_enabled=True)
     session = SimpleNamespace(im_config={})
 
-    assert resolve_im_thinking_enabled(agent, session) is True
+    assert resolve_im_progress_enabled(agent, session) is True
+    assert resolve_im_thinking_enabled(agent, session) is False
 
 
 def test_resolve_im_thinking_enabled_ignores_legacy_session_on_override():
     agent = SimpleNamespace(im_thinking_output_enabled=False)
     session = SimpleNamespace(im_config={"thinking_output": "on"})
 
-    assert resolve_im_thinking_enabled(agent, session) is False
+    assert resolve_im_progress_enabled(agent, session) is False
 
 
 def test_resolve_im_thinking_enabled_ignores_legacy_session_off_override():
     agent = SimpleNamespace(im_thinking_output_enabled=True)
     session = SimpleNamespace(im_config={"thinking_output": "off"})
 
-    assert resolve_im_thinking_enabled(agent, session) is True
+    assert resolve_im_progress_enabled(agent, session) is True
 
 
 def test_resolve_im_thinking_enabled_missing_fields_is_false():
+    assert resolve_im_progress_enabled(SimpleNamespace(), SimpleNamespace()) is False
     assert resolve_im_thinking_enabled(SimpleNamespace(), SimpleNamespace()) is False
 
 

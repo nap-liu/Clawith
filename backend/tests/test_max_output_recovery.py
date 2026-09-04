@@ -365,9 +365,10 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
         on_tool_call=capture_tool_event,
     )
 
-    # The recovered tool-call round was streamed to the user, so it remains
-    # part of the canonical reply together with the terminal round.
-    assert result == "thinking... going to call a tool\n\ndone-after-tool"
+    # Output-limit recovery within the tool round remains lossless in its
+    # durable recovery prefix, but tool-round narration is not terminal reply
+    # content.
+    assert result == "done-after-tool"
     # 3 stream calls: initial + 1 resume + 1 follow-up round
     assert len(client.stream_calls) == 3
 
@@ -453,12 +454,7 @@ async def test_changing_file_failures_remain_visible_to_model_until_it_replies(m
         session_id="s",
     )
 
-    assert result == (
-        "trying another approach\n\n"
-        "trying another approach\n\n"
-        "trying another approach\n\n"
-        "I could not find the exact requested path after three different attempts."
-    )
+    assert result == "I could not find the exact requested path after three different attempts."
     assert len(client.stream_calls) == 4
     final_round_messages: list[LLMMessage] = client.stream_calls[3]["messages"]
     tool_results = [message.content for message in final_round_messages if message.role == "tool"]
@@ -471,17 +467,32 @@ async def test_changing_file_failures_remain_visible_to_model_until_it_replies(m
 
 
 @pytest.mark.asyncio
-async def test_late_injection_persists_a1_before_claim_and_overflow_recovery_keeps_it(
+async def test_late_injection_tail_ignores_prior_tool_narration_during_recovery(
     monkeypatch,
 ):
     client = _ScriptedClient(
         [
+            LLMResponse(
+                content="tool preamble",
+                tool_calls=[
+                    {
+                        "id": "missing-1",
+                        "type": "function",
+                        "function": {"name": "missing_tool", "arguments": "{}"},
+                    }
+                ],
+                finish_reason="tool_calls",
+            ),
             _stop_response("A1"),
             LLMError("context_length_exceeded"),
             _stop_response("A2"),
         ]
     )
     _patch_caller_collaborators(monkeypatch, client)
+    monkeypatch.setattr(
+        "app.services.llm.caller._persist_tool_call_events_strict",
+        AsyncMock(return_value={"missing-1": uuid.uuid4()}),
+    )
     agent_id = uuid.uuid4()
     user_id = uuid.uuid4()
     anchor_id = uuid.uuid4()
@@ -534,7 +545,8 @@ async def test_late_injection_persists_a1_before_claim_and_overflow_recovery_kee
     assert events[:2] == ["persist:A1", "claim:injection"]
     assert events.count("persist:A1") == 1
     assert persisted[0]["content"] == "A1"
-    assert len(client.stream_calls) == 3
+    assert persisted[0]["visible_joiner_before"] == ""
+    assert len(client.stream_calls) == 4
     recovered_messages = client.stream_calls[-1]["messages"]
     assert [message.role for message in recovered_messages][-3:] == [
         "user",

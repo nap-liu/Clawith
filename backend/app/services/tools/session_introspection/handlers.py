@@ -25,6 +25,11 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
 from app.services import session_query as sq
+from app.services.timezone_utils import (
+    format_datetime_for_agent,
+    get_agent_timezone_in_session,
+    parse_datetime_for_agent,
+)
 from app.services.tools.session_introspection import formatting as fmt
 
 
@@ -36,13 +41,18 @@ def _clamp(value, *, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
-def _parse_dt(value):
-    if not value:
-        return None
+def _parse_dt(value, timezone_name: str):
     try:
-        return datetime.fromisoformat(str(value))
-    except (ValueError, TypeError):
-        return None
+        return parse_datetime_for_agent(value, timezone_name)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("必须是有效的 ISO 8601 时间") from exc
+
+
+def _parse_time_bounds(arguments: dict, timezone_name: str):
+    return (
+        _parse_dt(arguments.get("since"), timezone_name),
+        _parse_dt(arguments.get("until"), timezone_name),
+    )
 
 
 async def _load_agent(db, agent_id) -> Agent | None:
@@ -57,6 +67,7 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
         agent = await _load_agent(db, agent_id)
         if not agent:
             return sq.DENIAL_MSG
+        timezone_name = await get_agent_timezone_in_session(db, agent)
         scope, where = await sq.resolve_scope(db, agent, ctx_session_id, user_id)
         if where is None:
             return fmt.empty_list("会话")
@@ -83,6 +94,12 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
             return "❌ is_group 必须是布尔值"
 
         limit = _clamp(arguments.get("limit"), default=20, lo=1, hi=50)
+        try:
+            since, until = _parse_time_bounds(arguments, timezone_name)
+        except ValueError as exc:
+            return f"❌ since/until {exc}"
+        if since and until and since > until:
+            return "❌ since 不能晚于 until"
         raw = arguments.get("raw") is True
         if raw:
             filter_fingerprint = sq.session_filter_fingerprint(
@@ -91,8 +108,8 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
                 viewer_id=user_id,
                 channel=arguments.get("channel") or None,
                 query=(arguments.get("query") or "").strip() or None,
-                since=arguments.get("since") or None,
-                until=arguments.get("until") or None,
+                since=since.isoformat() if since else None,
+                until=until.isoformat() if until else None,
                 scene=scene,
                 counterpart=counterpart,
                 counterpart_match=counterpart_match,
@@ -113,8 +130,8 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
                 agent_id=agent.id,
                 channel=arguments.get("channel"),
                 title_query=(arguments.get("query") or "").strip() or None,
-                since=_parse_dt(arguments.get("since")),
-                until=_parse_dt(arguments.get("until")),
+                since=since,
+                until=until,
                 scene=scene,
                 counterpart=counterpart,
                 counterpart_match=counterpart_match,
@@ -127,21 +144,30 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
             )
             items = []
             for session in sessions:
-                items.append(
-                    {
-                        column.name: getattr(session, column.name)
-                        for column in ChatSession.__table__.columns
-                    }
-                )
+                item = {
+                    column.name: getattr(session, column.name)
+                    for column in ChatSession.__table__.columns
+                }
+                for column in ChatSession.__table__.columns:
+                    value = item[column.name]
+                    if isinstance(value, datetime):
+                        item[f"{column.name}_local"] = format_datetime_for_agent(
+                            value, timezone_name
+                        )
+                items.append(item)
             return json.dumps(
                 {
                     "items": items,
+                    "effective_timezone": timezone_name,
                     "page": {
                         "limit": limit,
                         "total": total,
                         "has_more": next_cursor is not None,
                         "next_cursor": next_cursor,
                         "snapshot_at": snapshot_at.isoformat(),
+                        "snapshot_at_local": format_datetime_for_agent(
+                            snapshot_at, timezone_name
+                        ),
                     },
                 },
                 ensure_ascii=False,
@@ -156,8 +182,8 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
             agent_id=agent.id,
             channel=arguments.get("channel"),
             title_query=(arguments.get("query") or "").strip() or None,
-            since=_parse_dt(arguments.get("since")),
-            until=_parse_dt(arguments.get("until")),
+            since=since,
+            until=until,
             scene=scene,
             counterpart=counterpart,
             counterpart_match=counterpart_match,
@@ -170,7 +196,13 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
         counts = await sq.count_messages_per_session(db, [s.id for s in sessions])
         counterparts = await sq.resolve_session_counterparts(db, agent.id, sessions)
         return fmt.render_session_list(
-            sessions, counts, counterparts, total=total, offset=offset, limit=limit
+            sessions,
+            counts,
+            counterparts,
+            total=total,
+            offset=offset,
+            limit=limit,
+            timezone_name=timezone_name,
         )
 
 
@@ -186,6 +218,7 @@ async def handle_read_session_messages(agent_id, user_id, ctx_session_id, argume
         agent = await _load_agent(db, agent_id)
         if not agent:
             return sq.DENIAL_MSG
+        timezone_name = await get_agent_timezone_in_session(db, agent)
         _scope, where = await sq.resolve_scope(db, agent, ctx_session_id, user_id)
         if where is None:
             return sq.DENIAL_MSG
@@ -207,7 +240,12 @@ async def handle_read_session_messages(agent_id, user_id, ctx_session_id, argume
         )
         senders = await sq.resolve_senders(db, msgs)
         more_available = len(msgs) >= limit
-        return fmt.render_messages(msgs, senders, more_available=more_available)
+        return fmt.render_messages(
+            msgs,
+            senders,
+            more_available=more_available,
+            timezone_name=timezone_name,
+        )
 
 
 async def handle_search_sessions(agent_id, user_id, ctx_session_id, arguments) -> str:
@@ -219,11 +257,18 @@ async def handle_search_sessions(agent_id, user_id, ctx_session_id, arguments) -
         agent = await _load_agent(db, agent_id)
         if not agent:
             return sq.DENIAL_MSG
+        timezone_name = await get_agent_timezone_in_session(db, agent)
         _scope, where = await sq.resolve_scope(db, agent, ctx_session_id, user_id)
         if where is None:
             return fmt.render_search_hits([], {}, keyword=keyword)
 
         limit = _clamp(arguments.get("limit"), default=20, lo=1, hi=50)
+        try:
+            since, until = _parse_time_bounds(arguments, timezone_name)
+        except ValueError as exc:
+            return f"❌ since/until {exc}"
+        if since and until and since > until:
+            return "❌ since 不能晚于 until"
         channel = arguments.get("channel")
         sess_q = select(
             ChatSession.id,
@@ -241,10 +286,23 @@ async def handle_search_sessions(agent_id, user_id, ctx_session_id, arguments) -
             return fmt.render_search_hits([], {}, keyword=keyword)
 
         t0 = time.monotonic()
-        hits = await sq.search_messages(db, session_ids, keyword, limit=limit)
+        hits = await sq.search_messages(
+            db,
+            session_ids,
+            keyword,
+            limit=limit,
+            since=since,
+            until=until,
+        )
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(
             f"[search_sessions] agent={agent.id} scope_sessions={len(session_ids)} "
             f"hits={len(hits)} {elapsed_ms:.0f}ms kw_len={len(keyword)}"
         )
-        return fmt.render_search_hits(hits, titles, keyword=keyword, channels=channels)
+        return fmt.render_search_hits(
+            hits,
+            titles,
+            keyword=keyword,
+            channels=channels,
+            timezone_name=timezone_name,
+        )

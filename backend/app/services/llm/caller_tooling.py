@@ -80,6 +80,8 @@ def is_error_result(result: str) -> bool:
     The LLM/tool layer signals failures by returning a string prefixed with one
     of these markers instead of raising, so a successful reply never matches.
     """
+    if getattr(result, "code", None):
+        return True
     return result == PROVIDER_CONTEXT_BLOCKED_MESSAGE or result.startswith(
         ("[LLM Error]", "[LLM call error]", "[Error]")
     )
@@ -91,6 +93,8 @@ def is_retryable_error(result: str) -> bool:
     Uses unified classification from failover.py.
     """
     if not is_error_result(result):
+        return False
+    if getattr(result, "retryable", None) is False:
         return False
 
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE

@@ -18,9 +18,12 @@ replace token accounting with character heuristics or a stale model-family
 lookup. Primary/fallback dispatch must preserve a safe protected history suffix
 for every model that may serve the turn.
 
-The HTTP client may bound connect, write, and pool establishment, but does not
-impose a generic read timeout over a valid long-running model response. Whole
-tool-loop timeouts do not belong in channel adapters.
+The HTTP client bounds connect, write, pool establishment, and consecutive
+response-read inactivity with the selected model's request timeout. The read
+timer resets whenever provider bytes arrive, so it is not a whole-response or
+whole-tool-loop deadline. A response-idle timeout is a non-retryable model
+failure: the platform does not switch models, lower reasoning effort, or replay
+the turn. Whole tool-loop timeouts do not belong in channel adapters.
 
 ## Turn partition and compaction
 

@@ -18,6 +18,7 @@ from app.services.agent_tools import (
     standard_agent_runtime_workspace,
 )
 from app.services.recipient_resolver import RecipientResolutionError, resolve_agent_recipient
+from app.services.timezone_utils import format_datetime_for_agent, get_agent_timezone
 
 
 async def _send_file_to_agent(
@@ -101,10 +102,11 @@ async def _send_file_to_agent(
         sender_short = str(from_agent_id)[:8]
         note_rel_path = f"workspace/inbox/{stamp}_{sender_short}_file_delivery.md"
         note_key = target_workspace.storage_key(note_rel_path)
+        target_timezone_name = await get_agent_timezone(target_id)
         note_lines = [
             f"# File delivery from {source_agent_name}",
             "",
-            f"- Time (UTC): {ts.isoformat()}",
+            f"- Time: {format_datetime_for_agent(ts, target_timezone_name)}",
             f"- Sender: {source_agent_name}",
             f"- Source path: {rel_path}",
             f"- Delivered file: {target_rel_path}",

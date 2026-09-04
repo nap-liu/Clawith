@@ -547,6 +547,8 @@ def build_llm_messages_from_rows(
     # later. Group each typed round at its first physical row and replay the
     # model-issued order, independent of equal timestamps or random UUIDs.
     round_rows: dict[str, list[tuple[int, Any, dict[str, Any]]]] = {}
+    tool_text_by_anchor: dict[str, list[str]] = {}
+    seen_tool_text_rounds: set[tuple[str, str]] = set()
     for position, row in enumerate(rows):
         if getattr(row, "role", None) != "tool_call":
             continue
@@ -554,6 +556,27 @@ def build_llm_messages_from_rows(
         round_id = str((payload or {}).get("round_id") or "")
         if round_id and (payload or {}).get("status") in {"done", "pending"}:
             round_rows.setdefault(round_id, []).append((position, row, payload or {}))
+        meta = (
+            row.message_meta
+            if isinstance(getattr(row, "message_meta", None), dict)
+            else {}
+        )
+        anchor_id = str(meta.get("turn_anchor_id") or "")
+        if not anchor_id or (payload or {}).get("status") != "done":
+            continue
+        text_round_id = round_id or str((payload or {}).get("call_id") or row.id)
+        round_key = (anchor_id, text_round_id)
+        if round_key in seen_tool_text_rounds:
+            continue
+        recovery_text = "".join(
+            item["content"]
+            for item in _validated_recovery_prefix(payload or {})
+            if item["role"] == "assistant"
+        )
+        visible_text = recovery_text + str((payload or {}).get("assistant_content") or "")
+        if visible_text.strip():
+            seen_tool_text_rounds.add(round_key)
+            tool_text_by_anchor.setdefault(anchor_id, []).append(visible_text)
 
     out: list[dict[str, Any]] = []
     emitted_rounds: set[str] = set()
@@ -615,14 +638,31 @@ def build_llm_messages_from_rows(
                 continue
             out.extend(expand_tool_call_row(m))
             continue
-        out.append(
-            build_llm_message_from_row(
-                m,
-                wrap_user_names=wrap_user_names,
-                name_map=name_map,
-                include_thinking=include_thinking,
-            )
+        entry = build_llm_message_from_row(
+            m,
+            wrap_user_names=wrap_user_names,
+            name_map=name_map,
+            include_thinking=include_thinking,
         )
+        # v1.10.3 and earlier copied every tool-round narration into the final
+        # assistant row. Keep that raw row untouched for audit/UI history, but
+        # remove its exact durable tool prefix from provider replay so legacy
+        # sessions do not teach the model to repeat the platform's old merge.
+        anchor_id = str(meta.get("turn_anchor_id") or "")
+        if (
+            m.role == "assistant"
+            and meta.get("turn_status") in {"completed", "failed"}
+            and anchor_id in tool_text_by_anchor
+            and isinstance(entry.get("content"), str)
+        ):
+            legacy_prefix = "\n\n".join(tool_text_by_anchor[anchor_id]) + "\n\n"
+            if entry["content"].startswith(legacy_prefix):
+                terminal_tail = entry["content"][len(legacy_prefix) :]
+                if terminal_tail.strip():
+                    entry["content"] = terminal_tail
+                else:
+                    continue
+        out.append(entry)
         if (
             m.role == "assistant"
             and meta.get("artifact_role") == INTERMEDIATE_ASSISTANT_ARTIFACT_ROLE

@@ -8,6 +8,7 @@ conversations from blowing up the introspecting agent's context window.
 from __future__ import annotations
 
 from app.services.session_query import encode_cursor
+from app.services.timezone_utils import format_datetime_for_agent
 
 PER_MSG_CHARS = 2000     # single-message body cap
 TOTAL_CHARS = 14000      # whole-read payload cap (leaves room for system/format)
@@ -48,7 +49,16 @@ def empty_list(kind: str = "会话") -> str:
     return f"没有找到符合条件的{kind}。"
 
 
-def render_session_list(sessions, counts: dict, counterparts: dict, *, total: int, offset: int, limit: int) -> str:
+def render_session_list(
+    sessions,
+    counts: dict,
+    counterparts: dict,
+    *,
+    total: int,
+    offset: int,
+    limit: int,
+    timezone_name: str = "UTC",
+) -> str:
     if not sessions:
         return empty_list("会话")
     head = f"共 {total} 个会话，显示第 {offset + 1}–{offset + len(sessions)} 个："
@@ -57,7 +67,7 @@ def render_session_list(sessions, counts: dict, counterparts: dict, *, total: in
         cid = str(s.id)
         title = s.group_name or s.title or "(无标题)"
         n = counts.get(cid, 0)
-        last = s.last_message_at.isoformat() if s.last_message_at else "—"
+        last = format_datetime_for_agent(s.last_message_at, timezone_name) or "—"
         cp = counterparts.get(s.id, "?")
         lines.append(
             f"{i}. [{cid}] {title} · {_channel_kind(s)} · 通道={s.source_channel}"
@@ -68,7 +78,13 @@ def render_session_list(sessions, counts: dict, counterparts: dict, *, total: in
     return "\n".join(lines)
 
 
-def render_messages(messages, senders: dict, *, more_available: bool) -> str:
+def render_messages(
+    messages,
+    senders: dict,
+    *,
+    more_available: bool,
+    timezone_name: str = "UTC",
+) -> str:
     """Render a page chronologically, keeping the most-recent messages that fit
     under TOTAL_CHARS and pointing at a ``before`` cursor for older ones."""
     if not messages:
@@ -88,7 +104,7 @@ def render_messages(messages, senders: dict, *, more_available: bool) -> str:
 
     blocks = []
     for m in kept:
-        ts = m.created_at.isoformat() if m.created_at else "—"
+        ts = format_datetime_for_agent(m.created_at, timezone_name) or "—"
         meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
         delivery = meta.get("delivery") if isinstance(meta.get("delivery"), dict) else {}
         recall = delivery.get("recall") if isinstance(delivery.get("recall"), dict) else {}
@@ -116,13 +132,20 @@ def _snippet(content: str | None, keyword: str) -> str:
     return content[start:end].replace("\n", " ")
 
 
-def render_search_hits(hits, titles: dict, *, keyword: str, channels: dict | None = None) -> str:
+def render_search_hits(
+    hits,
+    titles: dict,
+    *,
+    keyword: str,
+    channels: dict | None = None,
+    timezone_name: str = "UTC",
+) -> str:
     if not hits:
         return f"没有找到包含「{keyword}」的消息。"
     lines = [f"命中 {len(hits)} 条包含「{keyword}」的消息（最多 {len(hits)} 条；如过多请缩小关键词）："]
     channels = channels or {}
     for m in hits:
-        ts = m.created_at.isoformat() if m.created_at else "—"
+        ts = format_datetime_for_agent(m.created_at, timezone_name) or "—"
         title = titles.get(str(m.conversation_id), "?")
         channel = channels.get(str(m.conversation_id), "?")
         lines.append(

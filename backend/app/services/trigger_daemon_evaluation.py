@@ -45,9 +45,9 @@ async def _evaluate_trigger(
         if not at_str:
             return False
         try:
-            at = datetime.fromisoformat(at_str)
-            if at.tzinfo is None:
-                at = at.replace(tzinfo=timezone.utc)
+            from app.services.trigger_time_contract import resolve_once_trigger_at
+
+            at = await resolve_once_trigger_at(trigger, cfg)
             return now >= at and trigger.fire_count == 0
         except Exception:
             return False

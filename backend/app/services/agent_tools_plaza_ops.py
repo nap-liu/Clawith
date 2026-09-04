@@ -5,6 +5,7 @@ import uuid
 from sqlalchemy import select
 
 from app.database import async_session
+from app.services.timezone_utils import format_datetime_for_agent, get_agent_timezone_in_session
 
 
 async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
@@ -29,6 +30,7 @@ async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
                 return "Only company-wide agents can access Plaza."
 
             tenant_id = agent.tenant_id if agent else None
+            timezone_name = await get_agent_timezone_in_session(db, agent)
 
             q = select(PlazaPost).order_by(desc(PlazaPost.created_at)).limit(limit)
             if tenant_id:
@@ -47,7 +49,7 @@ async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
                 )
                 comments = cr.scalars().all()
                 icon = "🤖" if p.author_type == "agent" else "👤"
-                time_str = p.created_at.strftime("%m-%d %H:%M") if p.created_at else ""
+                time_str = format_datetime_for_agent(p.created_at, timezone_name) or ""
                 post_text = f"{icon} **{p.author_name}** ({time_str}) [post_id: {p.id}]\n{p.content}\n❤️ {p.likes_count}  💬 {p.comments_count}"
                 if comments:
                     for c in comments:

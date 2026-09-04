@@ -245,7 +245,7 @@ async def call_agent_llm_with_tools(
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client_guard.close()
                     return (
-                        _join_visible_response_segments(*visible_response_segments) or "[Empty response]",
+                        response.content or "[Empty response]",
                         True,
                         tool_executed,
                     )
@@ -274,7 +274,7 @@ async def call_agent_llm_with_tools(
                             source_channel="web",
                             # Bind background confirmation to the configured executor.
                             user_id=execution_user_id,
-                            intro_text=_join_visible_response_segments(*visible_response_segments),
+                            intro_text=_latest_visible_response_segment(*visible_response_segments),
                             title=conf_call.title,
                             summary=conf_call.summary,
                             action=conf_call.action,
@@ -342,11 +342,7 @@ async def call_agent_llm_with_tools(
                     if agent_id and _unsaved_usage.total_tokens > 0:
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client_guard.close()
-                    return (
-                        _join_visible_response_segments(*visible_response_segments) or REPEAT_TOOL_CALL_BREAK_MESSAGE,
-                        True,
-                        tool_executed,
-                    )
+                    return REPEAT_TOOL_CALL_BREAK_MESSAGE, True, tool_executed
 
                 # Only this newly appended round may be materialized. Earlier
                 # rounds were already dispatched and are an immutable cache
@@ -428,11 +424,15 @@ async def call_agent_llm_with_tools(
                 await record_token_usage(agent_id, _unsaved_usage)
             if client_guard is not None:
                 await client_guard.close()
+            if _as_model_response_idle_timeout(e) is not None:
+                return model_response_idle_timeout_failure(), False, tool_executed
             return f"[Error] {e}", False, tool_executed
 
     # Try primary model
     reply, success, primary_tool_executed = await _try_model(primary_model)
     if success:
+        return reply
+    if getattr(reply, "allow_failover", True) is False:
         return reply
 
     # Primary failed - check if retryable

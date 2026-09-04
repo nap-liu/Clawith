@@ -4,9 +4,13 @@ Read `.agents/runbooks/production_release.md` in full for every release,
 production cutover, or rollback plan. These invariants are not a substitute for
 the runbook.
 
-- Commit, push, tag, registry writes, production configuration changes,
-  migrations, backup, cutover, external smoke messages, and rollback each
-  require the applicable explicit authorization.
+- An explicit request to "prepare everything before release" authorizes the
+  reviewed release-candidate commit, authoritative-branch push, immutable
+  backend/frontend image and cache build, registry push, and digest capture.
+  It does not authorize a Git tag or hosted Release, production inspection,
+  configuration changes, migrations, backup, cutover, external smoke messages,
+  or rollback. Outside this defined shorthand, each operation requires its
+  applicable explicit authorization.
 - The semantic version prefix follows the current upstream release. Private
   changes use the exact commit SHA suffix; do not invent a higher private
   semantic version.

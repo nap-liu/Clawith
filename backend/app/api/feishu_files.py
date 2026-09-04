@@ -408,6 +408,9 @@ async def _handle_feishu_file(
                         except Exception:
                             pass
 
+            from app.services.llm.failure_outcome import llm_failure_code
+
+            failure_code = llm_failure_code(reply_text)
             logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
 
             from app.services.im_delivery import (
@@ -425,6 +428,8 @@ async def _handle_feishu_file(
                 content=reply_text or "…",
                 thinking="".join(_img_thinking_chunks) or None,
                 complete_turn=True,
+                turn_terminal_status="failed" if failure_code else "completed",
+                error_code=failure_code,
             ):
                 raise RuntimeError("feishu_image_stream_anchor_missing")
             delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)

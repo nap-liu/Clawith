@@ -15,6 +15,14 @@ Production inspection, backup, migration, external smoke messages, configuration
 mutation, cutover, rollback, push, and tag are separate authority boundaries.
 Planning or auditing grants none of them.
 
+The repository recognizes one explicit shorthand: a user request to "prepare
+everything before release" authorizes completion of the candidate, commit and
+push of the reviewed source, immutable backend/frontend image and cache builds,
+registry pushes, and digest evidence. It does not authorize a Git tag or hosted
+Release, any production inspection or mutation, backup, migration, external
+smoke message, cutover, or rollback. Those checkpoints still require direct
+authorization.
+
 Record before GO:
 
 ```text

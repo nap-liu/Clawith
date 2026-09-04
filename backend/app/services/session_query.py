@@ -765,6 +765,8 @@ async def search_messages(
     keyword: str,
     *,
     limit: int = 20,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[ChatMessage]:
     """ILIKE search over messages of the already-permission-narrowed sessions.
 
@@ -776,14 +778,19 @@ async def search_messages(
         return []
     str_ids = [str(sid) for sid in session_ids]
     pattern = f"%{_escape_like(keyword)}%"
-    rows = await db.execute(
-        select(ChatMessage)
-        .where(
+    conditions = [
             ChatMessage.conversation_id.in_(str_ids),
             ChatMessage.compacted_into.is_(None),
             ChatMessage.role.in_(_VISIBLE_ROLES),
             ChatMessage.content.ilike(pattern, escape="\\"),
-        )
+    ]
+    if since is not None:
+        conditions.append(ChatMessage.created_at >= since)
+    if until is not None:
+        conditions.append(ChatMessage.created_at <= until)
+    rows = await db.execute(
+        select(ChatMessage)
+        .where(*conditions)
         .order_by(ChatMessage.created_at.desc())
         .limit(limit)
     )

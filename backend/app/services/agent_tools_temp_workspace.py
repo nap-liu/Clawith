@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.agent import Agent as AgentModel
 from app.models.task import Task
+from app.services.task_time_projection import serialize_tasks_for_agent
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.agent_tools import (
     CORE_MEMORY_TEMPLATE,
@@ -195,18 +196,7 @@ async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
             result = await db.execute(select(Task).where(Task.agent_id == agent_id).order_by(Task.created_at.desc()))
             tasks = result.scalars().all()
 
-        task_list = []
-        for t in tasks:
-            task_list.append(
-                {
-                    "title": t.title,
-                    "status": t.status,
-                    "priority": t.priority,
-                    "description": t.description or "",
-                    "created_at": t.created_at.isoformat() if t.created_at else "",
-                    "completed_at": t.completed_at.isoformat() if t.completed_at else "",
-                }
-            )
+        task_list = await serialize_tasks_for_agent(agent_id, tasks)
 
         tasks_path.write_text(
             json.dumps(task_list, ensure_ascii=False, indent=2),

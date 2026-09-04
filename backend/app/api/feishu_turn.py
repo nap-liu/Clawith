@@ -268,7 +268,9 @@ async def _process_feishu_text_turn(
     # ── Streaming card state (intra-turn, orthogonal to the per-session lock) ──
     _stream_buffer: list[str] = []
     _thinking_buffer: list[str] = []
-    _thinking_output_enabled = resolve_im_thinking_enabled(agent_obj, _sess)
+    from app.services.im_thinking_output import resolve_im_progress_enabled
+
+    _progress_output_enabled = resolve_im_progress_enabled(agent_obj, _sess)
     _agent_name = agent_obj.name if agent_obj else "AI 回复"
     _tool_errors: list[str] = []
     _tool_status_running: dict[str, str] = {}
@@ -295,6 +297,8 @@ async def _process_feishu_text_turn(
     )
 
     def _visible_tool_status_lines() -> list[str]:
+        if not _progress_output_enabled:
+            return []
         done_visible = _tool_status_done[-_TOOL_STATUS_KEEP_LINES:]
         running_visible = list(_tool_status_running.values())
         return done_visible + running_visible
@@ -364,8 +368,8 @@ async def _process_feishu_text_turn(
             now = time.time()
             if not force and now - _last_flush_time < _flush_interval:
                 return
-            accumulated = "".join(_stream_buffer)
-            thinking_text = "".join(_thinking_buffer) if _thinking_output_enabled else ""
+            accumulated = "".join(_stream_buffer) if _progress_output_enabled else ""
+            thinking_text = ""
             tool_status_lines = _visible_tool_status_lines()
             current_hash = hash(accumulated + thinking_text + "\n".join(tool_status_lines))
             if reason == "heartbeat" and current_hash == _last_flushed_hash:
@@ -468,10 +472,13 @@ async def _process_feishu_text_turn(
                 pass
         _cfs.reset(_cfs_token)
         _cfso.reset(_cfso_token)
+    from app.services.llm.failure_outcome import llm_failure_code
+
+    failure_code = llm_failure_code(reply_text)
     logger.info(f"[Feishu] LLM reply: {reply_text[:100]}")
 
     # If task creation detected, create a real Task record
-    if task_match:
+    if task_match and not failure_code:
         task_title = task_match.group(1).strip()
         if task_title:
             try:
@@ -515,6 +522,8 @@ async def _process_feishu_text_turn(
         content=final_reply_text or "…",
         thinking="".join(_thinking_buffer) or None,
         complete_turn=True,
+        turn_terminal_status="failed" if failure_code else "completed",
+        error_code=failure_code,
     ):
         raise RuntimeError("feishu_stream_anchor_missing")
     delivery_reply_text = await project_agent_images_for_im(agent_id, final_reply_text)

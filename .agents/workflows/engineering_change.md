@@ -77,3 +77,18 @@ authorized implementation task.
   limitations, and any step that remains unauthorized or unverified.
 - Commit, push, tag, release, and deploy only under their explicit authority
   gates.
+
+## 8. Release-preparation shorthand
+
+When the user explicitly asks to "prepare everything before release" (or an
+unambiguous equivalent), treat that phrase as authorization to finish the
+release candidate, commit and push the reviewed source, build and push the
+matching immutable backend/frontend images and cache artifacts, and record
+their digests. This shorthand exists so routine release preparation does not
+stall on separate confirmations for each preparatory artifact.
+
+It does not authorize a Git tag or hosted Release, production inspection,
+production backup or migration, external provider smoke messages, production
+configuration changes, application cutover, or rollback. Those remain separate
+explicit authority gates. Follow `.agents/rules/release.md` and the production
+runbook for every release candidate.

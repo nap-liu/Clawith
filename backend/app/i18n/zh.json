@@ -1,0 +1,3 @@
+{
+  "errors.modelResponseIdleTimeout": "模型响应超时，本次回复未能完成，请重试。"
+}

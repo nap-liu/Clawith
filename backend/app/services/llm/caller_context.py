@@ -489,14 +489,21 @@ async def _process_tool_call(
             "assistant_content": assistant_content,
             "recovery_prefix_messages": recovery_prefix_messages or [],
         }
-        if await _persist_tool_call_events_strict(
+        persisted_running = await _persist_tool_call_events_strict(
             [running_evt],
             agent_id=persistence_agent_id,
             user_id=user_id,
             session_id=session_id,
             turn_anchor_id=turn_anchor_id,
-        ):
+        )
+        running_row_id = (
+            persisted_running.get(str(running_evt.get("call_id") or ""))
+            if isinstance(persisted_running, dict)
+            else None
+        )
+        if running_row_id is not None:
             running_evt["_durable_persisted"] = True
+            running_evt["_durable_message_id"] = str(running_row_id)
     else:
         running_evt = None
 

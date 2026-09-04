@@ -36,7 +36,7 @@ _MOVED_SYMBOLS = (
     "get_agent_tools_for_llm",
     "execute_tool",
     "_cache_hit_ratio",
-    "_join_visible_response_segments",
+    "_latest_visible_response_segment",
     "_invoke_before_round",
     "_response_was_truncated_by_length",
     "ProviderThrottleExhausted",

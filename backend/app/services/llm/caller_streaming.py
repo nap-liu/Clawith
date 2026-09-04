@@ -216,6 +216,17 @@ async def call_llm(
             _call_llm_log_turn_timing(state, "throttle_exhausted", round_i + 1)
             return PROVIDER_THROTTLE_USER_MESSAGE
         except LLMError as e:
+            if _as_model_response_idle_timeout(e) is not None:
+                logger.error(
+                    "[LLM] model response idle timeout: "
+                    f"provider={getattr(state.model, 'provider', '?')} "
+                    f"model={getattr(state.model, 'model', '?')}"
+                )
+                if state.agent_id and state.unsaved_usage.total_tokens > 0:
+                    await record_token_usage(state.agent_id, state.unsaved_usage)
+                await state.client_guard.close()
+                _call_llm_log_turn_timing(state, "response_idle_timeout", round_i + 1)
+                return model_response_idle_timeout_failure()
             logger.error(
                 f"[LLM] LLMError: provider={getattr(state.model, 'provider', '?')} model={getattr(state.model, 'model', '?')} {e}"
             )
@@ -225,6 +236,17 @@ async def call_llm(
             _call_llm_log_turn_timing(state, "llm_error", round_i + 1)
             return f"[LLM Error] {e}"
         except Exception as e:
+            if _as_model_response_idle_timeout(e) is not None:
+                logger.error(
+                    "[LLM] model response idle timeout: "
+                    f"provider={getattr(state.model, 'provider', '?')} "
+                    f"model={getattr(state.model, 'model', '?')}"
+                )
+                if state.agent_id and state.unsaved_usage.total_tokens > 0:
+                    await record_token_usage(state.agent_id, state.unsaved_usage)
+                await state.client_guard.close()
+                _call_llm_log_turn_timing(state, "response_idle_timeout", round_i + 1)
+                return model_response_idle_timeout_failure()
             logger.exception(f"[LLM] Unexpected error: {type(e).__name__}: {str(e)[:300]}")
             if state.agent_id and state.unsaved_usage.total_tokens > 0:
                 await record_token_usage(state.agent_id, state.unsaved_usage)

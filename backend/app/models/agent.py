@@ -192,7 +192,8 @@ class Agent(Base):
     # Timezone (IANA format, e.g. "Asia/Shanghai"). None = inherit from tenant.
     timezone: Mapped[str | None] = mapped_column(String(50), default=None, nullable=True)
 
-    # External IM channels can optionally show model thinking progress.
+    # Legacy field name: controls public Agent-authored progress in external IM,
+    # never raw provider reasoning.
     im_thinking_output_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, server_default="false"
     )

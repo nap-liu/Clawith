@@ -293,6 +293,9 @@ async def call_llm_with_failover(
         max_tool_rounds_override=max_tool_rounds_override,
     )
 
+    if getattr(primary_result, "allow_failover", True) is False:
+        return primary_result
+
     # Check if we need to failover
     if not is_retryable_error(primary_result):
         # A non-error result is just a normal reply — no failover needed, and

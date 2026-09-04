@@ -12,7 +12,7 @@ async def persist_tool_call(
     conversation_id: str,
     evt: dict[str, Any],
     turn_anchor_id: uuid.UUID | None = None,
-) -> None:
+) -> uuid.UUID | None:
     """Persist a tool-call marker into chat history using the canonical
     ``name`` / ``args`` schema — the single writer shared by the web WebSocket
     path and every IM channel, so the web UI and the LLM-history replay both
@@ -34,10 +34,10 @@ async def persist_tool_call(
     break the live conversation.
     """
     if (evt or {}).get("_durable_persisted"):
-        return
+        return None
     try:
         async with db_session_factory() as db:
-            await persist_tool_call_row(
+            row_id = await persist_tool_call_row(
                 db,
                 agent_id=agent_id,
                 user_id=user_id,
@@ -46,8 +46,10 @@ async def persist_tool_call(
                 turn_anchor_id=turn_anchor_id,
             )
             await db.commit()
+            return row_id
     except Exception as e:
         logger.warning(f"[chat_history] persist_tool_call failed (non-fatal): {e}")
+        return None
 
 
 async def persist_tool_call_row(

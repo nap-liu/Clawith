@@ -285,8 +285,10 @@ async def _is_cli_tool_name(agent_id: Optional[uuid.UUID], tool_name: str) -> bo
     (→ surface a clear error instead of a confusing 'Unknown tool').
     """
     try:
+        from app.database import async_session
+        from app.models.agent import Agent as AgentModel
         from app.models.tool import Tool
-        from sqlalchemy import or_
+        from sqlalchemy import or_, select
 
         async with async_session() as db:
             tenant_id = None

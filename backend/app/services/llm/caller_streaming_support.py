@@ -51,6 +51,7 @@ class CallLlmState:
     max_output_recoveries: int = 0
     repeat_streaks: dict[tuple[str, str], int] = field(default_factory=dict)
     visible_response_segments: list[str] = field(default_factory=list)
+    terminal_response_segments: list[str] = field(default_factory=list)
     turn_execution_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     api_messages: list[LLMMessage] = field(default_factory=list)
     preflight_compaction_not_applicable: bool = False

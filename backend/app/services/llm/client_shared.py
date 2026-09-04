@@ -293,16 +293,15 @@ class LLMClient(ABC):
 
 
 def _httpx_timeout(timeout: float, *, provider_managed_timeout: bool) -> httpx.Timeout:
-    """Bound transport setup only; never time-limit model generation/reads.
+    """Bound setup and consecutive response-read inactivity.
 
     ``provider_managed_timeout`` remains in the public constructor for backward
-    compatibility but no longer changes read behavior. Every LLM call — normal
-    turns, compaction, model checks and background runs — ends only when the
-    provider/transport ends it or the caller explicitly cancels it.
+    compatibility. ``httpx`` resets its read timer whenever response bytes
+    arrive, so this does not impose a total model-generation deadline.
     """
     return httpx.Timeout(
         connect=timeout,
-        read=None,
+        read=timeout,
         write=timeout,
         pool=timeout,
     )
@@ -440,6 +439,17 @@ class LLMError(Exception):
             status_code=status_code,
             error_code=error_code,
             error_type=error_type,
+        )
+
+
+class ModelResponseIdleTimeout(LLMError):
+    """The provider sent no response bytes inside the model read budget."""
+
+    def __init__(self, message: str = "model response idle timeout"):
+        super().__init__(
+            message,
+            error_code="model_response_idle_timeout",
+            error_type="timeout",
         )
 
 __all__ = [name for name in globals() if not name.startswith("__")]

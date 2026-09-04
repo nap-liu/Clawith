@@ -8,6 +8,7 @@ from pathlib import Path
 from loguru import logger
 
 from app.services.agent_tools import _agent_workspace_root, _get_tool_config
+from app.services.timezone_utils import format_datetime_for_agent, get_agent_timezone
 
 
 async def _get_vercel_token(agent_id: uuid.UUID, tool_name: str) -> str | None:
@@ -256,6 +257,7 @@ async def _vercel_list_deployments(agent_id: uuid.UUID, arguments: dict) -> str:
         return "❌ Vercel Access Token is not configured."
 
     headers = {"Authorization": f"Bearer {token}"}
+    timezone_name = await get_agent_timezone(agent_id)
     async with httpx.AsyncClient() as client:
         try:
             res = await client.get(f"https://api.vercel.com/v6/deployments?projectId={project_name}", headers=headers)
@@ -269,7 +271,7 @@ async def _vercel_list_deployments(agent_id: uuid.UUID, arguments: dict) -> str:
                     created_at = dep.get("created")
                     if isinstance(created_at, int):
                         created_dt = datetime.fromtimestamp(created_at / 1000, timezone.utc)
-                        created_str = created_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                        created_str = format_datetime_for_agent(created_dt, timezone_name)
                     else:
                         created_str = str(created_at)
                     lines.append(

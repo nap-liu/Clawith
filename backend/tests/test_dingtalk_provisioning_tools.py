@@ -188,6 +188,7 @@ async def test_start_dingtalk_provisioning_tool_defaults_to_safe_reuse(monkeypat
     assert captured == [False]
     assert "复用原钉钉授权链接" in result
     assert "https://auth.example/existing" in result
+    assert "2026-07-16T08:00:00+00:00 [UTC]" in result
 
 
 @pytest.mark.asyncio

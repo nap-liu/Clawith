@@ -75,16 +75,17 @@ export function runH5ChatTimelinePart4(ctx) {
 
     messages = applyAssistantDoneMessage(messages, {
         type: 'done',
-        content: '知识库正文 A\n\n补充正文 B',
+        content: '最终答复 C',
         now: '2026-08-18T00:00:00.000Z',
     });
 
     assert.equal(messages.filter((message) => message.role === 'assistant' && message.streaming).length, 0);
     assert.equal(messages.filter((message) => message.content === '知识库正文 A').length, 0);
     assert.equal(messages.filter((message) => message.content === '补充正文 B').length, 0);
-    assert.equal(messages.filter((message) => message.content === '知识库正文 A\n\n补充正文 B').length, 1);
+    assert.equal(messages.filter((message) => message.content === '知识库正文 A\n\n补充正文 B').length, 0);
+    assert.equal(messages.filter((message) => message.content === '最终答复 C').length, 1);
     assert.equal(messages.filter((message) => message.content === '视频说明').length, 1);
-    assert.equal(messages.at(-1).content, '知识库正文 A\n\n补充正文 B');
+    assert.equal(messages.at(-1).content, '最终答复 C');
 }
 
 {

@@ -61,7 +61,7 @@ _MODULE_EXPORTS: tuple[tuple[ModuleType, tuple[str, ...]], ...] = (
     ),
 )
 
-_SHARED_SYMBOLS = ('LLMClientCloseGuard', 'LLMMessage', 'LLMResponse', 'LLMStreamChunk', 'ChunkCallback', 'ToolCallback', 'ThinkingCallback', 'LLMClient', '_httpx_timeout', '_is_markable_payload_msg', 'select_cache_breakpoints', '_observable_messages_payload', 'LLMError')
+_SHARED_SYMBOLS = ('LLMClientCloseGuard', 'LLMMessage', 'LLMResponse', 'LLMStreamChunk', 'ChunkCallback', 'ToolCallback', 'ThinkingCallback', 'LLMClient', '_httpx_timeout', '_is_markable_payload_msg', 'select_cache_breakpoints', '_observable_messages_payload', 'LLMError', 'ModelResponseIdleTimeout')
 
 for module, names in _MODULE_EXPORTS:
     for name in names:

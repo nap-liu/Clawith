@@ -181,6 +181,10 @@ async def _execute_schedule(
                     reasoning_effort_override=reasoning_effort,
                 )
 
+            from app.services.llm.failure_outcome import llm_failure_code
+
+            failure_code = llm_failure_code(reply)
+
             from app.services.activity_logger import log_activity
 
             await log_activity(
@@ -191,11 +195,17 @@ async def _execute_schedule(
                     "schedule_id": str(schedule_id),
                     "instruction": instruction,
                     "reply": reply[:500],
+                    "status": "failed" if failure_code else "completed",
+                    **({"error_code": failure_code} if failure_code else {}),
                 },
             )
 
             logger.info(f"Schedule {schedule_id} executed for agent {agent_name}: {reply[:80]}")
-            return ScheduleExecutionOutcome.SUCCEEDED
+            return (
+                ScheduleExecutionOutcome.FAILED
+                if failure_code
+                else ScheduleExecutionOutcome.SUCCEEDED
+            )
 
     except WorkloadOverloadedError as e:
         logger.warning(f"Schedule {schedule_id} deferred by workload capacity: {e}")

@@ -322,7 +322,7 @@ async def _resume_origin_session_for_on_message(
     trigger: AgentTrigger,
     *,
     tenant_id: uuid.UUID | str | None = None,
-) -> None:
+) -> str:
     """Start one real event turn inside the exact originating ChatSession.
 
     An on_message trigger is a subscription.  The inbound row can therefore
@@ -401,6 +401,13 @@ async def _resume_origin_session_for_on_message(
             # delivered after /new rotates the external conversation id.
             existing_final = await db.get(ChatMessage, final_id)
             if existing_final is not None:
+                from app.services.llm.failure_outcome import (
+                    MODEL_RESPONSE_IDLE_TIMEOUT_CODE,
+                    model_response_idle_timeout_failure,
+                )
+
+                if (existing_final.message_meta or {}).get("error_code") == MODEL_RESPONSE_IDLE_TIMEOUT_CODE:
+                    return model_response_idle_timeout_failure()
                 return existing_final.content
 
             owner_user_id = origin.user_id
@@ -629,7 +636,7 @@ async def _resume_origin_session_for_on_message(
             raise RuntimeError("on_message origin session no longer exists")
         lock_key = chat_session_lock_key(origin_session)
 
-    await run_channel_message(
+    return await run_channel_message(
         lock_key,
         is_command=False,
         reactions=ChannelReactions(),

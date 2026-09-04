@@ -19,9 +19,14 @@ THINKING_INHERIT = "inherit"
 SendText = Callable[[str], Awaitable[None]]
 
 
-def resolve_im_thinking_enabled(agent, session) -> bool:
-    """Return the effective IM thinking-output setting for this digital employee."""
+def resolve_im_progress_enabled(agent, session) -> bool:
+    """Return whether public, Agent-authored turn progress is visible in IM."""
     return bool(getattr(agent, "im_thinking_output_enabled", False))
+
+
+def resolve_im_thinking_enabled(agent, session) -> bool:
+    """Raw provider reasoning is never projected to external IM users."""
+    return False
 
 
 @dataclass

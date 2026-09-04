@@ -2511,6 +2511,12 @@
       "save": "Save",
       "saving": "Saving...",
       "saved": "Saved",
+      "imProgress": {
+        "title": "IM Channels",
+        "description": "Configure progress feedback in DingTalk, Feishu, and other IM conversations.",
+        "label": "Show Thinking Progress",
+        "hint": "When enabled, the Digital Employee sends clear, self-authored work updates for the current turn. Internal model reasoning is never included. Use /thinking on/off to change it."
+      },
       "autonomy": {
         "title": "Autonomy Policy",
         "description": "Configure the autonomy level for each agent action",
@@ -3337,9 +3343,9 @@
       "effectiveContext": "Effective context",
       "keepRecentTurns": "Maximum protected complete turns",
       "keepRecentTurnsDesc": "Recent complete turns kept verbatim at the real-token threshold; recovery may reduce this down to the current turn only.",
-      "requestTimeout": "Connection Setup Timeout (s)",
+      "requestTimeout": "Response Idle Timeout (s)",
       "requestTimeoutPlaceholder": "Leave empty for the 120s default",
-      "requestTimeoutDesc": "Only bounds connection setup, writes, and pool waits; model generation and response reads have no platform timeout.",
+      "requestTimeoutDesc": "Bounds connection setup, writes, pool waits, and consecutive response inactivity without limiting total model thinking time.",
       "enabled": "Enabled",
       "disabled": "Disabled",
       "save": "Save",

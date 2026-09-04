@@ -11,6 +11,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.user import User as UserModel
 from app.services.agent_tools_file_support import _get_agent_tenant_id
+from app.services.timezone_utils import format_datetime_for_agent, get_agent_timezone
 
 
 async def _search_clawhub(agent_id: uuid.UUID, arguments: dict) -> str:
@@ -39,17 +40,18 @@ async def _search_clawhub(agent_id: uuid.UUID, arguments: dict) -> str:
         return f"No skills found matching '{query}'."
 
     lines = [f"Found {len(results)} skill(s) matching '{query}':\n"]
+    timezone_name = await get_agent_timezone(agent_id)
     for r in results:
         name = r.get("displayName") or r.get("slug", "?")
         slug = r.get("slug", "")
         summary = (r.get("summary") or "")[:120]
         updated = ""
         if r.get("updatedAt"):
-            from datetime import datetime
+            from datetime import datetime, timezone
 
             try:
-                dt = datetime.fromtimestamp(r["updatedAt"] / 1000)
-                updated = f" | Updated: {dt.strftime('%Y-%m-%d')}"
+                dt = datetime.fromtimestamp(r["updatedAt"] / 1000, tz=timezone.utc)
+                updated = f" | Updated: {format_datetime_for_agent(dt, timezone_name)}"
             except Exception:
                 pass
         lines.append(f"• **{name}** (`{slug}`){updated}")

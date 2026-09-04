@@ -2448,6 +2448,12 @@
       "save": "保存",
       "saving": "保存中...",
       "saved": "已保存",
+      "imProgress": {
+        "title": "IM 通道",
+        "description": "配置数字员工在钉钉、飞书等 IM 对话中的过程反馈。",
+        "label": "输出思考过程",
+        "hint": "开启后，数字员工会发送本轮主动总结的可读工作进度；不包含模型内部推理。可用 /thinking on/off 开启或关闭。"
+      },
       "autonomy": {
         "title": "自主性边界配置",
         "description": "配置数字员工执行各项操作时的自主性级别",
@@ -3363,9 +3369,9 @@
       "effectiveContext": "最终可用总量",
       "keepRecentTurns": "最大保护完整 Turn 数",
       "keepRecentTurnsDesc": "达到真实 Token 阈值后优先原样保留的最近完整 Turn；必要时会逐级降到只保护当前 Turn。",
-      "requestTimeout": "连接建立超时（秒）",
+      "requestTimeout": "响应空闲超时（秒）",
       "requestTimeoutPlaceholder": "留空使用默认 120",
-      "requestTimeoutDesc": "仅限制连接建立、写入和连接池等待；模型生成与流式读取没有平台超时。",
+      "requestTimeoutDesc": "限制连接建立、写入、连接池等待及连续无响应数据的时间，不限制模型总思考时长。",
       "enabled": "启用",
       "disabled": "禁用",
       "save": "保存",

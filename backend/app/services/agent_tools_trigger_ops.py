@@ -13,6 +13,11 @@ from app.services.recipient_resolver import (
     resolve_agent_recipient,
     resolve_platform_user_recipient,
 )
+from app.services.timezone_utils import get_agent_timezone
+from app.services.trigger_time_contract import (
+    normalize_trigger_time_config,
+    project_trigger_config,
+)
 
 
 MAX_TRIGGERS_PER_AGENT = 20
@@ -161,6 +166,13 @@ async def _handle_set_trigger(
         if wmode in ("queue", "merge"):
             config["webhook_mode"] = wmode
             config["_webhook_queue"] = []
+
+    try:
+        config = normalize_trigger_time_config(
+            ttype, config, await get_agent_timezone(agent_id)
+        )
+    except ValueError as exc:
+        return f"❌ {exc}"
 
     public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
 
@@ -558,6 +570,12 @@ async def _handle_update_trigger(
                 public_new = {
                     key: value for key, value in new_config.items() if not str(key).startswith("_")
                 }
+                try:
+                    public_new = normalize_trigger_time_config(
+                        trigger.type, public_new, await get_agent_timezone(agent_id)
+                    )
+                except ValueError as exc:
+                    return f"❌ {exc}"
                 if trigger.type == "webhook":
                     # Webhook config updates are patches. The callback token,
                     # delivery mode and security settings are durable identity;
@@ -585,6 +603,8 @@ async def _handle_update_trigger(
                     public_new.pop("from_agent_name", None)
                     public_new.pop("from_user_name", None)
                 private_old = {key: value for key, value in old_config.items() if str(key).startswith("_")}
+                if "_input_timezone" in public_new:
+                    private_old.pop("_input_timezone", None)
                 old_target = (
                     old_config.get("from_agent_id"),
                     old_config.get("from_user_id"),
@@ -728,6 +748,7 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
             # Resolve base_url for webhook triggers
             _a_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             _agent = _a_r.scalar_one_or_none()
+            _timezone_name = await get_agent_timezone(agent_id)
             _tenant_id = str(_agent.tenant_id) if _agent and _agent.tenant_id else None
             _base_url = (await resolve_base_url(db, request=None, tenant_id=_tenant_id)).rstrip("/")
 
@@ -749,8 +770,8 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
                 config_str = f"token: {config['token']}"
                 webhook_url = f"{_base_url}/api/webhooks/t/{config['token']}"
             else:
-                public_config = {key: value for key, value in config.items() if not str(key).startswith("_")}
-                config_str = str(public_config)[:50]
+                public_config = project_trigger_config(config, _timezone_name)
+                config_str = str(public_config)[:160]
                 webhook_url = "-"
             reason_str = t.reason[:40] if t.reason else ""
             lines.append(

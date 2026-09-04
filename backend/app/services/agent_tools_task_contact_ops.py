@@ -11,6 +11,12 @@ from sqlalchemy import select
 from app.database import async_session as _database_async_session
 from app.models.task import Task
 from app.services.recipient_resolver import RecipientResolutionError
+from app.services.task_time_projection import serialize_tasks_for_agent
+from app.services.timezone_utils import (
+    format_datetime_for_agent,
+    get_agent_timezone_in_session,
+    parse_datetime_for_agent,
+)
 
 
 class _AsyncSessionProxy:
@@ -26,6 +32,15 @@ class _AsyncSessionProxy:
 async_session = _AsyncSessionProxy()
 
 
+def _render_tool_time(value: object, timezone_name: str) -> str:
+    """Project a canonical service timestamp without changing its source value."""
+    try:
+        parsed = parse_datetime_for_agent(value, "UTC")
+    except (TypeError, ValueError):
+        return str(value)
+    return format_datetime_for_agent(parsed, timezone_name) or str(value)
+
+
 async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
     """Sync tasks from DB to legacy tasks.json, if the file already exists."""
     tasks_path = ws / "tasks.json"
@@ -37,18 +52,7 @@ async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
             result = await db.execute(select(Task).where(Task.agent_id == agent_id).order_by(Task.created_at.desc()))
             tasks = result.scalars().all()
 
-        task_list = []
-        for t in tasks:
-            task_list.append(
-                {
-                    "title": t.title,
-                    "status": t.status,
-                    "priority": t.priority,
-                    "description": t.description or "",
-                    "created_at": t.created_at.isoformat() if t.created_at else "",
-                    "completed_at": t.completed_at.isoformat() if t.completed_at else "",
-                }
-            )
+        task_list = await serialize_tasks_for_agent(agent_id, tasks)
 
         tasks_path.write_text(
             json.dumps(task_list, ensure_ascii=False, indent=2),
@@ -380,6 +384,7 @@ async def _start_dingtalk_channel_provisioning_tool(
             requested_by_user_id=user_id,
             force_reconfigure=force_reconfigure,
         )
+        timezone_name = await get_agent_timezone_in_session(db, agent)
         await db.commit()
 
     flow_action = response.get("flow_action")
@@ -403,7 +408,7 @@ async def _start_dingtalk_channel_provisioning_tool(
         f"{action_message}\n"
         f"授权链接: {response['authorization_url']}\n"
         f"配置编号: {response['provisioning_id']}\n"
-        f"有效期至: {response['expires_at']}\n"
+        f"有效期至: {_render_tool_time(response['expires_at'], timezone_name)}\n"
         "用户完成授权后，平台会自动配置钉钉通道，并在钉钉中发送配置完成通知，无需手动回复确认。"
         f"{force_warning}"
     )
@@ -446,12 +451,13 @@ async def _get_dingtalk_channel_provisioning_status_tool(
             return "❌ 未找到该钉钉数字员工通道配置流程。"
 
         response = get_dingtalk_provisioning_status_response(session)
+        timezone_name = await get_agent_timezone_in_session(db, agent)
 
     lines = [
         "钉钉数字员工通道配置状态:",
         f"状态: {response['status']}",
         f"配置编号: {response['provisioning_id']}",
-        f"有效期至: {response['expires_at']}",
+        f"有效期至: {_render_tool_time(response['expires_at'], timezone_name)}",
     ]
     if response.get("authorization_url") and response["status"] in {"waiting_for_authorization", "polling"}:
         lines.append(f"授权链接: {response['authorization_url']}")
