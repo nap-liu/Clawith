@@ -1,6 +1,10 @@
 .venv/
 agent_data/
 data/
+logs/
+build/
+.ruff_cache/
+.DS_Store
 __pycache__/
 *.pyc
 .pytest_cache/
