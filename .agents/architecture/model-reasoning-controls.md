@@ -198,3 +198,10 @@ release is blocked if any enabled production model is absent from the streamed
 inventory or lacks a successful applicable live case.  Production is inspected
 read-only for configuration; all client construction and test execution run in
 the isolated local Docker environment.
+
+Rollback keeps the additive database columns, but an older binary must not see
+the newer reasoning arguments in persisted builtin tool schemas.  Before the
+legacy application roles start, run the candidate image's idempotent
+`python -m app.scripts.rollback_reasoning_controls apply` helper and verify
+`status` reports zero reasoning fields.  A later candidate startup restores the
+current schemas through the normal builtin seeder.

@@ -396,6 +396,14 @@ For Agent self-service settings, use the same exact-tool cleanup contract:
 python -m app.scripts.rollback_agent_self_settings
 ```
 
+For normalized model reasoning controls, remove only the newer arguments from
+the persisted builtin tool schemas before starting a legacy release set:
+
+```bash
+python -m app.scripts.rollback_reasoning_controls apply
+python -m app.scripts.rollback_reasoning_controls status
+```
+
 Before rollback to a binary that predates project-scoped Agents, follow the
 candidate helper's documented apply/status/restore lifecycle:
 

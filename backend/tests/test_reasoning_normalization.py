@@ -2,6 +2,7 @@ import pytest
 
 from app.models.agent import Agent
 from app.models.llm import LLMModel
+from app.scripts.rollback_reasoning_controls import legacy_parameters_schema
 from app.services.chat_model_selection import _runtime_snapshot
 from app.services.llm.client_anthropic import AnthropicClient
 from app.services.llm.client_gemini import GeminiClient
@@ -221,3 +222,24 @@ def test_gemini_none_uses_zero_thinking_budget():
     client = GeminiClient("secret", model="gemini-2.5-flash")
     payload = client._build_payload(MESSAGE, None, None, 1000, reasoning_effort="none")
     assert payload["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+
+
+def test_reasoning_rollback_schema_cleanup_is_narrow_and_idempotent():
+    schema = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "reasoning_effort": {"type": "string"},
+        },
+        "required": ["task", "reasoning_effort"],
+    }
+
+    cleaned, changed = legacy_parameters_schema(schema)
+    cleaned_again, changed_again = legacy_parameters_schema(cleaned)
+
+    assert changed is True
+    assert cleaned["properties"] == {"task": {"type": "string"}}
+    assert cleaned["required"] == ["task"]
+    assert schema["properties"].get("reasoning_effort") is not None
+    assert cleaned_again == cleaned
+    assert changed_again is False
