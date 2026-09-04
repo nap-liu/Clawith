@@ -1,6 +1,6 @@
 """Pydantic models for the tools API."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class ToolCreate(BaseModel):
@@ -21,7 +21,7 @@ class ToolCreate(BaseModel):
 
 
 class ToolUpdate(BaseModel):
-    display_name: str | None = None
+    display_name: str | None = Field(None, max_length=200)
     description: str | None = None
     icon: str | None = None
     enabled: bool | None = None
@@ -31,6 +31,16 @@ class ToolUpdate(BaseModel):
     is_default: bool | None = None
     config: dict | None = None
     tenant_id: str | None = None
+
+    @field_validator("display_name")
+    @classmethod
+    def _normalize_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("display_name is required")
+        return normalized
 
 
 class AgentToolUpdate(BaseModel):

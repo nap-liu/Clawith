@@ -18,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.mcp_server_import import router as import_router
+from app.api.mcp_server_updates import normalize_masked_header_update
 from app.core.security import get_current_user, require_role
 from app.database import get_db
 from app.models.agent import Agent
@@ -29,37 +31,44 @@ from app.schemas.mcp_server import (
     DryRunResponse,
     MCPServerCreate,
     MCPServerOut,
-    MCPToolRefreshResultOut,
-    MCPServerUpdate,
-    MCPServerOverridePut,
     MCPServerOverrideOut,
+    MCPServerOverridePut,
+    MCPServerUpdate,
+    MCPToolRefreshResultOut,
     OverridesGroupedOut,
     TestConnectionResult,
-)
-from app.services.mcp_server_service import compose_runtime_config, lookup_overrides
-from app.services.placeholder_engine import (
-    ALL_ROOTS,
-    DisallowedPlaceholderError,
-    PlaceholderContext,
-    PROMPT_SAFE_ROOTS,
-    UnknownPlaceholderError,
-    render,
-    render_dict,
 )
 from app.services.audit_logger import write_audit_log
 from app.services.mcp_client import MCPClient
 from app.services.mcp_dry_run_context import _build_user_ctx, _mask_auth_headers
 from app.services.mcp_refresh_service import refresh_mcp_server_tools
+from app.services.mcp_server_service import compose_runtime_config, lookup_overrides
+from app.services.placeholder_engine import (
+    ALL_ROOTS,
+    PROMPT_SAFE_ROOTS,
+    DisallowedPlaceholderError,
+    PlaceholderContext,
+    UnknownPlaceholderError,
+    render,
+    render_dict,
+)
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
-
 router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
+router.include_router(import_router)
 
 
 from app.services.mcp_permissions import (  # noqa: E402
     assert_can_edit_server as _assert_can_edit_server_sync,
+)
+from app.services.mcp_permissions import (
+    assert_can_patch_server as _assert_can_patch_server,
+)
+from app.services.mcp_permissions import (
     can_edit_server as _can_edit_server,
+)
+from app.services.mcp_permissions import (
     is_platform_admin as _is_platform_admin,
 )
 
@@ -168,10 +177,12 @@ async def update_mcp_server(
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    await _assert_can_edit_server(current_user, srv)
+    await _assert_can_patch_server(current_user, srv, db)
 
     diff: dict[str, dict] = {}
-    update_data = payload.model_dump(exclude_unset=True)
+    update_data = normalize_masked_header_update(
+        payload.model_dump(exclude_unset=True), srv.headers_template
+    )
 
     for field, new_value in update_data.items():
         # credential_template: None means "don't touch" per schema contract;
@@ -184,7 +195,7 @@ async def update_mcp_server(
         old_value = getattr(srv, field)
         if old_value != new_value:
             # Don't include credential plaintext in audit log — log the fact, not the value
-            if field == "credential_template":
+            if field in {"credential_template", "headers_template", "env_template"}:
                 diff[field] = {"changed": True}
             else:
                 diff[field] = {"old": old_value, "new": new_value}
@@ -506,6 +517,10 @@ async def _upsert_override(
     # credential_template: None means "don't touch" (mirrors server PATCH semantics)
     if "credential_template" in update_data and update_data["credential_template"] is None:
         update_data.pop("credential_template")
+    update_data = normalize_masked_header_update(
+        update_data,
+        existing.headers_template if existing is not None else None,
+    )
 
     if existing is None:
         ovr = MCPServerOverride(

@@ -62,6 +62,23 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
 
 - Persist discovered tools and explicit Agent assignment; a transient discovery
   response alone is incomplete.
+- Company-level manual import performs one remote discovery, ends that provider
+  wait before opening the persistence transaction, and atomically stores the
+  MCP server plus its complete discovered catalog. It must not fan out into one
+  client request or transaction per tool.
+- `MCPServer.display_name` and `Tool.display_name` are mutable local labels.
+  Internal server identity, `Tool.name`, and `mcp_tool_name` remain stable;
+  `mcp_tool_name` is the remote method used for dispatch. Runtime LLM schemas
+  include bounded current group/tool labels in the MCP tool description so a
+  rename is visible from the next turn without changing function identity.
+- Tenant-wide MCP definitions linked to admin tools are writable only by a
+  platform administrator or that tenant's organization administrator. Literal
+  secrets in header templates are write-only: control-plane responses return a
+  stable mask, placeholder templates remain visible, and sending the unchanged
+  mask preserves the stored value.
+- Legacy company-tool backfill treats tenant, URL, and legacy group name as one
+  complete group identity. It creates an independent server for each safe
+  group and never reuses another server merely because its URL matches.
 - A newly imported tool becomes available on the next turn because the tool set
   is assembled at turn start. Do not claim same-turn availability.
 - Preserve tenant, Agent, server, and workspace isolation in names, queries, and

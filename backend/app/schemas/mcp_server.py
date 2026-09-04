@@ -12,7 +12,9 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.services.mcp_secret_fields import mask_sensitive_headers
 
 # Regex for env key names that may contain secrets.
 # Values matching this pattern are masked UNLESS the value is a placeholder template.
@@ -68,6 +70,38 @@ class MCPServerCreate(BaseModel):
         return self
 
 
+class MCPServerImport(BaseModel):
+    """Create a company MCP server and discover its complete tool catalog once."""
+
+    display_name: str = Field(..., min_length=1, max_length=200)
+    tenant_id: uuid.UUID | None = None
+    transport: Literal["http", "stdio"] = "http"
+    base_url_template: str = ""
+    headers_template: dict = Field(default_factory=dict)
+    credential_template: str | None = None
+    system_prompt_block: str | None = None
+    placeholder_allowlist: list[str] | None = None
+    command_template: str | None = None
+    args_template: list[str] = Field(default_factory=list)
+    env_template: dict = Field(default_factory=dict)
+
+    @field_validator("display_name")
+    @classmethod
+    def _single_line_display_name(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("display_name is required")
+        return normalized
+
+    @model_validator(mode="after")
+    def _check_transport_fields(self) -> MCPServerImport:
+        if self.transport == "http" and not self.base_url_template.strip():
+            raise ValueError("base_url_template is required for transport=http")
+        if self.transport == "stdio" and not (self.command_template or "").strip():
+            raise ValueError("command_template is required for transport=stdio")
+        return self
+
+
 class MCPServerUpdate(BaseModel):
     """Request body for PATCH /api/admin/mcp-servers/{id}.
 
@@ -85,6 +119,16 @@ class MCPServerUpdate(BaseModel):
     command_template: str | None = None
     args_template: list[str] | None = None
     env_template: dict | None = None
+
+    @field_validator("display_name")
+    @classmethod
+    def _single_line_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("display_name is required")
+        return normalized
 
 
 class MCPServerOut(BaseModel):
@@ -117,7 +161,7 @@ class MCPServerOut(BaseModel):
             name=server.name,
             display_name=server.display_name,
             base_url_template=server.base_url_template,
-            headers_template=server.headers_template or {},
+            headers_template=mask_sensitive_headers(server.headers_template),
             credential_state="set" if (server.credential_template or "").strip() else "unset",
             system_prompt_block=server.system_prompt_block,
             placeholder_allowlist=server.placeholder_allowlist,
@@ -150,6 +194,13 @@ class MCPToolRefreshResultOut(BaseModel):
     created: int
     updated: int
     assigned: int
+    effective: Literal["next_turn"] = "next_turn"
+
+
+class MCPServerImportOut(BaseModel):
+    server: MCPServerOut
+    discovered: int
+    created: int
     effective: Literal["next_turn"] = "next_turn"
 
 
@@ -194,7 +245,11 @@ class MCPServerOverrideOut(BaseModel):
             scope_id=ovr.scope_id,
             system_prompt_block=ovr.system_prompt_block,
             url_template=ovr.url_template,
-            headers_template=ovr.headers_template,
+            headers_template=(
+                mask_sensitive_headers(ovr.headers_template)
+                if ovr.headers_template is not None
+                else None
+            ),
             credential_state="set" if (ovr.credential_template or "").strip() else "unset",
             last_modified_by_user_id=ovr.last_modified_by_user_id,
             created_at=ovr.created_at,

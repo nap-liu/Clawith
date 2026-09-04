@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { mcpServersApi } from '../../services/mcpServers';
-import type { MCPServer } from '../../types/mcpServer';
+import type { MCPServer, MCPServerUpdatePayload } from '../../types/mcpServer';
 import type { EditorRole } from './types';
 import PlaceholderField from './PlaceholderField';
 import KeyValueEditor from './KeyValueEditor';
@@ -34,10 +34,13 @@ export default function AdvancedTab({ server, agentId, onSaved }: Props) {
     setSaving(true);
     setErr(null);
     try {
-      await mcpServersApi.update(server.id, {
-        headers_template: headers,
+      const payload: MCPServerUpdatePayload = {
         system_prompt_block: systemPrompt || null,
-      });
+      };
+      if (JSON.stringify(headers) !== JSON.stringify(server.headers_template || {})) {
+        payload.headers_template = headers;
+      }
+      await mcpServersApi.update(server.id, payload);
       onSaved();
     } catch (e: any) {
       setErr(e?.message ?? String(e));

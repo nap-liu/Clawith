@@ -7,8 +7,11 @@ One source of truth so the role taxonomy stays in lockstep across endpoints.
 from __future__ import annotations
 
 from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.mcp_server import MCPServer
+from app.models.tool import Tool
 from app.models.user import User
 
 
@@ -54,6 +57,44 @@ def assert_can_edit_server(user: User, server: MCPServer) -> None:
         )
 
 
+def assert_can_manage_tenant_tools(user: User, tenant_id) -> None:
+    """Allow platform admins everywhere and org admins only in their tenant."""
+    if is_platform_admin(user):
+        return
+    if (
+        user.role == "org_admin"
+        and tenant_id is not None
+        and user.tenant_id == tenant_id
+    ):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Organization admin required",
+    )
+
+
+def assert_can_manage_company_server(user: User, server: MCPServer) -> None:
+    """Restrict tenant-wide MCP definitions to company administrators."""
+    assert_can_manage_tenant_tools(user, server.tenant_id)
+
+
+async def assert_can_patch_server(
+    user: User,
+    server: MCPServer,
+    db: AsyncSession,
+) -> None:
+    """Apply company-admin policy only to tenant-wide imported definitions."""
+    company_tool_id = await db.scalar(
+        select(Tool.id)
+        .where(Tool.mcp_server_id == server.id, Tool.source == "admin")
+        .limit(1)
+    )
+    if company_tool_id is not None:
+        assert_can_manage_company_server(user, server)
+    else:
+        assert_can_edit_server(user, server)
+
+
 def assert_can_create_server_in_tenant(
     user: User,
     tenant_id: "uuid.UUID | None",  # noqa: F821  — uuid imported lazily by callers
@@ -64,15 +105,4 @@ def assert_can_create_server_in_tenant(
     /api/tools/mcp-server). Without this gate, any logged-in user could
     introduce a brand-new MCP server in any tenant by simply naming it.
     """
-    if is_platform_admin(user):
-        return
-    if (
-        user.role in ("org_admin", "agent_admin")
-        and tenant_id is not None
-        and user.tenant_id == tenant_id
-    ):
-        return
-    raise HTTPException(
-        status_code=403,
-        detail="You do not have permission to create an MCP server in this tenant",
-    )
+    assert_can_manage_tenant_tools(user, tenant_id)

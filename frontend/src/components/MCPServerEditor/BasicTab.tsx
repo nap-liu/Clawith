@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { mcpServersApi } from '../../services/mcpServers';
 import type { MCPServer } from '../../types/mcpServer';
+import TextInput from '../ui/TextInput';
 import type { EditorRole } from './types';
 import PlaceholderField from './PlaceholderField';
 import KeyValueEditor from './KeyValueEditor';
@@ -18,6 +20,8 @@ const SECRET_KEY_RE = /TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH/i;
 const isSecretKey = (k: string) => SECRET_KEY_RE.test(k);
 
 export default function BasicTab({ server, role, agentId, onSaved }: Props) {
+  const { t } = useTranslation();
+  const [displayName, setDisplayName] = useState(server.display_name);
   // Transport selector — default to 'http' when the server doesn't have a
   // stored transport value (backward-compat with existing servers).
   const [transport, setTransport] = useState<'http' | 'stdio'>(
@@ -55,8 +59,12 @@ export default function BasicTab({ server, role, agentId, onSaved }: Props) {
     setSaving(true);
     setErr(null);
     try {
+      const commonPayload: Record<string, unknown> = {};
+      if (displayName.trim() !== server.display_name) {
+        commonPayload.display_name = displayName.trim();
+      }
       if (transport === 'http') {
-        const payload: any = { transport };
+        const payload: any = { ...commonPayload, transport };
         if (baseUrl !== server.base_url_template) payload.base_url_template = baseUrl;
         if (credential !== '') payload.credential_template = credential;
         await mcpServersApi.update(server.id, payload);
@@ -64,6 +72,7 @@ export default function BasicTab({ server, role, agentId, onSaved }: Props) {
       } else {
         // stdio
         const payload: any = {
+          ...commonPayload,
           transport,
           command_template: command,
           args_template: args,
@@ -80,9 +89,9 @@ export default function BasicTab({ server, role, agentId, onSaved }: Props) {
   };
 
   const isValid =
-    transport === 'http'
+    displayName.trim().length > 0 && (transport === 'http'
       ? baseUrl.trim().length > 0
-      : command.trim().length > 0;
+      : command.trim().length > 0);
 
   // --- Args editor helpers ---
   const updateArg = (idx: number, v: string) =>
@@ -93,6 +102,14 @@ export default function BasicTab({ server, role, agentId, onSaved }: Props) {
 
   return (
     <div>
+      <div style={{ marginBottom: 16 }}>
+        <label className="form-label">{t('enterprise.tools.mcpGroupDisplayName')}</label>
+        <TextInput
+          value={displayName}
+          onChange={(event) => setDisplayName(event.target.value)}
+          maxLength={200}
+        />
+      </div>
       {/* Transport selector */}
       <div style={{ marginBottom: 16 }}>
         <label style={{ display: 'block', marginBottom: 6, fontSize: 12, color: 'var(--text-secondary)' }}>

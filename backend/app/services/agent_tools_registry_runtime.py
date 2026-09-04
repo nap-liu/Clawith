@@ -11,6 +11,7 @@ from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_featur
 from app.database import async_session
 from app.services.agent_tools_catalog import AGENT_TOOLS
 from app.services.agent_tools_config_runtime import _get_tool_config
+from app.services.mcp_naming import load_mcp_display_names, model_mcp_description
 
 _ALWAYS_INCLUDE_CORE = {
     "add_contact",
@@ -322,6 +323,7 @@ async def _get_agent_tools_for_llm_impl(
                 tool_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
             tool_clauses.append(Tool.name.not_in(PLAZA_TOOL_NAMES))
             all_tools = (await db.execute(select(Tool).where(*tool_clauses))).scalars().all()
+            mcp_display_names = await load_mcp_display_names(db, all_tools)
 
             from app.services.cli_tools.sandbox_inject import _TOOL_NAME_RE
 
@@ -380,6 +382,12 @@ async def _get_agent_tools_for_llm_impl(
                 if (t.config or {}).get("okr_agent_only") and not is_system_agent:
                     continue
                 description = t.description
+                if t.type == "mcp":
+                    description = model_mcp_description(
+                        description,
+                        mcp_display_names.get(t.mcp_server_id),
+                        t.display_name,
+                    )
                 if t.name == "execute_code_aio":
                     from app.services.toolscall.capability import TOOLSCALL_USAGE_DESCRIPTION, toolscall_enabled_for_agent
 

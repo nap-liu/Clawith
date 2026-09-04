@@ -132,12 +132,6 @@ export default function EnterpriseSettings() {
 
     const [allTools, setAllTools] = useState<any[]>([]);
     const [showAddMCP, setShowAddMCP] = useState(false);
-    const [mcpForm, setMcpForm] = useState({ server_url: '', server_name: '', api_key: '' });
-    const [mcpRawInput, setMcpRawInput] = useState('');
-    const [mcpTestResult, setMcpTestResult] = useState<any>(null);
-    const [mcpTesting, setMcpTesting] = useState(false);
-    // Parsed stdio entries from the textarea: [{name, command, args, env}]
-    const [mcpStdioEntries, setMcpStdioEntries] = useState<Array<{name: string; command: string; args: string[]; env: Record<string, string>}>>([]);
     // Edit Server modal state — null when closed, otherwise the server to edit.
     // server_id is the FK from tools.mcp_server_id; using it directly avoids fragile
     // base_url_template string matching (host.docker.internal vs in-cluster names diverge).
@@ -683,10 +677,9 @@ export default function EnterpriseSettings() {
                         GLOBAL_CATEGORY_CONFIG_PRIMARY_TOOL, GLOBAL_CATEGORY_CONFIG_SCHEMAS, allTools, agentInstalledTools,
                         applyConfigDefaults, configCategory, currentUser, dialog, editingConfig, editingConfigInitial, editingMcpServer, editingToolId,
                         expandedAgentInstalledGroups, expandedToolCategories, getToolGroupMeta, hasMeaningfulConfig, loadAgentInstalledTools,
-                        loadAllTools, mcpForm, mcpRawInput, mcpStdioEntries, mcpTestResult, mcpTesting, renderCategoryIcon,
+                        loadAllTools, renderCategoryIcon,
                         selectedTenantId, setConfigCategory, setEditingConfig, setEditingConfigInitial, setEditingMcpServer, setEditingToolId,
-                        setExpandedAgentInstalledGroups, setExpandedToolCategories, setMcpForm, setMcpRawInput, setMcpStdioEntries,
-                        setMcpTestResult, setMcpTesting, setShowAddMCP, setShowAdvancedToolConfig, setToolSearch, setToolStatusFilter,
+                        setExpandedAgentInstalledGroups, setExpandedToolCategories, setShowAddMCP, setShowAdvancedToolConfig, setToolSearch, setToolStatusFilter,
                         setToolsView, showAddMCP, showAdvancedToolConfig, switchKnob, switchTrack, t, toast, toolSearch, toolStatusFilter, toolsView,
                     }} />
                 )}
