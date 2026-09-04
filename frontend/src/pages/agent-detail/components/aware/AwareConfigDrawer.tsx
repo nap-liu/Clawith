@@ -608,45 +608,60 @@ export default function AwareConfigDrawer({
             <Field label={t('agent.aware.workspace.config.model')}>
                 <SelectDropdown value={draft.modelId} options={modelOptions} onChange={(value) => set('modelId', value)} ariaLabel={t('agent.aware.workspace.config.model')} disabled={!canEdit} />
             </Field>
-            <DivergenceSlider
-                value={draft.temperature}
-                onChange={(value) => set('temperature', value)}
-                label={t('agent.aware.workspace.config.imagination')}
-                inheritedLabel={t('agent.aware.workspace.config.inheritAgent')}
-                lowLabel={t('agent.aware.workspace.config.stable')}
-                middleLabel={t('agent.aware.workspace.config.balanced')}
-                highLabel={t('agent.aware.workspace.config.imaginative')}
-                disabled={!canEdit}
-            />
+            <div className="aware-config-imagination">
+                <DivergenceSlider
+                    value={draft.temperature}
+                    onChange={(value) => set('temperature', value)}
+                    label={t('agent.aware.workspace.config.imagination')}
+                    inheritedLabel={t('agent.aware.workspace.config.inheritAgent')}
+                    lowLabel={t('agent.aware.workspace.config.stable')}
+                    middleLabel={t('agent.aware.workspace.config.balanced')}
+                    highLabel={t('agent.aware.workspace.config.imaginative')}
+                    disabled={!canEdit}
+                />
+            </div>
             <Field label={t('reasoning.label')}>
                 <ReasoningEffortSelect value={draft.reasoningEffort as ReasoningEffortValue} onChange={(value) => set('reasoningEffort', value)} supportedEfforts={selectedModel?.reasoning_efforts} inheritLabel={t('reasoning.inherit')} disabled={!canEdit} />
             </Field>
-            <div className="aware-config-checks">
-                <label><Checkbox checked={draft.soul} disabled={!canEdit} onChange={(event) => set('soul', event.target.checked)} /> {t('agent.aware.workspace.config.useSoul')}</label>
-                <label><Checkbox checked={draft.memory} disabled={!canEdit} onChange={(event) => set('memory', event.target.checked)} /> {t('agent.aware.workspace.config.useMemory')}</label>
+            <div className="aware-config-capabilities">
+                <div className="aware-config-capability-row">
+                    <span>{t('agent.aware.workspace.config.useSoul')}</span>
+                    <ToggleSwitch checked={draft.soul} disabled={!canEdit} onChange={(value) => set('soul', value)} ariaLabel={t('agent.aware.workspace.config.useSoul')} />
+                </div>
+                <div className="aware-config-capability-row">
+                    <span>{t('agent.aware.workspace.config.useMemory')}</span>
+                    <ToggleSwitch checked={draft.memory} disabled={!canEdit} onChange={(value) => set('memory', value)} ariaLabel={t('agent.aware.workspace.config.useMemory')} />
+                </div>
             </div>
         </div>
     );
 
     const resourceTypeLabel = type === 'trigger'
-        ? t(`agent.aware.workspace.triggerTypes.${resource.type}`, { defaultValue: resource.type })
+        ? t(`agent.aware.workspace.triggerTypes.${resource.type}`, { defaultValue: t('agent.aware.workspace.config.unknownType') })
         : type === 'task'
-            ? t(`agent.aware.workspace.taskTypes.${resource.type}`, { defaultValue: resource.type })
+            ? t(`agent.aware.workspace.taskTypes.${resource.type}`, { defaultValue: t('agent.aware.workspace.config.unknownType') })
             : t('agent.aware.workspace.schedules');
+    const resourceDisplayLabel = type === 'trigger'
+        ? resourceTypeLabel
+        : resource.title || resource.name || resourceTypeLabel;
+    const drawerTabs = (['business', ...(canReassign ? ['identity'] : []), 'runtime']) as DrawerTab[];
+    const tabLabel = (item: DrawerTab) => item === 'business'
+        ? t(`agent.aware.workspace.config.tabs.business.${type}`)
+        : t(`agent.aware.workspace.config.tabs.${item}`);
 
     return (
         <Drawer open onClose={onClose} ariaLabelledBy="aware-config-title" className="aware-config-drawer">
             <header className="aware-config-header">
                 <div>
                     <h2 id="aware-config-title">{t(`agent.aware.workspace.config.titles.${type}`)}</h2>
-                    <p>{resource.title || resource.name} · {resourceTypeLabel}</p>
+                    <p>{resourceDisplayLabel}</p>
                 </div>
                 <Button variant="ghost" onClick={onClose} aria-label={t('common.close')}><IconX size={18} /></Button>
             </header>
             <nav className="aware-config-tabs" aria-label={t('agent.aware.workspace.config.sections')}>
-                {(['business', 'identity', 'runtime'] as DrawerTab[]).map((item) => (
-                    <button key={item} type="button" className={tab === item ? 'active' : ''} onClick={() => { setTab(item); setError(''); }} disabled={item === 'identity' && !canReassign}>
-                        {t(`agent.aware.workspace.config.tabs.${item}`)}
+                {drawerTabs.map((item) => (
+                    <button key={item} type="button" className={tab === item ? 'active' : ''} onClick={() => { setTab(item); setError(''); }}>
+                        {tabLabel(item)}
                     </button>
                 ))}
             </nav>
@@ -654,18 +669,14 @@ export default function AwareConfigDrawer({
                 {tab === 'business' && renderBusiness()}
                 {tab === 'identity' && (
                     <div className="aware-config-form">
-                        <div className="aware-config-note">{t('agent.aware.workspace.config.identityPermission')}</div>
-                        <div className="aware-config-identity">
-                            <span><small>{t('agent.aware.executionIdentity.createdBy')}</small><strong>{creator.name || creator.id || '—'}</strong></span>
-                            <i aria-hidden="true">→</i>
+                        <div className="aware-config-assignee">
                             <span><small>{t('agent.aware.executionIdentity.runsAs')}</small><strong>{executionName}</strong></span>
+                            <Button variant="secondary" disabled={!canReassign} onClick={() => onChooseIdentity(type, resource)}>{t('agent.aware.workspace.config.changeExecutor')}</Button>
                         </div>
-                        <Button variant="secondary" disabled={!canReassign} onClick={() => onChooseIdentity(type, resource)}>{t('agent.aware.workspace.config.changeExecutor')}</Button>
                     </div>
                 )}
                 {tab === 'runtime' && renderRuntime()}
                 {!canEdit && tab !== 'identity' && <div className="aware-config-note">{t('agent.aware.workspace.config.readOnly')}</div>}
-                {executionChanged && tab !== 'identity' && <div className="aware-config-note aware-config-note--accent">{t('agent.aware.workspace.config.executionWillAlign')}</div>}
                 {error && <div className="aware-config-alert" role="alert">{error}</div>}
             </div>
             <footer className="aware-config-footer">
