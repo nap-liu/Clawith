@@ -165,7 +165,7 @@ async def test_one_inbound_event_fans_out_once_per_matching_subscription():
         await db.commit()
 
         assert first.created is True
-        assert first.consumed_by_onmessage is True
+        assert first.consumed_by_onmessage is False
         assert len(first.execution_ids) == 2
 
         executions = list(
@@ -187,9 +187,7 @@ async def test_one_inbound_event_fans_out_once_per_matching_subscription():
             "original reason 2",
         }
         await db.refresh(first.message)
-        assert set(first.message.message_meta["onmessage_execution_ids"]) == {
-            str(execution_id) for execution_id in first.execution_ids
-        }
+        assert "consumed_by_onmessage" not in first.message.message_meta
 
         duplicate = await ingest_incoming_chat_message(
             db,
@@ -213,7 +211,7 @@ async def test_one_inbound_event_fans_out_once_per_matching_subscription():
 
         assert duplicate.created is False
         assert duplicate.consumed_by_onmessage is True
-        assert set(duplicate.execution_ids) == set(first.execution_ids)
+        assert duplicate.execution_ids == ()
         assert execution_count == 2
 
 

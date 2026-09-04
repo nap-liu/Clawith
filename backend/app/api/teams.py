@@ -25,6 +25,7 @@ from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_llm import _call_agent_llm
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
+from app.services.im_markdown_media import project_agent_images_for_im
 from app.services.teams_delivery import _send_teams_message_single_chunk
 from app.services.agent_tools import channel_file_sender as _cfs_s
 from app.core.security import hash_password as _hp
@@ -699,6 +700,7 @@ async def teams_event_webhook(
                 logger.exception(f"Teams: Failed to save reply to database: {e}")
                 await db.rollback()
                 raise
+            delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
 
             # Send to Teams
             delivery_result = IMDeliveryResult.failed("microsoft_teams", "channel_config_unavailable")
@@ -728,7 +730,7 @@ async def teams_event_webhook(
                         "conversation": {"id": conversation_id},
                         "recipient": user_account,  # The user who sent the message (from incoming activity's from)
                         "replyToId": reply_to_id,  # Reply to the specific incoming message
-                        "text": reply_text,
+                        "text": delivery_reply_text,
                     }
                     logger.info(f"Teams: Attempting to send reply to conversation {conversation_id}, from={bot_channel_account.get('id')}, recipient={user_account.get('id')}")
                     service_url = str((config.extra_config or {}).get("service_url") or "")

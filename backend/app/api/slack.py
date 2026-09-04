@@ -18,6 +18,7 @@ from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.chat_attachments import attachment_from_workspace_path
+from app.services.im_markdown_media import project_agent_images_for_im
 from app.services.storage import store_agent_upload
 
 router = APIRouter(tags=["slack"])
@@ -673,6 +674,7 @@ async def slack_event_webhook(
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
+        delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
 
         # Send to Slack (chunked)
         bot_token = config.app_secret or ""
@@ -692,7 +694,7 @@ async def slack_event_webhook(
                 responses = await _send_slack_messages(
                     bot_token,
                     channel_id,
-                    reply_text,
+                    delivery_reply_text,
                     on_result=_record_slack_part,
                 )
                 delivery_result = IMDeliveryResult.sent(

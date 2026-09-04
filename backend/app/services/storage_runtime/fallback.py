@@ -140,8 +140,19 @@ class FallbackStorageBackend(StorageBackend):
             await self.primary.write_bytes(key, data)
         return path
 
-    async def presign_download_url(self, key: str, filename: str | None = None, inline: bool = False) -> str | None:
+    async def presign_download_url(
+        self,
+        key: str,
+        filename: str | None = None,
+        inline: bool = False,
+        content_type: str | None = None,
+    ) -> str | None:
         if not await self.primary.exists(key) and await self.fallback.exists(key) and await self.fallback.is_file(key):
             data = await self.fallback.read_bytes(key)
-            await self.primary.write_bytes(key, data)
-        return await self.primary.presign_download_url(key, filename=filename, inline=inline)
+            await self.primary.write_bytes(key, data, content_type=content_type)
+        return await self.primary.presign_download_url(
+            key,
+            filename=filename,
+            inline=inline,
+            content_type=content_type,
+        )

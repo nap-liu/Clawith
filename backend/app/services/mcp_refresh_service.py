@@ -19,6 +19,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer
+from app.models.project import ProjectCapabilityBinding
 from app.models.tool import AgentTool, Tool
 from app.services.mcp_client import MCPClient
 from app.services.mcp_server_service import (
@@ -145,12 +146,42 @@ async def _assignment_template(
     )
 
 
+async def _project_mcp_references(
+    db,
+    server: MCPServer,
+    source_agent_id: uuid.UUID,
+) -> dict[uuid.UUID, bool]:
+    """Return project Agents that explicitly inherit this source Agent's MCP."""
+    if server.tenant_id is None:
+        return {}
+    rows = (
+        await db.execute(
+            select(Agent.id, ProjectCapabilityBinding.is_enabled)
+            .join(
+                ProjectCapabilityBinding,
+                ProjectCapabilityBinding.inherited_from_agent_id == Agent.id,
+            )
+            .where(
+                Agent.scope == "project",
+                Agent.source_agent_id == source_agent_id,
+                Agent.project_id == ProjectCapabilityBinding.project_id,
+                Agent.tenant_id == server.tenant_id,
+                ProjectCapabilityBinding.tenant_id == server.tenant_id,
+                ProjectCapabilityBinding.capability_type == "mcp",
+                ProjectCapabilityBinding.capability_id == server.id,
+                ProjectCapabilityBinding.source == "inherited",
+            )
+        )
+    ).all()
+    return {project_agent_id: is_enabled for project_agent_id, is_enabled in rows}
+
+
 async def _assert_agent_refresh_is_isolated(
     db,
     server: MCPServer,
     agent_id: uuid.UUID,
-) -> None:
-    """Allow Agent-scoped refresh only for an exclusively self-installed server."""
+) -> dict[uuid.UUID, bool]:
+    """Allow one owner plus explicit project references to refresh a server."""
     if server.created_by_user_id is not None:
         raise PermissionError(
             "Inherited enterprise MCP servers cannot be refreshed by an Agent; "
@@ -164,18 +195,29 @@ async def _assert_agent_refresh_is_isolated(
             .where(Tool.mcp_server_id == server.id)
         )
     ).scalars().all()
-    exclusively_self_installed = bool(assignments) and all(
+    project_references = await _project_mcp_references(db, server, agent_id)
+    owns_server = any(
         assignment.agent_id == agent_id
         and assignment.source == "user_installed"
         and assignment.installed_by_agent_id == agent_id
         for assignment in assignments
     )
-    if not exclusively_self_installed:
+    refresh_is_isolated = owns_server and all(
+        (
+            assignment.agent_id == agent_id
+            and assignment.source == "user_installed"
+            and assignment.installed_by_agent_id == agent_id
+        )
+        or assignment.agent_id in project_references
+        for assignment in assignments
+    )
+    if not refresh_is_isolated:
         raise PermissionError(
             "Only an MCP server installed exclusively by the current Agent can "
             "be refreshed here; inherited or shared MCP servers must use the "
             "administrator global refresh"
         )
+    return project_references
 
 
 async def ensure_agent_mcp_server_isolated(
@@ -219,6 +261,14 @@ async def ensure_agent_mcp_server_isolated(
         if assignment.agent_id != agent_id
     ]
     if not other_pairs:
+        return server
+    project_references = await _project_mcp_references(db, server, agent_id)
+    if any(
+        assignment.agent_id in project_references
+        for assignment, _tool in other_pairs
+    ):
+        # Never split a server away from its explicit project references. The
+        # final guard will still reject any unrelated owner in this mixed case.
         return server
     if not all(
         assignment.source == "user_installed"
@@ -390,7 +440,13 @@ async def refresh_mcp_server_tools(
             raise PermissionError("Agent and MCP server belong to different tenants")
         tenant_id = agent.tenant_id
         server = await ensure_agent_mcp_server_isolated(db, server, agent_id)
-        await _assert_agent_refresh_is_isolated(db, server, agent_id)
+        project_references = await _assert_agent_refresh_is_isolated(
+            db,
+            server,
+            agent_id,
+        )
+    else:
+        project_references = {}
 
     tenant_override, agent_override = await lookup_overrides(
         db,
@@ -434,6 +490,7 @@ async def refresh_mcp_server_tools(
     created = 0
     updated = 0
     assigned = 0
+    refreshed_tool_ids: set[uuid.UUID] = set()
     for item in discovered_tools:
         remote_name = str(item.get("name") or "").strip()
         if not remote_name:
@@ -479,6 +536,7 @@ async def refresh_mcp_server_tools(
             tool.mcp_server_name = server.name
             tool.mcp_server_instructions = instructions
             updated += 1
+        refreshed_tool_ids.add(tool.id)
 
         if assign_to_agent and agent_id is not None:
             assignment = (
@@ -504,6 +562,31 @@ async def refresh_mcp_server_tools(
                 )
                 db.add(assignment)
                 assigned += 1
+
+    if assign_to_agent and project_references and refreshed_tool_ids:
+        existing_project_assignments = set(
+            (
+                await db.execute(
+                    select(AgentTool.agent_id, AgentTool.tool_id).where(
+                        AgentTool.agent_id.in_(project_references),
+                        AgentTool.tool_id.in_(refreshed_tool_ids),
+                    )
+                )
+            ).all()
+        )
+        for project_agent_id, is_enabled in project_references.items():
+            for tool_id in refreshed_tool_ids:
+                if (project_agent_id, tool_id) in existing_project_assignments:
+                    continue
+                db.add(
+                    AgentTool(
+                        agent_id=project_agent_id,
+                        tool_id=tool_id,
+                        enabled=is_enabled,
+                        config={},
+                        source="user_installed",
+                    )
+                )
 
     server.instructions = instructions
     server.instructions_captured_at = datetime.now(timezone.utc)

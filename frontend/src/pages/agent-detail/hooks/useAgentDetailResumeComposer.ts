@@ -509,6 +509,7 @@ export function useAgentDetailResumeComposer({
                     ...(m.sender_name && { sender_name: m.sender_name }),
                     ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
                     ...(m.sender_agent_id && { sender_agent_id: m.sender_agent_id }),
+                    ...(m.sender_avatar_url && { sender_avatar_url: m.sender_avatar_url }),
                 },
                 id,
                 activeSession,

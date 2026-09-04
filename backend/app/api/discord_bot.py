@@ -16,6 +16,7 @@ from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_commands import is_channel_command
 from app.services.channel_dispatch import channel_session_lock_key
+from app.services.im_markdown_media import project_agent_images_for_im
 
 router = APIRouter(tags=["discord"])
 
@@ -512,6 +513,7 @@ async def discord_interaction_webhook(
                         turn_anchor_id=ingested.message.id,
                         required=True,
                     )
+                    delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()
 
@@ -541,7 +543,7 @@ async def discord_interaction_webhook(
                                 app_id_bg,
                                 bot_token_bg,
                                 interaction_token,
-                                reply_text,
+                                delivery_reply_text,
                                 on_result=_record_discord_part,
                             )
                             delivery_result = IMDeliveryResult.sent(

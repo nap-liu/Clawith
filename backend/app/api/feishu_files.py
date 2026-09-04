@@ -1,6 +1,7 @@
 """Feishu file-message handling helpers."""
 
 from app.api.feishu_shared import *  # noqa: F401,F403
+from app.services.im_markdown_media import project_agent_images_for_im
 
 IMPORT_RE = None  # lazy sentinel
 _FILE_ACK_MESSAGES = [
@@ -340,10 +341,10 @@ async def _handle_feishu_file(
                     return
                 _answer_text = "".join(_img_stream_buf)
                 _thinking_text = "".join(_img_thinking_chunks) if _img_thinking_enabled else ""
-                _card = _build_card(
+                _card = await _build_projected_stream_card(
+                    agent_id,
                     _answer_text,
                     thinking_text=_thinking_text,
-                    streaming=True,
                     agent_name=_agent_name_img,
                 )
                 current_hash = hash(_answer_text + _thinking_text)
@@ -426,6 +427,7 @@ async def _handle_feishu_file(
                 complete_turn=True,
             ):
                 raise RuntimeError("feishu_image_stream_anchor_missing")
+            delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
 
             # ── Send final card / fallback ──
             delivery_result = IMDeliveryResult.failed("feishu", "send_failed")
@@ -440,7 +442,7 @@ async def _handle_feishu_file(
                     await _img_patch_queue.drain()
                 except Exception as _e_drain:
                     logger.warning(f"[Feishu] Image patch queue drain failed: {_e_drain}")
-                _final_card = _build_card(reply_text or "...", streaming=False, agent_name=_agent_name_img)
+                _final_card = _build_card(delivery_reply_text or "...", streaming=False, agent_name=_agent_name_img)
                 try:
                     await feishu_service.patch_message(
                         config.app_id, config.app_secret, _patch_msg_id,
@@ -456,7 +458,7 @@ async def _handle_feishu_file(
                 try:
                     fallback_response = await feishu_service.send_message(
                         config.app_id, config.app_secret, _reply_to, "text",
-                        json.dumps({"text": reply_text}), receive_id_type=_rid_type_img,
+                        json.dumps({"text": delivery_reply_text}), receive_id_type=_rid_type_img,
                         stage="image_stream_fallback_text",
                     )
                     fallback_message_id = str(

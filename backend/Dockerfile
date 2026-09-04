@@ -2,7 +2,8 @@
 # Multi-stage: deps → production
 ARG CLAWITH_IMAGE_MIRROR=docker.m.daocloud.io
 ARG CLAWITH_PYTHON_BASE_DIGEST=sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217
-FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim@${CLAWITH_PYTHON_BASE_DIGEST} AS deps
+ARG CLAWITH_DEPS_IMAGE=deps-build
+FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim@${CLAWITH_PYTHON_BASE_DIGEST} AS deps-build
 
 WORKDIR /app
 # APT mirror is a build arg — the default (aliyun) occasionally stalls on
@@ -29,6 +30,10 @@ RUN if [ -n "$CLAWITH_PIP_INDEX_URL" ] && [ -n "$CLAWITH_PIP_TRUSTED_HOST" ]; th
     fi
 
 # ─── Production ─────────────────────────────────────────
+# Reuse a verified immutable backend image when dependency inputs are unchanged.
+# Its /usr/local is the dependency artifact; application code is copied below.
+FROM ${CLAWITH_DEPS_IMAGE} AS deps
+
 FROM ${CLAWITH_IMAGE_MIRROR}/library/python:3.12-slim@${CLAWITH_PYTHON_BASE_DIGEST} AS production
 
 WORKDIR /app
@@ -54,6 +59,15 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     apt-get update && \
     apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
+
+# Fail closed if a caller tries to reuse dependencies for a changed manifest.
+COPY pyproject.toml /tmp/candidate-pyproject.toml
+COPY --from=deps /app/pyproject.toml /tmp/deps-pyproject.toml
+RUN if ! cmp -s /tmp/candidate-pyproject.toml /tmp/deps-pyproject.toml; then \
+        echo "pyproject.toml differs from CLAWITH_DEPS_IMAGE; use deps-build" >&2; \
+        exit 1; \
+    fi && \
+    rm /tmp/candidate-pyproject.toml /tmp/deps-pyproject.toml
 
 # Copy installed packages from deps stage
 COPY --from=deps /usr/local/lib/python3.12/site-packages/ /usr/local/lib/python3.12/site-packages/

@@ -1,6 +1,7 @@
 /** Global state management with Zustand */
 
 import { create } from 'zustand';
+import { clearAuthCredentials } from '../services/api/core';
 import type { User, Agent } from '../types';
 
 interface AuthStore {
@@ -8,8 +9,14 @@ interface AuthStore {
     token: string | null;
     setAuth: (user: User, token: string) => void;
     setUser: (user: User) => void;
-    logout: () => void;
+    logout: () => Promise<void>;
     isAuthenticated: () => boolean;
+}
+
+async function clearAuthSession(): Promise<void> {
+    const credentialsCleared = clearAuthCredentials();
+    useAuthStore.setState({ user: null, token: null });
+    await credentialsCleared;
 }
 
 export const useAuthStore = create<AuthStore>((set, get) => ({
@@ -25,10 +32,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         set({ user });
     },
 
-    logout: () => {
-        localStorage.removeItem('token');
-        set({ user: null, token: null });
-    },
+    logout: clearAuthSession,
 
     isAuthenticated: () => !!get().token,
 }));

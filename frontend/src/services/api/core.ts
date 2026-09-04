@@ -2,6 +2,22 @@
 
 const API_BASE = "/api";
 
+export async function clearAuthCredentials(): Promise<void> {
+  const token = localStorage.getItem("token");
+  localStorage.removeItem("token");
+  localStorage.removeItem("user");
+  try {
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: "same-origin",
+      keepalive: true,
+    });
+  } catch {
+    // Local credentials are already cleared; network failure must not restore them.
+  }
+}
+
 type RequestBehavior = {
   redirectOnUnauthorized?: boolean;
 };
@@ -33,8 +49,7 @@ async function request<T>(
       !isAuthEndpoint &&
       behavior.redirectOnUnauthorized !== false
     ) {
-      localStorage.removeItem("token");
-      localStorage.removeItem("user");
+      void clearAuthCredentials();
       const onLoginPage = window.location.pathname === "/login";
       const loginParams = onLoginPage
         ? ""

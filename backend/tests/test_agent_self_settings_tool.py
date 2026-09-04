@@ -81,9 +81,9 @@ async def _seed_runtime():
 
 
 async def test_seeded_self_settings_tool_executes_zero_false_and_null_patch():
+    from app.models.tool import Tool
     from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
     from app.services.tool_seeder import seed_builtin_tools
-    from app.models.tool import Tool
 
     agent_id, user_id, model_id, _foreign_model_id = await _seed_runtime()
     # Exercise the upgrade path too: a previously-known tool becoming default
@@ -106,6 +106,8 @@ async def test_seeded_self_settings_tool_executes_zero_false_and_null_patch():
     assert "agent_id" not in properties
     assert "autonomy_policy" not in properties
     assert "imagination" in properties
+    assert "relative managed path" in properties["avatar_url"]["description"]
+    assert "/api/agents/{agent_id}/files/download" in properties["avatar_url"]["description"]
 
     result = await execute_tool(
         "update_self_settings",
@@ -148,6 +150,71 @@ async def test_seeded_self_settings_tool_executes_zero_false_and_null_patch():
         assert agent.daily_memory_load_days == 0
         assert agent.im_thinking_output_enabled is False
         assert participant.display_name == "After"
+
+
+async def test_self_settings_avatar_requires_relative_path_for_managed_agent_file(monkeypatch):
+    from app.services.agent_tools import execute_tool
+
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.example.com")
+    agent_id, user_id, _model_id, _foreign_model_id = await _seed_runtime()
+    managed_path = (
+        f"/api/agents/{agent_id}/files/download"
+        "?path=workspace/uploads/avatar.jpg"
+    )
+
+    rejected = await execute_tool(
+        "update_self_settings",
+        {"avatar_url": f"https://ai.example.com{managed_path}"},
+        agent_id,
+        user_id,
+    )
+    assert "参数无效" in rejected
+    assert "relative /api/agents/" in rejected
+    assert "remove the scheme and host" in rejected
+
+    updated = json.loads(await execute_tool(
+        "update_self_settings",
+        {"avatar_url": managed_path},
+        agent_id,
+        user_id,
+    ))
+    assert updated["status"] == "updated"
+    assert "avatar_url" in updated["changed_fields"]
+
+    async with async_session() as db:
+        agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one()
+        participant = (
+            await db.execute(
+                select(Participant).where(
+                    Participant.type == "agent",
+                    Participant.ref_id == agent_id,
+                )
+            )
+        ).scalar_one()
+        assert agent.avatar_url == managed_path
+        assert participant.avatar_url == managed_path
+
+
+async def test_self_settings_avatar_allows_external_url_with_managed_shaped_path():
+    from app.services.agent_tools import execute_tool
+
+    agent_id, user_id, _model_id, _foreign_model_id = await _seed_runtime()
+    external_url = (
+        f"https://cdn.example.com/api/agents/{agent_id}/files/download"
+        "?path=workspace/uploads/avatar.jpg"
+    )
+
+    updated = json.loads(await execute_tool(
+        "update_self_settings",
+        {"avatar_url": external_url},
+        agent_id,
+        user_id,
+    ))
+    assert updated["status"] == "updated"
+
+    async with async_session() as db:
+        agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one()
+        assert agent.avatar_url == external_url
 
 
 async def test_self_settings_patch_is_atomic_for_foreign_model_and_rejects_target_smuggling():

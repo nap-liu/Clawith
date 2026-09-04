@@ -1,6 +1,7 @@
 """Feishu text-turn execution inside the serialized channel lock."""
 
 from app.api.feishu_shared import *  # noqa: F401,F403
+from app.services.im_markdown_media import project_agent_images_for_im
 
 
 async def _process_feishu_text_turn(
@@ -370,10 +371,10 @@ async def _process_feishu_text_turn(
             if reason == "heartbeat" and current_hash == _last_flushed_hash:
                 return
             _last_flushed_hash = current_hash
-            card = _build_card(
-                answer_text=accumulated,
+            card = await _build_projected_stream_card(
+                agent_id,
+                accumulated,
                 thinking_text=thinking_text,
-                streaming=True,
                 tool_status_lines=tool_status_lines,
                 agent_name=_agent_name,
             )
@@ -499,14 +500,6 @@ async def _process_feishu_text_turn(
                 reply_text += f"\n\n⚠️ 任务已识别，但写入任务面板失败：{str(e)[:150]}"
 
     final_reply_text = _append_error_details(reply_text, _tool_errors)
-    final_card = _build_card(
-        answer_text=final_reply_text or "...",
-        thinking_text="",
-        streaming=False,
-        tool_status_lines=_visible_tool_status_lines(),
-        agent_name=_agent_name,
-    )
-
     from app.services.im_delivery import (
         DeliveryReceiptPersistenceError,
         IMDeliveryPart,
@@ -524,6 +517,14 @@ async def _process_feishu_text_turn(
         complete_turn=True,
     ):
         raise RuntimeError("feishu_stream_anchor_missing")
+    delivery_reply_text = await project_agent_images_for_im(agent_id, final_reply_text)
+    final_card = _build_card(
+        answer_text=delivery_reply_text or "...",
+        thinking_text="",
+        streaming=False,
+        tool_status_lines=_visible_tool_status_lines(),
+        agent_name=_agent_name,
+    )
     delivery_parts: list[IMDeliveryPart] = []
     if _patch_msg_id:
         card_part = IMDeliveryPart(
@@ -555,7 +556,7 @@ async def _process_feishu_text_turn(
                     config.app_secret,
                     _reply_target,
                     "text",
-                    _json.dumps({"text": final_reply_text}),
+                    _json.dumps({"text": delivery_reply_text}),
                     receive_id_type=_reply_rid_type,
                     stage="final_after_task_fallback_text",
                 )
@@ -608,7 +609,7 @@ async def _process_feishu_text_turn(
                     config.app_secret,
                     _reply_target,
                     "text",
-                    _json.dumps({"text": final_reply_text}),
+                    _json.dumps({"text": delivery_reply_text}),
                     receive_id_type=_reply_rid_type,
                     stage="final_after_task_fallback_text",
                 )

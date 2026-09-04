@@ -2,12 +2,20 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.security import create_access_token, get_authenticated_user, get_current_user, hash_password_async, verify_password_async
+from app.core.security import (
+    clear_access_token_cookie,
+    create_access_token,
+    get_authenticated_user,
+    get_current_user,
+    hash_password_async,
+    set_access_token_cookie,
+    verify_password_async,
+)
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import TenantChoice, TenantSwitchRequest, TenantSwitchResponse, UserOut, UserUpdate
@@ -130,6 +138,7 @@ async def switch_tenant(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
 ):
     """Switch to a different tenant and return a new token and redirect URL."""
     from app.models.tenant import Tenant
@@ -163,6 +172,7 @@ async def switch_tenant(
     await require_active_authentication_principal(db, target_user)
     # 3. Generate new token
     token = create_access_token(str(target_user.id), target_user.role)
+    set_access_token_cookie(response, request, token)
 
     # 4. Determine redirect URL
     # Determine redirect URL (Priority: sso_domain > ENV > Request > Fallback)
@@ -195,6 +205,13 @@ async def switch_tenant(
         redirect_url=redirect_url,
         message="Switching organization..."
     )
+
+
+@router.post("/logout")
+async def logout(request: Request, response: Response):
+    """Clear the browser copy of the login JWT."""
+    clear_access_token_cookie(response, request)
+    return {"ok": True}
 
 
 @router.put("/me/password")

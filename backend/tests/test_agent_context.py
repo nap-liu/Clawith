@@ -132,6 +132,15 @@ async def test_static_includes_message_sender_tag_section():
     assert "VERY BEGINNING" in static_p
 
 
+async def test_static_guides_agent_relative_markdown_images():
+    agent_id = await _seed_basic_agent()
+    static_p, _ = await build_agent_context(agent_id, "Test Agent", "role")
+
+    assert "![clear description](workspace/path/to/image.png)" in static_p
+    assert "Never construct a platform domain" in static_p
+    assert "The platform resolves the relative image path" in static_p
+
+
 async def test_no_user_name_no_current_conversation_either_mode():
     """current_user_name=None 时, P2P 和 group 都不应注入 Current Conversation."""
     agent_id = await _seed_basic_agent()

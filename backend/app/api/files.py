@@ -410,20 +410,24 @@ async def stream_media_playback(
 async def download_file(
     agent_id: uuid.UUID,
     path: str,
+    request: Request,
     token: str = "",
+    im_ticket: str = "",
     inline: bool = False,
     credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ):
     """Download / serve a file from the agent workspace (browser-friendly).
 
-    Auth via Bearer header OR `token` query parameter (for <img> tags).
+    Auth via Bearer header, the login cookie, or the legacy `token` query parameter.
     """
     return await files_route_ops.download_file_impl(
         MODULE,
         agent_id=agent_id,
         path=path,
+        request=request,
         token=token,
+        im_ticket=im_ticket,
         inline=inline,
         credentials=credentials,
         db=db,

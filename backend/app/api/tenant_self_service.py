@@ -5,12 +5,12 @@ import secrets
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_authenticated_user
+from app.core.security import get_authenticated_user, set_access_token_cookie
 from app.database import get_db
 from app.models.tenant import Tenant
 from app.models.user import User
@@ -174,6 +174,8 @@ class SelfCreateResponse(BaseModel):
 @router.post("/self-create", response_model=SelfCreateResponse, status_code=status.HTTP_201_CREATED)
 async def self_create_company(
     data: TenantCreate,
+    request: Request,
+    response: Response,
     current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -264,6 +266,7 @@ async def self_create_company(
         logger.warning(f"[self_create_company] Failed to seed default agents: {e}")
 
     await db.commit()
+    set_access_token_cookie(response, request, access_token)
 
     return SelfCreateResponse(
         tenant=TenantOut.model_validate(tenant),

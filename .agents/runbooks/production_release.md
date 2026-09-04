@@ -97,44 +97,105 @@ Production-host source builds are emergency-only and require separate approval.
 1. Put the full SHA in the backend `COMMIT` build-context file.
 2. Build backend and frontend together for `linux/amd64` with OCI revision and
    version labels.
-3. Reuse the reviewed stable build arguments and registry cache references.
+3. Select and record the backend dependency mode described below. Use
+   release-scoped cache references; never overwrite the cache being consumed.
 4. Rebuild AIO only when its source/base changed or explicitly requested.
 5. Push immutable release tags, then record index digests and prove the manifest
    contains `linux/amd64`.
 
-Template (resolve registry and reviewed build arguments from current config):
+### 4.1 Backend dependency mode
+
+The mutable `buildcache-amd64` tag is not a dependency artifact. A concurrent
+or later build can replace its cache graph, and harmless build-argument changes
+can change cache keys. Treat registry cache as a speed hint only.
+
+For the normal code-only release, use the current trusted backend image by its
+`linux/amd64` manifest digest as `CLAWITH_DEPS_IMAGE`. The Dockerfile copies only
+its `/usr/local` dependency tree; candidate application code is copied from the
+clean release context afterward. This path is allowed only when all gates pass:
+
+1. `backend/pyproject.toml` is unchanged from `CURRENT_RELEASE_SHA` to
+   `RELEASE_SHA`;
+2. its checksum equals `/app/pyproject.toml` inside the dependency image;
+3. the dependency image is the running trusted release, is digest-pinned, and
+   is `linux/amd64`;
+4. its Python version equals the candidate Dockerfile's digest-pinned Python
+   base; and
+5. review confirms that the dependency-build commands, required runtime
+   libraries, and `/usr/local` copy contract did not change.
+
+Example gate (resolve the exact image and base references first):
+
+```bash
+BACKEND_DEPS_IMAGE=<current-backend-linux-amd64-image@sha256:digest>
+TARGET_PYTHON_BASE=<candidate-digest-pinned-python-base>
+CANDIDATE_DEPS_SHA=$(sha256sum <clean-context>/backend/pyproject.toml | awk '{print $1}')
+CARRIER_DEPS_SHA=$(docker run --rm --platform linux/amd64 \
+  --entrypoint sha256sum "$BACKEND_DEPS_IMAGE" /app/pyproject.toml | awk '{print $1}')
+test "$CANDIDATE_DEPS_SHA" = "$CARRIER_DEPS_SHA"
+test "$(docker run --rm --platform linux/amd64 --entrypoint python \
+  "$BACKEND_DEPS_IMAGE" --version 2>&1)" = \
+  "$(docker run --rm --platform linux/amd64 --entrypoint python \
+  "$TARGET_PYTHON_BASE" --version 2>&1)"
+```
+
+If any gate fails, omit `CLAWITH_DEPS_IMAGE`. That explicitly selects the
+Dockerfile's `deps-build` stage and is a dependency-refresh release. Review the
+resolved package set before publish; package downloads are expected only in
+this mode. Never force the carrier path across changed or uncertain dependency
+inputs.
+
+### 4.2 Immutable cache chain and build template
+
+Each release writes new cache tags keyed by its release SHA and reads only the
+current release's cache tags. Never use the same cache reference for input and
+output, and never publish again to the legacy mutable `buildcache-amd64` tag.
+The first release adopting this scheme may use the legacy cache as a read-only
+hint or omit it; backend dependency reuse still comes from the verified
+immutable dependency image.
+
+Template (resolve registry, current cache tags, and reviewed build arguments
+from current configuration):
 
 ```bash
 RELEASE_SHA=<full-release-sha>
-RELEASE_ID=v<upstream-version>-<release-sha7>
-REGISTRY=<approved-registry-namespace>
-BACKEND_CACHE="$REGISTRY/backend:buildcache-amd64"
-FRONTEND_CACHE="$REGISTRY/frontend:buildcache-amd64"
+RELEASE_SHA7=${RELEASE_SHA:0:7}
+UPSTREAM_VERSION=<upstream-version>
+RELEASE_ID="v${UPSTREAM_VERSION}-${RELEASE_SHA7}"
+BACKEND_REPOSITORY=<approved-backend-image-repository>
+FRONTEND_REPOSITORY=<approved-frontend-image-repository>
+CURRENT_SHA7=<current-release-sha7>
+BACKEND_CACHE_FROM="$BACKEND_REPOSITORY:buildcache-$CURRENT_SHA7-amd64"
+BACKEND_CACHE_TO="$BACKEND_REPOSITORY:buildcache-$RELEASE_SHA7-amd64"
+FRONTEND_CACHE_FROM="$FRONTEND_REPOSITORY:buildcache-$CURRENT_SHA7-amd64"
+FRONTEND_CACHE_TO="$FRONTEND_REPOSITORY:buildcache-$RELEASE_SHA7-amd64"
+BACKEND_DEPS_IMAGE=<verified-current-backend-image@sha256:digest>
 
 docker buildx build --builder <verified-builder> \
   --platform linux/amd64 --progress=plain \
-  --cache-from type=registry,ref="$BACKEND_CACHE" \
-  --cache-to type=registry,ref="$BACKEND_CACHE",mode=max \
+  --cache-from type=registry,ref="$BACKEND_CACHE_FROM" \
+  --cache-to type=registry,ref="$BACKEND_CACHE_TO",mode=max \
+  --build-arg "CLAWITH_DEPS_IMAGE=$BACKEND_DEPS_IMAGE" \
   <reviewed-stable-backend-build-args> \
   --label org.opencontainers.image.revision="$RELEASE_SHA" \
   --label org.opencontainers.image.version="$RELEASE_ID" \
-  --tag "$REGISTRY/backend:$RELEASE_ID" --push <clean-context>/backend
+  --tag "$BACKEND_REPOSITORY:$RELEASE_ID" --push <clean-context>/backend
 
 docker buildx build --builder <verified-builder> \
   --platform linux/amd64 --progress=plain \
-  --cache-from type=registry,ref="$FRONTEND_CACHE" \
-  --cache-to type=registry,ref="$FRONTEND_CACHE",mode=max \
+  --cache-from type=registry,ref="$FRONTEND_CACHE_FROM" \
+  --cache-to type=registry,ref="$FRONTEND_CACHE_TO",mode=max \
   --label org.opencontainers.image.revision="$RELEASE_SHA" \
   --label org.opencontainers.image.version="$RELEASE_ID" \
-  --tag "$REGISTRY/frontend:$RELEASE_ID" --push <clean-context>/frontend
+  --tag "$FRONTEND_REPOSITORY:$RELEASE_ID" --push <clean-context>/frontend
 ```
 
 Never use `docker compose build` or `docker compose up --build` for production
-artifacts. Before building, confirm there is no stale concurrent build and that
-the intended builder, platform, Dockerfile, dependency manifests, and build
-arguments match the cache chain. If unchanged dependencies start downloading,
-cancel within about ten seconds, confirm no detached build remains, and diagnose
-the cache carrier/keys. Do not normalize an unexplained full dependency rebuild.
+artifacts. In carrier mode the build graph must not execute the backend
+`deps-build` stage or download Python packages. If it does, cancel promptly,
+confirm no detached build remains, and diagnose the selected image/build args.
+In dependency-refresh mode, inspect and record the resolved packages rather
+than describing their download as an unexpected cache failure.
 
 ## 5. Prepare production while the old release stays live
 
@@ -367,7 +428,8 @@ Every release plan derived from this runbook includes:
 - authoritative branch, diff range, final SHA, and release ID;
 - included/excluded components, 800-line gate, migration/seed/state impact;
 - exact Docker validation and independent review evidence;
-- cache-aware backend/frontend build and immutable digest capture commands;
+- backend dependency mode, immutable cache-chain build commands, and immutable
+  image digest capture commands;
 - current/candidate/rollback topology and explicit Compose project;
 - interruption requirement and why single-replica or blue-green is acceptable;
 - online backup matrix, evidence, omissions, and data-owner approvals;

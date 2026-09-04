@@ -86,6 +86,7 @@ export function mapHistoryMessage(
       sender_name: raw.sender_name || undefined,
       sender_user_id: raw.sender_user_id || undefined,
       sender_agent_id: raw.sender_agent_id || undefined,
+      sender_avatar_url: raw.sender_avatar_url || undefined,
       turnAnchorId:
         raw.timeline_anchor_id ||
         raw.turnAnchorId ||
@@ -119,6 +120,7 @@ export function mapHistoryMessage(
     sender_name: raw.sender_name || undefined,
     sender_user_id: raw.sender_user_id || undefined,
     sender_agent_id: raw.sender_agent_id || undefined,
+    sender_avatar_url: raw.sender_avatar_url || undefined,
     turnAnchorId:
       raw.timeline_anchor_id ||
       raw.turnAnchorId ||
@@ -188,6 +190,9 @@ export function applyUserMessageCommitted<T extends Record<string, any>>(
     ...(event.sender_name ? { sender_name: event.sender_name } : {}),
     ...(event.sender_user_id || event.user_id
       ? { sender_user_id: String(event.sender_user_id || event.user_id) }
+      : {}),
+    ...(event.sender_avatar_url
+      ? { sender_avatar_url: event.sender_avatar_url }
       : {}),
     created_at: event.created_at || existing.created_at,
     timestamp: event.created_at || existing.timestamp,

@@ -12,7 +12,7 @@ from datetime import datetime
 
 from loguru import logger
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -21,7 +21,7 @@ from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.security import get_current_user, require_role, get_authenticated_user
+from app.core.security import get_current_user, require_role, get_authenticated_user, set_access_token_cookie
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.tenant import Tenant
@@ -73,6 +73,8 @@ class JoinResponse(BaseModel):
 @router.post("/join", response_model=JoinResponse)
 async def join_company(
     data: JoinRequest,
+    request: Request,
+    response: Response,
     current_user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -185,6 +187,7 @@ async def join_company(
     await db.flush()
 
     await db.commit()
+    set_access_token_cookie(response, request, access_token)
 
     return JoinResponse(
         tenant=TenantOut.model_validate(tenant),

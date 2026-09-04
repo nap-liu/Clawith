@@ -1,11 +1,11 @@
 """Authentication email-verification routes."""
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth_registration import _send_verification_email_task
-from app.core.security import create_access_token
+from app.core.security import create_access_token, set_access_token_cookie
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import IdentityOut, ResendVerificationRequest, TokenResponse, UserOut, VerifyEmailRequest
@@ -14,7 +14,12 @@ router = APIRouter()
 
 
 @router.post("/verify-email")
-async def verify_email(data: VerifyEmailRequest, db: AsyncSession = Depends(get_db)):
+async def verify_email(
+    data: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
+):
     """Verify email address using a token from the verification email.
 
     On success, returns user info and access token to allow immediate login.
@@ -66,6 +71,7 @@ async def verify_email(data: VerifyEmailRequest, db: AsyncSession = Depends(get_
     effective_id = str(user.id) if user else str(identity.id)
     effective_role = user.role if user else "user"
     token = create_access_token(effective_id, effective_role)
+    set_access_token_cookie(response, request, token)
 
     return TokenResponse(
         access_token=token,

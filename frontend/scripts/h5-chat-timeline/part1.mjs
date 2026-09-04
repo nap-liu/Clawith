@@ -20,6 +20,37 @@ export function runH5ChatTimelinePart1(ctx) {
     } = ctx;
 
 {
+    const senderAvatar = '/api/users/user-2/avatar';
+    const historyMessage = mapHistoryMessage({
+        id: 'group-user-history',
+        role: 'user',
+        content: 'history message',
+        sender_name: 'User Two',
+        sender_user_id: 'user-2',
+        sender_avatar_url: senderAvatar,
+    });
+    assert.equal(
+        historyMessage.sender_avatar_url,
+        senderAvatar,
+        'history normalization must preserve the avatar belonging to the sender identity',
+    );
+
+    const committed = applyUserMessageCommitted([], {
+        message_id: 'group-user-live',
+        content: 'live message',
+        sender_name: 'User Three',
+        sender_user_id: 'user-3',
+        sender_avatar_url: '/api/users/user-3/avatar',
+    });
+    assert.equal(committed[0].sender_user_id, 'user-3');
+    assert.equal(
+        committed[0].sender_avatar_url,
+        '/api/users/user-3/avatar',
+        'live normalization must keep the sender avatar independent of bubble side',
+    );
+}
+
+{
     const initial = [{ id: 'u1', role: 'user', content: 'keep' }];
     const draft = foldConversationTimelineEvent(initial, {
         type: 'workspace_draft',

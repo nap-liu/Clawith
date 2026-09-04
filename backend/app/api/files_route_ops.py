@@ -9,17 +9,21 @@ from pathlib import Path
 from typing import Any
 
 import aiofiles
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import decode_access_token, request_access_token
 from app.models.agent import Agent
 from app.models.user import User
 from app.models.workspace import WorkspaceFileRevision
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
+from app.services.authentication_state import require_active_authentication_principal
+from app.services.chat_attachments import sniff_image_mime_bytes
 from app.services.focus_service import is_focus_file_path
+from app.services.im_markdown_media import verify_im_image_ticket
 from app.services.storage import ensure_local_path, guess_content_type
 from app.services.workspace_collaboration import (
     acquire_edit_lock,
@@ -267,16 +271,50 @@ async def download_file_impl(
     *,
     agent_id: uuid.UUID,
     path: str,
+    request: Request,
     token: str,
+    im_ticket: str,
     inline: bool,
     credentials: HTTPAuthorizationCredentials | None,
     db: AsyncSession,
 ):
     """Download / serve a file from the agent workspace (browser-friendly)."""
 
-    from app.core.security import decode_access_token
+    storage = api.get_storage_backend()
+    if im_ticket:
+        image_ticket = verify_im_image_ticket(agent_id, path, im_ticket)
+        if image_ticket is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+        key = image_ticket.storage_key
+        if not await storage.is_file(key):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+        mime_type = sniff_image_mime_bytes(await storage.read_range(key, 0, 511))
+        if mime_type is None:
+            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Not an image")
+        headers = {
+            "Cache-Control": "private, no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        }
+        local_path = await storage.local_path_for(key)
+        if local_path is not None:
+            return FileResponse(
+                path=str(local_path),
+                filename=Path(image_ticket.path).name,
+                media_type=mime_type,
+                content_disposition_type="inline",
+                headers=headers,
+            )
+        return Response(
+            content=await storage.read_bytes(key),
+            media_type=mime_type,
+            headers={
+                **headers,
+                "Content-Disposition": f'inline; filename="{Path(image_ticket.path).name}"',
+            },
+        )
 
-    jwt_token = credentials.credentials if credentials else (token or None)
+    jwt_token = request_access_token(request, credentials, query_token=token)
     if not jwt_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     payload = decode_access_token(jwt_token)
@@ -284,15 +322,16 @@ async def download_file_impl(
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    user = await require_active_authentication_principal(
+        db,
+        result.scalar_one_or_none(),
+        status_code=status.HTTP_401_UNAUTHORIZED,
+    )
     agent, _access = await api.check_agent_access(db, user, agent_id)
     is_creator = (agent.creator_id == user.id) or (user.role == "platform_admin")
     filename = Path(path).name
     if filename in api.CREATOR_ONLY_FILES and not is_creator:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    storage = api.get_storage_backend()
     key, _ = api._visible_storage_key(
         agent_id,
         path,

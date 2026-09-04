@@ -1,6 +1,7 @@
 """Validated updates for ordinary Digital Employee settings."""
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -23,7 +24,16 @@ class AgentSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    avatar_url: str | None = Field(default=None, max_length=500)
+    avatar_url: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "Avatar image URL. Use a publicly accessible http(s) URL, or for a file in this "
+            "Digital Employee's workspace use the relative managed path "
+            "'/api/agents/{agent_id}/files/download?path=workspace/...'. Never prepend the "
+            "platform scheme and host to a managed /api/ path."
+        ),
+    )
     role_description: str | None = Field(default=None, max_length=500)
     bio: str | None = None
     welcome_message: str | None = None
@@ -74,7 +84,24 @@ class AgentSettingsPatch(BaseModel):
         if value in (None, ""):
             return None
         parsed = urlsplit(value)
-        if value.startswith("/api/") or parsed.scheme in {"http", "https"}:
+        if value.startswith("/api/"):
+            return value
+        if parsed.scheme in {"http", "https"}:
+            public_origin = urlsplit(os.environ.get("PUBLIC_BASE_URL", ""))
+            is_platform_origin = bool(
+                public_origin.scheme in {"http", "https"}
+                and parsed.scheme == public_origin.scheme
+                and parsed.netloc == public_origin.netloc
+            )
+            if (
+                is_platform_origin
+                and parsed.path.startswith("/api/agents/")
+                and "/files/download" in parsed.path
+            ):
+                raise ValueError(
+                    "managed Agent file avatars must use the relative /api/agents/.../files/download "
+                    "path; remove the scheme and host"
+                )
             return value
         raise ValueError("avatar_url must be an http(s) URL or a managed /api/ path")
 

@@ -3,12 +3,12 @@
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import create_access_token, get_current_user
+from app.core.security import create_access_token, get_current_user, set_access_token_cookie
 from app.database import get_db
 from app.models.user import User
 from app.services.platform_auth_policy import AccountRegistrationDisabled
@@ -109,6 +109,8 @@ async def authorize(
 async def exchange_auth_code(
     data: AuthCodeExchangeRequest,
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
 ):
     """Exchange an OAuth authorization code for a platform login token."""
 
@@ -150,6 +152,7 @@ async def exchange_auth_code(
         raise HTTPException(status_code=500, detail="OAuth authentication failed")
 
     jwt_token = create_access_token(str(user.id), user.role)
+    set_access_token_cookie(response, request, jwt_token)
     return TokenResponse(
         access_token=jwt_token,
         user=UserOut.model_validate(user),
@@ -162,6 +165,8 @@ async def oauth_callback(
     provider: str,
     data: OAuthCallbackRequest,
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
+    request: Request = None,
 ):
     """Handle OAuth callback — supports a two-step flow for multi-tenant selection.
 
@@ -219,6 +224,7 @@ async def oauth_callback(
             raise HTTPException(status_code=403, detail="Account is disabled")
 
         jwt_token = create_access_token(str(user.id), user.role)
+        set_access_token_cookie(response, request, jwt_token)
         return TokenResponse(
             access_token=jwt_token,
             user=UserOut.model_validate(user),
@@ -304,6 +310,7 @@ async def oauth_callback(
 
     # Single tenant (or new user with no tenant yet) — issue token directly
     jwt_token = create_access_token(str(user.id), user.role)
+    set_access_token_cookie(response, request, jwt_token)
     return TokenResponse(
         access_token=jwt_token,
         user=UserOut.model_validate(user),

@@ -16,6 +16,7 @@ from app.services.agent_tools_outbound_core import (
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import get_platform_user_by_org_member
 from app.services.im_delivery import IMDeliveryResult, register_delivery
+from app.services.im_markdown_media import project_agent_images_for_im
 from app.services.recipient_resolver import (
     RecipientResolutionError,
     resolve_platform_user_recipient,
@@ -98,6 +99,7 @@ async def _send_teams_channel_message(
             await db.commit()
             if not should_deliver:
                 return _duplicate_outbound_claim_result(receipt)
+            delivery_text = await project_agent_images_for_im(agent_id, message_text)
 
             async def _record_teams_part(response: dict) -> None:
                 part = IMDeliveryPart(
@@ -116,7 +118,7 @@ async def _send_teams_channel_message(
                     conversation_id,
                     {
                         "type": "message",
-                        "text": message_text,
+                        "text": delivery_text,
                         "conversation": {"id": conversation_id},
                     },
                     on_result=_record_teams_part,
@@ -232,6 +234,7 @@ async def _send_wechat_channel_message(
             await db.commit()
             if not should_deliver:
                 return _duplicate_outbound_claim_result(receipt)
+            delivery_text = await project_agent_images_for_im(agent_id, message_text)
 
             async def _record_wechat_part(response: dict) -> None:
                 part = IMDeliveryPart(
@@ -249,7 +252,7 @@ async def _send_wechat_channel_message(
                     base_url=base_url,
                     to_user_id=user_id,
                     context_token=context_token,
-                    text=message_text,
+                    text=delivery_text,
                     route_tag=route_tag,
                     on_result=_record_wechat_part,
                 )
