@@ -11,8 +11,10 @@ from app.services.llm import caller_streaming as _caller_streaming
 from app.services.llm import caller_streaming_rounds as _caller_streaming_rounds
 from app.services.llm import caller_streaming_support as _caller_streaming_support
 from app.services.llm import caller_tooling as _caller_tooling
+from app.services.llm import provider_retry as _provider_retry
 
 _EXPORT_MODULES = (
+    _provider_retry,
     _caller_shared,
     _caller_tooling,
     _caller_context,
@@ -22,6 +24,7 @@ _EXPORT_MODULES = (
 )
 
 _SYNC_MODULES = (
+    _provider_retry,
     _caller_shared,
     _caller_tooling,
     _caller_context,
@@ -40,6 +43,7 @@ _MOVED_SYMBOLS = (
     "_invoke_before_round",
     "_response_was_truncated_by_length",
     "ProviderThrottleExhausted",
+    "ProviderRecoveryExhausted",
     "_is_provider_throttle_error",
     "_sleep_before_throttle_retry",
     "_close_cancelled_provider_client",
@@ -50,7 +54,9 @@ _MOVED_SYMBOLS = (
     "measure_dispatch",
     "_guard_provider_dispatch",
     "_tool_call_signature",
-    "_update_repeat_streaks",
+    "_tool_round_fingerprint",
+    "_tool_round_observation",
+    "_repeating_tool_period",
     "FailoverGuard",
     "is_error_result",
     "is_retryable_error",

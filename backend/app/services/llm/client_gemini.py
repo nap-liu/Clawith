@@ -397,12 +397,12 @@ class GeminiClient(LLMClient):
         response = await client.post(url, json=payload, headers=self._get_headers())
 
         if response.status_code >= 400:
-            error_text = response.text[:500]
-            raise LLMError.from_http(response.status_code, error_text)
+            error_text = response.text
+            raise LLMError.from_http(response.status_code, error_text, response.headers)
 
         data = response.json()
         if isinstance(data, dict) and data.get("error"):
-            raise LLMError(f"API error: {data['error']}")
+            raise LLMError.from_payload(data)
 
         return self._parse_response_data(data)
 
@@ -437,7 +437,7 @@ class GeminiClient(LLMClient):
 
         full_text = ""
         tool_calls: list[dict[str, Any]] = []
-        seen_tool_calls: set[str] = set()
+        seen_tool_call_counts: dict[str, int] = {}
         final_usage: dict[str, int] | None = None
         final_finish_reason: str | None = None
 
@@ -454,8 +454,9 @@ class GeminiClient(LLMClient):
                 if resp.status_code >= 400:
                     error_body = ""
                     async for chunk in resp.aiter_bytes():
-                        error_body += chunk.decode(errors="replace")
-                    raise LLMError.from_http(resp.status_code, error_body[:500])
+                        if len(error_body) < 65536:
+                            error_body += chunk.decode(errors="replace")[: 65536 - len(error_body)]
+                    raise LLMError.from_http(resp.status_code, error_body, resp.headers)
 
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -470,7 +471,7 @@ class GeminiClient(LLMClient):
                         continue
 
                     if isinstance(data, dict) and data.get("error"):
-                        raise LLMError(f"API error: {data['error']}")
+                        raise LLMError.from_payload(data)
 
                     usage = self._normalize_usage(data.get("usageMetadata"))
                     if usage:
@@ -482,6 +483,7 @@ class GeminiClient(LLMClient):
                     candidate = candidates[0]
                     final_finish_reason = candidate.get("finishReason") or final_finish_reason
                     content_obj = candidate.get("content", {}) or {}
+                    event_tool_call_counts: dict[str, int] = {}
                     for part in content_obj.get("parts", []) or []:
                         text = part.get("text")
                         if text:
@@ -495,9 +497,10 @@ class GeminiClient(LLMClient):
                             args = function_call.get("args", {})
                             args_str = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
                             dedup_key = f"{name}:{args_str}"
-                            if dedup_key in seen_tool_calls:
+                            occurrence = event_tool_call_counts.get(dedup_key, 0) + 1
+                            event_tool_call_counts[dedup_key] = occurrence
+                            if occurrence <= seen_tool_call_counts.get(dedup_key, 0):
                                 continue
-                            seen_tool_calls.add(dedup_key)
 
                             extra = {k: v for k, v in function_call.items() if k not in ["name", "args"]}
 
@@ -510,9 +513,13 @@ class GeminiClient(LLMClient):
                                 },
                                 "_gemini_extra": extra,
                             })
+                    for key, count in event_tool_call_counts.items():
+                        seen_tool_call_counts[key] = max(seen_tool_call_counts.get(key, 0), count)
 
-        except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
-            raise LLMError(f"Connection failed: {e}")
+        except httpx.ReadTimeout:
+            raise
+        except httpx.TransportError:
+            raise
 
         return LLMResponse(
             content=full_text,

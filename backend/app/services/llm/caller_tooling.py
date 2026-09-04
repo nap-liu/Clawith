@@ -1,5 +1,7 @@
 """Caller tool-event and persistence helpers."""
 
+import hashlib
+
 from app.services.llm.caller_shared import *  # noqa: F401,F403
 
 
@@ -24,18 +26,51 @@ def _tool_call_signature(tc: dict) -> tuple[str, str]:
     return (name, args_key)
 
 
-def _update_repeat_streaks(
-    prev_streaks: dict[tuple[str, str], int],
-    round_signatures: list[tuple[str, str]],
-) -> dict[tuple[str, str], int]:
-    """Consecutive-round streak counts after one round of tool calls.
+def _tool_round_fingerprint(tool_calls: list[dict]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(_tool_call_signature(tc) for tc in tool_calls))
 
-    A signature seen this round extends its prior streak (+1); any signature NOT
-    seen this round drops out (streak resets to 0). Pure — does not mutate
-    ``prev_streaks``. Identical calls within the *same* round count once (the
-    provider's 400 is about repetition *across* rounds).
-    """
-    return {sig: prev_streaks.get(sig, 0) + 1 for sig in round_signatures}
+
+def _tool_round_observation(
+    tool_calls: list[dict],
+    results: list[Any],
+) -> tuple[tuple[tuple[str, str], str], ...]:
+    """Bound one round's calls to hashes of the results that followed them."""
+    if len(tool_calls) != len(results):
+        return ()
+    observed = []
+    for tool_call, result in zip(tool_calls, results, strict=True):
+        if isinstance(result, (dict, list)):
+            rendered = json.dumps(result, sort_keys=True, ensure_ascii=False, default=str)
+        else:
+            rendered = str(result)
+        observed.append(
+            (_tool_call_signature(tool_call), hashlib.sha256(rendered.encode()).hexdigest())
+        )
+    return tuple(sorted(observed))
+
+
+def _repeating_tool_period(
+    history: list[tuple[tuple[tuple[str, str], str], ...]],
+    current_tool_calls: list[dict] | None = None,
+) -> int | None:
+    """Detect only stable period-1/2 loops with unchanged tool results."""
+    current = _tool_round_fingerprint(current_tool_calls) if current_tool_calls is not None else None
+
+    def calls(observation):
+        return tuple(item[0] for item in observation)
+
+    if len(history) >= 2 and history[-2] == history[-1]:
+        if current is None or current == calls(history[-1]):
+            return 1
+    if (
+        len(history) >= 4
+        and history[-4] == history[-2]
+        and history[-3] == history[-1]
+        and history[-4] != history[-3]
+    ):
+        if current is None or current == calls(history[-4]):
+            return 2
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -302,6 +337,7 @@ def _durable_tool_result_row_id(tool_name: str, result: str, session_id: str) ->
 class _RoundDoneToolCall:
     event: dict[str, Any]
     row_id: uuid.UUID | None
+    provider_content: Any
 
 
 async def _persist_tool_call_events_strict(
@@ -409,7 +445,9 @@ async def _reconcile_round_tool_outputs(
     # Mutate callback payloads only after the durable transaction commits. On
     # failure they retain the original values that are still authoritative in DB.
     for call_id, final_content in final_by_call_id.items():
-        records_by_call_id[call_id].event["result"] = final_content
+        record = records_by_call_id[call_id]
+        record.event["result"] = final_content
+        record.provider_content = final_content
 
 
 async def _emit_round_done_events(

@@ -35,6 +35,14 @@ compatible typed failure; each existing workload finalizer records its own
 failed state and every user-facing channel renders the same localized failure
 message. The LLM client never writes conversation or workload terminal state.
 
+A transient provider HTTP 429 uses one shared recovery lane: the original
+request plus at most five identical-payload retries with 1/2/4/8/16-second
+backoff. Each retry emits transient status rather than model text. The lane
+does not stack with 5xx recovery or model failover, and authentication,
+billing, or hard-quota failures are not retried. Exhaustion is a typed terminal
+failure that tells the user to wait and send `continue` in the same Session;
+resetting the conversation is neither required nor recommended.
+
 Model text emitted in a response that also carries tool calls belongs to that
 intermediate tool round. Persist it with the tool-call audit record and replay
 it to the provider unchanged, but do not concatenate it into the terminal

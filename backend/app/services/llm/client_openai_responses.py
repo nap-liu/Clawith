@@ -339,8 +339,8 @@ class OpenAIResponsesClient(LLMClient):
         response = await client.post(url, json=payload, headers=self._get_headers())
 
         if response.status_code >= 400:
-            error_text = response.text[:500]
-            raise LLMError.from_http(response.status_code, error_text)
+            error_text = response.text
+            raise LLMError.from_http(response.status_code, error_text, response.headers)
 
         data = response.json()
         api_error = self._extract_api_error(data)
@@ -351,7 +351,7 @@ class OpenAIResponsesClient(LLMClient):
                 api_error,
                 ctx,
             )
-            raise LLMError(api_error)
+            raise LLMError.from_payload(data)
 
         return self._parse_response_data(data)
 

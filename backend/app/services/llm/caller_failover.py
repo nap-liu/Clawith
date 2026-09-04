@@ -18,6 +18,7 @@ async def call_llm_with_failover(
     session_id: str = "",
     on_chunk=None,
     on_thinking=None,
+    on_status=None,
     on_usage=None,
     on_tool_call=None,
     on_tool_delta=None,
@@ -276,6 +277,7 @@ async def call_llm_with_failover(
         on_tool_call=_wrapped_on_tool_call,
         on_tool_delta=_wrapped_on_tool_delta,
         on_thinking=_wrapped_on_thinking,
+        on_status=on_status,
         on_usage=on_usage,
         skip_tools=skip_tools,
         is_group=is_group,
@@ -368,6 +370,7 @@ async def call_llm_with_failover(
         on_tool_call=_fallback_on_tool_call,
         on_tool_delta=_fallback_on_tool_delta,
         on_thinking=_fallback_on_thinking,
+        on_status=on_status,
         on_usage=on_usage,
         skip_tools=skip_tools,
         is_group=is_group,
@@ -386,6 +389,7 @@ async def call_llm_with_failover(
         before_round=_wrapped_before_round,
         before_tool_execution=before_tool_execution,
         max_tool_rounds_override=max_tool_rounds_override,
+        provider_retries_enabled=False,
     )
 
     if primary_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE and fallback_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE:
@@ -393,6 +397,8 @@ async def call_llm_with_failover(
 
     # Combine error messages if fallback also failed
     if is_retryable_error(fallback_result) or fallback_result.startswith("⚠️") or fallback_result.startswith("[Error]"):
+        if isinstance(fallback_result, LLMFailure):
+            return _combined_model_failure(primary_result, fallback_result)
         return f"⚠️ 调用模型出错: Primary: {primary_result[:80]} | Fallback: {fallback_result[:80]}"
 
     return fallback_result

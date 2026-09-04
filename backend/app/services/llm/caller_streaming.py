@@ -22,6 +22,7 @@ async def call_llm(
     on_tool_call=None,
     on_tool_delta=None,
     on_thinking=None,
+    on_status=None,
     on_usage=None,
     max_tool_rounds_override: int | None = None,
     skip_tools: bool = False,
@@ -39,6 +40,7 @@ async def call_llm(
     before_tool_execution=None,
     include_soul: bool = True,
     include_memory: bool = True,
+    provider_retries_enabled: bool = True,
 ) -> str:
     state = CallLlmState(
         model=model,
@@ -51,6 +53,7 @@ async def call_llm(
         on_tool_call=on_tool_call,
         on_tool_delta=on_tool_delta,
         on_thinking=on_thinking,
+        on_status=on_status,
         on_usage=on_usage,
         is_group=is_group,
         on_code_output=on_code_output,
@@ -64,6 +67,7 @@ async def call_llm(
         before_tool_execution=before_tool_execution,
         include_soul=include_soul,
         include_memory=include_memory,
+        provider_retries_enabled=provider_retries_enabled,
     )
 
     await _call_llm_resolve_execution_identity_and_active_turn(state)
@@ -214,7 +218,13 @@ async def call_llm(
                 await record_token_usage(state.agent_id, state.unsaved_usage)
             await state.client_guard.close()
             _call_llm_log_turn_timing(state, "throttle_exhausted", round_i + 1)
-            return PROVIDER_THROTTLE_USER_MESSAGE
+            return _provider_failure_outcome(
+                model=state.model,
+                round_number=round_i + 1,
+                error=e,
+                messages=dispatch_messages,
+                had_tool_side_effect=state.tool_executed,
+            )
         except LLMError as e:
             if _as_model_response_idle_timeout(e) is not None:
                 logger.error(
@@ -234,7 +244,13 @@ async def call_llm(
                 await record_token_usage(state.agent_id, state.unsaved_usage)
             await state.client_guard.close()
             _call_llm_log_turn_timing(state, "llm_error", round_i + 1)
-            return f"[LLM Error] {e}"
+            return _provider_failure_outcome(
+                model=state.model,
+                round_number=round_i + 1,
+                error=e,
+                messages=dispatch_messages,
+                had_tool_side_effect=state.tool_executed,
+            )
         except Exception as e:
             if _as_model_response_idle_timeout(e) is not None:
                 logger.error(
@@ -252,7 +268,17 @@ async def call_llm(
                 await record_token_usage(state.agent_id, state.unsaved_usage)
             await state.client_guard.close()
             _call_llm_log_turn_timing(state, "call_error", round_i + 1)
-            return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
+            return make_llm_failure(
+                code="model_turn_failed",
+                message_key="errors.modelTurnFailed",
+                details=_llm_failure_details(
+                    model=state.model,
+                    round_number=round_i + 1,
+                    error=e,
+                    messages=dispatch_messages,
+                    had_tool_side_effect=state.tool_executed,
+                ),
+            )
 
         if round_outcome.complete_response_content and round_outcome.complete_response_content.strip():
             state.visible_response_segments.append(round_outcome.complete_response_content)
@@ -268,7 +294,11 @@ async def call_llm(
             if plain_text_result.advance_round:
                 skip_before_round_once = plain_text_result.skip_before_round_once
                 continue
-            return plain_text_result.result or "[LLM returned empty content]"
+            return plain_text_result.result or make_llm_failure(
+                code="empty_model_response",
+                message_key="errors.emptyModelResponse",
+                details={"round": round_i + 1},
+            )
 
         tool_round_result = await _call_llm_execute_tool_round(
             state,
@@ -283,4 +313,8 @@ async def call_llm(
         await record_token_usage(state.agent_id, state.unsaved_usage)
     await state.client_guard.close()
     _call_llm_log_turn_timing(state, "round_limit", state.max_tool_rounds)
-    return "[Error] Too many tool call rounds"
+    return make_llm_failure(
+        code="tool_round_limit",
+        message_key="errors.toolRoundLimit",
+        details={"round": state.max_tool_rounds},
+    )

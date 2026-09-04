@@ -655,6 +655,7 @@ async def teams_event_webhook(
                     db, agent_id, user_text,
                     history=history, user_id=platform_user_id, session_id=session_conv_id,
                     on_thinking=_collect_thinking,
+                    on_status=_thinking_sender.push_status,
                     turn_anchor_id=ingested.message.id,
                 )
                 logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")

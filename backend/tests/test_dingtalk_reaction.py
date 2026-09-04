@@ -34,6 +34,24 @@ async def test_durable_cleanup_does_not_accept_only_wrong_reaction_success(
 
 
 @pytest.mark.asyncio
+async def test_durable_cleanup_includes_each_rate_limit_status(monkeypatch):
+    recalled: set[str] = set()
+
+    async def fake_post_reaction(**kwargs) -> bool:
+        recalled.add(kwargs["reaction_name"])
+        return True
+
+    monkeypatch.setattr(dingtalk_reaction, "_post_reaction", fake_post_reaction)
+    assert await dingtalk_reaction.cleanup_durable_progress_reactions(
+        "robot",
+        "secret",
+        "provider-message",
+        "provider-conversation",
+    ) is True
+    assert set(dingtalk_reaction._RATE_LIMIT_REACTIONS) <= recalled
+
+
+@pytest.mark.asyncio
 async def test_healthy_dingtalk_terminal_uses_one_live_recall_then_acks_marker(
     monkeypatch,
 ):
@@ -170,4 +188,38 @@ async def test_dingtalk_reaction_controller_allows_first_tool_switch_with_min_in
         ("recall", "🤔思考中"),
         ("attach", "📂"),
         ("recall", "📂"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_retry_status_updates_each_attempt_despite_switch_interval():
+    calls: list[tuple[str, str]] = []
+
+    async def attach(reaction: str) -> bool:
+        calls.append(("attach", reaction))
+        return True
+
+    async def recall(reaction: str) -> bool:
+        calls.append(("recall", reaction))
+        return True
+
+    controller = DingTalkReactionController(
+        attach_reaction=attach,
+        recall_reaction=recall,
+        min_switch_interval_seconds=60,
+        heartbeat_enabled=False,
+    )
+
+    await controller.on_consume()
+    await controller.on_status("限流重试 1/5（1秒）")
+    await controller.on_status("限流重试 2/5（2秒）")
+    await controller.on_complete("answer")
+
+    assert calls == [
+        ("attach", "🤔思考中"),
+        ("recall", "🤔思考中"),
+        ("attach", "限流重试 1/5（1秒）"),
+        ("recall", "限流重试 1/5（1秒）"),
+        ("attach", "限流重试 2/5（2秒）"),
+        ("recall", "限流重试 2/5（2秒）"),
     ]

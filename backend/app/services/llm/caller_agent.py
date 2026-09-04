@@ -15,6 +15,7 @@ async def call_agent_llm(
     session_id: str = "",
     on_chunk=None,
     on_thinking=None,
+    on_status=None,
 ) -> str:
     """Call the agent's LLM with automatic failover support."""
     from app.core.permissions import is_agent_expired
@@ -60,6 +61,7 @@ async def call_agent_llm(
             session_id=session_id,
             on_chunk=on_chunk,
             on_thinking=on_thinking,
+            on_status=on_status,
             turn_anchor_id=None,
         )
         return reply
@@ -81,6 +83,7 @@ async def call_agent_llm_with_tools(
     model_override_id: uuid.UUID | str | None = None,
     temperature_override: float | None = None,
     reasoning_effort_override: str | None = None,
+    on_status=None,
 ) -> str:
     """Call agent LLM with tool-calling loop (for background services)."""
     from app.models.agent import Agent
@@ -162,13 +165,15 @@ async def call_agent_llm_with_tools(
     # each. ``expire_on_commit=False`` keeps the loaded agent/model values usable.
     await db.commit()
 
-    async def _try_model(model) -> tuple[str, bool, bool]:
+    async def _try_model(model, *, allow_provider_retries: bool = True) -> tuple[str, bool, bool]:
         """Try to complete with a model. Returns (response, success, tool_executed)."""
         _accumulated_usage = TokenUsage()
         _unsaved_usage = TokenUsage()
         tool_executed = False
         visible_response_segments: list[str] = []
         client_guard: LLMClientCloseGuard | None = None
+        api_messages = list(messages)
+        current_round = 1
         try:
             client = create_llm_client(
                 provider=model.provider,
@@ -183,10 +188,10 @@ async def call_agent_llm_with_tools(
             max_tokens = get_max_tokens(model.provider, model.model, getattr(model, "max_output_tokens", None))
 
             # Tool-calling loop
-            api_messages = list(messages)
-            # Repeated tool-call guard state: per-signature consecutive-round streaks.
-            _repeat_streaks: dict[tuple[str, str], int] = {}
+            _tool_round_history: list[tuple[tuple[tuple[str, str], str], ...]] = []
+            _invalid_tool_call_retries = 0
             for round_i in range(max_rounds):
+                current_round = round_i + 1
                 # Check token usage limit mid-loop (every 3 rounds)
                 if round_i > 0 and round_i % 3 == 0:
                     if agent_id and _unsaved_usage.total_tokens > 0:
@@ -223,6 +228,8 @@ async def call_agent_llm_with_tools(
                         temperature=model.temperature,
                         reasoning_effort=getattr(model, "reasoning_effort", None),
                         max_tokens=max_tokens,
+                        on_status=on_status,
+                        allow_retries=allow_provider_retries,
                     )
                 except Exception as e:
                     logger.error(f"[call_agent_llm_with_tools] Agent {agent_id}: LLM call error: {e}")
@@ -255,8 +262,23 @@ async def call_agent_llm_with_tools(
                 # (mirrors the streaming path's behavior in the main _try_model).
                 sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
                 if retry_instruction:
+                    if _invalid_tool_call_retries >= 1:
+                        if agent_id and _unsaved_usage.total_tokens > 0:
+                            await record_token_usage(agent_id, _unsaved_usage)
+                        await client_guard.close()
+                        return (
+                            make_llm_failure(
+                                code="invalid_tool_call_stream",
+                                message_key="errors.invalidToolCallStream",
+                                details={"round": round_i + 1},
+                            ),
+                            False,
+                            tool_executed,
+                        )
+                    _invalid_tool_call_retries += 1
                     api_messages.append(LLMMessage(role="user", content=retry_instruction))
                     continue
+                _invalid_tool_call_retries = 0
 
                 # request_confirmation handling (twin of the main call_llm loop):
                 # valid → SUSPEND the turn on this tool_call (pending row + card; resumed on
@@ -327,22 +349,24 @@ async def call_agent_llm_with_tools(
                         )
                         continue
 
-                # Repeated tool-call guard (twin of the streaming call_llm loop).
-                # Stop before re-issuing the identical call for the Nth
-                # consecutive round so the provider never 400s on "Repetitive
-                # tool calls detected" and crashes this turn.
-                _round_sigs = [_tool_call_signature(tc) for tc in (sanitized_tool_calls or [])]
-                _repeat_streaks = _update_repeat_streaks(_repeat_streaks, _round_sigs)
-                _max_repeat = max(_repeat_streaks.values(), default=0)
-                if _max_repeat >= REPEAT_TOOL_CALL_BREAK:
+                repeat_period = _repeating_tool_period(_tool_round_history, sanitized_tool_calls)
+                if repeat_period is not None:
                     logger.warning(
                         f"[call_agent_llm_with_tools] Repeated tool-call guard tripped "
-                        f"(streak={_max_repeat}, round {round_i + 1}, agent={agent_id})."
+                        f"(period={repeat_period}, round {round_i + 1}, agent={agent_id})."
                     )
                     if agent_id and _unsaved_usage.total_tokens > 0:
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client_guard.close()
-                    return REPEAT_TOOL_CALL_BREAK_MESSAGE, True, tool_executed
+                    return (
+                        make_llm_failure(
+                            code=f"tool_loop_period_{repeat_period}",
+                            message_key="errors.toolLoopStopped",
+                            details={"period": repeat_period, "round": round_i + 1},
+                        ),
+                        True,
+                        tool_executed,
+                    )
 
                 # Only this newly appended round may be materialized. Earlier
                 # rounds were already dispatched and are an immutable cache
@@ -362,6 +386,7 @@ async def call_agent_llm_with_tools(
                     )
                 )
 
+                round_results: list[Any] = []
                 for tc in sanitized_tool_calls or []:
                     args = _canonicalize_tc_arguments(tc, session_id)
                     tool_name = tc["function"]["name"]
@@ -393,6 +418,7 @@ async def call_agent_llm_with_tools(
                         session_id=session_id,
                         tool_call_id=str(tc.get("id") or ""),
                     )
+                    round_results.append(llm_view)
                     api_messages.append(
                         LLMMessage(
                             role="tool",
@@ -401,23 +427,42 @@ async def call_agent_llm_with_tools(
                         )
                     )
 
-                await enforce_message_budget(
+                rewrites = await enforce_message_budget(
                     api_messages,
                     fresh_start_idx=fresh_start,
                     agent_id=agent_id,
                     session_id=session_id,
                 )
+                rewritten_results = {
+                    rewrite.tool_call_id: rewrite.final_content for rewrite in rewrites
+                }
+                round_results = [
+                    rewritten_results.get(str(tc.get("id") or ""), result)
+                    for tc, result in zip(
+                        sanitized_tool_calls or [],
+                        round_results,
+                        strict=True,
+                    )
+                ]
 
-                # Repeated tool-call nudge (2nd identical round): one corrective
-                # message so the model can change approach or answer before the
-                # guard above hard-stops it on the 3rd.
-                if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
+                observation = _tool_round_observation(sanitized_tool_calls or [], round_results)
+                if observation:
+                    _tool_round_history = [*_tool_round_history, observation][-6:]
+                if _repeating_tool_period(_tool_round_history) is not None:
                     api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client_guard.close()
-            return "[Error] Too many tool call rounds", False, tool_executed
+            return (
+                make_llm_failure(
+                    code="tool_round_limit",
+                    message_key="errors.toolRoundLimit",
+                    details={"round": max_rounds},
+                ),
+                False,
+                tool_executed,
+            )
 
         except Exception as e:
             if agent_id and _unsaved_usage.total_tokens > 0:
@@ -426,7 +471,33 @@ async def call_agent_llm_with_tools(
                 await client_guard.close()
             if _as_model_response_idle_timeout(e) is not None:
                 return model_response_idle_timeout_failure(), False, tool_executed
-            return f"[Error] {e}", False, tool_executed
+            if isinstance(e, LLMError):
+                return (
+                    _provider_failure_outcome(
+                        model=model,
+                        round_number=current_round,
+                        error=e,
+                        messages=api_messages,
+                        had_tool_side_effect=tool_executed,
+                    ),
+                    False,
+                    tool_executed,
+                )
+            return (
+                make_llm_failure(
+                    code="model_turn_failed",
+                    message_key="errors.modelTurnFailed",
+                    details=_llm_failure_details(
+                        model=model,
+                        round_number=current_round,
+                        error=e,
+                        messages=api_messages,
+                        had_tool_side_effect=tool_executed,
+                    ),
+                ),
+                False,
+                tool_executed,
+            )
 
     # Try primary model
     reply, success, primary_tool_executed = await _try_model(primary_model)
@@ -446,11 +517,16 @@ async def call_agent_llm_with_tools(
 
     # Try fallback model
     logger.info(f"[call_agent_llm_with_tools] Retrying with fallback: {fallback_model.model}")
-    reply2, success2, _fallback_tool_executed = await _try_model(fallback_model)
+    reply2, success2, _fallback_tool_executed = await _try_model(
+        fallback_model,
+        allow_provider_retries=False,
+    )
     if success2:
         return reply2
 
     if reply == PROVIDER_CONTEXT_BLOCKED_MESSAGE and reply2 == PROVIDER_CONTEXT_BLOCKED_MESSAGE:
         return PROVIDER_CONTEXT_BLOCKED_MESSAGE
 
+    if isinstance(reply2, LLMFailure):
+        return _combined_model_failure(reply, reply2)
     return f"⚠️ Both models failed | Primary: {reply[:80]} | Fallback: {reply2[:80]}"

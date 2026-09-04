@@ -145,6 +145,16 @@ class BufferedIMThinkingSender:
         if should_schedule:
             self._schedule_flush()
 
+    async def push_status(self, status: dict[str, Any]) -> None:
+        """Deliver mandatory system status through the existing hidden progress lane."""
+        content = str(status.get("content") or "").strip()
+        if not content:
+            return
+        try:
+            await self.send_text(content)
+        except Exception as exc:  # noqa: BLE001 - status delivery is best-effort
+            logger.warning(f"[im_thinking_output] status send failed (ignored): {exc}")
+
     async def flush(self) -> None:
         task = self._flush_task
         if task is not None and not task.done() and task is not asyncio.current_task():

@@ -286,9 +286,10 @@ async def persist_assistant_reply_row(
     turn_terminal_status: str = "completed",
 ) -> uuid.UUID:
     """Persist a non-empty assistant reply in the caller's transaction."""
-    from app.services.llm.failure_outcome import llm_failure_code
+    from app.services.llm.failure_outcome import llm_failure_code, llm_failure_meta
 
     failure_code = llm_failure_code(content)
+    failure_meta = llm_failure_meta(content)
     if failure_code and turn_terminal_status == "completed":
         turn_terminal_status = "failed"
     content = sanitize_user_visible_text(content or "")
@@ -304,7 +305,7 @@ async def persist_assistant_reply_row(
         )
     final_meta = dict(message_meta or {})
     if failure_code:
-        final_meta["error_code"] = failure_code
+        final_meta.update(failure_meta)
     final_meta.setdefault("attachments", [])
     if turn_anchor_id is not None:
         if turn_terminal_status not in {"completed", "failed", "cancelled"}:

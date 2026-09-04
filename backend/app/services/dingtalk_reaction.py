@@ -18,6 +18,8 @@ from app.services.channel_reaction_recovery import (
     register_recovery_reaction_factory,
 )
 from app.services.dingtalk_token import dingtalk_token_manager
+from app.services.llm.failure_outcome import render_message
+from app.services.llm.provider_retry import RATE_LIMIT_RETRY_DELAYS
 
 REACTION_REPLY_URL = "https://api.dingtalk.com/v1.0/robot/emotion/reply"
 REACTION_RECALL_URL = "https://api.dingtalk.com/v1.0/robot/emotion/recall"
@@ -27,6 +29,14 @@ TEXT_EMOTION_BACKGROUND_ID = "im_bg_1"
 DEFAULT_THINKING_REACTION = "🤔思考中"
 HEARTBEAT_REACTION = "⏳"
 DEFAULT_TOOL_REACTION = "🛠️"
+_RATE_LIMIT_REACTIONS = tuple(
+    render_message("status.providerRateLimitRetry", "zh").format(
+        delay_seconds=delay,
+        retry_index=index,
+        max_retries=len(RATE_LIMIT_RETRY_DELAYS),
+    )
+    for index, delay in enumerate(RATE_LIMIT_RETRY_DELAYS, start=1)
+)
 DURABLE_PROGRESS_REACTIONS = (
     DEFAULT_THINKING_REACTION,
     HEARTBEAT_REACTION,
@@ -37,6 +47,7 @@ DURABLE_PROGRESS_REACTIONS = (
     "✍️",
     "🌐",
     "🔗",
+    *_RATE_LIMIT_REACTIONS,
 )
 DURABLE_REACTION_CLEANUP_TIMEOUT_SECONDS = 2.0
 
@@ -300,6 +311,10 @@ def make_dingtalk_reactions(
                 )
         return cleanup_completed
 
+    async def _status(status: dict) -> None:
+        content = str(status.get("content") or "").strip()
+        await controller.on_status(content)
+
     return ChannelReactions(
         on_recover=_recover if recover_existing else None,
         on_consume=controller.on_consume,
@@ -308,6 +323,7 @@ def make_dingtalk_reactions(
         bind_receipt_context=_bind_receipt_context,
         on_tool_call=controller.on_tool_call,
         on_thinking=controller.on_thinking,
+        on_status=_status,
     )
 
 
@@ -493,6 +509,10 @@ class DingTalkReactionController:
     async def on_thinking(self, _text: str) -> None:
         self._last_activity_at = time.monotonic()
         await self._switch(DEFAULT_THINKING_REACTION)
+
+    async def on_status(self, text: str) -> None:
+        self._last_activity_at = time.monotonic()
+        await self._switch(text or DEFAULT_THINKING_REACTION, force=True)
 
     async def on_complete(self, _reply: str) -> bool:
         return await self.dispose()

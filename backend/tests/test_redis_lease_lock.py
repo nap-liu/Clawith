@@ -389,6 +389,64 @@ async def test_release_transport_failure_is_retryable_and_does_not_claim_success
     assert redis.values == {}
 
 
+async def test_context_release_uncertainty_keeps_success_and_ttl_exclusion(monkeypatch) -> None:
+    redis = FakeRedis()
+
+    async def get_fake_redis():
+        return redis
+
+    monkeypatch.setattr(lease_module, "get_redis", get_fake_redis)
+    resource = "session-release-uncertain"
+    redis.fail_release = True
+
+    async with RedisLeaseLock(
+        resource,
+        ttl_seconds=0.08,
+        acquire_timeout_seconds=0.01,
+        retry_interval_seconds=0.002,
+        renew_interval_seconds=0.02,
+    ):
+        result = "completed once"
+
+    assert result == "completed once"
+    contender = RedisLeaseLock(
+        resource,
+        ttl_seconds=0.08,
+        acquire_timeout_seconds=0.01,
+        retry_interval_seconds=0.002,
+        renew_interval_seconds=0.02,
+    )
+    with pytest.raises(RedisLeaseBusyError):
+        await contender.acquire()
+
+    await asyncio.sleep(0.09)
+    redis.fail_release = False
+    await contender.acquire()
+    await contender.release()
+    assert redis.values == {}
+
+
+async def test_context_release_lost_still_fails_after_successful_body(monkeypatch) -> None:
+    redis = FakeRedis()
+
+    async def get_fake_redis():
+        return redis
+
+    monkeypatch.setattr(lease_module, "get_redis", get_fake_redis)
+    lock = RedisLeaseLock(
+        "session-release-lost",
+        ttl_seconds=1,
+        acquire_timeout_seconds=0.02,
+    )
+
+    with pytest.raises(RedisLeaseLostError):
+        async with lock:
+            redis.values[lock.key] = (
+                "replacement-owner",
+                asyncio.get_running_loop().time() + 1,
+            )
+
+
 async def test_redis_unavailable_does_not_fall_back_to_database(monkeypatch) -> None:
     async def unavailable_redis():
         raise ConnectionError("redis unavailable")

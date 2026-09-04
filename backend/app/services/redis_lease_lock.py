@@ -209,6 +209,13 @@ class RedisLeaseLock:
             if self._loss_error.__cause__ is None:
                 raise self._loss_error from exc
             raise self._loss_error
+        if isinstance(release_error, RedisLeaseUnavailableError) and exc_type is None:
+            logger.warning(
+                "Redis lease protected work completed but release is uncertain; "
+                "the existing TTL remains authoritative: {}",
+                release_error,
+            )
+            return False
         if release_error is not None and exc_type is None:
             raise release_error
         if release_error is not None:
