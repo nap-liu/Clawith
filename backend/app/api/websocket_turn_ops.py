@@ -113,7 +113,12 @@ async def execute_web_turn_impl(
                 message_id=terminal_message_id,
                 turn_anchor_id=turn_anchor_id,
                 turn_status=terminal_status,
-                complete_onboarding=(is_onboarding_trigger and produced_output and self.source_channel != "web"),
+                complete_onboarding=(
+                    is_onboarding_trigger
+                    and produced_output
+                    and turn_outcome not in {"failed", "aborted"}
+                    and self.source_channel != "web"
+                ),
             )
             turn_snapshot = await self._load_turn_snapshot(turn_anchor_id)
             await self._safe_send(

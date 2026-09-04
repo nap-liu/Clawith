@@ -443,7 +443,7 @@ async def run_llm_and_stream_impl(
 
         if isinstance(assistant_response, LLMFailure):
             assistant_response = localize_llm_failure(assistant_response, self.lang)
-            return assistant_response, thinking_content, queued_messages, "failed", bool(partial_chunks)
+            return assistant_response, thinking_content, queued_messages, "failed", True
         if self.client_disconnected:
             api.logger.info(
                 f"[WS] Client disconnected mid-turn — turn finished detached, "
@@ -677,6 +677,7 @@ async def save_assistant_reply_impl(
                 conversation_id=self.conv_id,
                 turn_anchor_id=turn_anchor_id,
                 content=assistant_response,
+                turn_terminal_status=turn_status,
             )
         else:
             intermediate_ids = []

@@ -357,7 +357,7 @@ async def update_llm_model(
             model.supports_vision = data.supports_vision
         if hasattr(data, 'max_output_tokens') and data.max_output_tokens is not None:
             model.max_output_tokens = data.max_output_tokens
-        if hasattr(data, 'request_timeout') and data.request_timeout is not None:
+        if "request_timeout" in data.model_fields_set:
             model.request_timeout = data.request_timeout
         if data.context_window is not None:
             model.context_window = data.context_window

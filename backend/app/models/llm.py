@@ -42,8 +42,8 @@ class LLMModel(Base):
     supports_vision: Mapped[bool] = mapped_column(Boolean, default=False)
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # Transport connection/pool timeout only. Model generation/read duration is
-    # never capped by the platform.
+    # Transport setup and consecutive response-read inactivity timeout. It is
+    # not a whole-turn or multi-round tool-loop deadline.
     request_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Per-model output token limit override
     # Total prompt-token capacity of this model (used by auto-compaction trigger).

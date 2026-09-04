@@ -384,6 +384,9 @@ async def _resume_origin_session_for_on_message(
                 origin_turn_anchor = await db.get(ChatMessage, origin_turn_anchor_id)
                 if origin_turn_anchor is None or origin_turn_anchor.conversation_id != str(origin.id):
                     raise RuntimeError("on_message origin turn anchor changed")
+                origin_turn_status = str((origin_turn_anchor.message_meta or {}).get("turn_status") or "")
+                if origin_turn_status in {"failed", "cancelled"}:
+                    raise RuntimeError(f"on_message origin turn ended as {origin_turn_status}")
                 completion_query = select(ChatMessage.id).where(
                     ChatMessage.conversation_id == str(origin.id),
                     ChatMessage.role == "assistant",

@@ -204,8 +204,9 @@ async def terminal_assistant_tail(
     conversation_id: str,
     turn_anchor_id: uuid.UUID,
     content: str,
+    turn_terminal_status: str,
 ) -> tuple[str, list[uuid.UUID]]:
-    """Remove already-durable intermediate segments from a terminal reply.
+    """Finalize intermediate segments and remove them from a terminal reply.
 
     ``call_llm`` still returns the complete visible A1+A2 value for transport.
     The final writer calls this helper so the terminal row stores only A2 and
@@ -234,6 +235,14 @@ async def terminal_assistant_tail(
     if not rows:
         return content, []
 
+    intermediate_ids = [row.id for row in rows]
+    if turn_terminal_status in {"failed", "cancelled"}:
+        for row in rows:
+            row.message_meta = {
+                **dict(row.message_meta or {}),
+                "turn_status": turn_terminal_status,
+            }
+
     prefix_parts: list[str] = []
     for row in rows:
         meta = dict(row.message_meta or {})
@@ -241,11 +250,12 @@ async def terminal_assistant_tail(
         prefix_parts.append(str(row.content or ""))
     prefix = "".join(prefix_parts)
     if not content.startswith(prefix):
-        logger.error(
-            "[chat_history] terminal reply does not match durable intermediate "
-            f"prefix anchor={turn_anchor_id}; refusing to split"
-        )
-        return content, []
+        if turn_terminal_status == "completed":
+            logger.error(
+                "[chat_history] terminal reply does not match durable intermediate "
+                f"prefix anchor={turn_anchor_id}; refusing to split"
+            )
+        return content, intermediate_ids
 
     tail = content[len(prefix) :]
     # Separate provider rounds are joined for external presentation only.  The
@@ -257,7 +267,7 @@ async def terminal_assistant_tail(
         tail = tail[2:]
     if not tail.strip():
         raise ValueError("terminal assistant tail must be non-empty")
-    return tail, [row.id for row in rows]
+    return tail, intermediate_ids
 
 
 async def persist_assistant_reply_row(
@@ -305,6 +315,7 @@ async def persist_assistant_reply_row(
             conversation_id=conversation_id,
             turn_anchor_id=turn_anchor_id,
             content=content,
+            turn_terminal_status=turn_terminal_status,
         )
         final_meta.update(
             {
@@ -428,11 +439,7 @@ async def persist_assistant_reply_and_complete_turn(
     thinking: str | None = None,
     message_meta: dict[str, Any] | None = None,
 ) -> uuid.UUID:
-    """Persist final assistant reply.
-
-    Completion is represented by the assistant row itself. ``turn_anchor_id`` is
-    accepted for older callers but no longer persists turn state.
-    """
+    """Persist a final assistant reply and its durable Turn terminal state."""
     row_id = await persist_assistant_reply(
         db_session_factory,
         agent_id=agent_id,
