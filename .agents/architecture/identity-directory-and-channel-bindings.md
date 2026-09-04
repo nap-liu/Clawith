@@ -534,8 +534,9 @@ authorization 等凭据字段，样本值必须有长度上限且只短期缓存
 - `password_login_enabled`：关闭后，后端密码登录接口直接拒绝，登录页隐藏账号密码
   表单与忘记密码入口；已启用的 SSO 登录不受影响。
 - `account_registration_enabled`：关闭后，后端自助注册接口直接拒绝，登录页隐藏注册
-  入口；现有 PlatformUser 登录不受影响。SSO 回调允许已有用户登录，但不得 JIT
-  创建新的 PlatformUser/tenant membership。
+  入口；现有 PlatformUser 登录不受影响。由租户已启用 ProviderConnection 返回 fresh
+  claims 的 SSO 登录属于可信企业身份接入，仍允许 JIT 创建 PlatformUser 和当前租户
+  membership，不得被公共自助注册开关误伤。
 
 前端隐藏只用于产品表现，后端开关才是授权边界。两个开关是平台级全局配置，不允许
 provider 或 tenant 绕过；管理员创建/邀请成员属于管理操作，继续由其独立权限与策略

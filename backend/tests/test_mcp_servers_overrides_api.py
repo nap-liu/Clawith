@@ -6,15 +6,17 @@ ACL matrix:
 - PUT/DELETE /overrides/agent/{agent_id} → platform_admin OR agent's creator
 """
 import uuid
+
 import pytest
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+
+from app.core.security import create_access_token
 from app.database import async_session, engine
-from app.models.user import User, Identity
-from app.models.tenant import Tenant
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer, MCPServerOverride
-from app.core.security import create_access_token
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
 
 pytestmark = pytest.mark.asyncio
 
@@ -111,26 +113,36 @@ async def test_get_overrides_returns_grouped(client):
 
 async def test_put_tenant_override_creates_then_updates(client):
     srv = await _make_server()
-    user, admin_token = await _make_user("platform_admin")
+    _, admin_token = await _make_user("platform_admin")
     t_id = uuid.uuid4()
     # PUT (create)
     r = await client.put(
         f"/api/admin/mcp-servers/{srv.id}/overrides/tenant/{t_id}",
-        json={"system_prompt_block": "TENANT-BLOCK"},
+        json={
+            "system_prompt_block": "TENANT-BLOCK",
+            "env_template": {"ACCESS_TOKEN": "override-secret", "MODE": "safe"},
+        },
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert r.status_code == 200
     assert r.json()["system_prompt_block"] == "TENANT-BLOCK"
+    assert r.json()["env_template"] == {"ACCESS_TOKEN": "***", "MODE": "safe"}
 
     # PUT (update — same scope_id) is idempotent upsert
     r2 = await client.put(
         f"/api/admin/mcp-servers/{srv.id}/overrides/tenant/{t_id}",
-        json={"system_prompt_block": "TENANT-BLOCK-V2"},
+        json={
+            "system_prompt_block": "TENANT-BLOCK-V2",
+            "env_template": {"ACCESS_TOKEN": "***", "MODE": "safe"},
+        },
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert r2.status_code == 200
     assert r2.json()["system_prompt_block"] == "TENANT-BLOCK-V2"
     assert r2.json()["id"] == r.json()["id"]  # same row, not a new one
+    async with async_session() as db:
+        stored = await db.get(MCPServerOverride, uuid.UUID(r.json()["id"]))
+        assert stored.env_template["ACCESS_TOKEN"] == "override-secret"
 
 
 async def test_put_tenant_override_requires_platform_or_matching_org_admin(client):

@@ -281,14 +281,9 @@ async def register_sso(
     This endpoint handles OAuth-based registration/login via external providers.
     """
     from app.services.auth_registry import auth_provider_registry
-    from app.services.platform_auth_policy import get_platform_auth_policy
     from app.services.registration_service import registration_service
 
     logger.info(f"[REGISTER_SSO] Starting SSO registration: provider={data.provider}")
-
-    registration_allowed = (
-        await get_platform_auth_policy(db)
-    ).account_registration_enabled
 
     # Get provider
     auth_provider = await auth_provider_registry.get_provider(db, data.provider)
@@ -302,10 +297,6 @@ async def register_sso(
 
     if error:
         raise HTTPException(status_code=400, detail=error)
-    if is_new and not registration_allowed:
-        await db.rollback()
-        raise HTTPException(status_code=403, detail="Account registration is disabled.")
-
     # If no tenant, check for email domain match
     if not user.tenant_id and user.email:
         tenant, _ = await registration_service.get_tenant_for_registration(

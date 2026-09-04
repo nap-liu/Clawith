@@ -647,12 +647,10 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
                     + json.dumps(committed, ensure_ascii=False, indent=2)
                 )
         else:
-            result = await _run_with_temp_workspace(
-                agent_id,
-                _agent_tenant_id,
-                lambda temp_ws: _execute_code(
+            async def run_code(workspace):
+                return await _execute_code(
                     agent_id,
-                    temp_ws,
+                    workspace,
                     arguments,
                     tool_name=tool_name,
                     user_id=user_id,
@@ -660,9 +658,21 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
                     turn_anchor_id=turn_anchor_id,
                     tools_for_llm=tools_for_llm,
                     on_output=on_output,
-                ),
-                sync_back=True,
-            )
+                )
+
+            if tool_name == "execute_code_aio":
+                # AIO executes against the Agent workspace bind-mounted at
+                # /data/agents. Materializing a second workspace here cannot
+                # participate in execution or capture its changes, and adds a
+                # full copy plus scan to every call.
+                result = await run_code(ws)
+            else:
+                result = await _run_with_temp_workspace(
+                    agent_id,
+                    _agent_tenant_id,
+                    run_code,
+                    sync_back=True,
+                )
     elif tool_name == "sql_execute":
         result = await _sql_execute(arguments)
     elif tool_name == "upload_image":

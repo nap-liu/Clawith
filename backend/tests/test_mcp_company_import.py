@@ -445,6 +445,15 @@ async def test_agent_tool_schema_tracks_group_and_local_display_names(client):
     assert listed_tool["mcp_server_display_name"] == "Renamed Knowledge Group"
     assert listed_tool["display_name"] == "Renamed Local Retrieval"
 
+    for suffix_path in ("", "/with-config"):
+        agent_tools = await client.get(
+            f"/api/tools/agents/{agent_id}{suffix_path}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert agent_tools.status_code == 200, agent_tools.text
+        agent_tool = next(item for item in agent_tools.json() if item["id"] == str(tool_id))
+        assert agent_tool["mcp_server_display_name"] == "Renamed Knowledge Group"
+
     second = await get_agent_tools_for_llm(agent_id)
     second_tool = next(item for item in second if item["function"]["name"] == stable_tool_name)
     assert "Renamed Knowledge Group" in second_tool["function"]["description"]

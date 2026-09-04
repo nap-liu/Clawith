@@ -8,12 +8,6 @@ from loguru import logger
 from sqlalchemy import String, cast, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.okr_feature import is_retired_okr_tool
-from app.core.security import get_current_user
-from app.database import get_db
-from app.models.tool import AgentTool, Tool
-from app.models.user import User
-
 from app.api.tools_models import AgentToolConfigUpdate, AgentToolUpdate, MCPTestRequest
 from app.api.tools_shared import (
     SUBAGENT_TOOL_NAMES,
@@ -33,6 +27,12 @@ from app.api.tools_shared import (
     router,
     tool_is_required,
 )
+from app.core.okr_feature import is_retired_okr_tool
+from app.core.security import get_current_user
+from app.database import get_db
+from app.models.tool import AgentTool, Tool
+from app.models.user import User
+from app.services.mcp_naming import load_mcp_display_names
 
 
 @router.get("/agents/{agent_id}")
@@ -64,6 +64,7 @@ async def get_agent_tools(
         .order_by(Tool.category, Tool.name)
     )
     all_tools = all_tools_r.scalars().all()
+    mcp_display_names = await load_mcp_display_names(db, all_tools)
 
     # ── Backfill: create missing AgentTool records ──────────────────────
     # For agents that already have at least one AgentTool assignment (i.e.
@@ -121,6 +122,7 @@ async def get_agent_tools(
             "enabled": enabled,
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
+            "mcp_server_display_name": mcp_display_names.get(t.mcp_server_id),
             "mcp_server_url": t.mcp_server_url,
             "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "source": t.source,
@@ -538,6 +540,7 @@ async def get_agent_tools_with_config(
         .order_by(Tool.category, Tool.name)
     )
     all_tools = all_tools_r.scalars().all()
+    mcp_display_names = await load_mcp_display_names(db, all_tools)
 
     # Pre-fetch system_settings keys that some tools use as an alternative
     # config storage (e.g. Jina stores its API key in system_settings.jina_api_key)
@@ -608,6 +611,7 @@ async def get_agent_tools_with_config(
             "enabled": enabled,
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
+            "mcp_server_display_name": mcp_display_names.get(t.mcp_server_id),
             "mcp_server_url": t.mcp_server_url,
             "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "config_schema": t.config_schema or {},

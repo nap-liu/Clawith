@@ -166,31 +166,26 @@ async def test_job_management_is_scoped_to_current_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_code_exec_passes_session_id(tmp_path):
-    """execute_tool's code-exec branch must forward its session_id.
-
-    Merge-interface notes:
-    - ensure_workspace was removed in the v1.10 storage refactor; the dispatch no
-      longer resolves a workspace directly. The _CODE_EXEC branch now wraps the
-      runner in _run_with_temp_workspace(...). We stub that wrapper so it just
-      invokes the runner with a tmp dir (its real contract: runner(temp.root)),
-      keeping the test off the DB/FS while still exercising the dispatch's
-      runner-construction — which is where session_id must be threaded.
-    """
+async def test_dispatch_aio_code_exec_uses_shared_workspace_without_materialization(tmp_path):
+    """AIO uses its shared mount and still forwards the current Session."""
     from app.services import agent_tools
+    from app.services import agent_tools_execute_tool_dispatch_basic as basic_dispatch
 
     captured = {}
+    captured_agent_id = uuid.uuid4()
 
     async def fake_execute_code(agent_id, ws, arguments, *, tool_name="", user_id=None, session_id=None, **kw):
         captured["session_id"] = session_id
+        captured["workspace"] = ws
         return "ok"
-
-    async def fake_run_with_temp_ws(agent_id, tenant_id, runner, *, paths=None, sync_back=False):
-        return await runner(tmp_path)
 
     with (
         patch.object(agent_tools, "_execute_code", new=fake_execute_code),
-        patch.object(agent_tools, "_run_with_temp_workspace", new=fake_run_with_temp_ws),
+        patch.object(
+            basic_dispatch,
+            "_run_with_temp_workspace",
+            new=AsyncMock(side_effect=AssertionError("AIO must not materialize a workspace")),
+        ) as materialize,
         patch.object(agent_tools, "_get_agent_tenant_id", new=AsyncMock(return_value=None)),
         # Keep the test off the DB: skip the autonomy check and activity log.
         patch.dict(agent_tools._TOOL_AUTONOMY_MAP, clear=True),
@@ -199,12 +194,53 @@ async def test_dispatch_code_exec_passes_session_id(tmp_path):
         await agent_tools.execute_tool(
             "execute_code_aio",
             {"language": "bash", "code": "echo hi"},
-            agent_id=uuid.uuid4(),
+            agent_id=captured_agent_id,
             user_id=uuid.uuid4(),
             session_id="conv-456",
         )
 
     assert captured.get("session_id") == "conv-456"
+    assert captured.get("workspace") == agent_tools._agent_workspace_root(captured_agent_id)
+    materialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_local_code_exec_keeps_temp_workspace(tmp_path):
+    """Local execution retains storage materialization and conflict-aware sync."""
+    from app.services import agent_tools
+    from app.services import agent_tools_execute_tool_dispatch_basic as basic_dispatch
+
+    captured = {}
+
+    async def fake_execute_code(agent_id, ws, arguments, *, tool_name="", **kw):
+        captured["workspace"] = ws
+        captured["tool_name"] = tool_name
+        return "ok"
+
+    async def fake_run_with_temp_ws(agent_id, tenant_id, runner, *, paths=None, sync_back=False):
+        captured["sync_back"] = sync_back
+        return await runner(tmp_path)
+
+    with (
+        patch.object(agent_tools, "_execute_code", new=fake_execute_code),
+        patch.object(basic_dispatch, "_run_with_temp_workspace", new=fake_run_with_temp_ws),
+        patch.object(agent_tools, "_get_agent_tenant_id", new=AsyncMock(return_value=None)),
+        patch.dict(agent_tools._TOOL_AUTONOMY_MAP, clear=True),
+        patch("app.services.activity_logger.log_activity", new=AsyncMock()),
+    ):
+        await agent_tools.execute_tool(
+            "execute_code",
+            {"language": "bash", "code": "echo hi"},
+            agent_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            session_id="conv-local",
+        )
+
+    assert captured == {
+        "workspace": tmp_path,
+        "tool_name": "execute_code",
+        "sync_back": True,
+    }
 
 
 @pytest.mark.asyncio

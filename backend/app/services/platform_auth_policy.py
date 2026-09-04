@@ -50,10 +50,16 @@ async def enforce_new_account_policy(db: AsyncSession, is_new: bool) -> None:
 
 
 async def enforce_sso_login_policy(db: AsyncSession, user, is_new: bool) -> None:
-    """Apply account-creation and active-principal gates to every SSO login."""
+    """Require an active principal without treating trusted SSO as self-signup.
+
+    Enterprise SSO JIT provisioning is scoped by an enabled tenant provider and
+    fresh provider claims.  The public self-registration switch therefore does
+    not control whether that trusted login may create its platform membership.
+    ``is_new`` remains in the signature for provider-call compatibility.
+    """
+    del is_new
     try:
         await require_active_authentication_principal(db, user)
     except HTTPException:
         await db.rollback()
         raise
-    await enforce_new_account_policy(db, is_new)

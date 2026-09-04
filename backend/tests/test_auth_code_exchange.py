@@ -12,6 +12,7 @@ from app.main import app
 from app.models.audit import AuditLog
 from app.models.identity import IdentityProvider, SSOScanSession
 from app.models.org import ChannelUserBinding, OrgMember
+from app.models.system_settings import SystemSetting
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.auth_code_exchange import validate_platform_login_channel
@@ -37,11 +38,21 @@ async def _isolate():
     auth_provider_registry.clear_all_cache()
     async with async_session() as db:
         await db.execute(delete(IdentityProvider))
+        await db.execute(
+            delete(SystemSetting).where(
+                SystemSetting.key == "account_registration_enabled"
+            )
+        )
         await db.commit()
     yield
     auth_provider_registry.clear_all_cache()
     async with async_session() as db:
         await db.execute(delete(IdentityProvider))
+        await db.execute(
+            delete(SystemSetting).where(
+                SystemSetting.key == "account_registration_enabled"
+            )
+        )
         await db.commit()
     await engine.dispose()
 
@@ -151,7 +162,11 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
             tenant_id=tenant.id,
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         )
-        db.add_all([provider, scan_session])
+        registration_setting = SystemSetting(
+            key="account_registration_enabled",
+            value={"enabled": False},
+        )
+        db.add_all([provider, scan_session, registration_setting])
         await db.commit()
         tenant_id = tenant.id
         scan_session_id = scan_session.id

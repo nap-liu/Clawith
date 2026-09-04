@@ -7,39 +7,13 @@ return the encrypted blob, never return the rendered cleartext.
 
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.services.mcp_secret_fields import mask_sensitive_headers
-
-# Regex for env key names that may contain secrets.
-# Values matching this pattern are masked UNLESS the value is a placeholder template.
-_SENSITIVE_ENV_KEY = re.compile(r"(?i)(TOKEN|KEY|SECRET|PASSWORD|AUTH|CREDENTIAL)")
-
-
-def _mask_env(env: dict | None) -> dict | None:
-    """Return a copy of *env* with literal secrets masked to ``'***'``.
-
-    A value is masked when:
-    - Its key matches ``_SENSITIVE_ENV_KEY`` (case-insensitive), AND
-    - Its value does NOT contain ``'${'`` (i.e. it is not a placeholder template).
-
-    Placeholder values (e.g. ``'${agent.token}'``) and non-sensitive keys pass
-    through unchanged so the UI can display them for configuration purposes.
-    """
-    if env is None:
-        return None
-    result: dict = {}
-    for k, v in env.items():
-        if _SENSITIVE_ENV_KEY.search(k) and "${" not in str(v):
-            result[k] = "***"
-        else:
-            result[k] = v
-    return result
+from app.services.mcp_secret_fields import mask_sensitive_env, mask_sensitive_headers
 
 
 class MCPServerCreate(BaseModel):
@@ -173,7 +147,7 @@ class MCPServerOut(BaseModel):
             transport=getattr(server, "transport", "http") or "http",
             command_template=getattr(server, "command_template", None),
             args_template=getattr(server, "args_template", None),
-            env_template=_mask_env(getattr(server, "env_template", None)),
+            env_template=mask_sensitive_env(getattr(server, "env_template", None)),
         )
 
 
@@ -256,7 +230,7 @@ class MCPServerOverrideOut(BaseModel):
             updated_at=ovr.updated_at,
             command_template=getattr(ovr, "command_template", None),
             args_template=getattr(ovr, "args_template", None),
-            env_template=getattr(ovr, "env_template", None),
+            env_template=mask_sensitive_env(getattr(ovr, "env_template", None)),
         )
 
 

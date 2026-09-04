@@ -19,7 +19,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.mcp_server_import import router as import_router
-from app.api.mcp_server_updates import normalize_masked_header_update
+from app.api.mcp_server_updates import normalize_masked_secret_update
 from app.core.security import get_current_user, require_role
 from app.database import get_db
 from app.models.agent import Agent
@@ -180,8 +180,10 @@ async def update_mcp_server(
     await _assert_can_patch_server(current_user, srv, db)
 
     diff: dict[str, dict] = {}
-    update_data = normalize_masked_header_update(
-        payload.model_dump(exclude_unset=True), srv.headers_template
+    update_data = normalize_masked_secret_update(
+        payload.model_dump(exclude_unset=True),
+        srv.headers_template,
+        srv.env_template,
     )
 
     for field, new_value in update_data.items():
@@ -517,9 +519,10 @@ async def _upsert_override(
     # credential_template: None means "don't touch" (mirrors server PATCH semantics)
     if "credential_template" in update_data and update_data["credential_template"] is None:
         update_data.pop("credential_template")
-    update_data = normalize_masked_header_update(
+    update_data = normalize_masked_secret_update(
         update_data,
         existing.headers_template if existing is not None else None,
+        existing.env_template if existing is not None else None,
     )
 
     if existing is None:
