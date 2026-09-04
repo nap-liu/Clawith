@@ -395,7 +395,7 @@ async def _call_llm_dispatch_round_with_context_recovery(
                 messages=current_messages,
                 tools=state.tools_for_llm if state.tools_for_llm else None,
                 temperature=state.model.temperature,
-                reasoning_effort=state.model.reasoning_effort,
+                reasoning_effort=getattr(state.model, "reasoning_effort", None),
                 max_tokens=state.max_tokens,
                 on_chunk=_chunk,
                 on_tool_delta=_tool_delta,

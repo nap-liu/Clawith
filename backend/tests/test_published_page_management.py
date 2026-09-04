@@ -25,6 +25,7 @@ from tests.test_published_page_access import (
     Tenant,
     Tool,
     User,
+    _dispose_engine,  # noqa: F401 - expose imported autouse fixture to this module
     _list_page_access_requests,
     _list_published_pages,
     _make_restricted_page,

@@ -82,12 +82,19 @@ export default function PublishedPageFilters({
                 placeholder={t('publishedPages.filters.searchPlaceholder')}
                 aria-label={t('publishedPages.filters.searchAriaLabel')}
             />
-            <Button type="submit" variant="secondary">
-                {t('publishedPages.filters.searchAction')}
-            </Button>
-            <Button type="button" onClick={onReset} disabled={!hasActiveFilters}>
-                {t('publishedPages.filters.resetAction')}
-            </Button>
+            <div className="published-page-filters__actions">
+                <Button type="submit" variant="secondary">
+                    {t('publishedPages.filters.searchAction')}
+                </Button>
+                <Button
+                    className="published-page-filters__reset"
+                    type="button"
+                    onClick={onReset}
+                    disabled={!hasActiveFilters}
+                >
+                    {t('publishedPages.filters.resetAction')}
+                </Button>
+            </div>
         </form>
     );
 }

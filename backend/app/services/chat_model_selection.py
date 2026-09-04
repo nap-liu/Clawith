@@ -56,6 +56,13 @@ def validate_temperature(value: float | None) -> float | None:
     return normalized
 
 
+def _stored_reasoning_effort(value: object | None) -> str | None:
+    """Read nullable persisted effort without treating dynamic attributes as data."""
+    if not isinstance(value, str):
+        return None
+    return validate_reasoning_effort(value)
+
+
 def _runtime_snapshot(
     model: LLMModel | None,
     *,
@@ -74,7 +81,7 @@ def _runtime_snapshot(
     effective_reasoning_effort = (
         validate_reasoning_effort(override_reasoning_effort)
         if override_reasoning_effort is not None
-        else validate_reasoning_effort(getattr(agent, "reasoning_effort", None))
+        else _stored_reasoning_effort(getattr(agent, "reasoning_effort", None))
     )
     changes = {}
     if effective_temperature is not None:

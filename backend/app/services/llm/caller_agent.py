@@ -221,7 +221,7 @@ async def call_agent_llm_with_tools(
                         messages=api_messages,
                         tools=tools_for_llm if tools_for_llm else None,
                         temperature=model.temperature,
-                        reasoning_effort=model.reasoning_effort,
+                        reasoning_effort=getattr(model, "reasoning_effort", None),
                         max_tokens=max_tokens,
                     )
                 except Exception as e:

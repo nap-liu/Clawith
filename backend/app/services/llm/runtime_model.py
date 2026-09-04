@@ -50,7 +50,11 @@ class RuntimeLLMModel:
             enabled=model.enabled,
             supports_vision=model.supports_vision,
             temperature=model.temperature,
-            reasoning_effort=getattr(model, "reasoning_effort", None),
+            reasoning_effort=(
+                model.reasoning_effort
+                if isinstance(getattr(model, "reasoning_effort", None), str)
+                else None
+            ),
             request_timeout=model.request_timeout,
             max_output_tokens=model.max_output_tokens,
             context_window=model.context_window,

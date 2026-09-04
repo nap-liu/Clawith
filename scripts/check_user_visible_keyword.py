@@ -109,6 +109,11 @@ ALLOWANCES = (
         "The legacy rollback database role is an operator-only compatibility identifier.",
     ),
     _allow(
+        r"\.agents/(?:rules/release|runbooks/production_release)\.md",
+        rf"{_legacy}_DEPS_IMAGE",
+        "The dependency-carrier build argument is an operator-only image-build contract.",
+    ),
+    _allow(
         r"backend/app/config\.py",
         rf"(?:\.{_legacy}|postgresql\+asyncpg://{_legacy}:{_legacy}@[^\"]+/{_legacy}|{_legacy}_network)",
         "Filesystem, database credential defaults, and Docker network names are deployment identifiers.",
@@ -162,6 +167,11 @@ ALLOWANCES = (
         r"backend/app/services/redis_lease_lock\.py",
         rf"{_legacy}:",
         "Distributed lease keys retain their rolling-upgrade namespace.",
+    ),
+    _allow(
+        r"backend/app/services/provider_field_discovery\.py",
+        rf"{_legacy}:field-sample:oauth:",
+        "Provider discovery samples use an internal cross-process Redis namespace.",
     ),
     _allow(
         r"backend/app/services/sandbox/local/docker_backend\.py",

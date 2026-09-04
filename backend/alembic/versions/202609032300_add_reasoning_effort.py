@@ -5,6 +5,7 @@ Revises: cleanup_dingtalk_root
 """
 
 import sqlalchemy as sa
+
 from alembic import op
 
 
