@@ -457,10 +457,9 @@ export default function AwareConfigDrawer({
                     </>
                 )}
                 {resource.type === 'on_message' && (
-                    <div className="aware-config-readonly">
-                        <small>{t(draft.sourceUserId ? 'agent.aware.workspace.config.fromUser' : 'agent.aware.workspace.config.fromAgent')}</small>
-                        <strong>{messageSourceName || t('agent.aware.workspace.config.sourceUnavailable')}</strong>
-                    </div>
+                    <Field label={t(draft.sourceUserId ? 'agent.aware.workspace.config.fromUser' : 'agent.aware.workspace.config.fromAgent')}>
+                        <div className="aware-config-value">{messageSourceName || t('agent.aware.workspace.config.sourceUnavailable')}</div>
+                    </Field>
                 )}
                 {resource.type === 'webhook' && (
                     <Field label={t('agent.aware.workspace.config.webhookMode')} hint={t('agent.aware.workspace.config.webhookPrivate')}>
@@ -468,12 +467,12 @@ export default function AwareConfigDrawer({
                     </Field>
                 )}
                 <div className="aware-config-grid">
-                    <Field label={t('agent.aware.workspace.config.maxFires')} hint={resource.max_fires == null ? t('agent.aware.workspace.config.unlimited') : t('agent.aware.workspace.config.cannotClear')} error={fieldErrors.maxFires}>
+                    <Field label={t('agent.aware.workspace.config.maxFires')} error={fieldErrors.maxFires}>
                         {textInput('maxFires', 'number', { min: 1 })}
                     </Field>
                     <Field label={t('agent.aware.workspace.config.cooldown')} error={fieldErrors.cooldownSeconds}>{textInput('cooldownSeconds', 'number', { min: 0, required: true })}</Field>
                 </div>
-                <Field label={t('agent.aware.workspace.config.expiresAt')} hint={resource.expires_at ? t('agent.aware.workspace.config.cannotClear') : t('agent.aware.workspace.config.noExpiry')} error={fieldErrors.expiresAt}>
+                <Field label={t('agent.aware.workspace.config.expiresAt')} error={fieldErrors.expiresAt}>
                     {textInput('expiresAt', 'datetime-local', { step: 0.001 })}
                 </Field>
             </>
@@ -483,8 +482,8 @@ export default function AwareConfigDrawer({
     const renderBusiness = () => (
         <div className="aware-config-form">
             {(type === 'trigger' || type === 'schedule') && (
-                <div className="aware-config-switch-row">
-                    <span>{t(type === 'trigger' ? 'agent.aware.workspace.config.triggerEnabled' : 'agent.aware.workspace.config.scheduleEnabled')}</span>
+                <div className="aware-config-toggle-field">
+                    <span className="aware-config-label">{t(type === 'trigger' ? 'agent.aware.workspace.config.triggerEnabled' : 'agent.aware.workspace.config.scheduleEnabled')}</span>
                     <ToggleSwitch checked={draft.enabled} onChange={(value) => set('enabled', value)} disabled={!canEdit} ariaLabel={t('agent.aware.workspace.config.enabledAria')} />
                 </div>
             )}
@@ -669,9 +668,12 @@ export default function AwareConfigDrawer({
                 {tab === 'business' && renderBusiness()}
                 {tab === 'identity' && (
                     <div className="aware-config-form">
-                        <div className="aware-config-assignee">
-                            <span><small>{t('agent.aware.executionIdentity.runsAs')}</small><strong>{executionName}</strong></span>
-                            <Button variant="secondary" disabled={!canReassign} onClick={() => onChooseIdentity(type, resource)}>{t('agent.aware.workspace.config.changeExecutor')}</Button>
+                        <div className="aware-config-field">
+                            <span className="aware-config-label">{t('agent.aware.executionIdentity.runsAs')}</span>
+                            <div className="aware-config-assignee">
+                                <strong>{executionName}</strong>
+                                <Button variant="secondary" disabled={!canReassign} onClick={() => onChooseIdentity(type, resource)}>{t('agent.aware.workspace.config.changeExecutor')}</Button>
+                            </div>
                         </div>
                     </div>
                 )}
