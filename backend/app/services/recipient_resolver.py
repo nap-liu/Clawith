@@ -132,6 +132,16 @@ class ResolvedHumanRoute(ResolvedHumanRecipient):
 
 
 @dataclass(frozen=True)
+class ResolvedGroupMentionRecipient:
+    """Active tenant user and provider endpoint for an exact group mention."""
+
+    source_agent: Agent
+    user: User
+    member: OrgMember
+    channel: str
+
+
+@dataclass(frozen=True)
 class HumanRecipientProfile:
     """Canonical relationship discovery data with executable route choices."""
 
@@ -254,11 +264,11 @@ async def resolve_agent_recipient(
     return ResolvedAgentRecipient(source, target, relationship)
 
 
-async def _active_human_rows(
+async def _load_active_tenant_user(
     db: AsyncSession,
     source: Agent,
     user_id: uuid.UUID,
-) -> tuple[User, AgentRelationship]:
+) -> User:
     user_result = await db.execute(
         select(User).where(
             User.id == user_id,
@@ -272,6 +282,15 @@ async def _active_human_rows(
             "recipient_not_found",
             "user_id does not identify an active user in the source agent tenant",
         )
+    return user
+
+
+async def _active_human_rows(
+    db: AsyncSession,
+    source: Agent,
+    user_id: uuid.UUID,
+) -> tuple[User, AgentRelationship]:
+    user = await _load_active_tenant_user(db, source, user_id)
 
     result = await db.execute(
         select(AgentRelationship).where(
@@ -368,6 +387,49 @@ async def resolve_human_channel_recipient(
         )
     source = await _load_source_agent(db, source_agent_id)
     user, relationship = await _active_human_rows(db, source, canonical_id)
+    member, provider_type = await _resolve_human_channel_endpoint(
+        db,
+        source,
+        user,
+        requested_channel=requested_channel,
+    )
+    return ResolvedHumanRoute(source, user, relationship, member, provider_type)
+
+
+async def resolve_group_mention_recipient(
+    db: AsyncSession,
+    source_agent_id: uuid.UUID,
+    user_id: object,
+) -> ResolvedGroupMentionRecipient:
+    """Resolve an active DingTalk identity without requiring a contact edge.
+
+    The exact group Session authorizes the destination. Mention targets remain
+    tenant-, provider-, installation-, and active-status scoped, but an
+    Agent-to-human relationship is not a prerequisite for addressing a member
+    already represented by the tenant directory and channel binding.
+    """
+
+    canonical_id = parse_canonical_id(user_id, "user_id")
+    source = await _load_source_agent(db, source_agent_id)
+    user = await _load_active_tenant_user(db, source, canonical_id)
+    member, provider_type = await _resolve_human_channel_endpoint(
+        db,
+        source,
+        user,
+        requested_channel="dingtalk",
+    )
+    return ResolvedGroupMentionRecipient(source, user, member, provider_type)
+
+
+async def _resolve_human_channel_endpoint(
+    db: AsyncSession,
+    source: Agent,
+    user: User,
+    *,
+    requested_channel: str | None,
+) -> tuple[OrgMember, str]:
+    """Select one executable provider endpoint after caller authorization."""
+
     config_query = select(ChannelConfig).where(
         ChannelConfig.agent_id == source.id,
         ChannelConfig.is_configured.is_(True),
@@ -385,7 +447,7 @@ async def resolve_human_channel_recipient(
         config_query = config_query.where(ChannelConfig.channel_type == config_type)
     configs = (await db.execute(config_query)).scalars().all()
 
-    routed: list[tuple[AgentRelationship, OrgMember, str]] = []
+    routed: list[tuple[OrgMember, str]] = []
     for config in configs:
         normalized_channel = _normalize_channel(config.channel_type)
         if normalized_channel in {None, "web", "platform"}:
@@ -475,10 +537,10 @@ async def resolve_human_channel_recipient(
         if member_ids:
             member = await db.get(OrgMember, next(iter(member_ids)))
             if member is not None:
-                routed.append((relationship, member, normalized_channel))
-    available = sorted({row[2] for row in routed if row[2]})
+                routed.append((member, normalized_channel))
+    available = sorted({row[1] for row in routed if row[1]})
     if requested_channel:
-        routed = [row for row in routed if row[2] == requested_channel]
+        routed = [row for row in routed if row[1] == requested_channel]
         if not routed:
             raise RecipientResolutionError(
                 "channel_unavailable",
@@ -497,9 +559,9 @@ async def resolve_human_channel_recipient(
             "More than one active route is available; provide channel explicitly or repair duplicate bindings",
             available_channels=available,
         )
-    relationship, member, provider_type = routed[0]
+    member, provider_type = routed[0]
     assert provider_type is not None
-    return ResolvedHumanRoute(source, user, relationship, member, provider_type)
+    return member, provider_type
 
 
 async def list_human_recipient_channels(
