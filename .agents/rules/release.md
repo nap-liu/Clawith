@@ -16,6 +16,11 @@ the runbook.
   semantic version.
 - Build and publish backend and frontend from the same immutable release SHA,
   even when only one side changed. Pin deployment and rollback to digests.
+- Select Docker validation from the final diff and affected behavior, including
+  callers and compatibility boundaries. Full test suites are not the default
+  release gate; broaden only for demonstrated wider impact, unresolved affected
+  failures, or an explicit user request. Record scope, evidence, and omissions
+  under the runbook's release-candidate gates.
 - Build production images for `linux/amd64`. Rebuild AIO only when its source or
   base image changed or the user explicitly requests it.
 - For a backend code-only release, reuse the previous trusted backend image by

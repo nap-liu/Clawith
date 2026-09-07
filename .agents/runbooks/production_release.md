@@ -76,24 +76,40 @@ this runbook.
 All validation runs in Docker against the exact release checkout and isolated
 state. Production is not a development test target.
 
-Required evidence:
+Select validation from the final diff and its affected callers and contracts.
+Run affected tests by default; the full backend or frontend suite is not a
+routine release gate. Broaden only for demonstrated wider impact (such as
+shared dependency or contract changes), unresolved affected failures, or an
+explicit user request. Record the reason before broadening.
 
-1. `git diff --check`, clean worktree, and final diff review;
-2. migrations from the current production parent to head on an isolated
-   PostgreSQL database plus a production-schema-derived copy;
-3. backend compile/import checks and the full backend test suite;
-4. frontend prebuild checks, TypeScript, and production build;
+Required evidence, with applicability recorded for each conditional gate:
+
+1. `git diff --check`, clean worktree, final diff review, and the 800-line gate;
+2. a mapping of changed behavior to affected API, database, event, IM-adapter,
+   or browser tests, with their Docker results;
+3. compile/import checks for affected backend modules;
+4. frontend prebuild, TypeScript, and behavior checks when frontend code or its
+   contracts change; both immutable production images still build under section 4;
 5. user-visible wording/i18n checks;
-6. focused API, database, event, IM-adapter, and browser behavior for the change;
-7. local port-3008 validation for UI/cross-layer changes;
-8. rendered `frontend/nginx.conf.template` validation when proxy, WebSocket,
+6. local port-3008 validation for UI/cross-layer changes;
+7. rendered `frontend/nginx.conf.template` validation when proxy, WebSocket,
    uploads, object storage, or MCP routing is in scope;
-9. tenant/ownership isolation tests for every changed query or capability;
-10. previous-image compatibility against the migrated schema;
-11. rollback helper drills for new seeded tools or compatibility boundaries.
+8. tenant/ownership isolation tests when queries or authorization boundaries change;
+9. migrations from the current production parent to head on isolated PostgreSQL
+   and a production-schema-derived copy when schema/migrations change, plus
+   previous-image compatibility against the migrated schema;
+10. rollback helper drills when seeds or compatibility boundaries change.
 
-Record exact commands, pass/fail counts, skipped tests, and baseline comparison.
-Never report a suite as green when it has failures. Raw `Traceback` text alone
+A code-only adapter hotfix with unchanged schema, seeds, dependencies, and UI
+does not require migration drills, a production-schema copy, browser checks, or
+unrelated full suites. The unchanged surfaces and omission reasons must be
+explicit in its release record.
+
+Record exact commands, pass/fail counts, skipped and unrun checks, and any
+interrupted attempts. Compare failing affected checks against the same checks
+on the parent; unrelated failures do not require a full baseline rerun or
+automatically block a bounded release. Never report a failing or interrupted
+suite as green. Raw `Traceback` text alone
 is not a health signal; use startup completion, health, precise errors, and
 observable behavior.
 

@@ -59,11 +59,17 @@ authorized implementation task.
 - Use the exact checkout mounted into one-shot containers and an isolated
   PostgreSQL database. Follow `.agents/rules/deploy.md` and
   `.agents/architecture/environments-and-operations.md`.
-- Start focused observable tests, then broaden in proportion to blast radius.
+- Map the changed behavior and its callers to affected observable tests, and
+  run that scope by default. A full suite is not a routine completion gate.
+  Broaden only when shared dependencies or contracts create wider impact, an
+  affected failure leaves a risk unresolved, or the user explicitly requests it;
+  record the reason and selected scope before broadening.
 - For UI or cross-layer behavior, validate through the local port-3008 path and
   the actual API/event/UI flow.
-- Compare failures with a measured baseline. Never label a suite green when it
-  has failures; distinguish pre-existing failures with evidence.
+- Compare failing affected checks with the same checks on a measured baseline.
+  Unrelated suite failures do not automatically block a bounded change or
+  require a full baseline run. Record failures, interruptions, skipped and
+  unrun checks honestly; never label a failing or interrupted suite green.
 
 ## 7. Review and hand off
 
