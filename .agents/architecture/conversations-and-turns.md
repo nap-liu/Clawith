@@ -2,6 +2,14 @@
 
 ## Shared execution model
 
+Web workspace references carry canonical Agent-relative paths, including core
+and daily memory, through shared attachment validation. A live file draft is
+preview content until its write completes; it must not become a required stored
+attachment during that write. Validation still requires an existing file under
+the Agent's allowed workspace roots and rejects private or escaping paths.
+Rejected sends reconcile optimistic composer state with the current server
+turn snapshot without stopping an active turn or applying a stale generation.
+
 Web, IM, A2A, trigger, task, webhook, and MCP-facing message paths should delegate model/tool work to `call_llm` / `call_llm_with_failover`. New entry points may adapt context and delivery, but must not fork a private tool loop.
 
 Build an immutable runtime/model snapshot and end the inbound read transaction

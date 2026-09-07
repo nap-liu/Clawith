@@ -377,7 +377,7 @@ export function buildChatAttachmentPayload({
             filesDisplay += `[Attachment: ${file.name}] `;
             if (!file.imageUrl) {
                 if (file.source === 'workspace_auto') {
-                    filesPrompt += `[Workspace reference: ${file.name}]\nUse read_file or read_document if you need the file contents.\n\n`;
+                    filesPrompt += `[Workspace reference: ${file.path || file.name}]\nUse read_file or read_document if you need the file contents.\n\n`;
                 } else {
                     filesPrompt += `[File: ${file.name}]\n${file.text}\n\n`;
                 }
