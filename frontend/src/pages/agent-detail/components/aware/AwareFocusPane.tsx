@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { IconChevronDown, IconChevronRight, IconSettings } from '@tabler/icons-react';
+import { IconChevronDown, IconChevronRight, IconClock, IconSettings } from '@tabler/icons-react';
 
+import ExpandableMarkdown from '../../../../components/ExpandableMarkdown';
 import Button from '../../../../components/ui/Button';
 import { focusItemFromApi, focusKeyFromTrigger, synthesizeFocusForTrigger } from '../../shared';
 import { triggerScheduleLabel } from './awareFormatters';
@@ -41,7 +42,11 @@ export default function AwareFocusPane({
     onConfigureTrigger,
 }: Props) {
     const { items, triggersByFocus, logsByFocus } = useMemo(() => {
-        const base = focusRecords.map(focusItemFromApi) as any[];
+        const base = focusRecords.map((record) => ({
+            ...focusItemFromApi(record),
+            source: record.source,
+            created_at: record.created_at,
+        })) as any[];
         const names = new Set(base.map((item) => item.name));
         const triggerGroups: Record<string, any[]> = {};
         for (const trigger of triggers) {
@@ -84,6 +89,13 @@ export default function AwareFocusPane({
     const selected = items.find((item) => item.id === selectedId) || firstVisible;
     const selectedTriggers = selected ? triggersByFocus[selected.name] || [] : [];
     const selectedLogs = selected ? logsByFocus[selected.name] || [] : [];
+    const lastFiredAt = selectedTriggers
+        .map((trigger) => trigger.last_fired_at)
+        .filter((value) => value && Number.isFinite(Date.parse(value)))
+        .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+    const dateLabel = (value: string) => new Date(value).toLocaleString(locale, {
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
 
     const row = (item: any, kind: 'active' | 'system' | 'done') => {
         const itemTriggers = triggersByFocus[item.name] || [];
@@ -137,10 +149,16 @@ export default function AwareFocusPane({
                                     <h3>{selected.title || selected.name}</h3>
                                     <span className={`aware-status-pill${selected.done ? ' success' : ''}`}>{selected.done ? t('agent.aware.completed') : t('agent.aware.inProgress')}</span>
                                 </div>
-                                {selected.description && <p>{selected.description}</p>}
+                                {selected.description && (
+                                    <div className="aware-focus-description">
+                                        <ExpandableMarkdown key={selected.id} content={selected.description} />
+                                    </div>
+                                )}
                                 <div className="aware-detail-meta">
                                     <span>{selected.system ? t('agent.aware.workspace.systemFocus') : t('agent.aware.workspace.normalFocus')}</span>
                                     <span>{t('agent.aware.workspace.source', { value: focusSourceLabel(selected.source, t) })}</span>
+                                    {selected.created_at && <span>{t('agent.aware.workspace.createdAt', { value: dateLabel(selected.created_at) })}</span>}
+                                    {lastFiredAt && <span>{t('agent.aware.workspace.lastExecutedAt', { value: dateLabel(lastFiredAt) })}</span>}
                                 </div>
                             </div>
                         </header>
@@ -149,13 +167,18 @@ export default function AwareFocusPane({
                             <div className="aware-trigger-list">
                                 {selectedTriggers.map((trigger) => (
                                     <article className={`aware-trigger-row${trigger.is_enabled ? '' : ' disabled'}`} key={trigger.id}>
-                                        <span className={`aware-status-dot aware-status-dot--${trigger.is_system ? 'system' : 'active'}`} />
-                                        <div className="aware-trigger-copy">
-                                            <div className="aware-trigger-title-line"><strong>{triggerScheduleLabel(trigger, t, locale)}</strong><code>{triggerTypeLabel(trigger.type, t)}</code></div>
-                                            {trigger.reason && <p>{trigger.reason}</p>}
-                                            <small>{statusLabel(trigger.is_enabled, t)} · {t('agent.aware.fired', { count: trigger.fire_count })}</small>
-                                        </div>
-                                        {canManage && <Button variant="secondary" onClick={() => onConfigureTrigger(trigger)}><IconSettings size={14} />{t('agent.aware.workspace.configure')}</Button>}
+                                        <header className="aware-trigger-header">
+                                            <div className="aware-trigger-title-line">
+                                                <IconClock size={17} aria-hidden="true" />
+                                                <strong>{triggerScheduleLabel(trigger, t, locale)}</strong>
+                                                <span className="aware-count-pill">{triggerTypeLabel(trigger.type, t)}</span>
+                                            </div>
+                                            {canManage && <Button variant="secondary" onClick={() => onConfigureTrigger(trigger)}><IconSettings size={14} />{t('agent.aware.workspace.configure')}</Button>}
+                                        </header>
+                                        {trigger.reason && <ExpandableMarkdown key={trigger.id} content={trigger.reason} />}
+                                        <footer className="aware-trigger-footer">
+                                            {statusLabel(trigger.is_enabled, t)} · {t('agent.aware.fired', { count: trigger.fire_count })}
+                                        </footer>
                                     </article>
                                 ))}
                                 {selectedTriggers.length === 0 && <div className="aware-empty aware-empty--compact">{t('agent.aware.noTriggers')}</div>}
