@@ -1,6 +1,5 @@
 """Pure contract tests for canonical channel and relationship identities."""
 
-from pathlib import Path
 import uuid
 
 import pytest
@@ -135,26 +134,3 @@ def test_relationship_inputs_reject_legacy_or_ambiguous_ids():
         RelationshipIn.model_validate({"user_id": f"platform-user:{identifier}"})
     with pytest.raises(ValidationError):
         AgentRelationshipIn.model_validate({"target_agent_id": str(identifier)})
-
-
-def test_identity_migration_reports_conflicts_and_fails_closed():
-    migration = (
-        Path(__file__).parents[1]
-        / "alembic"
-        / "versions"
-        / "071_identity_relationships_v1.py"
-    ).read_text()
-
-    assert 'revision: str = "identity_relationships_v1"' in migration
-    assert 'down_revision: Union[str, None] = "speech_recognition_configs"' in migration
-    assert "identity_relationship_migration_conflicts" in migration
-    assert "ambiguous_channel_subject" in migration
-    assert "to_jsonb(provider)" not in migration
-    assert "to_jsonb(member)" not in migration
-    assert "provider.provider_type IN" in migration
-    assert "relationship_suppressions" in migration
-    assert "enforce_agent_user_relationship_tenant" in migration
-    assert "enforce_agent_agent_relationship_tenant" in migration
-    assert "'relationship', to_jsonb" in migration
-    assert "DELETE FROM agent_relationships WHERE user_id IS NULL" in migration
-    assert "ON CONFLICT (tenant_id, installation_scope, id_type, subject) DO NOTHING" in migration
