@@ -142,6 +142,10 @@ Fully recalled messages remain in the audit trail and render as a tombstone. LLM
 
 - IM model execution has no whole-tool-loop timeout; request-level model timeouts and tool-round limits belong in the shared core.
 - Native provider capabilities differ across P2P and groups. Normalize the lifecycle result while keeping provider-specific request semantics in adapters.
+- DingTalk group-mention cards keep their conversation preview to at most 40
+  Unicode code points, including any truncation marker. This caps even all-emoji
+  previews at 80 UTF-16 units and leaves delivery headroom. Only the preview is
+  shortened; the message body and native mention targets remain complete.
 - A native mention in an already-authorized exact group Session does not require
   an Agent-to-human relationship. Individual targets still use canonical tenant
   user IDs and must resolve to one active endpoint for the Session's provider

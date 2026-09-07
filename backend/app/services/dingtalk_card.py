@@ -30,7 +30,9 @@ _DELIVER_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances/deliver"
 _CREATE_AND_DELIVER_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances/createAndDeliver"
 _UPDATE_URL = f"{DINGTALK_OPENAPI}/v1.0/card/instances"  # PUT
 
-_SUMMARY_LIMIT = 100
+# Keep previews within 80 UTF-16 units even when every character is an emoji,
+# leaving headroom below the provider's 100-unit boundary. Body text stays full.
+_SUMMARY_LIMIT = 40
 _AUTO_LAYOUT_CARD_CONFIG = json.dumps(
     {"config": {"autoLayout": True}},
     separators=(",", ":"),
