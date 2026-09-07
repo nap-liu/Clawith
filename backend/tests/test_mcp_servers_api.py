@@ -110,6 +110,7 @@ async def test_create_then_get_detail(client):
     )
     assert r2.status_code == 200
     detail = r2.json()
+    assert detail["headers_template"] == payload["headers_template"]
     assert detail["system_prompt_block"] == "Use citations."
     assert detail["credential_state"] == "set"
     assert "credential_template" not in detail

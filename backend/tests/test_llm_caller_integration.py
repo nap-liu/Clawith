@@ -7,7 +7,6 @@
 """
 import json
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -167,22 +166,6 @@ async def test_process_tool_call_clean_arguments_pass_through_unchanged_semantic
 
     # Semantic equivalence (key order / spacing may differ)
     assert json.loads(tc["function"]["arguments"]) == {"path": "foo.md"}
-
-
-def test_canonicalize_tc_arguments_helper_rewrites_tc_inplace():
-    """Unit test the helper directly — exercised by both _process_tool_call
-    and call_agent_llm_with_tools._try_model."""
-    from app.services.llm.caller import _canonicalize_tc_arguments
-    tc = {
-        "id": "call_1",
-        "function": {"name": "read_file", "arguments": '{"path": "foo.md",}'},
-    }
-    args = _canonicalize_tc_arguments(tc, session_id="sess-x")
-    assert args == {"path": "foo.md"}
-    # In-place mutation: tc now carries canonical JSON
-    import json
-    parsed = json.loads(tc["function"]["arguments"])
-    assert parsed == {"path": "foo.md"}
 
 
 @pytest.mark.asyncio

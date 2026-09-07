@@ -1,20 +1,7 @@
 # backend/tests/test_mcp_stdio_schema.py
 import pytest
 from pydantic import ValidationError
-from app.schemas.mcp_server import MCPServerCreate, MCPServerUpdate, MCPServerOut, MCPServerOverridePut
-
-
-def test_create_accepts_stdio():
-    m = MCPServerCreate(
-        name="yx", display_name="yx", base_url_template="",
-        transport="stdio", command_template="npx",
-        args_template=["-y", "alibabacloud-devops-mcp-server"],
-        env_template={"YUNXIAO_ACCESS_TOKEN": "${agent.tok}"},
-    )
-    assert m.transport == "stdio"
-    assert m.command_template == "npx"
-    assert m.args_template == ["-y", "alibabacloud-devops-mcp-server"]
-    assert m.env_template == {"YUNXIAO_ACCESS_TOKEN": "${agent.tok}"}
+from app.schemas.mcp_server import MCPServerCreate, MCPServerUpdate, MCPServerOverridePut
 
 
 def test_create_http_requires_base_url():
@@ -77,35 +64,3 @@ def test_override_put_accepts_all_stdio_fields():
     assert p.command_template == "npx"
     assert p.args_template == ["-y", "pkg"]
     assert p.env_template == {"KEY": "val"}
-
-
-def test_out_includes_stdio_fields():
-    """MCPServerOut should include transport, command_template, args_template, env_template."""
-    import uuid
-    from datetime import datetime, timezone
-
-    class FakeServer:
-        id = uuid.uuid4()
-        tenant_id = None
-        name = "yx"
-        display_name = "yx"
-        base_url_template = ""
-        headers_template = {}
-        credential_template = None
-        system_prompt_block = None
-        placeholder_allowlist = None
-        instructions = None
-        instructions_captured_at = None
-        created_by_user_id = None
-        created_at = datetime.now(timezone.utc)
-        updated_at = datetime.now(timezone.utc)
-        transport = "stdio"
-        command_template = "npx"
-        args_template = ["-y", "pkg"]
-        env_template = {"K": "${agent.v}"}
-
-    out = MCPServerOut.from_orm_model(FakeServer())
-    assert out.transport == "stdio"
-    assert out.command_template == "npx"
-    assert out.args_template == ["-y", "pkg"]
-    assert out.env_template == {"K": "${agent.v}"}

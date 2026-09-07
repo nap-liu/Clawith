@@ -1,16 +1,19 @@
 """Tests for tools/read_image/input_loader.py."""
 
 import asyncio
+import ssl
+import subprocess
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app.services.tools.read_image.input_loader import (
     DEFAULT_CONFIG,
     LoadError,
-    LoadResult,
     LoadedImage,
     load,
+    merge_config,
 )
 
 
@@ -175,9 +178,9 @@ async def test_base64_happy_path_jpeg(workspace, jpeg_bytes):
     result = await load([url], workspace, _b64_config())
     assert result.short_circuit is None
     assert isinstance(result.items[0], LoadedImage)
-    # Display ref must NOT contain the base64 payload
-    assert "base64" in result.items[0].display_ref.lower() or "[base64" in result.items[0].display_ref
-    assert "AAAA" not in result.items[0].display_ref  # no payload leak
+    assert "base64" in result.items[0].display_ref.lower()
+    assert "base64," not in result.items[0].display_ref
+    assert url.split(",", 1)[1] not in result.items[0].display_ref
 
 
 @pytest.mark.asyncio
@@ -229,22 +232,13 @@ async def test_base64_fake_image_bytes_is_category_B(workspace):
     assert result.items[0].category == "B"
 
 
-@pytest.mark.asyncio
-async def test_base64_display_ref_never_contains_payload(workspace, jpeg_bytes):
-    url = _make_data_url("jpeg", jpeg_bytes)
-    result = await load([url], workspace, _b64_config())
-    item = result.items[0]
-    # Regardless of success or failure, the display_ref must not contain the payload
-    assert "base64," not in item.display_ref
-
-
 # ─── URL mode ────────────────────────────────────────────────────────────────
 
 def _url_config(allowlist=None) -> dict:
     import copy
     c = copy.deepcopy(DEFAULT_CONFIG)
     c["input_modes"]["url"]["enabled"] = True
-    c["input_modes"]["url"]["allowlist"] = allowlist or ["*.example.com"]
+    c["input_modes"]["url"]["allowlist"] = ["*.example.com"] if allowlist is None else allowlist
     return c
 
 
@@ -351,22 +345,52 @@ async def test_url_happy_path_fetch(monkeypatch, workspace, jpeg_bytes):
     assert result.items[0].display_ref == "https://cdn.example.com/x.jpg"
 
 
-def test_verify_true_is_hardcoded_in_input_loader():
-    """Source-scan lock: input_loader must hardcode httpx verify=True.
-
-    This test catches a whole class of "someone disabled TLS verification
-    to support an internal self-signed cert" regressions. If that need
-    ever arises, it must land as a spec/ADR change, not a one-line flip.
-    """
-    import inspect
+@pytest.mark.asyncio
+async def test_url_rejects_untrusted_tls_certificate(monkeypatch, workspace, jpeg_bytes):
+    """Exercise the real HTTP client against a local self-signed HTTPS server."""
     from app.services.tools.read_image import input_loader
 
-    src = inspect.getsource(input_loader)
-    assert "verify=True" in src, "input_loader must hardcode verify=True"
-    assert "verify=False" not in src, (
-        "verify=False is never acceptable for read_image; "
-        "see spec §5 Security 2 (HTTPS verification is mandatory)."
+    cert_path = workspace / "cert.pem"
+    key_path = workspace / "key.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key_path), "-out", str(cert_path), "-days", "1",
+            "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1",
+        ],
+        check=True, capture_output=True, timeout=10,
     )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+
+    async def serve_image(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+            + f"Content-Length: {len(jpeg_bytes)}\r\nConnection: close\r\n\r\n".encode()
+            + jpeg_bytes
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async def public_dns(_host):
+        # Bypass only the separate SSRF guard to reach the local TLS fixture.
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(input_loader, "_resolve_host", public_dns)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    server = await asyncio.start_server(serve_image, "127.0.0.1", 0, ssl=context)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        result = await load(
+            [f"https://127.0.0.1:{port}/image.jpg"], workspace,
+            _url_config(allowlist=["127.0.0.1"]),
+        )
+    assert result.short_circuit is None
+    assert isinstance(result.items[0], LoadError)
+    assert result.items[0].category == "B"
+    assert "certificate verify failed" in result.items[0].reason.lower()
 
 
 @pytest.mark.asyncio
@@ -379,22 +403,28 @@ async def test_url_redirect_to_private_ip_rejected(monkeypatch, workspace):
             return ["93.184.216.34"]
         return ["10.0.0.5"]
 
-    async def fake_fetch(url, config):
-        raise input_loader._RedirectToPrivateIP("Location resolved to private IP")
+    requested_urls = []
+
+    def redirect(request):
+        requested_urls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://private.example.com/x.jpg"})
 
     monkeypatch.setattr(input_loader, "_resolve_host", fake_resolve)
-    monkeypatch.setattr(input_loader, "_fetch_with_revalidation", fake_fetch)
+    client_class = httpx.AsyncClient
+    monkeypatch.setattr(
+        input_loader.httpx, "AsyncClient",
+        lambda **kwargs: client_class(transport=httpx.MockTransport(redirect), **kwargs),
+    )
 
     cfg = _url_config(allowlist=["*.example.com"])
     result = await load(["https://cdn.example.com/x.jpg"], workspace, cfg)
     assert result.short_circuit is not None
     assert result.short_circuit.category == "A"
+    assert "blocked IP" in result.short_circuit.reason
+    assert requested_urls == ["https://cdn.example.com/x.jpg"]
 
 
 # ─── Config merge (tightening-only) ──────────────────────────────────────────
-
-from app.services.tools.read_image.input_loader import merge_config
-
 
 def test_merge_config_tightens_max_images_when_agent_lower():
     tool = {"max_images_per_call": 6}

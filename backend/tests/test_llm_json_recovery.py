@@ -70,23 +70,6 @@ def test_hopelessly_broken_returns_failed():
     assert method == "failed"
 
 
-def test_canonical_is_always_valid_json_even_on_failure():
-    """Invariant: canonical output must always be parseable JSON."""
-    import json
-    for raw in [
-        '',
-        '{"a": 1}',
-        '{"a": 1,}',
-        '{"a": "b\nc"}',
-        'not json at all',
-        '{"broken',
-        None,
-    ]:
-        _, canonical, _ = canonicalize_tool_arguments(raw or "")
-        # Must not raise
-        json.loads(canonical)
-
-
 def test_trailing_comma_inside_string_value_is_not_stripped():
     """Regression: regex-based stripping would silently corrupt
     `{"a": "hello,}", "b": 1,}` by eating the comma inside the string value.

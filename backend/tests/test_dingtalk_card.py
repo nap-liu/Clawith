@@ -44,6 +44,25 @@ class _Client:
         return _Response(self.response_payload)
 
 
+@pytest.fixture(autouse=True)
+def provider_token(monkeypatch):
+    async def fake_token(*_args, **_kwargs):
+        return "app-access-token"
+
+    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
+
+
+@pytest.fixture
+def card_calls(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        dingtalk_card.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _Client(calls),
+    )
+    return calls
+
+
 @pytest.mark.parametrize(
     ("at_user_ids", "mention_text"),
     [
@@ -52,21 +71,11 @@ class _Client:
     ],
 )
 async def test_message_card_renders_labels_and_delivers_native_mentions(
-    monkeypatch,
+    card_calls,
     at_user_ids,
     mention_text,
 ):
-    calls: list[dict] = []
-
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
-    monkeypatch.setattr(
-        dingtalk_card.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(calls),
-    )
+    calls = card_calls
 
     result = await dingtalk_card.send_message_card(
         app_id="ding-app",
@@ -111,18 +120,8 @@ async def test_message_card_renders_labels_and_delivers_native_mentions(
     }
 
 
-async def test_message_card_escapes_visible_mention_labels(monkeypatch):
-    calls: list[dict] = []
-
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
-    monkeypatch.setattr(
-        dingtalk_card.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(calls),
-    )
+async def test_message_card_escapes_visible_mention_labels(card_calls):
+    calls = card_calls
 
     await dingtalk_card.send_message_card(
         app_id="ding-app",
@@ -159,19 +158,9 @@ async def test_message_card_escapes_visible_mention_labels(monkeypatch):
     [({"@ALL": "@ALL"}, "@所有人"), ({"staff-zhangsan": "张三"}, "@张三")],
 )
 async def test_message_card_keeps_full_long_content_and_limits_preview(
-    monkeypatch, content, at_user_ids, mention_text
+    card_calls, content, at_user_ids, mention_text
 ):
-    calls: list[dict] = []
-
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
-    monkeypatch.setattr(
-        dingtalk_card.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(calls),
-    )
+    calls = card_calls
     result = await dingtalk_card.send_message_card(
         app_id="ding-app",
         app_secret="ding-secret",
@@ -198,18 +187,8 @@ async def test_message_card_keeps_full_long_content_and_limits_preview(
     assert body["imGroupOpenDeliverModel"]["atUserIds"] == at_user_ids
 
 
-async def test_confirmation_card_keeps_shared_transport_without_mentions(monkeypatch):
-    calls: list[dict] = []
-
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
-    monkeypatch.setattr(
-        dingtalk_card.httpx,
-        "AsyncClient",
-        lambda **_kwargs: _Client(calls),
-    )
+async def test_confirmation_card_keeps_shared_transport_without_mentions(card_calls):
+    calls = card_calls
 
     result = await dingtalk_card.send_confirmation_card(
         app_id="ding-app",
@@ -249,10 +228,6 @@ async def test_message_card_rejects_empty_mention_map_before_provider_call(monke
 async def test_message_card_rejects_failed_atomic_group_delivery(monkeypatch):
     calls: list[dict] = []
 
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
     monkeypatch.setattr(
         dingtalk_card.httpx,
         "AsyncClient",
@@ -292,9 +267,6 @@ async def test_message_card_rejects_failed_atomic_group_delivery(monkeypatch):
 async def test_message_card_transport_timeout_propagates_without_retry(monkeypatch):
     calls = []
 
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
     class _TimeoutClient:
         async def __aenter__(self):
             return self
@@ -306,7 +278,6 @@ async def test_message_card_transport_timeout_propagates_without_retry(monkeypat
             calls.append({"url": url, "headers": headers, "json": json})
             raise httpx.ReadTimeout("provider response timed out")
 
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
     monkeypatch.setattr(
         dingtalk_card.httpx,
         "AsyncClient",
@@ -330,9 +301,6 @@ async def test_message_card_transport_timeout_propagates_without_retry(monkeypat
 async def test_message_card_unreadable_response_is_uncertain_without_retry(monkeypatch):
     calls = []
 
-    async def fake_token(*_args, **_kwargs):
-        return "app-access-token"
-
     class _UnreadableResponse:
         status_code = 200
         text = "not-json"
@@ -351,7 +319,6 @@ async def test_message_card_unreadable_response_is_uncertain_without_retry(monke
             calls.append({"url": url, "headers": headers, "json": json})
             return _UnreadableResponse()
 
-    monkeypatch.setattr(dingtalk_card.dingtalk_token_manager, "get_token", fake_token)
     monkeypatch.setattr(
         dingtalk_card.httpx,
         "AsyncClient",

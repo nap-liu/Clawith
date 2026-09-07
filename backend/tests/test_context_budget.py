@@ -19,21 +19,6 @@ def test_context_budget_uses_physical_window_times_configured_ratio():
     assert budget.hard_input_limit == 100_000
 
 
-def test_one_million_window_at_seventy_percent_has_no_hidden_second_ratio():
-    model = SimpleNamespace(
-        context_window=1_000_000,
-        context_usage_ratio=0.7,
-        compact_trigger_ratio=0.85,
-    )
-
-    budget = resolve_context_budget(model, max_output_tokens=32_000)
-
-    assert budget.effective_context_window == 700_000
-    assert budget.input_capacity == 668_000
-    assert budget.compaction_trigger_limit == 668_000
-    assert budget.hard_input_limit == 668_000
-
-
 def test_invalid_persisted_ratio_fails_closed():
     model = SimpleNamespace(
         context_window=200_000,

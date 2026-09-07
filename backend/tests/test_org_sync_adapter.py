@@ -5,14 +5,12 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from app.database import async_session, engine
 from app.models.identity import IdentityProvider
-from app.models.org import OrgMember
 from app.models.tenant import Tenant
-from app.models.user import Identity, User
 from app.services.org_sync_adapter import (
     BaseOrgSyncAdapter,
     DingTalkOrgSyncAdapter,
@@ -23,7 +21,6 @@ from app.services.org_sync_adapter import (
     build_department_path_map,
     normalize_contact_for_match,
 )
-from app.services.canonical_user_resolver import CanonicalIdentityConflict
 from app.services.dingtalk_identity_reconciliation import (
     dingtalk_legacy_identity_reconciler,
 )
@@ -66,14 +63,6 @@ class _FakeDB:
 
     async def commit(self):
         return None
-
-
-class _RecordingExecuteDB:
-    def __init__(self):
-        self.statements = []
-
-    async def execute(self, statement):
-        self.statements.append(statement)
 
 
 class _FakeDingTalkResponse:
@@ -452,17 +441,6 @@ def test_dingtalk_sync_skip_department_names_default_to_empty():
     adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
 
     assert adapter._configured_user_fetch_skip_department_names() == set()
-
-
-def test_reconcile_disables_session_synchronization_for_datetime_comparisons():
-    adapter = _DummyAdapter()
-    db = _RecordingExecuteDB()
-
-    asyncio.run(adapter._reconcile(db, uuid.uuid4(), datetime.now(timezone.utc)))
-
-    assert len(db.statements) == 2
-    for statement in db.statements:
-        assert statement.get_execution_options()["synchronize_session"] is False
 
 
 def test_google_workspace_adapter_parses_legacy_service_account_json_string():

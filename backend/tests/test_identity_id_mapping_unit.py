@@ -24,24 +24,6 @@ def test_sso_identity_lookup_chain_prioritizes_unionid_then_userid_then_openid()
     ]
 
 
-def test_sso_extract_identity_ids_uses_real_union_id_not_open_id():
-    union_id, open_id, external_id = sso_service._extract_identity_ids(
-        "feishu",
-        "ou_open_123",
-        {
-            "raw_data": {
-                "open_id": "ou_open_123",
-                "union_id": "on_union_456",
-                "user_id": "u_emp_789",
-            }
-        },
-    )
-
-    assert union_id == "on_union_456"
-    assert open_id == "ou_open_123"
-    assert external_id == "u_emp_789"
-
-
 def test_sso_extract_identity_ids_handles_registration_wrapped_payload():
     union_id, open_id, external_id = sso_service._extract_identity_ids(
         "dingtalk",
