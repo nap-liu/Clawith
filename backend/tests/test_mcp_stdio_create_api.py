@@ -13,7 +13,7 @@ import httpx
 
 from app.database import async_session, engine
 from app.models.user import User, Identity
-from app.models.mcp_server import MCPServer, MCPServerOverride
+from app.models.mcp_server import MCPServer
 from app.core.security import create_access_token
 from app.schemas.mcp_server import MCPServerOut, MCPServerOverrideOut
 
@@ -163,11 +163,8 @@ async def test_override_out_includes_stdio_fields():
         env_template = {"YUNXIAO_ACCESS_TOKEN": "${agent.tok}"}
 
     out = MCPServerOverrideOut.from_orm_model(FakeOverride())
-    assert hasattr(out, "command_template"), "MCPServerOverrideOut missing command_template"
     assert out.command_template == "npx"
-    assert hasattr(out, "args_template"), "MCPServerOverrideOut missing args_template"
     assert out.args_template == ["-y", "pkg"]
-    assert hasattr(out, "env_template"), "MCPServerOverrideOut missing env_template"
     assert out.env_template == {"YUNXIAO_ACCESS_TOKEN": "${agent.tok}"}
 
 

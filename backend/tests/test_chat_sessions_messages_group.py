@@ -363,4 +363,3 @@ async def test_p2p_messages_api_returns_canonical_sender_user_id():
     assert len(user_msgs) == 1
     assert user_msgs[0]["sender_user_id"] == str(owner.id)
     assert "participant_id" not in user_msgs[0]
-    assert "participant_id" not in user_msgs[0]

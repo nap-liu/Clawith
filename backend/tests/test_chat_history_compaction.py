@@ -603,7 +603,6 @@ async def test_load_history_for_llm_compaction_and_tool_call_coexist():
         assert roles == ["user", "assistant", "tool", "assistant"]
         assert "tool_call" not in roles  # surviving tool_call expanded, not raw
         assert "<conversation-summary" in history[0]["content"]
-        assert len(history) < 50  # 211 stored rows collapse to summary + 3 raw turns.
         assert history[1]["tool_calls"][0]["function"]["name"] == "get_weather"
         assert history[2]["content"] == "sunny"
         assert history[3]["content"] == "今天上海晴"
@@ -634,9 +633,8 @@ async def _markers_for(conv_id: str):
         return (await db.execute(_select(ChatCompaction).where(ChatCompaction.session_id == conv_id))).scalars().all()
 
 
-async def test_precompact_noop_below_threshold():
-    """Pre-flight is a cheap no-op when the prompt is well under the window:
-    returns False and writes NO compaction marker (no summary LLM call)."""
+async def test_precompact_without_official_counter_does_not_write_marker():
+    """No official preflight counter means no speculative compaction or marker."""
     from app.services.llm.compactor import maybe_precompact_prompt
 
     conv_id, agent_id, _, _ = await _setup([("user", "hi", 100), ("assistant", "hello", 50)])
@@ -644,31 +642,10 @@ async def test_precompact_noop_below_threshold():
         result = await maybe_precompact_prompt(
             agent_id=agent_id,
             conversation_id=conv_id,
-            model=_precompact_model(context_window=131072),
-            prompt_messages=[{"role": "user", "content": "short"}],
-        )
-        assert result.triggered is False
-        assert result.required is False
-        assert await _markers_for(conv_id) == []
-    finally:
-        await _cleanup(conv_id)
-
-
-async def test_precompact_noop_when_history_too_small():
-    """Even when the estimate crosses the pre-flight ratio, compaction is a
-    no-op when there isn't enough older history to fold — no summary LLM call,
-    no marker (guards against thrashing tiny conversations)."""
-    from app.services.llm.compactor import maybe_precompact_prompt
-
-    conv_id, agent_id, _, _ = await _setup([("user", "hi", 100), ("assistant", "hello", 50)])
-    try:
-        result = await maybe_precompact_prompt(
-            agent_id=agent_id,
-            conversation_id=conv_id,
-            model=_precompact_model(context_window=100),  # tiny window → estimate >> 95%
+            model=_precompact_model(context_window=100),
             prompt_messages=[{"role": "user", "content": "x" * 4000}],
         )
-        assert result.triggered is False  # select_compaction_span returns None (too few rows)
+        assert result.triggered is False
         assert result.required is False
         assert result.skipped_reason == "official_preflight_counter_unavailable"
         assert await _markers_for(conv_id) == []

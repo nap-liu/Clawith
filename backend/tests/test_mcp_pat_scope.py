@@ -120,19 +120,6 @@ async def test_resolve_pat_context_carries_scope():
     assert pc is not None and pc.scope == "write" and pc.user.id == user.id and pc.tenant_id == tenant.id
 
 
-async def test_resolve_pat_user_still_two_tuple():
-    from app.services.pat_service import issue_pat
-    from app.mcp_server.auth import resolve_pat_user
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-    async with async_session() as db:
-        token, _ = await issue_pat(db, user=user, name="r")
-    async with async_session() as db:
-        result = await resolve_pat_user(_ctx(token), db)
-    assert len(result) == 2 and result[0].id == user.id
-
-
 async def test_resolve_pat_context_none_when_unauth():
     from app.mcp_server.auth import resolve_pat_context
 

@@ -319,8 +319,6 @@ async def test_persist_incoming_user_message_persists_plain_user_row():
 
     assert saved.role == "user"
     assert saved.content == "帮我查一下数据"
-    assert not hasattr(saved, "turn_status")
-    assert not hasattr(saved, "turn_context")
 
 
 async def test_completed_turn_is_represented_by_appended_assistant_row():
@@ -465,8 +463,8 @@ async def test_recoverable_history_skips_when_anchor_is_not_active():
     assert recoverable == []
 
 
-async def test_load_history_group_wraps_user_messages():
-    """is_group=True 时每条 user 消息被 sender 标签包前缀, 历史里能区分发件人."""
+async def test_load_history_group_wraps_only_user_messages():
+    """Group history identifies each human sender and preserves assistant text."""
     agent_id = uuid.uuid4()
     u_alice, u_bob = await _seed_two_users()
     conv_id = await _seed_group_history(agent_id, u_alice, u_bob)
@@ -487,20 +485,6 @@ async def test_load_history_group_wraps_user_messages():
     assert user_msgs[1]["content"].startswith(f'<sender id="{u_bob.id}">Bob</sender>\n')
     assert user_msgs[1]["content"].endswith("帮我订下午3点会议室")
 
-
-async def test_load_history_group_assistant_messages_untouched():
-    """assistant / system / tool_call 消息不应该被 wrap."""
-    agent_id = uuid.uuid4()
-    u_alice, u_bob = await _seed_two_users()
-    conv_id = await _seed_group_history(agent_id, u_alice, u_bob)
-    async with async_session() as db:
-        history = await load_history_for_llm(
-            db,
-            agent_id=agent_id,
-            conversation_id=conv_id,
-            ctx_size=50,
-            is_group=True,
-        )
     assistant_msgs = [m for m in history if m["role"] == "assistant"]
     assert len(assistant_msgs) == 2
     for m in assistant_msgs:

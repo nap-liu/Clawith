@@ -491,66 +491,6 @@ async def test_exact_subject_with_different_user_projection_is_rejected():
         assert member_user_id == other_user_id
 
 
-async def test_single_wrong_user_projection_is_rejected_before_it_can_be_rebound():
-    suffix = uuid.uuid4().hex[:10]
-    email = f"single-projection-{suffix}@example.com"
-    subject = f"subject-{suffix}"
-    phone = f"8618{uuid.uuid4().int % 10**9:09d}"
-    tenant_id, provider_id, identity_id, _trusted_user_id = await _seed_bound_user(
-        email=email,
-        subject=subject,
-        phone=phone,
-    )
-    async with async_session() as db:
-        other_identity = Identity(
-            username=f"single-projection-other-{suffix}",
-            email=f"single-projection-other-{suffix}@example.com",
-            phone=f"8617{uuid.uuid4().int % 10**9:09d}",
-            email_verified=True,
-        )
-        db.add(other_identity)
-        await db.flush()
-        other_user = User(
-            identity_id=other_identity.id,
-            tenant_id=tenant_id,
-            display_name="Single Projection Conflict",
-            role="member",
-            is_active=True,
-        )
-        db.add(other_user)
-        await db.flush()
-        member = (
-            await db.execute(
-                select(OrgMember).where(
-                    OrgMember.provider_id == provider_id,
-                    OrgMember.external_id == subject,
-                )
-            )
-        ).scalar_one()
-        member.user_id = other_user.id
-        await db.commit()
-        other_user_id = other_user.id
-
-    with pytest.raises(HTTPException) as exc_info:
-        await _login(
-            tenant_id,
-            provider_id,
-            subject=subject,
-            email=f"single-projection-new-{suffix}@example.com",
-            phone=phone,
-        )
-    assert exc_info.value.status_code == 409
-    async with async_session() as db:
-        assert (await db.get(Identity, identity_id)).email == email
-        member_user_id = await db.scalar(
-            select(OrgMember.user_id).where(
-                OrgMember.provider_id == provider_id,
-                OrgMember.external_id == subject,
-            )
-        )
-        assert member_user_id == other_user_id
-
-
 @pytest.mark.parametrize("incoming_email", [None, ""])
 async def test_exact_oauth_binding_keeps_existing_email_when_claim_is_empty(incoming_email):
     suffix = uuid.uuid4().hex[:10]

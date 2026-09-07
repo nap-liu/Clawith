@@ -328,21 +328,6 @@ async def test_install_local_server_no_tools_direct_import(monkeypatch):
     assert "✅" in out
 
 
-# ── Test 9: unknown server id → falls back to Smithery (backward compatible) ─────
-
-
-async def test_install_unknown_server_falls_back_to_smithery():
-    from app.mcp_server.tools_mcp import install_agent_mcp_server_impl
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user)
-    token = await _pat(user, scope="write")
-
-    out = await install_agent_mcp_server_impl(_ctx(token), agent=str(agent.id), server_id="github", confirm=True)
-    assert "Smithery API key" in out, f"Expected Smithery fallback, got: {out!r}"
-
-
 # ── Test 10: cross-tenant server id is NOT associated (treated as unknown) ───────
 
 

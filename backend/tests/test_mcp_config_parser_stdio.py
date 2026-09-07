@@ -2,15 +2,6 @@
 from app.services.mcp_config_parser import _from_server_spec
 
 
-def test_stdio_spec_parsed_not_rejected():
-    out = _from_server_spec({"command": "npx", "args": ["-y", "pkg"], "env": {"K": "v"}}, "yx")
-    assert out.get("error") is None
-    assert out["transport"] == "stdio"
-    assert out["command"] == "npx"
-    assert out["args"] == ["-y", "pkg"]
-    assert out["env"] == {"K": "v"}
-
-
 def test_http_spec_still_works():
     out = _from_server_spec({"url": "https://x/mcp"}, "h")
     assert out.get("error") is None

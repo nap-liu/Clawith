@@ -83,7 +83,7 @@ async def _seed_scope():
 
 async def test_conflict_queue_is_admin_only_tenant_scoped_and_pii_safe():
     tenant_a, tenant_b, provider_a, provider_b = await _seed_scope()
-    admin_a, admin_token = await _user(tenant_id=tenant_a.id, role="org_admin", label="admin-a")
+    _admin_a, admin_token = await _user(tenant_id=tenant_a.id, role="org_admin", label="admin-a")
     _member, member_token = await _user(tenant_id=tenant_a.id, role="member", label="member-a")
     affected, _ = await _user(tenant_id=tenant_a.id, role="member", label="affected")
 
@@ -165,7 +165,6 @@ async def test_conflict_queue_is_admin_only_tenant_scoped_and_pii_safe():
     assert foreign_provider_hidden.status_code == 404
     assert foreign_conflict_hidden.status_code == 404
     assert foreign_repair_hidden.status_code == 404
-    assert admin_a.tenant_id == tenant_a.id
 
 
 async def test_review_status_is_append_only_and_does_not_change_accounts():

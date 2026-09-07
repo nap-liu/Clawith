@@ -7,7 +7,6 @@ correctly-rendered URL / headers / api_key. This proves \${user.email},
 import uuid
 import pytest
 from unittest.mock import AsyncMock, patch
-from sqlalchemy import select
 from app.database import async_session, engine
 from app.models.user import User, Identity
 from app.models.tenant import Tenant

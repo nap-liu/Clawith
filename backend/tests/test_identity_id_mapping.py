@@ -13,7 +13,6 @@ from app.models.org import ChannelUserBinding, OrgMember
 from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
-from app.services.sso_service import sso_service
 
 
 @pytest.fixture(autouse=True)
