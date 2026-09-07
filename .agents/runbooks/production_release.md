@@ -39,8 +39,8 @@ CURRENT_BACKEND_DIGEST=
 CURRENT_FRONTEND_DIGEST=
 CURRENT_AIO_DIGEST=
 RELEASE_SHA=
-UPSTREAM_VERSION=
-RELEASE_ID=v<UPSTREAM_VERSION>-<RELEASE_SHA7>
+PRODUCT_VERSION=
+RELEASE_ID=v<PRODUCT_VERSION>-<RELEASE_SHA7>
 NEW_BACKEND_DIGEST=
 NEW_FRONTEND_DIGEST=
 COMPOSE_PROJECT=
@@ -58,11 +58,13 @@ release when a declared condition fires.
 3. If main moves, integrate it, repeat the diff audit and required Docker gates,
    and select a new final SHA.
 4. Confirm the candidate checkout is clean and backend/frontend `VERSION` files
-   match the current upstream semantic version.
+   match the independently maintained product version. This fork started at
+   upstream `1.10.3`; newer upstream releases do not change its version. Do not
+   bump VERSION without an explicit product version decision.
 5. Run the user-visible wording scanner and confirm changed/new hand-written
    source files comply with the 800-line gate.
 
-The private release identifier is `v<upstream-version>-<release-sha7>`. Tag the
+The private release identifier is `v<product-version>-<release-sha7>`. Tag the
 explicit immutable SHA, never a branch name. Backend, worker, connector,
 frontend, compose references, OCI labels, and the release record must agree on
 that SHA.
@@ -184,8 +186,8 @@ from current configuration):
 ```bash
 RELEASE_SHA=<full-release-sha>
 RELEASE_SHA7=${RELEASE_SHA:0:7}
-UPSTREAM_VERSION=<upstream-version>
-RELEASE_ID="v${UPSTREAM_VERSION}-${RELEASE_SHA7}"
+PRODUCT_VERSION=<repository-product-version>
+RELEASE_ID="v${PRODUCT_VERSION}-${RELEASE_SHA7}"
 BACKEND_REPOSITORY=<approved-backend-image-repository>
 FRONTEND_REPOSITORY=<approved-frontend-image-repository>
 CURRENT_SHA7=<current-release-sha7>

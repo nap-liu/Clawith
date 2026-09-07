@@ -11,9 +11,11 @@ the runbook.
   configuration changes, migrations, backup, cutover, external smoke messages,
   or rollback. Outside this defined shorthand, each operation requires its
   applicable explicit authorization.
-- The semantic version prefix follows the current upstream release. Private
-  changes use the exact commit SHA suffix; do not invent a higher private
-  semantic version.
+- This product forked at upstream `1.10.3` and now maintains its version
+  independently. Do not follow upstream release numbers or change VERSION as
+  part of an ordinary release. Use the repository's independent version plus
+  the exact commit SHA suffix; changing the version requires an explicit
+  product version decision.
 - Build and publish backend and frontend from the same immutable release SHA,
   even when only one side changed. Pin deployment and rollback to digests.
 - Select Docker validation from the final diff and affected behavior, including
