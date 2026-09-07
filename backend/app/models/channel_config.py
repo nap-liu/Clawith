@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,7 +23,17 @@ class ChannelConfig(Base):
         nullable=False,
     )
 
-    __table_args__ = (UniqueConstraint("agent_id", "channel_type", name="uq_channel_configs_agent_channel"),)
+    __table_args__ = (
+        UniqueConstraint("agent_id", "channel_type", name="uq_channel_configs_agent_channel"),
+        Index(
+            "uq_channel_configs_dingtalk_app_configured",
+            "app_id",
+            unique=True,
+            postgresql_where=text(
+                "channel_type = 'dingtalk' AND is_configured = true AND app_id IS NOT NULL"
+            ),
+        ).ddl_if(dialect="postgresql"),
+    )
 
     # Feishu specific config
     app_id: Mapped[str | None] = mapped_column(String(255))
