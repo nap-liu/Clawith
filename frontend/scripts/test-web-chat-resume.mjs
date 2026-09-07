@@ -10,8 +10,6 @@ const {
     prepareMessagesForActiveTurnResume,
     resolveVisibleTerminalRecoveryAction,
     shouldCompleteRecoveryPolling,
-} = loadTypeScriptModule(resumeModulePath);
-const {
     bufferResumeEvent,
     createResumeEventGate,
     drainResumeEventGate,

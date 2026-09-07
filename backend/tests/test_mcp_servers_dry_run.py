@@ -102,23 +102,20 @@ async def test_dry_run_masks_authorization_header(client):
     # (X-User-Id will have the user's UUID)
 
 
-async def test_dry_run_rejects_arbitrary_user_id(client):
-    """Schema doesn't accept user_id field — only identity:current_user|synthetic."""
+async def test_dry_run_uses_authenticated_user_despite_supplied_user_id(client):
+    """An extra user_id must not override the authenticated rendering identity."""
     srv = await _make_server_with_creds()
-    _, token = await _make_admin()
+    user, token = await _make_admin()
+    foreign_user_id = str(uuid.uuid4())
     r = await client.post(
         f"/api/admin/mcp-servers/{srv.id}/dry-run",
-        json={"identity": "current_user", "user_id": str(uuid.uuid4()), "scope": "platform"},
+        json={"identity": "current_user", "user_id": foreign_user_id, "scope": "platform"},
         headers={"Authorization": f"Bearer {token}"},
     )
-    # Pydantic should accept the request (ignoring extra field) but the
-    # rendered response uses the AUTHENTICATED user, not the supplied user_id
     assert r.status_code == 200
     body = r.json()
-    # Rendering used the admin's id, not the supplied uuid
-    # (X-User-Id template renders ${user.id})
-    # We can't easily check this without inspecting; assert no error
-    assert body["errors"] == [] or "user_id" not in str(body["errors"])
+    assert body["resolved_headers"]["X-User-Id"] == str(user.id)
+    assert body["resolved_headers"]["X-User-Id"] != foreign_user_id
 
 
 async def test_dry_run_with_three_layers_appends_prompts(client):

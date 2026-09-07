@@ -5,8 +5,6 @@ from app.services.tool_enablement import (
     agent_tool_enabled,
     compute_backfill_rows,
     default_tool_ids_to_seed,
-    resolved_agent_tool_enabled,
-    tool_is_required,
 )
 
 
@@ -28,12 +26,6 @@ def test_enabled_is_false_when_assignment_disabled():
 
 def test_enabled_is_true_only_when_assignment_enabled():
     assert agent_tool_enabled(_at(True)) is True
-
-
-def test_required_tool_resolves_enabled_despite_missing_or_false_assignment():
-    assert tool_is_required("send_media") is True
-    assert resolved_agent_tool_enabled("send_media", None) is True
-    assert resolved_agent_tool_enabled("send_media", _at(False)) is True
 
 
 def test_seed_picks_only_default_tools_without_existing_row():

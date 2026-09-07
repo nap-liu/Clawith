@@ -1,4 +1,6 @@
 """Unit tests for tool result size-shaping."""
+import re
+
 from app.services.llm.tool_result_shaping import shape_tool_result
 
 
@@ -32,8 +34,10 @@ def test_marker_reports_dropped_char_count():
     s = "A" * 10_000
     out, truncated = shape_tool_result(s, max_chars=1000)
     assert truncated is True
-    # The marker should contain the number of dropped characters
-    assert "9" in out  # ~9000 dropped
+    marker = re.search(r"truncated: ([\d,]+) chars omitted", out)
+    assert marker is not None
+    dropped = int(marker.group(1).replace(",", ""))
+    assert dropped == len(s) - out.count("A")
 
 
 def test_zero_budget_returns_empty():
@@ -63,8 +67,7 @@ def test_negative_budget_degenerates_gracefully():
 def test_output_length_respects_budget():
     s = "x" * 100_000
     out, truncated = shape_tool_result(s, max_chars=1000)
-    # Output should be <= max_chars + reasonable marker overhead (~200 chars)
-    assert len(out) <= 1000 + 200
+    assert len(out) <= 1000
     assert truncated is True
 
 

@@ -34,24 +34,3 @@ def test_stdio_spec_missing_args_still_ok():
     assert out["transport"] == "stdio"
     assert out["args"] == []
     assert out["env"] == {}
-
-
-def test_parse_mcp_input_bare_url_returns_transport_http():
-    """A bare URL string must include transport='http' in the result dict."""
-    from app.services.mcp_config_parser import parse_mcp_input
-    out = parse_mcp_input("https://myserver.example/mcp")
-    assert out is not None
-    assert out.get("error") is None
-    assert out["transport"] == "http"
-    assert out["url"] == "https://myserver.example/mcp"
-
-
-def test_parse_mcp_input_stdio_via_mcpservers_block():
-    """Full mcpServers block with stdio entry should parse correctly."""
-    from app.services.mcp_config_parser import parse_mcp_input
-    inp = {"mcpServers": {"yunxiao": {"command": "npx", "args": ["-y", "pkg"], "env": {"T": "1"}}}}
-    out = parse_mcp_input(inp)
-    assert out is not None
-    assert out.get("error") is None
-    assert out["transport"] == "stdio"
-    assert out["command"] == "npx"

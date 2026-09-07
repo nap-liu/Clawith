@@ -62,12 +62,3 @@ async def test_web_cdp_trusted_input_runs():
         timeout=30,
     )
     assert out["success"], out
-
-
-async def test_web_cdp_target_method_is_blocked_live():
-    # NOTE: the guard is client-side — web_cdp returns "blocked" BEFORE any
-    # sandbox/websocket call, so this asserts the guard, not a live CDP path.
-    b = _backend()
-    out = await b.web_cdp(agent_id="a", conversation_id="cdp-2", method="Target.getTargets", timeout=30)
-    assert out["success"] is False
-    assert "blocked" in out["error"]

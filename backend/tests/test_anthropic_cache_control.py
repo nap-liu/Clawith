@@ -7,6 +7,8 @@ These tests lock in the new rule: put `cache_control` on the tail of the stable 
 """
 from __future__ import annotations
 
+import pytest
+
 from app.services.llm.client import AnthropicClient, LLMMessage
 
 
@@ -27,14 +29,16 @@ def _has_cache_control(block) -> bool:
 # ---------------------------------------------------------------------------
 # Case 1 - single-turn user: messages must NOT carry cache_control; system/tools do.
 # ---------------------------------------------------------------------------
-def test_single_user_turn_does_not_cache_messages_but_keeps_system_and_tools():
-    messages = [
-        LLMMessage(role="system", content="you are helpful"),
-        LLMMessage(role="user", content="hi"),
-    ]
+@pytest.mark.parametrize("with_system_and_tools", [False, True])
+def test_single_user_turn_does_not_cache_messages_but_keeps_system_and_tools(with_system_and_tools):
+    messages = [LLMMessage(role="user", content="hi")]
     tools = [
         {"type": "function", "function": {"name": "foo", "description": "", "parameters": {"type": "object"}}},
     ]
+    if with_system_and_tools:
+        messages.insert(0, LLMMessage(role="system", content="you are helpful"))
+    else:
+        tools = None
     payload = _build(messages, tools=tools)
 
     # Only one message in anthropic_messages (the user turn) — no cache_control anywhere on it.
@@ -47,24 +51,27 @@ def test_single_user_turn_does_not_cache_messages_but_keeps_system_and_tools():
         # str content can't carry cache_control by construction
         assert isinstance(only_msg["content"], str)
 
-    # system cache_control preserved on the static block.
-    assert payload["system"][0]["text"] == "you are helpful"
-    assert _has_cache_control(payload["system"][0])
-
-    # tools cache_control preserved on the last tool.
-    assert _has_cache_control(payload["tools"][-1])
+    if with_system_and_tools:
+        assert payload["system"][0]["text"] == "you are helpful"
+        assert _has_cache_control(payload["system"][0])
+        assert _has_cache_control(payload["tools"][-1])
+    else:
+        assert not payload.get("system")
+        assert not payload.get("tools")
 
 
 # ---------------------------------------------------------------------------
 # Case 2 - multi-turn: cache_control goes on messages[-2] (assistant), not messages[-1].
 # ---------------------------------------------------------------------------
-def test_multi_turn_places_cache_control_on_penultimate_assistant():
+@pytest.mark.parametrize("with_system", [False, True])
+def test_multi_turn_places_cache_control_on_penultimate_assistant(with_system):
     messages = [
-        LLMMessage(role="system", content="sys"),
         LLMMessage(role="user", content="round 0 question"),
         LLMMessage(role="assistant", content="round 0 answer"),
         LLMMessage(role="user", content="round 1 question with <context>volatile</context>"),
     ]
+    if with_system:
+        messages.insert(0, LLMMessage(role="system", content="sys"))
     payload = _build(messages)
 
     anthropic_messages = payload["messages"]
@@ -73,12 +80,11 @@ def test_multi_turn_places_cache_control_on_penultimate_assistant():
     # [-2] is assistant — last content block should carry cache_control.
     prefix_msg = anthropic_messages[-2]
     assert prefix_msg["role"] == "assistant"
-    if isinstance(prefix_msg["content"], list):
-        assert _has_cache_control(prefix_msg["content"][-1])
-    else:
-        # to_anthropic_format collapses single-text-block content back to str;
-        # in that case _build_payload must wrap it into a list with cache_control.
-        raise AssertionError("assistant content should have been wrapped into a list")
+    assert prefix_msg["content"] == [{
+        "type": "text",
+        "text": "round 0 answer",
+        "cache_control": {"type": "ephemeral"},
+    }]
 
     # [-1] is the fresh user turn — must NOT carry cache_control anywhere.
     last_msg = anthropic_messages[-1]
@@ -166,44 +172,3 @@ def test_cache_control_on_tool_result_is_top_level_not_nested():
     else:
         # inner is a plain string — fine.
         assert isinstance(inner, str)
-
-
-# ---------------------------------------------------------------------------
-# Case 5 - when [-2].content is a plain string, wrap it into a list and add cache_control.
-# ---------------------------------------------------------------------------
-def test_string_content_is_wrapped_into_list_with_cache_control():
-    # A single-text assistant turn collapses to `content = str` in to_anthropic_format,
-    # so this is the realistic path.
-    messages = [
-        LLMMessage(role="user", content="q0"),
-        LLMMessage(role="assistant", content="plain string answer"),
-        LLMMessage(role="user", content="q1"),
-    ]
-    payload = _build(messages)
-
-    prefix_msg = payload["messages"][-2]
-    assert prefix_msg["role"] == "assistant"
-    # Must now be a list because _build_payload wrapped it to attach cache_control.
-    assert isinstance(prefix_msg["content"], list), (
-        "string content at [-2] must be wrapped into a list so cache_control can attach"
-    )
-    assert len(prefix_msg["content"]) == 1
-    block = prefix_msg["content"][0]
-    assert block["type"] == "text"
-    assert block["text"] == "plain string answer"
-    assert _has_cache_control(block)
-
-
-# ---------------------------------------------------------------------------
-# Case 6 - first turn (len(messages) == 1): no cache_control on messages.
-# ---------------------------------------------------------------------------
-def test_first_turn_no_cache_control_on_messages():
-    messages = [LLMMessage(role="user", content="first ever message")]
-    payload = _build(messages)
-
-    assert len(payload["messages"]) == 1
-    only_msg = payload["messages"][0]
-    if isinstance(only_msg["content"], list):
-        assert not any(_has_cache_control(b) for b in only_msg["content"])
-    else:
-        assert isinstance(only_msg["content"], str)

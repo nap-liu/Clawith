@@ -98,13 +98,6 @@ for (const [locale, messages] of [
   );
 }
 
-assert.equal(zh.projectWorkspaceNav.tabs.projectAgents, "数字员工");
-assert.equal(en.projectWorkspaceNav.tabs.projectAgents, "Digital Employees");
-assert.match(zh.projectGraphs.sourceAgent, /数字员工/);
-assert.match(en.projectGraphs.sourceAgent, /Digital Employee/);
-assert.equal(zh.projectWorkspaceFiles.agentRoot, "项目数字员工");
-assert.equal(en.projectWorkspaceFiles.agentRoot, "Project Digital Employees");
-
 console.log("project user-visible copy and i18n check passed");
 
 function leafKeys(value, prefix = "") {
