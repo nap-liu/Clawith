@@ -66,4 +66,9 @@ Keep seeded string values within database column limits. Do not infer runtime vi
 - Do not run blanket formatters over pre-existing large files; keep formatting churn separate.
 - Tests assert observable inputs, outputs, persisted state, API responses, provider-adapter behavior, events, or UI.
 - Do not add tests that read source files and regex-match an implementation shape.
+- Product delivery takes priority over test volume. Use the smallest meaningful
+  acceptance check; reuse existing tests or direct runtime verification before
+  adding code. Do not write redundant tests, repetitive permutations, or tests
+  that merely mirror the implementation. Reserve new regression tests for
+  material behavior and risk, then stop validating when that scope passes.
 - Report evidence and distinguish observed results from inference.

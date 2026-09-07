@@ -56,6 +56,20 @@ authorized implementation task.
 
 ## 6. Validate in Docker
 
+- Optimize for prompt, working product delivery. Validation must answer a
+  concrete acceptance question or protect a material regression risk; producing
+  test code, increasing coverage, and expanding a test matrix are not outcomes.
+- Start with the smallest useful check of the changed user-visible behavior.
+  Reuse existing checks and focused runtime/browser inspection. Do not add test
+  files for reversible low-impact changes, implementation-shaped assertions,
+  repetitive permutations, or behavior already covered by an existing check.
+- Add automated regression tests only where they materially protect behavior
+  such as tenant access, durable state, concurrency, recovery, or external side
+  effects. Keep the cases few and representative; do not build a new testing
+  framework or fixture layer for a bounded product change.
+- Once acceptance evidence and the applicable gates pass, finish the delivery.
+  Do not broaden or repeat validation without a new change, failure, unresolved
+  material risk, or explicit user request. Record unverified limits directly.
 - Use the exact checkout mounted into one-shot containers and an isolated
   PostgreSQL database. Follow `.agents/rules/deploy.md` and
   `.agents/architecture/environments-and-operations.md`.
