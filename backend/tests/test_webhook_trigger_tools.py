@@ -3,29 +3,20 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
 
-from tests.test_webhook_modes import (
-    AGENT_TOOLS,
-    Agent,
-    AgentTool,
-    AgentTrigger,
-    AuditLog,
-    BUILTIN_TOOLS,
-    Identity,
-    Tool,
-    User,
-    _advance_webhook_trigger,
-    _isolate,
-    _make_persisted_webhook_trigger,
-    _merge_webhook_payloads,
-    async_session,
-    get_agent_tools_for_llm,
-    seed_builtin_tools,
-)
+from app.database import async_session
+from app.models.agent import Agent
+from app.models.audit import AuditLog
+from app.models.tool import AgentTool, Tool
+from app.models.trigger import AgentTrigger
+from app.models.user import Identity, User
+from app.services.agent_tools import get_agent_tools_for_llm
+from app.services.tool_seeder import seed_builtin_tools
+from app.services.trigger_daemon import _advance_webhook_trigger, _merge_webhook_payloads
+from tests.test_webhook_modes import _isolate, _make_persisted_webhook_trigger  # noqa: F401 - autouse fixture
 
 pytestmark = pytest.mark.asyncio
 
@@ -101,11 +92,14 @@ async def test_merge_rendered_batch_equals_deleted_batch():
             email=f"{uuid.uuid4().hex[:6]}@t.local",
             password_hash="x",
         )
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
-        db.add(agent); await db.flush()
+        db.add(agent)
+        await db.flush()
         # late arrival 'd' appended after lock → queue now [a,b,c,d], batch_size still 3
         trig = AgentTrigger(
             agent_id=agent.id, type="webhook", name="h",
@@ -114,7 +108,8 @@ async def test_merge_rendered_batch_equals_deleted_batch():
                     "_webhook_batch_size": 3, "_webhook_active": True},
             reason="r", is_enabled=True,
         )
-        db.add(trig); await db.commit()
+        db.add(trig)
+        await db.commit()
         _advance_webhook_trigger(db, trig, reply="ok")  # sync helper, mutates in place
         await db.commit()
         await db.refresh(trig)
@@ -126,17 +121,21 @@ async def test_advance_noop_for_legacy_mode():
     """Defensive: advance must not touch a legacy trigger if ever passed one."""
     async with async_session() as db:
         ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
-        db.add(agent); await db.flush()
+        db.add(agent)
+        await db.flush()
         trig = AgentTrigger(
             agent_id=agent.id, type="webhook", name="h",
             config={"token": "x", "_webhook_pending": True, "_webhook_payload": "p"},
             reason="r", is_enabled=True,
         )
-        db.add(trig); await db.commit()
+        db.add(trig)
+        await db.commit()
         await db.refresh(trig)
         _advance_webhook_trigger(db, trig, "ok")
         await db.commit()
@@ -263,57 +262,23 @@ async def test_set_trigger_legacy_omits_mode_key():
         assert "_webhook_queue" not in t.config
 
 
-async def test_set_trigger_tool_schema_contains_webhook_mode():
-    """The set_trigger tool definition exposes the webhook_mode property in its input schema."""
-    from app.services.agent_tools import AGENT_TOOLS
-
-    set_trigger_def = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
-    props = set_trigger_def["function"]["parameters"]["properties"]
-    assert "webhook_mode" in props
-    assert props["webhook_mode"]["type"] == "string"
-    assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
-
-
-# --- A+B: discoverability + scenario guidance in tool descriptions ---
-
-
-async def test_set_trigger_description_mentions_webhook_mode():
-    """A: top-level set_trigger description surfaces the webhook_mode capability."""
-    from app.services.agent_tools import AGENT_TOOLS
-
-    st = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
-    assert "webhook_mode" in st["function"]["description"]
-
-
-async def test_webhook_mode_description_has_scenario_guidance():
-    """B: webhook_mode description tells the agent WHEN to use each mode, not just what they do."""
-    st = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
-    desc = st["function"]["parameters"]["properties"]["webhook_mode"]["description"]
-    assert "FIFO" in desc and "once per event" in desc
-    assert "batch captured when execution starts" in desc
-
-
 # --- C: update_trigger can switch an existing hook's mode without clobbering token/queue ---
 
 
 async def _make_webhook_agent(cfg):
     async with async_session() as db:
         ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
-        db.add(agent); await db.flush()
+        db.add(agent)
+        await db.flush()
         db.add(AgentTrigger(agent_id=agent.id, type="webhook", name="h", config=cfg, reason="r", is_enabled=True))
         await db.commit()
         return agent.id
-
-
-async def test_update_trigger_schema_contains_webhook_mode():
-    ut = next(t for t in AGENT_TOOLS if t["function"]["name"] == "update_trigger")
-    props = ut["function"]["parameters"]["properties"]
-    assert "webhook_mode" in props
-    assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
 
 
 async def test_webhook_guidance_reaches_seeded_llm_runtime():
@@ -345,24 +310,22 @@ async def test_webhook_guidance_reaches_seeded_llm_runtime():
         for tool in await get_agent_tools_for_llm(aid)
         if tool["function"]["name"] in expected_names
     }
-    seeded_by_name = {
-        tool["name"]: tool for tool in BUILTIN_TOOLS if tool["name"] in expected_names
-    }
-    fallback_by_name = {
-        tool["function"]["name"]: tool["function"]
-        for tool in AGENT_TOOLS
-        if tool["function"]["name"] in expected_names
-    }
-
     assert set(runtime_by_name) == expected_names
-    for name in expected_names:
-        assert runtime_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
-        assert fallback_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
+    for tool in tool_rows:
+        runtime = runtime_by_name[tool.name]
+        assert runtime["parameters"] == tool.parameters_schema
+        mode = runtime["parameters"]["properties"]["webhook_mode"]
+        assert mode["type"] == "string"
+        assert mode["enum"] == ["legacy", "queue", "merge"]
 
+    assert "webhook" in runtime_by_name["set_trigger"]["parameters"]["properties"]["type"]["enum"]
+    assert "webhook_mode" in runtime_by_name["set_trigger"]["description"]
     set_mode_description = runtime_by_name["set_trigger"]["parameters"]["properties"][
         "webhook_mode"
     ]["description"]
     update_properties = runtime_by_name["update_trigger"]["parameters"]["properties"]
+    assert "FIFO" in set_mode_description and "once per event" in set_mode_description
+    assert "batch captured when execution starts" in set_mode_description
     assert "stored byte-for-byte" in set_mode_description
     assert "read the referenced file" in set_mode_description
     assert "does not convert or drain in-flight work" in update_properties["webhook_mode"][
@@ -428,11 +391,14 @@ async def test_update_trigger_webhook_mode_rejects_non_webhook():
 
     async with async_session() as db:
         ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
-        db.add(agent); await db.flush()
+        db.add(agent)
+        await db.flush()
         db.add(AgentTrigger(agent_id=agent.id, type="interval", name="iv", config={"minutes": 5}, reason="r", is_enabled=True))
         await db.commit()
         aid = agent.id
@@ -448,11 +414,14 @@ async def test_webhook_creation_message_includes_sdk_collection_guidance():
 
     async with async_session() as db:
         ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
-        db.add(agent); await db.commit()
+        db.add(agent)
+        await db.commit()
         aid = agent.id
     result = await _handle_set_trigger(aid, {"name": "collect", "type": "webhook", "config": {}, "reason": "collect reader info"})
     # SDK injection + API surface the agent needs

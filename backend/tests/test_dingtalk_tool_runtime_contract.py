@@ -25,6 +25,7 @@ async def _dispose_engine_after_test():
 
 
 async def test_seeded_dingtalk_guidance_reaches_actual_llm_tool_output():
+    await seed_builtin_tools()
     suffix = uuid.uuid4().hex[:10]
     async with async_session() as db:
         tenant = Tenant(
@@ -51,34 +52,34 @@ async def test_seeded_dingtalk_guidance_reaches_actual_llm_tool_output():
         await db.commit()
         agent_id = agent.id
 
-    await seed_builtin_tools()
-
     async with async_session() as db:
-        tool = (
-            await db.execute(
-                select(Tool).where(Tool.name == "start_dingtalk_channel_provisioning")
-            )
-        ).scalar_one()
-        assignment = (
-            await db.execute(
-                select(AgentTool).where(
-                    AgentTool.agent_id == agent_id,
-                    AgentTool.tool_id == tool.id,
-                )
-            )
-        ).scalar_one_or_none()
-        if assignment is None:
-            db.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True))
-        else:
-            assignment.enabled = True
+        names = {
+            "start_dingtalk_channel_provisioning",
+            "get_dingtalk_channel_provisioning_status",
+        }
+        rows = (await db.scalars(select(Tool).where(Tool.name.in_(names)))).all()
+        assert {row.name for row in rows} == names
+        for row in rows:
+            assert row.category == "communication"
+            assert row.is_default is True
+            assert "数字员工" in row.display_name + row.description
+            assert "Agent" not in row.display_name + row.description
+            assert "client_secret" not in row.description
+            db.add(AgentTool(agent_id=agent_id, tool_id=row.id, enabled=True))
         await db.commit()
 
-    runtime_tools = await get_agent_tools_for_llm(agent_id)
-    runtime = next(
-        tool["function"]
-        for tool in runtime_tools
-        if tool["function"]["name"] == "start_dingtalk_channel_provisioning"
-    )
+    runtime_by_name = {
+        tool["function"]["name"]: tool["function"]
+        for tool in await get_agent_tools_for_llm(agent_id)
+    }
+    for row in rows:
+        assert runtime_by_name[row.name]["parameters"] == row.parameters_schema
+        assert runtime_by_name[row.name]["description"] == row.description
+        assert row.parameters_schema["type"] == "object"
+    status = runtime_by_name["get_dingtalk_channel_provisioning_status"]["parameters"]
+    assert status["required"] == ["provisioning_id"]
+    assert status["properties"]["provisioning_id"]["type"] == "string"
+    runtime = runtime_by_name["start_dingtalk_channel_provisioning"]
 
     assert "已配置时默认" in runtime["description"]
     assert "无需再次授权" in runtime["description"]

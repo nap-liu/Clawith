@@ -155,12 +155,12 @@ def _make_participant(ref_id=None):
 
 
 @pytest.mark.asyncio
-async def test_consult_routes_through_unified_loop_and_returns_reply():
+@pytest.mark.parametrize("a2a_async_enabled", [False, True])
+async def test_consult_routes_through_unified_loop_and_returns_reply(a2a_async_enabled):
     """Consult must call call_llm_with_failover and return a string containing the reply."""
     from app.services.agent_tools import _send_message_to_agent
 
-    from_agent_id = uuid.uuid4()
-    target_id = uuid.uuid4()
+    from_agent_id, target_id = sorted([uuid.uuid4(), uuid.uuid4()], key=str)
     model_id = uuid.uuid4()
     session_id = uuid.uuid4()
 
@@ -179,7 +179,7 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
     model.supports_vision = False
 
     tenant = MagicMock()
-    tenant.a2a_async_enabled = False  # force consult path
+    tenant.a2a_async_enabled = a2a_async_enabled
 
     db_main = RecordingDB(responses=[
         DummyResult(scalar_value=source_agent),
@@ -224,7 +224,7 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
 
     assert "Bob replied" in result
     assert "Unified loop reply" in result
-    mock_failover.assert_called_once()
+    mock_failover.assert_awaited_once()
 
     # Verify agent_id passed to failover is target.id (A2A id-split: run model = target)
     call_kw = mock_failover.call_args.kwargs

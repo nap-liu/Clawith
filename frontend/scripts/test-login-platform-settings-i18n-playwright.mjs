@@ -1,6 +1,8 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { chromium } from 'playwright';
 
-const baseUrl = process.env.TEST_BASE_URL || 'http://local-ai.yeyecha.com:3008';
+const baseUrl = process.env.TEST_BASE_URL || 'http://localhost:3008';
 const artifactDir = process.env.ARTIFACT_DIR || '/artifacts';
 const browser = await chromium.launch({ headless: true });
 
@@ -117,18 +119,16 @@ try {
   await login.goto(`${baseUrl}/login`, { waitUntil: 'networkidle' });
   await login.getByRole('button', { name: '钉钉' }).waitFor();
   await login.getByRole('button', { name: 'SSO登录' }).waitFor();
-  if (await login.getByText('测试企业', { exact: true }).count()) {
-    throw new Error('tenant SSO notice card is still visible');
-  }
-  if (await login.getByText('此域名已启用企业单点登录 (SSO)。', { exact: true }).count()) {
-    throw new Error('domain SSO notice is still visible');
-  }
-  if (await login.getByText('平台已关闭账号密码登录，请使用已启用的 SSO 登录。', { exact: true }).count()) {
-    throw new Error('password-login-disabled notice is still visible');
-  }
-  if (await login.getByText('或', { exact: true }).count()) {
-    throw new Error('or divider remains without a password form');
-  }
+  assert.equal(await login.locator('input[type="password"]').count(), 0,
+    'disabled password login must remove its input');
+  assert.equal(await login.locator('form button[type="submit"]').count(), 0,
+    'disabled password login must remove its submit action');
+  const zhCopy = JSON.parse(readFileSync(new URL('../src/i18n/zh.json', import.meta.url), 'utf8'));
+  assert.equal(await login.getByRole('link', { name: zhCopy.auth.goRegister, exact: true }).count(), 0,
+    'disabled registration must remove its entry');
+  assert.equal(await login.locator('a[href="/forgot-password"]').count(), 0);
+  assert.equal(await login.getByRole('button', { name: 'SSO登录' }).isEnabled(), true,
+    'SSO must remain available when password login is disabled');
   await login.screenshot({ path: `${artifactDir}/login-mobile-clean.png`, fullPage: true });
   await login.close();
 

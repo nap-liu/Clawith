@@ -12,7 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.database import engine
 from a2a_msg_type_support import DummyResult, RecordingDB
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_engine_between_tests():
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 @pytest.fixture(autouse=True)
@@ -207,82 +215,6 @@ async def test_task_delegate_creates_focus_and_trigger():
     assert arm_kwargs["target"] is target_agent
     assert arm_kwargs["watch_session_id"] == str(session_id)
     assert arm_kwargs["outbound_message_id"] is not None
-
-
-@pytest.mark.asyncio
-async def test_consult_calls_llm_synchronously():
-    """consult msg_type should route through call_llm_with_failover and return reply."""
-    from app.services.agent_tools import _send_message_to_agent
-
-    from_agent_id = uuid.uuid4()
-    target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    model_id = uuid.uuid4()
-    src_participant = _make_participant(ref_id=from_agent_id)
-    tgt_participant = _make_participant(ref_id=target_id)
-    source_agent = _make_agent(from_agent_id, name="Alice")
-    target_agent = _make_agent(target_id, name="Bob", primary_model_id=model_id)
-
-    session = MagicMock()
-    session.id = session_id
-    session.last_message_at = None
-
-    model = MagicMock()
-    model.id = model_id
-    model.enabled = True
-    model.supports_vision = False
-
-    # DB responses for the main session (outer async_session context):
-    # 1. source agent lookup
-    # 2. target agent exact-match lookup
-    # 3. relationship check
-    # 4. src_participant lookup
-    # 5. tgt_participant lookup
-    # 6. chat_session lookup
-    # 7. tenant feature-flag lookup
-    # 8. primary LLMModel lookup (consult branch)
-    # 9. load_messages_for_session: ChatMessage rows
-    # 10. load_messages_for_session: ChatCompaction marker
-    db = RecordingDB(responses=[
-        DummyResult(scalar_value=source_agent),
-        DummyResult(scalars_list=[target_agent]),
-        DummyResult(scalar_value=rel_id),
-        DummyResult(scalar_value=src_participant),
-        DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalars_list=[session]),
-        DummyResult(scalar_value=_make_tenant()),
-        DummyResult(scalar_value=model),
-        DummyResult(scalars_list=[]),   # ChatMessage rows (empty history)
-        DummyResult(scalar_value=None), # ChatCompaction marker (none)
-    ])
-
-    # DB for reply-save block (second async_session context)
-    db2 = RecordingDB(responses=[
-        DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=MagicMock(message_meta={})),
-    ])
-
-    with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
-         patch("app.services.llm.call_llm_with_failover",
-               new_callable=AsyncMock, return_value="Here is the answer") as mock_failover, \
-         patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
-
-        mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db, db2])
-        mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        result = await _send_message_to_agent(from_agent_id, {
-            "agent_id": str(target_id),
-            "message": "What is 2+2?",
-            "msg_type": "consult",
-        })
-
-    assert "Bob replied" in result
-    assert "Here is the answer" in result
-    mock_failover.assert_awaited_once()
-    # Verify agent_id passed to failover is target.id (not session_agent_id)
-    call_kwargs = mock_failover.call_args
-    assert call_kwargs.kwargs["agent_id"] == target_agent.id
 
 
 @pytest.mark.asyncio

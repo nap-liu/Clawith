@@ -1,33 +1,51 @@
-"""The web_* RPA builtin tool definitions are well-formed and non-default."""
+"""Opt-in browser contracts reach the LLM through persisted tool assignments."""
+
+from urllib.parse import urlsplit
+
 import pytest
+from sqlalchemy import select
 
-from app.services.tool_seeder import BUILTIN_TOOLS
-
-WEB_TOOLS = ["web_open", "web_eval", "web_cdp", "web_screenshot"]
-
-
-def _tool(name):
-    return next((t for t in BUILTIN_TOOLS if t["name"] == name), None)
-
-
-@pytest.mark.parametrize("name", WEB_TOOLS)
-def test_tool_registered_non_default_browser(name):
-    t = _tool(name)
-    assert t is not None, f"{name} not seeded"
-    assert t["is_default"] is False
-    assert t["category"] == "browser"
+from app.database import async_session
+from app.models.tool import AgentTool, Tool
+from app.services.agent_tools import get_agent_tools_for_llm
+from app.services.tool_seeder import seed_builtin_tools
+from tests.test_agent_mcp_lifecycle import _isolate, _make_agents  # noqa: F401 - autouse fixture
 
 
-@pytest.mark.parametrize("name", WEB_TOOLS)
-def test_tool_targets_aio_sandbox(name):
-    t = _tool(name)
-    assert t["config"]["sandbox_type"] == "aio_sandbox"
-    assert t["config"]["api_url"] == "http://aio-sandbox:8080"
+@pytest.mark.asyncio
+async def test_seeded_browser_tools_require_assignment_and_expose_parameters():
+    required = {
+        "browse": ["url"], "web_open": ["url"], "web_eval": ["expression"],
+        "web_cdp": ["method"], "web_screenshot": [],
+    }
+    await seed_builtin_tools()
+    _, (agent_id,) = await _make_agents(1)
+    async with async_session() as db:
+        rows = (await db.scalars(select(Tool).where(Tool.name.in_(required)))).all()
+        assert {row.name for row in rows} == set(required)
+        for row in rows:
+            assert row.is_default is False
+            assert row.category == "browser"
+            assert row.config["sandbox_type"] == "aio_sandbox"
+            endpoint = urlsplit(row.config["api_url"])
+            assert endpoint.scheme in {"http", "https"} and endpoint.hostname
+        assert not (await db.scalars(
+            select(AgentTool).where(AgentTool.agent_id == agent_id)
+        )).all()
+        visible = await get_agent_tools_for_llm(agent_id)
+        assert set(required).isdisjoint(t["function"]["name"] for t in visible)
+        db.add_all(AgentTool(agent_id=agent_id, tool_id=row.id, enabled=True) for row in rows)
+        await db.commit()
 
-
-def test_required_params():
-    assert _tool("web_open")["parameters_schema"]["required"] == ["url"]
-    assert _tool("web_eval")["parameters_schema"]["required"] == ["expression"]
-    assert _tool("web_cdp")["parameters_schema"]["required"] == ["method"]
-    # web_screenshot takes no required params
-    assert _tool("web_screenshot")["parameters_schema"].get("required", []) == []
+    runtime = {
+        item["function"]["name"]: item["function"]["parameters"]
+        for item in await get_agent_tools_for_llm(agent_id)
+    }
+    for row in rows:
+        schema = runtime[row.name]
+        assert schema == row.parameters_schema
+        assert schema.get("required", []) == required[row.name]
+        for name in required[row.name]:
+            assert schema["properties"][name]["type"] == "string"
+    for name in ("extract", "screenshot"):
+        assert runtime["browse"]["properties"][name]["type"] == "boolean"

@@ -7,17 +7,13 @@ serves the production SDK unchanged and a frame-compatible local OAuth provider.
 from __future__ import annotations
 
 import json
-import subprocess
-import tempfile
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import parse_qs, quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlencode, urlparse
 
-from websockets.sync.client import connect
+from chromium_browser import ChromiumSession
 
 SDK_SOURCE = (Path(__file__).resolve().parent.parent / "public/sdk/clawith.js").read_bytes()
 
@@ -54,8 +50,10 @@ class BrowserFixtureHandler(BaseHTTPRequestHandler):
 addEventListener('message', event => {{
   if (event.source === document.querySelector('#report').contentWindow
       && event.data && event.data.type === 'published-page:sdk-auth-start') {{
-    document.querySelector('#report').src = '/api/sdk/auth/start?return_to=' +
-      encodeURIComponent('/p/sdk-browser');
+    const report = document.querySelector('#report');
+    const reportUrl = new URL(report.src);
+    report.src = reportUrl.origin + '/api/sdk/auth/start?return_to=' +
+      encodeURIComponent(reportUrl.href);
     return;
   }}
   if (event.data && event.data.type === 'sdk-browser-result') {{
@@ -157,98 +155,6 @@ addEventListener('message', event => {{
             self._send(200, b'{"accepted":true}', "application/json")
             return
         self._send(404, b"not found", "text/plain")
-
-
-class ChromiumSession:
-    def __init__(self) -> None:
-        self._profile = tempfile.TemporaryDirectory(prefix="clawith-sdk-browser-")
-        self._process = subprocess.Popen(
-            [
-                "chromium",
-                "--headless",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-background-networking",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=9222",
-                f"--user-data-dir={self._profile.name}",
-                "about:blank",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.monotonic() + 15
-        while True:
-            try:
-                with urlopen("http://127.0.0.1:9222/json/version", timeout=1):
-                    break
-            except OSError:
-                if self._process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError("Chromium DevTools endpoint did not start")
-                time.sleep(0.1)
-
-    def close(self) -> None:
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait(timeout=5)
-        self._profile.cleanup()
-
-    def report_result(self, url: str) -> dict:
-        request = Request(
-            f"http://127.0.0.1:9222/json/new?{quote(url, safe='')}",
-            method="PUT",
-        )
-        with urlopen(request, timeout=5) as response:
-            target = json.load(response)
-        next_id = 0
-        with connect(target["webSocketDebuggerUrl"], max_size=None) as websocket:
-
-            def evaluate(expression: str) -> object:
-                nonlocal next_id
-                next_id += 1
-                request_id = next_id
-                websocket.send(
-                    json.dumps(
-                        {
-                            "id": request_id,
-                            "method": "Runtime.evaluate",
-                            "params": {"expression": expression, "returnByValue": True},
-                        }
-                    )
-                )
-                while True:
-                    message = json.loads(websocket.recv())
-                    if message.get("id") == request_id:
-                        if "exceptionDetails" in message.get("result", {}):
-                            raise AssertionError(message["result"]["exceptionDetails"])
-                        return message["result"]["result"].get("value")
-
-            deadline = time.monotonic() + 20
-            raw_result = None
-            while time.monotonic() < deadline:
-                raw_result = evaluate(
-                    "document.querySelector('#result') && document.querySelector('#result').textContent"
-                )
-                if raw_result and raw_result != "waiting":
-                    break
-                time.sleep(0.1)
-            else:
-                raise AssertionError(
-                    f"browser result timed out ({raw_result!r}); requests={BrowserFixtureHandler.request_paths}"
-                )
-        close_request = Request(
-            f"http://127.0.0.1:9222/json/close/{target['id']}",
-            method="PUT",
-        )
-        with urlopen(close_request, timeout=5):
-            pass
-        return json.loads(str(raw_result))
 
 
 def assert_sdk_result(result: dict, *, top_level: bool, retry: bool) -> None:

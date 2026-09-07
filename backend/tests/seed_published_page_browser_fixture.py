@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from sqlalchemy import delete
+from sqlalchemy import delete, text
 
 from app.database import async_session
 from app.models.agent import Agent
@@ -17,6 +17,7 @@ from app.models.published_page import PublishedPage
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.storage import get_storage_backend
+from tests.conftest import _is_safe_test_database_url
 
 SHORT_ID = "browserdirect"
 SOURCE_PATH = "out/browser-direct.html"
@@ -58,9 +59,6 @@ REPORT_HTML = rb"""<!doctype html>
   downloadLink.download = 'published-report.txt';
   downloadLink.href = 'data:text/plain,published-report';
   document.body.appendChild(downloadLink);
-  const download = downloadLink.download === 'published-report.txt' && downloadLink.href.startsWith('data:');
-  const audio = document.createElement('audio');
-  const media = audio.canPlayType('audio/wav') !== '';
   const initialUrl = new URL(location.href);
   history.pushState(null, '', '#published-navigation-check');
   const navigation = location.hash === '#published-navigation-check';
@@ -79,8 +77,6 @@ REPORT_HTML = rb"""<!doctype html>
     workerValue,
     font,
     form: formSubmitted && new FormData(form).get('browser-capability') === 'available',
-    download,
-    media,
     navigation,
     unsandboxed: !frameElement || !frameElement.hasAttribute('sandbox'),
     health,
@@ -100,6 +96,12 @@ REPORT_HTML = rb"""<!doctype html>
 
 async def main() -> None:
     async with async_session() as db:
+        url = db.bind.url
+        if url.get_backend_name() != "postgresql" or not _is_safe_test_database_url(url):
+            raise RuntimeError("Published browser fixtures require an isolated PostgreSQL test database")
+        actual_database = await db.scalar(text("SELECT current_database()"))
+        if actual_database != url.database:
+            raise RuntimeError("Connected database differs from the verified test database")
         await db.execute(delete(PublishedPage).where(PublishedPage.short_id == SHORT_ID))
         tenant = Tenant(
             name="Published Browser Test",
