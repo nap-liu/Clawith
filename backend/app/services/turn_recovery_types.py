@@ -40,5 +40,3 @@ def _recovery_max_age_hours() -> float:
         logger.warning(f"[turn_recovery] invalid TURN_RECOVERY_MAX_AGE_HOURS={raw!r}; using default")
         return DEFAULT_RECOVERY_MAX_AGE_HOURS
     return max(value, 0.0)
-
-
