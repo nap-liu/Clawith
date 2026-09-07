@@ -275,7 +275,11 @@ async def _call_llm_handle_plain_text_round(
                 )
                 if segment and segment.strip()
             )
-            or "[LLM returned empty content]"
+            or make_llm_failure(
+                code="empty_model_response",
+                message_key="errors.emptyModelResponse",
+                details={"round": round_i + 1},
+            )
         ),
     )
 
@@ -289,8 +293,20 @@ async def _call_llm_execute_tool_round(
     logger.info(f"[LLM] Round {round_i + 1}: {len(response.tool_calls)} tool call(s)")
     sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
     if retry_instruction:
+        if state.invalid_tool_call_retries >= 1:
+            if state.agent_id and state.unsaved_usage.total_tokens > 0:
+                await record_token_usage(state.agent_id, state.unsaved_usage)
+            await state.client_guard.close()
+            _call_llm_log_turn_timing(state, "invalid_tool_call", round_i + 1)
+            return make_llm_failure(
+                code="invalid_tool_call_stream",
+                message_key="errors.invalidToolCallStream",
+                details={"round": round_i + 1},
+            )
+        state.invalid_tool_call_retries += 1
         state.api_messages.append(LLMMessage(role="user", content=retry_instruction))
         return None
+    state.invalid_tool_call_retries = 0
 
     conf_call = find_request_confirmation_call(sanitized_tool_calls)
     if conf_call is not None:
@@ -347,19 +363,21 @@ async def _call_llm_execute_tool_round(
         )
         return None
 
-    _round_sigs = [_tool_call_signature(tc) for tc in (sanitized_tool_calls or [])]
-    state.repeat_streaks = _update_repeat_streaks(state.repeat_streaks, _round_sigs)
-    _max_repeat = max(state.repeat_streaks.values(), default=0)
-    if _max_repeat >= REPEAT_TOOL_CALL_BREAK:
+    repeat_period = _repeating_tool_period(state.tool_round_history, sanitized_tool_calls)
+    if repeat_period is not None:
         logger.warning(
-            f"[LLM] Repeated tool-call guard tripped (streak={_max_repeat}, "
+            f"[LLM] Repeated tool-call guard tripped (period={repeat_period}, "
             f"round {round_i + 1}, agent={state.agent_id}); stopping loop gracefully."
         )
         if state.agent_id and state.unsaved_usage.total_tokens > 0:
             await record_token_usage(state.agent_id, state.unsaved_usage)
         await state.client_guard.close()
-        _call_llm_log_turn_timing(state, "repeat_guard", round_i + 1)
-        return REPEAT_TOOL_CALL_BREAK_MESSAGE
+        _call_llm_log_turn_timing(state, f"tool_loop_period_{repeat_period}", round_i + 1)
+        return make_llm_failure(
+            code=f"tool_loop_period_{repeat_period}",
+            message_key="errors.toolLoopStopped",
+            details={"period": repeat_period, "round": round_i + 1},
+        )
 
     await _call_llm_before_tool_execution_guard(state)
 
@@ -503,7 +521,13 @@ async def _call_llm_execute_tool_round(
 
     await _emit_round_done_events(round_done_records, state.on_tool_call)
 
-    if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
+    observation = _tool_round_observation(
+        sanitized_tool_calls or [],
+        [record.provider_content for record in round_done_records],
+    )
+    if observation:
+        state.tool_round_history = [*state.tool_round_history, observation][-6:]
+    if _repeating_tool_period(state.tool_round_history) is not None:
         state.api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
     return None

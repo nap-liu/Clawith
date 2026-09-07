@@ -286,18 +286,43 @@ def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
 
 
 def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict] | None, str | None]:
-    """Return OpenAI-compatible tool calls, or a retry instruction if args are invalid."""
+    """Validate one provider tool-call round atomically before use or persistence."""
+    if not tool_calls or len(tool_calls) > 128:
+        return None, (
+            "Your previous tool-call response was incomplete. Retry once with between 1 and 128 "
+            "complete function calls. Do not explain; only return valid tool calls."
+        )
+
     sanitized: list[dict] = []
+    call_ids: set[str] = set()
     for tc in tool_calls:
-        fn = tc.get("function") or {}
-        tool_name = fn.get("name") or ""
+        if not isinstance(tc, dict):
+            return None, (
+                "Your previous tool-call response was malformed. Retry once with complete function "
+                "calls. Do not explain; only return valid tool calls."
+            )
+        fn = tc.get("function")
+        if tc.get("type") not in (None, "function") or not isinstance(fn, dict):
+            return None, (
+                "Your previous tool-call response was malformed. Retry once with complete function "
+                "calls. Do not explain; only return valid tool calls."
+            )
+        call_id = str(tc.get("id") or "").strip()
+        tool_name = str(fn.get("name") or "").strip()
+        if not call_id or call_id in call_ids or not tool_name:
+            return None, (
+                "Your previous tool-call response had a missing or duplicate call ID, or a missing "
+                "function name. Retry once with complete, uniquely identified function calls. "
+                "Do not explain; only return valid tool calls."
+            )
+        call_ids.add(call_id)
         raw_args = fn.get("arguments", "{}")
 
         if raw_args is None or raw_args == "":
             args_str = "{}"
         elif isinstance(raw_args, str):
             try:
-                json.loads(raw_args)
+                parsed_args = json.loads(raw_args)
             except json.JSONDecodeError as exc:
                 logger.warning(
                     "[LLM] Invalid tool arguments JSON for {}: {} at pos {}",
@@ -312,8 +337,14 @@ def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict]
                     "Escape all quotes and newlines inside long HTML, CSS, JavaScript, or markdown content. "
                     "Do not explain; only retry with a valid tool call."
                 )
+            if not isinstance(parsed_args, dict):
+                return None, (
+                    "Your previous tool call arguments were valid JSON but not a JSON object. "
+                    f"The affected tool was `{tool_name}`. Retry once with "
+                    "`function.arguments` as one JSON object string."
+                )
             args_str = raw_args
-        elif isinstance(raw_args, (dict, list)):
+        elif isinstance(raw_args, dict):
             args_str = json.dumps(raw_args, ensure_ascii=False)
         else:
             return None, (
@@ -323,7 +354,7 @@ def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict]
             )
 
         new_tc = {
-            "id": tc.get("id", ""),
+            "id": call_id,
             "type": tc.get("type") or "function",
             "function": {
                 "name": tool_name,
@@ -428,7 +459,7 @@ async def _process_tool_call(
         row_id = persisted.get(str(done_evt.get("call_id") or "")) if persisted else None
         if persisted:
             done_evt["_durable_persisted"] = True
-        record = _RoundDoneToolCall(event=done_evt, row_id=row_id)
+        record = _RoundDoneToolCall(event=done_evt, row_id=row_id, provider_content=error_msg)
         if round_done_records is not None:
             round_done_records.append(record)
         else:
@@ -460,7 +491,7 @@ async def _process_tool_call(
         row_id = persisted.get(str(done_evt.get("call_id") or "")) if persisted else None
         if persisted:
             done_evt["_durable_persisted"] = True
-        record = _RoundDoneToolCall(event=done_evt, row_id=row_id)
+        record = _RoundDoneToolCall(event=done_evt, row_id=row_id, provider_content=result)
         if round_done_records is not None:
             round_done_records.append(record)
         else:
@@ -592,7 +623,11 @@ async def _process_tool_call(
             if isinstance(persisted_done_rows, dict):
                 done_row_id = persisted_done_rows.get(str(done_evt.get("call_id") or ""))
 
-    done_record = _RoundDoneToolCall(event=done_evt, row_id=done_row_id)
+    done_record = _RoundDoneToolCall(
+        event=done_evt,
+        row_id=done_row_id,
+        provider_content=tool_content,
+    )
     if round_done_records is not None:
         round_done_records.append(done_record)
     else:

@@ -39,8 +39,8 @@ CURRENT_BACKEND_DIGEST=
 CURRENT_FRONTEND_DIGEST=
 CURRENT_AIO_DIGEST=
 RELEASE_SHA=
-UPSTREAM_VERSION=
-RELEASE_ID=v<UPSTREAM_VERSION>-<RELEASE_SHA7>
+PRODUCT_VERSION=
+RELEASE_ID=v<PRODUCT_VERSION>-<RELEASE_SHA7>
 NEW_BACKEND_DIGEST=
 NEW_FRONTEND_DIGEST=
 COMPOSE_PROJECT=
@@ -58,11 +58,13 @@ release when a declared condition fires.
 3. If main moves, integrate it, repeat the diff audit and required Docker gates,
    and select a new final SHA.
 4. Confirm the candidate checkout is clean and backend/frontend `VERSION` files
-   match the current upstream semantic version.
+   match the independently maintained product version. This fork started at
+   upstream `1.10.3`; newer upstream releases do not change its version. Do not
+   bump VERSION without an explicit product version decision.
 5. Run the user-visible wording scanner and confirm changed/new hand-written
    source files comply with the 800-line gate.
 
-The private release identifier is `v<upstream-version>-<release-sha7>`. Tag the
+The private release identifier is `v<product-version>-<release-sha7>`. Tag the
 explicit immutable SHA, never a branch name. Backend, worker, connector,
 frontend, compose references, OCI labels, and the release record must agree on
 that SHA.
@@ -76,24 +78,40 @@ this runbook.
 All validation runs in Docker against the exact release checkout and isolated
 state. Production is not a development test target.
 
-Required evidence:
+Select validation from the final diff and its affected callers and contracts.
+Run affected tests by default; the full backend or frontend suite is not a
+routine release gate. Broaden only for demonstrated wider impact (such as
+shared dependency or contract changes), unresolved affected failures, or an
+explicit user request. Record the reason before broadening.
 
-1. `git diff --check`, clean worktree, and final diff review;
-2. migrations from the current production parent to head on an isolated
-   PostgreSQL database plus a production-schema-derived copy;
-3. backend compile/import checks and the full backend test suite;
-4. frontend prebuild checks, TypeScript, and production build;
+Required evidence, with applicability recorded for each conditional gate:
+
+1. `git diff --check`, clean worktree, final diff review, and the 800-line gate;
+2. a mapping of changed behavior to affected API, database, event, IM-adapter,
+   or browser tests, with their Docker results;
+3. compile/import checks for affected backend modules;
+4. frontend prebuild, TypeScript, and behavior checks when frontend code or its
+   contracts change; both immutable production images still build under section 4;
 5. user-visible wording/i18n checks;
-6. focused API, database, event, IM-adapter, and browser behavior for the change;
-7. local port-3008 validation for UI/cross-layer changes;
-8. rendered `frontend/nginx.conf.template` validation when proxy, WebSocket,
+6. local port-3008 validation for UI/cross-layer changes;
+7. rendered `frontend/nginx.conf.template` validation when proxy, WebSocket,
    uploads, object storage, or MCP routing is in scope;
-9. tenant/ownership isolation tests for every changed query or capability;
-10. previous-image compatibility against the migrated schema;
-11. rollback helper drills for new seeded tools or compatibility boundaries.
+8. tenant/ownership isolation tests when queries or authorization boundaries change;
+9. migrations from the current production parent to head on isolated PostgreSQL
+   and a production-schema-derived copy when schema/migrations change, plus
+   previous-image compatibility against the migrated schema;
+10. rollback helper drills when seeds or compatibility boundaries change.
 
-Record exact commands, pass/fail counts, skipped tests, and baseline comparison.
-Never report a suite as green when it has failures. Raw `Traceback` text alone
+A code-only adapter hotfix with unchanged schema, seeds, dependencies, and UI
+does not require migration drills, a production-schema copy, browser checks, or
+unrelated full suites. The unchanged surfaces and omission reasons must be
+explicit in its release record.
+
+Record exact commands, pass/fail counts, skipped and unrun checks, and any
+interrupted attempts. Compare failing affected checks against the same checks
+on the parent; unrelated failures do not require a full baseline rerun or
+automatically block a bounded release. Never report a failing or interrupted
+suite as green. Raw `Traceback` text alone
 is not a health signal; use startup completion, health, precise errors, and
 observable behavior.
 
@@ -168,8 +186,8 @@ from current configuration):
 ```bash
 RELEASE_SHA=<full-release-sha>
 RELEASE_SHA7=${RELEASE_SHA:0:7}
-UPSTREAM_VERSION=<upstream-version>
-RELEASE_ID="v${UPSTREAM_VERSION}-${RELEASE_SHA7}"
+PRODUCT_VERSION=<repository-product-version>
+RELEASE_ID="v${PRODUCT_VERSION}-${RELEASE_SHA7}"
 BACKEND_REPOSITORY=<approved-backend-image-repository>
 FRONTEND_REPOSITORY=<approved-frontend-image-repository>
 CURRENT_SHA7=<current-release-sha7>
@@ -397,6 +415,33 @@ recall, the existing helper is:
 ```bash
 python -m app.scripts.rollback_im_recall
 ```
+
+Before rollback to a binary that predates explicit `/continue`, snapshot the
+eligible anchor IDs and generations with the candidate image's
+`python -m app.scripts.resume_turns_after_rollback snapshot <snapshot-file>`.
+Record any additional old-instance turns accepted during replacement separately;
+do not replace this identity list with a scan of new live work. Render the old
+application roles with `TURN_RECOVERY_ENABLED=false`. Its startup must not replay
+the new continuation's control/failure audit rows. After the four-role rollback,
+run the candidate image once with its entrypoint overridden:
+
+```bash
+docker compose -p <production-compose-project> -f <candidate-compose> \
+  run --rm --no-deps --entrypoint python backend \
+  -m app.scripts.resume_turns_after_rollback apply <mounted-snapshot-file>
+```
+
+This uses the shared startup recovery lease and recovers only snapshotted
+identities that still own their generation, including ordinary turns. It never
+claims new turns accepted by the old roles after replacement. Verify each
+selected anchor's terminal/suspended
+state and delivery; a skipped/failed anchor is not a successful handoff. Keep the
+candidate image available for any unresolved continuation or suspended tool.
+Only after checking that no unfinished explicit continuation remains, restore
+the previous startup-recovery setting in canonical compose without restarting
+roles. Do not use a second concurrent recovery implementation or rewrite audit
+history to make old code accept it. Drill both just-admitted and tool-tail
+continuations against the old image before release.
 
 For Agent self-service settings, use the same exact-tool cleanup contract:
 

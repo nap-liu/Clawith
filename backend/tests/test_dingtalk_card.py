@@ -144,7 +144,23 @@ async def test_message_card_escapes_visible_mention_labels(monkeypatch):
     }
 
 
-async def test_message_card_keeps_full_long_content_and_limits_preview(monkeypatch):
+@pytest.mark.parametrize(
+    "content",
+    [
+        "# 超长组合正文\n\n" + ("完整内容不得截断 **Markdown** `code`。" * 80),
+        "📋 今日待完成事项\n\n| 门店 | 数量 |\n|---|---|\n" + ("| 示例门店 | 9 |\n" * 30),
+        "📋🔴" * 80,
+        "👩🏽‍💻" * 80,
+    ],
+    ids=["long-markdown", "emoji-table", "all-emoji", "joined-emoji"],
+)
+@pytest.mark.parametrize(
+    ("at_user_ids", "mention_text"),
+    [({"@ALL": "@ALL"}, "@所有人"), ({"staff-zhangsan": "张三"}, "@张三")],
+)
+async def test_message_card_keeps_full_long_content_and_limits_preview(
+    monkeypatch, content, at_user_ids, mention_text
+):
     calls: list[dict] = []
 
     async def fake_token(*_args, **_kwargs):
@@ -156,8 +172,6 @@ async def test_message_card_keeps_full_long_content_and_limits_preview(monkeypat
         "AsyncClient",
         lambda **_kwargs: _Client(calls),
     )
-    content = "# 超长组合正文\n\n" + ("完整内容不得截断 **Markdown** `code`。" * 80)
-
     result = await dingtalk_card.send_message_card(
         app_id="ding-app",
         app_secret="ding-secret",
@@ -165,21 +179,23 @@ async def test_message_card_keeps_full_long_content_and_limits_preview(monkeypat
         out_track_id="message.track-id",
         content=content,
         external_conv_id="dingtalk_group_open-conversation-id",
-        at_user_ids={"@ALL": "@ALL"},
+        at_user_ids=at_user_ids,
     )
 
     assert result == "message.track-id"
     body = calls[0]["json"]
     card_data = body["cardData"]["cardParamMap"]
     assert card_data["content"] == (
-        f"{content}\n\n"
-        "<font colorTokenV2=common_blue1_color>@所有人</font>"
+        f"{content.rstrip()}\n\n"
+        f"<font colorTokenV2=common_blue1_color>{mention_text}</font>"
     )
     assert card_data["sys_full_json_obj"] == '{"config":{"autoLayout":true}}'
     preview = body["imGroupOpenSpaceModel"]["lastMessageI18n"]["ZH_CN"]
-    assert len(preview) == 100
+    assert len(preview) <= 40
+    assert len(preview.encode("utf-16-le")) // 2 <= 80
     assert preview.endswith("…")
     assert body["imGroupOpenSpaceModel"]["lastMessageI18n"]["EN_US"] == preview
+    assert body["imGroupOpenDeliverModel"]["atUserIds"] == at_user_ids
 
 
 async def test_confirmation_card_keeps_shared_transport_without_mentions(monkeypatch):

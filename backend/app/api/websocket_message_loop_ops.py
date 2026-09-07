@@ -74,6 +74,12 @@ async def message_loop_impl(api, self):
         if not content and not is_onboarding_trigger:
             continue
 
+        if content.strip().lower() == "/continue" and not is_onboarding_trigger:
+            from app.api.websocket_continue import handle_continue
+
+            await handle_continue(self, data)
+            continue
+
         validated_attachments = None
         if raw_attachments is not None:
             from app.services.chat_attachments import validate_client_attachments
@@ -213,8 +219,9 @@ async def message_loop_impl(api, self):
             )
             continue
 
-        if ignored_confirmation:
+        if self.agent_type != "openclaw" and turn_anchor_id is not None and not is_onboarding_trigger:
             from app.services.chat_history import load_history_prefix_before_anchor
+            from app.services.llm.failure_outcome import render_message
 
             async with api.async_session() as _history_db:
                 refreshed_prefix = await load_history_prefix_before_anchor(
@@ -231,7 +238,7 @@ async def message_loop_impl(api, self):
                     api.with_turn_envelope(
                         {
                             "type": "error",
-                            "content": "确认状态已更新，但会话上下文恢复失败，请重试。",
+                            "content": render_message("errors.conversationHistoryUnavailable", self.lang),
                         },
                         failed_snapshot,
                         event_kind="turn_terminal",
@@ -242,7 +249,7 @@ async def message_loop_impl(api, self):
                 continue
             self.conversation = refreshed_prefix
 
-        if persisted_initial_assistant is not None:
+        if persisted_initial_assistant is not None and (is_onboarding_trigger or self.agent_type == "openclaw"):
             self.conversation.append({"role": "assistant", "content": persisted_initial_assistant.content})
 
         if consumed_by_onmessage:

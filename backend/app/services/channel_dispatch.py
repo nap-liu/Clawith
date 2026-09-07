@@ -59,6 +59,7 @@ class ChannelReactions:
     on_tool_call: Callable[[dict], Awaitable[None]] | None = None
     on_thinking: Callable[[str], Awaitable[None]] | None = None
     on_chunk: Callable[[str], Awaitable[None]] | None = None
+    on_status: Callable[[dict], Awaitable[None]] | None = None
 
 
 # Process-wide per-session locks. Channel adapters use
@@ -305,6 +306,7 @@ async def advance_channel_receipt_anchor(message_ids: list[UUID]) -> bool:
     active_reactions.on_tool_call = next_reactions.on_tool_call
     active_reactions.on_thinking = next_reactions.on_thinking
     active_reactions.on_chunk = next_reactions.on_chunk
+    active_reactions.on_status = next_reactions.on_status
     await _safe(active_reactions.on_consume)
     return previous_cleanup_completed
 

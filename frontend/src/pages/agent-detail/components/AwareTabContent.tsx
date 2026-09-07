@@ -41,7 +41,7 @@ export type AwareTabContentProps = {
     expandedReflection: string | null;
     setExpandedReflection: (id: string | null) => void;
     reflectionMessages: Record<string, any[]>;
-    loadReflectionMessages: (conversationId: string) => Promise<any>;
+    loadReflectionMessages: (conversationId: string, revision?: string) => Promise<any>;
     openSubagentSession: (run: any) => void;
     unavailableAttachmentKeys: Set<string>;
     handleAttachmentDownload: (path: string, name: string) => Promise<void>;

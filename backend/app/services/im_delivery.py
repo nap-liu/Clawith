@@ -532,6 +532,7 @@ async def update_delivery_message_content(
     complete_turn: bool = False,
     turn_terminal_status: str = "completed",
     error_code: str | None = None,
+    failure_meta: dict[str, Any] | None = None,
 ) -> bool:
     """Update an already-pending anchor without creating a second outbox row."""
     try:
@@ -561,6 +562,7 @@ async def update_delivery_message_content(
         row.thinking = sanitized_thinking
         if complete_turn:
             meta = dict(row.message_meta or {})
+            meta.update(failure_meta or {})
             if error_code:
                 meta["error_code"] = error_code
             if meta.get("turn_anchor_id"):

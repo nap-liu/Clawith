@@ -12,6 +12,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from app.services.message_context_order import context_message_time, order_messages_for_context
+
 
 MIN_PROTECTED_RECENT_TURNS = 3
 TERMINAL_TURN_STATUSES = {"completed", "failed", "cancelled"}
@@ -185,7 +187,7 @@ def _same_turn_identity(root: Any, injected: Any) -> bool:
 def _group_turns(rows: Iterable[Any], current_anchor_id: str | None) -> list[ConversationTurn]:
     groups: list[list[Any]] = []
     root_group_indexes: dict[str, int] = {}
-    for row in rows:
+    for row in order_messages_for_context(rows):
         if _role(row) == "user" and groups:
             injected_root = _injected_root_id(row)
             target_idx = root_group_indexes.get(injected_root)
@@ -218,7 +220,7 @@ def _group_turns(rows: Iterable[Any], current_anchor_id: str | None) -> list[Con
     ambiguous_groups: set[int] = set()
     for group_idx, group in enumerate(groups):
         for row in group:
-            created_at = getattr(row, "created_at", None)
+            created_at = context_message_time(row)
             if created_at is None:
                 continue
             owner = timestamp_owner.setdefault(created_at, group_idx)

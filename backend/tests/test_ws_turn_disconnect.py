@@ -56,6 +56,47 @@ async def test_disconnect_does_not_cancel_turn_and_keeps_reply():
     assert task.done() and not task.cancelled(), "the turn must run to completion"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        'WebSocket is not connected. Need to call "accept" first.',
+        'Cannot call "receive" once a disconnect message has been received.',
+    ],
+)
+async def test_starlette_closed_receive_errors_detach_the_turn(message):
+    async def _turn():
+        await asyncio.sleep(0.01)
+        return "detached reply"
+
+    task = asyncio.create_task(_turn())
+
+    async def _recv():
+        raise RuntimeError(message)
+
+    resp, outcome = await _await_turn_with_abort(task, _recv, [])
+
+    assert (resp, outcome) == ("detached reply", "disconnected")
+    assert not task.cancelled()
+
+
+async def test_unrelated_receive_runtime_error_is_not_hidden():
+    async def _turn():
+        await asyncio.sleep(5)
+
+    task = asyncio.create_task(_turn())
+
+    async def _recv():
+        raise RuntimeError("application receive bug")
+
+    try:
+        with pytest.raises(RuntimeError, match="application receive bug"):
+            await _await_turn_with_abort(task, _recv, [])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_abort_cancels_turn_and_returns_partial():
     """An explicit user abort still cancels and returns the partial + marker."""
 

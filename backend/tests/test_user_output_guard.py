@@ -22,6 +22,7 @@ from app.models.user import Identity, User
 from app.services.agent_tools import get_agent_tools_for_llm
 from app.services.chat_history import persist_assistant_reply_row
 from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+from app.services.llm.failure_outcome import make_llm_failure
 from app.services.turn_runtime import TurnRuntime
 from app.services.tool_seeder import seed_builtin_tools
 from app.services.user_output import UserOutputStreamSanitizer, sanitize_user_visible_text
@@ -129,6 +130,34 @@ async def test_assistant_persistence_sanitizes_content_and_visible_thinking():
     assert stored.thinking == "visible trace"
     assert legacy_keyword.casefold() not in stored.content.casefold()
     assert legacy_keyword.casefold() not in stored.thinking.casefold()
+
+
+async def test_assistant_persistence_keeps_typed_failure_details():
+    agent, user, session = await _seed_session()
+    failure = make_llm_failure(
+        code="provider_rate_limit_exhausted",
+        message_key="errors.providerRateLimitExhausted",
+        details={"retry_count": 5, "recovery_action": "continue"},
+    )
+    async with async_session() as db:
+        message_id = await persist_assistant_reply_row(
+            db,
+            agent_id=agent.id,
+            user_id=user.id,
+            conversation_id=str(session.id),
+            content=failure,
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, message_id)
+
+    assert stored.message_meta["error_code"] == "provider_rate_limit_exhausted"
+    assert stored.message_meta["llm_failure"] == {
+        "code": "provider_rate_limit_exhausted",
+        "retry_count": 5,
+        "recovery_action": "continue",
+    }
 
 
 async def test_im_delivery_sanitizes_provider_payload_and_existing_anchor(monkeypatch):

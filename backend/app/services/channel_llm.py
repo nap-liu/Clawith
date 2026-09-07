@@ -156,6 +156,7 @@ async def _call_agent_llm(
     on_chunk=None,
     on_thinking=None,
     on_tool_call=None,
+    on_status=None,
     is_group: bool = False,
     recovery_hint: str | None = _IM_LLM_RECOVERY_HINT,
     continue_turn: bool = False,
@@ -656,6 +657,18 @@ async def _call_agent_llm(
     async def _on_thinking_bridged(text: str):
         await _emit_thinking(thinking_guard.feed(text))
 
+    async def _on_status_bridged(status: dict):
+        from app.services.llm.failure_outcome import render_message
+        message_key = str(status.get("message_key") or "")
+        content = render_message(message_key, "zh").format(**status) if message_key else ""
+        if content:
+            await _web_broadcast({"type": "info", "content": content})
+        await run_channel_reaction_hook(
+            on_status,
+            {**status, "content": content},
+            hook_name="on_status",
+        )
+
     async def _on_tool_call_persisted(evt: dict):
         durable_message_id = str(evt.get("_durable_message_id") or "") or None
         public_evt = {k: v for k, v in evt.items() if not k.startswith("_")}
@@ -733,6 +746,7 @@ async def _call_agent_llm(
                 session_id=session_id,
                 on_chunk=_on_chunk_bridged,
                 on_thinking=_on_thinking_bridged,
+                on_status=_on_status_bridged,
                 on_usage=_collect_usage,
                 on_tool_call=_on_tool_call_persisted,
                 is_group=is_group,

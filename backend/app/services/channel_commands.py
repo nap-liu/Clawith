@@ -34,7 +34,7 @@ from app.services.llm.reasoning import reasoning_effort_display_name
 def is_channel_command(text: str) -> bool:
     """Check if the message is a recognized channel command."""
     command, arg = _parse_command(text)
-    if command in {"/new", "/reset", "/help", "/stop", "/status"}:
+    if command in {"/new", "/reset", "/help", "/stop", "/status", "/continue"}:
         return arg is None
     if command in {"/thinking", "/think"}:
         return arg in {"on", "off", "status"}
@@ -117,6 +117,20 @@ async def handle_channel_command(
 
     if parsed_cmd == "/help":
         return {"action": "help", "message": _help_message()}
+
+    if parsed_cmd == "/continue" and arg is None:
+        from app.services.llm.failure_outcome import render_message
+        from app.services.turn_continue import prepare_continue
+
+        session = await _load_channel_session(
+            db, agent_id=agent_id, external_conv_id=external_conv_id,
+            source_channel=source_channel,
+        )
+        if session is None:
+            return {"action": "continue_unavailable", "message": render_message("commands.continue.unavailable")}
+        return await prepare_continue(
+            db, agent_id=agent_id, session_id=session.id, actor_user_id=user_id,
+        )
 
     if parsed_cmd == "/stop":
         session = await _load_channel_session(

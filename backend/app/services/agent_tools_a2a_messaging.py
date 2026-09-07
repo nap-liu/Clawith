@@ -647,6 +647,8 @@ async def _send_message_to_agent(
                 turn_anchor_agent_id=session_agent_id,
                 include_turn_inbox=True,
             )
+            # History/model reads must release their snapshot before provider waits.
+            await db.commit()
             target_reply = await call_llm_with_failover(
                 primary_model=target_model,
                 fallback_model=target_fallback,

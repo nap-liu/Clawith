@@ -254,6 +254,27 @@ export const chatSessionApi = {
       `/agents/${agentId}/sessions/${sessionId}/messages?${params.toString()}`,
     );
   },
+
+  async allMessages(agentId: string, sessionId: string): Promise<any[]> {
+    const pages: any[][] = [];
+    const seenMessages = new Set<string>();
+    const seenCursors = new Set<string>();
+    let before: string | undefined;
+    for (;;) {
+      const page = await chatSessionApi.messagesPage(agentId, sessionId, { before });
+      pages.push(page.items.filter((message) => {
+        if (seenMessages.has(message.id)) return false;
+        seenMessages.add(message.id);
+        return true;
+      }));
+      if (!page.has_more) return pages.reverse().flat();
+      if (!page.next_cursor || seenCursors.has(page.next_cursor)) {
+        throw new Error("Session history pagination did not advance");
+      }
+      seenCursors.add(page.next_cursor);
+      before = page.next_cursor;
+    }
+  },
 };
 
 export const taskApi = {

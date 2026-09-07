@@ -76,6 +76,20 @@ async def test_buffered_sender_noops_when_disabled():
 
 
 @pytest.mark.asyncio
+async def test_retry_status_is_delivered_even_when_reasoning_output_is_disabled():
+    sent: list[str] = []
+
+    async def send_text(text: str) -> None:
+        sent.append(text)
+
+    sender = BufferedIMThinkingSender(enabled=False, send_text=send_text)
+    for retry_index in range(1, 6):
+        await sender.push_status({"content": f"retry {retry_index}/5"})
+
+    assert sent == [f"retry {retry_index}/5" for retry_index in range(1, 6)]
+
+
+@pytest.mark.asyncio
 async def test_buffered_sender_limits_message_count_and_size():
     sent: list[str] = []
 

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
-from dataclasses import dataclass
 
 from loguru import logger
 from sqlalchemy import select
@@ -47,42 +45,17 @@ from app.services.turn_recovery_identity import (
 )
 from app.services.workload_capacity import WorkloadKind, get_workload_capacity
 
-DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
 STARTUP_RECOVERY_LEASE_RESOURCE = "startup-turn-recovery"
 RECOVERY_TOOL_MATERIALIZE_TIMEOUT_SECONDS = 60.0
 
 
-@dataclass
-class RecoveryStats:
-    scanned: int = 0
-    resumed: int = 0
-    skipped: int = 0
-    failed: int = 0
-
-
-class _RecoveryFenceLost(RuntimeError):
-    """The durable owner or route changed while recovery was running."""
-
-
-@dataclass(frozen=True)
-class _RecoveryOrigin:
-    session_found: bool
-    source_channel: str | None
-    external_conv_id: str | None
-    turn_anchor_id: uuid.UUID | None = None
-    turn_generation: int = 0
-
-
-def _recovery_max_age_hours() -> float:
-    raw = os.environ.get("TURN_RECOVERY_MAX_AGE_HOURS")
-    if raw is None or raw.strip() == "":
-        return DEFAULT_RECOVERY_MAX_AGE_HOURS
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning(f"[turn_recovery] invalid TURN_RECOVERY_MAX_AGE_HOURS={raw!r}; using default")
-        return DEFAULT_RECOVERY_MAX_AGE_HOURS
-    return max(value, 0.0)
+from app.services.turn_recovery_types import (
+    DEFAULT_RECOVERY_MAX_AGE_HOURS,
+    RecoveryStats,
+    _RecoveryFenceLost,
+    _RecoveryOrigin,
+    _recovery_max_age_hours,
+)
 
 
 def _tool_payload(row: ChatMessage) -> dict | None:
@@ -192,8 +165,8 @@ async def _load_recovery_origin(
     if fresh_anchor is None:
         return None
     anchor_status = _turn_status(fresh_anchor)
-    if anchor_status in {"cancelled", "failed"} or (
-        anchor_status == "completed" and not allow_completed
+    if anchor_status == "cancelled" or (
+        anchor_status in {"completed", "failed"} and not allow_completed
     ):
         return None
     if session is None:
@@ -206,7 +179,7 @@ async def _load_recovery_origin(
     anchor_generation = _metadata_int(anchor_meta, "turn_generation")
     if anchor_generation is None:
         return None
-    if anchor_status == "completed" and allow_completed:
+    if anchor_status in {"completed", "failed"} and allow_completed:
         origin_anchor_id = fresh_anchor.id
         origin_generation = anchor_generation
     else:
@@ -727,6 +700,8 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                             ChatMessage.agent_id == anchor.agent_id,
                             ChatMessage.conversation_id == anchor.conversation_id,
                             ChatMessage.role == "assistant",
+                            ChatMessage.message_meta["turn_control_only"].as_boolean().is_not(True),
+                            ChatMessage.message_meta["artifact_role"].as_string().is_distinct_from("command_reply"),
                             ChatMessage.compacted_into.is_(None),
                         )
                         .order_by(

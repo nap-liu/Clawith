@@ -12,13 +12,10 @@ All paths now support:
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
-import os
 import uuid
 from dataclasses import dataclass, replace
-from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -58,7 +55,8 @@ from .failover import FailoverErrorType, classify_error
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import ToolOutputRewrite, enforce_message_budget, finalize_tool_output
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
-from .failure_outcome import model_response_idle_timeout_failure
+from .failure_outcome import LLMFailure, make_llm_failure, model_response_idle_timeout_failure
+from .provider_retry import *  # noqa: F401,F403
 
 if TYPE_CHECKING:
     from app.models.agent import Agent
@@ -152,16 +150,6 @@ async def _invoke_before_round(
 # surface a clear error so the failover layer can decide what to do.
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
-PROVIDER_THROTTLE_RETRY_DELAYS = (1.0, 2.0)
-# DashScope compatible endpoints can silently queue requests when several
-# project Agents wake at once.  Bound provider I/O separately from the
-# Subagent worker pool so waiting for a slot does not consume the model's
-# request timeout.  Operators with a higher provider quota can raise this
-# without changing the durable project queue semantics.
-PROVIDER_MAX_IN_FLIGHT_ENV = "CLAWITH_LLM_PROVIDER_MAX_IN_FLIGHT"
-PROVIDER_MAX_IN_FLIGHT_DEFAULT = 2
-PROVIDER_THROTTLE_USER_MESSAGE = "⚠️ 模型服务当前繁忙或被限流，已自动重试仍未成功，请稍后再试。"
-
 # Claude Code's exact prompt text for the resume nudge. Keep verbatim so we
 # inherit its tuned tone — short, no recap, no apology.
 RESUME_PROMPT = (
@@ -192,10 +180,6 @@ def _response_was_truncated_by_length(response) -> bool:
     return reason in _TRUNCATED_FINISH_REASONS
 
 
-class ProviderThrottleExhausted(Exception):
-    """Raised after bounded retries for transient provider throttling."""
-
-
 def _as_model_response_idle_timeout(error: BaseException) -> ModelResponseIdleTimeout | None:
     """Normalize a nested HTTP read timeout without classifying other failures."""
     current: BaseException | None = error
@@ -210,192 +194,129 @@ def _as_model_response_idle_timeout(error: BaseException) -> ModelResponseIdleTi
     return None
 
 
-def _is_provider_throttle_error(error: Exception) -> bool:
-    """Return True for transient provider throttling/capacity errors.
+def _llm_failure_details(
+    *,
+    model,
+    round_number: int,
+    error: BaseException | None = None,
+    messages: list | None = None,
+    had_tool_side_effect: bool = False,
+) -> dict[str, Any]:
+    """Build a bounded diagnostic projection without request content or URLs."""
+    details: dict[str, Any] = {
+        "provider": str(getattr(model, "provider", "") or "")[:64],
+        "model": str(getattr(model, "model", "") or "")[:128],
+        "model_record_id": str(getattr(model, "id", "") or "")[:64],
+        "round": round_number,
+        "had_tool_side_effect": had_tool_side_effect,
+    }
+    if error is not None:
+        for output_key, attribute in (
+            ("http_status", "status_code"),
+            ("provider_error_code", "error_code"),
+            ("provider_error_type", "error_type"),
+            ("provider_request_id", "request_id"),
+        ):
+            value = getattr(error, attribute, None)
+            if value is not None and value != "":
+                details[output_key] = value
+        details["had_provider_progress"] = bool(getattr(error, "had_progress", False))
 
-    Quota/token-limit errors are also HTTP 429, but they are not transient
-    throttling and retrying them just burns time/tokens. Keep them distinct.
-    """
-    msg = str(error).lower()
-    if any(
-        kw in msg
-        for kw in (
-            "insufficient_quota",
-            "token-limit",
-            "exceeded your current quota",
-            "quota",
-        )
-    ):
-        return False
+    attachment_count = 0
+    attachment_mimes: set[str] = set()
+    attachment_bytes = 0
+    for message in (messages or [])[:256]:
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content[:64]:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            attachment_count += 1
+            raw_url = (part.get("image_url") or {}).get("url", "")
+            if not isinstance(raw_url, str) or not raw_url.startswith("data:"):
+                continue
+            header, separator, encoded = raw_url.partition(",")
+            mime = header[5:].split(";", 1)[0]
+            if mime:
+                attachment_mimes.add(mime[:64])
+            if separator:
+                attachment_bytes += (len(encoded) * 3) // 4
+    details.update(
+        {
+            "attachment_count": attachment_count,
+            "attachment_mimes": ",".join(sorted(attachment_mimes))[:256],
+            "attachment_bytes": attachment_bytes,
+        }
+    )
+    return details
 
-    return any(
-        kw in msg
-        for kw in (
-            "limit_burst_rate",
-            "request rate increased too quickly",
-            "too many requests",
-            "throttled due to system capacity",
-            "system capacity limits",
-            "serviceunavailable",
-            "service unavailable",
-            "http 503",
-            "<503>",
+
+def _provider_failure_outcome(
+    *,
+    model,
+    round_number: int,
+    error: LLMError,
+    messages: list | None,
+    had_tool_side_effect: bool,
+) -> str:
+    if isinstance(error, ProviderThrottleExhausted):
+        details = _llm_failure_details(
+            model=model,
+            round_number=round_number,
+            error=error,
+            messages=messages,
+            had_tool_side_effect=had_tool_side_effect,
         )
+        details.update(
+            {
+                "retry_count": error.retry_count,
+                "total_requests": error.retry_count + 1,
+                "recovery_action": "continue",
+            }
+        )
+        return make_llm_failure(
+            code="provider_rate_limit_exhausted",
+            message_key="errors.providerRateLimitExhausted",
+            retryable=False,
+            allow_failover=False,
+            details=details,
+        )
+    exhausted = isinstance(error, ProviderRecoveryExhausted)
+    permanently_blocked = error.status_code in {401, 403} or _is_hard_quota_error(error)
+    retryable = (
+        classify_error(error) == FailoverErrorType.RETRYABLE
+        and not exhausted
+        and not permanently_blocked
+    )
+    return make_llm_failure(
+        code="provider_request_failed",
+        message_key="errors.providerRequestFailed",
+        retryable=retryable,
+        allow_failover=retryable,
+        details=_llm_failure_details(
+            model=model,
+            round_number=round_number,
+            error=error,
+            messages=messages,
+            had_tool_side_effect=had_tool_side_effect,
+        ),
     )
 
 
-async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
-    await asyncio.sleep(delay_seconds)
-
-
-async def _close_cancelled_provider_client(client) -> None:
-    """Best-effort close without allowing cleanup to replace cancellation."""
-    close_task = asyncio.create_task(client.close())
-
-    def _consume_close_result(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except BaseException as exc:  # cleanup must never mask cancellation
-            logger.warning(f"[LLM] cancelled provider client close failed (ignored): {exc}")
-
-    close_task.add_done_callback(_consume_close_result)
-    try:
-        await asyncio.shield(close_task)
-    except BaseException:
-        # A repeated cancel must still propagate the original cancellation;
-        # the shielded close task continues and its callback consumes errors.
-        pass
-
-
-_provider_slots: dict[tuple[int, str, str, int, int], asyncio.Semaphore] = {}
-
-
-def _provider_slot(model) -> asyncio.Semaphore:
-    """Return one event-loop-local slot pool for a provider endpoint."""
-    try:
-        limit = int(os.environ.get(PROVIDER_MAX_IN_FLIGHT_ENV, PROVIDER_MAX_IN_FLIGHT_DEFAULT))
-    except ValueError:
-        limit = PROVIDER_MAX_IN_FLIGHT_DEFAULT
-    limit = max(1, limit)
-    loop_id = id(asyncio.get_running_loop())
-    key = (
-        loop_id,
-        str(getattr(model, "provider", "") or "").lower(),
-        str(getattr(model, "base_url", "") or ""),
-        # Separate provider accounts without retaining or logging credential
-        # material in the slot key. Cloned models sharing one stored credential
-        # intentionally share capacity.
-        hash(str(getattr(model, "api_key_encrypted", "") or "")),
-        limit,
+def _combined_model_failure(primary: str, fallback: str) -> str:
+    if not isinstance(fallback, LLMFailure):
+        return fallback
+    details = dict(fallback.details)
+    details["primary_error_code"] = getattr(primary, "code", "unknown")
+    if isinstance(primary, LLMFailure):
+        for key, value in primary.details.items():
+            details[f"primary_{key}"] = value
+    return make_llm_failure(
+        code="provider_failover_failed",
+        message_key="errors.providerFailoverFailed",
+        details=details,
     )
-    return _provider_slots.setdefault(key, asyncio.Semaphore(limit))
-
-
-async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
-    throttle_attempt_idx = 0
-    provider_slot = _provider_slot(model)
-
-    while True:
-        first_progress_at: list[float] = []
-        _t0 = perf_counter()
-        dispatch_started_at = _t0
-        attempt_kwargs = dict(stream_kwargs)
-        try:
-            # Queueing is admission control only. It does not impose a
-            # response lifetime on an accepted production turn.
-            async with provider_slot:
-                dispatch_started_at = perf_counter()
-
-                def _wrap_progress(cb, *, progress_marks=first_progress_at):
-                    async def _marked(*args, **kwargs):
-                        if not progress_marks:
-                            progress_marks.append(perf_counter())
-                        if cb is not None:
-                            return await cb(*args, **kwargs)
-
-                    return _marked
-
-                # Always observe meaningful model deltas, even when the
-                # transport adapter has no UI callback. This gates retries and
-                # prevents duplicate text/tool state after streaming starts.
-                for callback_key in ("on_chunk", "on_thinking", "on_tool_delta"):
-                    attempt_kwargs[callback_key] = _wrap_progress(attempt_kwargs.get(callback_key))
-                response = await client.stream(**attempt_kwargs)
-            _elapsed = perf_counter() - _t0
-            _ttft = f"{first_progress_at[0] - dispatch_started_at:.2f}s" if first_progress_at else "n/a"
-            _usage = getattr(response, "usage", None)
-            _out_tokens = _usage.get("completion_tokens") if isinstance(_usage, dict) else None
-            _rate = f" ({_out_tokens / _elapsed:.0f} tok/s)" if _out_tokens and _elapsed > 0 else ""
-            logger.info(
-                f"[LLM Timing] round={round_i} model={getattr(model, 'model', '?')} "
-                f"llm_call={_elapsed:.2f}s ttft={_ttft} output_tokens={_out_tokens}{_rate}"
-            )
-            return response
-        except asyncio.CancelledError:
-            await _close_cancelled_provider_client(client)
-            raise
-        except LLMError as e:
-            if first_progress_at or not _is_provider_throttle_error(e):
-                raise
-            if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
-                raise ProviderThrottleExhausted(str(e)) from e
-
-            delay = PROVIDER_THROTTLE_RETRY_DELAYS[throttle_attempt_idx]
-            throttle_attempt_idx += 1
-            logger.warning(
-                f"[LLM] Provider throttle; retrying after {delay:.1f}s "
-                f"(attempt {throttle_attempt_idx + 1}/"
-                f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
-                f"provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')}): {e}"
-            )
-            await _sleep_before_throttle_retry(delay)
-
-
-async def _complete_with_throttle_retry(client, *, model, round_i: int, **complete_kwargs):
-    """Run a non-streaming provider request through the shared capacity gate.
-
-    Background, scheduled, and project turns use ``complete`` while Web Chat
-    uses ``stream``. Both paths must share the same provider-account limit;
-    otherwise a project burst can bypass admission and starve interactive
-    conversations. Waiting for a provider slot does not hold a database
-    transaction or impose a response lifetime.
-    """
-
-    throttle_attempt_idx = 0
-    provider_slot = _provider_slot(model)
-
-    while True:
-        queued_at = perf_counter()
-        dispatch_started_at = queued_at
-        try:
-            async with provider_slot:
-                dispatch_started_at = perf_counter()
-                response = await client.complete(**complete_kwargs)
-            elapsed = perf_counter() - dispatch_started_at
-            logger.info(
-                f"[LLM Timing] round={round_i} model={getattr(model, 'model', '?')} "
-                f"queue={dispatch_started_at - queued_at:.2f}s llm_call={elapsed:.2f}s (complete)"
-            )
-            return response
-        except asyncio.CancelledError:
-            await _close_cancelled_provider_client(client)
-            raise
-        except LLMError as exc:
-            if not _is_provider_throttle_error(exc):
-                raise
-            if throttle_attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
-                raise ProviderThrottleExhausted(str(exc)) from exc
-
-            delay = PROVIDER_THROTTLE_RETRY_DELAYS[throttle_attempt_idx]
-            throttle_attempt_idx += 1
-            logger.warning(
-                f"[LLM] Provider complete throttled; retrying after {delay:.1f}s "
-                f"(attempt {throttle_attempt_idx + 1}/"
-                f"{len(PROVIDER_THROTTLE_RETRY_DELAYS) + 1}, round {round_i}, "
-                f"provider={getattr(model, 'provider', '?')} "
-                f"model={getattr(model, 'model', '?')}): {exc}"
-            )
-            await _sleep_before_throttle_retry(delay)
 
 
 # ── Repeated tool-call guard ─────────────────────────────────────────────────

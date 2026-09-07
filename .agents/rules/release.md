@@ -11,11 +11,18 @@ the runbook.
   configuration changes, migrations, backup, cutover, external smoke messages,
   or rollback. Outside this defined shorthand, each operation requires its
   applicable explicit authorization.
-- The semantic version prefix follows the current upstream release. Private
-  changes use the exact commit SHA suffix; do not invent a higher private
-  semantic version.
+- This product forked at upstream `1.10.3` and now maintains its version
+  independently. Do not follow upstream release numbers or change VERSION as
+  part of an ordinary release. Use the repository's independent version plus
+  the exact commit SHA suffix; changing the version requires an explicit
+  product version decision.
 - Build and publish backend and frontend from the same immutable release SHA,
   even when only one side changed. Pin deployment and rollback to digests.
+- Select Docker validation from the final diff and affected behavior, including
+  callers and compatibility boundaries. Full test suites are not the default
+  release gate; broaden only for demonstrated wider impact, unresolved affected
+  failures, or an explicit user request. Record scope, evidence, and omissions
+  under the runbook's release-candidate gates.
 - Build production images for `linux/amd64`. Rebuild AIO only when its source or
   base image changed or the user explicitly requests it.
 - For a backend code-only release, reuse the previous trusted backend image by

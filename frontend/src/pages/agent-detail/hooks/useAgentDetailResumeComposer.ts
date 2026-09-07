@@ -80,6 +80,7 @@ export function useAgentDetailResumeComposer({
         livePanelVisible,
         sidePanelTab,
         workspaceActivePath,
+        workspaceLiveDraft,
         chatContainerRef,
         chatInputRef,
         chatInputAreaRef,
@@ -419,7 +420,8 @@ export function useAgentDetailResumeComposer({
     handleWorkspacePathDeletedRef.current = handleWorkspacePathDeleted;
 
     useEffect(() => {
-        const shouldAutoReference = livePanelVisible && sidePanelTab === 'workspace' && !!workspaceActivePath;
+        const shouldAutoReference = livePanelVisible && sidePanelTab === 'workspace'
+            && !!workspaceActivePath && workspaceLiveDraft?.path !== workspaceActivePath;
         if (!shouldAutoReference) {
             dismissedWorkspaceRefPath.current = null;
             setAttachedFiles((prev: any[]) => prev.filter((file: any) => file.source !== 'workspace_auto'));
@@ -431,7 +433,7 @@ export function useAgentDetailResumeComposer({
             const withoutAuto = prev.filter((file: any) => file.source !== 'workspace_auto');
             return [...withoutAuto, { name: helpers.workspaceFileName(path), text: '', path, source: 'workspace_auto' }];
         });
-    }, [dismissedWorkspaceRefPath, livePanelVisible, setAttachedFiles, sidePanelTab, workspaceActivePath, helpers.workspaceFileName]);
+    }, [dismissedWorkspaceRefPath, livePanelVisible, setAttachedFiles, sidePanelTab, workspaceActivePath, workspaceLiveDraft?.path, helpers.workspaceFileName]);
 
     useEffect(() => {
         return () => {

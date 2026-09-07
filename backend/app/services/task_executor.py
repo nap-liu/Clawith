@@ -336,9 +336,10 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             reasoning_effort_override=task_reasoning_effort,
         )
 
-    from app.services.llm.failure_outcome import llm_failure_code
+    from app.services.llm.failure_outcome import llm_failure_code, llm_failure_meta
 
     failure_code = llm_failure_code(reply)
+    failure_meta = llm_failure_meta(reply)
     logger.info(f"[TaskExec] LLM reply: {reply[:80]}")
 
     async with async_session() as db:
@@ -377,7 +378,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             "title": task_title,
             "reply": reply[:500],
             "status": "failed" if failure_code else "completed",
-            **({"error_code": failure_code} if failure_code else {}),
+            **failure_meta,
         },
         related_id=task_id,
     )

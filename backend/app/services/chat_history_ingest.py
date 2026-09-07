@@ -492,7 +492,10 @@ async def ingest_incoming_chat_message(
 
     locked_session = (
         await db.execute(
-            select(ChatSession).where(ChatSession.id == session.id).with_for_update()
+            select(ChatSession)
+            .where(ChatSession.id == session.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if locked_session is None:
@@ -654,35 +657,19 @@ async def ingest_incoming_chat_message(
         snapshot = conversation_turn_snapshot_for_session(locked_session)
         if snapshot.status == ACTIVE_TURN_STATUS and snapshot.anchor_id is not None:
             active_anchor = await db.get(ChatMessage, snapshot.anchor_id)
-            active_meta = (
-                dict(active_anchor.message_meta or {})
-                if active_anchor is not None
-                else {}
-            )
-            active_execution_agent_id = str(
-                active_meta.get("execution_agent_id")
-                or (active_anchor.agent_id if active_anchor is not None else "")
-            )
-            incoming_execution_agent_id = str(
-                dict(row.message_meta or {}).get("execution_agent_id")
-                or row.agent_id
-            )
-            same_execution_identity = bool(
-                active_anchor is not None
-                and active_anchor.user_id == row.user_id
-                and active_execution_agent_id == incoming_execution_agent_id
-            )
+            # A2A stores both employees' directions in one conversation. Route
+            # by the executing employee, never by the human sender.
+            same_employee = active_anchor is not None and str(
+                (active_anchor.message_meta or {}).get("execution_agent_id")
+                or active_anchor.agent_id
+            ) == str((row.message_meta or {}).get("execution_agent_id") or row.agent_id)
             row.message_meta = {
                 **dict(row.message_meta or {}),
                 "turn_inbox_state": "pending",
                 "turn_inbox_anchor_id": str(snapshot.anchor_id),
                 "turn_inbox_generation": snapshot.generation,
-                # A different group sender must not inherit the active human's
-                # execution identity. It remains durable and is promoted only
-                # after the current generation terminates.
-                "turn_inbox_mode": (
-                    "current_turn" if same_execution_identity else "next_turn"
-                ),
+                # One conversation has one inbox, regardless of its sender.
+                "turn_inbox_mode": "current_turn" if same_employee else "next_turn",
             }
             await db.flush()
             queued_to_running_turn = True
@@ -692,7 +679,7 @@ async def ingest_incoming_chat_message(
             )
 
             await mark_channel_turn_admitted()
-            if same_execution_identity:
+            if same_employee:
                 await register_channel_receipt_anchor(row.id)
         else:
             await transition_conversation_turn(

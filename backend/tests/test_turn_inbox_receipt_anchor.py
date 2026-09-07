@@ -427,6 +427,8 @@ async def _ingest_interjection(
 
 
 async def test_late_injection_history_is_root_a1_injection_a2():
+    from app.services.message_context_order import order_messages_for_context
+
     agent_id, user_id, session_id, root_id, _generation = await _seed_running_im_turn()
     injection_id = await _ingest_interjection(
         agent_id=agent_id,
@@ -484,6 +486,7 @@ async def test_late_injection_history_is_root_a1_injection_a2():
                 )
             ).scalars()
         )
+    rows = order_messages_for_context(rows)
     assert [(row.role, row.content) for row in rows] == [
         ("user", "root request"),
         ("assistant", "A1"),
