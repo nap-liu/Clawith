@@ -334,10 +334,6 @@ async def _do_compact(
             logger.info(
                 f"[compactor] appended {len(appended_identifiers)} missing identifiers for session={session_id}"
             )
-        identifier_appendix_exhausted_budget = bool(
-            appended_identifiers
-            and len(summary) > MAX_SUMMARY_STORAGE_CHARS
-        )
 
         # 6. Validate
         passed, fail_reason, recall = validate_summary(
@@ -356,7 +352,6 @@ async def _do_compact(
         if (
             not passed
             and not initial_llm_failed
-            and not identifier_appendix_exhausted_budget
         ):
             repair_reason = fail_reason or recovery_reasons[-1]
             if not recovery_reasons or recovery_reasons[-1] != repair_reason:
@@ -659,6 +654,8 @@ async def _load_active_rows(
     conversation_id: str,
 ) -> list[ChatMessage]:
     """All non-compacted messages for this session, oldest first."""
+    from app.services.message_context_order import order_messages_for_context
+
     result = await db.execute(
         select(ChatMessage)
         .where(
@@ -667,12 +664,19 @@ async def _load_active_rows(
             ChatMessage.compacted_into.is_(None),
         )
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        .execution_options(populate_existing=True)
     )
-    return [
+    return order_messages_for_context([
         row
         for row in result.scalars().all()
-        if not (isinstance(getattr(row, "message_meta", None), dict) and row.message_meta.get("consumed_by_onmessage"))
-    ]
+        if not (
+            isinstance(getattr(row, "message_meta", None), dict)
+            and (
+                row.message_meta.get("consumed_by_onmessage")
+                or row.message_meta.get("turn_inbox_state") in {"pending", "processing", "cancelled"}
+            )
+        )
+    ])
 
 
 async def _load_compaction_state(

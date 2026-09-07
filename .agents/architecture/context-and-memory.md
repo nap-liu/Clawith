@@ -46,6 +46,13 @@ handoffs. Validation/repair failure falls back to a deterministic lossless
 archive reference; summary quality must not block safe compaction or silently
 lose history.
 
+Semantic summary generation and repair use the ordinary model output allowance,
+without a separate summary token cap or character-length acceptance gate. The
+legacy `compact_summary_max_tokens` column remains for schema compatibility.
+Structural validation tolerates Markdown emphasis on field labels. The local
+archive fallback retains bounded excerpts; that availability path does not
+limit or replace an otherwise valid semantic summary.
+
 ## Tool-result context
 
 Persist the truthful original tool result. The bounded LLM view of fresh textual

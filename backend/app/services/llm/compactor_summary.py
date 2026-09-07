@@ -245,34 +245,29 @@ def validate_summary(
 ) -> tuple[bool, str | None, float]:
     """Return ``(passed, fail_reason, uuid_recall_ratio)``.
 
-    Length + structure are hard gates; the UUID/path recall metric is
+    Structure is a hard gate; the UUID/path recall metric is
     a quality signal.
     """
     s = (summary or "").strip()
 
-    if len(s) < MIN_SUMMARY_CHARS:
-        return False, f"too_short ({len(s)} < {MIN_SUMMARY_CHARS})", 0.0
-
-    # Per the prompt we expect roughly < 4×max_tokens chars (gross
-    # English upper bound). Anything wildly over is suspicious.
-    if len(s) > MAX_SUMMARY_STORAGE_CHARS:
-        return False, f"too_long ({len(s)} > {MAX_SUMMARY_STORAGE_CHARS})", 0.0
-
-    if len(_HEADING_RE.findall(s)) < 2:
+    # Markdown emphasis does not change a section/field's meaning. Normalize
+    # only the structural view; exact evidence and identifiers use the original.
+    structure = s.replace("**", "").replace("__", "")
+    if len(_HEADING_RE.findall(structure)) < 2:
         return False, "missing_section_headings", 0.0
-    if not _CURRENT_OBJECTIVE_HEADING_RE.search(s):
+    if not _CURRENT_OBJECTIVE_HEADING_RE.search(structure):
         return False, "missing_current_objective_section", 0.0
-    if not _GOAL_LEDGER_HEADING_RE.search(s):
+    if not _GOAL_LEDGER_HEADING_RE.search(structure):
         return False, "missing_goal_ledger_section", 0.0
-    if not _GOAL_LEDGER_ACTIVE_RE.search(s):
+    if not _GOAL_LEDGER_ACTIVE_RE.search(structure):
         return False, "missing_active_goal", 0.0
-    if not _GOAL_LEDGER_ACHIEVED_RE.search(s):
+    if not _GOAL_LEDGER_ACHIEVED_RE.search(structure):
         return False, "missing_achieved_goals", 0.0
-    if not _GOAL_LEDGER_UNFINISHED_RE.search(s):
+    if not _GOAL_LEDGER_UNFINISHED_RE.search(structure):
         return False, "missing_unfinished_goals", 0.0
-    if not _RELATED_TASK_HEADING_RE.search(s):
+    if not _RELATED_TASK_HEADING_RE.search(structure):
         return False, "missing_related_task_handoff", 0.0
-    related_match = _RELATED_TASK_SECTION_RE.search(s)
+    related_match = _RELATED_TASK_SECTION_RE.search(structure)
     related_body = related_match.group("body").strip() if related_match else ""
     if not re.search(r"^\s*-\s*None evidenced[.!。]?\s*$", related_body, re.MULTILINE | re.IGNORECASE):
         missing_fields = [
@@ -282,7 +277,7 @@ def validate_summary(
         ]
         if missing_fields:
             return False, "incomplete_related_task_handoff:" + ",".join(missing_fields), 0.0
-    if not _OPEN_ITEMS_HEADING_RE.search(s):
+    if not _OPEN_ITEMS_HEADING_RE.search(structure):
         return False, "missing_open_items_section", 0.0
 
     # UUID + path recall: how much of what was in the original made it

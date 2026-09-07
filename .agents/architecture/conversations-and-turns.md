@@ -80,6 +80,18 @@ Do not add a second inbox table, a completion-cohort state machine, or channel-s
 
 - P2P: the counterpart is stable for the session, so identity is session-scoped.
 - Group: senders vary per message, so identity is message-scoped.
+- While an IM turn runs, all senders addressing that employee share its FIFO
+  conversation inbox. A different sender does not create a separate turn.
+  Preserve each message's sender attribution, attachments, and durable row.
+  Admission refreshes the locked session snapshot. The active turn consumes
+  pending conversation input, including older unconsumed backlog, and records
+  its current anchor/generation on delivery. Cancellation and ownership still
+  fence the consumer; opposite A2A directions target different employees.
+  Record consumption time separately from immutable arrival time. Model history,
+  recovery and compaction use one shared consumption-order projection, so old
+  backlog cannot precede its own root or be compacted out of the active turn.
+  Pending inputs are excluded from compaction until consumed. Fresh compaction
+  reads refresh ORM state after provider waits.
 - A2A: `(min(agent_a, agent_b), max(...))` is the normalized pair. `ChatMessage.agent_id` can therefore be the smaller UUID for both directions; load A2A history by `conversation_id`.
 - Trigger/A2A/background turns can carry a creator `user_id` for execution context. They do not thereby inherit that creator's administrative read authority.
 

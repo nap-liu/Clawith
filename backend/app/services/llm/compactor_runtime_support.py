@@ -60,7 +60,7 @@ async def _summarize_via_llm(
     tools, no streaming, no agent context — so we instantiate a bare
     LLM client directly.
     """
-    from app.services.llm import LLMMessage, create_llm_client, get_model_api_key
+    from app.services.llm import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
     def _messages(candidate_span: str) -> list[LLMMessage]:
         user_payload = []
@@ -97,7 +97,9 @@ async def _summarize_via_llm(
     try:
         response = await client.complete(
             messages,
-            max_tokens=model.compact_summary_max_tokens,
+            max_tokens=get_max_tokens(
+                model.provider, model.model, getattr(model, "max_output_tokens", None)
+            ),
             temperature=0.2,
         )
         return response.content or "", response.usage

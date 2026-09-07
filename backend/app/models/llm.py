@@ -71,6 +71,7 @@ class LLMModel(Base):
         default=3,
         server_default="3",
     )
+    # Legacy schema compatibility only; summary generation uses normal model output settings.
     compact_summary_max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
