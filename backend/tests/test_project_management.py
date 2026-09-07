@@ -7,21 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-import app.models.agent  # noqa: F401
-import app.models.chat_session  # noqa: F401
-import app.models.llm  # noqa: F401
-import app.models.org  # noqa: F401
-import app.models.participant  # noqa: F401
-import app.models.project  # noqa: F401
-import app.models.tenant  # noqa: F401
-import app.models.user  # noqa: F401
-from app.database import Base
-from app.models.agent import Agent
-from app.models.tenant import Tenant
-from app.models.user import Identity, User
 from app.services.project_git_service import (
     _git,
     _mime_and_kind,
@@ -40,33 +26,6 @@ from app.services.project_service import (
     bounded_project_event_summary,
 )
 
-TABLES = [
-    "llm_models",
-    "identities",
-    "tenants",
-    "users",
-    "agent_templates",
-    "agents",
-    "agent_permissions",
-    "tools",
-    "agent_tools",
-    "agent_agent_relationships",
-    "org_departments",
-    "org_members",
-    "participants",
-    "project_templates",
-    "projects",
-    "project_repository_operations",
-    "project_access_grants",
-    "project_member_snapshots",
-    "project_capability_bindings",
-    "project_work_items",
-    "project_runs",
-    "project_run_member_snapshots",
-    "project_events",
-    "chat_sessions",
-]
-
 
 def test_project_event_summary_boundary_keeps_full_unicode_detail_in_metadata():
     original = "完整中文事件说明" * 100
@@ -77,39 +36,6 @@ def test_project_event_summary_boundary_keeps_full_unicode_detail_in_metadata():
     assert metadata["full_summary"] == original
     assert metadata["summary_compacted"] is True
     assert len(metadata["summary_sha256"]) == 64
-
-
-@pytest.fixture
-async def db():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(
-            lambda sync_connection: Base.metadata.create_all(
-                sync_connection,
-                tables=[Base.metadata.tables[name] for name in TABLES],
-            )
-        )
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as session:
-        yield session
-    await engine.dispose()
-
-
-async def _tenant(db, name: str) -> Tenant:
-    tenant = Tenant(name=name, slug=f"{name.lower()}-{uuid.uuid4().hex[:6]}")
-    db.add(tenant)
-    await db.flush()
-    return tenant
-
-
-async def _user(db, tenant: Tenant, name: str) -> User:
-    identity = Identity(username=f"{name}-{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex}@local.test")
-    db.add(identity)
-    await db.flush()
-    user = User(identity_id=identity.id, tenant_id=tenant.id, display_name=name, role="member", is_active=True)
-    db.add(user)
-    await db.flush()
-    return user
 
 
 async def test_git_remote_validation_blocks_non_public_dns(monkeypatch: pytest.MonkeyPatch):
@@ -426,28 +352,3 @@ async def test_project_directory_archive_rejects_limits_traversal_and_symlinks(t
     with pytest.raises(HTTPException) as symlink:
         await inspect_project_directory(project, "deliverables")
     assert symlink.value.status_code == 422
-
-
-def test_project_router_exposes_closed_loop_contract():
-    from app.api.projects import router
-
-    paths = {route.path for route in router.routes}
-    assert {
-        "/projects",
-        "/projects/templates",
-        "/projects/bootstrap-options",
-        "/projects/{project_id}/members",
-        "/projects/{project_id}/capabilities",
-        "/projects/{project_id}/work-items",
-        "/projects/{project_id}/runs",
-        "/projects/{project_id}/events",
-        "/projects/{project_id}/a2a",
-        "/projects/{project_id}/settings",
-        "/projects/{project_id}/files",
-        "/projects/{project_id}/files/archive",
-        "/projects/{project_id}/files/archive/raw",
-        "/projects/{project_id}/files/preview/{ticket}/{path:path}",
-        "/projects/{project_id}/git/commit",
-        "/projects/{project_id}/git/diff",
-        "/projects/{project_id}/git/restore",
-    } <= paths

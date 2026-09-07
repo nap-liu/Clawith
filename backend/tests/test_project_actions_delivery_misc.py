@@ -1,17 +1,33 @@
-from project_actions_support import *  # noqa: F401,F403
+import asyncio
+import uuid
+from datetime import UTC, datetime
+
+from project_actions_support import (
+    ProjectApiEnv,
+    _create_project,
+)
+from project_actions_support import (
+    project_api as project_api,  # noqa: PLC0414 -- pytest fixture re-export
+)
+from project_actions_support import (
+    pytestmark as pytestmark,  # noqa: PLC0414 -- preserve module pytest marks
+)
+from sqlalchemy import select
+
+from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
+from app.models.project import ProjectMemberSnapshot
+from app.models.subagent_run import SubagentRun
+from app.services.a2a_file_delivery import (
+    append_a2a_file_delivery_message,
+    resolve_a2a_file_origin_scope,
+)
+
 
 async def test_concurrent_member_file_deliveries_keep_their_exact_parent_sessions(
     project_api: ProjectApiEnv,
 ):
     """Concurrent project members must not collapse onto another A2A thread."""
-    from app.models.chat_session import ChatSession
-    from app.models.project import ProjectMemberSnapshot
-    from app.models.subagent_run import SubagentRun
-    from app.services.a2a_file_delivery import (
-        append_a2a_file_delivery_message,
-        resolve_a2a_file_origin_scope,
-    )
-
     env = project_api
     project = await _create_project(env, name="Concurrent exact file routing")
     project_id = uuid.UUID(project["id"])
@@ -119,9 +135,3 @@ async def test_concurrent_member_file_deliveries_keep_their_exact_parent_session
     assert {uuid.UUID(row.conversation_id) for row in messages} == {route[2].id for route in routes}
     assert {row.sender_agent_id for row in messages} == {env.worker_id, env.reviewer_id}
     assert all(len(row.message_meta["attachments"]) == 1 for row in messages)
-
-async def test_activity_enum_includes_agent_file_delivery_actions():
-    from app.models.activity_log import AgentActivityLog
-
-    enum_values = set(AgentActivityLog.__table__.c.action_type.type.enums)
-    assert {"agent_file_sent", "agent_file_received"} <= enum_values

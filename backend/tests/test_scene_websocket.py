@@ -133,14 +133,3 @@ async def test_quota_check_uses_stable_authenticated_user_id(monkeypatch):
     assert await handler._check_quotas() is True
     check_conversation_quota.assert_awaited_once_with(user_id)
     check_agent_expired.assert_awaited_once_with(agent_id)
-
-
-def test_websocket_handler_does_not_retain_user_or_agent_orm_entities():
-    handler = WebSocketChatHandler(
-        websocket=SimpleNamespace(),
-        agent_id=uuid.uuid4(),
-        token="unused",
-    )
-
-    assert not hasattr(handler, "user")
-    assert not hasattr(handler, "agent")

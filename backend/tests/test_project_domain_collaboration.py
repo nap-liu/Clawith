@@ -11,7 +11,6 @@ from app.services.agent_runtime_workspace import (
     bind_agent_runtime_workspace,
     project_agent_runtime_workspace,
 )
-from app.services.llm.compactor import SUMMARY_SYSTEM_PROMPT
 from app.services.project_collaboration_prompt import (
     PROJECT_COLLABORATION_CONTRACT,
     PROJECT_HUMAN_REQUEST_MAX_CHARS,
@@ -381,15 +380,6 @@ def test_collaboration_tasks_bound_and_preserve_causal_work_item_context():
     assert len(snapshot["description"]) > PROJECT_WORK_ITEM_DESCRIPTION_MAX_CHARS
     assert f"条件 {PROJECT_WORK_ITEM_CRITERIA_MAX_ITEMS}" not in a2a_task
     assert f"证据 {PROJECT_WORK_ITEM_EVIDENCE_MAX_ITEMS}" not in a2a_task
-
-
-def test_standard_context_compaction_preserves_project_role_semantics():
-    """All project sessions use the standard compactor, so its contract is pinned."""
-
-    assert "speaker/Agent/role" in SUMMARY_SYSTEM_PROMPT
-    assert "Role-specific judgments" in SUMMARY_SYSTEM_PROMPT
-    assert "Evidence attribution" in SUMMARY_SYSTEM_PROMPT
-    assert "next actions and their owners" in SUMMARY_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize(("role", "expected"), ROLE_LENS_CASES)

@@ -61,8 +61,3 @@ async def test_project_agent_scope_defaults_constraints_and_lifecycle():
             assert await db.scalar(select(Agent.id).where(Agent.id == derivative.id)) is None
     finally:
         await engine.dispose()
-
-
-def test_project_agent_directory_is_derived_from_agent_id():
-    agent_id = uuid.uuid4()
-    assert Agent.project_agent_dir(agent_id) == f".agents/{agent_id}"

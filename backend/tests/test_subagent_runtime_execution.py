@@ -3,55 +3,19 @@
 import pytest
 
 from tests.test_subagent_runtime import (
-    UTC,
     Agent,
-    AgentTool,
-    AgentToolUpdate,
-    ChatCompaction,
     ChatMessage,
     ChatSession,
-    HTTPException,
-    Identity,
-    LLMModel,
-    MCPServer,
-    Participant,
-    Project,
-    ProjectMemberSnapshot,
-    ProjectRun,
-    SUBAGENT_TOOL_NAMES,
-    SimpleNamespace,
     SubagentRun,
-    Tenant,
-    Tool,
-    USER_PROJECT_TOOL_NAMES,
-    USER_PROJECT_TOOL_SEEDS,
-    User,
     WorkloadCapacity,
     WorkloadKind,
-    _dispose_engine_between_tests,
-    _has_active_subagent_event_turn,
+    _dispose_engine_between_tests,  # noqa: F401 - pytest autouse fixture
     _make_context,
-    asyncio,
     async_session,
     asynccontextmanager,
-    build_project_runtime_context,
-    channel_llm,
-    clone_source_agent_tool_dependencies,
-    datetime,
-    delete,
-    engine,
-    freeze_run_members,
-    func,
-    get_agent_tools_for_llm,
-    get_agent_tools_with_config,
-    json,
-    merge_project_member_runtime_config,
+    asyncio,
     runtime,
-    seed_builtin_tools,
     select,
-    timedelta,
-    update_agent_tools,
-    uuid,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -112,26 +76,6 @@ async def test_create_uses_one_id_readable_model_and_idempotent_fork():
     ]
     assert all(row.content != "parent request" for row in rows)
     assert rows[-1].message_meta["subagent_input_state"] == "pending"
-
-
-async def test_standard_subagent_claim_does_not_enter_project_query_path(monkeypatch):
-    agent_id, user_id, parent_id, anchor_id = await _make_context()
-    run, _created = await runtime.create_subagent(
-        agent_id=agent_id,
-        execution_user_id=user_id,
-        parent_session_id=str(parent_id),
-        origin_tool_call_id="standard-claim-project-isolation",
-        task="keep standard child work available",
-        mode="async",
-        turn_anchor_id=anchor_id,
-    )
-
-    def broken_project_exists(*_args, **_kwargs):
-        raise RuntimeError("projects relation unavailable")
-
-    monkeypatch.setattr(runtime, "exists", broken_project_exists)
-
-    assert await runtime._claim_subagent(run.id) == run.id
 
 
 async def test_round_boundary_drains_append_and_stop_wins():

@@ -10,7 +10,7 @@ from app.core.security import create_access_token
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.agent import AgentUserOnboarding
-from app.models.audit import ChatMessage
+from app.models.audit import AuditLog, ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.mcp_server import MCPServer  # noqa: F401
 from app.models.tenant import Tenant
@@ -601,7 +601,8 @@ async def test_scene_greeting_completes_shared_onboarding_arbitration():
     assert eligibility.reason == "already_started"
 
 
-async def test_real_session_permission_allows_creator_and_denies_use_only_member():
+@pytest.mark.parametrize("source_channel", ["web", "miniprogram", "feishu"])
+async def test_real_session_permission_allows_creator_and_denies_use_only_member(source_channel):
     creator_id, agent_id = await _seed_actor_and_agent()
     seed = next(item for item in BUILTIN_TOOLS if item["name"] == "manage_scene")
     suffix = uuid.uuid4().hex[:8]
@@ -643,8 +644,8 @@ async def test_real_session_permission_allows_creator_and_denies_use_only_member
         )
         db.add(member)
         await db.flush()
-        creator_session = ChatSession(agent_id=agent_id, user_id=creator_id, source_channel="web")
-        member_session = ChatSession(agent_id=agent_id, user_id=member.id, source_channel="web")
+        creator_session = ChatSession(agent_id=agent_id, user_id=creator_id, source_channel=source_channel)
+        member_session = ChatSession(agent_id=agent_id, user_id=member.id, source_channel=source_channel)
         db.add_all([creator_session, member_session])
         await db.commit()
         creator_session_id = creator_session.id
@@ -667,6 +668,15 @@ async def test_real_session_permission_allows_creator_and_denies_use_only_member
     assert isinstance(json.loads(allowed), list)
     assert denied.startswith("❌ Scene management denied")
     assert "administrator permission" in denied
+
+    async with async_session() as db:
+        audit = (await db.execute(
+            select(AuditLog.user_id, AuditLog.action).where(AuditLog.agent_id == agent_id)
+        )).all()
+    assert set(audit) == {
+        (creator_id, "scene_tool_allowed"),
+        (member_id, "scene_tool_denied"),
+    }
 
 
 async def test_scene_tool_save_patches_by_default_and_force_overwrites():
@@ -706,6 +716,7 @@ async def test_scene_tool_save_patches_by_default_and_force_overwrites():
                 "operation": "save",
                 "scene_key": "warranty",
                 "name": "Warranty",
+                "enabled": False,
                 "expected_revision": 0,
                 "welcome_message": "Welcome",
                 "system_prompts": [
@@ -743,9 +754,10 @@ async def test_scene_tool_save_patches_by_default_and_force_overwrites():
         )
     )
     assert patched["name"] == "Updated warranty"
+    assert patched["enabled"] is False
     assert patched["welcome_message"] == "Welcome"
-    assert len(patched["system_prompts"]) == 1
-    assert len(patched["quick_actions"]) == 1
+    assert patched["system_prompts"] == created["system_prompts"]
+    assert patched["quick_actions"] == created["quick_actions"]
 
     overwritten = json.loads(
         await execute_scene_management_tool(
