@@ -148,7 +148,7 @@ export default function AwareTabContent({
     };
 
     const focusCount = new Set([
-        ...focusRecords.map((item) => item.name),
+        ...focusRecords.map((item) => item.key),
         ...awareTriggers.map((trigger) => trigger.focus_ref || focusKeyFromTrigger(trigger)),
     ]).size;
     const tabs = [

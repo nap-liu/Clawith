@@ -1,4 +1,8 @@
 {
+  "markdown": {
+    "expandDescription": "展开完整说明",
+    "collapseDescription": "收起说明"
+  },
   "app": {
     "name": "数字员工平台",
     "tagline": "企业数字员工平台"
@@ -2210,6 +2214,8 @@
         "normalFocus": "普通关注点",
         "systemFocus": "系统关注点",
         "source": "来源：{{value}}",
+        "createdAt": "创建时间 {{value}}",
+        "lastExecutedAt": "最近执行 {{value}}",
         "linkedTriggers": "关联触发器",
         "configure": "配置",
         "activity": "关联动态",

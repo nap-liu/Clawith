@@ -1,4 +1,8 @@
 {
+  "markdown": {
+    "expandDescription": "Show full description",
+    "collapseDescription": "Collapse description"
+  },
   "app": {
     "name": "Digital Employee Platform",
     "tagline": "Enterprise Digital Employee Platform"
@@ -2276,6 +2280,8 @@
         "normalFocus": "Standard focus",
         "systemFocus": "System focus",
         "source": "Source: {{value}}",
+        "createdAt": "Created {{value}}",
+        "lastExecutedAt": "Last executed {{value}}",
         "linkedTriggers": "Linked triggers",
         "configure": "Configure",
         "activity": "Related activity",

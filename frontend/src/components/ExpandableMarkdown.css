@@ -1,0 +1,57 @@
+.expandable-markdown {
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: inherit;
+    line-height: 1.6;
+}
+
+.expandable-markdown__viewport {
+    overflow: hidden;
+    max-height: calc(var(--markdown-preview-lines) * 1.6em);
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.expandable-markdown__viewport[data-expanded='true'] {
+    max-height: none;
+}
+
+.expandable-markdown__viewport[data-expanded='false'] .markdown-renderer > br {
+    display: none;
+}
+
+.expandable-markdown__viewport[data-expanded='false'] .markdown-renderer :is(p, ul, ol, li, blockquote, pre) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    line-height: 1.6 !important;
+}
+
+.expandable-markdown .markdown-renderer p {
+    margin: 0 0 .35em !important;
+    line-height: 1.6 !important;
+}
+
+.expandable-markdown .markdown-renderer > :last-child {
+    margin-bottom: 0 !important;
+}
+
+.expandable-markdown .markdown-renderer strong {
+    color: var(--text-primary);
+}
+
+.expandable-markdown .markdown-renderer pre {
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+.expandable-markdown__toggle.btn {
+    min-height: 28px;
+    margin-top: 4px;
+    padding: 3px 0;
+    color: var(--accent-text);
+    font-size: inherit;
+}
+
+.expandable-markdown__toggle[aria-expanded='true'] svg {
+    transform: rotate(180deg);
+}
