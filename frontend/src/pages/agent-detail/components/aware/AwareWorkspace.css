@@ -403,7 +403,7 @@
 .aware-provenance small,
 .aware-provenance strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .aware-provenance small { color: var(--text-tertiary); font-size: 9px; text-transform: uppercase; }
-.aware-provenance strong { margin-top: 3px; font-size: 10px; font-weight: 600; }
+.aware-provenance strong { margin-top: 3px; overflow: visible; white-space: normal; overflow-wrap: anywhere; font-size: 10px; font-weight: 600; }
 .aware-execution-error { display: grid; gap: 3px; margin: 14px 16px 0; padding: 10px 12px; border-left: 2px solid var(--error); background: color-mix(in srgb, var(--error) 7%, transparent); font-size: 11px; }
 .aware-execution-error span { color: var(--text-secondary); }
 .aware-timeline { padding: 4px 16px 18px; }

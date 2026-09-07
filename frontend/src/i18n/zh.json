@@ -2238,7 +2238,8 @@
         "standardConversation": "标准会话记录",
         "lastError": "最近错误",
         "triggerEvent": "触发事件",
-      "noConversation": "无会话消息",
+        "noConversation": "无会话消息",
+        "historyLoadFailed": "执行记录未完整加载，请重试。",
         "agentFallback": "数字员工",
         "groups": {
           "active": "进行中",
@@ -4561,6 +4562,7 @@
     }
   },
   "common": {
+    "retry": "重试",
     "pagination": {
       "label": "分页导航",
       "range": "第 {{start}}–{{end}} 项，共 {{total}} 项",

@@ -2304,7 +2304,8 @@
         "standardConversation": "Standard conversation record",
         "lastError": "Last error",
         "triggerEvent": "Trigger event",
-      "noConversation": "No conversation messages",
+        "noConversation": "No conversation messages",
+        "historyLoadFailed": "The execution history could not be loaded completely. Please retry.",
         "agentFallback": "Digital employee",
         "groups": {
           "active": "Active",
@@ -4571,6 +4572,7 @@
     }
   },
   "common": {
+    "retry": "Retry",
     "pagination": {
       "label": "Pagination",
       "range": "{{start}}–{{end}} of {{total}}",
