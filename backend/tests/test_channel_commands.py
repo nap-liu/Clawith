@@ -1,13 +1,4 @@
-"""Unit tests for app.services.channel_commands.
-
-Covers:
-1. `handle_channel_command()` scopes its archive lookup by source_channel
-   (no cross-channel collision on shared external_conv_id).
-2. It archives the matching old session by renaming its external_conv_id.
-3. It defers new-session creation to the next user message so the session
-   title auto-names from the first message — rather than being locked to
-   a hard-coded 'New Session' placeholder.
-"""
+"""Observable channel command responses, permissions, and session state changes."""
 
 from __future__ import annotations
 
@@ -18,41 +9,6 @@ from typing import Any
 import pytest
 
 from app.services import channel_commands
-
-
-class _ExecutedQuery:
-    """Captures WHERE-clause state for an executed SQLAlchemy select()."""
-
-    def __init__(self, statement: Any) -> None:
-        self.statement = statement
-        # Extract column names referenced by equality comparisons in the WHERE
-        # clause. This lets tests assert that source_channel is part of the
-        # filter without depending on clause order.
-        self.filter_columns: set[str] = set()
-        self.filter_values: dict[str, Any] = {}
-        whereclause = getattr(statement, "whereclause", None)
-        self._collect(whereclause)
-
-    def _collect(self, clause: Any) -> None:
-        if clause is None:
-            return
-        # BooleanClauseList (AND/OR) has .clauses
-        sub_clauses = getattr(clause, "clauses", None)
-        if sub_clauses:
-            for c in sub_clauses:
-                self._collect(c)
-            return
-        left = getattr(clause, "left", None)
-        right = getattr(clause, "right", None)
-        if left is not None:
-            name = getattr(left, "key", None) or getattr(left, "name", None)
-            if name:
-                self.filter_columns.add(name)
-                if right is not None:
-                    # BindParameter exposes .value
-                    val = getattr(right, "value", None)
-                    if val is not None:
-                        self.filter_values[name] = val
 
 
 class _FakeResult:
@@ -68,12 +24,12 @@ class FakeDB:
 
     def __init__(self, lookup_result: Any = None) -> None:
         self._lookup_result = lookup_result
-        self.executed: list[_ExecutedQuery] = []
+        self.executed: list[Any] = []
         self.added: list[Any] = []
         self.flushes = 0
 
     async def execute(self, statement, _params=None):  # noqa: D401
-        self.executed.append(_ExecutedQuery(statement))
+        self.executed.append(statement)
         return _FakeResult(self._lookup_result)
 
     def add(self, obj) -> None:
@@ -87,59 +43,6 @@ class FakeDB:
 
     async def flush(self) -> None:
         self.flushes += 1
-
-
-def test_channel_turn_lock_key_falls_back_to_route_before_session_exists():
-    agent_id = uuid.uuid4()
-
-    assert channel_commands._channel_turn_lock_key(
-        None,
-        agent_id=agent_id,
-        source_channel="teams",
-        external_conv_id="conversation-1",
-    ) == channel_commands.channel_session_lock_key(
-        agent_id,
-        "teams",
-        "conversation-1",
-    )
-
-
-@pytest.mark.asyncio
-async def test_handle_channel_command_scopes_lookup_by_source_channel():
-    """Regression test for review concern #2.
-
-    The session-archive lookup must include `source_channel` in its WHERE
-    clause so a /new command on one channel never archives a same-external-id
-    session on another channel.
-    """
-    agent_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-
-    db = FakeDB(lookup_result=None)  # no pre-existing session
-
-    result = await channel_commands.handle_channel_command(
-        db=db,
-        command="/new",
-        agent_id=agent_id,
-        user_id=user_id,
-        external_conv_id="feishu_p2p_ou_xxx",
-        source_channel="feishu",
-    )
-
-    assert result["action"] == "new_session"
-    assert "下一条消息将开启新对话" in result["message"]
-    assert "重新发送刚才的需求" in result["message"]
-    # Exactly one SELECT for the old-session lookup.
-    assert len(db.executed) == 1
-    q = db.executed[0]
-    # The WHERE clause must filter on all three columns.
-    assert "agent_id" in q.filter_columns
-    assert "external_conv_id" in q.filter_columns
-    assert "source_channel" in q.filter_columns, (
-        "handle_channel_command() must scope the archive lookup by source_channel "
-        "so it never archives a cross-channel session with a colliding external_conv_id"
-    )
-    assert q.filter_values.get("source_channel") == "feishu"
 
 
 @pytest.mark.asyncio
@@ -164,6 +67,8 @@ async def test_handle_channel_command_does_not_preempt_session_creation():
     )
 
     assert result["action"] == "new_session"
+    assert "下一条消息将开启新对话" in result["message"]
+    assert "重新发送刚才的需求" in result["message"]
     # Nothing should be added to the DB — creation is deferred.
     assert db.added == []
     # And the response must not leak a session_id (there is no session yet).

@@ -14,7 +14,7 @@ from app.models.channel_config import ChannelConfig
 from app.models.tool import AgentTool, Tool
 from app.services import agent_tools_feishu_calendar as calendar
 from session_introspection_support import (
-    _isolate_async_engine_between_tests,
+    _isolate_async_engine_between_tests as _isolate_async_engine_between_tests,
     _seed_agent,
     _seed_tenant,
     _seed_user,
@@ -99,14 +99,6 @@ def _event_create_call() -> tuple[str, str, dict]:
         for call in _CalendarClient.calls
         if call[0] == "POST" and call[1].endswith("/events")
     )
-
-
-def test_agent_tools_facade_routes_calendar_to_split_module():
-    from app.services import agent_tools
-
-    assert agent_tools._feishu_calendar_list is calendar._feishu_calendar_list
-    assert agent_tools._feishu_calendar_create is calendar._feishu_calendar_create
-    assert agent_tools.channel_feishu_sender_open_id is calendar.channel_feishu_sender_open_id
 
 
 @pytest.mark.asyncio

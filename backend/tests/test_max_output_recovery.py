@@ -8,14 +8,11 @@ attempts per call; after that we surface a clean error string.
 
 Cases locked in here:
 
-A. ``finish_reason == "stop"`` → no recovery, normal return.
-B. First response truncated (``"length"``) + partial text, second response
-   ``"stop"`` + remainder → caller returns full concatenated content and the
-   dispatched recovery transcript remains append-only.
 C. Three consecutive truncated responses + a fourth still truncated →
    caller returns the exhaustion error string verbatim.
-D. During recovery the dispatch ``messages`` sent to ``client.stream`` retain
-   an append-only ``assistant(partial) + user(RESUME_PROMPT)`` tail.
+D. Recovery concatenates partial content and the dispatch ``messages`` sent
+   to ``client.stream`` retain an append-only
+   ``assistant(partial) + user(RESUME_PROMPT)`` tail.
 E. If the re-streamed (resumed) response carries ``tool_calls``, the outer
    tool-calling loop handles it normally — truncation recovery and tool
    calling compose cleanly without interfering.
@@ -188,54 +185,6 @@ def test_predicate_rejects_normal_finish_reasons():
             LLMResponse(content="x", finish_reason=r)
         ) is False, f"{r!r} should NOT trigger recovery"
 
-
-# ─── Case A: no truncation → single stream, no recovery ───────────────────────
-
-@pytest.mark.asyncio
-async def test_case_a_no_truncation_returns_direct(monkeypatch):
-    client = _ScriptedClient([
-        _stop_response("all-done"),
-    ])
-    _patch_caller_collaborators(monkeypatch, client)
-
-    result = await call_llm(
-        model=_FakeModel(),
-        messages=[{"role": "user", "content": "hi"}],
-        agent_name="T", role_description="",
-        agent_id="agent-x", user_id="user-x", session_id="s",
-    )
-
-    assert result == "all-done"
-    assert len(client.stream_calls) == 1, "no recovery should not re-stream"
-    assert client.closed is True
-
-
-# ─── Case B: one recovery → user-visible content concatenated ─────────────────
-
-@pytest.mark.asyncio
-async def test_case_b_single_recovery_concatenates_content(monkeypatch):
-    # First stream: partial text, cut off by length.
-    # Second stream: the resume continues where the partial left off. The
-    # recovery runs (1 resume = 2 stream calls); the loop stitches the partial
-    # and the continuation and returns the concatenation.
-    client = _ScriptedClient([
-        LLMResponse(content="half-one ", finish_reason="length"),
-        _stop_response("half-two"),
-    ])
-    _patch_caller_collaborators(monkeypatch, client)
-
-    result = await call_llm(
-        model=_FakeModel(),
-        messages=[{"role": "user", "content": "write something long"}],
-        agent_name="T", role_description="",
-        agent_id="agent-x", user_id="user-x", session_id="s",
-    )
-
-    # Returned string is the full concatenation.
-    assert result == "half-one half-two"
-    # We made exactly 2 stream calls: the initial + 1 resume.
-    assert len(client.stream_calls) == 2
-    assert client.closed is True
 
 
 # ─── Case C: 3 retries exhausted → error string ───────────────────────────────

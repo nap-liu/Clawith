@@ -9,19 +9,18 @@ loop. These tests pin:
 - (resolve + reenter tests are added as the resolve path is built)
 """
 
-import asyncio
 import datetime
 import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
-from app.models.channel_config import ChannelConfig
+from app.models.channel_config import ChannelConfig as ChannelConfig
 from app.models.chat_session import ChatSession
 from app.models.participant import Participant  # noqa: F401 — ChatMessage.participant_id FK
 from app.models.tenant import Tenant
@@ -553,6 +552,12 @@ async def test_resolve_fills_tool_result_and_reenters():
             button_label="确认", resolving_user_id=user_id,
         )
 
+        second = await cs.resolve_confirmation(
+            agent_id=agent_id, call_id=row_id, button_value="confirm",
+            button_label="确认", resolving_user_id=user_id,
+        )
+
+    assert second is None
     assert result is not None
     assert "确认" in result and "value=confirm" in result and "在有效期内" in result
     payload = await _row_payload(row_id)
@@ -644,51 +649,6 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
         )
     assert resumed_current == resumed_exact
     assert resumed_current.status == "running"
-
-
-async def test_session_lock_reuses_existing_pending_confirmation():
-    """A second suspension attempt in the same real session cannot create another card."""
-    from app.services import confirmation_service as cs
-
-    agent_id, user_id = await _make_agent()
-    session = await _make_session(agent_id, user_id, source_channel="web")
-    with patch.object(cs, "_broadcast", new=AsyncMock()):
-        first = await cs.suspend_for_confirmation(
-            agent_id=agent_id,
-            conversation_id=str(session.id),
-            chat_session_id=session.id,
-            source_channel="web",
-            user_id=user_id,
-            intro_text=None,
-            title="第一次确认",
-            summary="只能存在一张",
-            action=None,
-            risk_level="medium",
-        )
-        second = await cs.suspend_for_confirmation(
-            agent_id=agent_id,
-            conversation_id=str(session.id),
-            chat_session_id=session.id,
-            source_channel="web",
-            user_id=user_id,
-            intro_text=None,
-            title="第二次确认",
-            summary="不能覆盖第一张",
-            action=None,
-            risk_level="medium",
-        )
-
-    assert second == first
-    async with async_session() as db:
-        rows = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == str(session.id),
-                    ChatMessage.role == "tool_call",
-                )
-            )
-        ).scalars().all()
-    assert [row.id for row in rows] == [first]
 
 
 async def test_pending_lookup_reads_latest_tool_call_without_casting_history():

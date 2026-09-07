@@ -93,14 +93,7 @@ def test_expand_legacy_feishu_schema_is_tolerated():
     assert asst["tool_calls"][0]["function"]["name"] == "send_message"
     assert json.loads(asst["tool_calls"][0]["function"]["arguments"]) == {"to": "bob"}
     assert tool["content"] == "sent"
-
-
-def test_expand_without_reasoning_omits_field():
-    row = _row(json.dumps({"name": "noop", "args": {}, "result": ""}))
-
-    out = expand_tool_call_row(row)
-
-    assert "reasoning_content" not in out[0]
+    assert "reasoning_content" not in asst
 
 
 def test_expand_malformed_json_returns_empty():
@@ -148,21 +141,6 @@ def test_display_parse_malformed_returns_empty_dict():
     from app.services.chat_history import parse_tool_call_for_display
 
     assert parse_tool_call_for_display("{bad json") == {}
-
-
-def test_strip_leading_orphan_tool_messages_drops_orphan():
-    """A context-window slice can cut a tool-call pair, leaving the history
-    starting with a role='tool' that has no preceding tool_calls. LLM APIs
-    reject that, so leading orphan tool messages must be dropped."""
-    from app.services.chat_history import strip_leading_orphan_tool_messages
-
-    msgs = [
-        {"role": "tool", "tool_call_id": "x", "content": "orphan result"},
-        {"role": "assistant", "content": "hi"},
-        {"role": "user", "content": "q"},
-    ]
-    out = strip_leading_orphan_tool_messages(msgs)
-    assert [m["role"] for m in out] == ["assistant", "user"]
 
 
 def test_strip_leading_orphan_tool_messages_multiple():

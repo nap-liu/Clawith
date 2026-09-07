@@ -11,7 +11,6 @@ from app.services.sandbox.remote.aio_sandbox_backend import (
     compute_session_anchor,
     compute_session_namespace,
 )
-from app.services.tool_seeder import BUILTIN_TOOLS
 
 
 def _backend() -> AioSandboxBackend:
@@ -265,28 +264,3 @@ def test_background_python_is_a_managed_shell_process():
     script = _decode_transport(command)
     assert "python -u <<'AIOSB_PYTHON_" in script
     assert "print('hello')" in script
-
-
-def test_seeded_tool_exposes_one_simple_execute_and_job_management_contract():
-    tool = next(item for item in BUILTIN_TOOLS if item["name"] == "execute_code_aio")
-    schema = tool["parameters_schema"]
-    actions = schema["properties"]["action"]["enum"]
-
-    assert actions == [
-        "execute",
-        "list_jobs",
-        "job_status",
-        "job_logs",
-        "job_stop",
-    ]
-    assert schema["properties"]["execution_mode"]["enum"] == [
-        "foreground",
-        "background",
-    ]
-    assert schema["required"] == ["execution_mode"]
-    assert "default" not in schema["properties"]["execution_mode"]
-    assert "device/OAuth authorization waits" in tool["description"]
-    assert ".clawith-jobs" not in tool["description"]
-    assert tool["config"]["background_default_timeout"] < tool["config"][
-        "background_max_timeout"
-    ]

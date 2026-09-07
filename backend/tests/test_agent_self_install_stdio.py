@@ -7,7 +7,6 @@ from app.database import async_session, engine
 from app.models.user import User, Identity
 from app.models.tenant import Tenant
 from app.models.agent import Agent
-from app.models.mcp_server import MCPServer
 from app.models.tool import Tool, AgentTool
 from sqlalchemy import select
 
@@ -381,5 +380,5 @@ async def test_two_agents_tool_names_no_collision():
         names1 = {t.name for t in tools1 if t.mcp_tool_name == "create_pipeline"}
         names2 = {t.name for t in tools2 if t.mcp_tool_name == "create_pipeline"}
 
-        if names1 and names2:
-            assert names1.isdisjoint(names2), f"Tool name collision: {names1 & names2}"
+        assert names1 and names2, "Both agents must receive the discovered tool"
+        assert names1.isdisjoint(names2), f"Tool name collision: {names1 & names2}"

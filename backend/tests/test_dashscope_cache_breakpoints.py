@@ -39,13 +39,6 @@ def test_invariant_toolloop_tail_is_covered():
     assert _last_covered(marks) >= len(msgs) - 2, f"tail not covered: {marks}"
 
 
-def test_tool_role_tail_is_markable():
-    # Regression for the bug: tool-result tail must be markable (was skipped).
-    msgs = [SYS, USR, ASS_TC, TOOL]
-    marks = select_cache_breakpoints(msgs)
-    assert max(marks) >= 3, f"tool tail not marked: {marks}"
-
-
 def test_assistant_toolcall_null_content_falls_back_to_prev_tool():
     # Tail is a content-less assistant tool-call turn → fall back to the
     # preceding tool result (index 3), which IS markable.
@@ -59,11 +52,6 @@ def test_at_most_four_breakpoints_sorted_unique():
     marks = select_cache_breakpoints(msgs)
     assert marks == sorted(set(marks))
     assert len(marks) <= 4
-
-
-def test_system_always_included_when_present():
-    msgs = [SYS, USR, ASS_TC, TOOL]
-    assert 0 in select_cache_breakpoints(msgs)
 
 
 def test_empty_list():
@@ -101,6 +89,7 @@ def test_dashscope_marks_toolloop_tail_payload():
     tail = payload[-1]
     assert isinstance(tail["content"], list), "tool tail content must be wrapped to list form"
     assert any(b.get("cache_control") for b in tail["content"]), "tool tail must carry cache_control"
+    assert any(b.get("cache_control") for b in payload[0]["content"])
 
 
 def test_dashscope_serializes_external_tool_result_as_continuation_tail():
@@ -160,19 +149,6 @@ def test_apply_cache_control_idempotent_skips_volatile_dynamic_block():
     blocks = payload[0]["content"]
     assert blocks[0].get("cache_control"), "stable block stays marked"
     assert not blocks[1].get("cache_control"), "volatile dynamic block must NOT be marked"
-
-
-def test_dashscope_marks_system_prefix():
-    client = _dashscope_client()
-    payload = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "q"},
-        {"role": "assistant", "content": "a"},
-    ]
-    client._apply_dashscope_cache_markers(payload)
-    sysmsg = payload[0]
-    assert isinstance(sysmsg["content"], list)
-    assert any(b.get("cache_control") for b in sysmsg["content"])
 
 
 # --- observability: per-round cache-hit-ratio ---

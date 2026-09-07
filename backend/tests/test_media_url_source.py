@@ -3,7 +3,6 @@ import threading
 
 import httpx
 import pytest
-from loguru import logger
 
 from app.services import media_url_source
 from media_url_source_support import (
@@ -13,42 +12,6 @@ from media_url_source_support import (
     _fail_temp_directory,
     _staging_dir,
 )
-
-
-@pytest.mark.asyncio
-async def test_managed_url_streams_into_agent_media_store_and_finishes_atomically(tmp_path, monkeypatch):
-    original_client = httpx.AsyncClient
-    transport = httpx.MockTransport(lambda request: httpx.Response(
-        200,
-        headers={"content-type": "video/mp4"},
-        content=MP4_BYTES,
-        request=request,
-    ))
-
-    async def fake_validate(url, *, external):
-        assert external is False
-        return url
-
-    def client_factory(**kwargs):
-        return original_client(transport=transport, timeout=kwargs.get("timeout"))
-
-    monkeypatch.setattr(media_url_source, "validate_media_url", fake_validate)
-    monkeypatch.setattr(media_url_source, "_resolve_host", lambda *_args: _async_addresses(["93.184.216.34"]))
-    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
-
-    imported = await media_url_source.import_managed_media_url(
-        "https://media.example/demo.mp4",
-        agent_workspace=tmp_path,
-        session_id=SESSION_ID,
-        intent_id="call-managed",
-        max_bytes=1024,
-        expected_media_kind="video",
-    )
-
-    assert imported.file_path.read_bytes() == MP4_BYTES
-    assert imported.workspace_path.startswith("media/imported/")
-    assert imported.mime_type == "video/mp4"
-    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ Covers the contract that downstream code relies on:
     <persisted-output> marker + preview + file ref.
   - One normalized budget applies to every tool.
   - Env override changes that budget globally.
-  - Missing agent_id / unwritable path falls back to inline shape
+  - Missing agent_id / unwritable path raises a materialization error
     (never silently drops data).
 """
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -106,15 +105,14 @@ def test_json_output_detected_and_suffixed(tmp_workspace, agent_id):
     assert json.loads(written.read_text()) == payload
 
 
-def test_all_tools_share_normalized_budget(tmp_workspace, agent_id):
-    size = 50_000
-    s = "y" * size
+@pytest.mark.parametrize("tool_name", ["grep", "execute_code", "read_file", "some_mcp_tool"])
+def test_all_tools_share_normalized_budget(tmp_workspace, agent_id, tool_name):
+    result = "y" * 50_000
+    view = _finalize(result, tool_name=tool_name, agent_id=agent_id)
 
-    view_grep = _finalize(s, tool_name="grep", agent_id=agent_id, tool_call_id="c1")
-    assert tos.PERSISTED_OPEN in view_grep
-
-    view_default = _finalize(s, tool_name="some_mcp_tool", agent_id=agent_id, tool_call_id="c2")
-    assert tos.PERSISTED_OPEN in view_default
+    assert tos.PERSISTED_OPEN in view
+    assert len(view) <= tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
+    assert (tmp_workspace / agent_id / _saved_path(view)).read_text() == result
 
 
 def test_read_file_large_single_line_is_materialized(tmp_workspace, agent_id):
@@ -317,13 +315,3 @@ def test_materialization_sanitizes_unsafe_session_id(tmp_workspace, agent_id):
     expected = _saved_path(view)
     assert expected.startswith(".tool_results/unsafe_session/grep_safe-call_")
     assert (tmp_workspace / agent_id / expected).read_text() == big
-
-
-def test_budget_for_unknown_tool_uses_default():
-    assert tos.budget_for("nonexistent_tool_xyz") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
-
-
-def test_budget_for_known_tools_uses_same_default():
-    assert tos.budget_for("grep") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
-    assert tos.budget_for("execute_code") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS
-    assert tos.budget_for("read_file") == tos.DEFAULT_TOOL_OUTPUT_MAX_CHARS

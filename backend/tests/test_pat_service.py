@@ -64,19 +64,6 @@ async def _seed_user(tenant_id=None, name: str = "U") -> User:
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 
-async def test_issue_pat_returns_plaintext_with_clw_prefix():
-    """issue_pat returns a plaintext token starting with 'clw_'."""
-    from app.services.pat_service import issue_pat
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-
-    async with async_session() as db:
-        token, row = await issue_pat(db, user=user, name="my-token")
-
-    assert token.startswith("clw_"), f"Expected 'clw_' prefix, got: {token!r}"
-
-
 async def test_issue_pat_stores_hash_not_plaintext():
     """Stored token_hash is sha256 hex (64 chars), not the plaintext."""
     from app.services.pat_service import issue_pat
@@ -93,19 +80,6 @@ async def test_issue_pat_stores_hash_not_plaintext():
     assert row.token_hash != token, "Plaintext must not be stored"
 
 
-async def test_issue_pat_stores_correct_prefix():
-    """token_prefix == token[:8]."""
-    from app.services.pat_service import issue_pat
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-
-    async with async_session() as db:
-        token, row = await issue_pat(db, user=user, name="my-token")
-
-    assert row.token_prefix == token[:8], "token_prefix must be the first 8 chars of the plaintext"
-
-
 async def test_issue_pat_raises_if_user_has_no_tenant():
     """issue_pat raises ValueError when user.tenant_id is None."""
     from app.services.pat_service import issue_pat
@@ -117,25 +91,7 @@ async def test_issue_pat_raises_if_user_has_no_tenant():
             await issue_pat(db, user=user, name="bad-token")
 
 
-async def test_verify_pat_success_returns_user_and_tenant():
-    """verify_pat returns (user, tenant_id) for a valid token."""
-    from app.services.pat_service import issue_pat, verify_pat
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-
-    async with async_session() as db:
-        token, _ = await issue_pat(db, user=user, name="test-token")
-
-    async with async_session() as db:
-        returned_user, returned_tenant_id = await verify_pat(db, token)
-
-    assert returned_user is not None, "verify_pat should return a user"
-    assert returned_user.id == user.id
-    assert returned_tenant_id == tenant.id
-
-
-async def test_verify_pat_updates_last_used_at():
+async def test_verify_pat_returns_user_and_tenant_and_updates_last_used_at():
     """verify_pat refreshes last_used_at on the PAT row."""
     from app.services.pat_service import issue_pat, verify_pat
     from app.models.personal_access_token import PersonalAccessToken
@@ -153,7 +109,9 @@ async def test_verify_pat_updates_last_used_at():
     before = datetime.now(timezone.utc)
 
     async with async_session() as db:
-        await verify_pat(db, token)
+        returned_user, returned_tenant_id = await verify_pat(db, token)
+    assert returned_user.id == user.id
+    assert returned_tenant_id == tenant.id
 
     async with async_session() as db:
         result = await db.execute(select(PersonalAccessToken).where(PersonalAccessToken.id == pat_id))

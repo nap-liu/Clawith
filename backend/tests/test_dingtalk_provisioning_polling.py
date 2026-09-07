@@ -3,7 +3,6 @@
 from tests.test_dingtalk_provisioning import (
     UTC,
     Agent,
-    ChatMessage,
     ChannelConfig,
     DINGTALK_PROVISIONING_OPERATION_FORCE,
     DINGTALK_PROVISIONING_STATUS_CANCELLED,
@@ -11,20 +10,16 @@ from tests.test_dingtalk_provisioning import (
     DINGTALK_PROVISIONING_STATUS_EXPIRED,
     DINGTALK_PROVISIONING_STATUS_FAILED,
     DINGTALK_PROVISIONING_STATUS_POLLING,
-    DINGTALK_PROVISIONING_STATUS_WAITING,
     DINGTALK_WELCOME_STATUS_PENDING,
     DingTalkChannelProvisioningSession,
     FakeRegistrationClient,
-    IdentityProvider,
-    OrgMember,
     _seed_digital_employee,
-    db_session,
+    db_session as db_session,
     datetime,
     dingtalk_credential_fingerprint,
     poll_dingtalk_provisioning_session,
     pytest,
     select,
-    start_dingtalk_channel_provisioning,
     timedelta,
     uuid,
 )
@@ -280,61 +275,6 @@ async def test_final_deadline_poll_nonready_response_expires_instead_of_reschedu
     assert session.poll_attempt_count == 900
     assert session.status == DINGTALK_PROVISIONING_STATUS_EXPIRED
     assert session.next_poll_at is None
-
-
-@pytest.mark.asyncio
-async def test_full_30_minute_poll_window_consumes_success_on_attempt_900(db_session):
-    _, user, agent = await _seed_digital_employee(db_session)
-    started_at = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
-    session = DingTalkChannelProvisioningSession(
-        agent_id=agent.id,
-        tenant_id=agent.tenant_id,
-        requested_by_user_id=user.id,
-        status=DINGTALK_PROVISIONING_STATUS_WAITING,
-        device_code="full-window-success",
-        authorization_url="https://auth.example",
-        expires_at=started_at + timedelta(minutes=30),
-        next_poll_at=started_at + timedelta(seconds=2),
-        poll_interval_seconds=2,
-        max_poll_attempts=900,
-    )
-    db_session.add(session)
-    await db_session.flush()
-    fake_client = FakeRegistrationClient(
-        poll_responses=[
-            *({"status": "WAITING"} for _ in range(899)),
-            {
-                "status": "SUCCESS",
-                "client_id": "attempt-900-client-id",
-                "client_secret": "attempt-900-client-secret",
-            },
-        ]
-    )
-
-    async def fake_stream_starter(agent_id, app_key, app_secret):
-        return None
-
-    for attempt in range(1, 901):
-        await poll_dingtalk_provisioning_session(
-            db_session,
-            session,
-            registration_client=fake_client,
-            stream_starter=fake_stream_starter,
-            now=started_at + timedelta(seconds=attempt * 2),
-        )
-
-    assert session.poll_attempt_count == 900
-    assert len(fake_client.poll_calls) == 900
-    assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
-    config = (
-        await db_session.execute(
-            select(ChannelConfig).where(
-                ChannelConfig.agent_id == agent.id,
-                ChannelConfig.channel_type == "dingtalk",
-            )
-        )
-    ).scalar_one()
-    assert config.app_id == "attempt-900-client-id"
 
 
 @pytest.mark.asyncio

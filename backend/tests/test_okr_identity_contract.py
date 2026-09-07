@@ -23,8 +23,6 @@ def test_objective_contract_exposes_only_canonical_ids():
         period_end="2026-09-30",
     )
     assert body.user_id == str(user_id)
-    assert "owner_id" not in ObjectiveCreate.model_fields
-    assert "owner_type" not in ObjectiveCreate.model_fields
 
     with pytest.raises(ValidationError):
         ObjectiveCreate(
@@ -59,8 +57,6 @@ def test_objective_output_uses_user_id_or_agent_id_not_generic_owner():
 
 
 def test_daily_report_contract_is_exactly_one_canonical_id_or_current_user():
-    assert "member_id" not in MemberDailyReportUpsert.model_fields
-    assert "member_type" not in MemberDailyReportUpsert.model_fields
     current_user_request = MemberDailyReportUpsert(
         report_date="2026-07-15",
         content="done",

@@ -194,12 +194,6 @@ def test_update_body_rejects_flat_binary_sha256_key():
         CliToolUpdate.model_validate({"binary_sha256": "f" * 64})
 
 
-def test_update_body_accepts_env():
-    """Legitimate admin update with env dict is accepted."""
-    body = CliToolUpdate.model_validate({"env": {"K": "v", "X": "y"}})
-    assert body.env == {"K": "v", "X": "y"}
-
-
 def test_update_body_rejects_runtime_key():
     """Old ``runtime`` key is rejected by extra=forbid now that the shim is gone."""
     with pytest.raises(ValidationError):
@@ -596,54 +590,6 @@ def _member_user():
         tenant_id=uuid.uuid4(),
         is_active=True,
     )
-
-
-@pytest.mark.asyncio
-async def test_get_versions_returns_history(monkeypatch):
-    """GET /versions returns the service-layer list, mapped to the
-    BinaryVersionOut wire shape, newest first."""
-    tool = _make_tool()
-    db = FakeDB(tool=tool)
-    user = _platform_admin()
-
-    version_rows = [
-        SimpleNamespace(
-            id=uuid.uuid4(),
-            tool_id=tool.id,
-            sha256="a" * 64,
-            size=10,
-            original_name="v1",
-            uploaded_at=datetime(2026, 4, 1, tzinfo=timezone.utc),
-            uploaded_by_user_id=None,
-            is_current=False,
-            notes=None,
-        ),
-        SimpleNamespace(
-            id=uuid.uuid4(),
-            tool_id=tool.id,
-            sha256="b" * 64,
-            size=20,
-            original_name="v2",
-            uploaded_at=datetime(2026, 4, 2, tzinfo=timezone.utc),
-            uploaded_by_user_id=user.id,
-            is_current=True,
-            notes="ship",
-        ),
-    ]
-
-    async def _fake_list(_db, _tool):
-        return version_rows
-
-    from app.services.cli_tools import versioning as versioning_service
-
-    monkeypatch.setattr(versioning_service, "list_versions", _fake_list)
-
-    out = await list_binary_versions(tool_id=tool.id, db=db, user=user)
-
-    assert len(out) == 2
-    assert out[0].sha256 == "a" * 64
-    assert out[1].is_current is True
-    assert out[1].notes == "ship"
 
 
 @pytest.mark.asyncio

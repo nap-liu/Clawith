@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC as UTC, datetime as datetime, timedelta as timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -14,21 +14,21 @@ from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
-from app.models.chat_compaction import ChatCompaction
+from app.models.chat_compaction import ChatCompaction as ChatCompaction
 from app.models.chat_session import ChatSession
 from app.models.mcp_server import MCPServer  # noqa: F401 - register Tool FK target
 from app.models.participant import Participant  # noqa: F401 - register ChatMessage FK target
 from app.models.tenant import Tenant
-from app.models.tool import AgentTool, Tool
+from app.models.tool import AgentTool as AgentTool, Tool as Tool
 from app.models.user import Identity, User
-from app.scripts.rollback_im_recall import remove_builtin_tool
+from app.scripts.rollback_im_recall import remove_builtin_tool as remove_builtin_tool
 from app.services import agent_tools, im_delivery
 from app.services.channel_commands import prepare_channel_command_reply
-from app.services.chat_history import build_llm_messages_from_rows, load_messages_for_session
-from app.services.chat_message_serializer import serialize_chat_message_for_client
-from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, PartRecallResult
-from app.services.llm.compactor import serialize_span_for_summary
-from app.services.llm.utils import convert_chat_messages_to_llm_format
+from app.services.chat_history import build_llm_messages_from_rows as build_llm_messages_from_rows, load_messages_for_session as load_messages_for_session
+from app.services.chat_message_serializer import serialize_chat_message_for_client as serialize_chat_message_for_client
+from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult, PartRecallResult as PartRecallResult
+from app.services.llm.compactor import serialize_span_for_summary as serialize_span_for_summary
+from app.services.llm.utils import convert_chat_messages_to_llm_format as convert_chat_messages_to_llm_format
 
 pytestmark = pytest.mark.asyncio
 
@@ -256,47 +256,6 @@ async def test_proactive_channel_claim_is_single_sender_and_sanitizes_every_boun
     assert forbidden.casefold() not in session.title.casefold()
 
 
-async def test_reset_reply_anchors_to_archived_session_without_creating_active_ghost():
-    agent, user = await _seed_agent()
-    async with async_session() as db:
-        session = ChatSession(
-            agent_id=agent.id,
-            user_id=user.id,
-            title="Old session",
-            source_channel="dingtalk",
-            external_conv_id="dingtalk_p2p_staff-command",
-        )
-        db.add(session)
-        await db.commit()
-
-        result = await prepare_channel_command_reply(
-            db,
-            command="/new",
-            agent_id=agent.id,
-            user_id=user.id,
-            external_user_id="staff-command",
-            external_conv_id="dingtalk_p2p_staff-command",
-            source_channel="dingtalk",
-            provider_event_id="event-reset-1",
-        )
-        await db.commit()
-
-        active = (
-            await db.execute(
-                select(ChatSession).where(
-                    ChatSession.agent_id == agent.id,
-                    ChatSession.source_channel == "dingtalk",
-                    ChatSession.external_conv_id == "dingtalk_p2p_staff-command",
-                )
-            )
-        ).scalar_one_or_none()
-        archived = await db.get(ChatSession, session.id)
-
-    assert active is None
-    assert result["conversation_id"] == str(session.id)
-    assert "__archived_" in archived.external_conv_id
-
-
 async def test_duplicate_reset_event_archives_once_and_never_requests_redelivery():
     agent, user = await _seed_agent()
     external_conv_id = "dingtalk_p2p_duplicate-reset"
@@ -333,12 +292,19 @@ async def test_duplicate_reset_event_archives_once_and_never_requests_redelivery
     provider_sends = [result["message"] for result in results if result["should_deliver"]]
     async with async_session() as db:
         archived = await db.get(ChatSession, session_id)
+        active = await db.scalar(select(ChatSession).where(
+            ChatSession.agent_id == agent.id,
+            ChatSession.source_channel == "dingtalk",
+            ChatSession.external_conv_id == external_conv_id,
+        ))
         command_rows = list((await db.execute(
             select(ChatMessage).where(
                 ChatMessage.message_meta["artifact_role"].as_string() == "command_reply"
             )
         )).scalars())
 
+    assert active is None
+    assert first["conversation_id"] == str(session_id)
     assert first["should_deliver"] is True
     assert first["replayed"] is False
     assert replay["should_deliver"] is False

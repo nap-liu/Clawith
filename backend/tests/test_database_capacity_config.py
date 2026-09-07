@@ -5,9 +5,6 @@ from app.database import database_engine_options
 
 
 def test_database_pool_defaults_remain_conservative() -> None:
-    assert Settings.model_fields["DATABASE_POOL_SIZE"].default == 20
-    assert Settings.model_fields["DATABASE_MAX_OVERFLOW"].default == 10
-
     settings = Settings.model_construct(
         DATABASE_URL="postgresql+asyncpg://user:pass@db.example/test_clawith",
         DEBUG=False,

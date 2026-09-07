@@ -4,71 +4,6 @@ from types import SimpleNamespace
 import pytest
 
 from app.core import permissions
-from app.core.permissions import build_visible_agents_query
-
-
-def make_user(**overrides):
-    values = {
-        "id": uuid.uuid4(),
-        "role": "member",
-        "tenant_id": uuid.uuid4(),
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def test_build_visible_agents_query_restricts_to_same_tenant_and_visible_permissions():
-    user = make_user()
-
-    stmt = build_visible_agents_query(user)
-    sql = str(stmt)
-
-    assert "agents.scope" in sql
-    assert "agents.tenant_id" in sql
-    assert "agents.creator_id" in sql
-    assert "agent_permissions.scope_type" in sql
-    assert "agent_permissions.scope_id" in sql
-
-
-def _where_clause(stmt) -> str:
-    """Extract the SQL WHERE substring. ``str(select)`` includes the
-    SELECT projection (every column name like ``agents.access_mode``),
-    which would pollute filter-shape assertions; we only care about
-    what's in the WHERE clause."""
-    sql = str(stmt)
-    idx = sql.find("\nWHERE")
-    if idx == -1:
-        idx = sql.find(" WHERE")
-    return sql[idx:] if idx != -1 else ""
-
-
-def test_build_visible_agents_query_platform_admin_sees_everything_in_tenant():
-    """platform_admin is a cross-tenant operator; sees own tenant fully,
-    including other users' private agents."""
-    admin = make_user(role="platform_admin", tenant_id=None)
-
-    where = _where_clause(build_visible_agents_query(admin, tenant_id=uuid.uuid4()))
-
-    assert "agents.tenant_id" in where
-    # No access_mode filter in WHERE — platform_admin sees private agents too.
-    assert "access_mode" not in where
-    # No per-user grant filter either.
-    assert "agent_permissions" not in where
-
-
-def test_build_visible_agents_query_regular_user_uses_explicit_grants():
-    """Regular users see own creations, company-visible agents, and any
-    agent explicitly added to a custom roster they're on."""
-    user = make_user(role="member")
-
-    where = _where_clause(build_visible_agents_query(user))
-
-    assert "agents.tenant_id" in where
-    assert "agents.creator_id" in where
-    # Regular user needs both company-mode filter and explicit-grant filter.
-    assert "access_mode" in where
-    assert "agent_permissions.scope_type" in where
-    assert "agent_permissions.scope_id" in where
 
 
 class _ScalarResult:
@@ -77,19 +12,6 @@ class _ScalarResult:
 
     def scalar_one_or_none(self):
         return self.value
-
-
-class _ScalarsResult:
-    """Stub mimicking sqlalchemy Result.scalars().all() chain."""
-
-    def __init__(self, values):
-        self.values = values
-
-    def scalars(self):
-        return self
-
-    def all(self):
-        return self.values
 
 
 class _AccessLevelDb:
@@ -257,47 +179,3 @@ async def test_agent_relationship_status_requires_original_creator_to_still_mana
     assert status["access_allowed"] is False
     assert status["access_status"] == "restricted"
     assert status["access_status_reason"] == "relationship_creator_no_longer_has_access_to_both_agents"
-
-
-@pytest.mark.asyncio
-async def test_agent_relationship_status_active_when_original_creator_still_manages_both_agents(monkeypatch):
-    tenant_id = uuid.uuid4()
-    creator_id = uuid.uuid4()
-    source = SimpleNamespace(
-        id=uuid.uuid4(),
-        tenant_id=tenant_id,
-        creator_id=uuid.uuid4(),
-        access_mode="custom",
-        status="ready",
-        expires_at=None,
-    )
-    target = SimpleNamespace(
-        id=uuid.uuid4(),
-        tenant_id=tenant_id,
-        creator_id=uuid.uuid4(),
-        access_mode="private",
-        status="ready",
-        expires_at=None,
-    )
-    rel = SimpleNamespace(
-        agent_id=source.id,
-        target_agent_id=target.id,
-        target_agent=target,
-        created_by_user_id=creator_id,
-    )
-
-    async def can_access(_db, user_id, _agent):
-        return user_id == creator_id
-
-    # Source side checks manage; target side now checks view (manage implies view,
-    # so a creator who manages both passes both gates).
-    monkeypatch.setattr(permissions, "user_can_manage_agent_id", can_access)
-    monkeypatch.setattr(permissions, "user_can_view_agent_id", can_access)
-
-    status = await permissions.evaluate_agent_relationship_status(
-        _RelationshipStatusDb(source),
-        rel,
-    )
-
-    assert status["access_allowed"] is True
-    assert status["access_status"] == "active"

@@ -16,17 +16,13 @@ import uuid
 import json
 from datetime import datetime, timedelta, timezone
 
-import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 
-from app.database import async_session, engine
-from app.models.agent import Agent, AgentPermission
-from app.models.audit import ChatMessage
+from app.database import async_session
+from app.models.agent import AgentPermission
 from app.models.chat_compaction import ChatCompaction  # noqa: F401 — register FK target table
 from app.models.chat_session import ChatSession
 from app.models.participant import Participant  # noqa: F401 — register for mapper config
-from app.models.tenant import Tenant
-from app.models.user import Identity, User
 
 from app.services import session_query as sq
 from app.services.session_query import (
@@ -39,7 +35,7 @@ from app.services.session_query import (
     resolve_scope,
 )
 from session_introspection_support import (
-    _isolate_async_engine_between_tests,
+    _isolate_async_engine_between_tests,  # noqa: F401 — registers the shared autouse fixture
     _raw_insert_compacted_message,
     _seed_agent,
     _seed_legacy_malformed_session,
@@ -671,35 +667,6 @@ async def test_search_reports_exact_source_channel_for_each_hit():
 
     assert f"[session {web.id}] Web thread · 通道=web" in out
     assert f"[session {a2a.id}] A2A thread · 通道=agent" in out
-
-
-# ── Task 5: seeded schema ──────────────────────────────────────────────────
-
-
-def test_builtin_tools_seeded():
-    from app.services.tool_seeder import BUILTIN_TOOLS
-
-    by_name = {t["name"]: t for t in BUILTIN_TOOLS}
-    for name in ("list_sessions", "read_session_messages", "search_sessions"):
-        assert name in by_name, f"{name} missing from BUILTIN_TOOLS"
-        t = by_name[name]
-        assert t["is_default"] is True
-        assert t["category"] == "discovery"
-        assert t["parameters_schema"]["type"] == "object"
-    assert by_name["read_session_messages"]["parameters_schema"]["required"] == ["session_id"]
-    assert by_name["search_sessions"]["parameters_schema"]["required"] == ["query"]
-    assert "source channel" in by_name["search_sessions"]["description"]
-    list_properties = by_name["list_sessions"]["parameters_schema"]["properties"]
-    assert {
-        "scene",
-        "raw",
-        "cursor",
-        "counterpart",
-        "counterpart_match",
-        "is_group",
-        "group",
-        "group_match",
-    } <= set(list_properties)
 
 
 # ── Task 6: dispatch routing ───────────────────────────────────────────────

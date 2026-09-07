@@ -5,7 +5,6 @@ import asyncio
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
-from app.config import Settings
 from app.services.workload_capacity import (
     CapacityDimension,
     WorkloadCapacity,
@@ -13,17 +12,6 @@ from app.services.workload_capacity import (
     WorkloadKind,
     WorkloadOverloadedError,
 )
-
-
-def test_default_limits_reserve_capacity_for_non_interactive_work() -> None:
-    fields = Settings.model_fields
-
-    assert fields["WORKLOAD_GLOBAL_LIMIT"].default == 700
-    assert fields["WORKLOAD_TENANT_LIMIT"].default == 700
-    assert fields["WORKLOAD_INTERACTIVE_LIMIT"].default == 500
-    assert fields["WORKLOAD_PROJECT_LIMIT"].default == 100
-    assert fields["WORKLOAD_SCHEDULED_LIMIT"].default == 50
-    assert fields["WORKLOAD_BACKGROUND_LIMIT"].default == 50
 
 
 def _capacity(

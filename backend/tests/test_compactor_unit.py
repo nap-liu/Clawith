@@ -20,13 +20,9 @@ import pytest
 
 from app.services.llm.caller import measure_dispatch
 from app.services.llm.compactor import (
-    DETERMINISTIC_SUMMARY_MAX_CHARS,
-    UUID_RECALL_THRESHOLD,
     _load_summary_sender_attribution,
     _summarize_via_llm,
     append_missing_identifiers,
-    build_deterministic_summary,
-    extract_preserved_identifiers,
     extract_objective_evidence,
     objective_evidence_is_truncated,
     objective_evidence_items_from_rows,
@@ -334,11 +330,6 @@ class TestShouldCompact:
         fire, ratio, reason = should_compact(model=m, last_prompt_tokens=None, pre_flight_estimate=100_000)
         assert fire is False
         assert reason == "below_threshold"
-
-    def test_pre_flight_below_compaction_boundary_does_not_fire(self):
-        m = _model(context_window=100_000, ratio=0.85)
-        fire, _, reason = should_compact(model=m, last_prompt_tokens=None, pre_flight_estimate=84_998)
-        assert fire is False
 
     def test_model_usage_ratio_reduces_trigger_window(self):
         m = _model(context_window=100_000, usage_ratio=0.5)

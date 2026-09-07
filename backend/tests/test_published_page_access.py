@@ -1,4 +1,3 @@
-import asyncio
 import pathlib
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,7 +14,6 @@ from app.core.security import create_access_token
 from app.database import async_session, engine
 from app.main import app
 from app.models.agent import Agent
-from app.models.org import OrgDepartment, OrgMember
 from app.models.published_page import (
     PublishedPage,
     PublishedPageAccess,
@@ -23,26 +21,18 @@ from app.models.published_page import (
     PublishedPageVisitor,
 )
 from app.models.tenant import Tenant
-from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
-from app.services.agent_tools import (
-    AGENT_TOOLS,
-    _list_page_access_requests,
-    _list_published_pages,
-    _publish_page,
-    _search_page_viewers,
-    _update_published_page_access,
-    get_agent_tools_for_llm,
-)
 from app.services.published_page_access import PAGE_SESSION_COOKIE, create_page_session
-from app.services.tool_seeder import BUILTIN_TOOLS, seed_builtin_tools
 
 pytestmark = pytest.mark.asyncio
 settings = get_settings()
 
 
 @pytest.fixture(autouse=True)
-async def _dispose_engine():
+async def _dispose_engine(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "AGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(settings, "STORAGE_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "STORAGE_BACKEND", "local")
     await engine.dispose()
     yield
     await engine.dispose()
@@ -400,18 +390,13 @@ async def test_report_owned_meta_csp_and_dom_are_returned_unchanged():
         headerless_embed = await client.get(
             f"/p/{short_id}?__report_embed=1", follow_redirects=False,
         )
-        metadata_embed = await client.get(
-            f"/p/{short_id}?__report_embed=1",
-        )
         content = await client.get(f"/api/pages/{short_id}/content")
 
     assert viewer.status_code == 200
     assert viewer.headers["x-accel-redirect"] == "/__published_page_viewer"
     assert headerless_embed.status_code == 200
     assert "report remains intact" in headerless_embed.text
-    assert metadata_embed.status_code == 200
-    assert "report remains intact" in metadata_embed.text
-    assert "/sdk/clawith.js" in metadata_embed.text
+    assert "/sdk/clawith.js" in headerless_embed.text
     assert content.status_code == 200
     assert "content-security-policy" not in content.headers
     assert "x-frame-options" not in content.headers

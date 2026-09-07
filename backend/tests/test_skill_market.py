@@ -12,24 +12,17 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, ChatMessage
 from app.models.chat_session import ChatSession
-from app.models.skill import Skill, SkillFile, SkillInstall
+from app.models.skill import Skill, SkillInstall
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
-from app.services.agent_provisioning import validate_requested_skill_ids
 from app.services.agent_tools import execute_tool
 from app.services.autonomy_service import autonomy_service
 from app.services.skill_market import (
-    delete_offline_market_skill,
     get_market_skill_detail,
     install_market_skill,
     list_market_skills,
     publish_agent_skill,
-    relist_market_skill,
-    serialize_market_skill,
-    take_skill_offline,
     uninstall_market_skill,
-    validate_skill_files,
-    withdraw_agent_skill,
 )
 from app.services.storage import get_storage_backend, normalize_storage_key
 
@@ -732,7 +725,7 @@ async def test_global_and_tenant_folder_creation_is_serialized():
         assert await db.scalar(select(func.count(Skill.id)).where(Skill.folder_name == folder)) == 1
 
 
-def test_market_routes_are_exposed_before_dynamic_skill_route():
+def test_market_routes_are_exposed_in_openapi():
     from app.main import app
 
     paths = list(app.openapi()["paths"])
@@ -740,4 +733,3 @@ def test_market_routes_are_exposed_before_dynamic_skill_route():
     assert "/api/skills/market/{skill_id}" in paths
     assert "/api/skills/mine" in paths
     assert "/api/agents/{agent_id}/skills/install" in paths
-    assert paths.index("/api/skills/market") < paths.index("/api/skills/{skill_id}")

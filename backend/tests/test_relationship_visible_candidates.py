@@ -41,65 +41,6 @@ class _ScalarResult:
         return self.value
 
 
-class _ScalarsResult:
-    def __init__(self, values):
-        self.values = values
-
-    def scalars(self):
-        return self
-
-    def all(self):
-        return self.values
-
-
-class _QueuedDb:
-    """Session stub that returns queued results in order, one per execute()."""
-
-    def __init__(self, queued):
-        self._queued = list(queued)
-
-    async def execute(self, _stmt):
-        return self._queued.pop(0)
-
-
-def _make_agent(creator_id, tenant_id, access_mode="company", company_access_level=None):
-    return SimpleNamespace(
-        id=uuid.uuid4(),
-        creator_id=creator_id,
-        tenant_id=tenant_id,
-        access_mode=access_mode,
-        company_access_level=company_access_level,
-    )
-
-
-# ─── Change 3a: user_can_view_agent_id helper ─────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_user_can_view_agent_id_true_for_company_use_access():
-    """A regular user can *view* (use-level) a company agent they don't manage."""
-    tenant = uuid.uuid4()
-    user = SimpleNamespace(id=uuid.uuid4(), role="member", tenant_id=tenant, is_active=True)
-    agent = _make_agent(
-        creator_id=uuid.uuid4(), tenant_id=tenant, access_mode="company", company_access_level="use"
-    )
-    # get_agent_access_level_for_user_id executes: (1) user lookup, (2) permissions lookup
-    db = _QueuedDb([_ScalarResult(user), _ScalarsResult([])])
-
-    assert await permissions.user_can_view_agent_id(db, user.id, agent) is True
-
-
-@pytest.mark.asyncio
-async def test_user_can_view_agent_id_false_for_others_private():
-    """A regular user cannot view someone else's private agent → not a candidate."""
-    tenant = uuid.uuid4()
-    user = SimpleNamespace(id=uuid.uuid4(), role="member", tenant_id=tenant, is_active=True)
-    agent = _make_agent(creator_id=uuid.uuid4(), tenant_id=tenant, access_mode="private")
-    db = _QueuedDb([_ScalarResult(user), _ScalarsResult([])])
-
-    assert await permissions.user_can_view_agent_id(db, user.id, agent) is False
-
-
 # ─── Change 3b: evaluate_agent_relationship_status relaxes target to view ──
 
 

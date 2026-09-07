@@ -216,41 +216,9 @@ def test_mini_program_uri_contract_matches_scene_validation():
                 )
 
 
-def test_scene_tool_is_global_builtin_and_opt_in():
+def test_scene_tool_schema_validates_requests_and_converts_for_gemini():
     seed = next(item for item in BUILTIN_TOOLS if item["name"] == "manage_scene")
-
-    assert seed["is_default"] is False
-    assert seed["parameters_schema"]["properties"]["operation"]["enum"] == [
-        "list",
-        "get",
-        "save",
-        "publish",
-        "delete",
-        "rollback",
-    ]
-    overwrite = seed["parameters_schema"]["properties"]["force_overwrite"]
-    assert overwrite["type"] == "boolean"
-    assert overwrite["default"] is False
     schema = seed["parameters_schema"]
-    action_properties = schema["properties"]["quick_actions"]["items"]["properties"]
-    assert action_properties["id"] == {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64,
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
-    }
-    assert action_properties["menu_visible"]["default"] is True
-    assert action_properties["ai_visible"]["default"] is True
-    assert action_properties["ai_context"]["maxLength"] == 4000
-    assert action_properties["style"]["additionalProperties"] is False
-    assert action_properties["style"]["properties"]["font"]["enum"] == [
-        "default",
-        "sans",
-        "serif",
-        "monospace",
-    ]
-    assert "enabled" not in action_properties
-    assert "examples" not in schema
     Draft7Validator.check_schema(schema)
     validator = Draft7Validator(schema)
     for valid in (

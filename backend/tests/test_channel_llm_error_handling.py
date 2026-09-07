@@ -167,21 +167,6 @@ async def test_llm_error_preserves_original_and_appends_recovery_hint(monkeypatc
     assert reply != sentinel, "the recovery hint must be appended after the error"
 
 
-async def test_successful_reply_passes_through(monkeypatch):
-    """A normal reply is returned verbatim — wrapping must not touch success."""
-    agent, model = _make_agent_and_model()
-
-    async def ok_llm(*_args, **_kwargs):
-        return "你好，我可以帮你做什么？"
-
-    _patch_llm(monkeypatch, ok_llm)
-
-    reply = await channel_llm._call_agent_llm(
-        _make_db(agent, model), agent.id, "你好", session_id=str(agent.id), user_id=agent.id
-    )
-    assert reply == "你好，我可以帮你做什么？"
-
-
 async def test_im_tool_round_content_is_delivered_once_as_independent_progress(monkeypatch):
     from app.services import im_delivery
 

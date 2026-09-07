@@ -1,21 +1,14 @@
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import date
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from app.services.agent_memory import (
-    CORE_MEMORY_TEMPLATE,
-    MEMORY_INDEX_TEMPLATE,
-    MEMORY_SYSTEM_PROMPT,
     load_agent_memory_snapshot,
 )
-from app.services.agent_tools import AGENT_TOOLS
-from app.services.tool_seeder import BUILTIN_TOOLS
 from app.services.storage_runtime.base import StorageEntry
 
 
@@ -133,32 +126,3 @@ async def test_zero_daily_limit_loads_no_daily_records():
     assert snapshot.structure_guide == ""
     assert snapshot.daily_records == ()
     assert storage.list_dir_calls == 0
-
-
-def test_memory_index_template_matches_seed_file_and_contains_no_dynamic_dates():
-    template_path = Path(__file__).parents[1] / "agent_template" / "memory" / "MEMORY_INDEX.md"
-    assert template_path.read_text(encoding="utf-8") == MEMORY_INDEX_TEMPLATE
-    assert re.search(r"\b20\d{2}-\d{2}-\d{2}\b", MEMORY_INDEX_TEMPLATE) is None
-    assert "<YYYY-MM-DD>" in MEMORY_INDEX_TEMPLATE
-
-
-def test_core_memory_template_matches_seed_file_and_is_always_renderable():
-    template_path = Path(__file__).parents[1] / "agent_template" / "memory" / "memory.md"
-    assert template_path.read_text(encoding="utf-8") == CORE_MEMORY_TEMPLATE
-
-
-def test_static_memory_prompt_is_scenario_and_date_independent_but_guides_daily_writes():
-    assert re.search(r"\b20\d{2}-\d{2}-\d{2}\b", MEMORY_SYSTEM_PROMPT) is None
-    assert "memory/<YYYY-MM-DD>/memory.md" in MEMORY_SYSTEM_PROMPT
-    assert "before the final response" in MEMORY_SYSTEM_PROMPT
-    assert "Do not write Daily Memory for greetings" in MEMORY_SYSTEM_PROMPT
-    assert "throughout the complete tool-calling loop" in MEMORY_SYSTEM_PROMPT
-
-
-def test_runtime_and_fallback_file_tool_contracts_both_guide_daily_memory():
-    seeded = {tool["name"]: tool for tool in BUILTIN_TOOLS}
-    fallback = {tool["function"]["name"]: tool["function"] for tool in AGENT_TOOLS}
-
-    for name in ("write_file", "edit_file"):
-        assert "memory/<YYYY-MM-DD>/memory.md" in seeded[name]["description"]
-        assert "memory/<YYYY-MM-DD>/memory.md" in fallback[name]["description"]

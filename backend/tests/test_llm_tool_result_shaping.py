@@ -4,13 +4,6 @@ import re
 from app.services.llm.tool_result_shaping import shape_tool_result
 
 
-def test_short_result_passes_through_unchanged():
-    short = "hello world"
-    out, truncated = shape_tool_result(short, max_chars=1000)
-    assert out == short
-    assert truncated is False
-
-
 def test_exactly_at_limit_passes_through():
     s = "x" * 1000
     out, truncated = shape_tool_result(s, max_chars=1000)
@@ -22,7 +15,7 @@ def test_oversized_result_is_truncated_with_marker():
     s = "A" * 500 + "B" * 2000 + "C" * 500
     out, truncated = shape_tool_result(s, max_chars=1000)
     assert truncated is True
-    assert len(out) < len(s)
+    assert len(out) <= 1000
     # Marker is present and mentions how much was dropped
     assert "truncated" in out.lower()
     # Head (starts with A) and tail (ends with C) both preserved
@@ -62,19 +55,6 @@ def test_negative_budget_degenerates_gracefully():
     out, truncated = shape_tool_result("hello world", -5)
     assert out == ""
     assert truncated is True
-
-
-def test_output_length_respects_budget():
-    s = "x" * 100_000
-    out, truncated = shape_tool_result(s, max_chars=1000)
-    assert len(out) <= 1000
-    assert truncated is True
-
-
-def test_empty_result():
-    out, truncated = shape_tool_result("", max_chars=1000)
-    assert out == ""
-    assert truncated is False
 
 
 def test_non_string_coerced_to_string():

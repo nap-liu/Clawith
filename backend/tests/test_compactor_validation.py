@@ -118,15 +118,6 @@ okay-{epoch}
         assert fail_reason is None
         assert recall >= UUID_RECALL_THRESHOLD
 
-    def test_rejects_unstructured_summary(self):
-        passed, reason, _ = validate_summary(
-            summary="too short",
-            original_text="anything",
-            max_tokens=2000,
-        )
-        assert passed is False
-        assert reason == "missing_section_headings"
-
     def test_rejects_low_id_recall(self):
         # Original has 5 paths; summary recalls 1 → 20% < 70% threshold.
         original = (

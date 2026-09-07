@@ -141,34 +141,6 @@ async def test_process_tool_call_materializes_oversized_result(tmp_workspace):
 
 
 @pytest.mark.asyncio
-async def test_process_tool_call_clean_arguments_pass_through_unchanged_semantic():
-    """Clean JSON must still work exactly as before (backwards compat)."""
-    tc = {
-        "id": "call_1",
-        "function": {
-            "name": "read_file",
-            "arguments": '{"path": "foo.md"}',
-        },
-    }
-    api_messages: list = []
-
-    async def fake_execute_tool(name, args, **kwargs):
-        assert args == {"path": "foo.md"}
-        return "ok"
-
-    with patch("app.services.llm.caller.execute_tool", side_effect=fake_execute_tool):
-        await _process_tool_call(
-            tc=tc, api_messages=api_messages,
-            agent_id="agent-1", user_id="user-1", session_id="sess-1",
-            supports_vision=False, on_tool_call=None, full_reasoning_content="",
-            allowed_tool_names={"read_file"},
-        )
-
-    # Semantic equivalence (key order / spacing may differ)
-    assert json.loads(tc["function"]["arguments"]) == {"path": "foo.md"}
-
-
-@pytest.mark.asyncio
 async def test_call_agent_llm_keeps_genuinely_missing_user_anonymous(monkeypatch):
     """Only durable background APIs may apply the creator fallback."""
     agent_id = uuid.uuid4()

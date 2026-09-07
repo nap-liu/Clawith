@@ -89,25 +89,6 @@ def _patch_collaborators(monkeypatch, client, tools=None):
 
 
 @pytest.mark.asyncio
-async def test_plain_text_ends_turn_after_one_round(monkeypatch):
-    client = _ScriptedClient([
-        LLMResponse(content="直接回答", finish_reason="stop"),
-    ])
-    _patch_collaborators(monkeypatch, client)
-
-    result = await call_llm(
-        model=_FakeModel(),
-        messages=[{"role": "user", "content": "hi"}],
-        agent_name="T", role_description="",
-        agent_id="agent-x", user_id="user-x", session_id="s",
-    )
-
-    assert result == "直接回答"
-    assert len(client.stream_calls) == 1, "plain text must stop the loop — no reminder round"
-    assert client.closed is True
-
-
-@pytest.mark.asyncio
 async def test_late_round_message_interrupts_plain_reply_in_same_turn(monkeypatch):
     client = _ScriptedClient([
         LLMResponse(content="first answer", finish_reason="stop"),
@@ -190,6 +171,10 @@ async def test_plain_text_reports_normalized_usage_to_callback(monkeypatch):
     ])
     _patch_collaborators(monkeypatch, client)
     captured = TokenUsage()
+    received: list[str] = []
+
+    async def _on_chunk(text: str):
+        received.append(text)
 
     async def _on_usage(usage: TokenUsage):
         captured.add(usage)
@@ -203,9 +188,13 @@ async def test_plain_text_reports_normalized_usage_to_callback(monkeypatch):
         user_id="user-x",
         session_id="s",
         on_usage=_on_usage,
+        on_chunk=_on_chunk,
     )
 
     assert result == "直接回答"
+    assert len(client.stream_calls) == 1
+    assert client.closed is True
+    assert received == ["直接回答"]
     assert captured.total_tokens == 1200
     assert captured.input_tokens == 1000
     assert captured.output_tokens == 200
@@ -289,30 +278,6 @@ async def test_cancel_check_runs_before_tool_side_effect(monkeypatch):
         )
 
     assert executed is False
-
-
-@pytest.mark.asyncio
-async def test_content_streams_through_on_chunk(monkeypatch):
-    client = _ScriptedClient([
-        LLMResponse(content="流式内容", finish_reason="stop"),
-    ])
-    _patch_collaborators(monkeypatch, client)
-
-    received: list[str] = []
-
-    async def _on_chunk(text: str):
-        received.append(text)
-
-    result = await call_llm(
-        model=_FakeModel(),
-        messages=[{"role": "user", "content": "hi"}],
-        agent_name="T", role_description="",
-        agent_id="agent-x", user_id="user-x", session_id="s",
-        on_chunk=_on_chunk,
-    )
-
-    assert result == "流式内容"
-    assert received == ["流式内容"], "caller must pass on_chunk through — no chunk buffering"
 
 
 @pytest.mark.asyncio

@@ -53,13 +53,14 @@ def _make_mock_backend(result_sentinel=""):
     return backend
 
 
+@pytest.mark.parametrize("language,code", [("bash", "echo hi"), ("node", "console.log(1)"), ("python", "print(1)")])
 @pytest.mark.asyncio
-async def test_execute_code_aio_bash_receives_inject(tmp_path):
-    """execute_code_aio + bash: inject dict must be threaded through to backend.execute."""
+async def test_execute_code_aio_receives_inject(tmp_path, language, code):
+    """Every supported language forwards CLI injection to the sandbox."""
     from app.services.agent_tools import _execute_code
 
-    agent_id = uuid.uuid4()
-    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4() if language == "bash" else None
+    user_id = uuid.uuid4() if language == "bash" else None
     mock_backend = _make_mock_backend()
 
     with (
@@ -83,7 +84,7 @@ async def test_execute_code_aio_bash_receives_inject(tmp_path):
         await _execute_code(
             agent_id,
             tmp_path,
-            {"language": "bash", "code": "echo hi"},
+            {"language": language, "code": code},
             tool_name="execute_code_aio",
             user_id=user_id,
         )
@@ -92,82 +93,6 @@ async def test_execute_code_aio_bash_receives_inject(tmp_path):
     call_kwargs = mock_backend.execute.call_args.kwargs
     assert call_kwargs.get("inject") == _INJECTION_DICT, (
         f"expected inject={_INJECTION_DICT!r}, got {call_kwargs.get('inject')!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_execute_code_aio_node_receives_inject(tmp_path):
-    """execute_code_aio + node: inject dict must also be threaded through."""
-    from app.services.agent_tools import _execute_code
-
-    mock_backend = _make_mock_backend()
-
-    with (
-        patch(
-            "app.services.agent_tools.build_cli_injection",
-            new=AsyncMock(return_value=_INJECTION_DICT),
-        ),
-        patch(
-            "app.services.sandbox.registry.get_sandbox_backend",
-            return_value=mock_backend,
-        ),
-        patch(
-            "app.config.get_sandbox_config",
-            return_value=_FakeSandboxConfig(),
-        ),
-        patch(
-            "app.services.agent_tools._get_tool_config",
-            new=AsyncMock(return_value=None),
-        ),
-    ):
-        await _execute_code(
-            None,
-            tmp_path,
-            {"language": "node", "code": "console.log(1)"},
-            tool_name="execute_code_aio",
-            user_id=None,
-        )
-
-    call_kwargs = mock_backend.execute.call_args.kwargs
-    assert call_kwargs.get("inject") == _INJECTION_DICT
-
-
-@pytest.mark.asyncio
-async def test_execute_code_aio_python_receives_inject(tmp_path):
-    """execute_code_aio + python: inject dict is also passed (python prelude handles it)."""
-    from app.services.agent_tools import _execute_code
-
-    mock_backend = _make_mock_backend()
-
-    with (
-        patch(
-            "app.services.agent_tools.build_cli_injection",
-            new=AsyncMock(return_value=_INJECTION_DICT),
-        ),
-        patch(
-            "app.services.sandbox.registry.get_sandbox_backend",
-            return_value=mock_backend,
-        ),
-        patch(
-            "app.config.get_sandbox_config",
-            return_value=_FakeSandboxConfig(),
-        ),
-        patch(
-            "app.services.agent_tools._get_tool_config",
-            new=AsyncMock(return_value=None),
-        ),
-    ):
-        await _execute_code(
-            None,
-            tmp_path,
-            {"language": "python", "code": "print(1)"},
-            tool_name="execute_code_aio",
-            user_id=None,
-        )
-
-    call_kwargs = mock_backend.execute.call_args.kwargs
-    assert call_kwargs.get("inject") == _INJECTION_DICT, (
-        f"python must receive inject dict, got {call_kwargs.get('inject')!r}"
     )
 
 

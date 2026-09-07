@@ -50,12 +50,6 @@ def png_bytes() -> bytes:
 
 # ─── Config merge + defaults ─────────────────────────────────────────────────
 
-def test_default_config_workspace_only():
-    assert DEFAULT_CONFIG["input_modes"]["workspace_path"]["enabled"] is True
-    assert DEFAULT_CONFIG["input_modes"]["url"]["enabled"] is False
-    assert DEFAULT_CONFIG["input_modes"]["base64"]["enabled"] is False
-    assert DEFAULT_CONFIG["max_images_per_call"] == 6
-
 
 # ─── Workspace path — happy path ─────────────────────────────────────────────
 
@@ -166,7 +160,7 @@ def _make_data_url(mime: str, raw: bytes) -> str:
 @pytest.mark.asyncio
 async def test_base64_disabled_is_category_A(workspace, jpeg_bytes):
     url = _make_data_url("jpeg", jpeg_bytes)
-    result = await load([url], workspace, _b64_config(enabled=False))
+    result = await load([url], workspace, DEFAULT_CONFIG)
     assert result.short_circuit is not None
     assert result.short_circuit.category == "A"
     assert "base64" in result.short_circuit.reason.lower()

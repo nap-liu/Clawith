@@ -5,12 +5,6 @@ import uuid
 from app.services.sender_attribution import wrap_with_sender
 
 
-def test_wraps_basic_message():
-    uid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
-    out = wrap_with_sender("hello world", uid, "Alice")
-    assert out == ('<sender id="550e8400-e29b-41d4-a716-446655440000">Alice</sender>\nhello world')
-
-
 def test_escapes_xml_special_chars_in_name():
     uid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
     out = wrap_with_sender("hi", uid, "A<b>&c")

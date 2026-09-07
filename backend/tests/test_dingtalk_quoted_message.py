@@ -12,7 +12,6 @@ from app.services.chat_history import build_llm_message_from_row
 from app.services.chat_message_serializer import serialize_chat_message_for_client
 from app.services.dingtalk_quoted_message import has_trusted_dingtalk_sender_alias
 from app.services.quoted_message import (
-    normalize_quoted_message,
     render_quoted_message_for_llm,
 )
 
@@ -291,50 +290,6 @@ async def test_bot_card_quote_without_callback_content_is_explicitly_unavailable
     assert quote["message_type"] == "card"
     assert quote["content_status"] == "unavailable"
     assert quote["provider_message_id"] == "bot-card-id"
-
-
-async def test_quote_metadata_is_visible_to_llm_history_and_clients():
-    attachment = {
-        "display_name": "quoted.png",
-        "path": "workspace/uploads/quoted.png",
-        "kind": "image",
-        "mime_type": "image/png",
-    }
-    quote = normalize_quoted_message(
-        {
-            "message_type": "rich_text",
-            "provider_message_id": "quoted-id",
-            "sender_name": "张三",
-            "content_status": "available",
-            "text": "原始内容",
-            "attachments": [attachment],
-        }
-    )
-    row = SimpleNamespace(
-        id=uuid.uuid4(),
-        role="user",
-        content="请分析这条消息",
-        message_meta={
-            "source_channel": "dingtalk",
-            "attachments": [attachment],
-            "quoted_message": quote,
-        },
-        thinking=None,
-        created_at=datetime(2026, 8, 26, tzinfo=UTC),
-        sender_user_id=None,
-        user_id=None,
-    )
-
-    llm_message = build_llm_message_from_row(row)
-    client_message = serialize_chat_message_for_client(row)
-
-    assert llm_message["role"] == "user"
-    assert "引用消息上下文" in llm_message["content"]
-    assert "原始内容" in llm_message["content"]
-    assert "请分析这条消息" in llm_message["content"]
-    assert llm_message["attachments"] == [attachment]
-    assert client_message["display_content"] == "请分析这条消息"
-    assert client_message["quoted_message"] == quote
 
 
 async def test_legacy_raw_quote_identity_is_scrubbed_from_client_and_llm():

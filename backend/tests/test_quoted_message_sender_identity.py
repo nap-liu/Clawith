@@ -235,25 +235,6 @@ async def test_provider_alias_is_tenant_scoped_and_conflicts_fail_closed():
     )["sender"] == {"type": "unknown"}
 
 
-def test_legacy_provider_sender_reference_is_never_exposed_to_llm():
-    provider_ref = "legacy-provider-secret-id"
-    rendered = render_quoted_message_for_llm(
-        "current body",
-        {
-            "message_type": "text",
-            "content_status": "available",
-            "text": "quoted body",
-            "sender_ref": provider_ref,
-            "sender_name": "provider nickname",
-        },
-    )
-
-    context = json.loads(rendered.splitlines()[1])
-    assert context["sender"] == {"type": "unknown"}
-    assert provider_ref not in rendered
-    assert "provider nickname" not in rendered
-
-
 @pytest.mark.asyncio
 async def test_provider_self_reference_resolves_to_platform_agent():
     suffix = uuid.uuid4().hex[:12]

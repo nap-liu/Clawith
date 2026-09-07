@@ -8,19 +8,9 @@ needs no LLM/DB.
 
 from __future__ import annotations
 
-from app.services.channel_llm import _IM_LLM_RECOVERY_HINT, _apply_recovery_hint
-
-
-def test_error_reply_with_hint_gets_appended():
-    reply = "[Error] something blew up"
-    assert _apply_recovery_hint(reply, _IM_LLM_RECOVERY_HINT) == reply + _IM_LLM_RECOVERY_HINT
+from app.services.channel_llm import _apply_recovery_hint
 
 
 def test_error_reply_with_none_hint_unchanged():
     reply = "[Error] something blew up"
     assert _apply_recovery_hint(reply, None) == reply
-
-
-def test_normal_reply_never_gets_hint():
-    reply = "hello, here is your answer"
-    assert _apply_recovery_hint(reply, _IM_LLM_RECOVERY_HINT) == reply

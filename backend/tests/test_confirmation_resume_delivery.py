@@ -16,7 +16,7 @@ from tests.test_confirmation_toolcall import (
     _make_agent,
     _make_pending,
     _make_session,
-    _setup_tables,
+    _setup_tables as _setup_tables,
     async_session,
 )
 
@@ -213,47 +213,6 @@ async def test_confirmation_resume_replays_exact_typed_prefix_without_intro_dupl
     assert history[3]["reasoning_content"] == "typed reasoning"
     assert history[3]["tool_calls"][0]["function"]["name"] == "request_confirmation"
     assert all("此前可见片段" not in str(message.get("content")) for message in history)
-
-
-async def test_suspend_confirmation_persists_intro_before_pending_card():
-    """Intro and pending card are persisted in order as ordinary append-only messages."""
-    from app.services import confirmation_service as cs
-
-    agent_id, user_id = await _make_agent()
-    session = await _make_session(agent_id, user_id, source_channel="web")
-    conv = str(session.id)
-    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
-
-    with patch.object(cs, "_broadcast", new=AsyncMock()):
-        row_id = await cs.suspend_for_confirmation(
-            agent_id=agent_id,
-            conversation_id=conv,
-            chat_session_id=session.id,
-            source_channel="web",
-            user_id=user_id,
-            intro_text="需要你确认",
-            title="删库确认",
-            summary="清理历史订单",
-            action=None,
-            risk_level="high",
-            buttons=[{"text": "确认", "value": "confirm"}],
-            turn_anchor_id=anchor_id,
-        )
-
-    async with async_session() as db:
-        rows = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == conv,
-                    ChatMessage.role.in_(["assistant", "tool_call"]),
-                )
-                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-            )
-        ).scalars().all()
-    assert [row.role for row in rows] == ["assistant", "tool_call"]
-    assert rows[0].content == "需要你确认"
-    assert rows[1].id == row_id
-    assert json.loads(rows[1].content)["status"] == "pending"
 
 
 async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
@@ -627,31 +586,6 @@ async def test_call_llm_confirmation_tool_suspends_turn_anchor(monkeypatch):
     assert "turn_anchor_id" not in payload
 
 
-async def test_resolve_idempotent_on_already_done():
-    """A second resolve (double-click) of the same card is a no-op: no re-fill, no re-enter."""
-    from app.services import confirmation_service as cs
-
-    agent_id, user_id = await _make_agent()
-    _conv, row_id = await _make_pending(agent_id, user_id)
-
-    with (
-        patch.object(cs, "_reenter_loop", new=AsyncMock()) as reenter,
-        patch.object(cs, "_broadcast", new=AsyncMock()),
-    ):
-        first = await cs.resolve_confirmation(
-            agent_id=agent_id, call_id=row_id, button_value="confirm",
-            button_label="确认", resolving_user_id=user_id,
-        )
-        second = await cs.resolve_confirmation(
-            agent_id=agent_id, call_id=row_id, button_value="confirm",
-            button_label="确认", resolving_user_id=user_id,
-        )
-
-    assert first is not None
-    assert second is None  # idempotent — already resolved
-    assert reenter.await_count == 1
-
-
 async def test_resolve_expired_marks_unreliable():
     """A card older than the 24h window resolves with a result that flags the response as
     unreliable and warns against acting on dangerous operations."""
@@ -747,6 +681,7 @@ async def test_suspend_persists_intro_before_toolcall_and_broadcasts_web():
     assert [r.role for r in rows] == ["assistant", "tool_call"]
     assert rows[0].content == "我需要你确认删库操作:"
     assert rows[1].id == row_id
+    assert json.loads(rows[1].content)["status"] == "pending"
     # Card broadcast as a running tool_call (the frontend renders it as the card).
     broadcast.assert_awaited()
     payload = broadcast.await_args.args[2]

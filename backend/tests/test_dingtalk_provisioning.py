@@ -3,44 +3,43 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.database import Base
-from app.models.agent import Agent, AgentTemplate
-from app.models.audit import ChatMessage
+from app.database import async_session, engine
+from app.models.agent import Agent, AgentTemplate  # noqa: F401 - register ORM model
+from app.models.audit import ChatMessage as ChatMessage
 from app.models.channel_config import ChannelConfig
-from app.models.chat_compaction import ChatCompaction
-from app.models.chat_session import ChatSession
+from app.models.chat_compaction import ChatCompaction  # noqa: F401 - register ORM model
+from app.models.chat_session import ChatSession as ChatSession
 from app.models.dingtalk_provisioning import (
-    DINGTALK_PROVISIONING_STATUS_CANCELLED,
+    DINGTALK_PROVISIONING_STATUS_CANCELLED as DINGTALK_PROVISIONING_STATUS_CANCELLED,
     DINGTALK_PROVISIONING_STATUS_CONFIGURED,
-    DINGTALK_PROVISIONING_STATUS_EXPIRED,
-    DINGTALK_PROVISIONING_STATUS_FAILED,
+    DINGTALK_PROVISIONING_STATUS_EXPIRED as DINGTALK_PROVISIONING_STATUS_EXPIRED,
+    DINGTALK_PROVISIONING_STATUS_FAILED as DINGTALK_PROVISIONING_STATUS_FAILED,
     DINGTALK_PROVISIONING_STATUS_POLLING,
     DINGTALK_PROVISIONING_STATUS_WAITING,
-    DINGTALK_WELCOME_STATUS_FAILED,
-    DINGTALK_WELCOME_STATUS_PENDING,
-    DINGTALK_WELCOME_STATUS_SENT,
+    DINGTALK_WELCOME_STATUS_FAILED as DINGTALK_WELCOME_STATUS_FAILED,
+    DINGTALK_WELCOME_STATUS_PENDING as DINGTALK_WELCOME_STATUS_PENDING,
+    DINGTALK_WELCOME_STATUS_SENT as DINGTALK_WELCOME_STATUS_SENT,
     DingTalkChannelProvisioningSession,
 )
-from app.models.identity import IdentityProvider
-from app.models.llm import LLMModel
-from app.models.org import OrgMember
-from app.models.participant import Participant
+from app.models.identity import IdentityProvider as IdentityProvider
+from app.models.llm import LLMModel  # noqa: F401 - register ORM model
+from app.models.org import OrgMember as OrgMember
+from app.models.participant import Participant  # noqa: F401 - register ORM model
 from app.models.tenant import Tenant
-from app.models.user import Identity, User
+from app.models.user import Identity, User  # noqa: F401 - register ORM model
 from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_OPERATION_FORCE,
-    DINGTALK_WELCOME_RETRY_DELAYS_SECONDS,
+    DINGTALK_WELCOME_RETRY_DELAYS_SECONDS as DINGTALK_WELCOME_RETRY_DELAYS_SECONDS,
     DingTalkRegistrationClient,
     _bounded_polling_window,
     poll_dingtalk_provisioning_session,
-    poll_due_dingtalk_provisioning_sessions,
-    retry_due_dingtalk_welcome_messages,
+    poll_due_dingtalk_provisioning_sessions as poll_due_dingtalk_provisioning_sessions,
+    retry_due_dingtalk_welcome_messages as retry_due_dingtalk_welcome_messages,
     start_dingtalk_channel_provisioning,
 )
-from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
+from app.services.im_delivery import IMDeliveryResult as IMDeliveryResult, attach_delivery_to_meta as attach_delivery_to_meta
 
 
 class FakeRegistrationClient:
@@ -69,28 +68,15 @@ class FakeRegistrationClient:
 
 @pytest.fixture
 async def db_session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    tables = [
-        Identity.__table__,
-        Tenant.__table__,
-        User.__table__,
-        LLMModel.__table__,
-        AgentTemplate.__table__,
-        Agent.__table__,
-        ChannelConfig.__table__,
-        DingTalkChannelProvisioningSession.__table__,
-        IdentityProvider.__table__,
-        OrgMember.__table__,
-        Participant.__table__,
-        ChatSession.__table__,
-        ChatCompaction.__table__,
-        ChatMessage.__table__,
-    ]
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
-    Session = async_sessionmaker(engine, expire_on_commit=False)
-    async with Session() as session:
-        yield session
+    await engine.dispose()
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        async with async_session(
+            bind=connection,
+            join_transaction_mode="create_savepoint",
+        ) as session:
+            yield session
+        await transaction.rollback()
     await engine.dispose()
 
 

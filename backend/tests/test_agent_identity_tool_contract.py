@@ -147,8 +147,6 @@ def test_gateway_relationship_item_has_display_name_and_one_typed_id():
         channels=["feishu"],
     )
     assert item.user_id == user_id
-    assert "name" not in GatewayRelationshipItem.model_fields
-    assert "type" not in GatewayRelationshipItem.model_fields
     with pytest.raises(ValidationError):
         GatewayRelationshipItem(display_name="Missing ID", role="collaborator")
 

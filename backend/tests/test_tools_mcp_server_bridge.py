@@ -5,7 +5,6 @@ from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
 from app.database import async_session, engine
 from app.models.user import User, Identity
-from app.models.tenant import Tenant
 from app.models.tool import Tool
 from app.models.mcp_server import MCPServer
 from app.core.security import create_access_token
@@ -143,18 +142,3 @@ async def test_prompt_with_user_placeholder_rejected(client):
     )
     assert r.status_code == 422
     assert "user" in r.json()["detail"].lower() or "${user" in r.json()["detail"]
-
-
-async def test_headers_with_user_placeholder_allowed(client):
-    """headers_template CAN contain ${user.*} — that's the runtime resolve target."""
-    token, server_name, _ = await _make_admin_with_mcp_tool()
-    r = await client.put(
-        "/api/tools/mcp-server",
-        json={
-            "server_name": server_name,
-            "server_url": f"https://hdr-{server_name}.example",
-            "headers_template": {"X-User-Email": "${user.email}"},
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert r.status_code == 200

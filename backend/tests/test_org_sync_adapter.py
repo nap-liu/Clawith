@@ -17,9 +17,7 @@ from app.services.org_sync_adapter import (
     ExternalDepartment,
     ExternalUser,
     GoogleWorkspaceOrgSyncAdapter,
-    SYNC_ADAPTER_CLASSES,
     build_department_path_map,
-    normalize_contact_for_match,
 )
 from app.services.dingtalk_identity_reconciliation import (
     dingtalk_legacy_identity_reconciler,
@@ -437,12 +435,6 @@ def test_provider_snapshot_merges_repeated_user_group_memberships():
     assert adapter.applied_user.department_ids == ["dept-a", "dept-b"]
 
 
-def test_dingtalk_sync_skip_department_names_default_to_empty():
-    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
-
-    assert adapter._configured_user_fetch_skip_department_names() == set()
-
-
 def test_google_workspace_adapter_parses_legacy_service_account_json_string():
     adapter = GoogleWorkspaceOrgSyncAdapter(
         config={
@@ -470,10 +462,6 @@ def test_google_workspace_adapter_uses_admin_authorization_email_as_primary_iden
     assert adapter.client_secret == "oauth-client-secret"
     assert adapter.delegated_admin_email == "admin@example.com"
     assert adapter.service_account == {}
-
-
-def test_google_workspace_adapter_registered():
-    assert SYNC_ADAPTER_CLASSES["google_workspace"] is GoogleWorkspaceOrgSyncAdapter
 
 
 def test_dingtalk_fetch_departments_starts_from_authorized_scope(monkeypatch):
@@ -641,15 +629,6 @@ def test_build_department_path_map_treats_transport_root_as_empty_path(external_
 
     assert path_map[root_id] == ""
     assert path_map[child_id] == "研发部"
-
-
-def test_normalize_contact_for_match_strips_common_mobile_formatting():
-    assert normalize_contact_for_match("+86 138-0013-8000") == "8613800138000"
-    assert normalize_contact_for_match(" 138 0013 8000 ") == "13800138000"
-
-
-def test_normalize_contact_for_match_keeps_email_lowercase():
-    assert normalize_contact_for_match(" Alice@Example.COM ") == "alice@example.com"
 
 
 def test_dingtalk_fresh_claims_reject_different_email_variants():

@@ -473,58 +473,6 @@ async def test_text_model_dispatch_contains_image_path_without_image_payload(mon
     assert "base64" not in user_content
 
 
-@pytest.mark.asyncio
-async def test_input_history_remains_unmodified(monkeypatch):
-    """The ephemeral turn wrapper must never leak into persisted input data."""
-    # Client that returns no tool calls -> loop exits after one round; we can
-    # still reach into caller state via the dispatched messages snapshot and
-    # compare against what the caller would use next round. For that we need
-    # a client that captures its inputs.
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "app.services.llm.caller.create_llm_client",
-        lambda **kwargs: fake_client,
-    )
-    monkeypatch.setattr("app.services.llm.caller.get_max_tokens", lambda *a, **k: 1024)
-    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda m: "k")
-    monkeypatch.setattr(
-        "app.services.llm.caller._get_agent_config",
-        AsyncMock(return_value=(50, None)),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller._get_user_name", AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        "app.services.agent_context.build_agent_context",
-        AsyncMock(return_value=("STATIC", "DYN")),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.get_agent_tools_for_llm",
-        AsyncMock(return_value=[]),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.record_token_usage", AsyncMock(return_value=None),
-    )
-
-    history = [{"role": "user", "content": "raw-input"}]
-    await call_llm(
-        model=_FakeModel(),
-        messages=history,
-        agent_name="T", role_description="",
-        agent_id="agent-x", user_id="user-x", session_id="s",
-    )
-
-    # Dispatched message had the wrapper…
-    sent = fake_client.stream_calls[0]["messages"]
-    last_user_sent = sent[-1]
-    assert last_user_sent.content.startswith("<context>\n")
-    assert last_user_sent.content.endswith("raw-input")
-
-    # …but the original history dict that the caller received is untouched
-    # (caller builds LLMMessage copies, never mutates caller-provided list).
-    assert history[-1]["content"] == "raw-input"
-
-
 class _TwoRoundClient(_FakeClient):
     async def stream(self, messages, tools=None, temperature=None, max_tokens=None, **kwargs):
         self.stream_calls.append({

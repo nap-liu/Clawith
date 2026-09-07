@@ -25,7 +25,7 @@ from app.services.chat_history import (
     persist_tool_call,
 )
 
-_RAW_CONN = "mysql://liuxi:NqJ2yry01U1C0qu%23@fe-c-714913dbe928ddca-internal.starrocks.aliyuncs.com:9030/"
+_RAW_CONN = "mysql://fixture_user:fixture_password%23@database.example:9030/"
 
 
 def _row(content: str, mid: uuid.UUID | None = None) -> SimpleNamespace:
@@ -111,4 +111,4 @@ def test_parse_tool_call_for_display_masks_connection_string():
     # Non-sensitive args are untouched.
     assert out["toolArgs"]["sql"] == "SHOW DATABASES"
     # The raw secret must not leak through the display payload.
-    assert "NqJ2yry01U1C0qu" not in json.dumps(out, ensure_ascii=False)
+    assert "fixture_password" not in json.dumps(out, ensure_ascii=False)

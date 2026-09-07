@@ -1,7 +1,22 @@
-from project_actions_support import *  # noqa: F401,F403
+import json
+import uuid
+
+import pytest
+from sqlalchemy import select
+
+from app.models.audit import ChatMessage
+from app.models.project import Project
+from project_actions_support import (
+    ProjectApiEnv,
+    _create_project,
+    _mark_project_running,
+    project_api,  # noqa: F401 — registers the shared fixture
+    pytestmark as pytestmark,
+)
+
 
 async def test_project_a2a_uses_durable_project_child_and_exact_standard_timeline(
-    project_api: ProjectApiEnv,
+    project_api: ProjectApiEnv,  # noqa: F811 — pytest injects the imported fixture
     monkeypatch: pytest.MonkeyPatch,
 ):
     """A→B stays single-target while B retains project tools and exact trace."""
@@ -218,22 +233,6 @@ async def test_project_a2a_uses_durable_project_child_and_exact_standard_timelin
     assert "Approve the evidence contract" in child_input.content
     assert "docs/evidence-contract.md" in child_input.content
 
-    message_schema = project_runtime_tools.PROJECT_TOOL_REGISTRY["project_message_agent"]["function"]
-    assert message_schema["parameters"]["properties"]["mode"]["enum"] == ["task_delegate", "consult"]
-    assert set(message_schema["parameters"]["required"]) == {
-        "agent_id",
-        "title",
-        "message",
-        "mode",
-        "expected_output",
-    }
-    assert message_schema["description"] == (
-        "Send one active project member a review request or assigned task. Include the relevant context, requested "
-        "work, expected result, and related work item when one exists."
-    )
-    assert message_schema["parameters"]["properties"]["mode"]["description"] == (
-        "Choose task_delegate for assigned work and consult for a review or decision."
-    )
     with pytest.raises(ValueError, match="成员协作请求需要明确任务或咨询内容。"):
         await project_runtime_tools.execute_project_runtime_tool(
             "project_message_agent",

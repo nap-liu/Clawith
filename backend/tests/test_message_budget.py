@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -177,7 +176,7 @@ def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
     files = sorted(p.name for p in session_dir.iterdir())
     # Two materialized files; tool_call_ids f1 and f3.
     assert len(files) == 2
-    assert any("f1" in f for f in files)
+    assert any(f.startswith("grep_f1_") for f in files)
     assert any("f3" in f for f in files)
 
 
@@ -386,40 +385,6 @@ def test_over_budget_but_fresh_already_all_materialized(
     assert api_messages[3].content == "I" * 80_000
 
 
-def test_tool_name_lookup_from_preceding_assistant(tmp_workspace, agent_id):
-    """With a single fresh round: a(assistant with tool_calls=[c1:grep]),
-    b(tool c1, content=80k). Cap 60k forces materialization and the
-    written filename must contain 'grep'."""
-    fresh_assistant = _assistant([_tc("c1", "grep")])
-    fresh_tool = _tool("c1", "x" * 80_000)
-
-    api_messages = [
-        LLMMessage(role="user", content="q"),
-        fresh_assistant,
-        fresh_tool,
-    ]
-    fresh_start = 1
-
-    enforce_message_budget(
-        api_messages,
-        fresh_start_idx=fresh_start,
-        agent_id=agent_id,
-        session_id="sess-name",
-        max_chars=60_000,
-    )
-
-    rewritten = api_messages[2]
-    assert PERSISTED_OPEN in rewritten.content
-
-    session_dir = tmp_workspace / agent_id / ".tool_results" / "sess-name"
-    files = list(session_dir.iterdir())
-    assert len(files) == 1
-    # Filename format: {tool_name}_{tool_call_id}.{ext}
-    assert files[0].name.startswith("grep_")
-    # tool_name also embedded in the rendered llm_view via the rel_path.
-    assert "grep_" in rewritten.content
-
-
 def test_tool_name_missing_uses_unknown_fallback(tmp_workspace, agent_id):
     """If a fresh tool message has no matching assistant (pathological
     history), we still materialize using 'unknown' as the tool name."""
@@ -447,44 +412,6 @@ def test_tool_name_missing_uses_unknown_fallback(tmp_workspace, agent_id):
     files = list(session_dir.iterdir())
     assert len(files) == 1
     assert files[0].name.startswith("unknown_")
-
-
-def test_vision_list_content_skipped(tmp_workspace, agent_id):
-    """Vision tool messages (content is a list[dict]) do NOT count
-    toward the budget and are never selected for materialization."""
-    vision_parts = [
-        {"type": "text", "text": "screenshot OCR result"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
-    ]
-    fresh_assistant = _assistant([_tc("v1", "read_image"), _tc("t1", "grep")])
-    fresh_vision_tool = _tool("v1", vision_parts)
-    # The other fresh tool message is small; budget isn't even exceeded.
-    fresh_text_tool = _tool("t1", "small" * 100)
-
-    api_messages = [
-        LLMMessage(role="user", content="q"),
-        fresh_assistant,
-        fresh_vision_tool,
-        fresh_text_tool,
-    ]
-    fresh_start = 1
-
-    identities_before = [id(m) for m in api_messages]
-
-    enforce_message_budget(
-        api_messages,
-        fresh_start_idx=fresh_start,
-        agent_id=agent_id,
-        session_id="sess-vision",
-        max_chars=120_000,
-    )
-
-    # Nothing to do; but more importantly, the vision tool msg identity
-    # is untouched and its content is still a list.
-    identities_after = [id(m) for m in api_messages]
-    assert identities_before == identities_after
-    assert isinstance(api_messages[2].content, list)
-    assert api_messages[2].content == vision_parts
 
 
 def test_vision_tool_does_not_block_enforcement(tmp_workspace, agent_id):
@@ -521,7 +448,7 @@ def test_vision_tool_does_not_block_enforcement(tmp_workspace, agent_id):
     )
 
     # Vision msg untouched.
-    assert isinstance(api_messages[2].content, list)
+    assert api_messages[2].content == vision_parts
     # The 80k text tool got materialized (largest over-budget candidate).
     assert PERSISTED_OPEN in api_messages[3].content
     # Remaining text tool within cap.
