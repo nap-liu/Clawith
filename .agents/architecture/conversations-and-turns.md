@@ -40,8 +40,22 @@ request plus at most five identical-payload retries with 1/2/4/8/16-second
 backoff. Each retry emits transient status rather than model text. The lane
 does not stack with 5xx recovery or model failover, and authentication,
 billing, or hard-quota failures are not retried. Exhaustion is a typed terminal
-failure that tells the user to wait and send `continue` in the same Session;
+failure that tells the user to wait and send `/continue` in the same Session;
 resetting the conversation is neither required nor recommended.
+
+Web and IM `/continue` explicitly reopen only the current Session's last failed
+owner when it has a durable typed LLM failure. The original anchor, instructions,
+attachments, and completed tool results remain intact. The Session lock admits
+one continuation and advances its generation/revision; active, suspended,
+cancelled, completed, archived, and superseded turns are not reopened. Ordinary
+lifecycle transitions still reject terminal-to-running changes. The explicit
+claim and failure audit annotation commit before scheduling the shared durable
+recovery lane. Startup recovery can pick up an admitted continuation after a
+restart. Continued failure notices and command replies remain visible in audit
+history but are excluded from provider replay and terminal-completion detection.
+Before each ordinary native Web turn, reload its durable history prefix after
+admission; a connected socket's cached conversation may predate asynchronous
+continuation, tool results, or completion.
 
 Model text emitted in a response that also carries tool calls belongs to that
 intermediate tool round. Persist it with the tool-call audit record and replay
@@ -96,6 +110,13 @@ Do not add a second inbox table, a completion-cohort state machine, or channel-s
 - Trigger/A2A/background turns can carry a creator `user_id` for execution context. They do not thereby inherit that creator's administrative read authority.
 
 Session introspection is always an owned-session subset. Human Web/IM access uses authoritative user permissions; non-human access is limited to the agent's own A2A, trigger, and current-session context. Denials should not leak whether another session exists.
+
+Aware execution-record details load the linked Session's complete persisted
+history through cursor pagination, including its original task instructions.
+A failed page is shown as an incomplete load with retry, not an empty or
+complete record. Execution completion refreshes the history; an older in-flight
+read must not replace the newer result. This is an audit view and does not
+change model context loading or task execution isolation.
 
 Platform administrators in the active tenant context, tenant organization
 administrators governing standard Agents, and Agent administrators with manage

@@ -1,4 +1,5 @@
 {
+  "errors.conversationHistoryUnavailable": "The conversation history could not be restored. Please try again.",
   "errors.modelResponseIdleTimeout": "The model response timed out and could not be completed. Please try again.",
   "errors.invalidToolCallStream": "The model returned an incomplete tool call. No tools were run; please try again.",
   "errors.toolRoundLimit": "This task reached the tool-call round limit. Progress was preserved; ask me to continue the remaining work.",
@@ -8,5 +9,9 @@
   "errors.emptyModelResponse": "The model returned no usable content. Please try again.",
   "errors.providerFailoverFailed": "Neither the primary nor fallback model completed this request. Please try again later.",
   "status.providerRateLimitRetry": "The model service is rate-limited. The system will retry automatically in {delay_seconds:g} seconds ({retry_index}/{max_retries}).",
-  "errors.providerRateLimitExhausted": "The model service is still rate-limited. Wait a moment, then send “continue” in this conversation; you do not need /new."
+  "errors.providerRateLimitExhausted": "The model service is still rate-limited. Wait a moment, then send “/continue” in this conversation; you do not need /new.",
+  "commands.continue.accepted": "Continuing the previous task.",
+  "commands.continue.busy": "This conversation already has a running task or a task awaiting confirmation.",
+  "commands.continue.unavailable": "There is no task stopped by an LLM failure to continue in this conversation.",
+  "commands.continue.help": "/continue: resume the previous task stopped by a model call failure"
 }

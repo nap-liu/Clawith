@@ -1,4 +1,5 @@
 {
+  "errors.conversationHistoryUnavailable": "会话上下文恢复失败，请重试。",
   "errors.modelResponseIdleTimeout": "模型响应超时，本次回复未能完成，请重试。",
   "errors.invalidToolCallStream": "模型返回的工具调用不完整，本次没有执行任何工具，请重试。",
   "errors.toolRoundLimit": "本次任务达到工具调用轮次上限，当前进度已保留。你可以继续让我完成剩余工作。",
@@ -8,5 +9,9 @@
   "errors.emptyModelResponse": "模型本次没有返回有效内容，请重试。",
   "errors.providerFailoverFailed": "主模型和备用模型本次都未能完成请求，请稍后重试。",
   "status.providerRateLimitRetry": "模型服务触发限流，系统将在 {delay_seconds:g} 秒后自动重试（{retry_index}/{max_retries}）。",
-  "errors.providerRateLimitExhausted": "模型服务仍在限流，请稍等一会后在当前对话发送“继续”即可，无需发送 /new。"
+  "errors.providerRateLimitExhausted": "模型服务仍在限流，请稍等一会后在当前对话发送 /continue 即可，无需发送 /new。",
+  "commands.continue.accepted": "正在继续上一轮任务。",
+  "commands.continue.busy": "当前会话已有正在执行或等待确认的任务。",
+  "commands.continue.unavailable": "当前会话没有可继续的 LLM 调用失败任务。",
+  "commands.continue.help": "/continue：继续上一轮因模型调用失败而终止的任务"
 }

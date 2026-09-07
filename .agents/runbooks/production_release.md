@@ -416,6 +416,33 @@ recall, the existing helper is:
 python -m app.scripts.rollback_im_recall
 ```
 
+Before rollback to a binary that predates explicit `/continue`, snapshot the
+eligible anchor IDs and generations with the candidate image's
+`python -m app.scripts.resume_turns_after_rollback snapshot <snapshot-file>`.
+Record any additional old-instance turns accepted during replacement separately;
+do not replace this identity list with a scan of new live work. Render the old
+application roles with `TURN_RECOVERY_ENABLED=false`. Its startup must not replay
+the new continuation's control/failure audit rows. After the four-role rollback,
+run the candidate image once with its entrypoint overridden:
+
+```bash
+docker compose -p <production-compose-project> -f <candidate-compose> \
+  run --rm --no-deps --entrypoint python backend \
+  -m app.scripts.resume_turns_after_rollback apply <mounted-snapshot-file>
+```
+
+This uses the shared startup recovery lease and recovers only snapshotted
+identities that still own their generation, including ordinary turns. It never
+claims new turns accepted by the old roles after replacement. Verify each
+selected anchor's terminal/suspended
+state and delivery; a skipped/failed anchor is not a successful handoff. Keep the
+candidate image available for any unresolved continuation or suspended tool.
+Only after checking that no unfinished explicit continuation remains, restore
+the previous startup-recovery setting in canonical compose without restarting
+roles. Do not use a second concurrent recovery implementation or rewrite audit
+history to make old code accept it. Drill both just-admitted and tool-tail
+continuations against the old image before release.
+
 For Agent self-service settings, use the same exact-tool cleanup contract:
 
 ```bash

@@ -5,6 +5,7 @@ COMMANDS = {
     "/reset",
     "/help",
     "/stop",
+    "/continue",
     "/status",
     "/thinking",
     "/think",
@@ -29,6 +30,8 @@ def _parse_command(text: str) -> tuple[str, str | None]:
 
 
 def _help_message() -> str:
+    from app.services.llm.failure_outcome import render_message
+
     return (
         "可用指令：\n"
         "/new 或 /reset：开启新对话，清除当前上下文\n"
@@ -43,6 +46,7 @@ def _help_message() -> str:
         "/reasoning <档位>：设置当前会话思考强度（none/minimal/low/medium/high/xhigh/max）\n"
         "/reasoning status：查看当前思考强度；/reasoning auto：恢复自动设置\n"
         "/stop：停止当前这轮正在执行的工作\n"
+        f"{render_message('commands.continue.help')}\n"
         "/status：查看当前数字员工和会话状态\n"
         "/help：查看帮助"
     )

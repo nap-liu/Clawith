@@ -585,6 +585,8 @@ def build_llm_messages_from_rows(
     emitted_rounds: set[str] = set()
     for m in rows:
         meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
+        if meta.get("turn_control_only") or meta.get("artifact_role") == "command_reply":
+            continue
         # This visible row mirrors assistant_content on the confirmation tool
         # row. Keep it for UI rendering, but avoid replaying both copies.
         if m.role == "assistant" and meta.get("artifact_role") == "confirmation_intro":
