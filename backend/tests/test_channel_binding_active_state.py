@@ -7,6 +7,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
+from app.api.dingtalk import process_dingtalk_message
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.channel_config import ChannelConfig
@@ -125,18 +126,22 @@ async def test_established_binding_rejects_each_inactive_principal_layer(
         user_active=user_active,
         source_status=source_status,
     )
+    with pytest.raises(ChannelUserResolutionError):
+        await process_dingtalk_message(
+            agent_id=agent_id,
+            sender_staff_id=subject,
+            user_text="Message from an inactive sender",
+            conversation_id="inactive-sender",
+            conversation_type="1",
+        )
     async with async_session() as db:
-        agent = await db.get(Agent, agent_id)
-        provider = await db.get(IdentityProvider, provider_id)
-        with pytest.raises(ChannelUserResolutionError):
-            await ChannelUserService().resolve_channel_user(
-                db,
-                agent,
-                "dingtalk",
-                subject,
-                {"external_id": subject},
-                provider=provider,
-            )
+        state = (await db.execute(
+            select(Identity.is_active, User.is_active, OrgMember.status)
+            .join(User, User.identity_id == Identity.id)
+            .join(OrgMember, OrgMember.user_id == User.id)
+            .where(OrgMember.provider_id == provider_id)
+        )).one()
+    assert state == (identity_active, user_active, source_status)
 
 
 async def test_historical_binding_without_directory_source_remains_usable():

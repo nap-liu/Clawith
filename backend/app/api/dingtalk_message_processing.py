@@ -120,6 +120,7 @@ async def process_dingtalk_message(
 
         # Canonical attribution is resolved through the shared provider user.
         # The receiving robot never supplies directory lookup authority.
+        dt_user_detail = None
         if _directory_credentials and directory_staff_id:
             dt_user_detail = await _get_dingtalk_user_detail_with_fallback(
                 _directory_credentials,
