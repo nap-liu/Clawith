@@ -349,7 +349,6 @@
 }
 .aware-empty--compact { margin: 0; padding: 16px; }
 
-.aware-resources-pane { min-height: 520px; }
 .aware-segment {
     display: inline-flex;
     gap: 2px;
