@@ -148,7 +148,7 @@ async def login_link(body: LoginLinkInput, request: Request,
     require_scope(context, "auth:login")
     app = context.application
     user = await resolve_user(request, db, context, body.user)
-    if body.embed_origin and body.embed_origin not in app.embed_origins:
+    if body.embed_origin and app.embed_origins and body.embed_origin not in app.embed_origins:
         fail("embed_origin_denied")
     base = await platform_service.get_configured_public_base_url(db)
     redirect_uri = redirect_target(app, body.redirect_uri, base)

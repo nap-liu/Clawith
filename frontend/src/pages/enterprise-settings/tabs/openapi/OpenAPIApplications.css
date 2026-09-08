@@ -38,9 +38,12 @@
 .openapi-application__revoke.btn { color: var(--error); }
 .openapi-error { font-size: 13px; color: var(--error); line-height: 1.6; padding: 12px 0; }
 .openapi-error .btn { margin-left: 12px; }
-.openapi-secret.app-modal-surface { width: min(500px, calc(100vw - 32px)); }
-.openapi-secret > h2 { font-size: 16px; margin-top: 12px; }
-.openapi-secret > .btn { margin-top: 24px; width: 100%; }
+.openapi-secret.app-modal-surface { width: min(520px, calc(100vw - 32px)); }
+.openapi-secret__header { display: flex; align-items: center; gap: 10px; }
+.openapi-secret__header h2 { font-size: 16px; font-weight: 600; margin: 0; }
+.openapi-secret__header svg { flex-shrink: 0; color: var(--text-secondary); }
+.openapi-secret > p { overflow-wrap: anywhere; }
+.openapi-secret__footer { display: flex; justify-content: flex-end; margin-top: 24px; }
 .openapi-secret__credential { margin-top: 20px; }
 .openapi-secret__credential > label { font-size: 12px; color: var(--text-secondary); }
 .openapi-secret__credential > div { display: flex; align-items: center; gap: 12px; padding: 12px; margin-top: 8px; background: var(--bg-secondary); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }

@@ -35,10 +35,14 @@ export default function OpenAPIApplications({ tenantId }: { tenantId: string }) 
         toast.success(t('openapi.saved'));
         refresh();
     };
-    const action = async (item: Application, operation: 'rotate-secret' | 'revoke' | 'audit') => {
+    const action = async (item: Application, operation: 'credentials' | 'rotate-secret' | 'revoke' | 'audit') => {
         if (busy) return;
         setBusy(true);
         try {
+            if (operation === 'credentials') {
+                setSecret(await fetchJson<Application>(path(`/${item.id}/credentials`), { method: 'POST', cache: 'no-store' }));
+                return;
+            }
             if (operation === 'audit') {
                 const rows = await fetchJson<AuditEntry[]>(path(`/${item.id}/audit`));
                 setAudit({ name: item.name, rows });
@@ -91,6 +95,7 @@ export default function OpenAPIApplications({ tenantId }: { tenantId: string }) 
                                         {!item.scopes.length && <span>{t('openapi.noScopes')}</span>}
                                     </div>
                                     <div className="openapi-application__actions">
+                                        <Button variant="ghost" disabled={busy || !!item.revoked_at} onClick={() => void action(item, 'credentials')}>{t('openapi.viewCredentials')}</Button>
                                         <Button variant="secondary" disabled={busy || !!item.revoked_at} onClick={() => setEditor({ application: item })}>{t('openapi.edit')}</Button>
                                         <Button variant="ghost" disabled={busy || !!item.revoked_at} onClick={() => void action(item, 'rotate-secret')}>{t('openapi.rotate')}</Button>
                                         <Button variant="ghost" disabled={busy} onClick={() => void action(item, 'audit')}>{t('openapi.audit')}</Button>
@@ -101,12 +106,13 @@ export default function OpenAPIApplications({ tenantId }: { tenantId: string }) 
                         })}
                     </div>}
         {editor && <ApplicationEditor application={editor.application} onSave={save} onClose={() => setEditor(null)} />}
-        <Modal open={!!secret} onClose={() => setSecret(null)} ariaLabel={t('openapi.secretTitle')} className="openapi-secret">
-            <IconKey size={24} stroke={1.5} aria-hidden="true" />
-            <h2>{t('openapi.secretTitle')}</h2><p>{t('openapi.secretOnce')}</p>
+        <Modal open={!!secret} onClose={() => setSecret(null)} ariaLabel={t('openapi.secretTitle')} className="app-modal-surface--compact openapi-secret">
+            <header className="openapi-secret__header"><IconKey size={20} stroke={1.5} aria-hidden="true" />
+                <h2>{t('openapi.secretTitle')}</h2></header>
+            <p>{secret?.name}</p>
             <div className="openapi-secret__credential"><label>{t('openapi.clientId')}</label><div><code>{secret?.client_id}</code>{copy(secret?.client_id || '')}</div></div>
             <div className="openapi-secret__credential"><label>{t('openapi.clientSecret')}</label><div><code>{secret?.client_secret}</code>{copy(secret?.client_secret || '')}</div></div>
-            <Button variant="primary" onClick={() => setSecret(null)}>{t('openapi.dismiss')}</Button>
+            <footer className="openapi-secret__footer"><Button variant="primary" onClick={() => setSecret(null)}>{t('openapi.dismiss')}</Button></footer>
         </Modal>
         {audit && <SettingsDrawer title={t('openapi.audit')} description={audit.name} onClose={() => setAudit(null)}
             footer={<Button variant="secondary" onClick={() => setAudit(null)}>{t('openapi.dismiss')}</Button>}>

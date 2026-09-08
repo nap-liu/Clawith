@@ -78,7 +78,7 @@ async def credential(db: AsyncSession, token: str, kind: str, *, lock=False):
         fail("application_disabled", 401)
     if kind != "system" and (not app.trust_user_identity or "auth:login" not in app.scopes):
         fail("identity_delegation_disabled", 403)
-    if kind != "system" and value.embed_origin and value.embed_origin not in app.embed_origins:
+    if kind != "system" and value.embed_origin and app.embed_origins and value.embed_origin not in app.embed_origins:
         fail("embed_origin_denied", 403)
     return app, value
 

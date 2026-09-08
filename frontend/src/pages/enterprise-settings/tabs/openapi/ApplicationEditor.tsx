@@ -61,7 +61,7 @@ export default function ApplicationEditor({ application, onSave, onClose }: {
         }
     };
     return <SettingsDrawer title={t(application ? 'openapi.editTitle' : 'openapi.create')}
-        description={t('openapi.editorDescription')} busy={busy} onClose={onClose}
+        busy={busy} onClose={onClose}
         footer={<>
             <Button type="button" variant="secondary" disabled={busy} onClick={onClose}>{t('openapi.cancel')}</Button>
             <Button type="submit" form={formId} variant="primary" disabled={busy || !draft.name.trim()}>
@@ -76,19 +76,18 @@ export default function ApplicationEditor({ application, onSave, onClose }: {
                         placeholder={t('openapi.namePlaceholder')} value={draft.name} disabled={busy}
                         onChange={event => update('name', event.target.value)} />
                 </SettingsField>
-                <SettingsToggle label={t('openapi.enableApplication')} description={t('openapi.enableHint')}
+                <SettingsToggle label={t('openapi.enableApplication')}
                     checked={draft.enabled} disabled={busy} onChange={value => update('enabled', value)} />
             </SettingsSection>
             <SettingsSection title={t('openapi.scopes')}>
                 {(['employees:read', 'auth:login'] as const).map(scope => <SettingsToggle key={scope}
                     label={t(scope === 'employees:read' ? 'openapi.employeeScope' : 'openapi.loginScope')}
-                    description={t(scope === 'employees:read' ? 'openapi.employeeHint' : 'openapi.loginHint')}
                     disabled={busy} checked={draft.scopes.includes(scope)}
                     onChange={value => update('scopes', value ? [...draft.scopes, scope] : draft.scopes.filter(item => item !== scope))} />)}
                 <SettingsToggle label={t('openapi.trustIdentity')} description={t('openapi.identityHint')}
                     checked={draft.trust_user_identity} disabled={busy} onChange={value => update('trust_user_identity', value)} />
             </SettingsSection>
-            <SettingsSection title={t('openapi.allowedOrigins')} description={t('openapi.originsHint')}>
+            <SettingsSection title={t('openapi.allowedOrigins')}>
                 <SettingsField label={t('openapi.embedOrigins')} htmlFor={`${formId}-embed`} hint={t('openapi.embedHint')}>
                     <TextArea id={`${formId}-embed`} rows={2} value={embed} disabled={busy}
                         aria-describedby={`${formId}-embed-hint`} placeholder={t('openapi.originPlaceholder')}

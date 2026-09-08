@@ -31,17 +31,20 @@ delegated-user discovery and temporary login links.
   request/response schemas. There is no second bespoke client auth protocol.
 
 Company administrators create clients in the enterprise settings OpenAPI tab. A client belongs to
-one immutable tenant, has an independent one-time secret, expiry, enabled state,
+one immutable tenant, has an independent secret, expiry, enabled state,
 scopes (`employees:read`, `auth:login`), rate limit, trusted-user delegation flag,
-embedding origins and redirect origins. Secrets are hashed; management lists
-never return them. Creation and rotation return the new secret once. Rotation,
-configuration changes, disabling and revocation invalidate outstanding system
+embedding origins and redirect origins. Authentication uses a secret hash;
+creation and rotation also store the secret directly for administrator viewing.
+Management lists never return the secret or its hash.
+The tenant-scoped POST `/{app_id}/credentials` management action returns the
+stored credentials to administrators, records a secret-free audit event and returns no-store.
+Rotation, configuration changes, disabling and revocation invalidate outstanding system
 tokens and unconsumed login links via a credential generation boundary.
 Revocation is durable and cannot be undone by re-enabling the application.
 
 Management routes are under `/api/enterprise/openapi/applications`, protected by
 the existing administrator dependency and current tenant context. Every list,
-update, secret rotation, revocation and audit query is tenant-scoped. The service
+update, credential view, secret rotation, revocation and audit query is tenant-scoped. The service
 derives application ownership from the authenticated user's tenant; request bodies
 cannot choose or change it. An optional `tenant_id` query only asserts the current
 context. Platform administrators must use the ordinary tenant switch first and
@@ -50,7 +53,7 @@ management routes are removed. Existing applications and credentials retain thei
 stored tenant and need no data migration.
 
 The UI uses the shared Drawer, SettingsForm, inputs, switches, buttons and dialog
-owners. Tenant switches discard drafts, one-time secrets and audit views; the
+owners. Tenant switches discard drafts, displayed secrets and audit views; the
 application list is keyed by tenant. Management copy, including audit actions,
 comes from the standard locale resources.
 
@@ -121,7 +124,8 @@ apply to the destination, independently of the external client.
 Targets must be relative application paths or use the configured public origin
 or an application redirect-origin allowlist. Network-path references, control
 characters, backslashes and credential-bearing URL authorities are rejected.
-Optional embedding origins must be explicitly allowed on the client. This
+An empty embedding allowlist permits any valid embedding origin. A nonempty
+list restricts both link issuance and exchange to its configured origins. This
 configuration validates the requested embedding intent; it does not introduce
 new page-specific frame policies or grant employee access.
 

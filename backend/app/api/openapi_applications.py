@@ -61,7 +61,8 @@ async def list_applications(user=Depends(tenant_admin), db: AsyncSession = Depen
 async def create_application(body: ApplicationInput, response: Response,
                              user=Depends(tenant_admin), db: AsyncSession = Depends(get_db)):
     secret = new_secret()
-    app = OpenAPIApplication(**body.model_dump(), tenant_id=user.tenant_id, secret_hash=digest(secret))
+    app = OpenAPIApplication(**body.model_dump(), tenant_id=user.tenant_id, secret_hash=digest(secret),
+                             client_secret=secret)
     db.add(app)
     await db.flush()
     await audit(db, "application.create", application_id=app.id, user_id=user.id)
@@ -92,11 +93,25 @@ async def rotate_secret(app_id: uuid.UUID, response: Response,
         fail("application_revoked", 409)
     secret = new_secret()
     app.secret_hash = digest(secret)
+    app.client_secret = secret
     app.generation += 1
     await audit(db, "application.rotate", application_id=app.id, user_id=user.id)
     await db.commit()
     response.headers["Cache-Control"] = "no-store"
     return {**projection(app), "client_secret": secret}
+
+
+@router.post("/{app_id}/credentials")
+async def view_credentials(app_id: uuid.UUID, response: Response,
+                           user=Depends(tenant_admin), db: AsyncSession = Depends(get_db)):
+    app = await load(db, app_id, user.tenant_id)
+    if app.revoked_at:
+        fail("application_revoked", 409)
+    await audit(db, "application.credentials", application_id=app.id, user_id=user.id)
+    await db.commit()
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return {**projection(app), "client_secret": app.client_secret}
 
 
 @router.post("/{app_id}/revoke")

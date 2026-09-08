@@ -1,8 +1,8 @@
-"""System applications and temporary OpenAPI credentials; no plaintext secrets."""
+"""System applications and temporary OpenAPI credentials."""
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,6 +16,7 @@ class OpenAPIApplication(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_secret: Mapped[str | None] = mapped_column(Text)
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     trust_user_identity: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
