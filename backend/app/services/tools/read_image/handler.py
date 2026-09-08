@@ -15,8 +15,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
+from app.models.agent import Agent
 from app.models.llm import LLMModel  # module is `llm.py`, not `llm_model.py`
 from app.models.tool import AgentTool, Tool
+from app.services.tool_config import get_tool_company_config, merge_tool_config_layers
 from app.services.tools.read_image.input_loader import (
     LoadError,
     LoadedImage,
@@ -35,12 +37,17 @@ from app.services.tools.read_image.prompt import (
 async def _load_config(
     db: AsyncSession, agent_id: uuid.UUID
 ) -> tuple[dict | None, dict | None]:
-    """Return (tool_config, agent_override_config). Either may be None."""
+    """Return (company-resolved base, enabled Agent override) for tightening."""
     tool_row = (
         await db.execute(select(Tool).where(Tool.name == "read_image"))
     ).scalar_one_or_none()
     if tool_row is None or not tool_row.enabled:
         return None, None
+    tenant_id = await db.scalar(select(Agent.tenant_id).where(Agent.id == agent_id))
+    company_cfg = await get_tool_company_config(db, tool_row, tenant_id)
+    base_cfg = merge_tool_config_layers(
+        tool_row.config or {}, company_cfg, None, tool_row.config_schema,
+    )
     at_row = (
         await db.execute(
             select(AgentTool).where(
@@ -49,7 +56,7 @@ async def _load_config(
         )
     ).scalar_one_or_none()
     agent_cfg = at_row.config if (at_row and at_row.enabled) else None
-    return tool_row.config or {}, agent_cfg
+    return base_cfg, agent_cfg
 
 
 async def get_effective_read_image_max_bytes(agent_id: uuid.UUID) -> int:

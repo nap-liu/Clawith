@@ -25,6 +25,10 @@ trail. Seed values must respect the actual database column lengths.
 
 Do not hard-code one tool's name in unrelated tool descriptions, because disabled tools can leak back into model context through prose.
 
+Builtin tools must inherit company configuration through the current Agent's
+tenant; `read_image` resolves that shared base before applying its existing
+tightening-only Agent overrides, rather than bypassing the company layer.
+
 Builtin runtime-override fields must stay synchronized between database seeds
 and in-code fallback schemas. `run_subagent` and trigger-management tools accept
 the normalized model reference forms and optional 0–2 temperature override
