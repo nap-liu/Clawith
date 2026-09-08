@@ -134,10 +134,11 @@ async def _manage_tasks(
 
             if task_type == "todo":
                 # Trigger auto-execution for todo tasks
-                import asyncio
-                from app.services.task_executor import execute_task
+                from app.services.agent_execution.bridge import dispatch_background
 
-                asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
+                await dispatch_background(
+                    "app.services.task_executor:execute_task", task.id, agent_id, task.execution_user_id,
+                )
                 await _sync_tasks_to_file(agent_id, ws)
                 return f"✅ Task created: {title} — auto-execution started"
             else:

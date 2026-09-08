@@ -237,7 +237,7 @@ async def message_loop_impl(api, self):
             continue
 
         if self.agent_type != "openclaw" and turn_lease is None and ingested is not None and not consumed_by_onmessage:
-            schedule_durable_turn_resume(ingested.message)
+            await schedule_durable_turn_resume(ingested.message)
             continue
 
         # Onboarding uses a hidden system anchor, absent from ordinary history.

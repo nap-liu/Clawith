@@ -715,7 +715,7 @@ async def _send_message_to_agent(
         from app.services.redis_lease_lock import RedisLeaseError
         if recoverable_anchor is not None and isinstance(e, RedisLeaseError):
             from app.services.turn_inbox import schedule_durable_turn_resume
-            schedule_durable_turn_resume(recoverable_anchor)
+            await schedule_durable_turn_resume(recoverable_anchor)
         logger.exception(f"[A2A] send_message_to_agent failed: from={from_agent_id}, to={args.get('agent_id', '')}")
         error_type = type(e).__name__
         error_detail = (str(e) or "").strip()

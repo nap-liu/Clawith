@@ -2,6 +2,7 @@
 
 import asyncio
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -339,7 +340,7 @@ async def test_standard_native_a2a_lease_failure_schedules_and_resumes(
     )
     monkeypatch.setattr(
         "app.services.turn_inbox.schedule_durable_turn_resume",
-        scheduled.append,
+        AsyncMock(side_effect=scheduled.append),
     )
     result = await _send_message_to_agent(
         source_id,
@@ -409,7 +410,7 @@ async def test_recovered_standard_a2a_consumes_followup_in_the_same_turn(
     monkeypatch.setattr(
         turn_inbox,
         "schedule_durable_turn_resume",
-        first_scheduled.append,
+        AsyncMock(side_effect=first_scheduled.append),
     )
     first_result = await _send_message_to_agent(
         source_id,

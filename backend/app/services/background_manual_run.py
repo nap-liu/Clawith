@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -161,23 +160,22 @@ async def run_background_resource(
     )
     await db.commit()
 
-    if resource_type == "task":
-        from app.services.task_executor import execute_task
+    from app.services.agent_execution.bridge import dispatch_background
 
-        asyncio.create_task(execute_task(item.id, agent_id, actor_user_id))
+    if resource_type == "task":
+        await dispatch_background("app.services.task_executor:execute_task", item.id, agent_id, actor_user_id)
     elif resource_type == "schedule":
-        asyncio.create_task(
-            _execute_and_track_schedule(
-                item.id,
-                agent_id,
-                item.instruction,
-                actor_user_id,
-                item.model_id,
-                item.temperature,
-                item.reasoning_effort,
-                item.soul,
-                item.memory,
-            )
+        await dispatch_background(
+            "app.services.background_manual_run:_execute_and_track_schedule",
+            item.id,
+            agent_id,
+            item.instruction,
+            actor_user_id,
+            item.model_id,
+            item.temperature,
+            item.reasoning_effort,
+            item.soul,
+            item.memory,
         )
 
     return BackgroundManualRunResult(

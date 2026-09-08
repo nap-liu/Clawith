@@ -4,6 +4,7 @@ from app.services.llm.caller_context import *  # noqa: F401,F403
 from app.services.llm.caller_failover import call_llm_with_failover
 from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
+from app.services.agent_execution.runtime import isolate_agent_execution
 
 
 async def call_agent_llm(
@@ -71,6 +72,7 @@ async def call_agent_llm(
         return f"⚠️ 调用模型出错: {error_msg[:150]}"
 
 
+@isolate_agent_execution
 async def call_agent_llm_with_tools(
     db: AsyncSession,
     agent_id: uuid.UUID,

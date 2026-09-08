@@ -1,4 +1,5 @@
 {
+  "errors.agentExecutionUnavailable": "This execution was interrupted. Please send your request again.",
   "errors.conversationHistoryUnavailable": "The conversation history could not be restored. Please try again.",
   "errors.modelResponseIdleTimeout": "The model response timed out and could not be completed. Please try again.",
   "errors.invalidToolCallStream": "The model returned an incomplete tool call. No tools were run; please try again.",

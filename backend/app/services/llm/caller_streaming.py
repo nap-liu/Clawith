@@ -7,9 +7,11 @@ from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_streaming_rounds import *  # noqa: F401,F403
 from app.services.llm.caller_streaming_support import *  # noqa: F401,F403
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
+from app.services.agent_execution.runtime import isolate_agent_execution
 
 
 @serialize_conversation_execution
+@isolate_agent_execution
 async def call_llm(
     model: LLMModel,
     messages: list[dict],

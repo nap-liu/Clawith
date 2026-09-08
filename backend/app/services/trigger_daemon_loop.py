@@ -1,6 +1,7 @@
 """Trigger loading, daemon ticks, and public wake entry points."""
 
 from app.services.trigger_daemon_invocation import *  # noqa: F401,F403
+from app.services.agent_execution.bridge import supervised_operation
 
 async def _load_enabled_triggers_for_scope(*, project_agents: bool) -> list[AgentTrigger]:
     """Load one Agent scope without coupling standard triggers to projects."""
@@ -153,6 +154,7 @@ async def _tick():
         asyncio.create_task(_invoke_agent_for_triggers(agent_id, agent_triggers))
 
 
+@supervised_operation
 async def wake_agent_with_context(
     agent_id: uuid.UUID,
     message_context: str,

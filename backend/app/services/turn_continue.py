@@ -107,4 +107,4 @@ async def dispatch_continue(anchor_id):
         payload={"type": "status", "content": render_message("commands.continue.accepted")},
         snapshot=snapshot, event_kind="turn_resumed",
     )
-    schedule_durable_turn_resume(anchor)
+    await schedule_durable_turn_resume(anchor)

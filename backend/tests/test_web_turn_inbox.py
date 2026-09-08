@@ -124,7 +124,7 @@ async def test_other_socket_admission_uses_same_generation(monkeypatch):
 async def test_late_followup_promotes_after_terminal_commit(monkeypatch):
     handler, snapshot = await running_handler(monkeypatch)
     resume = []
-    monkeypatch.setattr("app.services.turn_inbox.schedule_durable_turn_resume", resume.append)
+    monkeypatch.setattr("app.services.turn_inbox.schedule_durable_turn_resume", AsyncMock(side_effect=resume.append))
     await receive_followup(api, handler, {"message_id": str(uuid.uuid4()), "content": "Late requirement"})
     await handler._save_assistant_reply("First reply", [], turn_anchor_id=snapshot.anchor_id)
     assert len(resume) == 1

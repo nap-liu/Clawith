@@ -5,9 +5,11 @@ from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_streaming import call_llm
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
 from app.services.turn_tool_settings import with_scene_tool_settings
+from app.services.agent_execution.runtime import isolate_agent_execution
 
 
 @serialize_conversation_execution
+@isolate_agent_execution
 @with_scene_tool_settings
 async def call_llm_with_failover(
     primary_model,

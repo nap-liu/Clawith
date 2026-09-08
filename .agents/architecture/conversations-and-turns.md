@@ -12,6 +12,41 @@ turn snapshot without stopping an active turn or applying a stale generation.
 
 Web, IM, A2A, trigger, task, webhook, and MCP-facing message paths should delegate model/tool work to `call_llm` / `call_llm_with_failover`. New entry points may adapt context and delivery, but must not fork a private tool loop.
 
+Native model/tool invocations run in a supervised, single-use process through
+`services/agent_execution`. The existing shared loop, tools, schemas, workspace
+routing and channel adapters remain authoritative. Nested calls within one root
+Turn stay in that process; independent Turns get separate processes. Direct confirmed
+tool execution uses the same boundary. File search has no additional process or
+changed matching/truncation contract.
+
+The supervisor retains the conversation execution lease, provider concurrency
+slots and ingress cancellation target. Awaited callbacks use a private inherited
+socketpair, preserve callback ordering and receipt mutations, and inherit only
+their own active turn. A nested A2A call may inherit its parent's still-held
+Session lease; unrelated tasks must acquire their own lease. Children create
+independent database pools and never start connectors, schedulers or the
+ASGI bootstrap. Existing workload admission remains outside the child boundary.
+
+The isolation boundary adds no admission quota, execution deadline, memory or
+CPU restriction. Existing workload/provider limits and tool behavior stay in
+force. An independently executing Agent cannot hold another Turn's Python GIL
+or ingress event loop. Shared host capacity, storage, provider quotas and the
+external sandbox remain the existing platform dependencies.
+
+An unexpected child exit yields the normalized `agent_execution_unavailable`
+failure, without automatically replaying tools or failing over. Explicit
+cancellation reaps the child process group, and Linux parent-death signalling
+prevents orphan execution after supervisor exit. `AGENT_EXECUTION_ISOLATION=1`
+enables the boundary; the switch can be disabled for rollback or in-process
+contract tests.
+
+Independent background work is acknowledged by the supervisor before the
+originating Turn can exit. It uses the existing task/schedule/wake/recovery
+executor and a fresh root context. Nested durable anchor admission and terminal
+stop checks delegate to the supervisor's existing active-turn protocol. A child
+database commit remains inside that protocol's admission gate, so a stop cannot
+miss an A2A anchor committed concurrently with its snapshot.
+
 Build an immutable runtime/model snapshot and end the inbound read transaction
 before waiting on provider capacity or entering a long tool loop. Usage, tool
 results, delivery state, compaction, and other externally relevant progress use
@@ -50,6 +85,16 @@ does not stack with 5xx recovery or model failover, and authentication,
 billing, or hard-quota failures are not retried. Exhaustion is a typed terminal
 failure that tells the user to wait and send `/continue` in the same Session;
 resetting the conversation is neither required nor recommended.
+
+Quota classification follows the actual provider endpoint, not the model's
+display provider. On DashScope endpoints, `insufficient_quota` and
+`Throttling.AllocationQuota` denote TPS/TPM throttling and enter the same bounded
+429 retry lane, including third-party models hosted there. The generic
+"plan and billing details" message does not prove billing exhaustion. Explicit
+billing/hard-quota evidence and authentication failures remain terminal; other
+providers retain their quota semantics. Retries preserve completed tool results
+and never replay an already executed tool or a request that emitted progress.
+See the provider's [error-code contract](https://help.aliyun.com/zh/model-studio/error-code).
 
 Web and IM `/continue` explicitly reopen only the current Session's last failed
 owner when it has a durable typed LLM failure. The original anchor, instructions,

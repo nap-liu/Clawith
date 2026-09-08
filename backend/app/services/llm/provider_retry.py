@@ -6,17 +6,23 @@ import asyncio
 import copy
 import os
 from time import perf_counter
+from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
 
-from .client import LLMError
+from .client import LLMError, get_provider_base_url
+from app.services.agent_execution.provider import RemoteProviderSlot, provider_bridge
 
 RATE_LIMIT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0)
 CONNECTION_RETRY_DELAYS = (1.0, 2.0)
 PROVIDER_RECOVERY_RETRY_DELAY = 0.25
 PROVIDER_MAX_IN_FLIGHT_ENV = "LLM_PROVIDER_MAX_IN_FLIGHT"
 PROVIDER_MAX_IN_FLIGHT_DEFAULT = 2
+_EXPLICIT_HARD_QUOTA_MARKERS = (
+    "credit balance", "credits exhausted", "hard_limit", "payment_required",
+    "billoverdue", "arrearage", "free allocated quota",
+)
 
 
 class ProviderThrottleExhausted(LLMError):
@@ -50,7 +56,41 @@ class ProviderRecoveryExhausted(LLMError):
         self.had_progress = bool(getattr(error, "had_progress", False))
 
 
-def _is_hard_quota_error(error: LLMError) -> bool:
+def _is_dashscope_token_throttle(error: LLMError, model=None) -> bool:
+    """DashScope's OpenAI-compatible quota code means TPS/TPM throttling.
+
+    Resolve the actual endpoint, including the registry default: third-party
+    models can use DashScope and Qwen models can use another provider's API.
+    The generic "plan and billing details" message is not proof of debt.
+    """
+    if model is None or error.status_code not in {None, 429}:
+        return False
+    endpoint = get_provider_base_url(
+        getattr(model, "provider", ""), getattr(model, "base_url", None),
+    )
+    try:
+        hostname = urlsplit(endpoint or "").hostname
+    except ValueError:
+        return False
+    if hostname not in {
+        "dashscope.aliyuncs.com",
+        "dashscope-intl.aliyuncs.com",
+        "dashscope-us.aliyuncs.com",
+    }:
+        return False
+    codes = {str(value or "").lower() for value in (error.error_code, error.error_type)}
+    # Explicit billing/hard-quota evidence must win over an ambiguous quota code.
+    evidence = " ".join((*codes, str(error).lower()))
+    if any("billing" in code for code in codes) or any(
+        marker in evidence for marker in _EXPLICIT_HARD_QUOTA_MARKERS
+    ):
+        return False
+    return bool(codes & {"insufficient_quota", "throttling.allocationquota"})
+
+
+def _is_hard_quota_error(error: LLMError, model=None) -> bool:
+    if _is_dashscope_token_throttle(error, model):
+        return False
     structured = " ".join(
         str(value or "").lower()
         for value in (error.error_code, error.error_type, error)
@@ -60,19 +100,18 @@ def _is_hard_quota_error(error: LLMError) -> bool:
         for marker in (
             "insufficient_quota",
             "billing",
-            "credit balance",
-            "credits exhausted",
-            "hard_limit",
-            "payment_required",
             "exceeded your current quota",
+            *_EXPLICIT_HARD_QUOTA_MARKERS,
         )
     )
 
 
-def _is_provider_throttle_error(error: LLMError) -> bool:
+def _is_provider_throttle_error(error: LLMError, model=None) -> bool:
     """Recognize transient rate limiting without retrying auth or hard quota."""
-    if error.status_code in {401, 403} or _is_hard_quota_error(error):
+    if error.status_code in {401, 403} or _is_hard_quota_error(error, model):
         return False
+    if _is_dashscope_token_throttle(error, model):
+        return True
     if error.status_code is not None:
         return error.status_code == 429
     structured = " ".join(
@@ -187,7 +226,10 @@ async def _close_cancelled_provider_client(client) -> None:
 _provider_slots: dict[tuple[int, str, str, int, int], asyncio.Semaphore] = {}
 
 
-def _provider_slot(model) -> asyncio.Semaphore:
+def _provider_slot(model) -> asyncio.Semaphore | RemoteProviderSlot:
+    bridge = provider_bridge.get()
+    if bridge is not None:
+        return RemoteProviderSlot(model, bridge)
     try:
         limit = int(os.environ.get(PROVIDER_MAX_IN_FLIGHT_ENV, PROVIDER_MAX_IN_FLIGHT_DEFAULT))
     except ValueError:
@@ -206,11 +248,12 @@ def _provider_slot(model) -> asyncio.Semaphore:
 def _next_retry(
     error: LLMError,
     *,
+    model=None,
     lane: str | None,
     rate_limit_retries: int,
     recovery_retries: int,
 ) -> tuple[str, int, float]:
-    if _is_provider_throttle_error(error):
+    if _is_provider_throttle_error(error, model):
         if lane not in {None, "rate_limit_429"}:
             raise ProviderRecoveryExhausted(error) from error
         if rate_limit_retries >= len(RATE_LIMIT_RETRY_DELAYS):
@@ -298,7 +341,7 @@ async def _stream_with_throttle_retry(
             error = _normalize_transport_error(caught)
             if first_progress_at:
                 error.had_progress = True
-                if _is_provider_throttle_error(error):
+                if _is_provider_throttle_error(error, model):
                     raise ProviderThrottleExhausted(
                         error,
                         retry_count=rate_limit_retries,
@@ -312,6 +355,7 @@ async def _stream_with_throttle_retry(
                 raise error from caught
             lane, retry_count, delay = _next_retry(
                 error,
+                model=model,
                 lane=lane,
                 rate_limit_retries=rate_limit_retries,
                 recovery_retries=recovery_retries,
@@ -384,6 +428,7 @@ async def _complete_with_throttle_retry(
                 raise error from caught
             lane, retry_count, delay = _next_retry(
                 error,
+                model=model,
                 lane=lane,
                 rate_limit_retries=rate_limit_retries,
                 recovery_retries=recovery_retries,
