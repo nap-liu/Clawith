@@ -29,6 +29,7 @@ const EnterpriseSettings = lazy(() => import("./pages/EnterpriseSettings"));
 const InvitationCodes = lazy(() => import("./pages/InvitationCodes"));
 const AdminCompanies = lazy(() => import("./pages/AdminCompanies"));
 const OAuthCallback = lazy(() => import("./pages/OAuthCallback"));
+const OpenApiLogin = lazy(() => import('./pages/OpenApiLogin'));
 const OAuthAdminResult = lazy(() => import("./pages/OAuthAdminResult"));
 const SSOEntry = lazy(() => import("./pages/SSOEntry"));
 const H5AgentChat = lazy(() => import("./pages/h5/H5AgentChat"));
@@ -279,6 +280,7 @@ export default function App() {
   const location = useLocation();
   const isH5Route = location.pathname.startsWith("/h5/");
   const isPublishedPageRoute = location.pathname.startsWith("/p/");
+  const isOpenApiLoginRoute = location.pathname === '/openapi/login';
 
   useLayoutEffect(() => {
     if (isH5Route) return;
@@ -295,6 +297,10 @@ export default function App() {
     // /reset-password and /verify-email both receive a one-time token for their own flow —
     // consuming it here as a session JWT would call /auth/me, fail, log out the user,
     // and redirect them to /login instead of showing the correct page.
+    if (window.location.pathname === '/openapi/login') {
+      setLoading(false);
+      return;
+    }
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get("token");
     const currentPath = window.location.pathname;
@@ -341,8 +347,8 @@ export default function App() {
   if (loading) {
     return (
       <>
-        {!isPublishedPageRoute && <PlatformWatermark />}
-        {!isH5Route && !isPublishedPageRoute && <NotificationBar />}
+        {!isPublishedPageRoute && !isOpenApiLoginRoute && <PlatformWatermark />}
+        {!isH5Route && !isPublishedPageRoute && !isOpenApiLoginRoute && <NotificationBar />}
         <Suspense
           fallback={
             <div
@@ -360,6 +366,7 @@ export default function App() {
         >
           <Routes>
             <Route path="/h5/agents/:agentId/chat" element={<H5AgentChat />} />
+            <Route path="/openapi/login" element={<OpenApiLogin />} />
             <Route path="/login" element={<Login />} />
             <Route path="/forgot-password" element={<ForgotPassword />} />
             <Route path="/reset-password" element={<ResetPassword />} />
@@ -447,8 +454,8 @@ export default function App() {
 
   return (
     <>
-      {!isPublishedPageRoute && <PlatformWatermark />}
-      {!isH5Route && !isPublishedPageRoute && <NotificationBar />}
+      {!isPublishedPageRoute && !isOpenApiLoginRoute && <PlatformWatermark />}
+      {!isH5Route && !isPublishedPageRoute && !isOpenApiLoginRoute && <NotificationBar />}
       <Suspense
         fallback={
           <div
@@ -466,6 +473,7 @@ export default function App() {
       >
         <Routes>
           <Route path="/h5/agents/:agentId/chat" element={<H5AgentChat />} />
+          <Route path="/openapi/login" element={<OpenApiLogin />} />
           <Route path="/login" element={<Login />} />
           <Route path="/forgot-password" element={<ForgotPassword />} />
           <Route path="/reset-password" element={<ResetPassword />} />

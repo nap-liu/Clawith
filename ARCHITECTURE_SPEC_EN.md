@@ -139,3 +139,11 @@ See `.agents/architecture/environments-and-operations.md` for the exact safe wor
 
 Context budgeting, compaction, tool-result views, and Agent memory loading are
 specified in `.agents/architecture/context-and-memory.md`.
+
+## Standard system integrations
+
+External applications use OAuth 2.0 Client Credentials and versioned OpenAPI
+business APIs. Client management, delegated identity, employee resource links
+and page-independent temporary login follow `.agents/architecture/openapi.md`.
+The ordinary identity, permission and conversation owners remain authoritative;
+external integrations do not introduce a second chat or authorization runtime.

@@ -116,6 +116,7 @@ async def main():
     import app.models.cli_tool_binary       # noqa
     import app.models.dingtalk_provisioning # noqa
     import app.models.personal_access_token # noqa
+    import app.models.openapi_application # noqa
     import app.models.speech_recognition_config  # noqa
     import app.models.workspace      # noqa
     # Mirror the main.py lifespan create_all set exactly so a fresh-DB bootstrap

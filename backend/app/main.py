@@ -213,6 +213,7 @@ async def lifespan(fastapi_app: FastAPI):
             import app.models.cli_tool_binary       # noqa
             import app.models.dingtalk_provisioning # noqa
             import app.models.personal_access_token # noqa
+            import app.models.openapi_application # noqa
             import app.models.speech_recognition_config  # noqa
             import app.models.workspace      # noqa
             import app.models.project        # noqa
@@ -627,3 +628,10 @@ _version_cache = _load_version_info()
 async def get_version():
     """Return the current platform version and commit hash."""
     return _version_cache
+
+from app.api.openapi import router as openapi_router
+from app.api.openapi_applications import router as openapi_applications_router
+app.include_router(openapi_router, prefix=settings.API_PREFIX)
+app.include_router(openapi_applications_router, prefix=settings.API_PREFIX)
+from app.api.openapi_metadata import router as openapi_metadata_router
+app.include_router(openapi_metadata_router)

@@ -31,6 +31,20 @@ server {
         add_header Pragma "no-cache";
     }
 
+    location = /.well-known/oauth-authorization-server {
+        proxy_pass $api_upstream;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto $effective_forwarded_proto;
+    }
+
+    # Temporary login codes must never enter access logs or referrers.
+    location = /openapi/login {
+        access_log off;
+        try_files /index.html =404;
+        add_header Cache-Control "no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+    }
+
     # Hashed assets (JS/CSS) — safe to cache for 1 year since filenames change on every build
     location /assets/ {
         expires 1y;

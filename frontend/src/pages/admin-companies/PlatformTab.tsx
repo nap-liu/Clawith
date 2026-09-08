@@ -5,6 +5,7 @@ import { saveAccentColor, getSavedAccentColor } from "../../utils/theme";
 import { fetchJson } from "./helpers";
 import PlatformGeneralSettings from "./PlatformGeneralSettings";
 import PlatformEmailSettings from "./PlatformEmailSettings";
+import OpenAPIApplications from "./OpenAPIApplications";
 
 export default function PlatformTab() {
   const { t } = useTranslation();
@@ -580,6 +581,8 @@ export default function PlatformTab() {
         urlSaving={urlSaving}
         urlSaved={urlSaved}
       />
+
+      <OpenAPIApplications />
 
       <PlatformEmailSettings
         t={t}

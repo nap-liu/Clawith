@@ -44,3 +44,5 @@ When work establishes a durable lesson:
 Do not create hidden project knowledge in personal agent memory. If information
 is important for future repository work, it belongs in this handbook, code,
 tests, migrations, or an approved operations inventory.
+
+System OpenAPI and OAuth client management: [architecture/openapi.md](architecture/openapi.md).

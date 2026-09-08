@@ -1,0 +1,151 @@
+# Standard system OpenAPI iteration
+
+## Engineering authority
+
+This work is exclusively governed by the Digital Employee Platform repository
+`AGENTS.md` and the task routes it selects. No Grid engineering workflow,
+architecture boundary or test policy is applied to this repository. Only the
+versioned RFC-based integration contract is shared across the two products.
+
+Read for this iteration:
+
+- `AGENTS.md`
+- `.agents/workflows/read_architecture.md`
+- `ARCHITECTURE_SPEC_EN.md`
+- `.agents/rules/design_and_dev.md`
+- `.agents/workflows/engineering_change.md`
+- `.agents/rules/github.md`
+- `.agents/rules/deploy.md`
+- `.agents/architecture/identity-directory-and-channel-bindings.md`
+- `.agents/architecture/conversations-and-turns.md`
+- `.agents/architecture/environments-and-operations.md`
+
+No production release was requested, so the release/runbook path is not invoked.
+The implementation is authorized; push, PR, release and deployment are not.
+Repository rules permit a local implementation commit. The integration lead
+commits only the reviewed worktree changes; no push or release is included.
+
+## Baseline and ownership
+
+Dedicated worktree `.worktrees/openapi-h5-integration`, branch
+`feat/openapi-h5-integration`, baseline `89f5c976` selected by integration lead.
+The repository has no `company` remote; company branch refs exist under other
+remotes. Existing dirty main checkout and all unrelated worktrees are untouched.
+
+The OpenAPI agent owns backend, system-client management UI and canonical
+OpenAPI architecture documentation. The integration lead contributes the generic
+`OpenApiLogin` frontend page, route and its separate localization block under
+this repository's rules. Both contributors review the combined diff before
+handoff; neither imports the other project's internal models or permissions.
+
+## Todo
+
+- [x] Read repository rules and inspect baseline, worktrees and containers.
+- [x] Agree the standard OAuth and page-independent login business contract.
+- [x] Implement system application lifecycle, OAuth and delegated-user APIs.
+- [x] Implement generic signed temporary login and reuse normal login owner.
+- [x] Add system management UI and canonical architecture/index references.
+- [x] Run isolated Docker migration and real API product walkthrough.
+- [x] Run focused OAuth/identity/signed-link risk validation.
+- [x] Run complete frontend build with repository prebuild checks in Docker.
+- [x] Review real browser login/admin UI and two-system result readback.
+- [ ] Final reviewed local commit and handoff (in progress).
+
+## Acceptance evidence so far
+
+Isolated `clawith-openapi-validation` Docker PostgreSQL/Redis, disposable
+`test_openapi` database. Backend mounts this exact checkout, with workers disabled
+and lifespan/bootstrap disabled after explicit schema bring-up. Backend also
+joins `grid-digital-employee-lab` solely for integration validation. Independent
+frontend proxy uses port 64514; the shared 3008 stack is unchanged.
+
+Fresh database bootstrap and existing-base downgrade/upgrade of the new migration
+passed. Live HTTP product walkthrough passed: create client, OAuth Basic+form,
+discover delegated user's employee, sign generic login link, consume it, and read
+the employee through the ordinary user API. Focused PostgreSQL-backed API test
+passed scope, replay, concurrent consumption, redirect, identity, revocation and
+rotation risks. Full Docker `npm run build` including prebuild checks passed.
+Ruff is not installed in the available backend test image; no host fallback used.
+
+## Completion gate
+
+The repository requires observable Docker evidence, final diff review, canonical
+documentation for changed invariants, explicit unverified limits, `git diff
+--check`, and at most 800 physical lines in every delivered handwritten source
+file. Existing shared services, UI controls, i18n, identity and permission owners
+are reused. Completion includes a short local sound. Worktree cleanup follows
+this repository's Git/post-release rules; unmerged work is retained and unrelated
+worktrees are never removed.
+
+## Agent handoff
+
+Backend and management UI implementation/review complete; the integration lead
+continues browser and cross-system acceptance in the same worktree. No commit,
+push, deployment, shared-stack change or worktree removal performed by this
+agent. Retain this unmerged worktree until reviewed integration is committed.
+
+Additional verified risks: mainland domestic/+86/0086 exact phone equivalence,
+duplicate-equivalent Identity refusal, unchanged foreign-phone exact lookup,
+unknown OAuth extension acceptance, invalid scope whitespace rejection,
+cross-client revocation isolation, expired login credential and inactive user.
+The latest PostgreSQL-backed focused test passed after these changes.
+
+Latest full frontend build passed after replacing the custom confirmation area
+with the repository's shared ConfirmModal. The independent frontend login route
+was re-read as HTTP 200 with no-referrer/no-store after build completion. A brief
+404 occurred during Vite's rebuild of the mounted dist directory; it is resolved.
+Further validation builds must use a staged output before switching the served
+artifact to avoid interrupting integration tests.
+
+All delivered handwritten source counts are <=800; the largest touched source
+is `canonical_user_resolver.py` at 789 lines. Localization JSON is declarative
+and exempt. `git diff --check` passed. Browser navigation and management UI final
+result remain with the integration lead, as does combined-source commit approval.
+
+## Integrated acceptance
+
+The integration lead verified the real browser generic login to `/explore`,
+ordinary authenticated navigation and removal of the code from the URL. A reused
+link renders a localized expiry message without retaining the query. The login
+failure heading uses the existing generic login translation. The final Docker
+frontend build passed and staged assets before replacing index.html.
+
+The system administration UI created a client, showed its secret once, rotated
+it, revoked it and read its audit. Revoked controls become disabled. Desktop and
+mobile views were inspected; the new section fits its parent. Existing platform
+settings outside this section still have mobile horizontal overflow.
+
+Both administrator and delegated member passed ordinary WebSocket authentication
+and message persistence with the correct owner. The isolated employee has no LLM
+model configured, so the normal turn returned the explicit model-missing error;
+natural-language model replies were not verified. Cross-origin Safari/device
+behavior and production deployment were not tested.
+
+Non-secret browser evidence is retained in Docker volume
+`clawith-openapi-evidence`. The worktree and feature branch remain because the
+primary checkout contains user-owned uncommitted work and this feature is not
+merged. Owner: integration lead. Next action: integrate after that work is
+committed; review retention at the next iteration and remove the worktree only
+after integration. No unrelated worktree or shared service is cleaned.
+
+## Follow-up: member H5 connection
+
+- [x] Diagnose the ordinary member WebSocket/session handshake in isolated Docker.
+- [x] Confirm no authoritative owner defect in the real handshake; no implementation change needed.
+
+The Builder member bootstrap and ordinary `/api/auth/me` succeed, while the H5
+view remains disconnected. Preserve the generic login contract and inspect the
+existing Clawith WebSocket path. Do not modify the shared 3008 service or print
+credentials, login codes or credential-bearing query strings.
+
+Member follow-up result: the existing backend path passed without any product
+patch. A standard delegated login was compared to the fixture member ID inside
+the container, then the ordinary WebSocket emitted `connected` with
+`read_only=false`. A real member message completed through the shared turn path
+with the existing explicit no-model result. Database readback found one message
+and confirmed it belongs to that member. The backend has no member handshake or
+permission defect in this reproduction. The frontend validation owner is checking
+browser foreground/visibility because H5 intentionally suspends hidden pages.
+
+- [x] Diagnose ordinary member WebSocket/session handshake in isolated Docker.
+- [x] Verify real member turn and persisted member ownership; no owner patch needed.

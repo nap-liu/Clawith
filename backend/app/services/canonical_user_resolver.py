@@ -48,6 +48,23 @@ def normalize_phone(value: str | None) -> str | None:
     return normalized or None
 
 
+def phone_match_candidates(value: str | None) -> list[str | None]:
+    """Exact mainland domestic/international equivalents for opt-in lookup.
+
+    Other explicit international numbers keep the existing exact normalization.
+    This never writes or merges identities; callers must reject multiple hits.
+    """
+    raw = re.sub(r"[\s\-]", "", str(value or ""))
+    normalized = normalize_phone(raw)
+    if raw.startswith("+") and not raw.startswith("+86"):
+        return [normalized]
+    match = re.fullmatch(r"(?:0086|86)?(1[3-9]\d{9})", normalized or "")
+    if not match:
+        return [normalized]
+    national = match.group(1)
+    return [national, "86" + national, "0086" + national]
+
+
 @dataclass(slots=True)
 class IdentityClaims:
     identity: Identity | None
@@ -67,10 +84,12 @@ class CanonicalUserResolver:
         phone: str | None,
         enrich: bool = True,
         ordered_fields: tuple[str, ...] | list[str] = DEFAULT_IDENTITY_MATCH_ORDER,
+        phone_equivalence: bool = False,
     ) -> IdentityClaims:
         """Resolve exact contacts in order; lower-priority conflicts are flagged."""
         fields = normalize_identity_match_order(ordered_fields)
         email = normalize_email(email) if "email" in fields else None
+        phone_values = phone_match_candidates(phone) if phone_equivalence else [normalize_phone(phone)]
         phone = normalize_phone(phone) if "phone" in fields else None
 
         candidates: dict[str, Identity | None] = {"email": None, "phone": None}
@@ -92,8 +111,7 @@ class CanonicalUserResolver:
                     .where(
                         func.regexp_replace(
                             Identity.phone, r"[[:space:]+-]", "", "g"
-                        )
-                        == phone
+                        ).in_(phone_values)
                     )
                     .limit(2)
                 )

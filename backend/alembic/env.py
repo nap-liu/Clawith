@@ -50,6 +50,7 @@ from app.models.project import (  # noqa: F401
 from app.models.agent_credential import AgentCredential  # noqa: F401
 from app.models.onboarding import UserTenantOnboarding  # noqa: F401
 from app.models.personal_access_token import PersonalAccessToken  # noqa: F401
+from app.models.openapi_application import OpenAPIApplication, OpenAPICredential, OpenAPIUserBinding  # noqa: F401
 from app.models.speech_recognition_config import SpeechRecognitionConfig  # noqa: F401
 from app.models.published_page import (  # noqa: F401
     PublishedPage,
