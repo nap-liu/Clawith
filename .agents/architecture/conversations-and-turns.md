@@ -71,6 +71,13 @@ mutations rather than the complete model turn.
 
 Turn execution is logically independent of a socket or webhook request. A transport can disconnect after accepting input; the turn still persists its outcome and delivery state. Process restart recovery needs explicit durable completion/sequence state and must not infer completion only from `created_at`, because PostgreSQL transaction timestamps can sort a final row before independently committed tool rows.
 
+Each startup recovery task acquires the existing conversation execution lease
+before writing recovery state. A busy lease keeps that task waiting while its
+original durable origin, anchor, and generation remain current; completion,
+STOP, or replacement ends the wait. The original owner may renew normally, and
+only its release or lease expiry permits recovery. Waiting never holds a database
+transaction, steals a lease, or blocks recovery of another conversation.
+
 A provider response that sends no bytes within the selected model's request
 timeout ends as `model_response_idle_timeout`. This failure never triggers an
 automatic retry or fallback. The shared LLM boundary returns one string-

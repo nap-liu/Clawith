@@ -38,6 +38,7 @@ from app.services.conversation_turn_lifecycle import (
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
 from app.services.redis_lease_lock import RedisLeaseBusyError, RedisLeaseLock
+from app.services.turn_recovery_startup import resume_startup_anchor
 from app.services.turn_runtime import deliver_recovered_reply_to_origin, load_turn_runtime
 from app.services.turn_recovery_identity import (
     _metadata_execution_agent_id,
@@ -559,7 +560,7 @@ async def _resume_one(
         # A recovered turn owns its cancellation lifecycle. Running it in a
         # child task lets one stopped turn remain isolated while an actual
         # shutdown still cancels the whole startup recovery set.
-        did_resume = await asyncio.create_task(resume_turn(anchor))
+        did_resume = await asyncio.create_task(resume_startup_anchor(anchor))
     except asyncio.CancelledError:
         recovery_task = asyncio.current_task()
         if recovery_task is not None and recovery_task.cancelling():

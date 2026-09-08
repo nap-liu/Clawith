@@ -25,8 +25,14 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
 
     from app.services import turn_recovery
 
-    anchor = SimpleNamespace(id=uuid.uuid4())
+    anchor = SimpleNamespace(
+        id=uuid.uuid4(), agent_id=uuid.uuid4(), conversation_id="startup_shutdown",
+    )
     recovery_started = asyncio.Event()
+    origin = object()
+
+    async def fake_origin(_anchor):
+        return origin
 
     async def fake_load(_db):
         return [anchor]
@@ -37,6 +43,7 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
         return True
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery, "_load_fresh_recovery_origin", fake_origin)
     monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
 
     scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=1))
