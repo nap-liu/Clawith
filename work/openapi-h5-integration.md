@@ -49,7 +49,8 @@ handoff; neither imports the other project's internal models or permissions.
 - [x] Run focused OAuth/identity/signed-link risk validation.
 - [x] Run complete frontend build with repository prebuild checks in Docker.
 - [x] Review real browser login/admin UI and two-system result readback.
-- [ ] Final reviewed local commit and handoff (in progress).
+- [x] Final diff/source-line review and local implementation commit.
+- [x] Handoff with explicit validation limits and retention owner.
 
 ## Acceptance evidence so far
 
@@ -127,6 +128,14 @@ primary checkout contains user-owned uncommitted work and this feature is not
 merged. Owner: integration lead. Next action: integrate after that work is
 committed; review retention at the next iteration and remove the worktree only
 after integration. No unrelated worktree or shared service is cleaned.
+
+Implementation committed locally as `cc7599a8`. Final OpenAPI schema inspection
+also confirmed exact per-operation OAuth scopes through FastAPI Security; the
+focused PostgreSQL API test passed again after that annotation change. The
+generic login failure heading and current frontend production build are verified.
+The integration browser and completed build helper were removed after evidence
+archival. The service containers remain only until the client iteration finishes
+its review; their cleanup does not remove this unmerged feature worktree.
 
 ## Follow-up: member H5 connection
 

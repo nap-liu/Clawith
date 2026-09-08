@@ -2,7 +2,7 @@
 import uuid
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -113,7 +113,7 @@ async def capabilities(context=Depends(system_context)):
 
 @router.post("/digital-employees/search", response_model=EmployeePageOut)
 async def employees(body: EmployeeSearchInput, request: Request,
-                    context=Depends(system_context), db: AsyncSession = Depends(get_db)):
+                    context=Security(system_context, scopes=["employees:read"]), db: AsyncSession = Depends(get_db)):
     require_scope(context, "employees:read")
     user = await resolve_user(request, db, context, body.user)
     stmt = build_visible_agents_query(user, tenant_id=context.application.tenant_id)
@@ -131,7 +131,7 @@ async def employees(body: EmployeeSearchInput, request: Request,
 
 @router.post("/digital-employees/{employee_id}/access", response_model=EmployeeOut)
 async def employee(employee_id: uuid.UUID, body: EmployeeAccessInput, request: Request,
-                   context=Depends(system_context), db: AsyncSession = Depends(get_db)):
+                   context=Security(system_context, scopes=["employees:read"]), db: AsyncSession = Depends(get_db)):
     require_scope(context, "employees:read")
     user = await resolve_user(request, db, context, body.user)
     agent, _ = await check_agent_access(db, user, employee_id)
@@ -144,7 +144,7 @@ async def employee(employee_id: uuid.UUID, body: EmployeeAccessInput, request: R
 
 @router.post("/auth/links", response_model=LoginLinkOut)
 async def login_link(body: LoginLinkInput, request: Request,
-                     context=Depends(system_context), db: AsyncSession = Depends(get_db)):
+                     context=Security(system_context, scopes=["auth:login"]), db: AsyncSession = Depends(get_db)):
     require_scope(context, "auth:login")
     app = context.application
     user = await resolve_user(request, db, context, body.user)
