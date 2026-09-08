@@ -30,7 +30,7 @@ delegated-user discovery and temporary login links.
   obtain/revoke tokens; generated API clients use the documented business
   request/response schemas. There is no second bespoke client auth protocol.
 
-Platform administrators create clients in system settings. A client belongs to
+Company administrators create clients in the enterprise settings OpenAPI tab. A client belongs to
 one immutable tenant, has an independent one-time secret, expiry, enabled state,
 scopes (`employees:read`, `auth:login`), rate limit, trusted-user delegation flag,
 embedding origins and redirect origins. Secrets are hashed; management lists
@@ -39,9 +39,22 @@ configuration changes, disabling and revocation invalidate outstanding system
 tokens and unconsumed login links via a credential generation boundary.
 Revocation is durable and cannot be undone by re-enabling the application.
 
-Management routes are under `/api/admin/openapi/applications`, protected by
-existing platform-admin authorization. No external dynamic client registration
-protocol is exposed. Disabling an external application does not revoke an
+Management routes are under `/api/enterprise/openapi/applications`, protected by
+the existing administrator dependency and current tenant context. Every list,
+update, secret rotation, revocation and audit query is tenant-scoped. The service
+derives application ownership from the authenticated user's tenant; request bodies
+cannot choose or change it. An optional `tenant_id` query only asserts the current
+context. Platform administrators must use the ordinary tenant switch first and
+receive no unscoped list or cross-tenant object bypass. The former platform-wide
+management routes are removed. Existing applications and credentials retain their
+stored tenant and need no data migration.
+
+The UI uses the shared Drawer, SettingsForm, inputs, switches, buttons and dialog
+owners. Tenant switches discard drafts, one-time secrets and audit views; the
+application list is keyed by tenant. Management copy, including audit actions,
+comes from the standard locale resources.
+
+No external dynamic client registration protocol is exposed. Disabling an external application does not revoke an
 ordinary user login already established through the platform's login owner.
 
 ## Delegated user is business data
@@ -66,6 +79,12 @@ A client-scoped hashed subject binding prevents a later phone assertion from
 silently switching an existing subject to another person. Ambiguous or conflicting
 matches fail closed. Existing global, membership and tenant active-state checks
 remain authoritative.
+
+Tenant-managed clients cannot delegate platform administrators, whether that
+authority comes from the tenant role or the global Identity flag. Both identity
+resolution and login-code exchange enforce this boundary, including when a user
+is promoted after a link was issued. Enterprise self-service must not mint a
+platform-administrator login through trusted phone assertions.
 
 ## Business API contract
 

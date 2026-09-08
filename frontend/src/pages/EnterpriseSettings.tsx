@@ -11,6 +11,7 @@ import OrgTab from './enterprise-settings/tabs/OrgTab';
 import SkillsTab from './enterprise-settings/tabs/SkillsTab';
 import LlmTab from './enterprise-settings/tabs/LlmTab';
 import SpeechRecognitionTab from './enterprise-settings/tabs/SpeechRecognitionTab';
+import OpenAPIApplications from './enterprise-settings/tabs/openapi/OpenAPIApplications';
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
 import { A2AAsyncToggle, CompanyLogoEditor, CompanyNameEditor, CompanyTimezoneEditor } from './enterprise-settings/components/CompanyInfoEditors';
 import { getLocalizedToolPresentation } from '../utils/toolPresentation';
@@ -42,8 +43,8 @@ export default function EnterpriseSettings() {
     const qc = useQueryClient();
     const currentUser = useAuthStore((s) => s.user);
     const isPlatformAdmin = currentUser?.role === 'platform_admin' || currentUser?.is_platform_admin === true;
-    type TabKey = 'llm' | 'speech' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites';
-    const VALID_TABS: TabKey[] = ['info', 'llm', 'speech', 'tools', 'skills', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    type TabKey = 'llm' | 'speech' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'openapi';
+    const VALID_TABS: TabKey[] = ['info', 'llm', 'speech', 'tools', 'skills', 'openapi', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
     const getTabFromHash = (): TabKey => {
         const hash = window.location.hash.replace('#', '') as TabKey;
         return VALID_TABS.includes(hash) ? hash : 'info';
@@ -348,7 +349,7 @@ export default function EnterpriseSettings() {
                 </div>
 
                 <div className="tabs">
-                    {(['info', 'llm', 'speech', 'tools', 'skills', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'] as const).map(tab => (
+                    {VALID_TABS.map(tab => (
                         <div
                             key={tab}
                             className={`tab ${activeTab === tab ? 'active' : ''}`}
@@ -368,6 +369,11 @@ export default function EnterpriseSettings() {
 
                 {/* ── Speech Recognition Service ── */}
                 {activeTab === 'speech' && <SpeechRecognitionTab selectedTenantId={selectedTenantId} />}
+
+                {activeTab === 'openapi' && <OpenAPIApplications
+                    key={selectedTenantId || currentUser?.tenant_id}
+                    tenantId={selectedTenantId || currentUser?.tenant_id || ''}
+                />}
 
                 {/* ── Org Structure ── */}
                 {activeTab === 'org' && <OrgTab tenant={currentTenant} />}

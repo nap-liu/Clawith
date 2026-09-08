@@ -23,7 +23,6 @@ def validate_origin(value: str) -> str:
 class ApplicationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=100)
-    tenant_id: UUID
     enabled: bool = True
     trust_user_identity: bool = False
     scopes: list[str] = Field(default_factory=lambda: sorted(SCOPES))

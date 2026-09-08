@@ -1,4 +1,4 @@
-import { forwardRef, type InputHTMLAttributes } from 'react';
+import { forwardRef, type InputHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 
 type TextInputProps = InputHTMLAttributes<HTMLInputElement>;
 
@@ -17,3 +17,9 @@ const TextInput = forwardRef<HTMLInputElement, TextInputProps>(function TextInpu
 });
 
 export default TextInput;
+
+export const TextArea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(
+    function TextArea({ className = '', ...props }, ref) {
+        return <textarea ref={ref} className={['form-textarea', className].filter(Boolean).join(' ')} {...props} />;
+    },
+);

@@ -45,15 +45,15 @@ async def test_oauth_and_generic_login_contract():
     headers = {"Authorization": f"Bearer {create_access_token(str(users[0].id), users[0].role)}"}
     base = "/api/openapi/v1"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        created = await client.post("/api/admin/openapi/applications", headers=headers, json={
-            "name": "OAuth contract client", "tenant_id": str(tenant.id), "trust_user_identity": True,
+        created = await client.post("/api/enterprise/openapi/applications", headers=headers, json={
+            "name": "OAuth contract client", "trust_user_identity": True,
             "scopes": ["employees:read", "auth:login"], "embed_origins": ["http://localhost:64513"],
         })
         assert created.status_code == 201
         application = created.json()
         app_id, secret = application["client_id"], application["client_secret"]
         basic = httpx.BasicAuth(app_id, secret)
-        listing = await client.get("/api/admin/openapi/applications", headers=headers)
+        listing = await client.get("/api/enterprise/openapi/applications", headers=headers)
         assert secret not in listing.text and "secret_hash" not in listing.text
         response = await client.post(base + "/auth/token", json={"grant_type": "client_credentials"}, auth=basic)
         assert response.status_code == 400 and response.json()["error"] == "invalid_request"
@@ -92,7 +92,7 @@ async def test_oauth_and_generic_login_contract():
         assert response.status_code == 401 and response.headers["www-authenticate"] == "Bearer"
         response = await client.post(base + "/digital-employees/search", headers=bearer,
                                      json={"user": {**claim, "phone": identities[0].phone}})
-        assert response.status_code == 409
+        assert response.status_code == 403
         response = await client.post(base + "/digital-employees/search", headers=bearer,
                                      json={"user": {**claim, "asserted_at": int(time.time()) - 90}})
         assert response.status_code == 400
@@ -129,8 +129,8 @@ async def test_oauth_and_generic_login_contract():
         # Signing arbitrary relative destinations is page-independent.
         assert (await link("/settings?tab=profile")).status_code == 200
 
-        second = await client.post("/api/admin/openapi/applications", headers=headers, json={
-            "name": "Independent OAuth client", "tenant_id": str(tenant.id),
+        second = await client.post("/api/enterprise/openapi/applications", headers=headers, json={
+            "name": "Independent OAuth client",
         })
         other_basic = httpx.BasicAuth(second.json()["client_id"], second.json()["client_secret"])
         assert (await client.post(base + "/auth/revoke", auth=other_basic, data={"token": token})).status_code == 200
@@ -172,7 +172,7 @@ async def test_oauth_and_generic_login_contract():
         bearer = {"Authorization": f"Bearer {token}"}
         issued = await link()
         code = parse_qs(urlsplit(issued.json()["login_url"]).query)["code"][0]
-        rotated = await client.post(f"/api/admin/openapi/applications/{app_id}/rotate-secret", headers=headers)
+        rotated = await client.post(f"/api/enterprise/openapi/applications/{app_id}/rotate-secret", headers=headers)
         assert rotated.status_code == 200
         assert (await client.get(base + "/capabilities", headers=bearer)).status_code == 401
         assert (await client.post(base + "/auth/link-exchange", json={"code": code})).status_code == 401

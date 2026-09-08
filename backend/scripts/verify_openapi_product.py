@@ -25,10 +25,10 @@ async def main():
         tenant = Tenant(name="OpenAPI validation", slug=f"openapi-{uuid.uuid4().hex[:8]}")
         db.add(tenant)
         await db.flush()
-        identity = Identity(phone=f"1555{str(int(time.time()))[-7:]}", is_active=True, is_platform_admin=True)
+        identity = Identity(phone=f"1555{str(int(time.time()))[-7:]}", is_active=True)
         db.add(identity)
         await db.flush()
-        user = User(tenant_id=tenant.id, identity_id=identity.id, display_name="OpenAPI administrator", role="platform_admin", is_active=True)
+        user = User(tenant_id=tenant.id, identity_id=identity.id, display_name="OpenAPI administrator", role="org_admin", is_active=True)
         db.add(user)
         await db.flush()
         employee = Agent(tenant_id=tenant.id, creator_id=user.id, name="OpenAPI employee", access_mode="company", role_description="Integration validation")
@@ -37,8 +37,8 @@ async def main():
         fixture = {"tenant_id": str(tenant.id), "user_id": str(user.id), "phone": identity.phone,
                    "employee_id": str(employee.id), "admin_token": create_access_token(str(user.id), user.role)}
     async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", timeout=30) as client:
-        response = await client.post("/api/admin/openapi/applications", headers={"Authorization": f"Bearer {fixture['admin_token']}"}, json={
-            "name": "OpenAPI validation client", "tenant_id": fixture["tenant_id"], "trust_user_identity": True,
+        response = await client.post("/api/enterprise/openapi/applications", headers={"Authorization": f"Bearer {fixture['admin_token']}"}, json={
+            "name": "OpenAPI validation client", "trust_user_identity": True,
             "scopes": ["employees:read", "auth:login"], "embed_origins": ["http://localhost:64513"],
             "redirect_origins": ["http://localhost:64514"],
         })
