@@ -17,4 +17,3 @@ class SceneAutoActivation(BaseModel):
 
     enabled: bool = False
     targets: list[SceneTargetSelection] = Field(default_factory=list, max_length=100)
-
