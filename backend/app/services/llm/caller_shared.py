@@ -283,7 +283,7 @@ def _provider_failure_outcome(
             details=details,
         )
     exhausted = isinstance(error, ProviderRecoveryExhausted)
-    permanently_blocked = error.status_code in {401, 403} or _is_hard_quota_error(error)
+    permanently_blocked = error.status_code in {401, 403} or _is_hard_quota_error(error, model)
     retryable = (
         classify_error(error) == FailoverErrorType.RETRYABLE
         and not exhausted

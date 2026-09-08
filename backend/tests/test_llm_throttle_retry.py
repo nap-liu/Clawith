@@ -555,7 +555,7 @@ async def test_provider_throttle_exhaustion_returns_later_user_message(monkeypat
     assert result.details["retry_count"] == 5
     assert result.details["total_requests"] == 6
     assert result.details["recovery_action"] == "continue"
-    assert "继续" in result
+    assert "/continue" in result
     assert "无需发送 /new" in result
     assert len(client.stream_calls) == 6
     assert [status["retry_index"] for status in statuses] == [1, 2, 3, 4, 5]

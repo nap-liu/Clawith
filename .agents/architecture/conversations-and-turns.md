@@ -51,6 +51,16 @@ billing, or hard-quota failures are not retried. Exhaustion is a typed terminal
 failure that tells the user to wait and send `/continue` in the same Session;
 resetting the conversation is neither required nor recommended.
 
+Quota classification follows the actual provider endpoint, not the model's
+display provider. On DashScope endpoints, `insufficient_quota` and
+`Throttling.AllocationQuota` denote TPS/TPM throttling and enter the same bounded
+429 retry lane, including third-party models hosted there. The generic
+"plan and billing details" message does not prove billing exhaustion. Explicit
+billing/hard-quota evidence and authentication failures remain terminal; other
+providers retain their quota semantics. Retries preserve completed tool results
+and never replay an already executed tool or a request that emitted progress.
+See the provider's [error-code contract](https://help.aliyun.com/zh/model-studio/error-code).
+
 Web and IM `/continue` explicitly reopen only the current Session's last failed
 owner when it has a durable typed LLM failure. The original anchor, instructions,
 attachments, and completed tool results remain intact. The Session lock admits
