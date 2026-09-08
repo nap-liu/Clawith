@@ -4,9 +4,11 @@ from app.services.llm.caller_context import *  # noqa: F401,F403
 from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_streaming import call_llm
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
+from app.services.turn_tool_settings import with_scene_tool_settings
 
 
 @serialize_conversation_execution
+@with_scene_tool_settings
 async def call_llm_with_failover(
     primary_model,
     fallback_model,
@@ -41,6 +43,8 @@ async def call_llm_with_failover(
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
+    include_soul = include_soul and (channel_context or {}).get("scene_include_soul", True)
+    include_memory = include_memory and (channel_context or {}).get("scene_include_memory", True)
 
     # Config-level fallback: if no primary, use fallback directly
     if primary_model is None and fallback_model is not None:

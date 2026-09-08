@@ -98,6 +98,65 @@ Ordinary Web, IM, trigger, and non-project A2A parent Sessions use one durable S
 
 Do not add a second inbox table, a completion-cohort state machine, or channel-specific copies for this behavior. Preserve per-event audit rows, unique projection keys, bounded batch size, execution-identity validation, and the shared LLM turn loop.
 
+### User messages during a running turn
+
+WebChat (PC/H5) and IM use the same durable turn inbox on existing `ChatMessage`
+rows. The WebSocket turn driver accepts ordinary messages while listening for
+stop/disconnect; other sockets use the same admission function. Client message
+IDs deduplicate retries. Admission checks current Session ownership and keeps
+the active anchor's execution identity, model, reasoning, and scene snapshot.
+
+The shared bounded `before_round` drain consumes messages for the same executing Agent at the
+next model iteration. Messages arriving too late are promoted after terminal
+commit through the existing durable resume path. Stop cancels pending inputs;
+socket disconnect alone does not cancel execution. Each new Web user root reloads
+durable history so consumed follow-ups survive subsequent turns and reconnects.
+Hidden onboarding roots retain their initialized context because ordinary history
+intentionally excludes those anchors.
+PC/H5 allow sending during generation while retaining the stop action and the
+current stream. Read-only, confirmation, quota, and attachment checks still
+apply. Gateway-managed OpenClaw turns retain their existing admission behavior.
+This capability is independent of automatic scene selection and adds no table,
+queue service, or separate model loop.
+
+## Automatic scene selection
+
+Scene drafts and published revisions contain optional `auto_activation` settings
+with selected private/group conversation identities. These settings use the
+existing scene JSON and publication lifecycle; there is no separate binding
+table, activation worker, or execution loop. Publication and rollback lock the
+Agent before checking that a conversation has only one enabled automatic scene.
+Omitted settings from older clients and the management tool preserve the current
+selection.
+
+The management picker deduplicates historical Sessions before pagination.
+Platform private targets use tenant, Agent, channel, and user; IM targets also
+include the provider conversation, channel configuration, and installation scope.
+Project conversations use project scope and require an enabled Agent membership and
+the manager's project edit access. Tenant and current target ownership are
+validated on save and publication. Runtime resolves the latest Session for the
+target; an explicitly opened historical Session is never silently redirected.
+Archived IM routes and terminated Sessions cannot activate an automatic scene.
+
+Web, IM, and project-member dispatch share the same scene resolver. Explicit
+scene selection takes precedence; `/scene off` suppresses automatic selection
+for that Session, while a new Session inherits the target's published setting.
+Automatic activation emits no welcome, confirmation, or extra LLM invocation;
+this also suppresses the Agent's default welcome fallback on empty Sessions.
+Provider reply/@ policy stays with the existing channel adapter. Incoming turn
+anchors store the existing scene key/revision snapshot; same-turn IM messages
+retain the active anchor's scene snapshot. Recovery reads that revision.
+Browser manifests expose menus through the existing least-privilege projection
+and exclude automatic-selection targets and system prompts. H5's implicit
+default landing remains a fallback after automatic selection; an explicit scene
+URL retains precedence. WebChat in-turn admission is a separate capability.
+
+Private platform Session creation, default selection and primary deletion share
+one transaction-scoped advisory lock keyed by Agent, user and channel. Acquire
+it before selecting or creating the newest primary; release the transaction
+before model or provider waits. Concurrent admission must neither create two
+primaries nor return a unique-constraint failure.
+
 ## Sessions and identities
 
 - P2P: the counterpart is stable for the session, so identity is session-scoped.

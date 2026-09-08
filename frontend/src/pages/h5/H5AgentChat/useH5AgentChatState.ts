@@ -65,7 +65,7 @@ export function useH5AgentChatState() {
     const oauthState = useMemo(() => new URLSearchParams(searchString).get('state'), [searchString]);
     const themeMode = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
     const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
-    const sceneKey = useMemo(() => new URLSearchParams(searchString).get('scene') || 'default', [searchString]);
+    const sceneKey = useMemo(() => new URLSearchParams(searchString).get('scene') || '', [searchString]);
     const [resolvedTheme, setResolvedTheme] = useState(() => resolveThemeMode(themeMode));
     const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime | 'detecting'>('detecting');
 

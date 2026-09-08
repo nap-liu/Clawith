@@ -443,6 +443,14 @@ roles. Do not use a second concurrent recovery implementation or rewrite audit
 history to make old code accept it. Drill both just-admitted and tool-tail
 continuations against the old image before release.
 
+For scene runtime settings, update only the four new `manage_scene` schema
+properties with the candidate's `python -m app.scripts.scene_runtime_schema apply`.
+Before returning to a binary without those fields, use its `rollback` action;
+`status` verifies the result. The helper preserves other schemas, assignments
+and scene revisions. Old binaries do not implement scene memory/tool overrides
+or automatic activation; rollback restores the old product behavior, not those
+new capabilities. Keep durable configuration and conversation data intact.
+
 For Agent self-service settings, use the same exact-tool cleanup contract:
 
 ```bash

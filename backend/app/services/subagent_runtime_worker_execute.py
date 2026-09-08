@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.services.subagent_runtime_shared import *  # noqa: F401,F403
 from app.services.subagent_runtime_tools import prepare_subagent_tools
+from app.services.turn_tool_settings import restore_turn_tool_settings
 from app.services.subagent_runtime_worker_claim import _claim_subagent
 from app.services.subagent_runtime_worker_resume import _finish_subagent_turn
 
@@ -243,11 +244,12 @@ async def execute_claimed_subagent(
                             )
                         )
 
-            tools = await prepare_subagent_tools(
-                child_agent_id,
-                child_session_id,
-                execution_user_id=execution_user_id,
-            )
+            async with restore_turn_tool_settings(child_agent_id, child_session_id, anchor_id):
+                tools = await prepare_subagent_tools(
+                    child_agent_id,
+                    child_session_id,
+                    execution_user_id=execution_user_id,
+                )
             thinking_parts: list[str] = []
 
             async def _capture_thinking(

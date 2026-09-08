@@ -436,6 +436,7 @@ async def ingest_incoming_chat_message(
     user_id: uuid.UUID,
     content: str,
     source_channel: str,
+    allow_turn_inbox: bool = True,
     provider_event_id: str | None = None,
     channel_config_id: uuid.UUID | str | None = None,
     actor_ref: str | None = None,
@@ -561,25 +562,13 @@ async def ingest_incoming_chat_message(
     # to order inbound events.  A /scene command racing with an older in-flight
     # turn can therefore affect only messages ingested after the command wins
     # this lock.  Explicit Web/H5 scene metadata remains authoritative.
-    if not meta.get("scene_key"):
-        from app.services.scene_service import (
-            SCENE_SESSION_CONFIG_KEY,
-            SCENE_STATUS_OK,
-            resolve_scene_for_activation,
-            scene_message_meta,
-        )
+    if not meta.get("scene_resolved") and not meta.get("scene_key"):
+        from app.services.scene_activation import resolve_session_scene
+        from app.services.scene_service import scene_message_meta
 
-        active_scene_key = str(
-            (locked_session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) or ""
-        )
-        if active_scene_key:
-            resolved_scene = await resolve_scene_for_activation(
-                db,
-                agent_id,
-                active_scene_key,
-            )
-            if resolved_scene.status == SCENE_STATUS_OK:
-                meta.update(scene_message_meta(resolved_scene.manifest))
+        manifest = await resolve_session_scene(db, agent_id, locked_session)
+        meta.update(scene_message_meta(manifest))
+        meta["scene_resolved"] = True
     if not meta.get("model_id"):
         from app.services.chat_model_selection import MODEL_SESSION_CONFIG_KEY
 
@@ -647,7 +636,7 @@ async def ingest_incoming_chat_message(
     queued_to_running_turn = False
     from app.services.turn_inbox import is_turn_inbox_channel
 
-    if not matched.consumed and is_turn_inbox_channel(source_channel):
+    if allow_turn_inbox and not matched.consumed and is_turn_inbox_channel(source_channel):
         from app.services.conversation_turn_lifecycle import (
             ACTIVE_TURN_STATUS,
             conversation_turn_snapshot_for_session,
@@ -663,6 +652,18 @@ async def ingest_incoming_chat_message(
                 (active_anchor.message_meta or {}).get("execution_agent_id")
                 or active_anchor.agent_id
             ) == str((row.message_meta or {}).get("execution_agent_id") or row.agent_id)
+            active_meta = (
+                dict(active_anchor.message_meta or {})
+                if active_anchor is not None
+                else {}
+            )
+            if same_employee:
+                incoming_meta = dict(row.message_meta or {})
+                for key in ("scene_key", "scene_revision", "activation_source", "model_id", "reasoning_effort"):
+                    incoming_meta.pop(key, None)
+                    if key in active_meta:
+                        incoming_meta[key] = active_meta[key]
+                row.message_meta = incoming_meta
             row.message_meta = {
                 **dict(row.message_meta or {}),
                 "turn_inbox_state": "pending",

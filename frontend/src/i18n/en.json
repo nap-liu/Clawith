@@ -5233,5 +5233,39 @@
     "scopeWrite": "Write",
     "scopeHint": "Read: view and chat with digital employees. Write: also create and configure digital employees.",
     "colScope": "Scope"
+  },
+  "sceneAuto": {
+    "title": "Automatic activation",
+    "description": "Use this scene by default in selected private or group chats. Publishing applies it silently.",
+    "select": "Select private or group chats",
+    "selected": "{{count}} selected",
+    "search": "Search conversations",
+    "empty": "No available conversations",
+    "loading": "Loading…",
+    "loadMore": "Load more",
+    "clear": "Clear",
+    "retry": "Retry",
+    "loadError": "Unable to load conversations",
+    "private": "Private chat",
+    "group": "Group chat",
+    "unnamed": "Unnamed conversation",
+    "selectRequired": "Select at least one private or group chat.",
+    "targetUnavailable": "A selected conversation is unavailable. Select it again.",
+    "duplicateTarget": "A conversation can only be selected once.",
+    "targetConflict": "A selected conversation already uses another published scene. Remove that assignment first."
+  },
+  "sceneRuntime": {
+    "title": "Memory and tools",
+    "memory": "Load memory",
+    "memoryDescription": "Automatically load core and daily memory. Turning this off keeps existing memory.",
+    "tools": "Tool configuration",
+    "inherit": "Follow digital employee",
+    "custom": "Custom tool configuration",
+    "loadError": "Failed to load tool configuration",
+    "toolUnavailable": "A selected tool is unavailable. Refresh the tool list.",
+    "serverUnavailable": "A selected MCP service is unavailable.",
+    "invalidSecret": "Invalid credential configuration. Enter it again.",
+    "toolDisabled": "This tool is not enabled in the current scene.",
+    "soul": "Load Soul"
   }
 }

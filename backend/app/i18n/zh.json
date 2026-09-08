@@ -13,5 +13,19 @@
   "commands.continue.accepted": "正在继续上一轮任务。",
   "commands.continue.busy": "当前会话已有正在执行或等待确认的任务。",
   "commands.continue.unavailable": "当前会话没有可继续的 LLM 调用失败任务。",
-  "commands.continue.help": "/continue：继续上一轮因模型调用失败而终止的任务"
+  "commands.continue.help": "/continue：继续上一轮因模型调用失败而终止的任务",
+  "chat.confirmationRequired": "请先完成待确认操作。",
+  "chat.messageRejected": "消息未能接收，请重试。",
+  "sceneRuntime.title": "记忆与工具",
+  "sceneRuntime.memory": "加载记忆",
+  "sceneRuntime.memoryDescription": "自动加载核心记忆和每日记忆。关闭后保留已有记忆。",
+  "sceneRuntime.tools": "工具配置",
+  "sceneRuntime.inherit": "跟随数字员工",
+  "sceneRuntime.custom": "自定义工具配置",
+  "sceneRuntime.loadError": "工具配置加载失败",
+  "sceneRuntime.toolUnavailable": "所选工具不可用，请刷新工具列表。",
+  "sceneRuntime.serverUnavailable": "所选 MCP 服务不可用。",
+  "sceneRuntime.invalidSecret": "凭据配置无效，请重新填写。",
+  "sceneRuntime.toolDisabled": "当前场景未启用此工具。",
+  "sceneRuntime.soul": "加载 Soul"
 }

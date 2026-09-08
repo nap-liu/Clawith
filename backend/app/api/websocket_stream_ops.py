@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.api.websocket_inbox_ops import receive_followup, receive_turn_message
+
 
 async def run_llm_and_stream_impl(
     api,
@@ -448,9 +450,10 @@ async def run_llm_and_stream_impl(
         try:
             assistant_response, _turn_outcome = await api._await_turn_with_abort(
                 llm_task,
-                self.websocket.receive_json,
+                lambda: receive_turn_message(self.websocket),
                 partial_chunks,
                 on_abort=_stop_web_turn_tree,
+                on_message=lambda data: receive_followup(api, self, data),
             )
         finally:
             api.set_active_turn_cancel_task(None)

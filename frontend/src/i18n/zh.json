@@ -5284,5 +5284,39 @@
     "agentLoadIncomplete": "数字员工列表未加载完整。",
     "resultsIncomplete": "搜索结果可能不完整",
     "retry": "重试"
+  },
+  "sceneAuto": {
+    "title": "自动启用",
+    "description": "为指定私聊或群聊默认启用此场景，发布后静默生效。",
+    "select": "选择私聊或群聊",
+    "selected": "已选 {{count}} 项",
+    "search": "搜索会话名称",
+    "empty": "没有可选会话",
+    "loading": "加载中…",
+    "loadMore": "加载更多",
+    "clear": "清空",
+    "retry": "重试",
+    "loadError": "会话加载失败",
+    "private": "私聊",
+    "group": "群聊",
+    "unnamed": "未命名会话",
+    "selectRequired": "请选择至少一个私聊或群聊。",
+    "targetUnavailable": "所选会话已不可用，请重新选择。",
+    "duplicateTarget": "不能重复选择同一会话。",
+    "targetConflict": "所选会话已在其他已发布场景中启用，请先解除原配置。"
+  },
+  "sceneRuntime": {
+    "title": "记忆与工具",
+    "memory": "加载记忆",
+    "memoryDescription": "自动加载核心记忆和每日记忆。关闭后保留已有记忆。",
+    "tools": "工具配置",
+    "inherit": "跟随数字员工",
+    "custom": "自定义工具配置",
+    "loadError": "工具配置加载失败",
+    "toolUnavailable": "所选工具不可用，请刷新工具列表。",
+    "serverUnavailable": "所选 MCP 服务不可用。",
+    "invalidSecret": "凭据配置无效，请重新填写。",
+    "toolDisabled": "当前场景未启用此工具。",
+    "soul": "加载 Soul"
   }
 }

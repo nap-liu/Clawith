@@ -360,6 +360,7 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
         session_id = session.id
 
     handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
+    handler.agent_type = "native"
     handler.agent_id = agent_id
     handler.user_id = user_id
     handler.conv_id = str(session_id)

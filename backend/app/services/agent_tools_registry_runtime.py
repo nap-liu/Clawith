@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from types import SimpleNamespace
 import uuid
 
@@ -11,6 +10,8 @@ from app.core.okr_feature import OKR_TOOL_NAMES, is_retired_okr_tool, okr_featur
 from app.database import async_session
 from app.services.agent_tools_catalog import AGENT_TOOLS
 from app.services.agent_tools_config_runtime import _get_tool_config
+from app.services.turn_tool_settings import current_tool_settings
+from app.services.tool_enablement import tool_visibility_clause
 from app.services.mcp_naming import load_mcp_display_names, model_mcp_description
 
 _ALWAYS_INCLUDE_CORE = {
@@ -268,6 +269,9 @@ async def _get_agent_tools_for_llm_impl(
     get_tool_config,
     assignment_snapshot: list[dict] | None = None,
 ) -> list[dict]:
+    scope = current_tool_settings(agent_id)
+    if assignment_snapshot is None and scope is not None:
+        assignment_snapshot = scope.assignments
     has_feishu = await _agent_has_feishu(agent_id)
     has_any_channel = await _agent_has_any_channel(agent_id)
     always_core_tools, feishu_tools, channel_tools = _build_always_tool_subsets(agent_tools)
@@ -310,15 +314,10 @@ async def _get_agent_tools_for_llm_impl(
                 }
             assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
 
-            visible_clauses = [Tool.source == "builtin"]
-            if agent_tenant_id:
-                visible_clauses.append((Tool.source == "admin") & ((Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))))
-            else:
-                visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
-            if assigned_tool_ids:
-                visible_clauses.append(Tool.id.in_(assigned_tool_ids))
-
-            tool_clauses = [or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)), or_(*visible_clauses)]
+            tool_clauses = [
+                or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)),
+                tool_visibility_clause(agent_tenant_id, assigned_tool_ids),
+            ]
             if not okr_feature_enabled():
                 tool_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))
             tool_clauses.append(Tool.name.not_in(PLAZA_TOOL_NAMES))
@@ -422,7 +421,7 @@ async def _get_agent_tools_for_llm_impl(
                 always_added = []
                 for t in _always_tools:
                     fn_name = t["function"]["name"]
-                    if fn_name not in db_tool_names and fn_name not in explicitly_disabled_names:
+                    if (assignment_snapshot is None or tool_is_required(fn_name)) and fn_name not in db_tool_names and fn_name not in explicitly_disabled_names:
                         result.append(t)
                         always_added.append(fn_name)
                 if always_added:
@@ -447,6 +446,8 @@ async def _get_agent_tools_for_llm_impl(
     except Exception as e:
         logger.error(f"[Tools] DB load failed, using fallback: {e}")
 
+    if assignment_snapshot is not None:
+        return _stabilize_media_tool_definitions_impl([], agent_tools)
     fallback = _patch_computer_tool_descriptions(_always_tools, computer_os_type)
     if not _a2a_async:
         fallback = _strip_a2a_msg_type(fallback)
@@ -549,22 +550,10 @@ async def get_agent_tools_for_llm(
                 }
             assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
 
-            visible_clauses = [Tool.source == "builtin"]
-            # Platform-level admin tools (tenant_id IS NULL) are visible to all tenants;
-            # tenant-scoped admin tools only to their own tenant.
-            if agent_tenant_id:
-                visible_clauses.append(
-                    (Tool.source == "admin") & ((Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None)))
-                )
-            else:
-                visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
-            if assigned_tool_ids:
-                visible_clauses.append(Tool.id.in_(assigned_tool_ids))
-
             # Get all tools visible within this agent's tenant boundary.
             tool_clauses = [
                 or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)),
-                or_(*visible_clauses),
+                tool_visibility_clause(agent_tenant_id, assigned_tool_ids),
             ]
             if not okr_feature_enabled():
                 tool_clauses.append(Tool.name.not_in(OKR_TOOL_NAMES))

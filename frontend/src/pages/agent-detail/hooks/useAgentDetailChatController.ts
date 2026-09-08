@@ -90,6 +90,7 @@ export function useAgentDetailChatController({
 
     const resumeComposer = useAgentDetailResumeComposer({
         id,
+        agent,
         activeTab,
         token: chat.token,
         effectiveChatModelId: resources.effectiveChatModelId,

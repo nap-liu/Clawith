@@ -13,5 +13,19 @@
   "commands.continue.accepted": "Continuing the previous task.",
   "commands.continue.busy": "This conversation already has a running task or a task awaiting confirmation.",
   "commands.continue.unavailable": "There is no task stopped by an LLM failure to continue in this conversation.",
-  "commands.continue.help": "/continue: resume the previous task stopped by a model call failure"
+  "commands.continue.help": "/continue: resume the previous task stopped by a model call failure",
+  "chat.confirmationRequired": "Complete the pending confirmation first.",
+  "chat.messageRejected": "The message could not be accepted. Please retry.",
+  "sceneRuntime.title": "Memory and tools",
+  "sceneRuntime.memory": "Load memory",
+  "sceneRuntime.memoryDescription": "Automatically load core and daily memory. Turning this off keeps existing memory.",
+  "sceneRuntime.tools": "Tool configuration",
+  "sceneRuntime.inherit": "Follow digital employee",
+  "sceneRuntime.custom": "Custom tool configuration",
+  "sceneRuntime.loadError": "Failed to load tool configuration",
+  "sceneRuntime.toolUnavailable": "A selected tool is unavailable. Refresh the tool list.",
+  "sceneRuntime.serverUnavailable": "A selected MCP service is unavailable.",
+  "sceneRuntime.invalidSecret": "Invalid credential configuration. Enter it again.",
+  "sceneRuntime.toolDisabled": "This tool is not enabled in the current scene.",
+  "sceneRuntime.soul": "Load Soul"
 }

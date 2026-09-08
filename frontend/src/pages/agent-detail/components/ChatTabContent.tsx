@@ -562,11 +562,11 @@ export default function ChatTabContent(props: Props) {
                                         </div>
                                     )}
                                     <div className="chat-composer-input-block">
-                                        <textarea ref={chatInputRef} className="chat-input" disabled={showNoModelState || confirmationPending} value={chatInput} onChange={(e) => { setChatInput(e.target.value); const el = e.target; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; }} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming && !isStopping) { e.preventDefault(); sendChatMsg(); } }} onPaste={handlePaste} placeholder={confirmationPending ? '请先完成上方确认' : showNoModelState ? t('agent.chat.noModelPlaceholder', 'Configure a company model to start chatting') : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder'))} rows={1} />
+                                        <textarea ref={chatInputRef} className="chat-input" disabled={showNoModelState || confirmationPending} value={chatInput} onChange={(e) => { setChatInput(e.target.value); const el = e.target; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; }} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isStopping) { e.preventDefault(); sendChatMsg(); } }} onPaste={handlePaste} placeholder={confirmationPending ? '请先完成上方确认' : showNoModelState ? t('agent.chat.noModelPlaceholder', 'Configure a company model to start chatting') : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder'))} rows={1} />
                                     </div>
                                     <div className="chat-composer-toolbar">
                                         <input type="file" multiple ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
-                                        <button type="button" className="chat-composer-btn" onClick={() => fileInputRef.current?.click()} disabled={showNoModelState || confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10} title={t('agent.workspace.uploadFile')}><IconPaperclip size={16} stroke={1.75} /></button>
+                                        <button type="button" className="chat-composer-btn" onClick={() => fileInputRef.current?.click()} disabled={showNoModelState || confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isStopping || attachedFiles.length >= 10} title={t('agent.workspace.uploadFile')}><IconPaperclip size={16} stroke={1.75} /></button>
                                         <ModelSwitcher value={overrideModelId} onChange={handleModelChange} tenantDefaultId={myTenant?.default_model_id || null} disabled={showNoModelState || !wsConnected} />
                                         <ReasoningEffortSelect
                                             value={reasoningEffortOverride as ReasoningEffortValue}
@@ -600,8 +600,9 @@ export default function ChatTabContent(props: Props) {
                                             >
                                                 <span className="stop-icon" />
                                             </button>
-                                        ) : (
-                                            <button type="button" className="btn btn-primary chat-composer-send" onClick={sendChatMsg} disabled={showNoModelState || confirmationPending || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)} title={t('chat.send')}><IconSend size={16} stroke={1.75} /></button>
+                                        ) : null}
+                                        {(!agent || agent.agent_type !== "openclaw" || (!isWaiting && !isStreaming)) && (
+                                            <button type="button" className="btn btn-primary chat-composer-send" onClick={sendChatMsg} disabled={showNoModelState || confirmationPending || isStopping || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)} title={t('chat.send')}><IconSend size={16} stroke={1.75} /></button>
                                         )}
                                     </div>
                                 </div>

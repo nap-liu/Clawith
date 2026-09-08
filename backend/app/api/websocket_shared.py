@@ -159,6 +159,7 @@ async def await_turn_with_abort_impl(
     partial_chunks: list[str],
     *,
     on_abort=None,
+    on_message=None,
 ):
     """Drive a running web turn while listening for abort / disconnect on the socket."""
     aborted = False
@@ -178,6 +179,8 @@ async def await_turn_with_abort_impl(
                     llm_task.cancel()
                 aborted = True
                 break
+            elif isinstance(msg, dict) and on_message is not None:
+                await on_message(msg)
         except asyncio.TimeoutError:
             continue
         except WebSocketDisconnect:

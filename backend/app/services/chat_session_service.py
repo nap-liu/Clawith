@@ -5,12 +5,20 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.services.session_identity import require_same_tenant_session_user
+
+
+async def lock_platform_sessions(db, agent_id, user_id, source_channel):
+    """Serialize primary selection for one private conversation until commit."""
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"platform-primary:{agent_id}:{user_id}:{source_channel}"},
+    )
 
 
 async def get_latest_platform_session(
@@ -74,6 +82,7 @@ async def ensure_primary_platform_session(
     """
 
     await require_same_tenant_session_user(db, agent_id, user_id)
+    await lock_platform_sessions(db, agent_id, user_id, source_channel)
     latest = await get_latest_platform_session(
         db,
         agent_id,

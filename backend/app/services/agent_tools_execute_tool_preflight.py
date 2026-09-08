@@ -24,6 +24,9 @@ from app.services.agent_tools import (
 )
 from app.services.im_delivery import DELIVERY_LEASE, IMDeliveryResult, register_delivery
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
+from app.services.turn_tool_settings import current_tool_settings
+from app.services.tool_enablement import tool_is_required
+from app.services.llm.failure_outcome import render_message
 from app.services.user_project_tools import (
     USER_PROJECT_TOOL_NAMES,
     execute_user_project_tool,
@@ -103,6 +106,12 @@ async def execute_tool_preflight(
         .replace("\ufeff", "")
         .strip()
     )
+    scope = current_tool_settings(agent_id)
+    from app.services.project_runtime_tool_catalog import PROJECT_RUNTIME_TOOL_NAMES
+
+    # Project protocol tools have their own validated member/role scope below.
+    if scope is not None and tool_name not in scope.enabled_names and not tool_is_required(tool_name) and tool_name not in PROJECT_RUNTIME_TOOL_NAMES:
+        return render_message("sceneRuntime.toolDisabled")
     # Normalize only the legacy Agent-UUID sentinel at the shared tool boundary.
     # A genuine ``None`` remains anonymous/autonomous; durable background entry
     # points resolve a missing resource execution user to its creator earlier.
@@ -282,7 +291,6 @@ async def execute_tool_preflight(
         PROJECT_RUNTIME_TOOL_NAMES,
         execute_project_workspace_tool,
         execute_project_runtime_tool,
-        finalize_project_sandbox_changes,
         resolve_project_sandbox_scope,
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.services.subagent_runtime_shared import *  # noqa: F401,F403
+from app.services.turn_tool_settings import current_tool_settings, effective_assignment
 
 async def cancel_local_subagent_tasks(
     run_ids: list[uuid.UUID],
@@ -122,7 +123,10 @@ async def prepare_subagent_tools(
                 execution_user_id=execution_user_id,
             )
             runtime_config = dict(scoped_child.im_config or {})
-            if runtime_config.get("project_run_frozen"):
+            scene_scope = current_tool_settings(agent_id)
+            if scene_scope is not None:
+                tools = await get_agent_tools_for_llm(agent_id)
+            elif runtime_config.get("project_run_frozen"):
                 assignment_snapshot = [
                     item
                     for item in runtime_config.get("capability_snapshot", [])
@@ -232,7 +236,7 @@ async def prepare_subagent_tools(
     parent_tool = row[0] if row else None
     if parent_tool is None:
         raise RuntimeError("send_message_to_parent builtin tool is not seeded")
-    assignment = row[1]
+    assignment = effective_assignment(agent_id, parent_tool, row[1])
     if not parent_tool.enabled or not resolved_agent_tool_enabled(
         parent_tool.name,
         assignment,

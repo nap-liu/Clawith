@@ -92,6 +92,7 @@ async def test_initial_assistant_message_has_stable_session_identity():
     handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
     handler.conv_id = session_id
     handler.pending_initial_assistant = {"content": "欢迎使用报修服务"}
+    handler.scene_manifest = None
     handler.welcome_message = ""
     handler.history_messages = []
     handler.onboarding_required = False

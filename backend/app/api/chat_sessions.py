@@ -38,6 +38,7 @@ from app.services.chat_message_serializer import (
 from app.services.chat_session_service import (
     get_latest_platform_session,
     promote_platform_session,
+    lock_platform_sessions,
 )
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
@@ -585,6 +586,7 @@ async def create_session(
     agent, _ = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     source_channel = validate_platform_login_channel(body.source_channel)
+    await lock_platform_sessions(db, agent_id, current_user.id, source_channel)
 
     now = datetime.now(tz.utc)
     new_id = uuid.uuid4()
@@ -691,6 +693,9 @@ async def delete_session(
             detail="Sessions with Subagent audit records cannot be deleted.",
         )
 
+    if session.user_id is not None and not session.is_group:
+        await lock_platform_sessions(db, session.agent_id, session.user_id, session.source_channel)
+        await db.refresh(session)
     was_primary = bool(session.is_primary)
     owner_user_id = session.user_id
     owner_agent_id = session.agent_id

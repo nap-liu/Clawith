@@ -34,8 +34,10 @@ def test_admin_tools_are_visible_only_to_same_tenant():
 def test_agent_installed_tools_require_explicit_assignment():
     tenant_id = uuid.uuid4()
     tool_id = uuid.uuid4()
-    installed_tool = make_tool(source="agent", id=tool_id, tenant_id=uuid.uuid4())
+    installed_tool = make_tool(source="agent", id=tool_id, tenant_id=tenant_id)
 
     assert _tool_record_visible_to_agent(installed_tool, tenant_id, {}) is False
     assert _tool_record_visible_to_agent(installed_tool, tenant_id, {str(tool_id): object()}) is True
 
+    foreign_tool = make_tool(source="agent", id=tool_id, tenant_id=uuid.uuid4())
+    assert _tool_record_visible_to_agent(foreign_tool, tenant_id, {str(tool_id): object()}) is False

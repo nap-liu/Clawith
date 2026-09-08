@@ -15,6 +15,9 @@ CHANNEL_RECEIPT_CLEANUP_DIAGNOSTIC_RING_SIZE = 8
 CHANNEL_RECEIPT_STARTUP_MAX_BATCHES = 512
 TURN_INBOX_CHANNELS = frozenset(
     {
+        "web",
+        "miniprogram",
+        "wechat_miniprogram",
         "agent",
         "dingtalk",
         "feishu",

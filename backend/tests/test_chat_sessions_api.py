@@ -664,7 +664,7 @@ async def test_create_session_returns_web_session_shape(monkeypatch):
     agent_id = uuid.uuid4()
 
     current_user = SimpleNamespace(id=user_id, role="member")
-    db = RecordingDB()
+    db = RecordingDB(responses=[DummyResult()])
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return SimpleNamespace(id=agent_id), "use"

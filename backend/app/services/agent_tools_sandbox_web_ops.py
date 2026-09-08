@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from app.database import async_session
 from app.models.agent import Agent as AgentModel
 from app.services.agent_tools_config_runtime import _get_tool_config
-from app.services.tool_enablement import agent_tool_enabled
+from app.services.tool_enablement import agent_tool_enabled, tool_visibility_clause
+from app.services.turn_tool_settings import effective_assignment, current_tool_settings
 
 _STDOUT_RPA_LIMIT = 20000
 
@@ -166,17 +167,10 @@ async def build_cli_injection(
                 assignments = {str(at.tool_id): at for at in at_r.scalars().all()}
                 assigned_tool_ids = [uuid.UUID(tid) for tid in assignments]
 
-            visible_clauses = [Tool.source == "builtin"]
-            if agent_tenant_id:
-                visible_clauses.append(
-                    (Tool.source == "admin") & ((Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None)))
-                )
-            else:
-                visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
-            if assigned_tool_ids:
-                visible_clauses.append((Tool.source == "agent") & Tool.id.in_(assigned_tool_ids))
-
-            cli_q = select(Tool).where(Tool.type == "cli", Tool.enabled == True, or_(*visible_clauses))  # noqa: E712
+            cli_q = select(Tool).where(
+                Tool.type == "cli", Tool.enabled.is_(True),
+                tool_visibility_clause(agent_tenant_id, assigned_tool_ids),
+            )
             if only_tool_names:
                 cli_q = cli_q.where(Tool.name.in_(only_tool_names))
             tools_r = await db.execute(cli_q)
@@ -203,18 +197,19 @@ async def build_cli_injection(
             if tool.name == "toolscall":
                 logger.warning("[CLI Inject] skip reserved platform command: toolscall")
                 continue
-            at = assignments.get(str(tool.id))
+            at = effective_assignment(agent_id, tool, assignments.get(str(tool.id)))
             if not agent_tool_enabled(at):
                 continue
             # Skip tools whose name isn't a safe PATH/function name, or whose env
             # keys aren't strict shell identifiers (env keys → `export KEY=`, so
             # they stay dash-free; the tool name may carry a dash, e.g. my-cli).
+            scope = current_tool_settings(agent_id)
+            cfg = CliToolConfig.model_validate(scope.configs.get(tool.name, {}) if scope else tool.config or {})
             if not _TOOL_NAME_RE.fullmatch(tool.name) or any(
-                not _FUNC_NAME_RE.fullmatch(k) for k in (CliToolConfig.model_validate(tool.config or {}).env or {})
+                not _FUNC_NAME_RE.fullmatch(k) for k in cfg.env
             ):
                 logger.warning(f"[CLI Inject] skip tool {tool.name}: unsafe name or env key")
                 continue
-            cfg = CliToolConfig.model_validate(tool.config or {})
             if not cfg.binary.sha256:
                 continue  # no binary uploaded yet
             tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"

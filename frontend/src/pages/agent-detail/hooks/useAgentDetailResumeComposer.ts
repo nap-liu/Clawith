@@ -21,6 +21,7 @@ import { normalizeChatTimelineMessages } from '../../../features/conversation/co
 
 export function useAgentDetailResumeComposer({
     id,
+    agent,
     activeTab,
     token,
     effectiveChatModelId,
@@ -211,10 +212,10 @@ export function useAgentDetailResumeComposer({
 
     const dispatchChatMessage = (socket: WebSocket, runtimeKey: string, payload: any) => {
         helpers.pendingPcRouteRecoveryRuntimeKeys.delete(runtimeKey);
-        setIsWaiting(true);
-        setIsStreaming(false);
-        setIsStopping(false);
-        setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false, isStopping: false });
+        if (!isWaiting && !isStreaming) {
+            setIsWaiting(true);
+            setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false, isStopping: false });
+        }
         setChatMessages((prev: any[]) => [...prev, parseChatMsgRef.current({
             msg: {
                 id: payload.messageId,
@@ -581,7 +582,8 @@ export function useAgentDetailResumeComposer({
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
         if (showNoModelState) return;
-        if (isWaiting || isStreaming || isStopping || confirmationPending) return;
+        if (isStopping || confirmationPending) return;
+        if (agent?.agent_type === "openclaw" && (isWaiting || isStreaming)) return;
         const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         const activeSocket = wsMapRef.current[activeRuntimeKey];
         if (!chatInput.trim() && attachedFiles.length === 0) return;
@@ -676,7 +678,7 @@ export function useAgentDetailResumeComposer({
         await runUpload(filesToUpload, `paste-${Date.now()}`);
     };
     const handleDroppedChatFiles = useCallback(async (files: File[]) => {
-        if (confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10) return;
+        if (confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isStopping || attachedFiles.length >= 10) return;
         const availableSlots = Math.max(0, 10 - attachedFiles.length);
         const filesToProcess = files.slice(0, availableSlots);
         for (const file of filesToProcess) {
@@ -699,7 +701,7 @@ export function useAgentDetailResumeComposer({
     }, [attachedFiles.length, chatUploadDrafts.length, confirmationPending, id, isStopping, isStreaming, isWaiting, setAttachedFiles, setChatUploadDrafts, t, toast, wsConnected]);
     const { isDragging: isChatDragging, dropZoneProps: chatDropProps } = useDropZone({
         onDrop: handleDroppedChatFiles,
-        disabled: confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
+        disabled: confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isStopping || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
     });
 
     return {

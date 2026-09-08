@@ -6,11 +6,14 @@ from pathlib import Path
 from sqlalchemy import select
 
 from app.database import async_session
-from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields
+from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields, _get_tool_config
+from app.services.turn_tool_settings import current_tool_settings
 
 
 async def _get_email_config(agent_id: uuid.UUID) -> dict:
     """Retrieve per-agent email config from the send_email tool's AgentTool config."""
+    if current_tool_settings(agent_id) is not None:
+        return await _get_tool_config(agent_id, "send_email") or {}
     from app.models.tool import Tool, AgentTool
 
     async with async_session() as db:

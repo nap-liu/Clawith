@@ -10,6 +10,7 @@ from app.database import async_session
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields
 from app.services.agent_tools_file_support import _agent_workspace_root
+from app.services.turn_tool_settings import effective_assignment
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
@@ -92,10 +93,10 @@ async def _execute_mcp_tool(
                     select(AgentTool).where(
                         AgentTool.agent_id == agent_id,
                         AgentTool.tool_id == tool.id,
-                        AgentTool.enabled == True,
                     )
                 )
             ).scalar_one_or_none()
+            live_assignment = effective_assignment(agent_id, tool, live_assignment)
             if live_assignment is None:
                 return f"❌ MCP tool {tool_name}: no longer installed or enabled for this agent"
             runtime_workspace = current_agent_runtime_workspace(agent_id)
@@ -147,6 +148,9 @@ async def _execute_mcp_tool(
                     user_id,
                     session_id=session_id,
                 )
+                # Configuration and identity are resolved; provider waits must
+                # not keep this read transaction open.
+                await db.commit()
 
                 # stdio branch: route through aio-sandbox hub instead of HTTP.
                 if cfg.transport == "stdio":
@@ -293,18 +297,8 @@ async def _execute_mcp_tool(
                 )
                 return await client.call_tool(mcp_name, arguments)
 
-            # LEGACY PATH (mcp_server_id is NULL): unchanged behavior.
-            # Load per-agent config override
-            agent_config = {}
-            if tool and agent_id:
-                at_r = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
-                    )
-                )
-                at = at_r.scalar_one_or_none()
-                agent_config = effective_assignment_config
+            # Legacy MCP uses the same effective assignment as server-backed MCP.
+            agent_config = effective_assignment_config
 
         if not tool.mcp_server_url:
             logger.error(f"[MCP] Tool {tool_name} has no server URL configured")

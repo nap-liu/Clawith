@@ -539,6 +539,7 @@ async def handle_channel_command(
 
     if parsed_cmd == "/scene":
         from app.schemas.scene import validate_scene_key
+        from app.services.scene_activation import resolve_session_scene
         from app.services.channel_session import find_or_create_channel_session
         from app.services.scene_service import (
             SCENE_SESSION_CONFIG_KEY,
@@ -566,7 +567,9 @@ async def handle_channel_command(
         )
 
         if arg == "status":
-            active_key = str((session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) or "") if session else ""
+            active = await resolve_session_scene(db, agent_id, session)
+            recorded_key = (session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) if session else None
+            active_key = str(recorded_key or (active or {}).get("scene_key") or "")
             if not active_key:
                 return {"action": "scene_status", "message": "当前会话未激活场景。"}
             resolved = await resolve_scene_for_activation(db, agent_id, active_key)
@@ -582,13 +585,18 @@ async def handle_channel_command(
             }
 
         if arg == "off":
-            active_key = str((session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) or "") if session else ""
-            if not active_key:
+            active = await resolve_session_scene(db, agent_id, session)
+            recorded_key = (session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) if session else None
+            active_key = str(recorded_key or (active or {}).get("scene_key") or "")
+            if session is None:
                 return {"action": "scene_off", "message": "当前会话未激活场景。"}
             config = dict(session.im_config or {})
             config.pop(SCENE_SESSION_CONFIG_KEY, None)
+            config["scene_disabled"] = True
             session.im_config = config
             await db.flush()
+            if not active_key:
+                return {"action": "scene_off", "message": "当前会话未激活场景。"}
             return {
                 "action": "scene_off",
                 "message": f"✅ 已退出场景 {active_key}，从下一条消息起恢复默认对话模式。",
@@ -638,6 +646,7 @@ async def handle_channel_command(
 
         config = dict(session.im_config or {})
         config[SCENE_SESSION_CONFIG_KEY] = scene_key
+        config.pop("scene_disabled", None)
         session.im_config = config
         await db.flush()
         manifest = resolved.manifest

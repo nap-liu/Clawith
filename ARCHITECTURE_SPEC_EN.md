@@ -89,7 +89,7 @@ Production nginx configuration is built from `frontend/nginx.conf.template`; a s
 
 - Runtime LLM tool definitions normally come from database `tools` rows.
 - Builtin database definitions are seeded from `backend/app/services/tool_seeder.py`.
-- `AgentTool(enabled=True)` is the explicit per-agent enablement boundary; `is_default` is a seeding template, not a runtime permission fallback.
+- Explicit tool assignments define runtime enablement: normally `AgentTool`, or a published scene's complete tool-panel configuration for that turn. `is_default` is a seeding template, not a runtime permission fallback.
 - Platform code remains neutral to tenant-specific tool or CLI names.
 - Uploaded executable tools and AIO sandbox shell/code execution are distinct execution models with different security and lifecycle constraints.
 

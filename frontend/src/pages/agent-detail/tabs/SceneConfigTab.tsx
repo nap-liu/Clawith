@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import SceneAutoActivationSection from './SceneAutoActivationSection';
+import SceneRuntimeSection from './SceneRuntimeSection';
 import {
     IconArrowDown,
     IconArrowUp,
@@ -22,7 +25,7 @@ import ToggleSwitch from '../../../components/ToggleSwitch';
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import './SceneConfigTab.css';
 
-type Section = 'welcome' | 'prompts' | 'actions';
+type Section = 'welcome' | 'prompts' | 'actions' | 'activation' | 'runtime';
 
 const emptyScene = (): Scene => ({
     scene_key: '',
@@ -45,6 +48,11 @@ const defaultQuickActionStyle: SceneQuickActionStyle = {
 };
 
 const editableSceneSnapshot = (scene: Scene) => JSON.stringify({
+    include_soul: scene.include_soul ?? true,
+    include_memory: scene.include_memory ?? true,
+    tools: scene.tools ?? null,
+    mcp_server_overrides: scene.mcp_server_overrides ?? [],
+    auto_activation: scene.auto_activation,
     scene_key: scene.scene_key,
     name: scene.name,
     enabled: scene.enabled,
@@ -112,6 +120,7 @@ export default function SceneConfigTab({
     onDirtyChange?: (dirty: boolean) => void;
 }) {
     const dialog = useDialog();
+    const { t } = useTranslation();
     const [scenes, setScenes] = useState<Scene[]>([]);
     const [draft, setDraft] = useState<Scene>(emptyScene);
     const [savedSnapshot, setSavedSnapshot] = useState(() => editableSceneSnapshot(emptyScene()));
@@ -253,7 +262,8 @@ export default function SceneConfigTab({
 
     const saveDraft = async () => {
         if (isPreviewing) return;
-        const validationError = validateSceneDraft(draft);
+        const validationError = draft.auto_activation?.enabled && !draft.auto_activation.targets.length
+            ? t('sceneAuto.selectRequired') : validateSceneDraft(draft);
         if (validationError) {
             setError(validationError);
             setNotice('');
@@ -264,6 +274,11 @@ export default function SceneConfigTab({
         setNotice('');
         try {
             const saved = await sceneApi.save(agentId, draft.scene_key, {
+                include_soul: draft.include_soul ?? true,
+                include_memory: draft.include_memory ?? true,
+                tools: draft.tools ?? null,
+                mcp_server_overrides: draft.mcp_server_overrides ?? [],
+                auto_activation: draft.auto_activation,
                 name: draft.name.trim(),
                 enabled: draft.enabled,
                 expected_revision: draft.revision,
@@ -463,7 +478,7 @@ export default function SceneConfigTab({
                 </header>
 
                 {(error || notice) && (
-                    <div className={`scene-config__message ${error ? 'is-error' : 'is-success'}`}>{error || notice}</div>
+                    <div className={`scene-config__message ${error ? 'is-error' : 'is-success'}`}>{error ? t(error) : notice}</div>
                 )}
 
                 <div className="scene-config__identity">
@@ -492,11 +507,24 @@ export default function SceneConfigTab({
                 </div>
 
                 <nav className="scene-config__subtabs" aria-label="场景配置分区">
+                    <button className={section === 'runtime' ? 'is-active' : ''} onClick={() => setSection('runtime')}>{t('sceneRuntime.title')}</button>
+                    <button className={section === 'activation' ? 'is-active' : ''} onClick={() => setSection('activation')}>{t('sceneAuto.title')}</button>
                     <button className={section === 'welcome' ? 'is-active' : ''} onClick={() => setSection('welcome')}>初始化欢迎词</button>
                     <button className={section === 'prompts' ? 'is-active' : ''} onClick={() => setSection('prompts')}>系统提示词</button>
                     <button className={section === 'actions' ? 'is-active' : ''} onClick={() => setSection('actions')}>快捷入口</button>
                 </nav>
 
+                {section === 'activation' && (
+                    <SceneAutoActivationSection agentId={agentId} value={visibleScene.auto_activation}
+                        disabled={saving || isPreviewing}
+                        onChange={(auto_activation) => setDraft({ ...draft, auto_activation })} />
+                )}
+
+                {section === 'runtime' && (
+                    <SceneRuntimeSection key={`${visibleScene.scene_key}:${preview?.revision ?? 'draft'}`}
+                        agentId={agentId} value={visibleScene} disabled={isPreviewing || saving}
+                        onChange={(patch) => setDraft((current) => ({ ...current, ...patch }))} />
+                )}
                 {section === 'welcome' && (
                     <div className="scene-config__panel">
                         <div className="scene-config__panel-title">

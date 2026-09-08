@@ -29,6 +29,10 @@ from app.services.timezone_utils import (
     add_local_datetime_projections,
     get_agent_timezone_in_session,
 )
+from app.services.scene_tool_settings import (
+    _merge_tool_save_request, merge_scene_settings, prepare_scene_settings, project_settings,
+)
+from app.services.scene_activation import validate_auto_activation
 
 SCENE_TOOL_NAME = "manage_scene"
 SCENE_SESSION_CONFIG_KEY = "scene_key"
@@ -76,51 +80,6 @@ def _draft_dict(data: SceneSaveRequest) -> dict:
     }
 
 
-def _merge_tool_save_request(
-    current: dict | None,
-    patch: SceneToolSaveRequest,
-) -> SceneSaveRequest:
-    """Build a full draft while preserving omitted tool fields by default."""
-    current = current or {}
-    provided = patch.model_fields_set
-    force_overwrite = patch.force_overwrite
-
-    name = patch.name if "name" in provided else current.get("name")
-    if not name:
-        raise ValueError("name is required when creating a scene")
-
-    if force_overwrite:
-        values = {
-            "name": name,
-            "enabled": patch.enabled if "enabled" in provided else True,
-            "expected_revision": patch.expected_revision,
-            "welcome_message": patch.welcome_message if "welcome_message" in provided else "",
-            "system_prompts": patch.system_prompts if "system_prompts" in provided else [],
-            "quick_actions": patch.quick_actions if "quick_actions" in provided else [],
-        }
-    else:
-        values = {
-            "name": name,
-            "enabled": patch.enabled if "enabled" in provided else current.get("enabled", True),
-            "expected_revision": patch.expected_revision,
-            "welcome_message": (
-                patch.welcome_message
-                if "welcome_message" in provided
-                else current.get("welcome_message", "")
-            ),
-            "system_prompts": (
-                patch.system_prompts
-                if "system_prompts" in provided
-                else current.get("system_prompts", [])
-            ),
-            "quick_actions": (
-                patch.quick_actions
-                if "quick_actions" in provided
-                else current.get("quick_actions", [])
-            ),
-        }
-    return SceneSaveRequest.model_validate(values)
-
 
 def _published_values(scene: AgentScene, revision: AgentSceneRevision | None) -> tuple[str, bool, dict]:
     raw = revision.config if revision else {}
@@ -150,7 +109,7 @@ def serialize_scene(scene: AgentScene, revision: AgentSceneRevision | None) -> d
         "enabled": enabled,
         "revision": scene.current_revision,
         "has_unpublished_changes": draft is not None,
-        **config,
+        **project_settings(config),
         "updated_at": scene.updated_at.isoformat() if scene.updated_at else None,
     }
 
@@ -171,7 +130,13 @@ def serialize_published_scene(scene: AgentScene, revision: AgentSceneRevision) -
 
 def serialize_scene_manifest(scene: AgentScene, revision: AgentSceneRevision) -> dict:
     """Return the least-privilege scene projection consumed by user-facing clients."""
-    published = serialize_published_scene(scene, revision)
+    return project_scene_manifest(serialize_published_scene(scene, revision))
+
+
+def project_scene_manifest(manifest: dict) -> dict:
+    published = dict(manifest)
+    for key in ("auto_activation", "include_soul", "include_memory", "tools", "mcp_server_overrides"):
+        published.pop(key, None)
     menu_actions = []
     for action in published.get("quick_actions", []):
         if not action.get("menu_visible", action.get("enabled", True)):
@@ -307,6 +272,7 @@ def scene_message_meta(manifest: dict | None) -> dict:
     return {
         "scene_key": manifest.get("scene_key"),
         "scene_revision": manifest.get("revision"),
+        **({"activation_source": "automatic"} if manifest.get("activation_source") == "automatic" else {}),
     }
 
 
@@ -328,6 +294,10 @@ def build_scene_channel_context(
             {
                 "scene_key": manifest.get("scene_key"),
                 "scene_revision": manifest.get("revision"),
+                "scene_include_memory": manifest.get("include_memory", True),
+                "scene_include_soul": manifest.get("include_soul", True),
+                "scene_tools": manifest.get("tools"),
+                "scene_mcp_server_overrides": manifest.get("mcp_server_overrides", []),
                 "scene_system_prompts": [
                     item for item in manifest.get("system_prompts", []) if item.get("enabled", True)
                 ],
@@ -433,7 +403,11 @@ async def save_scene(
     elif data.expected_revision is not None and scene.current_revision != data.expected_revision:
         raise HTTPException(status_code=409, detail="Scene revision changed; refresh and retry")
 
-    scene.draft_config = _draft_dict(data)
+    payload = _draft_dict(data)
+    previous = await get_revision(db, scene.id, scene.current_revision)
+    await merge_scene_settings(db, agent_id, data, payload, scene.draft_config or (previous.config if previous else {}))
+    await validate_auto_activation(db, agent_id, payload, viewer_id=created_by_user_id)
+    scene.draft_config = payload
     await db.flush()
     await db.refresh(scene)
     revision = await get_revision(db, scene.id, scene.current_revision) if scene.current_revision > 0 else None
@@ -449,6 +423,7 @@ async def publish_scene(
     created_by_user_id: uuid.UUID | None = None,
     created_by_agent_id: uuid.UUID | None = None,
 ) -> dict:
+    await db.scalar(select(Agent.id).where(Agent.id == agent_id).with_for_update())
     result = await db.execute(
         select(AgentScene)
         .where(
@@ -466,6 +441,8 @@ async def publish_scene(
         raise HTTPException(status_code=409, detail="No saved draft to publish")
 
     payload = dict(scene.draft_config)
+    await prepare_scene_settings(db, agent_id, payload, payload)
+    await validate_auto_activation(db, agent_id, payload, viewer_id=created_by_user_id, scene_id=scene.id, publishing=True)
     scene.name = str(payload.get("name") or scene.name)
     scene.enabled = bool(payload.get("enabled", scene.enabled))
     scene.current_revision += 1
@@ -531,7 +508,7 @@ async def get_scene_revision_detail(
     source = await get_revision(db, scene.id, revision)
     if not source:
         raise HTTPException(status_code=404, detail="Scene revision not found")
-    result = serialize_published_scene(scene, source)
+    result = project_settings(serialize_published_scene(scene, source))
     result["updated_at"] = source.created_at.isoformat() if source.created_at else None
     return result
 
@@ -546,6 +523,7 @@ async def rollback_scene(
     created_by_user_id: uuid.UUID | None = None,
     created_by_agent_id: uuid.UUID | None = None,
 ) -> dict:
+    await db.scalar(select(Agent.id).where(Agent.id == agent_id).with_for_update())
     result = await db.execute(
         select(AgentScene)
         .where(
@@ -566,6 +544,8 @@ async def rollback_scene(
     scene.current_revision += 1
     name, enabled, config = _published_values(scene, source)
     payload = {"name": name, "enabled": enabled, **config}
+    await prepare_scene_settings(db, agent_id, payload, payload)
+    await validate_auto_activation(db, agent_id, payload, viewer_id=created_by_user_id, scene_id=scene.id, publishing=True)
     scene.name = name
     scene.enabled = enabled
     scene.draft_config = None
@@ -694,6 +674,7 @@ async def execute_scene_management_tool(
                             "system_prompts",
                             "quick_actions",
                             "force_overwrite",
+                            "include_soul", "include_memory", "tools", "mcp_server_overrides",
                         )
                         if field in arguments
                     }

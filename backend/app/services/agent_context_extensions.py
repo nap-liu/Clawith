@@ -3,6 +3,18 @@
 import uuid
 
 from app.config import get_settings
+from sqlalchemy import select
+from app.models.tool import Tool, AgentTool
+from app.services.turn_tool_settings import current_tool_settings, effective_mcp_override
+
+
+def _enabled_tools_query(agent_id):
+    scope = current_tool_settings(agent_id)
+    if scope is not None:
+        return select(Tool).where(Tool.id.in_([item["tool_id"] for item in scope.assignments]), Tool.enabled.is_(True))
+    return select(Tool).join(AgentTool, AgentTool.tool_id == Tool.id).where(
+        AgentTool.agent_id == agent_id, AgentTool.enabled.is_(True), Tool.enabled.is_(True),
+    )
 
 
 async def _collect_channel_prompts(agent_id: uuid.UUID) -> list[str]:
@@ -72,8 +84,6 @@ async def _collect_extension_prompts_legacy(agent_id: uuid.UUID) -> list[str]:
     ``_collect_channel_prompts`` helper.
     """
     from app.database import async_session
-    from app.models.tool import AgentTool, Tool
-    from sqlalchemy import select
 
     blocks: list[str] = []
 
@@ -81,13 +91,7 @@ async def _collect_extension_prompts_legacy(agent_id: uuid.UUID) -> list[str]:
         # Tool-driven blocks. We sort by Tool.name so identical agent
         # configurations always produce a byte-identical prefix.
         tool_rows = await db.execute(
-            select(Tool)
-            .join(AgentTool, AgentTool.tool_id == Tool.id)
-            .where(
-                AgentTool.agent_id == agent_id,
-                AgentTool.enabled == True,  # noqa: E712 — SQLAlchemy idiom
-                Tool.enabled == True,  # noqa: E712
-            )
+            _enabled_tools_query(agent_id)
             .order_by(Tool.name)
         )
         tools = tool_rows.scalars().all()
@@ -128,8 +132,6 @@ async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
     from app.database import async_session
     from app.models.agent import Agent
     from app.models.mcp_server import MCPServer, MCPServerOverride
-    from app.models.tool import AgentTool, Tool
-    from sqlalchemy import select
 
     blocks: list[str] = []
     async with async_session() as db:
@@ -138,14 +140,8 @@ async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
 
         # Distinct server ids enabled for this agent
         srv_id_rows = await db.execute(
-            select(Tool.mcp_server_id)
-            .join(AgentTool, AgentTool.tool_id == Tool.id)
-            .where(
-                AgentTool.agent_id == agent_id,
-                AgentTool.enabled == True,  # noqa: E712
-                Tool.enabled == True,  # noqa: E712
-                Tool.mcp_server_id.is_not(None),
-            )
+            _enabled_tools_query(agent_id).with_only_columns(Tool.mcp_server_id)
+            .where(Tool.mcp_server_id.is_not(None))
             .distinct()
         )
         server_ids = [r[0] for r in srv_id_rows.all() if r[0] is not None]
@@ -170,7 +166,7 @@ async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
 
         for srv in servers:
             t_ovr = ovr_index.get((srv.id, "tenant", tenant_id)) if tenant_id else None
-            a_ovr = ovr_index.get((srv.id, "agent", agent_id))
+            a_ovr = effective_mcp_override(agent_id, srv.id, ovr_index.get((srv.id, "agent", agent_id)))
             parts = [
                 (srv.system_prompt_block or "").strip(),
                 (t_ovr.system_prompt_block or "").strip() if t_ovr else "",

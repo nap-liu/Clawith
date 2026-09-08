@@ -13,6 +13,11 @@ Agent context. Tasks, schedules, triggers, and Subagents share the same
 `include_soul` / `include_memory` semantics; both default to enabled so legacy
 resources retain their prior behavior.
 
+Published scenes expose independent `include_soul` and `include_memory`
+switches, both enabled by default. Their immutable turn revision controls the
+same shared context-builder flags in Web and IM. Disabling loading does not
+delete workspace files or remove previously persisted conversation history.
+
 Provider-reported usage is the authority for successful model rounds. Do not
 replace token accounting with character heuristics or a stale model-family
 lookup. Primary/fallback dispatch must preserve a safe protected history suffix
