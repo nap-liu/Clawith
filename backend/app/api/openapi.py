@@ -16,7 +16,6 @@ from app.models.openapi_application import OpenAPICredential
 from app.schemas.openapi_application import LoginLinkInput, LoginExchangeInput, EmployeeSearchInput, EmployeeAccessInput
 from app.schemas.schemas import UserOut
 from app.schemas.openapi_application import EmployeeOut, EmployeePageOut, OAuthTokenOut, LoginLinkOut, CapabilitiesOut
-from app.services.employee_access import employee_access_url
 from app.services.openapi_applications import (
     audit, authenticate_client, credential, delegated_user, digest, login_user, fail, issue_system_token, now,
 )
@@ -31,7 +30,8 @@ router = APIRouter(prefix="/openapi/v1", tags=["OpenAPI v1"], route_class=OpenAP
 
 def employee_projection(agent, public_base_url=""):
     return {"id": str(agent.id), "name": agent.name, "avatar_url": agent.avatar_url,
-            "description": agent.role_description or "", "access_url": employee_access_url(agent, public_base_url)}
+            "description": agent.role_description or "",
+            "access_url": f"{public_base_url.rstrip('/')}/h5/agents/{agent.id}/chat"}
 
 
 async def rate_limit(app):
