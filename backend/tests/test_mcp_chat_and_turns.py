@@ -146,7 +146,7 @@ async def test_stop_turn_does_not_cancel_when_durable_write_fails():
     record = (await list_active_turns(owner_user_id=owner.id))[0]
 
     with patch(
-        "app.mcp_server.tools_turns.mark_turn_cancelled",
+        "app.services.active_turn_stop.mark_turn_cancelled",
         new=AsyncMock(side_effect=RuntimeError("database unavailable")),
     ):
         with pytest.raises(RuntimeError, match="database unavailable"):
@@ -209,7 +209,10 @@ async def test_stop_turn_request_cancellation_cannot_strand_reservation():
         factory_calls += 1
         return real_session_factory() if factory_calls == 1 else DelayedSessionExit()
 
-    with patch.object(tools_turns, "async_session", side_effect=controlled_session_factory):
+    with (
+        patch.object(tools_turns, "async_session", side_effect=controlled_session_factory),
+        patch("app.services.active_turn_stop.async_session", side_effect=controlled_session_factory),
+    ):
         request = asyncio.create_task(
             tools_turns.stop_turn(_ctx(write_token), record.turn_id)
         )
@@ -287,7 +290,7 @@ async def test_stop_turn_freezes_terminal_reply_until_cancel_is_durable():
         await allow_durable_write.wait()
         return await real_mark_turn_cancelled(db, **kwargs)
 
-    with patch("app.mcp_server.tools_turns.mark_turn_cancelled", side_effect=paused_mark):
+    with patch("app.services.active_turn_stop.mark_turn_cancelled", side_effect=paused_mark):
         stop_task = asyncio.create_task(stop_turn(_ctx(write_token), record.turn_id))
         await durable_write_started.wait()
         finalize_reply.set()
@@ -376,7 +379,7 @@ async def test_terminal_reply_that_holds_anchor_lock_wins_over_stop_turn():
         mark_entered.set()
         return await real_mark_turn_cancelled(db, **kwargs)
 
-    with patch("app.mcp_server.tools_turns.mark_turn_cancelled", side_effect=observed_mark):
+    with patch("app.services.active_turn_stop.mark_turn_cancelled", side_effect=observed_mark):
         stop_task = asyncio.create_task(stop_turn(_ctx(write_token), record.turn_id))
         await mark_entered.wait()
         allow_commit.set()

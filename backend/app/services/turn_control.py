@@ -350,16 +350,19 @@ async def stop_session_turn_tree(
         await db.commit()
 
     from app.services.turn_control_bus import publish_turn_tree_stopped
+    from app.services.active_turn_stop import stop_local_registered_turns
 
+    turn_anchors = {
+        str(target_id): str(snapshot.anchor_id)
+        for target_id, _target_agent_id, snapshot in cancelled_turns
+    }
     await publish_turn_tree_stopped(
-        {
-            str(target_id): str(snapshot.anchor_id)
-            for target_id, _target_agent_id, snapshot in cancelled_turns
-        },
+        turn_anchors,
         subagent_lease_owners={
             str(run_id): lease_owner_by_run.get(run_id)
             for run_id in cancelled_run_ids
         },
+        reason=reason,
     )
 
     if cancelled_run_ids:
@@ -391,6 +394,10 @@ async def stop_session_turn_tree(
             event_kind="turn_terminal",
         )
 
+    # Web may interrupt its LLM task immediately after this operation returns.
+    # Persist all anchors owned here before that interruption. Notify remote
+    # owners first: finalizing a local owner may cancel this caller itself.
+    await stop_local_registered_turns(turn_anchors, reason=reason)
     return TurnTreeStopResult(
         session_ids=tuple(sorted(stopped_session_ids, key=str)),
         cancelled_turns=tuple(cancelled_turns),

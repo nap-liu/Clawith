@@ -14,19 +14,15 @@ from app.mcp_server import mcp
 from app.mcp_server._common import authed_write
 from app.mcp_server.auth import resolve_pat_context
 from app.models.agent import Agent
-from app.models.audit import AuditLog
 from app.models.chat_session import ChatSession
 from app.models.user import User
 from app.services.active_turns import (
-    finalize_active_turn_stop,
-    release_active_turn_stop,
     reserve_active_turn_stop,
     wait_until_stopped,
 )
 from app.services.active_turns import (
     list_active_turns as list_registered_turns,
 )
-from app.services.chat_history import mark_turn_cancelled, turn_has_completed_reply
 
 _UNAUTH = "❌ 未鉴权：请在 MCP 客户端配置 Authorization: Bearer <clw_...> 令牌。"
 _TURN_LABELS = {
@@ -177,75 +173,14 @@ async def _commit_reserved_stop(
     actor_user_id: uuid.UUID,
     is_admin: bool,
 ) -> str:
-    """Drive a reserved stop to one definite state outside request cancellation."""
+    """Keep the MCP response/audit adapter on the shared stop commit protocol."""
+    from app.services.active_turn_stop import commit_reserved_turn_stop
 
-    completed_anchors = 0
-    cancelled_anchors = []
-    try:
-        async with async_session() as db:
-            for anchor in tuple(record.durable_anchors):
-                cancelled_id = await mark_turn_cancelled(
-                    db,
-                    agent_id=anchor.agent_id,
-                    conversation_id=anchor.session_id,
-                    turn_anchor_id=anchor.message_id,
-                    reason=f"MCP stop_turn by user {actor_user_id}",
-                )
-                if cancelled_id is None and await turn_has_completed_reply(
-                    db,
-                    agent_id=anchor.agent_id,
-                    conversation_id=anchor.session_id,
-                    turn_anchor_id=anchor.message_id,
-                ):
-                    completed_anchors += 1
-                elif cancelled_id is not None:
-                    cancelled_anchors.append(anchor)
-            db.add(
-                AuditLog(
-                    user_id=actor_user_id,
-                    agent_id=None,
-                    action="mcp_turn_stop_requested",
-                    details={
-                        "turn_id": record.turn_id,
-                        "turn_owner_user_id": str(record.owner_user_id),
-                        "target_agent_id": str(record.agent_id),
-                        "session_id": record.session_id,
-                        "turn_type": record.turn_type,
-                        "platform_admin": is_admin,
-                        "completed_anchor_count": completed_anchors,
-                        "durable_anchor_count": len(record.durable_anchors),
-                    },
-                )
-            )
-            await db.commit()
-    except BaseException:
-        await release_active_turn_stop(record, stop_token)
-        raise
-
-    from app.services.conversation_turn_lifecycle import (
-        get_conversation_turn_snapshot,
-        publish_conversation_turn_event,
+    return await commit_reserved_turn_stop(
+        record=record,
+        stop_token=stop_token,
+        reason=f"MCP stop_turn by user {actor_user_id}",
+        audit_action="mcp_turn_stop_requested",
+        actor_user_id=actor_user_id,
+        is_admin=is_admin,
     )
-
-    for anchor in cancelled_anchors:
-        async with async_session() as db:
-            snapshot = await get_conversation_turn_snapshot(
-                db,
-                agent_id=anchor.agent_id,
-                conversation_id=anchor.session_id,
-                turn_anchor_id=anchor.message_id,
-            )
-        await publish_conversation_turn_event(
-            agent_id=anchor.agent_id,
-            conversation_id=anchor.session_id,
-            payload={"type": "done", "role": "assistant", "content": ""},
-            snapshot=snapshot,
-            event_kind="turn_terminal",
-        )
-
-    if record.durable_anchors and completed_anchors == len(record.durable_anchors):
-        await release_active_turn_stop(record, stop_token)
-        return "completed"
-
-    finalized = await finalize_active_turn_stop(record, stop_token)
-    return "cancelled" if finalized is not None else "ended"

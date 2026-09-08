@@ -9,7 +9,7 @@ import uuid
 from loguru import logger
 
 from app.core.events import get_redis
-from app.services.active_turns import cancel_active_turn, list_active_turns
+from app.services.active_turn_stop import stop_local_registered_turns
 
 TURN_CONTROL_CHANNEL = "platform:turn-control"
 
@@ -18,6 +18,7 @@ async def publish_turn_tree_stopped(
     turn_anchors: dict[str, str],
     *,
     subagent_lease_owners: dict[str, str | None] | None = None,
+    reason: str = "Durable conversation STOP received",
 ) -> None:
     """Wake remote owners after DB cancellation; DB remains authoritative."""
 
@@ -29,6 +30,7 @@ async def publish_turn_tree_stopped(
                 {
                     "turn_anchors": turn_anchors,
                     "subagent_lease_owners": subagent_lease_owners or {},
+                    "reason": reason,
                 }
             ),
         )
@@ -41,12 +43,9 @@ async def _cancel_local(payload: dict) -> None:
         str(session_id): str(anchor_id)
         for session_id, anchor_id in dict(payload.get("turn_anchors") or {}).items()
     }
-    for record in await list_active_turns():
-        if any(
-            anchors.get(anchor.session_id) == str(anchor.message_id)
-            for anchor in record.durable_anchors
-        ):
-            await cancel_active_turn(record.turn_id)
+    await stop_local_registered_turns(
+        anchors, reason=str(payload.get("reason") or "Durable conversation STOP received"),
+    )
 
     leases = {
         uuid.UUID(str(run_id)): (str(owner) if owner is not None else None)

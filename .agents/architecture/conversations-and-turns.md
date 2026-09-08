@@ -248,6 +248,18 @@ preserve the assistant/tool ordering, and let channel adapters render buttons or
 cards. A confirmation response must not invent a new session or bypass the
 shared loop.
 
+The shared suspension writer commits before exposing a confirmation card.
+An empty reply from that invocation therefore projects the persisted Session
+snapshot; a transport finalizer must not write suspension again. A user can
+already have resumed or stopped the same anchor while its earlier invocation
+finishes. Web suspension events retain the current anchor, generation and
+revision and are emitted only while that same generation remains suspended.
+
+Session STOP uses the execution owner's existing admission gate to cancel every
+registered durable anchor, including ordinary A2A Sessions, before interrupting
+that root. Web, IM, the control bus and MCP share this stop commit protocol;
+interrupting a process alone does not complete the durable cancellation.
+
 Suspension and external completion are generic tool-loop capabilities, not
 confirmation-specific behavior. When an external actor fills a suspended tool
 result, provider history must still end with the matching
