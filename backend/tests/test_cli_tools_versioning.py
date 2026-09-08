@@ -1,30 +1,21 @@
-"""Unit tests for the CLI-tool binary versioning service.
-
-These exercise ``record_new_version`` / ``rollback_to`` / ``list_versions``
-against an in-memory aiosqlite DB that mirrors the production schema
-(including the partial unique index on is_current). The BinaryStorage
-side is a real tmp_path directory so file eviction is observable.
-
-Why aiosqlite: the production code uses async SQLAlchemy only — any
-sync test fixture would hide real bugs (e.g. forgetting to await a
-flush). aiosqlite gives us the async contract without a live postgres.
-"""
+"""CLI binary version history against PostgreSQL and real filesystem storage."""
 
 from __future__ import annotations
 
 import io
 import uuid
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.cli_tool_binary import CliToolBinaryVersion
-import app.models.mcp_server  # noqa: F401 — registers mcp_servers in metadata so Tool FK resolves
+from app.database import async_session, engine
+from app.models.audit import AuditLog
+import app.models.registry  # noqa: F401 - complete model graph
 from app.models.tool import Tool
-from app.models.user import User  # noqa: F401 — registers users table for FK resolution
+from app.models.user import User
 from app.services.cli_tools import versioning as versioning_service
 from app.services.cli_tools.schema import (
     BinaryMetadata,
@@ -36,49 +27,12 @@ from app.services.cli_tools.storage import BinaryStorage
 _SHEBANG = b"#!/bin/sh\necho hi\n"
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Fixtures — async SQLite engine + per-test session, fresh schema each time
-# ─────────────────────────────────────────────────────────────────────────
-
-
 @pytest.fixture
-async def engine():
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
-    async with eng.begin() as conn:
-        # Create a minimal users table so the FK on
-        # cli_tool_binary_versions.uploaded_by_user_id can resolve. We
-        # don't actually need the User model loaded — just the target
-        # table name.
-        await conn.execute(text(
-            "CREATE TABLE users (id TEXT PRIMARY KEY)"
-        ))
-        # Stub table for the FK on tools.mcp_server_id (the column was
-        # added after this test was written; only the PK is needed so the
-        # FK constraint resolves when tools is created below).
-        await conn.execute(text(
-            "CREATE TABLE mcp_servers (id TEXT PRIMARY KEY)"
-        ))
-        # Create the tool + version tables through the ORM metadata so
-        # column types (especially UUID <-> TEXT) match what the service
-        # code expects.
-        await conn.run_sync(lambda sync_conn: Tool.__table__.create(sync_conn))
-        await conn.run_sync(
-            lambda sync_conn: CliToolBinaryVersion.__table__.create(sync_conn)
-        )
-        # Partial unique index: sqlite supports WHERE-partial indexes.
-        await conn.execute(text(
-            "CREATE UNIQUE INDEX uq_cli_tool_binary_versions_current "
-            "ON cli_tool_binary_versions (tool_id) WHERE is_current = 1"
-        ))
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-async def session(engine):
-    Session = async_sessionmaker(engine, expire_on_commit=False)
-    async with Session() as s:
-        yield s
+async def session():
+    async with async_session() as db:
+        yield db
+        await db.rollback()
+    await engine.dispose()
 
 
 async def _insert_tool(session: AsyncSession, *, tenant_id=None) -> Tool:
@@ -203,34 +157,13 @@ async def test_rollback_swaps_current_flag(session, tmp_path):
     assert currents[0].id == v1.id
     # v2 still there, just demoted.
     assert any(r.id == v2.id and r.is_current is False for r in rows)
-
-
-@pytest.mark.asyncio
-async def test_rollback_updates_tool_config_binary_subtree(session, tmp_path):
-    """After rollback, ``tool.config.binary`` reflects the rolled-back
-    version (not the one that was current when rollback started)."""
-    tool = await _insert_tool(session)
-    storage = BinaryStorage(root=tmp_path)
-
-    v1 = await versioning_service.record_new_version(
-        session, tool, sha256="a" * 64, size=10, original_name="v1",
-        user_id=None, binary_storage=storage,
-    )
-    await versioning_service.record_new_version(
-        session, tool, sha256="b" * 64, size=20, original_name="v2",
-        user_id=None, binary_storage=storage,
-    )
-    assert tool.config["binary"]["sha256"] == "b" * 64
-
-    await versioning_service.rollback_to(session, tool, v1.id)
-
     assert tool.config["binary"]["sha256"] == "a" * 64
     assert tool.config["binary"]["size"] == 10
     assert tool.config["binary"]["original_name"] == "v1"
 
 
 @pytest.mark.asyncio
-async def test_rollback_writes_audit_log(session, tmp_path, monkeypatch):
+async def test_rollback_writes_audit_log(session, tmp_path):
     """The API handler wraps rollback with an AuditLog row; this test
     exercises the API-layer code path directly using the real service so
     the from_sha / to_sha fields are populated correctly."""
@@ -249,35 +182,19 @@ async def test_rollback_writes_audit_log(session, tmp_path, monkeypatch):
     )
     await session.commit()
 
-    # Capture audit rows by intercepting db.add — the FakeDB pattern from
-    # test_cli_tools_api.py would work too, but the real session gives us
-    # flush semantics the partial index depends on.
-    captured_audit: list = []
-    original_add = session.add
-
-    def _spy_add(obj):
-        # Filter to AuditLog-like objects (duck-typed to avoid importing
-        # the full model schema into this sqlite session).
-        if type(obj).__name__ == "AuditLog":
-            captured_audit.append(obj)
-        else:
-            original_add(obj)
-
-    monkeypatch.setattr(session, "add", _spy_add)
-
-    user = SimpleNamespace(
-        id=uuid.uuid4(),
-        role="platform_admin",
-        tenant_id=None,
-    )
+    user = User(display_name="Version administrator", role="platform_admin", is_active=True)
+    session.add(user)
+    await session.commit()
 
     body = cli_tools_api.RollbackRequest(version_id=v1.id, notes="regression fix")
     await cli_tools_api.rollback_binary_version(
         tool_id=tool.id, body=body, db=session, user=user,
     )
 
-    assert len(captured_audit) == 1
-    audit = captured_audit[0]
+    async with async_session() as observer:
+        audit = (await observer.execute(
+            select(AuditLog).where(AuditLog.user_id == user.id, AuditLog.action == "cli_tool.rollback")
+        )).scalar_one()
     assert audit.action == "cli_tool.rollback"
     assert audit.details["from_sha"] == "b" * 64
     assert audit.details["to_sha"] == "a" * 64
@@ -309,7 +226,7 @@ async def test_max_retained_hard_deletes_oldest_binary_on_disk(session, tmp_path
 
     # Register them through the service in upload order so uploaded_at
     # is strictly monotonic (each call is a separate datetime.now()).
-    # We must space them so sqlite's TIMESTAMP column orders them.
+    # Explicit timestamps make retention order independent of database clock resolution.
     base_ts = datetime(2026, 4, 1, tzinfo=timezone.utc)
     for i, sha in enumerate(shas):
         await versioning_service.record_new_version(

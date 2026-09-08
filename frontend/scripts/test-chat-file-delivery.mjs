@@ -1,34 +1,10 @@
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
-import vm from 'node:vm';
+import { loadTypeScriptModule } from './load-typescript-module.mjs';
 
-const require = createRequire(import.meta.url);
-const ts = require('typescript');
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const sourcePath = resolve(__dirname, '../src/utils/chatFileDelivery.ts');
-const source = readFileSync(sourcePath, 'utf8');
-const compiled = ts.transpileModule(source, {
-    compilerOptions: {
-        module: ts.ModuleKind.CommonJS,
-        target: ts.ScriptTarget.ES2020,
-        esModuleInterop: true,
-    },
-}).outputText;
-
-const module = { exports: {} };
-vm.runInNewContext(compiled, {
-    module,
-    exports: module.exports,
-    require,
-    console,
-    URL,
-}, { filename: sourcePath });
-
-const { parseFileDeliveryToolResult } = module.exports;
+const { parseFileDeliveryToolResult } = loadTypeScriptModule(
+    fileURLToPath(new URL('../src/utils/chatFileDelivery.ts', import.meta.url)),
+);
 
 {
     const delivery = parseFileDeliveryToolResult(

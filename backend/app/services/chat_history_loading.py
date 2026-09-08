@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.services.chat_history_shared import *  # noqa: F401,F403
+from app.services.message_context_order import order_messages_for_context
 
 async def _batch_load_display_names(
     db: AsyncSession,
@@ -75,7 +76,7 @@ async def load_messages_for_session(
     # only complete old turns when necessary. After compaction, all surviving
     # rows are the protected suffix. Either way, slicing by rows could split a
     # tool-heavy turn or silently violate a model's larger keep_recent_turns.
-    rows = all_active_rows
+    rows = order_messages_for_context(all_active_rows)
 
     if marker is not None:
         _prepend_compaction_context(
@@ -132,6 +133,7 @@ async def load_recoverable_messages_for_turn(
         )
     ]
 
+    active_rows = order_messages_for_context(active_rows)
     anchor_idx = next((idx for idx, row in enumerate(active_rows) if row.id == turn_anchor_id), None)
     if anchor_idx is None:
         logger.warning(
@@ -542,6 +544,7 @@ def build_llm_messages_from_rows(
     - model ``thinking`` is carried only when ``include_thinking`` is set (the
       web client replays it into context; IM history intentionally does not).
     """
+    rows = order_messages_for_context(rows)
     # A tool-owned delivery (for example send_media) may promote its original
     # ``running`` row to ``done`` in place, while sibling results are appended
     # later. Group each typed round at its first physical row and replay the
@@ -582,6 +585,8 @@ def build_llm_messages_from_rows(
     emitted_rounds: set[str] = set()
     for m in rows:
         meta = m.message_meta if isinstance(getattr(m, "message_meta", None), dict) else {}
+        if meta.get("turn_control_only") or meta.get("artifact_role") == "command_reply":
+            continue
         # This visible row mirrors assistant_content on the confirmation tool
         # row. Keep it for UI rendering, but avoid replaying both copies.
         if m.role == "assistant" and meta.get("artifact_role") == "confirmation_intro":

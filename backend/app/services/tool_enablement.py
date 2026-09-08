@@ -17,6 +17,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from sqlalchemy import and_, or_
+
+from app.models.tool import Tool
+
 # Protocol tools whose schemas must remain present for every Agent. Keeping
 # this set here makes the runtime resolver, management APIs, and startup seed
 # agree on one authoritative rule.
@@ -32,6 +36,21 @@ SUBAGENT_TOOL_NAMES = frozenset(
         "send_message_to_parent",
     }
 )
+
+
+def tool_visibility_clause(tenant_id, assigned_tool_ids):
+    """Use one tenant boundary for catalog, scene saves and runtime tools."""
+    return and_(
+        or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
+        or_(Tool.source.in_(["builtin", "admin"]), Tool.id.in_(assigned_tool_ids)),
+    )
+
+
+def tool_visible_to_agent(tool, tenant_id, assigned_tool_ids) -> bool:
+    return (
+        tool.tenant_id in (None, tenant_id)
+        and (tool.source in ("builtin", "admin") or str(tool.id) in assigned_tool_ids)
+    )
 
 
 def tool_is_required(tool_name: str) -> bool:

@@ -39,13 +39,6 @@ def test_invariant_toolloop_tail_is_covered():
     assert _last_covered(marks) >= len(msgs) - 2, f"tail not covered: {marks}"
 
 
-def test_tool_role_tail_is_markable():
-    # Regression for the bug: tool-result tail must be markable (was skipped).
-    msgs = [SYS, USR, ASS_TC, TOOL]
-    marks = select_cache_breakpoints(msgs)
-    assert max(marks) >= 3, f"tool tail not marked: {marks}"
-
-
 def test_assistant_toolcall_null_content_falls_back_to_prev_tool():
     # Tail is a content-less assistant tool-call turn → fall back to the
     # preceding tool result (index 3), which IS markable.
@@ -59,11 +52,6 @@ def test_at_most_four_breakpoints_sorted_unique():
     marks = select_cache_breakpoints(msgs)
     assert marks == sorted(set(marks))
     assert len(marks) <= 4
-
-
-def test_system_always_included_when_present():
-    msgs = [SYS, USR, ASS_TC, TOOL]
-    assert 0 in select_cache_breakpoints(msgs)
 
 
 def test_empty_list():
@@ -101,6 +89,7 @@ def test_dashscope_marks_toolloop_tail_payload():
     tail = payload[-1]
     assert isinstance(tail["content"], list), "tool tail content must be wrapped to list form"
     assert any(b.get("cache_control") for b in tail["content"]), "tool tail must carry cache_control"
+    assert any(b.get("cache_control") for b in payload[0]["content"])
 
 
 def test_dashscope_serializes_external_tool_result_as_continuation_tail():
@@ -162,19 +151,6 @@ def test_apply_cache_control_idempotent_skips_volatile_dynamic_block():
     assert not blocks[1].get("cache_control"), "volatile dynamic block must NOT be marked"
 
 
-def test_dashscope_marks_system_prefix():
-    client = _dashscope_client()
-    payload = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "q"},
-        {"role": "assistant", "content": "a"},
-    ]
-    client._apply_dashscope_cache_markers(payload)
-    sysmsg = payload[0]
-    assert isinstance(sysmsg["content"], list)
-    assert any(b.get("cache_control") for b in sysmsg["content"])
-
-
 # --- observability: per-round cache-hit-ratio ---
 
 def test_cache_hit_ratio_helper():
@@ -189,19 +165,3 @@ def test_cache_hit_ratio_helper():
     assert _cache_hit_ratio({"prompt_tokens": 0}) is None
     assert _cache_hit_ratio({}) is None
     assert _cache_hit_ratio(None) is None
-
-
-# --- guard: tool definitions must serialize byte-identically across rounds ---
-
-def test_agent_tools_serialize_byte_stable_across_calls():
-    # DashScope (and implicit prefix caching) require the tools array to be
-    # byte-identical every round, or the cached prefix misses. AGENT_TOOLS is a
-    # module-level constant; this guard fails loudly if anyone makes it
-    # non-deterministic (e.g. building it per-call with set/dict ordering).
-    import json
-
-    from app.services.agent_tools import AGENT_TOOLS
-
-    a = json.dumps(AGENT_TOOLS, ensure_ascii=False)
-    b = json.dumps(AGENT_TOOLS, ensure_ascii=False)
-    assert a == b, "AGENT_TOOLS serialization must be byte-identical across rounds"

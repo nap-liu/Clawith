@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.conversation_turn_lifecycle import conversation_turn_snapshot_for_session
+
 
 async def execute_web_turn_impl(
     api,
@@ -275,6 +277,8 @@ async def save_user_message_impl(
 ):
     from app.services.chat_attachments import strip_image_data_markers
 
+    self.last_ingest_result = None
+
     has_image_marker = "[image_data:" in content
     if attachments is not None:
         saved_content = display_content if display_content else strip_image_data_markers(content)
@@ -333,8 +337,8 @@ async def save_user_message_impl(
         _sess = _sess_r.scalar_one_or_none()
         if _sess is None:
             raise RuntimeError("chat session no longer exists")
-        if await api._has_active_subagent_event_turn(db, self.conv_id):
-            raise api.SessionTurnBusyError("Subagent parent wake currently owns this session turn")
+        if _sess.agent_id != self.agent_id or (not _sess.is_group and _sess.user_id != self.user_id):
+            raise PermissionError("Session ownership changed")
         initial_assistant = None
         first_user_created_at = None
         if self.pending_initial_assistant is not None:
@@ -356,6 +360,7 @@ async def save_user_message_impl(
             user_id=self.user_id,
             content=saved_content,
             source_channel=_sess.source_channel,
+            allow_turn_inbox=self.agent_type != "openclaw",
             provider_event_id=str(client_message_id or "") or None,
             channel_config_id=_sess.id,
             actor_ref=str(self.user_id),
@@ -371,7 +376,8 @@ async def save_user_message_impl(
             await db.commit()
             api.logger.info("[WS] Message blocked by pending confirmation %s", ingested.message.id)
             return None, True, None, ingested.pending_confirmation, False, None
-        turn_snapshot = None
+        self.last_ingest_result = ingested
+        turn_snapshot = conversation_turn_snapshot_for_session(_sess)
         if not ingested.consumed_by_onmessage:
             turn_snapshot = await api.transition_conversation_turn(
                 db,

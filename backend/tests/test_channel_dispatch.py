@@ -13,55 +13,6 @@ import app.services.channel_dispatch as cd
 from app.models.chat_session import ChatSession
 
 
-def test_channel_reactions_defaults_all_none():
-    r = cd.ChannelReactions()
-    assert r.on_consume is None
-    assert r.on_complete is None
-    assert r.on_error is None
-    assert r.on_tool_call is None
-    assert r.on_thinking is None
-    assert r.on_chunk is None
-
-
-def test_channel_reactions_partial_assignment():
-    async def _noop():
-        return None
-
-    r = cd.ChannelReactions(on_consume=_noop)
-    assert r.on_consume is _noop
-    assert r.on_complete is None
-
-
-async def test_get_session_lock_same_key_returns_same_lock():
-    a = await cd._get_session_lock("dingtalk:dingtalk_p2p_1")
-    b = await cd._get_session_lock("dingtalk:dingtalk_p2p_1")
-    assert a is b
-
-
-async def test_get_session_lock_different_keys_differ():
-    a = await cd._get_session_lock("dingtalk:dingtalk_p2p_1")
-    b = await cd._get_session_lock("dingtalk:dingtalk_p2p_2")
-    assert a is not b
-
-
-async def test_same_key_serializes_work():
-    """同一 lock_key 下两段工作不会重叠执行。"""
-    order = []
-    lock = await cd._get_session_lock("k:serial")
-
-    async def worker(tag):
-        async with lock:
-            order.append(f"{tag}-start")
-            await asyncio.sleep(0.02)
-            order.append(f"{tag}-end")
-
-    await asyncio.gather(worker("A"), worker("B"))
-    assert order in (
-        ["A-start", "A-end", "B-start", "B-end"],
-        ["B-start", "B-end", "A-start", "A-end"],
-    )
-
-
 async def test_command_bypasses_lock_and_reactions():
     """is_command=True: 直接执行 work,不触发 on_consume/on_complete。"""
     events = []
@@ -171,10 +122,18 @@ async def test_normal_message_holds_session_lock():
         return _w
 
     r = cd.ChannelReactions()
-    await asyncio.gather(
-        cd.run_channel_message("k:hold", is_command=False, reactions=r, work=make_work("A")),
-        cd.run_channel_message("k:hold", is_command=False, reactions=r, work=make_work("B")),
-    )
+    lock = await cd._get_session_lock("k:hold")
+    async with lock:
+        tasks = [
+            asyncio.create_task(cd.run_channel_message(
+                "k:hold", is_command=False, reactions=r, work=make_work(tag),
+            ))
+            for tag in ("A", "B")
+        ]
+        await asyncio.sleep(0.01)
+        assert order == []
+    replies = await asyncio.gather(*tasks)
+    assert replies == ["A", "B"]
     assert order in (
         ["A-start", "A-end", "B-start", "B-end"],
         ["B-start", "B-end", "A-start", "A-end"],

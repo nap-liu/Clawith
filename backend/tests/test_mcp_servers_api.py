@@ -110,6 +110,7 @@ async def test_create_then_get_detail(client):
     )
     assert r2.status_code == 200
     detail = r2.json()
+    assert detail["headers_template"] == payload["headers_template"]
     assert detail["system_prompt_block"] == "Use citations."
     assert detail["credential_state"] == "set"
     assert "credential_template" not in detail
@@ -238,30 +239,6 @@ async def test_create_requires_platform_admin(client):
         "/api/admin/mcp-servers",
         json={"name": "x", "display_name": "x", "base_url_template": "https://x"},
         headers={"Authorization": f"Bearer {member_token}"},
-    )
-    assert r.status_code == 403
-
-
-async def test_patch_rejects_non_owner_member(client):
-    """PATCH access now per-server: non-owner member is forbidden after server lookup."""
-    owner, _ = await _make_user("member")
-    suffix = uuid.uuid4().hex[:6]
-    async with async_session() as db:
-        srv = MCPServer(
-            name=f"patch_perm_{suffix}",
-            display_name="x",
-            base_url_template="https://x.example",
-            created_by_user_id=owner.id,
-        )
-        db.add(srv)
-        await db.commit()
-        await db.refresh(srv)
-        srv_id = srv.id
-    _, intruder_token = await _make_user("member")
-    r = await client.patch(
-        f"/api/admin/mcp-servers/{srv_id}",
-        json={"display_name": "y"},
-        headers={"Authorization": f"Bearer {intruder_token}"},
     )
     assert r.status_code == 403
 

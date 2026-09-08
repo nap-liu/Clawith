@@ -2,6 +2,14 @@
 
 ## Shared execution model
 
+Web workspace references carry canonical Agent-relative paths, including core
+and daily memory, through shared attachment validation. A live file draft is
+preview content until its write completes; it must not become a required stored
+attachment during that write. Validation still requires an existing file under
+the Agent's allowed workspace roots and rejects private or escaping paths.
+Rejected sends reconcile optimistic composer state with the current server
+turn snapshot without stopping an active turn or applying a stale generation.
+
 Web, IM, A2A, trigger, task, webhook, and MCP-facing message paths should delegate model/tool work to `call_llm` / `call_llm_with_failover`. New entry points may adapt context and delivery, but must not fork a private tool loop.
 
 Build an immutable runtime/model snapshot and end the inbound read transaction
@@ -34,6 +42,28 @@ automatic retry or fallback. The shared LLM boundary returns one string-
 compatible typed failure; each existing workload finalizer records its own
 failed state and every user-facing channel renders the same localized failure
 message. The LLM client never writes conversation or workload terminal state.
+
+A transient provider HTTP 429 uses one shared recovery lane: the original
+request plus at most five identical-payload retries with 1/2/4/8/16-second
+backoff. Each retry emits transient status rather than model text. The lane
+does not stack with 5xx recovery or model failover, and authentication,
+billing, or hard-quota failures are not retried. Exhaustion is a typed terminal
+failure that tells the user to wait and send `/continue` in the same Session;
+resetting the conversation is neither required nor recommended.
+
+Web and IM `/continue` explicitly reopen only the current Session's last failed
+owner when it has a durable typed LLM failure. The original anchor, instructions,
+attachments, and completed tool results remain intact. The Session lock admits
+one continuation and advances its generation/revision; active, suspended,
+cancelled, completed, archived, and superseded turns are not reopened. Ordinary
+lifecycle transitions still reject terminal-to-running changes. The explicit
+claim and failure audit annotation commit before scheduling the shared durable
+recovery lane. Startup recovery can pick up an admitted continuation after a
+restart. Continued failure notices and command replies remain visible in audit
+history but are excluded from provider replay and terminal-completion detection.
+Before each ordinary native Web turn, reload its durable history prefix after
+admission; a connected socket's cached conversation may predate asynchronous
+continuation, tool results, or completion.
 
 Model text emitted in a response that also carries tool calls belongs to that
 intermediate tool round. Persist it with the tool-call audit record and replay
@@ -68,14 +98,92 @@ Ordinary Web, IM, trigger, and non-project A2A parent Sessions use one durable S
 
 Do not add a second inbox table, a completion-cohort state machine, or channel-specific copies for this behavior. Preserve per-event audit rows, unique projection keys, bounded batch size, execution-identity validation, and the shared LLM turn loop.
 
+### User messages during a running turn
+
+WebChat (PC/H5) and IM use the same durable turn inbox on existing `ChatMessage`
+rows. The WebSocket turn driver accepts ordinary messages while listening for
+stop/disconnect; other sockets use the same admission function. Client message
+IDs deduplicate retries. Admission checks current Session ownership and keeps
+the active anchor's execution identity, model, reasoning, and scene snapshot.
+
+The shared bounded `before_round` drain consumes messages for the same executing Agent at the
+next model iteration. Messages arriving too late are promoted after terminal
+commit through the existing durable resume path. Stop cancels pending inputs;
+socket disconnect alone does not cancel execution. Each new Web user root reloads
+durable history so consumed follow-ups survive subsequent turns and reconnects.
+Hidden onboarding roots retain their initialized context because ordinary history
+intentionally excludes those anchors.
+PC/H5 allow sending during generation while retaining the stop action and the
+current stream. Read-only, confirmation, quota, and attachment checks still
+apply. Gateway-managed OpenClaw turns retain their existing admission behavior.
+This capability is independent of automatic scene selection and adds no table,
+queue service, or separate model loop.
+
+## Automatic scene selection
+
+Scene drafts and published revisions contain optional `auto_activation` settings
+with selected private/group conversation identities. These settings use the
+existing scene JSON and publication lifecycle; there is no separate binding
+table, activation worker, or execution loop. Publication and rollback lock the
+Agent before checking that a conversation has only one enabled automatic scene.
+Omitted settings from older clients and the management tool preserve the current
+selection.
+
+The management picker deduplicates historical Sessions before pagination.
+Platform private targets use tenant, Agent, channel, and user; IM targets also
+include the provider conversation, channel configuration, and installation scope.
+Project conversations use project scope and require an enabled Agent membership and
+the manager's project edit access. Tenant and current target ownership are
+validated on save and publication. Runtime resolves the latest Session for the
+target; an explicitly opened historical Session is never silently redirected.
+Archived IM routes and terminated Sessions cannot activate an automatic scene.
+
+Web, IM, and project-member dispatch share the same scene resolver. Explicit
+scene selection takes precedence; `/scene off` suppresses automatic selection
+for that Session, while a new Session inherits the target's published setting.
+Automatic activation emits no welcome, confirmation, or extra LLM invocation;
+this also suppresses the Agent's default welcome fallback on empty Sessions.
+Provider reply/@ policy stays with the existing channel adapter. Incoming turn
+anchors store the existing scene key/revision snapshot; same-turn IM messages
+retain the active anchor's scene snapshot. Recovery reads that revision.
+Browser manifests expose menus through the existing least-privilege projection
+and exclude automatic-selection targets and system prompts. H5's implicit
+default landing remains a fallback after automatic selection; an explicit scene
+URL retains precedence. WebChat in-turn admission is a separate capability.
+
+Private platform Session creation, default selection and primary deletion share
+one transaction-scoped advisory lock keyed by Agent, user and channel. Acquire
+it before selecting or creating the newest primary; release the transaction
+before model or provider waits. Concurrent admission must neither create two
+primaries nor return a unique-constraint failure.
+
 ## Sessions and identities
 
 - P2P: the counterpart is stable for the session, so identity is session-scoped.
 - Group: senders vary per message, so identity is message-scoped.
+- While an IM turn runs, all senders addressing that employee share its FIFO
+  conversation inbox. A different sender does not create a separate turn.
+  Preserve each message's sender attribution, attachments, and durable row.
+  Admission refreshes the locked session snapshot. The active turn consumes
+  pending conversation input, including older unconsumed backlog, and records
+  its current anchor/generation on delivery. Cancellation and ownership still
+  fence the consumer; opposite A2A directions target different employees.
+  Record consumption time separately from immutable arrival time. Model history,
+  recovery and compaction use one shared consumption-order projection, so old
+  backlog cannot precede its own root or be compacted out of the active turn.
+  Pending inputs are excluded from compaction until consumed. Fresh compaction
+  reads refresh ORM state after provider waits.
 - A2A: `(min(agent_a, agent_b), max(...))` is the normalized pair. `ChatMessage.agent_id` can therefore be the smaller UUID for both directions; load A2A history by `conversation_id`.
 - Trigger/A2A/background turns can carry a creator `user_id` for execution context. They do not thereby inherit that creator's administrative read authority.
 
 Session introspection is always an owned-session subset. Human Web/IM access uses authoritative user permissions; non-human access is limited to the agent's own A2A, trigger, and current-session context. Denials should not leak whether another session exists.
+
+Aware execution-record details load the linked Session's complete persisted
+history through cursor pagination, including its original task instructions.
+A failed page is shown as an incomplete load with retry, not an empty or
+complete record. Execution completion refreshes the history; an older in-flight
+read must not replace the newer result. This is an audit view and does not
+change model context loading or task execution isolation.
 
 Platform administrators in the active tenant context, tenant organization
 administrators governing standard Agents, and Agent administrators with manage
@@ -134,6 +242,14 @@ Fully recalled messages remain in the audit trail and render as a tombstone. LLM
 
 - IM model execution has no whole-tool-loop timeout; request-level model timeouts and tool-round limits belong in the shared core.
 - Native provider capabilities differ across P2P and groups. Normalize the lifecycle result while keeping provider-specific request semantics in adapters.
+- DingTalk group-mention cards keep their conversation preview to at most 40
+  Unicode code points, including any truncation marker. This caps even all-emoji
+  previews at 80 UTF-16 units and leaves delivery headroom. Only the preview is
+  shortened; the message body and native mention targets remain complete.
+- A native mention in an already-authorized exact group Session does not require
+  an Agent-to-human relationship. Individual targets still use canonical tenant
+  user IDs and must resolve to one active endpoint for the Session's provider
+  installation; proactive person delivery retains its relationship gate.
 - `send_channel_file` resolves canonical users through transport adapters. A
   DingTalk user route reuses or creates the canonical P2P Session and then uses
   the exact-Session DingTalk file sender. Capability absence on other

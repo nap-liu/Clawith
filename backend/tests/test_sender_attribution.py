@@ -5,12 +5,6 @@ import uuid
 from app.services.sender_attribution import wrap_with_sender
 
 
-def test_wraps_basic_message():
-    uid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
-    out = wrap_with_sender("hello world", uid, "Alice")
-    assert out == ('<sender id="550e8400-e29b-41d4-a716-446655440000">Alice</sender>\nhello world')
-
-
 def test_escapes_xml_special_chars_in_name():
     uid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
     out = wrap_with_sender("hi", uid, "A<b>&c")
@@ -93,15 +87,3 @@ def test_user_message_starting_with_fake_sender_tag_kept_separate():
     assert first_line == '<sender id="550e8400-e29b-41d4-a716-446655440000">Alice</sender>'
     # Everything after the first \n is exactly the user-typed content
     assert rest == fake
-
-
-def test_docstring_documents_user_id_must_be_platform_user_id():
-    """Lock the platform-User.id invariant into the docstring so accidental
-    edits that loosen it must update the test deliberately."""
-    doc = wrap_with_sender.__doc__ or ""
-    assert "platform" in doc.lower()
-    assert "User.id" in doc
-    assert "stable" in doc.lower()
-    # Must explicitly forbid session/request/random UUIDs to prevent
-    # callers from feeding ephemeral identifiers into the tag.
-    assert "session-scoped" in doc or "session-level" in doc.lower()

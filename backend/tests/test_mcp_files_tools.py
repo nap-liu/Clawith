@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import uuid
 import pytest
-from pathlib import Path
 from types import SimpleNamespace
 
 from app.database import async_session, engine
@@ -14,7 +13,9 @@ from app.models.mcp_server import MCPServer  # noqa: F401  (resolve Tool.mcp_ser
 
 @pytest.fixture(autouse=True)
 async def _isolate():
-    await engine.dispose(); yield; await engine.dispose()
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 def _ctx(token):
@@ -25,16 +26,23 @@ def _ctx(token):
 async def _seed_tenant():
     async with async_session() as db:
         t = Tenant(name="T", slug=f"t-{uuid.uuid4().hex[:10]}")
-        db.add(t); await db.commit(); await db.refresh(t); return t
+        db.add(t)
+        await db.commit()
+        await db.refresh(t)
+        return t
 
 
 async def _seed_user(tenant_id=None):
     async with async_session() as db:
         s = uuid.uuid4().hex[:12]
         ident = Identity(username=f"u_{s}", email=f"{s}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         u = User(identity_id=ident.id, display_name="U", role="member", is_active=True, tenant_id=tenant_id)
-        db.add(u); await db.commit(); await db.refresh(u); return u
+        db.add(u)
+        await db.commit()
+        await db.refresh(u)
+        return u
 
 
 async def _pat(user, scope="write"):
@@ -50,9 +58,12 @@ async def _seed_agent(creator, name="Agent", access_mode="company"):
     async with async_session() as db:
         a = Agent(name=name, creator_id=creator.id, tenant_id=creator.tenant_id,
                   agent_type="native", access_mode=access_mode, status="idle")
-        db.add(a); await db.flush()
+        db.add(a)
+        await db.flush()
         db.add(Participant(type="agent", ref_id=a.id, display_name=a.name))
-        await db.commit(); await db.refresh(a); return a
+        await db.commit()
+        await db.refresh(a)
+        return a
 
 
 async def test_read_agent_file_reads_soul():
@@ -73,27 +84,6 @@ async def test_read_agent_file_reads_soul():
 
     out = await read_agent_file_impl(_ctx(token), agent=str(agent.id), path="soul.md")
     assert "hello world" in out
-
-
-async def test_write_agent_file_new_no_confirm():
-    """Writing a brand-new file requires no confirm and returns ✅."""
-    from app.mcp_server.tools_files import read_agent_file_impl, write_agent_file_impl
-    from app.api.files import _agent_base_dir
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user)
-    token = await _pat(user, scope="write")
-
-    base = _agent_base_dir(agent.id)
-    base.mkdir(parents=True, exist_ok=True)
-
-    out = await write_agent_file_impl(_ctx(token), agent=str(agent.id), path="notes.md", content="v1")
-    assert "✅" in out, f"Expected ✅ in: {out}"
-
-    # Read it back to confirm the content was written
-    read_out = await read_agent_file_impl(_ctx(token), agent=str(agent.id), path="notes.md")
-    assert "v1" in read_out
 
 
 async def test_write_agent_file_overwrite_needs_confirm():

@@ -174,12 +174,12 @@ class AnthropicClient(LLMClient):
         response = await client.post(url, json=payload, headers=self._get_headers())
 
         if response.status_code >= 400:
-            error_text = response.text[:500]
-            raise LLMError.from_http(response.status_code, error_text)
+            error_text = response.text
+            raise LLMError.from_http(response.status_code, error_text, response.headers)
 
         data = response.json()
         if data.get("type") == "error":
-            raise LLMError(f"API error: {data.get('error', {})}")
+            raise LLMError.from_payload(data)
 
         full_content = ""
         full_reasoning = ""
@@ -252,8 +252,9 @@ class AnthropicClient(LLMClient):
                 if resp.status_code >= 400:
                     error_body = ""
                     async for chunk in resp.aiter_bytes():
-                        error_body += chunk.decode(errors="replace")
-                    raise LLMError.from_http(resp.status_code, error_body[:500])
+                        if len(error_body) < 65536:
+                            error_body += chunk.decode(errors="replace")[: 65536 - len(error_body)]
+                    raise LLMError.from_http(resp.status_code, error_body, resp.headers)
 
                 current_event = None
 
@@ -354,14 +355,15 @@ class AnthropicClient(LLMClient):
                             }
 
                     elif current_event == "error":
-                        error_info = data.get("error", {})
-                        raise LLMError(f"Anthropic stream error ({error_info.get('type')}): {error_info.get('message')}")
+                        raise LLMError.from_payload(data)
 
                     elif current_event == "message_stop":
                         break
 
-        except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
-            raise LLMError(f"Connection failed: {e}")
+        except httpx.ReadTimeout:
+            raise
+        except httpx.TransportError:
+            raise
 
         # Normalize stop reason to OpenAI style (optional but helpful for consistency)
         if last_finish_reason == "end_turn":

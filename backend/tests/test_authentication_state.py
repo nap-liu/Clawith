@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 from fastapi import BackgroundTasks, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth_login import login
 from app.core.security import create_access_token, get_current_user, hash_password

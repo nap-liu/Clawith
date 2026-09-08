@@ -85,15 +85,6 @@ async def test_content_addressed_dedup(tmp_path):
     assert len(list(storage.list_shas("t1", "tool1"))) == 1
 
 
-def _write_positional_wrapper(storage: BinaryStorage, tenant: str, tool: str, data: bytes):
-    """Tiny helper so iter_orphans test can seed quickly via sync write."""
-    import asyncio
-
-    return asyncio.get_event_loop().run_until_complete(
-        storage.write(tenant_key=tenant, tool_id=tool, stream=io.BytesIO(data))
-    )
-
-
 def test_delete_orphans_counts_successful_deletions(tmp_path):
     """delete_orphans returns the number of files actually removed."""
     storage = BinaryStorage(root=tmp_path)

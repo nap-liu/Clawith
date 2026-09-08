@@ -13,8 +13,10 @@ Use an image with development test dependencies and an isolated PostgreSQL datab
 ```bash
 docker run --rm --entrypoint python \
   --network <local-compose-network> \
-  -v "<exact-checkout>/backend:/app" -w /app \
+  -v "<exact-checkout>/backend:/app:ro" \
+  -v "<exact-checkout>/frontend:/frontend:ro" -w /app \
   -e PYTHONPATH=/app \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   -e DATABASE_URL="postgresql+asyncpg://<local-user>:<local-password>@<postgres-service>:5432/<isolated-test-db>" \
   -e AGENT_DATA_DIR=/tmp/agents \
   <backend-test-image> -m pytest <tests> -q -p no:cacheprovider
@@ -25,11 +27,24 @@ docker run --rm --entrypoint python \
 - Create/clone only an isolated test database. Never drop, migrate, or seed the local development database as test setup.
 - Runtime images may omit pytest/ruff; create or reuse a dedicated test image instead of installing on the host.
 - Import the complete relevant SQLAlchemy model graph in standalone scripts when foreign-key resolution requires it.
-- The bootstrap entrypoint detects a truly empty database, creates current metadata,
-  then stamps Alembic heads; existing databases run Alembic upgrades. Validate both
-  paths. Do not rewrite historical revisions to accommodate fresh `create_all`
-  collisions; keep ordering compatibility in the bootstrap boundary or the new
-  revision that introduces the schema.
+- Frontend is mounted read-only because the backend scene tests consume the same
+  mini-program URI fixture as the frontend. Do not copy that contract fixture.
+- `python -m app.scripts.bootstrap_db` and online Alembic CLI `upgrade head(s)`
+  share the schema boundary in `alembic/env.py`; the container entrypoint calls
+  the former. `app.models.registry` is the complete metadata import graph.
+- A truly empty database creates current metadata and guards, then stamps heads
+  in one transaction. A PostgreSQL session advisory lock serializes bootstrap
+  across concurrent-index migration commits. Versioned databases run upgrades
+  without a preceding `create_all`; application lifespan only seeds data.
+- A populated database without a revision is rejected without mutation. It needs
+  a verified legacy baseline, never a blind stamp. Raw historical revision
+  targets and offline SQL retain Alembic semantics; the current-schema shortcut
+  only applies to the bootstrap command and online CLI upgrades to head(s).
+- Validate new, repeated and previous-version paths. Historical migrations are
+  not rewritten to fix current `create_all` collisions. New schema constraints
+  and indexes must exist in metadata as well as the incremental migration;
+  non-metadata guards use `database_guards`. Previously stamped databases need a
+  new repair revision; `create_all` does not repair indexes on existing tables.
 
 For a compile/import check, use the same mounted container and run `python -m compileall` or a focused import there. This rule applies even when host Python happens to be available.
 

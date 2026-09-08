@@ -10,7 +10,7 @@ import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -218,7 +218,7 @@ class LLMStreamChunk:
 
     content: str = ""
     reasoning_content: str = ""
-    tool_call: dict | None = None
+    tool_calls: list[dict] = field(default_factory=list)
     finish_reason: str | None = None
     is_finished: bool = False
     usage: dict | None = None
@@ -407,38 +407,98 @@ class LLMError(Exception):
         status_code: int | None = None,
         error_code: str | None = None,
         error_type: str | None = None,
+        request_id: str | None = None,
+        retry_after_seconds: float | None = None,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
         self.error_type = error_type
+        self.request_id = request_id
+        self.retry_after_seconds = retry_after_seconds
 
     @classmethod
-    def from_http(cls, status_code: int, body: str) -> "LLMError":
-        """Parse common provider envelopes without relying on display text."""
-        error_code: str | None = None
-        error_type: str | None = None
+    def from_payload(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        status_code: int | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> "LLMError":
+        """Parse a structured HTTP or SSE provider error envelope."""
+        nested = payload.get("error")
+        sources = [nested, payload] if isinstance(nested, Mapping) else [payload]
+        error_code = None
+        error_type = None
+        request_id = None
         provider_message = ""
+        for source in sources:
+            if error_code is None and source.get("code") is not None:
+                error_code = str(source["code"])
+            if error_type is None and source.get("type") is not None:
+                error_type = str(source["type"])
+            if not provider_message and source.get("message") is not None:
+                provider_message = str(source["message"])
+            if status_code is None:
+                raw_status = source.get("status_code") or source.get("status")
+                if isinstance(raw_status, int) and not isinstance(raw_status, bool):
+                    status_code = raw_status
+                elif isinstance(raw_status, str) and raw_status.isdigit():
+                    status_code = int(raw_status)
+                elif str(source.get("code") or "").isdigit():
+                    numeric_code = int(str(source["code"]))
+                    if 400 <= numeric_code <= 599:
+                        status_code = numeric_code
+            if request_id is None:
+                for key in ("request_id", "requestId", "request-id"):
+                    if source.get(key) is not None:
+                        request_id = str(source[key])
+                        break
+
+        normalized_headers = {
+            str(key).lower(): str(value) for key, value in (headers or {}).items()
+        }
+        if request_id is None:
+            for key in ("x-request-id", "x-dashscope-request-id", "request-id"):
+                if normalized_headers.get(key):
+                    request_id = normalized_headers[key]
+                    break
+        retry_after = None
+        try:
+            if normalized_headers.get("retry-after") is not None:
+                retry_after = max(0.0, float(normalized_headers["retry-after"]))
+        except ValueError:
+            pass
+
+        rendered = provider_message or str(nested or payload)[:500]
+        prefix = f"HTTP {status_code}: " if status_code is not None else "Provider error: "
+        return cls(
+            prefix + rendered,
+            status_code=status_code,
+            error_code=error_code,
+            error_type=error_type,
+            request_id=request_id,
+            retry_after_seconds=retry_after,
+        )
+
+    @classmethod
+    def from_http(
+        cls,
+        status_code: int,
+        body: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> "LLMError":
+        """Parse common provider envelopes without relying on display text."""
         try:
             payload = json.loads(body)
         except (TypeError, json.JSONDecodeError):
             payload = None
         if isinstance(payload, dict):
-            error = payload.get("error")
-            sources = [error, payload] if isinstance(error, dict) else [payload]
-            for source in sources:
-                if error_code is None and source.get("code") is not None:
-                    error_code = str(source["code"])
-                if error_type is None and source.get("type") is not None:
-                    error_type = str(source["type"])
-                if not provider_message and source.get("message") is not None:
-                    provider_message = str(source["message"])
-        rendered = provider_message or str(body or "")[:500]
-        return cls(
-            f"HTTP {status_code}: {rendered}",
+            return cls.from_payload(payload, status_code=status_code, headers=headers)
+        return cls.from_payload(
+            {"message": str(body or "")[:500]},
             status_code=status_code,
-            error_code=error_code,
-            error_type=error_type,
+            headers=headers,
         )
 
 

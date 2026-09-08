@@ -120,6 +120,7 @@ async def process_dingtalk_message(
 
         # Canonical attribution is resolved through the shared provider user.
         # The receiving robot never supplies directory lookup authority.
+        dt_user_detail = None
         if _directory_credentials and directory_staff_id:
             dt_user_detail = await _get_dingtalk_user_detail_with_fallback(
                 _directory_credentials,
@@ -655,6 +656,13 @@ async def process_dingtalk_message(
                 except Exception as exc:  # noqa: BLE001 - reaction feedback is best-effort
                     logger.warning(f"[DingTalk] Tool reaction update failed: {exc}")
 
+        async def _notify_status(status: dict):
+            if channel_reactions and channel_reactions.on_status:
+                try:
+                    await channel_reactions.on_status(status)
+                except Exception as exc:
+                    logger.warning(f"[DingTalk] Status reaction update failed: {exc}")
+
         try:
             reply_text = await _call_agent_llm(
                 db, agent_id, llm_user_text,
@@ -663,6 +671,7 @@ async def process_dingtalk_message(
                 is_group=(conversation_type == "2"),
                 on_thinking=_collect_thinking,
                 on_tool_call=_notify_tool_call,
+                on_status=_notify_status,
                 turn_anchor_id=turn_anchor_id,
             )
         finally:

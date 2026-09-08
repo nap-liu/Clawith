@@ -84,7 +84,6 @@ async def setup_impl(api, self) -> bool:
             self.ctx_size = agent.context_window_size or 100
             self.user_display_name = (user.display_name or "").strip() or "there"
             self.tenant_id = user.tenant_id
-            await self._load_scene_manifest(db)
             api.logger.info(
                 f"[WS] Agent: {self.agent_name}, type: {self.agent_type}, model_id: {agent.primary_model_id}, ctx: {self.ctx_size}"
             )
@@ -101,6 +100,7 @@ async def setup_impl(api, self) -> bool:
             if not self.conv_id:
                 return False
 
+            await self._load_scene_manifest(db)
             await self._load_history(db)
             await self._prepare_initial_greeting(db, user_id)
             onboarding_eligibility = await api.resolve_onboarding_eligibility(
@@ -140,6 +140,7 @@ async def setup_impl(api, self) -> bool:
                 "read_only": self.read_only,
                 "source_channel": self.source_channel,
                 "onboarding_required": self.onboarding_required,
+                "scene_manifest": api.websocket_scene_ops.public_manifest(self.scene_manifest),
             },
             turn_snapshot,
             event_kind="turn_snapshot",

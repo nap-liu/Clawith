@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 
 import Button from '../../../../components/ui/Button';
 import ConversationTimeline from '../../../../features/conversation/web/ConversationTimeline';
@@ -18,7 +18,7 @@ type Props = {
     selectedId: string | null;
     setSelectedId: (id: string | null) => void;
     messages: Record<string, any[]>;
-    loadMessages: (conversationId: string) => Promise<any>;
+    loadMessages: (conversationId: string, revision?: string) => Promise<any>;
     agentId: string;
     agentName: string;
     locale?: string;
@@ -57,6 +57,9 @@ export default function AwareExecutionsPane({
     const conversationId = selected?.conversation_id || (!selected?.conversation_missing ? selected?.id : null);
     const timeline = conversationId ? messages[conversationId] || [] : [];
     const timelineLoaded = !conversationId || Object.prototype.hasOwnProperty.call(messages, conversationId);
+    const [historyError, setHistoryError] = useState(false);
+    const [retry, setRetry] = useState(0);
+    const historyVersion = `${selected?.execution?.status || ''}:${selected?.execution?.finished_at || ''}:${selected?.last_message_at || ''}`;
 
     useEffect(() => {
         if (!selectedRecordId) {
@@ -64,14 +67,22 @@ export default function AwareExecutionsPane({
             return;
         }
         if (selectedId !== selectedRecordId) setSelectedId(selectedRecordId);
-        if (conversationId && !Object.prototype.hasOwnProperty.call(messages, conversationId)) void loadMessages(conversationId);
-    }, [conversationId, loadMessages, messages, selectedId, selectedRecordId, setSelectedId]);
+    }, [selectedId, selectedRecordId, setSelectedId]);
 
-    const choose = async (session: any) => {
+    useEffect(() => {
+        let active = true;
+        setHistoryError(false);
+        if (conversationId) {
+            void loadMessages(conversationId, `${historyVersion}:${retry}`).catch(() => {
+                if (active) setHistoryError(true);
+            });
+        }
+        return () => { active = false; };
+    }, [conversationId, historyVersion, loadMessages, retry]);
+
+    const choose = (session: any) => {
         const id = session.record_id || session.id;
         setSelectedId(id);
-        const nextConversationId = session.conversation_id || (!session.conversation_missing ? session.id : null);
-        if (nextConversationId) await loadMessages(nextConversationId);
     };
     const execution = selected?.execution;
     const selectedStatus = execution?.status || 'completed';
@@ -121,7 +132,8 @@ export default function AwareExecutionsPane({
                         )}
                         {execution?.last_error && <div className="aware-execution-error" role="alert"><strong>{t('agent.aware.workspace.lastError')}</strong><span>{execution.last_error}</span></div>}
                         <div className="aware-timeline">
-                            {!timelineLoaded ? <div className="aware-empty aware-empty--compact">{t('common.loading')}</div> : (
+                            {historyError && <div className="aware-execution-error" role="alert"><span>{t('agent.aware.workspace.historyLoadFailed')}</span><Button variant="secondary" onClick={() => setRetry((value) => value + 1)}>{t('common.retry')}</Button></div>}
+                            {!timelineLoaded ? (historyError ? null : <div className="aware-empty aware-empty--compact">{t('common.loading')}</div>) : (
                                 <ConversationTimeline
                                     agentId={agentId}
                                     agentName={agentName}

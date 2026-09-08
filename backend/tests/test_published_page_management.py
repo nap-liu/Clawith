@@ -11,33 +11,31 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+from app.models.org import OrgDepartment, OrgMember
+from app.models.tool import AgentTool, Tool
+from app.services.agent_tools import (
+    _list_page_access_requests,
+    _list_published_pages,
+    _publish_page,
+    _search_page_viewers,
+    _update_published_page_access,
+    get_agent_tools_for_llm,
+)
+from app.services.tool_seeder import seed_builtin_tools
 from tests.test_published_page_access import (
-    AGENT_TOOLS,
-    BUILTIN_TOOLS,
     Agent,
-    AgentTool,
-    OrgDepartment,
-    OrgMember,
     PublishedPage,
     PublishedPageAccess,
     PublishedPageAnonymousVisitor,
     PublishedPageVisitor,
     Tenant,
-    Tool,
     User,
     _dispose_engine,  # noqa: F401 - expose imported autouse fixture to this module
-    _list_page_access_requests,
-    _list_published_pages,
     _make_restricted_page,
     _make_user,
-    _publish_page,
-    _search_page_viewers,
-    _update_published_page_access,
     app,
     async_session,
     create_access_token,
-    get_agent_tools_for_llm,
-    seed_builtin_tools,
     settings,
 )
 
@@ -664,49 +662,6 @@ async def test_agent_can_list_real_access_request_statuses_with_pagination():
     assert "Pending access requests: 1" in page_list
 
 
-async def test_publish_tool_contract_is_self_contained_and_consistent():
-    runtime_publish = next(item["function"] for item in AGENT_TOOLS if item["function"]["name"] == "publish_page")
-    seeded_publish = next(item for item in BUILTIN_TOOLS if item["name"] == "publish_page")
-    assert runtime_publish["parameters"]["properties"]["access_mode"]["default"] == "authenticated"
-    assert seeded_publish["parameters_schema"]["properties"]["access_mode"]["default"] == "authenticated"
-    for required_guidance in (
-        "omit access_mode for authenticated access",
-        "use public only when the user explicitly wants",
-        "search_page_viewers",
-        "preserves its current permissions",
-        "Non-public pages receive the platform watermark automatically",
-        "publication actor and exact publication time",
-        "Page URL and Management URL",
-    ):
-        assert required_guidance in runtime_publish["description"]
-        assert required_guidance in seeded_publish["description"]
-    assert any(item["function"]["name"] == "list_page_access_requests" for item in AGENT_TOOLS)
-    assert any(item["name"] == "list_page_access_requests" for item in BUILTIN_TOOLS)
-    runtime_list = next(item["function"] for item in AGENT_TOOLS if item["function"]["name"] == "list_published_pages")
-    for expected_metadata in ("creator", "creation time", "most recent publisher", "publication time"):
-        assert expected_metadata in runtime_list["description"]
-    runtime_page_tools = {
-        item["function"]["name"]: item["function"]
-        for item in AGENT_TOOLS
-        if item["function"]["name"] in {
-            "publish_page",
-            "search_page_viewers",
-            "update_published_page_access",
-            "list_published_pages",
-            "list_page_access_requests",
-        }
-    }
-    seeded_page_tools = {
-        item["name"]: item
-        for item in BUILTIN_TOOLS
-        if item["name"] in runtime_page_tools
-    }
-    assert seeded_page_tools.keys() == runtime_page_tools.keys()
-    for tool_name, runtime_tool in runtime_page_tools.items():
-        assert seeded_page_tools[tool_name]["description"] == runtime_tool["description"]
-        assert seeded_page_tools[tool_name]["parameters_schema"] == runtime_tool["parameters"]
-
-
 async def test_seeded_publish_page_guidance_reaches_actual_llm_tool_output():
     _short_id, _page_id, agent_id, _owner_id, _viewer_id = await _make_restricted_page()
     await seed_builtin_tools()
@@ -740,7 +695,9 @@ async def test_page_manager_can_use_member_picker_directory():
     _short_id, page_id, _agent_id, owner_id, viewer_id = await _make_restricted_page()
     async with async_session() as db:
         published_page = await db.get(PublishedPage, page_id)
-        department = OrgDepartment(name="研发部", path="研发部", tenant_id=published_page.tenant_id)
+        department = OrgDepartment(
+            name="研发部", path="研发部", tenant_id=published_page.tenant_id, member_count=1,
+        )
         db.add(department)
         await db.flush()
         owner = await db.get(User, owner_id)

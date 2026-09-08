@@ -111,43 +111,15 @@ async def test_stdio_routes_through_sandbox():
 
     assert result == "CALLED"
     mock_host_inst.ensure_registered.assert_awaited_once()
+    registration = mock_host_inst.ensure_registered.call_args
+    assert registration.args[1] == str(agent_id)
+    cfg = registration.args[2]
+    assert cfg["command"] == "npx"
+    assert cfg["args"] == ["-y", "alibabacloud-devops-mcp-server"]
+    assert cfg["env"]["YUNXIAO_ACCESS_TOKEN"] == "tok-literal"
     # call_tool should be called with the hub entry name, the MCP tool name, and args
     mock_hub_inst.call_tool.assert_awaited_once_with("yx__abc123456789", "get_current_user", {})
     mock_host_inst.deregister.assert_awaited_once_with("yx__abc123456789")
-
-
-async def test_stdio_ensure_registered_receives_rendered_cfg():
-    """ensure_registered receives rendered command/args/env (no placeholders left)."""
-    agent_id, user_id, tool_name = await _make_stdio_fixture()
-
-    with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, \
-         patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub, \
-         patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
-        mock_host_inst = MagicMock()
-        mock_host_inst.ensure_registered = AsyncMock(return_value="yx__entry")
-        mock_host_inst.deregister = AsyncMock(return_value=None)
-        MockHost.return_value = mock_host_inst
-
-        mock_hub_inst = MagicMock()
-        mock_hub_inst.call_tool = AsyncMock(return_value="OK")
-        MockHub.return_value = mock_hub_inst
-
-        from app.services.agent_tools import _execute_mcp_tool
-
-        await _execute_mcp_tool(
-            tool_name, {"param": "val"}, agent_id=agent_id, user_id=user_id
-        )
-
-    # Verify ensure_registered was called with (server_name, str(agent_id), cfg_dict)
-    call_args = mock_host_inst.ensure_registered.call_args
-    assert call_args is not None
-    positional = call_args[0]
-    assert positional[1] == str(agent_id)
-    cfg_arg = positional[2]
-    assert cfg_arg["command"] == "npx"
-    assert cfg_arg["args"] == ["-y", "alibabacloud-devops-mcp-server"]
-    assert cfg_arg["env"]["YUNXIAO_ACCESS_TOKEN"] == "tok-literal"
-    mock_host_inst.deregister.assert_awaited_once_with("yx__entry")
 
 
 async def test_stdio_call_error_still_deregisters_runtime():

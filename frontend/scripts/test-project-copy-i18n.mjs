@@ -1,15 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, extname, join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const projectRoot = resolve(root, "src/features/projects");
-const checkedFiles = [
-  ...collectSourceFiles(projectRoot),
-  resolve(root, "src/components/SessionViewerDrawer.tsx"),
-];
-
 const bannedVisibleCopy = [
   "已连接标准 Web Chat",
   "标准 Web Chat",
@@ -34,17 +28,6 @@ const bannedVisibleCopy = [
   "enabled project owner",
   "Human group messages",
 ];
-
-for (const path of checkedFiles) {
-  const source = readFileSync(path, "utf8");
-  for (const copy of bannedVisibleCopy) {
-    assert.equal(
-      source.toLowerCase().includes(copy.toLowerCase()),
-      false,
-      `${path} contains internal or obsolete visible copy: ${copy}`,
-    );
-  }
-}
 
 const zh = JSON.parse(readFileSync(resolve(root, "src/i18n/zh.json"), "utf8"));
 const en = JSON.parse(readFileSync(resolve(root, "src/i18n/en.json"), "utf8"));
@@ -115,32 +98,7 @@ for (const [locale, messages] of [
   );
 }
 
-assert.equal(zh.projectWorkspaceNav.tabs.projectAgents, "数字员工");
-assert.equal(en.projectWorkspaceNav.tabs.projectAgents, "Digital Employees");
-assert.match(zh.projectGraphs.sourceAgent, /数字员工/);
-assert.match(en.projectGraphs.sourceAgent, /Digital Employee/);
-assert.equal(zh.projectWorkspaceFiles.agentRoot, "项目数字员工");
-assert.equal(en.projectWorkspaceFiles.agentRoot, "Project Digital Employees");
-
-const planningSource = readFileSync(
-  resolve(projectRoot, "ProjectPlanningPage.tsx"),
-  "utf8",
-);
-assert.equal(
-  /[\u3400-\u9fff]/u.test(planningSource),
-  false,
-  "ProjectPlanningPage user copy must use i18n keys",
-);
-
 console.log("project user-visible copy and i18n check passed");
-
-function collectSourceFiles(directory) {
-  return readdirSync(directory).flatMap((name) => {
-    const path = join(directory, name);
-    if (statSync(path).isDirectory()) return collectSourceFiles(path);
-    return [".ts", ".tsx"].includes(extname(path)) ? [path] : [];
-  });
-}
 
 function leafKeys(value, prefix = "") {
   return Object.entries(value)

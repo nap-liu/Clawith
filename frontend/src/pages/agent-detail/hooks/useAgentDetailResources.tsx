@@ -3,6 +3,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, taskApi, tenantApi, triggerApi } from '../../../services/api';
 import { fetchAuth } from '../utils/fetchAuth';
+import { useExecutionHistory } from './useExecutionHistory';
 import {
     focusItemFromApi,
     formatTokensParts,
@@ -197,7 +198,7 @@ export function useAgentDetailResources({
 
     const [expandedFocusIds, setExpandedFocusIds] = useState<Set<string>>(() => new Set());
     const [expandedReflection, setExpandedReflection] = useState<string | null>(null);
-    const [reflectionMessages, setReflectionMessages] = useState<Record<string, any[]>>({});
+    const { messages: reflectionMessages, setMessages: setReflectionMessages, loadMessages: loadReflectionMessages } = useExecutionHistory(id);
     const [showAllFocus, setShowAllFocus] = useState(false);
     const [showCompletedFocus, setShowCompletedFocus] = useState(false);
     const [showAllReflections, setShowAllReflections] = useState(false);
@@ -215,18 +216,6 @@ export function useAgentDetailResources({
             else next.add(focusId);
             return next;
         });
-    };
-    const loadReflectionMessages = async (sessionId: string) => {
-        if (!id || reflectionMessages[sessionId]) return;
-        try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${id}/sessions/${sessionId}/messages`, { headers: { Authorization: `Bearer ${tkn}` } });
-            if (res.ok) {
-                const data = await res.json();
-                setReflectionMessages((prev) => ({ ...prev, [sessionId]: data }));
-            }
-        } catch {
-        }
     };
 
     const { data: soulContent } = useQuery({

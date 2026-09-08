@@ -159,6 +159,7 @@ async def await_turn_with_abort_impl(
     partial_chunks: list[str],
     *,
     on_abort=None,
+    on_message=None,
 ):
     """Drive a running web turn while listening for abort / disconnect on the socket."""
     aborted = False
@@ -178,9 +179,16 @@ async def await_turn_with_abort_impl(
                     llm_task.cancel()
                 aborted = True
                 break
+            elif isinstance(msg, dict) and on_message is not None:
+                await on_message(msg)
         except asyncio.TimeoutError:
             continue
         except WebSocketDisconnect:
+            disconnected = True
+            break
+        except RuntimeError as exc:
+            if not _is_closed_websocket_receive_error(exc, recv_json):
+                raise
             disconnected = True
             break
 
@@ -198,3 +206,26 @@ async def await_turn_with_abort_impl(
 
     resp = await llm_task
     return resp, ("disconnected" if disconnected else "completed")
+
+
+_CLOSED_WEBSOCKET_RECEIVE_ERRORS = frozenset(
+    {
+        'WebSocket is not connected. Need to call "accept" first.',
+        'Cannot call "receive" once a disconnect message has been received.',
+    }
+)
+
+
+def _is_closed_websocket_receive_error(exc: RuntimeError, recv_json) -> bool:
+    """Recognize only Starlette's closed-socket receive errors."""
+    if str(exc) not in _CLOSED_WEBSOCKET_RECEIVE_ERRORS:
+        return False
+    websocket = getattr(recv_json, "__self__", None)
+    states = [
+        getattr(websocket, name, None)
+        for name in ("client_state", "application_state")
+        if hasattr(websocket, name)
+    ]
+    if not states:
+        return True
+    return any(getattr(state, "name", str(state)).upper().endswith("DISCONNECTED") for state in states)

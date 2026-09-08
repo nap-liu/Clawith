@@ -388,6 +388,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                     user_id=platform_user_id,
                     session_id=session_conv_id,
                     on_thinking=_collect_thinking,
+                    on_status=_thinking_sender.push_status,
                     turn_anchor_id=ingested.message.id,
                 )
             finally:

@@ -15,7 +15,6 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
 
 from app.core.security import create_access_token
 from app.database import async_session, engine
@@ -88,7 +87,7 @@ async def client():
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 
-async def test_create_pat_returns_plaintext_token_and_prefix(client):
+async def test_create_pat_returns_token_and_persists_tenant_owner(client):
     """POST creates a PAT; response includes plaintext token (clw_ prefix) and token_prefix."""
     tenant = await _seed_tenant()
     user, token = await _seed_user(tenant_id=tenant.id)
@@ -105,27 +104,10 @@ async def test_create_pat_returns_plaintext_token_and_prefix(client):
     assert body["name"] == "my-mcp-token"
     assert "id" in body
     assert "created_at" in body
-
-
-async def test_create_pat_row_exists_in_db(client):
-    """PAT row is written to DB after successful POST."""
-    tenant = await _seed_tenant()
-    user, token = await _seed_user(tenant_id=tenant.id)
-
-    resp = await client.post(
-        "/api/personal-access-tokens",
-        json={"name": "db-check-token"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp.status_code in (200, 201), resp.text
-    pat_id = uuid.UUID(resp.json()["id"])
+    assert body["scope"] == "read"
 
     async with async_session() as db:
-        result = await db.execute(
-            select(PersonalAccessToken).where(PersonalAccessToken.id == pat_id)
-        )
-        row = result.scalar_one_or_none()
-
+        row = await db.get(PersonalAccessToken, uuid.UUID(body["id"]))
     assert row is not None
     assert row.user_id == user.id
     assert row.tenant_id == tenant.id
@@ -250,16 +232,6 @@ async def test_create_pat_with_write_scope(client):
     lst = await client.get("/api/personal-access-tokens",
                            headers={"Authorization": f"Bearer {jwt}"})
     assert any(p["scope"] == "write" for p in lst.json())
-
-
-async def test_create_pat_defaults_scope_read(client):
-    tenant = await _seed_tenant()
-    user, jwt = await _seed_user(tenant_id=tenant.id)
-    r = await client.post("/api/personal-access-tokens",
-                          json={"name": "ro"},
-                          headers={"Authorization": f"Bearer {jwt}"})
-    assert r.status_code in (200, 201), r.text
-    assert r.json()["scope"] == "read"
 
 
 async def test_create_pat_invalid_scope_400(client):

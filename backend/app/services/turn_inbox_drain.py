@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, func, select
 
 from app.database import async_session
 from app.models.audit import ChatMessage
@@ -50,6 +50,12 @@ async def drain_turn_inbox(
         ):
             raise asyncio.CancelledError
 
+        anchor = await db.get(ChatMessage, active_turn_anchor_id)
+        if anchor is None:
+            raise asyncio.CancelledError
+        target_agent_id = str(
+            (anchor.message_meta or {}).get("execution_agent_id") or anchor.agent_id
+        )
         candidates = list(
             (
                 await db.execute(
@@ -58,13 +64,10 @@ async def drain_turn_inbox(
                         ChatMessage.conversation_id == str(session.id),
                         ChatMessage.message_meta["turn_inbox_state"].as_string()
                         == "pending",
-                        ChatMessage.message_meta["turn_inbox_mode"].as_string()
-                        == "current_turn",
-                        ChatMessage.user_id == execution_user_id,
-                        ChatMessage.message_meta["turn_inbox_anchor_id"].as_string()
-                        == str(active_turn_anchor_id),
-                        ChatMessage.message_meta["turn_inbox_generation"].as_integer()
-                        == snapshot.generation,
+                        func.coalesce(
+                            ChatMessage.message_meta["execution_agent_id"].as_string(),
+                            cast(ChatMessage.agent_id, String),
+                        ) == target_agent_id,
                     )
                     .order_by(ChatMessage.created_at, ChatMessage.id)
                     .limit(TURN_INBOX_MAX_MESSAGES * 4)
@@ -94,10 +97,10 @@ async def drain_turn_inbox(
             selected.append(row)
             total_bytes += min(size, TURN_INBOX_MAX_BYTES)
 
+        consumed_at = max(datetime.now(UTC), anchor.created_at + timedelta(microseconds=2))
         if selected and before_injection is not None:
-            earliest_injection = min(row.created_at for row in selected)
             await before_injection(
-                created_at=earliest_injection - timedelta(microseconds=1)
+                created_at=consumed_at - timedelta(microseconds=1)
             )
 
         injected: list[dict] = []
@@ -117,7 +120,16 @@ async def drain_turn_inbox(
             if attachments:
                 message["attachments"] = attachments
             injected.append(message)
-            row.message_meta = {**meta, "turn_inbox_state": "delivered"}
+            # The live session snapshot fences the consumer. Pending inputs
+            # belong to the conversation, including a prior owner's backlog.
+            row.message_meta = {
+                **meta,
+                "turn_inbox_state": "delivered",
+                "turn_inbox_mode": "current_turn",
+                "turn_inbox_anchor_id": str(active_turn_anchor_id),
+                "turn_inbox_generation": snapshot.generation,
+                "turn_inbox_consumed_at": consumed_at.isoformat(),
+            }
         marker_advanced = False
         if selected:
             prior_marker = dict(session.im_config or {}).get(

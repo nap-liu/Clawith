@@ -226,11 +226,6 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
   assert.equal(first?.sessionId, second?.sessionId);
   assert.equal(first?.anchorMessageId, "first-run-turn");
   assert.equal(second?.anchorMessageId, "second-run-turn");
-  assert.notEqual(
-    first?.anchorMessageId,
-    second?.anchorMessageId,
-    "Run routing must preserve its exact turn inside a shared session",
-  );
 }
 
 assert.equal(

@@ -19,6 +19,8 @@ from app.services.agent_mcp_lifecycle import (
     list_installed_mcp_servers,
     uninstall_mcp_server,
 )
+from app.services.agent_tools import get_agent_tools_for_llm
+from app.services.tool_seeder import seed_builtin_tools
 
 pytestmark = pytest.mark.asyncio
 
@@ -450,83 +452,31 @@ async def test_runtime_rechecks_assignment_after_schema_was_built():
     call.assert_not_awaited()
 
 
-def test_builtin_and_runtime_tool_contracts_are_exact_and_default():
-    from app.services.agent_tools import AGENT_TOOLS
-    from app.services.tool_seeder import BUILTIN_TOOLS
+async def test_seeded_inventory_contract_is_visible_to_the_llm():
+    expected_names = {
+        "list_installed_mcp_servers", "refresh_mcp_server", "uninstall_mcp_server",
+    }
+    await seed_builtin_tools()
+    _tenant_id, (agent_id,) = await _make_agents(1)
+    async with async_session() as db:
+        rows = (await db.scalars(select(Tool).where(Tool.name.in_(expected_names)))).all()
+        assert {row.name for row in rows} == expected_names
+        for row in rows:
+            assert row.is_default is True
+            db.add(AgentTool(agent_id=agent_id, tool_id=row.id, enabled=True))
+        await db.commit()
 
     runtime = {
         item["function"]["name"]: item["function"]
-        for item in AGENT_TOOLS
-        if item.get("function", {}).get("name") in {
-            "list_installed_mcp_servers",
-            "refresh_mcp_server",
-            "uninstall_mcp_server",
-        }
+        for item in await get_agent_tools_for_llm(agent_id)
     }
-    seeded = {
-        item["name"]: item
-        for item in BUILTIN_TOOLS
-        if item.get("name") in runtime
-    }
-    assert set(runtime) == {
-        "list_installed_mcp_servers",
-        "refresh_mcp_server",
-        "uninstall_mcp_server",
-    }
-    assert set(seeded) == set(runtime)
-
-    list_schema = runtime["list_installed_mcp_servers"]["parameters"]
-    assert list_schema == {"type": "object", "properties": {}, "required": []}
-    uninstall_schema = runtime["uninstall_mcp_server"]["parameters"]
-    assert uninstall_schema["required"] == ["mcp_server_id"]
-    assert set(uninstall_schema["properties"]) == {"mcp_server_id"}
-    refresh_schema = runtime["refresh_mcp_server"]["parameters"]
-    assert refresh_schema["required"] == ["mcp_server_id"]
-    assert set(refresh_schema["properties"]) == {"mcp_server_id"}
-    for name in runtime:
-        assert seeded[name]["parameters_schema"] == runtime[name]["parameters"]
-        assert seeded[name]["description"] == runtime[name]["description"]
-        assert seeded[name]["is_default"] is True
-
-
-async def test_seeded_inventory_contract_is_visible_to_the_llm():
-    from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
-    from app.services.tool_seeder import seed_builtin_tools
-
-    _tenant_id, (agent_id,) = await _make_agents(1)
-    expected_description = next(
-        item["function"]["description"]
-        for item in AGENT_TOOLS
-        if item.get("function", {}).get("name") == "list_installed_mcp_servers"
-    )
-
-    await seed_builtin_tools()
-
-    async with async_session() as db:
-        persisted_tool = await db.scalar(
-            select(Tool).where(Tool.name == "list_installed_mcp_servers")
-        )
-        assignment = await db.scalar(
-            select(AgentTool).where(
-                AgentTool.agent_id == agent_id,
-                AgentTool.tool_id == persisted_tool.id,
-            )
-        )
-        if assignment is None:
-            db.add(
-                AgentTool(
-                    agent_id=agent_id,
-                    tool_id=persisted_tool.id,
-                    enabled=True,
-                )
-            )
-            await db.commit()
-    visible_tools = await get_agent_tools_for_llm(agent_id)
-    visible_description = next(
-        item["function"]["description"]
-        for item in visible_tools
-        if item.get("function", {}).get("name") == "list_installed_mcp_servers"
-    )
-
-    assert persisted_tool.description == expected_description
-    assert visible_description == expected_description
+    for row in rows:
+        schema = runtime[row.name]["parameters"]
+        assert schema == row.parameters_schema
+        assert runtime[row.name]["description"] == row.description
+        if row.name == "list_installed_mcp_servers":
+            assert schema == {"type": "object", "properties": {}, "required": []}
+        else:
+            assert schema["required"] == ["mcp_server_id"]
+            assert set(schema["properties"]) == {"mcp_server_id"}
+            assert schema["properties"]["mcp_server_id"]["type"] == "string"

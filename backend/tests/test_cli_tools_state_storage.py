@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -44,14 +43,8 @@ def test_ensure_home_is_idempotent(state_root):
 
     leaf2 = s.ensure_home(tenant_id=None, tool_id=tool, user_id=user)
     assert leaf2 == leaf1
+    assert leaf2.parent.parent.name == "_global"
     assert marker.read_text() == "persisted"
-
-
-def test_ensure_home_uses_global_segment_for_missing_tenant(state_root):
-    s = StateStorage(root=state_root)
-    leaf = s.ensure_home(tenant_id=None, tool_id=uuid.uuid4(), user_id=uuid.uuid4())
-    # `_global` keeps tenantless tools out of the per-tenant namespace.
-    assert leaf.parent.parent.name == "_global"
 
 
 def test_ensure_home_isolates_different_users(state_root):

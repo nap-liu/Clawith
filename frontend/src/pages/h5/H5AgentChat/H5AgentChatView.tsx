@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import {
     IconAlertTriangle,
     IconArrowLeft,
@@ -46,6 +47,7 @@ export default function H5AgentChatView({
     composer: ReturnType<typeof useH5AgentChatComposer>;
     presentation: ReturnType<typeof useH5AgentChatPresentation>;
 }) {
+    const { t } = useTranslation();
     const {
         chatRootRef,
         closeQuickActionsMenu,
@@ -588,22 +590,21 @@ export default function H5AgentChatView({
                             type="button"
                             className="h5-chat__send h5-chat__send--stop"
                             onClick={stopGeneration}
-                            aria-label="停止"
-                            title="停止"
+                            aria-label={t("chat.stop")}
+                            title={t("chat.stop")}
                         >
                             <IconPlayerStopFilled size={18} />
                         </button>
-                    ) : (
-                        <button
-                            type="submit"
-                            className="h5-chat__send"
-                            disabled={sendDisabled}
-                            aria-label="发送"
-                            title="发送"
-                        >
-                            {isStartingNew ? <IconLoader2 size={19} className="h5-chat__spin" /> : <IconSend size={19} />}
-                        </button>
-                    )}
+                    ) : null}
+                    <button
+                        type="submit"
+                        className="h5-chat__send"
+                        disabled={sendDisabled}
+                        aria-label={t("chat.send")}
+                        title={t("chat.send")}
+                    >
+                        {isStartingNew ? <IconLoader2 size={19} className="h5-chat__spin" /> : <IconSend size={19} />}
+                    </button>
                 </div>
             </form>
             <SessionViewerDrawer

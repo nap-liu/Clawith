@@ -111,7 +111,11 @@ async def test_dingtalk_quote_survives_jsonb_persistence_and_history_replay():
 
         client_message = serialize_chat_message_for_client(stored)
         assert client_message["quoted_message"] == quote
+        assert client_message["display_content"] == "请分析这条引用"
         llm_message = build_llm_message_from_row(stored)
         assert llm_message is not None
+        assert llm_message["role"] == "user"
+        assert llm_message["attachments"] == quote["attachments"]
+        assert "引用消息上下文" in llm_message["content"]
         assert "持久化的引用内容" in str(llm_message["content"])
         assert "请分析这条引用" in str(llm_message["content"])

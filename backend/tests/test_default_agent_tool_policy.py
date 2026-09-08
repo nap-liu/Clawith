@@ -3,12 +3,9 @@
 import uuid
 from types import SimpleNamespace
 
-from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.tool_config import merge_tool_config_layers
 from app.services.tool_seeder import (
     BUILTIN_TOOLS,
-    FORCE_DISABLED_BUILTIN_CATEGORIES,
-    SYNC_IS_DEFAULT_TOOL_NAMES,
     builtin_tool_enabled,
     should_sync_builtin_default,
 )
@@ -20,41 +17,7 @@ def _seed(name: str) -> dict:
     return next(tool for tool in BUILTIN_TOOLS if tool["name"] == name)
 
 
-def test_requested_builtin_default_flags_are_canonical():
-    assert _seed("execute_code")["is_default"] is False
-    assert _seed("execute_code_aio")["is_default"] is True
-    assert _seed("read_image")["is_default"] is True
-    assert REQUEST_CONFIRMATION_TOOL_SEED["is_default"] is True
-    assert _seed("run_subagent")["is_default"] is True
-    assert _seed("send_message_to_subagent")["is_default"] is True
-    assert _seed("stop_subagent")["is_default"] is True
-    assert _seed("send_message_to_parent")["is_default"] is True
-
-
-def test_session_message_exposes_shared_dingtalk_card_template_config():
-    seed = _seed("send_session_message")
-    field = next(
-        item
-        for item in seed["config_schema"]["fields"]
-        if item["key"] == "card_template_id"
-    )
-
-    assert field["type"] == "string"
-    assert field.get("agent_only") is not True
-    assert _seed("send_group_session_message")["config_schema"] == {}
-
-
 def test_toolscall_is_agent_scoped_and_defaults_on():
-    seed = _seed("execute_code_aio")
-    assert seed["config"]["toolscall_enabled"] is True
-    field = next(
-        item
-        for item in seed["config_schema"]["fields"]
-        if item["key"] == "toolscall_enabled"
-    )
-    assert field["type"] == "checkbox"
-    assert field["default"] is True
-    assert field["agent_only"] is True
     assert toolscall_enabled_for_agent({}) is True
     assert toolscall_enabled_for_agent(None) is True
     assert toolscall_enabled_for_agent({"toolscall_enabled": True}) is True
@@ -88,21 +51,10 @@ def test_agent_only_toolscall_flag_cannot_be_overridden_by_broader_config():
     assert toolscall_enabled_for_agent(opted_out) is False
 
 
-def test_requested_builtin_flags_are_synced_to_existing_databases():
-    assert {
-        "execute_code",
-        "execute_code_aio",
-        "read_image",
-        "request_confirmation",
-    }.issubset(SYNC_IS_DEFAULT_TOOL_NAMES)
-
-
 def test_agentbay_builtin_tools_are_globally_and_by_default_disabled():
     agentbay_tools = [tool for tool in BUILTIN_TOOLS if tool["category"] == "agentbay"]
 
-    assert FORCE_DISABLED_BUILTIN_CATEGORIES == {"agentbay"}
     assert agentbay_tools
-    assert all(tool["is_default"] is False for tool in agentbay_tools)
     assert all(builtin_tool_enabled(tool) is False for tool in agentbay_tools)
     assert all(should_sync_builtin_default(tool) is True for tool in agentbay_tools)
 

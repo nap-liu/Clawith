@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from app.api.websocket_inbox_ops import publish_inbox_receipt, receive_turn_message
+from app.services.llm.failure_outcome import render_message
+from app.services.turn_inbox import schedule_durable_turn_resume
+
 
 async def message_loop_impl(api, self):
     initial_content = (
         str(self.pending_initial_assistant["content"]) if self.pending_initial_assistant else self.welcome_message
     )
-    if initial_content and not self.history_messages and not self.onboarding_required:
+    automatic_scene = (self.scene_manifest or {}).get("activation_source") == "automatic"
+    if initial_content and not self.history_messages and not self.onboarding_required and not automatic_scene:
         await self.websocket.send_json(
             {
                 "type": "done",
@@ -18,7 +23,7 @@ async def message_loop_impl(api, self):
         )
 
     while True:
-        data = await self.websocket.receive_json()
+        data = await receive_turn_message(self.websocket)
 
         project_writable = False
         if getattr(self, "project_session_access", None) is not None:
@@ -74,6 +79,12 @@ async def message_loop_impl(api, self):
         if not content and not is_onboarding_trigger:
             continue
 
+        if content.strip().lower() == "/continue" and not is_onboarding_trigger:
+            from app.api.websocket_continue import handle_continue
+
+            await handle_continue(self, data)
+            continue
+
         validated_attachments = None
         if raw_attachments is not None:
             from app.services.chat_attachments import validate_client_attachments
@@ -94,6 +105,10 @@ async def message_loop_impl(api, self):
             continue
 
         await self._load_scene_manifest()
+        await self.websocket.send_json({
+            "type": "scene_manifest",
+            "manifest": api.websocket_scene_ops.public_manifest(self.scene_manifest),
+        })
         try:
             effective_llm_model = await self._resolve_effective_model(
                 override_model_id,
@@ -122,7 +137,8 @@ async def message_loop_impl(api, self):
         client_message_id = data.get("message_id") or data.get("client_message_id")
 
         turn_lease = None
-        if self.agent_type != "openclaw":
+        active_snapshot = await self._load_turn_snapshot()
+        if self.agent_type != "openclaw" and active_snapshot.status != "running":
             try:
                 turn_lease = await api.get_workload_capacity().acquire(
                     api.WorkloadKind.INTERACTIVE,
@@ -178,6 +194,13 @@ async def message_loop_impl(api, self):
                 await turn_lease.release()
             raise
 
+        ingested = getattr(self, "last_ingest_result", None)
+        if ingested is not None and (ingested.queued_to_running_turn or not ingested.created):
+            if turn_lease is not None:
+                await turn_lease.release()
+            await publish_inbox_receipt(api, self, ingested, turn_snapshot)
+            continue
+
         if turn_anchor_id is not None and not is_onboarding_trigger:
             await api.publish_conversation_turn_event(
                 agent_id=self.agent_id,
@@ -203,7 +226,7 @@ async def message_loop_impl(api, self):
             await self._send_current_turn_event(
                 {
                     "type": "confirmation_required",
-                    "content": "请先完成待确认操作。",
+                    "content": render_message("chat.confirmationRequired", self.lang),
                     "message_id": data.get("message_id") or data.get("client_message_id"),
                     "name": "request_confirmation",
                     "call_id": str(pending_confirmation.row_id),
@@ -213,7 +236,13 @@ async def message_loop_impl(api, self):
             )
             continue
 
-        if ignored_confirmation:
+        if self.agent_type != "openclaw" and turn_lease is None and ingested is not None and not consumed_by_onmessage:
+            schedule_durable_turn_resume(ingested.message)
+            continue
+
+        # Onboarding uses a hidden system anchor, absent from ordinary history.
+        # Its initialized context must continue through the existing turn path.
+        if self.agent_type != "openclaw" and not is_onboarding_trigger and not consumed_by_onmessage and turn_anchor_id is not None:
             from app.services.chat_history import load_history_prefix_before_anchor
 
             async with api.async_session() as _history_db:
@@ -231,7 +260,7 @@ async def message_loop_impl(api, self):
                     api.with_turn_envelope(
                         {
                             "type": "error",
-                            "content": "确认状态已更新，但会话上下文恢复失败，请重试。",
+                            "content": render_message("errors.conversationHistoryUnavailable", self.lang),
                         },
                         failed_snapshot,
                         event_kind="turn_terminal",
@@ -242,7 +271,7 @@ async def message_loop_impl(api, self):
                 continue
             self.conversation = refreshed_prefix
 
-        if persisted_initial_assistant is not None:
+        if persisted_initial_assistant is not None and (is_onboarding_trigger or self.agent_type == "openclaw"):
             self.conversation.append({"role": "assistant", "content": persisted_initial_assistant.content})
 
         if consumed_by_onmessage:

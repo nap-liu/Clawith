@@ -127,6 +127,11 @@ short-lived credential records; normal identity, RBAC, chat and turn tables keep
 their existing ownership. Cleanup must preserve unmerged work and the user's
 other worktrees and shared local stacks.
 
+OpenAPI models register through `app.models.registry`. The shared bootstrap and
+Alembic boundary owns schema creation; neither application lifespan nor a second
+entrypoint import list creates these tables. The integration merge revision joins
+the OpenAPI migration and bootstrap-index repair without rewriting either parent.
+
 OpenAPI opts into the shared identity owner's exact mainland phone lookup:
 domestic 11-digit, `+86`, `86` and `0086` forms resolve to the same existing
 membership when unambiguous. Other explicit international prefixes are preserved.

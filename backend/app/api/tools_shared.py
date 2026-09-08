@@ -25,6 +25,8 @@ from app.services.tool_enablement import (
     SUBAGENT_TOOL_NAMES,
     resolved_agent_tool_enabled,
     tool_is_required,
+    tool_visibility_clause,
+    tool_visible_to_agent,
 )
 from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES
 
@@ -125,28 +127,8 @@ async def _load_agent_tool_assignments(db: AsyncSession, agent_id: uuid.UUID) ->
 
 
 def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: dict[str, AgentTool]):
-    """Build the DB filter for tools visible to an agent.
-
-    Visibility rules:
-    - builtin tools are global platform capabilities
-    - admin tools belong only to the agent's company or are platform-wide (tenant_id is NULL)
-    - explicitly assigned tools are always visible
-    """
-    clauses = [Tool.source == "builtin"]
-    # Platform-level admin tools (tenant_id IS NULL) are visible to all tenants;
-    # tenant-scoped admin tools are restricted to their own tenant.
-    if agent_tenant_id:
-        clauses.append((Tool.source == "admin") & (
-            (Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))
-        ))
-    else:
-        clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
-
-    assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
-    if assigned_tool_ids:
-        clauses.append(Tool.id.in_(assigned_tool_ids))
-
-    return or_(*clauses)
+    """Build the shared tenant-safe catalog filter."""
+    return tool_visibility_clause(agent_tenant_id, [uuid.UUID(tool_id) for tool_id in assignments])
 
 
 def _tool_record_visible_to_agent(
@@ -154,19 +136,7 @@ def _tool_record_visible_to_agent(
     agent_tenant_id: uuid.UUID | None,
     assignments: dict[str, AgentTool],
 ) -> bool:
-    """Pure visibility check mirroring _agent_visible_tool_clause."""
-    if str(tool.id) in assignments:
-        return True
-    if tool.source == "builtin":
-        return True
-    if tool.source == "admin":
-        # Platform-level admin tool (tenant_id IS NULL) visible to all tenants.
-        if tool.tenant_id is None:
-            return True
-        return bool(agent_tenant_id and tool.tenant_id == agent_tenant_id)
-    if tool.source == "agent":
-        return str(tool.id) in assignments
-    return False
+    return tool_visible_to_agent(tool, agent_tenant_id, assignments)
 
 
 def _resolve_target_tenant_id(current_user: User, tenant_id: str | None = None) -> uuid.UUID | None:

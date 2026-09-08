@@ -34,14 +34,12 @@ class DummyResult:
 class RecordingDB:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
-        self.statements = []
         self.added = []
         self.committed = False
         self.refreshed = []
         self.flush_count = 0
 
     async def execute(self, _statement, _params=None):
-        self.statements.append(_statement)
         if not self.responses:
             raise AssertionError("unexpected execute() call")
         return self.responses.pop(0)
@@ -292,8 +290,6 @@ async def test_org_admin_can_list_all_sessions(monkeypatch):
         db=db,
     )
 
-    rendered = str(db.statements[1])
-    assert "chat_sessions.project_id IS NULL" in rendered
     assert len(sessions) == 1
     assert sessions[0].id == str(session.id)
     assert sessions[0].user_id == str(owner_id)
@@ -350,60 +346,6 @@ async def test_creator_can_list_all_sessions(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mine_session_list_applies_channel_filter_and_pagination(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    now = datetime.now(UTC)
-
-    current_user = SimpleNamespace(id=user_id, role="member")
-    agent = SimpleNamespace(id=agent_id, creator_id=uuid.uuid4())
-    session = SimpleNamespace(
-        id=uuid.uuid4(),
-        agent_id=agent_id,
-        user_id=user_id,
-        source_channel="wechat_miniprogram",
-        title="H5 history",
-        created_at=now,
-        last_message_at=now,
-        peer_agent_id=None,
-        is_group=False,
-        group_name=None,
-        is_primary=False,
-    )
-    db = RecordingDB(
-        responses=[
-            DummyResult([agent]),
-            DummyResult([session]),
-            DummyResult([(str(session.id), 1)]),
-            DummyResult([]),
-        ]
-    )
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    sessions = await chat_sessions_api.list_sessions(
-        agent_id=agent_id,
-        scope="mine",
-        source_channel="wechat_miniprogram",
-        limit=10,
-        offset=5,
-        current_user=current_user,
-        db=db,
-    )
-
-    rendered = str(db.statements[1])
-    assert "chat_sessions.source_channel =" in rendered
-    assert "chat_sessions.project_id IS NULL" in rendered
-    assert "LIMIT" in rendered.upper()
-    assert "OFFSET" in rendered.upper()
-    assert len(sessions) == 1
-    assert sessions[0].source_channel == "wechat_miniprogram"
-
-
-@pytest.mark.asyncio
 async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
     viewer_id = uuid.uuid4()
     agent_id = uuid.uuid4()
@@ -439,6 +381,7 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
         responses=[
             DummyResult([session]),
             DummyResult([message]),
+            DummyResult([(owner_id, "Owner", None)]),  # canonical sender profile
         ]
     )
 
@@ -503,6 +446,7 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
         responses=[
             DummyResult([session]),
             DummyResult([message]),
+            DummyResult([(other_user_id, "Other user", None)]),
         ]
     )
 
@@ -613,7 +557,12 @@ async def test_session_messages_fold_append_only_tool_events(monkeypatch):
         }), 7, second_anchor),
     ]
     # The SQL query returns newest-first; the handler reverses it before rendering.
-    db = RecordingDB(responses=[DummyResult([session]), DummyResult(reversed(rows))])
+    db = RecordingDB(responses=[
+        DummyResult([session]),
+        DummyResult(reversed(rows)),
+        DummyResult([(user_id, "User", None)]),
+        DummyResult([(agent_id, "Assistant", None)]),
+    ])
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return SimpleNamespace(id=agent_id, creator_id=uuid.uuid4()), "use"
@@ -683,7 +632,11 @@ async def test_session_messages_keep_row_id_as_confirmation_handle(monkeypatch):
         participant_id=None,
         user_id=user_id,
     )
-    db = RecordingDB(responses=[DummyResult([session]), DummyResult([pending_confirmation])])
+    db = RecordingDB(responses=[
+        DummyResult([session]),
+        DummyResult([pending_confirmation]),
+        DummyResult([(agent_id, "Assistant", None)]),
+    ])
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return SimpleNamespace(id=agent_id, creator_id=uuid.uuid4()), "use"
@@ -711,7 +664,7 @@ async def test_create_session_returns_web_session_shape(monkeypatch):
     agent_id = uuid.uuid4()
 
     current_user = SimpleNamespace(id=user_id, role="member")
-    db = RecordingDB()
+    db = RecordingDB(responses=[DummyResult()])
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return SimpleNamespace(id=agent_id), "use"

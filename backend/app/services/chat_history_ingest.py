@@ -436,6 +436,7 @@ async def ingest_incoming_chat_message(
     user_id: uuid.UUID,
     content: str,
     source_channel: str,
+    allow_turn_inbox: bool = True,
     provider_event_id: str | None = None,
     channel_config_id: uuid.UUID | str | None = None,
     actor_ref: str | None = None,
@@ -492,7 +493,10 @@ async def ingest_incoming_chat_message(
 
     locked_session = (
         await db.execute(
-            select(ChatSession).where(ChatSession.id == session.id).with_for_update()
+            select(ChatSession)
+            .where(ChatSession.id == session.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if locked_session is None:
@@ -558,25 +562,13 @@ async def ingest_incoming_chat_message(
     # to order inbound events.  A /scene command racing with an older in-flight
     # turn can therefore affect only messages ingested after the command wins
     # this lock.  Explicit Web/H5 scene metadata remains authoritative.
-    if not meta.get("scene_key"):
-        from app.services.scene_service import (
-            SCENE_SESSION_CONFIG_KEY,
-            SCENE_STATUS_OK,
-            resolve_scene_for_activation,
-            scene_message_meta,
-        )
+    if not meta.get("scene_resolved") and not meta.get("scene_key"):
+        from app.services.scene_activation import resolve_session_scene
+        from app.services.scene_service import scene_message_meta
 
-        active_scene_key = str(
-            (locked_session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) or ""
-        )
-        if active_scene_key:
-            resolved_scene = await resolve_scene_for_activation(
-                db,
-                agent_id,
-                active_scene_key,
-            )
-            if resolved_scene.status == SCENE_STATUS_OK:
-                meta.update(scene_message_meta(resolved_scene.manifest))
+        manifest = await resolve_session_scene(db, agent_id, locked_session)
+        meta.update(scene_message_meta(manifest))
+        meta["scene_resolved"] = True
     if not meta.get("model_id"):
         from app.services.chat_model_selection import MODEL_SESSION_CONFIG_KEY
 
@@ -644,7 +636,7 @@ async def ingest_incoming_chat_message(
     queued_to_running_turn = False
     from app.services.turn_inbox import is_turn_inbox_channel
 
-    if not matched.consumed and is_turn_inbox_channel(source_channel):
+    if allow_turn_inbox and not matched.consumed and is_turn_inbox_channel(source_channel):
         from app.services.conversation_turn_lifecycle import (
             ACTIVE_TURN_STATUS,
             conversation_turn_snapshot_for_session,
@@ -654,35 +646,31 @@ async def ingest_incoming_chat_message(
         snapshot = conversation_turn_snapshot_for_session(locked_session)
         if snapshot.status == ACTIVE_TURN_STATUS and snapshot.anchor_id is not None:
             active_anchor = await db.get(ChatMessage, snapshot.anchor_id)
+            # A2A stores both employees' directions in one conversation. Route
+            # by the executing employee, never by the human sender.
+            same_employee = active_anchor is not None and str(
+                (active_anchor.message_meta or {}).get("execution_agent_id")
+                or active_anchor.agent_id
+            ) == str((row.message_meta or {}).get("execution_agent_id") or row.agent_id)
             active_meta = (
                 dict(active_anchor.message_meta or {})
                 if active_anchor is not None
                 else {}
             )
-            active_execution_agent_id = str(
-                active_meta.get("execution_agent_id")
-                or (active_anchor.agent_id if active_anchor is not None else "")
-            )
-            incoming_execution_agent_id = str(
-                dict(row.message_meta or {}).get("execution_agent_id")
-                or row.agent_id
-            )
-            same_execution_identity = bool(
-                active_anchor is not None
-                and active_anchor.user_id == row.user_id
-                and active_execution_agent_id == incoming_execution_agent_id
-            )
+            if same_employee:
+                incoming_meta = dict(row.message_meta or {})
+                for key in ("scene_key", "scene_revision", "activation_source", "model_id", "reasoning_effort"):
+                    incoming_meta.pop(key, None)
+                    if key in active_meta:
+                        incoming_meta[key] = active_meta[key]
+                row.message_meta = incoming_meta
             row.message_meta = {
                 **dict(row.message_meta or {}),
                 "turn_inbox_state": "pending",
                 "turn_inbox_anchor_id": str(snapshot.anchor_id),
                 "turn_inbox_generation": snapshot.generation,
-                # A different group sender must not inherit the active human's
-                # execution identity. It remains durable and is promoted only
-                # after the current generation terminates.
-                "turn_inbox_mode": (
-                    "current_turn" if same_execution_identity else "next_turn"
-                ),
+                # One conversation has one inbox, regardless of its sender.
+                "turn_inbox_mode": "current_turn" if same_employee else "next_turn",
             }
             await db.flush()
             queued_to_running_turn = True
@@ -692,7 +680,7 @@ async def ingest_incoming_chat_message(
             )
 
             await mark_channel_turn_admitted()
-            if same_execution_identity:
+            if same_employee:
                 await register_channel_receipt_anchor(row.id)
         else:
             await transition_conversation_turn(

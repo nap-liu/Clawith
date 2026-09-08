@@ -20,6 +20,20 @@ class Identity(Base):
     """
 
     __tablename__ = "identities"
+    __table_args__ = (
+        sa.Index(
+            "uq_identities_email_lower_not_null",
+            sa.text("lower(btrim(email))"),
+            unique=True,
+            postgresql_where=sa.text("email IS NOT NULL AND btrim(email) <> ''"),
+        ).ddl_if(dialect="postgresql"),
+        sa.Index(
+            "uq_identities_phone_normalized_not_null",
+            sa.text("regexp_replace(phone, '[[:space:]+-]', '', 'g')"),
+            unique=True,
+            postgresql_where=sa.text("phone IS NOT NULL AND btrim(phone) <> ''"),
+        ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     

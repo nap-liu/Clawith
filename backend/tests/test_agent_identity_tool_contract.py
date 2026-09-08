@@ -1,17 +1,23 @@
-"""Agent-visible identity contracts use canonical, typed execution IDs only."""
+"""Seeded LLM tools and Gateway requests use canonical, typed execution IDs."""
 
 import uuid
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
+from sqlalchemy import select
 
+from app.database import async_session
+from app.models.channel_config import ChannelConfig
+from app.models.tool import AgentTool, Tool
 from app.schemas.schemas import (
     GatewayMessageOut,
     GatewayRelationshipItem,
     GatewaySendMessageRequest,
 )
-from app.services.agent_tools import AGENT_TOOLS
-from app.services.tool_seeder import BUILTIN_TOOLS
+from app.services.agent_tools import get_agent_tools_for_llm
+from app.services.tool_seeder import seed_builtin_tools
+from tests.test_agent_mcp_lifecycle import _isolate, _make_agents  # noqa: F401 - autouse fixture
 
 
 LEGACY_EXECUTION_FIELDS = {
@@ -33,223 +39,87 @@ LEGACY_EXECUTION_FIELDS = {
 }
 
 
-def _agent_schema(name: str) -> dict:
-    for tool in AGENT_TOOLS:
-        function = tool.get("function") or {}
-        if function.get("name") == name:
-            return function["parameters"]
-    raise AssertionError(f"Agent tool {name!r} is missing")
-
-
-def _seed_schema(name: str) -> dict:
-    for tool in BUILTIN_TOOLS:
-        if tool.get("name") == name:
-            return tool["parameters_schema"]
-    raise AssertionError(f"Seeded tool {name!r} is missing")
-
-
-def _agent_description(name: str) -> str:
-    for tool in AGENT_TOOLS:
-        function = tool.get("function") or {}
-        if function.get("name") == name:
-            return function.get("description") or ""
-    raise AssertionError(f"Agent tool {name!r} is missing")
-
-
-def _seed_description(name: str) -> str:
-    for tool in BUILTIN_TOOLS:
-        if tool.get("name") == name:
-            return tool.get("description") or ""
-    raise AssertionError(f"Seeded tool {name!r} is missing")
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "run_background_resource",
-        "set_execution_user",
-        "set_trigger",
-        "update_trigger",
-        "cancel_trigger",
-        "list_triggers",
-        "send_channel_file",
-        "send_platform_message",
-        "send_channel_message",
-        "send_session_message",
-        "send_group_session_message",
-        "search_contacts",
-        "add_contact",
-        "remove_contact",
-        "send_message_to_agent",
-        "send_file_to_agent",
-        "send_feishu_message",
-        "feishu_user_search",
-        "feishu_calendar_list",
-        "feishu_calendar_create",
-        "feishu_calendar_update",
-        "feishu_calendar_delete",
-        "feishu_approval_create",
-    ],
-)
-def test_identity_related_seed_and_runtime_schemas_are_identical(name):
-    assert _seed_schema(name) == _agent_schema(name)
-
-
-def test_seeded_trigger_schema_exposes_real_webhook_runtime_contract():
-    schema = _seed_schema("set_trigger")
-    assert "webhook" in schema["properties"]["type"]["enum"]
-    assert schema["properties"]["webhook_mode"]["enum"] == [
-        "legacy",
-        "queue",
-        "merge",
-    ]
-    assert _seed_schema("update_trigger")["properties"]["webhook_mode"]["enum"] == [
-        "legacy",
-        "queue",
-        "merge",
-    ]
-
-
-def test_seeded_tool_strings_fit_persisted_column_contracts():
-    for tool in BUILTIN_TOOLS:
-        assert len(tool.get("icon") or "") <= 10, tool.get("name")
-
-
-@pytest.mark.parametrize(
-    ("name", "canonical_field"),
-    [
-        ("send_channel_message", "user_id"),
-        ("send_platform_message", "user_id"),
-        ("send_feishu_message", "user_id"),
-        ("send_message_to_agent", "agent_id"),
-        ("send_file_to_agent", "agent_id"),
-    ],
-)
-def test_message_tool_schemas_use_only_canonical_recipient_ids(name, canonical_field):
-    for schema in (_agent_schema(name), _seed_schema(name)):
-        properties = schema["properties"]
-        assert canonical_field in properties
-        assert canonical_field in schema["required"]
-        assert LEGACY_EXECUTION_FIELDS.isdisjoint(properties)
-
-
-@pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
-def test_session_message_uses_only_exact_session_address(name):
-    for schema in (_agent_schema(name), _seed_schema(name)):
-        assert set(schema["properties"]) == {
-            "session_id",
-            "message",
-            "mention_user_ids",
-            "mention_all",
-        }
-        assert schema["required"] == ["session_id", "message"]
-        assert schema["additionalProperties"] is False
-        assert schema["properties"]["mention_user_ids"]["maxItems"] == 20
-        assert schema["properties"]["mention_all"]["type"] == "boolean"
-
-
-def test_session_message_description_states_its_narrow_delivery_boundary():
-    for description in (
-        _agent_description("send_session_message"),
-        _seed_description("send_session_message"),
-    ):
-        assert "text only" in description
-        assert "already exists" in description
-        assert "never creates a Session" in description
-        assert "selects or changes a channel" in description
-        assert "sends files" in description
-        assert "contacts another digital employee" in description
-
-
-@pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
-def test_session_message_description_requires_tool_for_native_mentions(name):
-    for description in (_agent_description(name), _seed_description(name)):
-        assert "MUST call" in description
-        assert "normal assistant reply is plain text" in description
-        assert "mention_all=true" in description
-    for schema in (_agent_schema(name), _seed_schema(name)):
-        message_description = schema["properties"]["message"]["description"]
-        assert "do not prefix" in message_description
-        assert "renders the mention exactly once" in message_description
-
-
-@pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
-def test_session_message_native_mention_schema_is_channel_neutral(name):
-    for description, schema in (
-        (_agent_description(name), _agent_schema(name)),
-        (_seed_description(name), _seed_schema(name)),
-    ):
-        mention_contract = " ".join(
-            [
-                description,
-                schema["properties"]["message"]["description"],
-                schema["properties"]["mention_user_ids"]["description"],
-                schema["properties"]["mention_all"]["description"],
-            ]
-        ).lower()
-        assert "dingtalk" not in mention_contract
-        assert "钉钉" not in mention_contract
-
-
-@pytest.mark.parametrize("name", ["add_contact", "remove_contact"])
-def test_contact_mutation_schema_requires_exactly_one_canonical_id(name):
-    for schema in (_agent_schema(name), _seed_schema(name)):
+@pytest.mark.asyncio
+async def test_seeded_identity_contract_reaches_llm_with_canonical_parameters():
+    recipients = {
+        "send_channel_message": "user_id", "send_platform_message": "user_id",
+        "send_feishu_message": "user_id", "send_message_to_agent": "agent_id",
+        "send_file_to_agent": "agent_id",
+    }
+    sessions = {"send_session_message", "send_group_session_message"}
+    feishu = {
+        "feishu_user_search", "feishu_calendar_list", "feishu_calendar_create",
+        "feishu_calendar_update", "feishu_calendar_delete", "feishu_approval_create",
+    }
+    contacts = {"add_contact", "remove_contact"}
+    names = set(recipients) | sessions | feishu | contacts
+    await seed_builtin_tools()
+    _, (agent_id,) = await _make_agents(1)
+    async with async_session() as db:
+        db.add(ChannelConfig(agent_id=agent_id, channel_type="feishu", is_configured=True))
+        rows = (await db.scalars(select(Tool).where(Tool.name.in_(names)))).all()
+        assert {row.name for row in rows} == names
+        db.add_all(AgentTool(agent_id=agent_id, tool_id=row.id, enabled=True) for row in rows)
+        await db.commit()
+    runtime = {
+        item["function"]["name"]: item["function"]
+        for item in await get_agent_tools_for_llm(agent_id)
+    }
+    for row in rows:
+        schema = runtime[row.name]["parameters"]
         assert LEGACY_EXECUTION_FIELDS.isdisjoint(schema["properties"])
-        assert schema["oneOf"] == [
-            {"required": ["user_id"], "not": {"required": ["agent_id"]}},
-            {"required": ["agent_id"], "not": {"required": ["user_id"]}},
-        ]
+        # A2A runtime legitimately removes msg_type when async A2A is disabled.
+        for name, prop in schema["properties"].items():
+            assert prop == row.parameters_schema["properties"][name]
+        if row.name in recipients:
+            field = recipients[row.name]
+            assert field in schema["properties"] and field in schema["required"]
+        if row.name in feishu:
+            assert "open_id" not in runtime[row.name]["description"]
+        if row.name in contacts:
+            validator = Draft202012Validator(schema)
+            assert validator.is_valid({"user_id": str(uuid.uuid4())})
+            assert validator.is_valid({"agent_id": str(uuid.uuid4())})
+            assert not validator.is_valid({})
+            assert not validator.is_valid({"user_id": "u", "agent_id": "a"})
+        if row.name in sessions:
+            assert set(schema["properties"]) == {
+                "session_id", "message", "mention_user_ids", "mention_all",
+            }
+            assert schema["required"] == ["session_id", "message"]
+            assert schema["additionalProperties"] is False
+            assert schema["properties"]["mention_user_ids"]["maxItems"] == 20
+            assert schema["properties"]["mention_all"]["type"] == "boolean"
+            description = runtime[row.name]["description"]
+            assert "MUST call" in description and "mention_all=true" in description
+            mention_copy = description + " ".join(
+                prop.get("description", "") for prop in schema["properties"].values()
+            )
+            assert "dingtalk" not in mention_copy.lower() and "钉钉" not in mention_copy
+    assert "user_id" in runtime["feishu_calendar_list"]["parameters"]["properties"]
+    assert "attendee_user_ids" in runtime["feishu_calendar_create"]["parameters"]["properties"]
+    assert "user_id" in runtime["feishu_approval_create"]["parameters"]["required"]
 
 
-def test_okr_seed_schemas_use_canonical_owner_and_member_ids():
-    objective = _seed_schema("create_objective")
-    daily = _seed_schema("upsert_member_daily_report")
-
-    assert LEGACY_EXECUTION_FIELDS.isdisjoint(objective["properties"])
-    assert objective["not"] == {"required": ["user_id", "agent_id"]}
-    assert {"user_id", "agent_id"}.issubset(objective["properties"])
-
-    assert LEGACY_EXECUTION_FIELDS.isdisjoint(daily["properties"])
-    assert daily["oneOf"] == [
-        {"required": ["user_id"], "not": {"required": ["agent_id"]}},
-        {"required": ["agent_id"], "not": {"required": ["user_id"]}},
-    ]
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "feishu_user_search",
-        "feishu_calendar_list",
-        "feishu_calendar_create",
-        "feishu_calendar_update",
-        "feishu_calendar_delete",
-        "feishu_approval_create",
-    ],
-)
-def test_feishu_tool_contract_never_exposes_provider_or_name_execution_ids(name):
-    for schema in (_agent_schema(name), _seed_schema(name)):
-        assert LEGACY_EXECUTION_FIELDS.isdisjoint(schema.get("properties", {}))
-
-    runtime_description = next(
-        tool["function"]["description"]
-        for tool in AGENT_TOOLS
-        if tool.get("function", {}).get("name") == name
-    )
-    seeded_description = next(
-        tool["description"] for tool in BUILTIN_TOOLS if tool.get("name") == name
-    )
-    for description in (runtime_description, seeded_description):
-        assert "open_id" not in description
-
-
-def test_feishu_execution_tools_use_canonical_user_ids():
-    for getter in (_agent_schema, _seed_schema):
-        assert "user_id" in getter("feishu_calendar_list")["properties"]
-        assert "attendee_user_ids" in getter("feishu_calendar_create")["properties"]
-        approval = getter("feishu_approval_create")
-        assert "user_id" in approval["properties"]
-        assert "user_id" in approval["required"]
+@pytest.mark.asyncio
+async def test_persisted_okr_schema_retains_canonical_owner_contract():
+    await seed_builtin_tools()
+    async with async_session() as db:
+        rows = (await db.scalars(select(Tool).where(Tool.name.in_(
+            {"create_objective", "upsert_member_daily_report"}
+        )))).all()
+    assert len(rows) == 2
+    for row in rows:
+        schema = row.parameters_schema
+        assert LEGACY_EXECUTION_FIELDS.isdisjoint(schema["properties"])
+        if row.name == "create_objective":
+            assert schema["not"] == {"required": ["user_id", "agent_id"]}
+            assert {"user_id", "agent_id"}.issubset(schema["properties"])
+        else:
+            assert schema["oneOf"] == [
+                {"required": ["user_id"], "not": {"required": ["agent_id"]}},
+                {"required": ["agent_id"], "not": {"required": ["user_id"]}},
+            ]
 
 
 def test_gateway_recipient_is_exactly_one_typed_id():
@@ -277,8 +147,6 @@ def test_gateway_relationship_item_has_display_name_and_one_typed_id():
         channels=["feishu"],
     )
     assert item.user_id == user_id
-    assert "name" not in GatewayRelationshipItem.model_fields
-    assert "type" not in GatewayRelationshipItem.model_fields
     with pytest.raises(ValidationError):
         GatewayRelationshipItem(display_name="Missing ID", role="collaborator")
 

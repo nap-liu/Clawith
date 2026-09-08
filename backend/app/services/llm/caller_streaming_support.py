@@ -21,6 +21,7 @@ class CallLlmState:
     on_tool_call: Any = None
     on_tool_delta: Any = None
     on_thinking: Any = None
+    on_status: Any = None
     on_usage: Any = None
     is_group: bool = False
     on_code_output: Any = None
@@ -34,6 +35,7 @@ class CallLlmState:
     before_tool_execution: Any = None
     include_soul: bool = True
     include_memory: bool = True
+    provider_retries_enabled: bool = True
     supports_vision: bool = False
     max_tool_rounds: int = 50
     static_prompt: str = ""
@@ -49,7 +51,9 @@ class CallLlmState:
     durable_user_id: uuid.UUID | None = None
     turn_t0: float = 0.0
     max_output_recoveries: int = 0
-    repeat_streaks: dict[tuple[str, str], int] = field(default_factory=dict)
+    invalid_tool_call_retries: int = 0
+    tool_executed: bool = False
+    tool_round_history: list[tuple[tuple[tuple[str, str], str], ...]] = field(default_factory=list)
     visible_response_segments: list[str] = field(default_factory=list)
     terminal_response_segments: list[str] = field(default_factory=list)
     turn_execution_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -77,6 +81,7 @@ async def _call_llm_before_tool_execution_guard(state: CallLlmState) -> None:
 
 
 async def _call_llm_admit_tool_execution(state: CallLlmState) -> None:
+    state.tool_executed = True
     durable_agent_id = state.turn_anchor_agent_id or state.agent_uuid
     if durable_agent_id is not None and state.session_id and state.turn_anchor_id is not None:
         from app.services.conversation_turn_lifecycle import admit_conversation_turn_side_effect
@@ -401,6 +406,8 @@ async def _call_llm_dispatch_round_with_context_recovery(
                 on_chunk=_chunk,
                 on_tool_delta=_tool_delta,
                 on_thinking=_thinking,
+                on_status=state.on_status,
+                allow_retries=state.provider_retries_enabled,
             )
             return response, current_messages, current_budget
         except LLMError as exc:

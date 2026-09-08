@@ -91,27 +91,6 @@ async def test_delete_tool_tolerates_missing_dirs(tmp_path):
     assert state.delete_tenant("tenant-x") == 0
 
 
-def test_delete_user_only_affects_that_user(tmp_path):
-    """Removing user A's state must not touch user B's state in the same tool."""
-    state_root = tmp_path / "state"
-    state_root.mkdir()
-    state = StateStorage(root=state_root)
-
-    tenant = uuid.uuid4()
-    tool = uuid.uuid4()
-    user_a, user_b = uuid.uuid4(), uuid.uuid4()
-
-    _seed_user_home(state, tenant, tool, user_a, b"a-secret")
-    _seed_user_home(state, tenant, tool, user_b, b"b-secret")
-
-    freed = state.delete_user(user_a)
-
-    # A's bytes reported; A's dir gone; B untouched.
-    assert freed >= len(b"a-secret")
-    assert not (state_root / str(tenant) / str(tool) / str(user_a)).exists()
-    assert (state_root / str(tenant) / str(tool) / str(user_b) / "login.json").read_bytes() == b"b-secret"
-
-
 def test_delete_user_spans_tenants_and_tools(tmp_path):
     """A user's state leaf lives under every (tenant, tool) they've used."""
     state_root = tmp_path / "state"
@@ -137,7 +116,7 @@ def test_delete_user_spans_tenants_and_tools(tmp_path):
     assert not (state_root / str(tenant_1) / str(tool_2) / str(user)).exists()
     assert not (state_root / str(tenant_2) / str(tool_1) / str(user)).exists()
     # Control user's state survives.
-    assert (state_root / str(tenant_1) / str(tool_1) / str(other_user) / "login.json").exists()
+    assert (state_root / str(tenant_1) / str(tool_1) / str(other_user) / "login.json").read_bytes() == b"other"
 
 
 @pytest.mark.asyncio

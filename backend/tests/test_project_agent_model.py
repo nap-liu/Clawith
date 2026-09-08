@@ -1,54 +1,63 @@
-"""Model invariants for project-native Agent derivatives."""
-
-from __future__ import annotations
+"""PostgreSQL invariants for project-native Agent derivatives."""
 
 import uuid
 
-from sqlalchemy import CheckConstraint
+import pytest
+from sqlalchemy import delete, null, select, text, update
+from sqlalchemy.exc import IntegrityError
 
+from app.database import async_session, engine
+from app.models import registry  # noqa: F401
 from app.models.agent import Agent
+from app.models.project import Project
+from app.models.tenant import Tenant
+from app.models.user import User
 
 
-def _constraint_sql(name: str) -> str:
-    constraint = next(
-        item for item in Agent.__table__.constraints if isinstance(item, CheckConstraint) and item.name == name
-    )
-    return str(constraint.sqltext)
+async def test_project_agent_scope_defaults_constraints_and_lifecycle():
+    await engine.dispose()
+    try:
+        async with async_session() as db:
+            tenant = Tenant(name="Project model", slug=f"project-model-{uuid.uuid4().hex}")
+            db.add(tenant)
+            await db.flush()
+            owner = User(tenant_id=tenant.id, display_name="Owner")
+            db.add(owner)
+            await db.flush()
+            project = Project(tenant_id=tenant.id, owner_user_id=owner.id, name="Project")
+            source = Agent(tenant_id=tenant.id, creator_id=owner.id, name="Source")
+            db.add_all([project, source])
+            await db.flush()
+            assert (source.scope, source.project_id, source.source_agent_id, source.agent_dir) == (
+                "standard", None, None, None,
+            )
+            server_scope = await db.scalar(update(Agent).where(Agent.id == source.id).values(
+                scope=text("DEFAULT"),
+            ).returning(Agent.scope))
+            assert server_scope == "standard"
 
+            for fields in (
+                {"scope": null()},
+                {"scope": "invalid"},
+                {"scope": "standard", "project_id": project.id},
+                {"scope": "project", "agent_dir": ".agents/missing-project"},
+                {"scope": "project", "project_id": project.id},
+            ):
+                with pytest.raises(IntegrityError):
+                    async with db.begin_nested():
+                        db.add(Agent(tenant_id=tenant.id, creator_id=owner.id, name="Invalid", **fields))
+                        await db.flush()
 
-def test_project_agent_columns_and_default() -> None:
-    table = Agent.__table__
-
-    assert table.c.scope.default.arg == "standard"
-    assert table.c.scope.server_default.arg == "standard"
-    assert table.c.scope.nullable is False
-    assert table.c.project_id.nullable is True
-    assert table.c.source_agent_id.nullable is True
-    assert table.c.agent_dir.nullable is True
-
-
-def test_project_agent_foreign_keys_preserve_lifecycle_and_lineage() -> None:
-    table = Agent.__table__
-    project_fk = next(iter(table.c.project_id.foreign_keys))
-    source_fk = next(iter(table.c.source_agent_id.foreign_keys))
-
-    assert project_fk.target_fullname == "projects.id"
-    assert project_fk.ondelete == "CASCADE"
-    assert source_fk.target_fullname == "agents.id"
-    assert source_fk.ondelete == "SET NULL"
-
-
-def test_project_agent_scope_constraints_are_explicit() -> None:
-    scope_sql = _constraint_sql("ck_agents_scope")
-    project_scope_sql = _constraint_sql("ck_agents_project_scope")
-
-    assert "'standard', 'project'" in scope_sql
-    assert "scope = 'standard' AND project_id IS NULL" in project_scope_sql
-    assert "scope = 'project' AND project_id IS NOT NULL" in project_scope_sql
-    assert "agent_dir IS NOT NULL" in project_scope_sql
-
-
-def test_project_agent_directory_is_derived_from_agent_id() -> None:
-    agent_id = uuid.uuid4()
-
-    assert Agent.project_agent_dir(agent_id) == f".agents/{agent_id}"
+            derivative = Agent(
+                tenant_id=tenant.id, creator_id=owner.id, name="Derivative", scope="project",
+                project_id=project.id, source_agent_id=source.id, agent_dir=".agents/derivative",
+            )
+            db.add(derivative)
+            await db.flush()
+            await db.execute(delete(Agent).where(Agent.id == source.id))
+            await db.refresh(derivative)
+            assert derivative.source_agent_id is None
+            await db.execute(delete(Project).where(Project.id == project.id))
+            assert await db.scalar(select(Agent.id).where(Agent.id == derivative.id)) is None
+    finally:
+        await engine.dispose()

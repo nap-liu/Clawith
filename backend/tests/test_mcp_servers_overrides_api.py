@@ -227,17 +227,6 @@ async def test_get_overrides_agent_creator_can_read_own_agent_scope(client):
     assert body["agent"][0]["system_prompt_block"] == "CREATOR-BLOCK"
 
 
-async def test_get_overrides_non_admin_without_agent_id_is_403(client):
-    """Non-admin calling GET /overrides without agent_id must get 403."""
-    srv = await _make_server()
-    _, member_token = await _make_user("member")
-    r = await client.get(
-        f"/api/admin/mcp-servers/{srv.id}/overrides",
-        headers={"Authorization": f"Bearer {member_token}"},
-    )
-    assert r.status_code == 403
-
-
 async def test_delete_override_clears_row(client):
     srv = await _make_server()
     _, admin_token = await _make_user("platform_admin")

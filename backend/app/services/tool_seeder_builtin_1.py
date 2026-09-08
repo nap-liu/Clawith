@@ -1,8 +1,8 @@
 """Builtin tool seed catalog part 1."""
 
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
-from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
 from app.services.agent_self_settings_tool import UPDATE_SELF_SETTINGS_TOOL_SEED
+from app.schemas.tool_settings import ToolSetting, MCPServerOverrideSetting
 
 
 BUILTIN_TOOLS_PART_1 = [
@@ -239,6 +239,13 @@ BUILTIN_TOOLS_PART_1 = [
         "parameters_schema": {
             "type": "object",
             "properties": {
+                "include_soul": {"type": "boolean", "description": "Load Soul in this scene; defaults to true."},
+                "include_memory": {"type": "boolean", "description": "Load core and daily memory in this scene; defaults to true."},
+                "tools": {
+                    "anyOf": [{"type": "null"}, {"type": "array", "items": ToolSetting.model_json_schema()}],
+                    "description": "Complete scene tool-panel assignments; null follows the digital employee. Empty array disables optional tools.",
+                },
+                "mcp_server_overrides": {"type": "array", "items": MCPServerOverrideSetting.model_json_schema()},
                 "operation": {
                     "type": "string",
                     "enum": ["list", "get", "save", "publish", "delete", "rollback"],

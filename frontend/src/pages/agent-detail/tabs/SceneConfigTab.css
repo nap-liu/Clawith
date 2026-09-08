@@ -305,6 +305,33 @@
     padding-top: 18px;
 }
 
+.scene-config__runtime-settings {
+    margin-bottom: 20px;
+}
+
+.scene-config__runtime-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+}
+
+.scene-config__runtime-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.scene-config__runtime-hint {
+    margin: 8px 0 0;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
 .scene-config__panel-title {
     margin-bottom: 12px;
 }

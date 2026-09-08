@@ -1,75 +1,11 @@
-"""Pure-function tests for identity-safe aio CLI launchers."""
-import os
-import subprocess
-
-import pytest
-
-from app.services.cli_tools.sandbox_inject import (
-    build_launcher_write_sh,
-    build_python_execution,
-    prepare_launchers,
-    render_env,
-    shell_quote,
-)
-from app.services.cli_tools.placeholders import PlaceholderContext
-
-
+"""Database-backed checks for tenant-scoped CLI injection and LLM exposure."""
+import uuid as _uuid
 # ──────────────────────────────────────────────────────────────────────────────
 # DB-backed tests for build_cli_injection
 # ──────────────────────────────────────────────────────────────────────────────
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-
-@pytest.fixture
-async def cli_inject_session(monkeypatch):
-    """aiosqlite engine with identity+users+tools tables; patches agent_tools.async_session.
-
-    Strategy:
-    - Import agent_tools (and transitively Tenant, MCPServer, etc.) first so all
-      ORM-managed tables are registered in Base.metadata before we call .create().
-      This satisfies every FK resolution at ORM create time.
-    - MCPServer uses JSONB (PostgreSQL-only): create it via raw DDL stub so SQLite
-      doesn't choke on the column type.
-    - Tenant FKs to llm_models and other tables we don't need; create Tenant via
-      raw DDL stub too — it's only needed to satisfy users.tenant_id at INSERT time
-      (and SQLite doesn't enforce FK constraints without PRAGMA foreign_keys=ON).
-    - Create identities first, then users (FK order), then tools.
-    """
-    # Import agent_tools first — this pulls in Tenant, etc. and registers
-    # their tables in Base.metadata, satisfying FK resolution for users.
-    # Also import mcp_server explicitly: agent_tools only imports it lazily
-    # (inside function body), so the mcp_servers table wouldn't otherwise
-    # be in metadata when Tool.__table__.create() runs.
-    import app.services.agent_tools as at_mod  # noqa: F401
-    import app.models.mcp_server  # noqa: F401 — registers mcp_servers in Base.metadata
-    from app.models.user import Identity, User
-    from app.models.tool import Tool
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
-    async with eng.begin() as conn:
-        # Stub tables that have complex types (JSONB) or deep FK chains.
-        # Raw DDL satisfies physical FK constraint checks at INSERT time;
-        # the ORM metadata entry (already registered by the imports above)
-        # satisfies SQLAlchemy FK resolution at .create() time.
-        for stub in (
-            "mcp_servers", "tenants", "llm_models", "agents",
-            "tasks", "channel_configs", "org_members", "org_departments",
-            "agent_agent_relationships", "agent_relationships",
-            "agent_permissions", "agent_templates", "agent_user_onboardings",
-            "task_logs", "mcp_server_overrides",
-        ):
-            await conn.execute(text(f"CREATE TABLE IF NOT EXISTS {stub} (id TEXT PRIMARY KEY)"))
-        # Create the tables we actually insert into, in FK-dependency order.
-        await conn.run_sync(lambda c: Identity.__table__.create(c, checkfirst=True))
-        await conn.run_sync(lambda c: User.__table__.create(c, checkfirst=True))
-        await conn.run_sync(lambda c: Tool.__table__.create(c, checkfirst=True))
-
-    Session = async_sessionmaker(eng, expire_on_commit=False)
-    monkeypatch.setattr(at_mod, "async_session", Session)
-    yield Session
-    await eng.dispose()
 
 
 @pytest.mark.asyncio
@@ -192,16 +128,14 @@ async def test_build_cli_injection_only_tool_names_filters(cli_inject_session_ag
 
 
 @pytest.mark.asyncio
-async def test_build_inject_no_cli_tools_returns_none(cli_inject_session):
+async def test_build_inject_no_cli_tools_returns_none(cli_inject_session_agents):
     from app.services.agent_tools import build_cli_injection
     assert await build_cli_injection(agent_id=None, user_id=None) is None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tests for get_agent_tools_for_llm: cli tools must not appear as LLM functions;
-# their docs must be appended to execute_code_aio's description instead.
+# CLI tools surface as standalone LLM functions when an executable is available.
 # ──────────────────────────────────────────────────────────────────────────────
-import uuid as _uuid
 
 
 @pytest.fixture
@@ -212,7 +146,6 @@ async def llm_tools_session(monkeypatch):
     import app.models.mcp_server  # noqa: F401 — registers mcp_servers in Base.metadata
     from app.models.tool import Tool, AgentTool
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
     async with eng.begin() as conn:
@@ -445,59 +378,6 @@ async def test_cli_tool_without_binary_not_surfaced(llm_tools_session):
     assert "svc" not in names
 
 
-@pytest.mark.asyncio
-async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session_agents, monkeypatch, tmp_path):
-    """Trigger/cron and A2A pass the agent creator's User PK as user_id;
-    svc binds to the creator's phone (digital employee acts on its owner's
-    behalf). Confirmed product semantics — NOT identity-less for autonomous
-    origins. Guards against regressing to the old (wrong) NOT_LOGGED_IN spec."""
-    import uuid as _uuid_mod
-    from app.models.tool import Tool, AgentTool
-    from app.models.user import Identity, User
-    from app.services.agent_tools import build_cli_injection
-    from app.services.cli_tools import state_storage as ss_mod
-
-    monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
-    monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
-
-    agent_id = _uuid_mod.uuid4()
-
-    async with cli_inject_session_agents() as s:
-        # User model uses association_proxy → Identity for email/phone.
-        identity = Identity(email="creator@x.com", phone="13900000000", password_hash="x")
-        s.add(identity)
-        await s.flush()
-        creator = User(identity_id=identity.id, display_name="Creator", role="member", is_active=True)
-        s.add(creator)
-        await s.flush()
-        creator_id = creator.id
-        tool = Tool(
-            name="svc", display_name="svc", description="d", type="cli",
-            category="cli", icon="🔧", source="admin", enabled=True, is_default=True,
-            parameters_schema={},
-            config={"binary": {"sha256": "a" * 64, "size": 1, "original_name": "svc"},
-                    "env": {"YYBPC_CLI_USER_PHONE": "$user.phone", "YYBPC_CLI_HOME": "$state.dir"}},
-            config_schema={},
-        )
-        s.add(tool)
-        await s.flush()
-        # Raw-insert agent row (hex UUID for SQLite TEXT column).
-        await s.execute(
-            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
-            {"id": agent_id.hex, "tid": None},
-        )
-        # Explicit AgentTool row — explicit-only model: no row = not enabled.
-        s.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True))
-        await s.commit()
-
-    # Autonomous origin passes the creator's User PK (as heartbeat.py / A2A do).
-    injection = await build_cli_injection(agent_id=agent_id, user_id=creator_id)
-    assert injection is not None
-    # creator identity must be bound (on the svc wrapper), not dropped
-    svc_wrapper = next(w for w in injection["wrappers"] if w["name"] == "svc")
-    assert svc_wrapper["env"].get("YYBPC_CLI_USER_PHONE") == "13900000000"
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # D3-2: cross-tenant isolation — admin tool scoped to tenant A must not inject
 # into an agent belonging to tenant B.
@@ -505,15 +385,12 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session_a
 
 @pytest.fixture
 async def cli_inject_session_agents(monkeypatch):
-    """Like cli_inject_session but also creates agent_tools table and an
-    agents stub with a tenant_id column so build_cli_injection's
-    select(AgentModel.tenant_id) query can return a non-null value."""
+    """Provide tool assignments and agent tenant lookup in an isolated database."""
     import app.services.agent_tools as at_mod  # noqa: F401 — registers ORM
     import app.models.mcp_server  # noqa: F401
     from app.models.user import Identity, User
     from app.models.tool import Tool, AgentTool
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
     async with eng.begin() as conn:
@@ -553,7 +430,7 @@ async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, m
     the select(AgentModel.tenant_id) query can find the row.
     """
     import uuid as _uuid_mod
-    from app.models.tool import Tool
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
@@ -563,10 +440,12 @@ async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, m
     tenant_a = _uuid_mod.uuid4()
     tenant_b = _uuid_mod.uuid4()
     agent_b_id = _uuid_mod.uuid4()
+    tool_id = _uuid_mod.uuid4()
 
     async with cli_inject_session_agents() as s:
         # Admin cli tool explicitly scoped to tenant A.
         s.add(Tool(
+            id=tool_id,
             name="svc_a", display_name="svc_a", description="tenant-A CLI",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={},
@@ -577,6 +456,8 @@ async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, m
             config_schema={},
             tenant_id=tenant_a,
         ))
+        # A stale foreign assignment must not bypass the runtime tenant filter.
+        s.add(AgentTool(agent_id=agent_b_id, tool_id=tool_id, enabled=True))
         await s.commit()
         # Raw-insert agent row for tenant B. Use hex format (no dashes) so
         # SQLAlchemy's UUID type lookup (which sends hex to SQLite) finds it.
@@ -739,38 +620,3 @@ async def test_build_cli_injection_renders_hyphenated_tool(cli_inject_session_ag
     assert injection is not None
     wrapper_names = [w["name"] for w in injection["wrappers"]]
     assert "my-cli" in wrapper_names
-
-
-@pytest.mark.asyncio
-async def test_cli_tool_no_aio_graceful_degrade(llm_tools_session):
-    """When an agent has a cli tool enabled but execute_code_aio is NOT in the
-    tool list, get_agent_tools_for_llm must not raise and must not surface the
-    cli tool as an LLM function (graceful degrade, D3-1).
-
-    The AgentTool row is explicitly present (enabled=True) so this test proves
-    the missing-aio guard — not the absence-of-row path — is what excludes it.
-    """
-    from app.models.tool import Tool, AgentTool
-    from app.services.agent_tools import get_agent_tools_for_llm
-
-    agent_id = _uuid.uuid4()
-
-    async with llm_tools_session() as s:
-        svc_tool = Tool(
-            name="svc", display_name="svc", description="CLI only, no aio in this agent",
-            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
-            is_default=True, parameters_schema={}, config={}, config_schema={},
-        )
-        s.add(svc_tool)
-        # Intentionally do NOT add execute_code_aio.
-        await s.flush()
-        # Explicit AgentTool row — the cli tool IS enabled for this agent so that
-        # the missing-aio guard (not the no-row path) is what excludes it from LLM tools.
-        s.add(AgentTool(agent_id=agent_id, tool_id=svc_tool.id, enabled=True))
-        await s.commit()
-
-    tools = await get_agent_tools_for_llm(agent_id)
-    names = [t["function"]["name"] for t in tools]
-    assert "svc" not in names, "cli tool must not appear as an LLM function"
-    # execute_code_aio is absent — no description to check; just verify no crash.
-    assert "execute_code_aio" not in names

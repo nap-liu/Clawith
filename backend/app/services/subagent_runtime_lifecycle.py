@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.scene_activation import snapshot_project_scene
+
 from app.services.subagent_runtime_shared import *  # noqa: F401,F403
 
 async def create_subagent(
@@ -173,6 +175,7 @@ async def create_subagent(
                 ).as_session_config()
 
         task_metadata = dict(input_metadata or {})
+        await snapshot_project_scene(db, agent_id, parent, task_metadata)
         child = ChatSession(
             id=child_id,
             agent_id=agent_id,
@@ -403,6 +406,7 @@ async def append_subagent_message(
                         supplied_metadata.get("project_read_only_conversation")
                     ),
                 }
+        await snapshot_project_scene(db, agent.id, parent, supplied_metadata)
         supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
         causality = await _subagent_input_causality(db, parent=parent)
         input_row = ChatMessage(

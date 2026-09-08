@@ -18,7 +18,10 @@ For every builtin schema change, validate in Docker:
 3. call `get_agent_tools_for_llm(agent_id)` and inspect what the model receives;
 4. exercise dispatch and observable state/result.
 
-Tool availability requires an explicit enabled `AgentTool` row. `is_default` only drives assignment at creation/seeding time. Rollouts must preserve this explicit audit trail. Seed values must respect the actual database column lengths.
+Tool availability requires an explicit enabled assignment: the `AgentTool` row,
+or the published scene assignment described below. `is_default` only drives
+assignment at creation/seeding time. Rollouts must preserve this explicit audit
+trail. Seed values must respect the actual database column lengths.
 
 Do not hard-code one tool's name in unrelated tool descriptions, because disabled tools can leak back into model context through prose.
 
@@ -52,6 +55,37 @@ to the tenant and tool. UI progress is a projection of that lifecycle, not a
 second upload protocol. Production storage/backup decisions must account for
 both finalized binaries and resumable state when their schema or semantics
 change.
+
+## Scene tool configuration
+
+Scenes reuse the Project/Agent tool panel and its enabled/config assignment
+contract, including MCP overrides. `tools=null` follows the Agent; an explicit
+list defines the scene's complete configuration, with an empty list leaving
+only required protocol tools. Scene configuration lives in existing draft and
+revision JSON, never in the Agent's live assignments or another Agent copy.
+
+At the shared failover boundary, one task-local snapshot supplies tool schemas,
+configuration reads, MCP execution and extension prompts. It is reset on normal
+completion, cancellation and failure; concurrent Sessions cannot share mutable
+configuration. The existing tool loop and dispatch enforce availability.
+Platform tool retirement, tenant visibility and required-tool rules still apply.
+The catalog, scene-save validator and runtime registry share one tenant-safe
+visibility predicate, including builtin and explicitly assigned tools. CLI
+injection uses the same effective scene assignment and configuration as the
+model schema. Existing CLI launchers can remain on disk, but a disabled tool
+receives no signed execution context and cannot use a previous turn's identity.
+The toolscall HTTP adapter reloads the scene revision from its signed turn
+anchor and enters the same task-local scope before dispatch. It closes the
+database read transaction first and resets the scope on exit.
+Newly published settings take effect on the next turn; recovery and in-turn
+inputs retain the root anchor's scene revision. Management responses mask scene
+credentials, and browser chat manifests omit runtime configuration entirely.
+
+Project children restore that same anchor before preparing tools. Scene
+assignments pass through the existing Project capability, role and status
+projection; authorized Project protocol tools remain governed by their own
+runtime scope. A generic scene-name intersection must not remove those tools.
+Explicit empty prepared tools for a prose-only correction remain empty.
 
 ## MCP transports
 

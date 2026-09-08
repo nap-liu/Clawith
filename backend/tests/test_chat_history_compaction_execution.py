@@ -15,7 +15,7 @@ from app.services.session_token_usage import (
 )
 from tests.test_chat_history_compaction import (
     _cleanup,
-    _isolate_async_engine_between_tests,
+    _isolate_async_engine_between_tests,  # noqa: F401 - register the autouse fixture
     _precompact_model,
     _setup,
 )
@@ -289,18 +289,3 @@ async def test_concurrent_compaction_rechecks_persisted_state_after_lock(monkeyp
     assert result.required is True
     assert result.skipped_reason == "completed_by_concurrent_compaction"
     do_compact.assert_not_awaited()
-
-
-async def test_preflight_threshold_reserves_configured_output_tokens():
-    """Preflight must fire before the final dispatch guard's input ceiling."""
-    from app.services.llm.compactor import prompt_exceeds_preflight_limit
-
-    model = _precompact_model(context_window=1_000)
-    model.provider = "custom"
-    model.model = "test"
-    model.max_output_tokens = 250
-
-    assert not prompt_exceeds_preflight_limit(
-        model=model,
-        prompt_messages=[{"role": "user", "content": "数" * 1_800}],
-    )

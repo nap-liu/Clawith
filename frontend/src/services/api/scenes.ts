@@ -1,4 +1,5 @@
 import { request } from "./core";
+import type { MCPServerEditorDraftOverride } from '../../types/mcpServer';
 
 export type SceneSystemPrompt = {
   id: string;
@@ -28,6 +29,11 @@ export type SceneQuickAction = {
 };
 
 export type Scene = {
+  include_soul?: boolean;
+  include_memory?: boolean;
+  tools?: Array<{ tool_id: string; enabled: boolean; config: Record<string, any> }> | null;
+  mcp_server_overrides?: Array<MCPServerEditorDraftOverride & { server_id: string }>;
+  auto_activation?: SceneAutoActivation;
   id?: string;
   scene_key: string;
   name: string;
@@ -57,12 +63,28 @@ export type SceneManifestQuickAction = SceneManifestQuickActionBase &
     | { type: "open_uri"; uri: string; message?: never }
   );
 
-export type SceneManifest = Omit<Scene, "system_prompts" | "quick_actions"> & {
+export type SceneManifest = Omit<Scene, "system_prompts" | "quick_actions" | "auto_activation" | "include_memory" | "include_soul" | "tools" | "mcp_server_overrides"> & {
   system_prompts: [];
   quick_actions: SceneManifestQuickAction[];
 };
 
+export type SceneConversationTarget = {
+  target_ref: string;
+  label: string;
+  source_channel: string;
+  is_group: boolean;
+};
+
+export type SceneAutoActivation = {
+  enabled: boolean;
+  targets: SceneConversationTarget[];
+};
+
 export const sceneApi = {
+  conversationOptions: (agentId: string, q = '', offset = 0) =>
+    request<{ items: SceneConversationTarget[]; next_offset: number | null }>(
+      `/agents/${agentId}/scenes/conversation-options?${new URLSearchParams({ q, offset: String(offset) })}`,
+    ),
   list: (agentId: string) => request<Scene[]>(`/agents/${agentId}/scenes`),
   get: (agentId: string, sceneKey: string) =>
     request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}`),

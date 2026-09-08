@@ -31,6 +31,10 @@ type MultiSelectDropdownProps = {
   className?: string;
   portal?: boolean;
   disabled?: boolean;
+  onSearchChange?: (query: string) => void;
+  onLoadMore?: () => void;
+  loadMoreLabel?: string;
+  loading?: boolean;
 };
 
 export default function MultiSelectDropdown({
@@ -48,6 +52,10 @@ export default function MultiSelectDropdown({
   className = "",
   portal = true,
   disabled = false,
+  onSearchChange,
+  onLoadMore,
+  loadMoreLabel,
+  loading = false,
 }: MultiSelectDropdownProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -84,12 +92,12 @@ export default function MultiSelectDropdown({
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const filteredOptions = useMemo(
     () =>
-      normalizedQuery
+      normalizedQuery && !onSearchChange
         ? options.filter((option) =>
             option.label.toLocaleLowerCase().includes(normalizedQuery),
           )
         : options,
-    [normalizedQuery, options],
+    [normalizedQuery, options, onSearchChange],
   );
   const floatingPosition = useAnchoredPopoverPosition({
     open: open && portal,
@@ -130,7 +138,10 @@ export default function MultiSelectDropdown({
       <SearchInput
         className="ui-multi-select__search"
         value={query}
-        onChange={(event) => setQuery(event.target.value)}
+        onChange={(event) => {
+          setQuery(event.target.value);
+          onSearchChange?.(event.target.value);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") event.preventDefault();
         }}
@@ -140,7 +151,7 @@ export default function MultiSelectDropdown({
       />
       {values.length > 0 && (
         <div className="ui-multi-select__actions">
-          <span>已选 {values.length} 项</span>
+          <span>{selectedLabel(values.length)}</span>
           <Button
             type="button"
             variant="ghost"
@@ -190,6 +201,11 @@ export default function MultiSelectDropdown({
           })
         )}
       </div>
+      {onLoadMore && (
+        <Button type="button" variant="ghost" disabled={loading} onClick={onLoadMore}>
+          {loadMoreLabel}
+        </Button>
+      )}
     </div>
   ) : null;
 
@@ -210,7 +226,10 @@ export default function MultiSelectDropdown({
         disabled={disabled}
         onClick={() =>
           setOpen((current) => {
-            if (!current) setQuery("");
+            if (!current) {
+              setQuery("");
+              onSearchChange?.("");
+            }
             return !current;
           })
         }

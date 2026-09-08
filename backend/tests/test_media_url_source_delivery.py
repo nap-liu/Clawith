@@ -134,6 +134,8 @@ async def test_concurrent_managed_imports_converge_on_one_atomic_final(tmp_path,
     ])
 
     assert first.workspace_path == second.workspace_path
+    assert first.workspace_path.startswith("media/imported/")
+    assert first.mime_type == "video/mp4"
     assert first.file_path.read_bytes() == MP4_BYTES
     assert (tmp_path / first.workspace_path).read_bytes() == MP4_BYTES
     assert list(_staging_dir(tmp_path).glob("*.partial")) == []

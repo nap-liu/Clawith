@@ -162,6 +162,7 @@ async def prepare_channel_command_reply(
                 "artifact_role": "command_reply",
                 "source_channel": source_channel,
                 "command_action": str(result.get("action") or "unknown"),
+                **({"turn_control_only": True} if result.get("action", "").startswith("continue_") else {}),
                 "provider_event_id_hash": event_digest,
             },
             IMDeliveryResult.pending(source_channel),
@@ -170,6 +171,12 @@ async def prepare_channel_command_reply(
     db.add(reply)
     await db.flush()
     session.last_message_at = datetime.now(UTC)
+    continue_anchor_id = result.pop("_continue_anchor_id", None)
+    if continue_anchor_id:
+        from app.services.turn_continue import dispatch_continue
+
+        await db.commit()
+        await dispatch_continue(continue_anchor_id)
     return {
         **result,
         "message_id": str(reply.id),

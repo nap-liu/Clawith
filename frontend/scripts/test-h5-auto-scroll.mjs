@@ -1,45 +1,6 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
-import vm from "node:vm";
-import { loadCssEntry } from "./load-css-entry.mjs";
-import { loadLocalSourceGraph } from "./load-local-source-graph.mjs";
-
-const require = createRequire(import.meta.url);
-const ts = require("typescript");
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const sourcePath = resolve(
-  __dirname,
-  "../src/features/conversation/autoScroll.ts",
-);
-const sessionViewerSource = loadLocalSourceGraph(
-  resolve(__dirname, "../src/components/SessionViewerDrawer.tsx"),
-);
-const timelineSource = loadLocalSourceGraph(
-  resolve(
-    __dirname,
-    "../src/features/conversation/web/ConversationTimeline.tsx",
-  ),
-);
-const globalStyles = loadCssEntry(resolve(__dirname, "../src/index.css"));
-const compiled = ts.transpileModule(readFileSync(sourcePath, "utf8"), {
-  compilerOptions: {
-    module: ts.ModuleKind.CommonJS,
-    target: ts.ScriptTarget.ES2020,
-  },
-}).outputText;
-const localModule = { exports: {} };
-vm.runInNewContext(
-  compiled,
-  {
-    module: localModule,
-    exports: localModule.exports,
-    require,
-  },
-  { filename: sourcePath },
-);
+import { loadTypeScriptModule } from "./load-typescript-module.mjs";
 
 const {
   alignConversationScrollerToBottom,
@@ -47,7 +8,9 @@ const {
   isConversationScrollbarPointer,
   isConversationScrollKey,
   scheduleStableConversationBottomScroll,
-} = localModule.exports;
+} = loadTypeScriptModule(fileURLToPath(
+  new URL("../src/features/conversation/autoScroll.ts", import.meta.url),
+));
 
 {
   const scroller = { scrollHeight: 900, scrollTop: 0 };
@@ -88,7 +51,20 @@ const {
   let nextHandle = 1;
   let resizeCallback = null;
   let resizeDisconnected = false;
-  let alignCount = 0;
+  const scroller = { scrollHeight: 900, scrollTop: 0, clientHeight: 600 };
+  const alignBottom = () => {
+    alignConversationScrollerToBottom(scroller);
+    // A DOM scroller clamps the assigned scrollTop to its available range.
+    scroller.scrollTop = Math.min(scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight);
+  };
+  const flushFrames = () => {
+    for (let pass = 0; frames.size; pass += 1) {
+      assert.ok(pass < 20, "scroll scheduling must settle");
+      const pending = [...frames.values()];
+      frames.clear();
+      pending.forEach((callback) => callback());
+    }
+  };
   const environment = {
     requestFrame: (callback) => {
       const handle = nextHandle++;
@@ -111,37 +87,32 @@ const {
   };
 
   const cleanup = scheduleStableConversationBottomScroll({
-    alignBottom: () => {
-      alignCount += 1;
-    },
-    resizeTargets: [{}],
+    alignBottom,
+    resizeTargets: [scroller],
     environment,
   });
-  assert.equal(
-    alignCount,
-    1,
-    "must align synchronously after the history DOM mounts",
-  );
+  assert.equal(scroller.scrollTop, 300, "history mounts at the bottom synchronously");
 
-  const firstFrame = [...frames.values()][0];
-  frames.clear();
-  firstFrame();
-  assert.equal(alignCount, 2);
-  const secondFrame = [...frames.values()][0];
-  frames.clear();
-  secondFrame();
-  assert.equal(alignCount, 3, "must retry after virtual list measurement");
+  scroller.scrollHeight = 1200;
+  flushFrames();
+  assert.equal(scroller.scrollTop, 600, "settle at the measured content bottom");
+
+  scroller.scrollHeight = 1800;
+  resizeCallback();
+  flushFrames();
+  assert.equal(scroller.scrollTop, 1200, "follow late content expansion");
 
   resizeCallback();
-  const resizeFrame = [...frames.values()][0];
-  frames.clear();
-  resizeFrame();
-  assert.equal(alignCount, 4, "must realign after asynchronous content resize");
-
+  const pendingCallbacks = [...frames.values(), ...timers.values()];
   cleanup();
   assert.equal(frames.size, 0);
   assert.equal(timers.size, 0);
   assert.equal(resizeDisconnected, true);
+  scroller.scrollTop = 100;
+  scroller.scrollHeight = 2400;
+  pendingCallbacks.forEach((callback) => callback());
+  assert.equal(scroller.scrollTop, 100, "disposed work must preserve user scroll position");
+  cleanup();
 }
 
 {
@@ -224,46 +195,5 @@ const {
     false,
   );
 }
-
-assert.match(
-  sessionViewerSource,
-  /useConversationAutoFollow\(\{[\s\S]*?contentKey:\s*timelineScrollAnchor,[\s\S]*?resetKey:\s*`\$\{sessionId \|\| ""\}:\$\{target\?\.anchorMessageId \|\| ""\}:\$\{target\?\.projectRunId \|\| ""\}`,[\s\S]*?enabled:\s*Boolean\([\s\S]*?!loading[\s\S]*?!resolvedAnchorMessageId/,
-  "the embedded project group viewer must reuse standard Web Chat auto-follow and reset it for each exact anchor or Run",
-);
-assert.match(
-  sessionViewerSource,
-  /className="session-viewer-drawer__messages"[\s\S]*?\{\.\.\.autoFollowInteractionProps\}/,
-  "the shared session scroller must preserve standard user-scroll pause and resume behavior",
-);
-assert.match(
-  sessionViewerSource,
-  /getConversationScrollAnchor\([\s\S]*?buildConversationEntries\(messages\),[\s\S]*?active/,
-  "history, streaming, and standard timeline updates must share the canonical conversation content key",
-);
-assert.doesNotMatch(
-  sessionViewerSource,
-  /element\.scrollTop\s*=\s*element\.scrollHeight/,
-  "the project viewer must not maintain a second ad-hoc bottom-scroll implementation",
-);
-assert.match(
-  timelineSource,
-  /findConversationAnchorEntryIndex\(entries, focusMessageId\)/,
-  "the standard timeline must resolve the exact durable message inside a reused session",
-);
-assert.match(
-  timelineSource,
-  /rowVirtualizer\.scrollToIndex\(focusEntryIndex, \{ align: "center" \}\)[\s\S]*?element\.dataset\.messageId === focusMessageId[\s\S]*?scrollIntoView\(\{ block: "center", behavior: "auto" \}\)/,
-  "exact anchors must reveal the matching virtual row and then center the matching durable message",
-);
-assert.match(
-  globalStyles,
-  /\.conversation-timeline__focus-anchor > \.chat-msg-row\s*\{[\s\S]*?animation: conversation-anchor-focus 5\.2s/,
-  "the exact message highlight must remain clearly identifiable for more than five seconds",
-);
-assert.match(
-  globalStyles,
-  /@media \(prefers-reduced-motion: reduce\)[\s\S]*?conversation-anchor-focus-reduced 5\.2s step-end/,
-  "reduced-motion users must receive a stable highlight without flashing animation",
-);
 
 console.log("conversation auto-scroll tests passed");

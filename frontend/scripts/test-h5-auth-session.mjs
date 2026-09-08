@@ -45,28 +45,23 @@ assert.equal(rememberH5AuthCode('once-code', blockedStorage), false);
 
 assert.equal(
     formatH5LoginError(Object.assign(new Error('Invalid or expired token'), { status: 401 })),
-    '登录已失效，请返回重新进入',
+    H5_LOGIN_MESSAGES.expired,
 );
 assert.equal(
     formatH5LoginError(Object.assign(new Error('OAuth provider rejected the authorization code'), { status: 400 })),
-    '登录链接已失效，请返回重新进入',
+    H5_LOGIN_MESSAGES.linkExpired,
 );
 assert.equal(
     formatH5LoginError(Object.assign(new Error('backend unavailable'), { status: 503 })),
-    '登录服务暂时不可用，请返回重新进入',
+    H5_LOGIN_MESSAGES.unavailable,
 );
 assert.equal(
     formatH5LoginError(new TypeError('Failed to fetch')),
-    '登录服务暂时不可用，请返回重新进入',
+    H5_LOGIN_MESSAGES.unavailable,
 );
 assert.equal(
     formatH5LoginError(new Error('unexpected English provider error')),
-    '登录失败，请返回重新进入',
+    H5_LOGIN_MESSAGES.failed,
 );
-
-for (const message of Object.values(H5_LOGIN_MESSAGES)) {
-    assert.match(message, /请返回重新进入$/);
-    assert.doesNotMatch(message, /小程序|重新打开|稍后重试/);
-}
 
 console.log('h5 auth session tests passed');

@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
+import uuid
+
+from app.models.chat_session import ChatSession
+from app.services.scene_activation import resolve_session_scene
+
+
+def public_manifest(manifest):
+    from app.services.scene_service import project_scene_manifest
+
+    return project_scene_manifest(manifest) if manifest else None
+
 
 async def load_scene_manifest_impl(api, self, *, db=None) -> None:
     self.scene_manifest = None
-    if not self.scene_key:
-        return
     try:
         from app.schemas.scene import validate_scene_key
         from app.services.scene_service import SCENE_STATUS_OK, resolve_scene_for_activation
 
-        self.scene_key = validate_scene_key(self.scene_key)
+        if self.scene_key:
+            self.scene_key = validate_scene_key(self.scene_key)
 
         async def _load(active_db):
-            resolved = await resolve_scene_for_activation(
-                active_db,
-                self.agent_id,
-                self.scene_key,
-            )
-            return resolved.manifest if resolved.status == SCENE_STATUS_OK else None
+            session_id = getattr(self, "conv_id", None)
+            session = await active_db.get(ChatSession, uuid.UUID(str(session_id))) if session_id else None
+            manifest = await resolve_session_scene(active_db, self.agent_id, session, explicit_key=self.scene_key)
+            # H5 sends an empty scene parameter for its existing default landing.
+            if manifest is None and self.scene_key == "":
+                resolved = await resolve_scene_for_activation(active_db, self.agent_id, "default")
+                return resolved.manifest if resolved.status == SCENE_STATUS_OK else None
+            return manifest
 
         if db is not None:
             self.scene_manifest = await _load(db)
@@ -40,7 +52,8 @@ def has_configured_scene_welcome_impl(_api, self) -> bool:
 
 
 def resolve_onboarding_required_impl(_api, self, onboarding_required: bool) -> bool:
-    return bool(onboarding_required and not self._has_configured_scene_welcome())
+    automatic = (self.scene_manifest or {}).get("activation_source") == "automatic"
+    return bool(onboarding_required and not automatic and not self._has_configured_scene_welcome())
 
 
 async def prepare_initial_greeting_impl(api, self, db, user_id) -> None:
@@ -62,7 +75,7 @@ async def prepare_initial_greeting_impl(api, self, db, user_id) -> None:
 def scene_message_meta_impl(_api, self) -> dict:
     from app.services.scene_service import scene_message_meta
 
-    return scene_message_meta(self.scene_manifest)
+    return scene_message_meta(self.scene_manifest) if self.scene_manifest else {"scene_resolved": True}
 
 
 def channel_context_impl(_api, self) -> dict:

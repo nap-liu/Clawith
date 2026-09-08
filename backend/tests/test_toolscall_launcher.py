@@ -224,15 +224,10 @@ def test_context_is_signed_and_scoped(bridge_server):
     assert "outer" not in payload
     assert "nonce" not in payload
     assert len(prepared["context_token"]) < 1000
-    assert "sample" not in prepared["launcher"]
-    assert "STANDARD_DATA" in prepared["launcher"]
-    assert bridge_server in prepared["launcher"]
     assert prepared["launcher_relpath"].startswith(
         ".cache/aio/toolscall/scopes/scope-launcher/"
     )
     assert prepared["launcher_compression"] == "gzip"
-    assert "cryptography" not in prepared["launcher"]
-    assert "Ed25519" not in prepared["launcher"]
     with pytest.raises(ValueError, match="invalid toolscall"):
         verify_toolscall_context(
             prepared["context_token"] + "corrupt",

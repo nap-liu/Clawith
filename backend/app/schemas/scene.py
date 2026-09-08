@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.utils.mini_program_uri import parse_mini_program_uri
+from app.schemas.scene_activation import SceneAutoActivation
+from app.schemas.tool_settings import MCPServerOverrideSetting, ToolSetting
 
 SCENE_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -91,12 +93,21 @@ class SceneQuickAction(BaseModel):
 
 
 class SceneConfig(BaseModel):
+    include_soul: bool = True
+    include_memory: bool = True
+    tools: list[ToolSetting] | None = None
+    mcp_server_overrides: list[MCPServerOverrideSetting] = Field(default_factory=list)
+    auto_activation: SceneAutoActivation = Field(default_factory=SceneAutoActivation)
     welcome_message: str = Field(default="", max_length=12000)
     system_prompts: list[SceneSystemPrompt] = Field(default_factory=list)
     quick_actions: list[SceneQuickAction] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_unique_ids(self):
+        for items, key in ((self.tools or [], "tool_id"), (self.mcp_server_overrides, "server_id")):
+            ids = [getattr(item, key) for item in items]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"duplicate {key}")
         for field_name in ("system_prompts", "quick_actions"):
             ids = [item.id for item in getattr(self, field_name)]
             if len(ids) != len(set(ids)):

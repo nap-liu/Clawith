@@ -8,6 +8,7 @@ from loguru import logger
 from sqlalchemy import select
 
 from app.database import async_session
+from app.services.turn_tool_settings import current_tool_settings
 
 
 # ─── Tool Config Cache ──────────────────────────────────────────
@@ -100,6 +101,9 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     Both configs are decrypted using the tool's config_schema for
     schema-aware field detection (e.g. smithery_api_key with type=password).
     """
+    scope = current_tool_settings(agent_id)
+    if scope is not None:
+        return _decrypt_sensitive_fields(scope.configs.get(tool_name, {}))
     # Check cache first
     cached = _get_cached_tool_config(agent_id, tool_name)
     if cached is not None:

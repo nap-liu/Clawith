@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from app.services.llm.caller import (
     DispatchBudget,
     _authoritative_usage_details,
@@ -17,6 +16,7 @@ from app.services.llm.caller import (
     measure_dispatch,
 )
 from app.services.llm.client import GeminiClient, LLMError, LLMMessage, LLMResponse
+from app.services.llm.failure_outcome import LLMFailure
 from app.services.token_tracker import extract_token_usage
 
 pytestmark = pytest.mark.asyncio
@@ -211,7 +211,9 @@ async def test_context_rejection_after_stream_progress_is_not_replayed(monkeypat
     )
 
     assert chunks == ["partial"]
-    assert result.startswith("[LLM Error]")
+    assert isinstance(result, LLMFailure)
+    assert result.code == "provider_request_failed"
+    assert result.details["had_provider_progress"] is True
     recovery.assert_not_awaited()
 
 

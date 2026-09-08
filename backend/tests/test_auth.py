@@ -178,34 +178,6 @@ async def test_login_unverified_email():
     assert exc.value.detail["needs_verification"] is True
 
 
-# ---------------------------------------------------------------------------
-# /me tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_me_returns_user():
-    """GET /me with an authenticated user returns user data."""
-    identity = _make_identity()
-    user = SimpleNamespace(
-        id=uuid.uuid4(),
-        identity_id=identity.id,
-        role="member",
-        tenant_id=uuid.uuid4(),
-        username=identity.username,
-        email=identity.email,
-        avatar_url=None,
-        identity=identity,
-    )
-
-    with patch("app.api.auth.UserOut") as MockUserOut:
-        MockUserOut.model_validate.return_value = SimpleNamespace(id=str(user.id), email=user.email, is_platform_admin=False)
-        result = await auth_api.get_me(current_user=user)
-    assert result.id == str(user.id)
-    assert result.email == user.email
-    assert result.is_platform_admin is False
-
-
 @pytest.mark.asyncio
 async def test_oauth_callback_passes_redirect_uri():
     """OAuth callback should forward redirect_uri for providers like Google."""

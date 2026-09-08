@@ -181,9 +181,10 @@ async def _execute_schedule(
                     reasoning_effort_override=reasoning_effort,
                 )
 
-            from app.services.llm.failure_outcome import llm_failure_code
+            from app.services.llm.failure_outcome import llm_failure_code, llm_failure_meta
 
             failure_code = llm_failure_code(reply)
+            failure_meta = llm_failure_meta(reply)
 
             from app.services.activity_logger import log_activity
 
@@ -196,7 +197,7 @@ async def _execute_schedule(
                     "instruction": instruction,
                     "reply": reply[:500],
                     "status": "failed" if failure_code else "completed",
-                    **({"error_code": failure_code} if failure_code else {}),
+                    **failure_meta,
                 },
             )
 

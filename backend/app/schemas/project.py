@@ -7,23 +7,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.llm.reasoning import ReasoningEffort
-
-
-class ProjectAgentToolSetting(BaseModel):
-    tool_id: uuid.UUID
-    enabled: bool = True
-    config: dict[str, Any] = Field(default_factory=dict)
-
-
-class ProjectAgentMCPServerOverrideSetting(BaseModel):
-    server_id: uuid.UUID
-    system_prompt_block: str | None = None
-    url_template: str | None = None
-    headers_template: dict | None = None
-    credential_template: str | None = None
-    command_template: str | None = None
-    args_template: list[str] | None = None
-    env_template: dict | None = None
+from app.schemas.tool_settings import (
+    ToolSetting as ProjectAgentToolSetting,
+    MCPServerOverrideSetting as ProjectAgentMCPServerOverrideSetting,
+)
 
 
 class ProjectAgentInitialSettings(BaseModel):

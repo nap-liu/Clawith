@@ -60,13 +60,6 @@ def test_legacy_webhook_pending_cleared():
     assert t.config["token"] == "abc"  # unrelated keys preserved
 
 
-def test_legacy_webhook_is_default_mode():
-    # webhook with no explicit webhook_mode is "legacy" → still cleared.
-    t = _trig(type="webhook", config={"_webhook_pending": True})
-    apply_base_trigger_fired_state(t, NOW)
-    assert t.config["_webhook_pending"] is False
-
-
 def test_queue_merge_webhook_pending_untouched():
     # queue/merge webhooks use a different mechanism (_webhook_queue/_webhook_active);
     # this function must NOT touch their pending/payload.

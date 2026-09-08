@@ -9,6 +9,7 @@ from fastapi import APIRouter, Header, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from app.services.agent_tools import execute_tool
+from app.services.turn_tool_settings import restore_turn_tool_settings
 from app.services.toolscall.capability import (
     ToolscallUnavailable,
     verify_toolscall_context,
@@ -77,15 +78,17 @@ async def call_tool(
         return _protocol_error("invalid identity in execution context", 401)
 
     nested_call_id = f"toolscall_{uuid.uuid4().hex}"
-    result: str = await execute_tool(
-        tool_name,
-        arguments,
-        agent_id=agent_id,
-        user_id=user_id,
-        session_id=str(context.get("session") or ""),
-        tool_call_id=nested_call_id,
-        turn_anchor_id=turn_anchor_id,
-    )
+    session_id = str(context.get("session") or "")
+    async with restore_turn_tool_settings(agent_id, session_id, turn_anchor_id):
+        result: str = await execute_tool(
+            tool_name,
+            arguments,
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            tool_call_id=nested_call_id,
+            turn_anchor_id=turn_anchor_id,
+        )
     if not isinstance(result, str):
         return _protocol_error("tool executor returned a non-text result", 500)
     return Response(content=result.encode("utf-8"), media_type="text/plain")

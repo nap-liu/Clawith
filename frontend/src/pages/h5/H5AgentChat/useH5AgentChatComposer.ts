@@ -401,9 +401,10 @@ export function useH5AgentChatComposer(
             setInput('');
             setAttachedFiles([]);
         }
-        generationActiveRef.current = true;
-        setIsWaiting(true);
-        setIsStreaming(false);
+        if (!generationActiveRef.current) {
+            generationActiveRef.current = true;
+            setIsWaiting(true);
+        }
         ws.send(JSON.stringify({
             message_id: messageId,
             content: payload.contentForLLM,
@@ -412,6 +413,7 @@ export function useH5AgentChatComposer(
             attachments: payload.attachments,
             model_id: effectiveModelId,
         }));
+        messageDispatchLockedRef.current = false;
     }, [confirmationPending, effectiveModelId, isReadOnly, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
 
     const sendMessage = useCallback(
@@ -422,7 +424,7 @@ export function useH5AgentChatComposer(
     const handleInputKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault();
-            if (!isWaiting && !isStreaming && !isStopping && uploadDrafts.length === 0 && !speech.isActive) {
+            if (!event.nativeEvent.isComposing && !isStopping && uploadDrafts.length === 0 && !speech.isActive) {
                 sendMessage();
             }
         }

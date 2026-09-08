@@ -1,9 +1,6 @@
 """Tests for app.services.mcp_config_parser.parse_mcp_input."""
 
-import pytest
-
 from app.services.mcp_config_parser import parse_mcp_input
-
 
 # ── Form A · bare URL string ──────────────────────────────────────
 
@@ -12,6 +9,7 @@ def test_bare_https_url():
     assert out["url"] == "https://mcp-gw.dingtalk.com/server/abc?key=xyz"
     assert out["error"] is None
     assert out["headers"] is None
+    assert out["transport"] == "http"
 
 
 def test_bare_http_url_with_whitespace():
@@ -83,13 +81,19 @@ def test_mcpServers_stdio_command_parsed():
     # stdio servers (command/args) are now supported — parser returns transport=stdio
     out = parse_mcp_input({
         "mcpServers": {
-            "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"]}
+            "fs": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                "env": {"TOKEN": "example"},
+            }
         }
     })
     assert out["url"] is None
     assert out.get("error") is None
     assert out.get("transport") == "stdio"
     assert out.get("command") == "npx"
+    assert out["args"] == ["-y", "@modelcontextprotocol/server-filesystem"]
+    assert out["env"] == {"TOKEN": "example"}
 
 
 # ── JSON-stringified inputs (LLM tool-calling habit) ──────────────

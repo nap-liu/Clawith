@@ -167,6 +167,17 @@ export function useH5AgentChatSocket(
             }
         }
         if (data.type !== 'thinking' && data.type !== 'chunk') flushStreamBatch();
+        if (data.type === 'scene_manifest') {
+            state.sceneManifestRequestRef.current += 1;
+            state.sceneManifestRef.current = data.manifest;
+            state.setSceneManifest(data.manifest);
+            return;
+        }
+        if (data.type === 'connected' && 'scene_manifest' in data) {
+            state.sceneManifestRequestRef.current += 1;
+            state.sceneManifestRef.current = data.scene_manifest;
+            state.setSceneManifest(data.scene_manifest);
+        }
         if (data.type === 'connected' && data.session_id) {
             clearSocketConnectTimer();
             const nextSessionId = String(data.session_id);

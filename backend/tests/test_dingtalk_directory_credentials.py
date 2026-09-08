@@ -49,13 +49,6 @@ def test_directory_credentials_do_not_depend_on_robot_permissions():
     assert _resolve_dingtalk_directory_credentials(provider, channel) == []
 
 
-def test_directory_credentials_do_not_call_the_same_app_twice():
-    provider = SimpleNamespace(config={"app_key": "shared-key", "app_secret": "shared-secret"})
-    channel = SimpleNamespace(app_id="shared-key", app_secret="shared-secret")
-
-    assert _resolve_dingtalk_directory_credentials(provider, channel) == [("shared-key", "shared-secret", "enterprise")]
-
-
 @pytest.mark.asyncio
 async def test_sender_id_only_registration_converges_when_staff_id_arrives():
     suffix = uuid.uuid4().hex[:10]

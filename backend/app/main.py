@@ -14,6 +14,7 @@ from app.config import get_settings
 from app.core.events import close_redis
 from app.core.logging_config import configure_logging, intercept_standard_logging
 from app.core.middleware import TraceIdMiddleware
+from app.models import registry  # noqa: F401
 from app.schemas.schemas import HealthResponse
 from app.services.realtime import realtime_router
 
@@ -174,57 +175,7 @@ async def lifespan(fastapi_app: FastAPI):
     from app.services.discord_gateway import discord_gateway_manager
 
     if _role_enabled("all", "bootstrap"):
-        # ── Step 0: Ensure all DB tables exist (idempotent, safe to run on every startup) ──
-        try:
-            from app.database import Base, engine
-            # Import all models so Base.metadata is fully populated
-            import app.models.user           # noqa
-            import app.models.agent          # noqa
-            import app.models.task           # noqa
-            import app.models.llm            # noqa
-            import app.models.tool           # noqa
-            import app.models.audit          # noqa
-            import app.models.skill          # noqa
-            import app.models.channel_config  # noqa
-            import app.models.dingtalk_provisioning  # noqa
-            import app.models.schedule       # noqa
-            import app.models.plaza          # noqa
-            import app.models.activity_log   # noqa
-            import app.models.org            # noqa
-            import app.models.system_settings  # noqa
-            import app.models.invitation_code  # noqa
-            import app.models.tenant         # noqa
-            import app.models.tenant_setting  # noqa
-            import app.models.participant    # noqa
-            import app.models.chat_session   # noqa
-            import app.models.trigger        # noqa
-            import app.models.trigger_execution  # noqa
-            import app.models.subagent_run  # noqa
-            import app.models.focus          # noqa
-            import app.models.notification   # noqa
-            import app.models.gateway_message # noqa
-            import app.models.agent_credential  # noqa
-            import app.models.okr            # noqa
-            import app.models.onboarding     # noqa
-            import app.models.mcp_server     # noqa  # FK target of tools.mcp_server_id; fresh-DB create_all needs it registered
-            import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
-            import app.models.scene          # noqa
-            import app.models.channel_type_default  # noqa
-            import app.models.cli_tool_binary       # noqa
-            import app.models.dingtalk_provisioning # noqa
-            import app.models.personal_access_token # noqa
-            import app.models.openapi_application # noqa
-            import app.models.speech_recognition_config  # noqa
-            import app.models.workspace      # noqa
-            import app.models.project        # noqa
-
-            import app.models.identity       # noqa
-            import app.models.published_page  # noqa
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            logger.info("[startup] Database tables ready")
-        except Exception as e:
-            logger.warning(f"[startup] create_all failed: {e}")
+        # Schema setup is owned by the container/standalone bootstrap command.
         logger.info("[startup] seeding...")
 
         try:

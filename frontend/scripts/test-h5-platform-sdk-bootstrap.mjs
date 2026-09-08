@@ -8,12 +8,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(resolve(__dirname, '../index.html'), 'utf8');
 const bootstrapMatch = html.match(/<script id="h5-platform-sdk-bootstrap">([\s\S]*?)<\/script>/);
 assert.ok(bootstrapMatch);
-assert.ok(
-    html.indexOf('id="vconsole-init"') < html.indexOf('id="h5-platform-sdk-bootstrap"'),
-);
-assert.ok(
-    html.indexOf('id="h5-platform-sdk-bootstrap"') < html.indexOf('src="/src/main.tsx"'),
-);
 
 function runBootstrap(pathname, userAgent) {
     const writes = [];

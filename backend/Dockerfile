@@ -89,5 +89,5 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
 EXPOSE 8000
-# entrypoint.sh runs `alembic upgrade head` then `uvicorn`
+# entrypoint.sh runs the shared schema bootstrap command, then uvicorn.
 ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]

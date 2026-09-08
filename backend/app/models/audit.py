@@ -97,6 +97,24 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index(
+            "ix_chat_messages_subagent_dispatch_pending",
+            "created_at", "id",
+            postgresql_where=text("(message_meta->>'subagent_dispatch_state') = 'pending'"),
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_chat_messages_leader_dispatch_pending",
+            "conversation_id", "created_at", "id",
+            postgresql_where=text(
+                "(message_meta->>'kind') = 'project_subagent_reply' "
+                "AND (message_meta->>'leader_batch_state') IN ('pending', 'claimed')"
+            ),
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_chat_messages_turn_inbox_pending_fifo",
+            "conversation_id", "created_at", "id",
+            postgresql_where=text("(message_meta->>'turn_inbox_state') = 'pending'"),
+        ).ddl_if(dialect="postgresql"),
+        Index(
             "uq_chat_messages_external_event_key",
             "external_event_key",
             unique=True,

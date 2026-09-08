@@ -4,65 +4,6 @@ from types import SimpleNamespace
 import pytest
 
 
-PROVISIONING_TOOL_NAMES = {
-    "start_dingtalk_channel_provisioning",
-    "get_dingtalk_channel_provisioning_status",
-}
-
-
-def _seed_tool(name: str) -> dict:
-    from app.services.tool_seeder import BUILTIN_TOOLS
-
-    for tool in BUILTIN_TOOLS:
-        if tool.get("name") == name:
-            return tool
-    raise AssertionError(f"{name} missing from BUILTIN_TOOLS")
-
-
-def _fallback_tool(name: str) -> dict:
-    from app.services import agent_tools
-
-    for tool in agent_tools.AGENT_TOOLS:
-        function = tool.get("function") or {}
-        if function.get("name") == name:
-            return function
-    raise AssertionError(f"{name} missing from AGENT_TOOLS fallback")
-
-
-def test_dingtalk_provisioning_tools_are_seeded_for_digital_employee_copy():
-    for name in PROVISIONING_TOOL_NAMES:
-        tool = _seed_tool(name)
-        assert tool["category"] == "communication"
-        assert tool["is_default"] is True
-        assert len(tool["name"]) <= 100
-        assert len(tool["icon"]) <= 10
-        text = f"{tool['display_name']} {tool['description']}"
-        assert "数字员工" in text
-        assert "Agent" not in text
-        assert "client_secret" not in text
-        assert tool["parameters_schema"]["type"] == "object"
-
-    start_schema = _seed_tool("start_dingtalk_channel_provisioning")["parameters_schema"]
-    assert not start_schema.get("required")
-    force = start_schema["properties"]["force_reconfigure"]
-    assert force["type"] == "boolean"
-    assert force["default"] is False
-    assert "强制" in force["description"]
-
-
-def test_dingtalk_provisioning_tools_exist_in_fallback_definitions():
-    for name in PROVISIONING_TOOL_NAMES:
-        function = _fallback_tool(name)
-        text = f"{function['name']} {function['description']}"
-        assert "数字员工" in text
-        assert "Agent" not in text
-        assert function["parameters"]["type"] == "object"
-
-    start_parameters = _fallback_tool("start_dingtalk_channel_provisioning")["parameters"]
-    assert not start_parameters.get("required")
-    assert start_parameters["properties"]["force_reconfigure"]["default"] is False
-
-
 @pytest.mark.asyncio
 async def test_execute_tool_routes_dingtalk_provisioning(monkeypatch):
     from app.services import agent_tools

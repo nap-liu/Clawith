@@ -1,58 +1,48 @@
 """Ordinary Web history must not discover project-scoped conversations."""
 
 import uuid
-from types import SimpleNamespace
 
-import pytest
-
-from app.api import activity
-
-
-class _Rows:
-    def scalars(self):
-        return self
-
-    def all(self):
-        return []
+import app.models.registry  # noqa: F401
+from app.api.activity import list_conversations
+from app.database import async_session, engine
+from app.models.agent import Agent
+from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
+from app.models.project import Project
+from app.models.tenant import Tenant
+from app.models.user import User
 
 
-class _RecordingDB:
-    def __init__(self):
-        self.statements = []
+async def test_ordinary_activity_history_excludes_project_sessions():
+    await engine.dispose()
+    try:
+        async with async_session() as db:
+            tenant = Tenant(name="History test", slug=f"history-{uuid.uuid4().hex}")
+            db.add(tenant)
+            await db.flush()
+            user = User(tenant_id=tenant.id, display_name="Owner", role="org_admin")
+            db.add(user)
+            await db.flush()
+            agent = Agent(tenant_id=tenant.id, creator_id=user.id, name="History agent")
+            project = Project(tenant_id=tenant.id, owner_user_id=user.id, name="Project")
+            db.add_all([agent, project])
+            await db.flush()
+            ordinary = ChatSession(agent_id=agent.id, user_id=user.id, source_channel="web")
+            scoped = ChatSession(agent_id=agent.id, user_id=user.id,
+                                 source_channel="web", project_id=project.id)
+            db.add_all([ordinary, scoped])
+            await db.flush()
+            db.add_all([ChatMessage(
+                agent_id=agent.id, user_id=user.id, conversation_id=str(session.id),
+                role="user", content=content,
+            ) for session, content in ((ordinary, "Ordinary message"), (scoped, "Project message"))])
+            await db.flush()
 
-    async def execute(self, statement):
-        self.statements.append(statement)
-        return _Rows()
+            conversations = await list_conversations(agent_id=agent.id, current_user=user, db=db)
 
-
-@pytest.mark.asyncio
-async def test_ordinary_activity_history_excludes_project_sessions(monkeypatch):
-    agent_id = uuid.uuid4()
-    tenant_id = uuid.uuid4()
-    user = SimpleNamespace(id=uuid.uuid4(), role="org_admin")
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=tenant_id,
-        creator_id=uuid.uuid4(),
-    )
-    db = _RecordingDB()
-
-    async def _check_access(_db, _user, _agent_id):
-        return agent, "manage"
-
-    async def _filter_tenant(_db, sessions, _tenant_id):
-        return sessions
-
-    monkeypatch.setattr(activity, "check_agent_access", _check_access)
-    monkeypatch.setattr(activity, "filter_tenant_safe_chat_sessions", _filter_tenant)
-    monkeypatch.setattr(activity, "can_view_all_agent_chat_sessions", lambda *_args: True)
-
-    conversations = await activity.list_conversations(
-        agent_id=agent_id,
-        current_user=user,
-        db=db,
-    )
-
-    assert conversations == []
-    assert len(db.statements) == 1
-    assert "chat_sessions.project_id IS NULL" in str(db.statements[0])
+            assert [item["conv_id"] for item in conversations] == [str(ordinary.id)]
+            assert conversations[0]["last_message"] == "Ordinary message"
+            assert conversations[0]["message_count"] == 1
+            await db.rollback()
+    finally:
+        await engine.dispose()

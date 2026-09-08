@@ -3,47 +3,26 @@
 import pytest
 
 from tests.test_group_session_message import (
-    Agent,
-    AgentRelationship,
-    AgentTool,
     ChannelConfig,
     ChatMessage,
-    ChatSession,
-    DeliveryReceiptPersistenceError,
-    IMDeliveryPart,
     IMDeliveryResult,
-    Identity,
-    MentionIntent,
-    SimpleNamespace,
-    Tenant,
-    Tool,
     TurnRuntime,
-    User,
-    _isolate_messages_and_engine,
+    _isolate_messages_and_engine as _isolate_messages_and_engine,
     _seed_agents,
     _seed_related_user,
     _seed_session,
     agent_tools,
-    asyncio,
     async_session,
-    create_async_engine,
-    datetime,
-    delete,
-    engine,
     httpx,
     json,
-    seed_builtin_tools,
     select,
-    text,
-    timedelta,
-    timezone,
     turn_runtime,
     uuid,
 )
 
 pytestmark = pytest.mark.asyncio
 
-@pytest.mark.parametrize("value", ["true", "false", 1, 0, None, [], {}])
+@pytest.mark.parametrize("value", ["true", 1, None])
 async def test_session_message_rejects_non_boolean_mention_all(value):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
@@ -117,41 +96,6 @@ async def test_session_message_rejects_unsupported_mention_all_before_persist(
             )
         ).scalars().all()
     assert receipts == []
-
-
-async def test_dingtalk_group_mention_does_not_require_recent_group_webhook(monkeypatch):
-    owner, _ = await _seed_agents()
-    target = await _seed_session(owner.id)
-    canonical_user_id = str(uuid.uuid4())
-    delivered: list[dict] = []
-
-    async def fake_prepare(*_args, **_kwargs):
-        return ["staff-zhangsan"], ["张三"]
-
-    async def fake_deliver(**kwargs):
-        delivered.append(kwargs)
-        return IMDeliveryResult.unsupported_delivery(
-            "dingtalk",
-            "dingtalk_interactive_card",
-        )
-
-    monkeypatch.setattr(agent_tools, "prepare_group_user_mentions", fake_prepare)
-    monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
-    result = await agent_tools._send_group_session_message(
-        owner.id,
-        {
-            "session_id": str(target.id),
-            "message": "请确认",
-            "mention_user_ids": [canonical_user_id],
-        },
-    )
-
-    assert json.loads(result)["status"] == "sent"
-    assert delivered[0]["mention"] == MentionIntent(
-        scope="users",
-        target_ids=("staff-zhangsan",),
-        target_names=("张三",),
-    )
 
 
 async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch):

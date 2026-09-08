@@ -3,41 +3,18 @@
 import pytest
 
 from tests.test_group_session_message import (
-    Agent,
-    AgentRelationship,
-    AgentTool,
     ChannelConfig,
     ChatMessage,
-    ChatSession,
-    DeliveryReceiptPersistenceError,
     IMDeliveryPart,
     IMDeliveryResult,
-    Identity,
-    MentionIntent,
-    SimpleNamespace,
-    Tenant,
-    Tool,
-    TurnRuntime,
-    User,
-    _isolate_messages_and_engine,
+    _isolate_messages_and_engine as _isolate_messages_and_engine,
     _seed_agents,
-    _seed_related_user,
     _seed_session,
     agent_tools,
-    asyncio,
     async_session,
-    create_async_engine,
-    datetime,
-    delete,
-    engine,
     httpx,
     json,
-    seed_builtin_tools,
     select,
-    text,
-    timedelta,
-    timezone,
-    turn_runtime,
     uuid,
 )
 
@@ -665,14 +642,3 @@ async def test_external_media_url_reuses_standard_current_tool_call(monkeypatch)
     stored_call = json.loads(stored.content)
     assert stored_call["status"] == "done"
     assert stored_call["args"] == tool_args
-
-
-async def test_outbound_operation_key_supports_sessionless_agent_turns():
-    key = agent_tools._build_outbound_operation_key(
-        agent_id=uuid.uuid4(),
-        origin_session_id=None,
-        tool_call_id="heartbeat-tool-call",
-    )
-
-    assert key is not None
-    assert ":no-session:unanchored:heartbeat-tool-call" in key

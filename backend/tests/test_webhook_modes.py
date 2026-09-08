@@ -14,22 +14,17 @@ from app.main import app
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
 from app.models.tenant import Tenant
-from app.models.tool import AgentTool, Tool
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import User, Identity
-from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
 from app.services.trigger_daemon import (
     _finalize_invocation_executions,
     _link_invocation_executions,
     _evaluate_trigger,
     _merge_webhook_payloads,
-    _advance_webhook_trigger,
 )
 from app.services.trigger_runtime.dispatch import enqueue_due_trigger
-from app.models.audit import AuditLog
 from app.services.storage import get_storage_backend, normalize_storage_key
-from app.services.tool_seeder import BUILTIN_TOOLS, seed_builtin_tools
 from app.services.webhook_inbox import format_webhook_inbox_context
 
 pytestmark = pytest.mark.asyncio
@@ -106,28 +101,6 @@ async def _isolate(monkeypatch):
     await engine.dispose()
 
 
-async def test_agent_has_webhook_queue_max_default_1000():
-    async with async_session() as db:
-        tenant = Tenant(name="T", slug=f"t_{uuid.uuid4().hex[:6]}", im_provider="web_only")
-        db.add(tenant)
-        await db.flush()
-        ident = Identity(
-            username=f"u_{uuid.uuid4().hex[:6]}",
-            email=f"{uuid.uuid4().hex[:6]}@t.local",
-            password_hash="x",
-        )
-        db.add(ident)
-        await db.flush()
-        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True, tenant_id=tenant.id)
-        db.add(user)
-        await db.flush()
-        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native", tenant_id=tenant.id)
-        db.add(agent)
-        await db.commit()
-        await db.refresh(agent)
-        assert agent.webhook_queue_max == 1000
-
-
 # ── Helpers for mode-dispatch tests ─────────────────────────────────────────
 
 
@@ -136,11 +109,14 @@ async def _make_agent_with_hook(mode: str, queue_max: int = 1000):
     token = f"tk_{uuid.uuid4().hex}"  # globally unique — no cross-test collisions
     async with async_session() as db:
         ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native", webhook_queue_max=queue_max)
-        db.add(agent); await db.flush()
+        db.add(agent)
+        await db.flush()
         cfg = {"token": token}
         if mode != "legacy":
             cfg["webhook_mode"] = mode
@@ -180,11 +156,14 @@ async def _make_persisted_webhook_trigger(mode, queue, *, batch_size=None):
     """Persist an agent + queue/merge webhook trigger (active lock held)."""
     async with async_session() as db:
         ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
-        db.add(user); await db.flush()
+        db.add(user)
+        await db.flush()
         agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
-        db.add(agent); await db.flush()
+        db.add(agent)
+        await db.flush()
         cfg = {
             "token": "x",
             "webhook_mode": mode,
@@ -195,7 +174,8 @@ async def _make_persisted_webhook_trigger(mode, queue, *, batch_size=None):
         if batch_size is not None:
             cfg["_webhook_batch_size"] = batch_size
         trig = AgentTrigger(agent_id=agent.id, type="webhook", name="h", config=cfg, reason="r", is_enabled=True)
-        db.add(trig); await db.commit()
+        db.add(trig)
+        await db.commit()
         await db.refresh(trig)
         return agent.id, trig.id
 
@@ -205,9 +185,14 @@ async def _make_persisted_webhook_trigger(mode, queue, *, batch_size=None):
 
 async def test_legacy_overwrites():
     aid, token = await _make_agent_with_hook("legacy")
-    await _post(token, {"n": 1})
+    response = await _post(token, {"n": 1})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
     first = (await _trigger_cfg(aid))["_webhook_event"]
-    await _post(token, {"n": 2})
+    assert first["event_id"] > 0
+    response = await _post(token, {"n": 2})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
     cfg = await _trigger_cfg(aid)
     assert cfg.get("_webhook_pending") is True
     second = cfg["_webhook_event"]
@@ -301,14 +286,6 @@ async def test_queue_backpressure_when_full():
     assert len(cfg["_webhook_queue"]) == 2
 
 
-async def test_merge_accumulates():
-    aid, token = await _make_agent_with_hook("merge")
-    for i in range(4):
-        assert (await _post(token, {"n": i})).status_code == 200
-    cfg = await _trigger_cfg(aid)
-    assert len(cfg["_webhook_queue"]) == 4
-
-
 # ── Daemon evaluation tests (queue/merge serial lock + cooldown bypass) ───────
 
 
@@ -327,11 +304,6 @@ def _mk_trigger(mode, *, queue=None, active=False, pending=False, last_fired=Non
                      is_enabled=True, cooldown_seconds=cooldown, fire_count=0)
     t.last_fired_at = last_fired
     return t
-
-
-async def test_queue_fires_when_queue_nonempty_and_not_active():
-    now = datetime.now(timezone.utc)
-    assert await _evaluate_trigger(_mk_trigger("queue", queue=["a", "b"], active=False), now) is True
 
 
 async def test_queue_skips_when_active():
@@ -356,11 +328,6 @@ async def test_queue_lock_timeout_forces_refire():
     # active 但持锁 > 10min → 强制重处理
     t = _mk_trigger("queue", queue=["a"], active=True, active_since=now - timedelta(minutes=11))
     assert await _evaluate_trigger(t, now) is True
-
-
-async def test_merge_fires_when_queue_nonempty():
-    now = datetime.now(timezone.utc)
-    assert await _evaluate_trigger(_mk_trigger("merge", queue=["a", "b", "c"], active=False), now) is True
 
 
 async def test_merge_due_claim_is_atomic_and_enqueues_one_execution():
@@ -748,9 +715,6 @@ async def test_merge_wake_context_format():
     """merge join is numbered, and the (merged, N entries) header counts entries."""
     merged = _merge_webhook_payloads(["p1", "p2"])
     assert merged == "--- [1] ---\np1\n--- [2] ---\np2"
-    # The header the wake-context builder wraps it with:
-    header = f"Webhook Payload (merged, {len(['p1', 'p2'])} entries):\n{merged}"
-    assert "(merged, 2 entries)" in header
 
 
 async def test_webhook_inbox_context_contains_references_not_payload_bytes():

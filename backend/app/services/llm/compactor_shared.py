@@ -13,8 +13,8 @@ When a session's running prompt-token count approaches the model's
    estimate this input locally; an explicit provider rejection falls through
    to the deterministic lossless archive path.
 5. Calls the same primary LLM with a structured-summary system
-   prompt; caps output via ``LLMModel.compact_summary_max_tokens``.
-6. Validates the summary (length / structure / UUID-and-path recall
+   prompt and its ordinary model output allowance, without a summary-only cap.
+6. Validates the summary (structure / UUID-and-path recall
    ≥ 0.7). A failed model summary gets one repair attempt, then a
    deterministic local summary, so model formatting failures cannot
    disable compaction. The first failure reason is retained for audit.
@@ -76,8 +76,6 @@ COMPACT_LOCK_TTL_SECONDS = 120
 # IDs and file paths from the original span. 0.7 is a starting point;
 # we'll tune after observing the dryrun distribution for a week.
 UUID_RECALL_THRESHOLD = 0.7
-MIN_SUMMARY_CHARS = 200
-MAX_SUMMARY_STORAGE_CHARS = 24_000
 DETERMINISTIC_SUMMARY_MAX_CHARS = 12_000
 OBJECTIVE_EVIDENCE_MAX_CHARS = 800
 OBJECTIVE_EVIDENCE_USER_INPUTS = 3

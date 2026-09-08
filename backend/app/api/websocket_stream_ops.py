@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.api.websocket_inbox_ops import receive_followup, receive_turn_message
+
 
 async def run_llm_and_stream_impl(
     api,
@@ -231,6 +233,22 @@ async def run_llm_and_stream_impl(
                     )
                 )
 
+            async def _on_status(status: dict):
+                from app.services.llm.failure_outcome import render_message
+
+                if not status.get("message_key"):
+                    return
+                content = render_message(
+                    str(status.get("message_key") or ""), self.lang
+                ).format(**status)
+                await self._safe_send(
+                    api.with_turn_envelope(
+                        {"type": "info", "content": content},
+                        turn_snapshot,
+                        event_kind="turn_stream",
+                    )
+                )
+
             from app.services.chat_history import strip_leading_orphan_tool_messages
 
             persisted_view = strip_leading_orphan_tool_messages(self.conversation)
@@ -391,6 +409,7 @@ async def run_llm_and_stream_impl(
                 on_tool_call=tool_call_to_ws,
                 on_tool_delta=tool_delta_to_ws,
                 on_thinking=thinking_to_ws,
+                on_status=_on_status,
                 on_failover=_on_failover,
                 skip_tools=skip_tools_for_greeting,
                 on_code_output=code_output_to_ws,
@@ -431,9 +450,10 @@ async def run_llm_and_stream_impl(
         try:
             assistant_response, _turn_outcome = await api._await_turn_with_abort(
                 llm_task,
-                self.websocket.receive_json,
+                lambda: receive_turn_message(self.websocket),
                 partial_chunks,
                 on_abort=_stop_web_turn_tree,
+                on_message=lambda data: receive_followup(api, self, data),
             )
         finally:
             api.set_active_turn_cancel_task(None)
@@ -642,9 +662,9 @@ async def save_assistant_reply_impl(
     turn_status: str = "completed",
     complete_onboarding: bool = False,
 ) -> bool:
-    from app.services.llm.failure_outcome import llm_failure_code
+    from app.services.llm.failure_outcome import llm_failure_meta
 
-    failure_code = llm_failure_code(assistant_response)
+    failure_meta = llm_failure_meta(assistant_response)
     async with api.async_session() as db:
         if message_id is not None and await db.get(api.ChatMessage, message_id):
             return False
@@ -693,12 +713,12 @@ async def save_assistant_reply_impl(
                 {
                     "turn_anchor_id": str(turn_anchor_id),
                     "turn_status": turn_status,
-                    **({"error_code": failure_code} if failure_code else {}),
+                    **failure_meta,
                     **({"intermediate_assistant_ids": [str(value) for value in intermediate_ids]} if intermediate_ids else {}),
                     **self._scene_message_meta(),
                 }
                 if turn_anchor_id is not None
-                else self._scene_message_meta()
+                else {**failure_meta, **self._scene_message_meta()}
             ),
         )
         db.add(assistant_msg)

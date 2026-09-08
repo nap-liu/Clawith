@@ -7,7 +7,6 @@
 """
 import json
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -139,50 +138,6 @@ async def test_process_tool_call_materializes_oversized_result(tmp_workspace):
     assert persisted_file.read_text() == huge_result
     # 文件路径引用也出现在 llm_view 里，LLM 可以凭此调 read_file 取全文
     assert persisted_file.name in callback_result
-
-
-@pytest.mark.asyncio
-async def test_process_tool_call_clean_arguments_pass_through_unchanged_semantic():
-    """Clean JSON must still work exactly as before (backwards compat)."""
-    tc = {
-        "id": "call_1",
-        "function": {
-            "name": "read_file",
-            "arguments": '{"path": "foo.md"}',
-        },
-    }
-    api_messages: list = []
-
-    async def fake_execute_tool(name, args, **kwargs):
-        assert args == {"path": "foo.md"}
-        return "ok"
-
-    with patch("app.services.llm.caller.execute_tool", side_effect=fake_execute_tool):
-        await _process_tool_call(
-            tc=tc, api_messages=api_messages,
-            agent_id="agent-1", user_id="user-1", session_id="sess-1",
-            supports_vision=False, on_tool_call=None, full_reasoning_content="",
-            allowed_tool_names={"read_file"},
-        )
-
-    # Semantic equivalence (key order / spacing may differ)
-    assert json.loads(tc["function"]["arguments"]) == {"path": "foo.md"}
-
-
-def test_canonicalize_tc_arguments_helper_rewrites_tc_inplace():
-    """Unit test the helper directly — exercised by both _process_tool_call
-    and call_agent_llm_with_tools._try_model."""
-    from app.services.llm.caller import _canonicalize_tc_arguments
-    tc = {
-        "id": "call_1",
-        "function": {"name": "read_file", "arguments": '{"path": "foo.md",}'},
-    }
-    args = _canonicalize_tc_arguments(tc, session_id="sess-x")
-    assert args == {"path": "foo.md"}
-    # In-place mutation: tc now carries canonical JSON
-    import json
-    parsed = json.loads(tc["function"]["arguments"])
-    assert parsed == {"path": "foo.md"}
 
 
 @pytest.mark.asyncio

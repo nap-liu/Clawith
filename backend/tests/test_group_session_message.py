@@ -595,10 +595,9 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
 
     delivered: list[dict] = []
 
-    async def fake_resolve(_db, agent_id, user_id, *, channel):
+    async def fake_resolve(_db, agent_id, user_id):
         assert agent_id == owner.id
         assert user_id == str(mentioned_user_id)
-        assert channel == "dingtalk"
         return SimpleNamespace(
             user=SimpleNamespace(display_name="张三"),
             member=SimpleNamespace(external_id="staff-zhangsan", name="张三"),
@@ -616,7 +615,7 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
         return None
 
     monkeypatch.setattr(
-        "app.services.dingtalk_group_mentions.resolve_human_channel_recipient",
+        "app.services.dingtalk_group_mentions.resolve_group_mention_recipient",
         fake_resolve,
     )
     monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)
@@ -685,7 +684,7 @@ async def test_dingtalk_group_session_message_mentions_everyone(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        "app.services.dingtalk_group_mentions.resolve_human_channel_recipient",
+        "app.services.dingtalk_group_mentions.resolve_group_mention_recipient",
         fail_if_resolved,
     )
     monkeypatch.setattr(agent_tools, "deliver_message_with_receipt", fake_deliver)

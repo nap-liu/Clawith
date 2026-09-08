@@ -158,3 +158,55 @@ browser foreground/visibility because H5 intentionally suspends hidden pages.
 
 - [x] Diagnose ordinary member WebSocket/session handshake in isolated Docker.
 - [x] Verify real member turn and persisted member ownership; no owner patch needed.
+
+## 2026-09-08 接管与主线同步
+
+本节是本次接管的最新状态；前文为原迭代验收记录，不能视为合并后重新验收。
+
+- 工作区继续使用 `.worktrees/openapi-h5-integration`，分支
+  `feat/openapi-h5-integration`；本次未创建额外工作区。
+- 接管起点为 `ff171faf`。本次 fetch 后的公司主线为
+  `yybpc/company/main` 的 `9333e897`，主线有 30 个待合入提交，功能分支有
+  3 个独有提交。用户授权方向为把主线合入功能分支，并在此分支继续接管。
+- 合并冲突涉及 `backend/alembic/env.py`、`backend/app/main.py` 和
+  `backend/entrypoint.sh`。保留主线统一 bootstrap，将 OpenAPI 模型注册迁到
+  `backend/app/models/registry.py`，保留全部 OpenAPI 路由。
+- 新增 `merge_openapi_bootstrap` 合并迁移，汇合
+  `openapi_applications_v1` 与 `repair_bootstrap_indexes`，不重写历史迁移。
+- 主目录的未提交改动、其他工作区和既有联调服务继续保留；本次仅做本地合并，
+  没有 push、反向合入公司主线或部署。
+
+### 当前产品能力
+
+| 能力 | 当前范围 |
+| --- | --- |
+| 外部应用管理 | 平台管理员创建、编辑、启停、轮换密钥、永久撤销、查询审计；绑定固定租户，配置 scope、委托身份、有效期、限流与来源白名单 |
+| 系统认证 | OAuth Client Credentials，Basic + 表单换取 300 秒 Bearer；scope 限制、令牌撤销和服务发现 |
+| 用户委托 | 可信应用提交 subject、已验证手机号和时间戳；匹配既有有效身份及租户成员，拒绝冲突和越租户访问，不自动建人或赋权 |
+| 数字员工发现 | 按委托用户原有权限搜索、分页，返回展示信息及普通 H5 入口 |
+| 临时登录 | 60 秒一次性登录链接，兑换标准用户登录态后跳转到服务端绑定的目标；可以复用到 H5 以外的页面 |
+| 普通 H5 会话 | 复用既有会话、权限、WebSocket 和共享执行链；本次同步也带入主线的自动场景与生成中追加消息能力 |
+
+这是一轮系统接入能力，未增加面向外部应用的独立聊天 REST/流式接口、用户自动同步、
+OAuth 授权码登录或 OIDC。嵌入来源白名单校验不等于跨站 iframe/cookie 全浏览器兼容。
+
+### 本次验证与仍需跟进
+
+- 隔离 Docker PostgreSQL：41 项通过，覆盖空库三种启动入口、重复及并发启动、
+  两个父迁移版本升级、索引修复、OpenAPI 身份/权限/登录重放风险、账户状态、
+  WebSocket 初始化和自动场景。
+- Docker 前端全部 prebuild 行为检查、TypeScript 和 Vite 生产构建通过；构建产物
+  放在一次性容器内，没有替换既有联调站点。首次构建因只读依赖目录阻止 Vite 写入
+  临时配置而退出；增加容器内临时目录后完整重跑通过。保留大分块提示与依赖弃用警告，
+  本次未执行全仓库后端测试或完整 lint。
+- 最终合并差异检查通过；相对两个父分支的所有交付手写源文件均不超过 800 行，
+  最大为 800 行，声明式本地化 JSON 不计入源文件门禁。
+- 临时 PostgreSQL 容器 `openapi-merge-pg-20260908` 在验证后移除；测试与构建
+  容器为一次性容器。原有 OpenAPI 联调服务及证据卷继续保留，当前工作区由本轮
+  接管维护，待功能合入公司主线并按工作区清理规则满足保留条件后再处理。
+- 原迭代记录的双系统浏览器联调不作为本次合并后的浏览器验收；本次未重新执行
+  真实双系统嵌入、Safari/真机或自然语言模型回复。
+- 下一步优先闭环成员 H5 嵌入页面的前台/隐藏生命周期和重连表现；后台已通过的
+  鉴权、WebSocket 握手与落库证据不能代替可见页面验收。
+- 再完成配置真实模型的完整回复，以及跨站 Safari/真机验收，之后评估发布准备。
+  这些是后续验收范围，不代表本次已授权发布或修改另一个产品。

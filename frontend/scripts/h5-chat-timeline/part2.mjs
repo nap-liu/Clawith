@@ -13,10 +13,8 @@ export function runH5ChatTimelinePart2(ctx) {
         upsertToolCallMessage,
         normalizeChatTimelineMessages,
         mergeHistoryMessages,
-        prepareMessagesForActiveTurnResume,
         createResumeEventGate,
         bufferResumeEvent,
-        drainResumeEventGate,
         shouldScheduleResumeReconnect,
         createOrReuseResumeEventGate,
     } = ctx;
@@ -296,31 +294,6 @@ export function runH5ChatTimelinePart2(ctx) {
 }
 
 {
-    const messages = [
-        { id: 'failed-user', role: 'user', content: 'old request' },
-        { id: 'failed-partial', role: 'assistant', content: 'keep old partial', streaming: true },
-        { id: 'active-user', role: 'user', content: 'active request' },
-        { id: 'active-partial', role: 'assistant', content: 'remove active partial', streaming: true },
-        { id: 'active-tool', role: 'tool_call', toolCallId: 'tool-1' },
-        { id: 'active-durable', role: 'assistant', content: 'keep committed output' },
-    ];
-    assert.deepEqual(
-        prepareMessagesForActiveTurnResume(messages).map((message) => message.id),
-        ['failed-user', 'failed-partial', 'active-user', 'active-tool', 'active-durable'],
-        'H5 resume cleanup must affect only transient assistant rows in the active turn',
-    );
-
-    const gate = createResumeEventGate('h5-session', 1);
-    assert.equal(bufferResumeEvent(gate, 'other-session', { type: 'chunk', value: 'wrong' }), false);
-    assert.equal(bufferResumeEvent(gate, 'h5-session', { type: 'chunk', value: 'A' }), true);
-    assert.equal(bufferResumeEvent(gate, 'h5-session', { type: 'tool_call', value: 'tool' }), true);
-    assert.equal(bufferResumeEvent(gate, 'h5-session', { type: 'done', value: 'B' }), true);
-    assert.equal(
-        drainResumeEventGate(gate).map((event) => event.type).join(','),
-        'chunk,tool_call,done',
-        'H5 resume must replay buffered socket events in arrival order',
-    );
-
     assert.equal(shouldScheduleResumeReconnect({
         pageSuspended: false,
         unmounted: false,

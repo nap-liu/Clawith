@@ -13,6 +13,11 @@ Agent context. Tasks, schedules, triggers, and Subagents share the same
 `include_soul` / `include_memory` semantics; both default to enabled so legacy
 resources retain their prior behavior.
 
+Published scenes expose independent `include_soul` and `include_memory`
+switches, both enabled by default. Their immutable turn revision controls the
+same shared context-builder flags in Web and IM. Disabling loading does not
+delete workspace files or remove previously persisted conversation history.
+
 Provider-reported usage is the authority for successful model rounds. Do not
 replace token accounting with character heuristics or a stale model-family
 lookup. Primary/fallback dispatch must preserve a safe protected history suffix
@@ -45,6 +50,13 @@ completed and incomplete work, evidence, blockers, next actions, and relevant
 handoffs. Validation/repair failure falls back to a deterministic lossless
 archive reference; summary quality must not block safe compaction or silently
 lose history.
+
+Semantic summary generation and repair use the ordinary model output allowance,
+without a separate summary token cap or character-length acceptance gate. The
+legacy `compact_summary_max_tokens` column remains for schema compatibility.
+Structural validation tolerates Markdown emphasis on field labels. The local
+archive fallback retains bounded excerpts; that availability path does not
+limit or replace an otherwise valid semantic summary.
 
 ## Tool-result context
 

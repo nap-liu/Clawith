@@ -243,6 +243,7 @@ export function useH5AgentChatLifecycle(state: ReturnType<typeof useH5AgentChatS
 
     const refreshSceneManifest = useCallback(async () => {
         if (authStatus !== 'ready' || !agentId || !token) return null;
+        if (!sceneKey) return sceneManifestRef.current;
         const requestId = ++sceneManifestRequestRef.current;
         try {
             const loaded = await sceneApi.manifest(agentId, sceneKey);

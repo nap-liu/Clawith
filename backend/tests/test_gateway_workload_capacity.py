@@ -229,7 +229,7 @@ async def test_concurrent_standard_native_a2a_consult_merges_into_running_turn(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_standard_native_a2a_different_user_queues_next_turn(
+async def test_concurrent_standard_native_a2a_different_user_joins_current_turn(
     monkeypatch,
 ) -> None:
     from app.services.agent_tools import _send_message_to_agent
@@ -248,13 +248,15 @@ async def test_concurrent_standard_native_a2a_different_user_queues_next_turn(
     release = asyncio.Event()
     provider_calls = 0
     queued_text = f"different execution user {uuid.uuid4()}"
+    injected = []
 
-    async def fake_failover(**_kwargs):
+    async def fake_failover(**kwargs):
         nonlocal provider_calls
         provider_calls += 1
         started.set()
         await release.wait()
-        return "first isolated identity reply"
+        injected.extend(await kwargs["before_round"](0))
+        return "shared turn reply"
 
     monkeypatch.setattr(
         "app.services.llm.call_llm_with_failover",
@@ -281,7 +283,7 @@ async def test_concurrent_standard_native_a2a_different_user_queues_next_turn(
         },
         user_id=second_user_id,
     )
-    assert "queued for the next durable conversation turn" in second
+    assert "merged into the current durable conversation turn" in second
 
     async with async_session() as db:
         queued = await db.scalar(
@@ -291,16 +293,13 @@ async def test_concurrent_standard_native_a2a_different_user_queues_next_turn(
             )
         )
         assert queued is not None
-        assert queued.message_meta["turn_inbox_mode"] == "next_turn"
-        queued.message_meta = {
-            **dict(queued.message_meta or {}),
-            "turn_inbox_state": "cancelled",
-        }
-        await db.commit()
+        assert queued.message_meta["turn_inbox_mode"] == "current_turn"
 
     release.set()
     await asyncio.wait_for(first, timeout=1)
     assert provider_calls == 1
+    assert len(injected) == 1
+    assert queued_text in injected[0]["content"]
 
 
 @pytest.mark.parametrize(
@@ -379,7 +378,7 @@ async def test_standard_native_a2a_lease_failure_schedules_and_resumes(
 
 
 @pytest.mark.asyncio
-async def test_recovered_standard_a2a_kicks_and_completes_promoted_next_turn(
+async def test_recovered_standard_a2a_consumes_followup_in_the_same_turn(
     monkeypatch,
 ) -> None:
     from app.services import turn_inbox, turn_recovery
@@ -433,16 +432,19 @@ async def test_recovered_standard_a2a_kicks_and_completes_promoted_next_turn(
         },
         user_id=second_user_id,
     )
-    assert "queued for the next durable conversation turn" in second_result
+    assert "merged into the current durable conversation turn" in second_result
 
     recovery_calls = 0
-    second_started = asyncio.Event()
+    injected = []
 
     async def recovered_llm(*_args, **_kwargs):
         nonlocal recovery_calls
         recovery_calls += 1
-        if recovery_calls == 2:
-            second_started.set()
+        anchor = first_scheduled[0]
+        injected.extend(await turn_inbox.drain_turn_inbox(
+            session_id=anchor.conversation_id, active_turn_anchor_id=anchor.id,
+            execution_agent_id=anchor.agent_id, execution_user_id=first_user_id,
+        ))
         return f"chain recovery reply {recovery_calls}"
 
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", recovered_llm)
@@ -452,7 +454,6 @@ async def test_recovered_standard_a2a_kicks_and_completes_promoted_next_turn(
         real_schedule,
     )
     assert await turn_recovery.resume_turn(first_scheduled[0]) is True
-    await asyncio.wait_for(second_started.wait(), timeout=2)
 
     for _ in range(40):
         async with async_session() as db:
@@ -477,17 +478,18 @@ async def test_recovered_standard_a2a_kicks_and_completes_promoted_next_turn(
                 session is not None
                 and conversation_turn_snapshot_for_session(session).status
                 == "completed"
-                and len(rows) == 2
+                and len(rows) == 1
             ):
                 break
         await asyncio.sleep(0.05)
 
-    assert recovery_calls == 2
+    assert recovery_calls == 1
+    assert len(injected) == 1
+    assert "recover chain promoted turn" in injected[0]["content"]
     assert session is not None
     assert conversation_turn_snapshot_for_session(session).status == "completed"
     assert [row.content for row in rows] == [
         "chain recovery reply 1",
-        "chain recovery reply 2",
     ]
 
 

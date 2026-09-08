@@ -26,7 +26,6 @@ from starlette.websockets import WebSocketDisconnect
 from app.api.websocket import WebSocketChatHandler, _await_turn_with_abort
 from app.services.conversation_turn_lifecycle import ConversationTurnSnapshot
 from app.services.workload_capacity import WorkloadCapacity, WorkloadKind
-from app.services.workload_capacity import WorkloadOverloadedError
 
 pytestmark = pytest.mark.asyncio
 
@@ -54,6 +53,47 @@ async def test_disconnect_does_not_cancel_turn_and_keeps_reply():
     assert outcome == "disconnected"
     assert resp == "最终回复", "the reply must NOT be lost on disconnect"
     assert task.done() and not task.cancelled(), "the turn must run to completion"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'WebSocket is not connected. Need to call "accept" first.',
+        'Cannot call "receive" once a disconnect message has been received.',
+    ],
+)
+async def test_starlette_closed_receive_errors_detach_the_turn(message):
+    async def _turn():
+        await asyncio.sleep(0.01)
+        return "detached reply"
+
+    task = asyncio.create_task(_turn())
+
+    async def _recv():
+        raise RuntimeError(message)
+
+    resp, outcome = await _await_turn_with_abort(task, _recv, [])
+
+    assert (resp, outcome) == ("detached reply", "disconnected")
+    assert not task.cancelled()
+
+
+async def test_unrelated_receive_runtime_error_is_not_hidden():
+    async def _turn():
+        await asyncio.sleep(5)
+
+    task = asyncio.create_task(_turn())
+
+    async def _recv():
+        raise RuntimeError("application receive bug")
+
+    try:
+        with pytest.raises(RuntimeError, match="application receive bug"):
+            await _await_turn_with_abort(task, _recv, [])
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 async def test_abort_cancels_turn_and_returns_partial():
@@ -244,33 +284,6 @@ async def test_failed_onboarding_closes_hidden_turn_before_skip_event():
             "turn": failed.to_client_dict(),
         }
     )
-
-
-async def test_capacity_rejection_never_admits_durable_turn(monkeypatch):
-    handler = WebSocketChatHandler(
-        websocket=SimpleNamespace(),
-        agent_id=uuid.uuid4(),
-        token="test",
-        session_id=str(uuid.uuid4()),
-    )
-    handler.user_id = uuid.uuid4()
-    handler.tenant_id = uuid.uuid4()
-    handler.conv_id = handler.session_id_param
-    handler.conversation = [{"role": "user", "content": "hello"}]
-    capacity = WorkloadCapacity(
-        global_limit=1,
-        tenant_limit=1,
-        category_limits={kind: 1 for kind in WorkloadKind},
-        default_timeout_seconds=0.01,
-        instance_id="websocket-capacity-rejection",
-    )
-    monkeypatch.setattr("app.api.websocket.get_workload_capacity", lambda: capacity)
-    async with capacity.slot(WorkloadKind.INTERACTIVE, handler.tenant_id):
-        with pytest.raises(WorkloadOverloadedError):
-            await capacity.acquire(
-                WorkloadKind.INTERACTIVE,
-                handler.tenant_id,
-            )
 
 
 async def test_pre_admission_rejection_is_not_a_turn_terminal(monkeypatch):

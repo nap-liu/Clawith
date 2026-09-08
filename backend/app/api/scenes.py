@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
@@ -23,6 +23,9 @@ from app.services.scene_service import (
     serialize_scene,
     serialize_scene_manifest,
 )
+from app.services.scene_targets import conversation_options
+from app.api.tools_agent import get_agent_tools_with_config
+from app.services.scene_tool_settings import scene_mcp_override_options
 
 router = APIRouter(prefix="/agents/{agent_id}/scenes", tags=["scenes"])
 
@@ -57,6 +60,31 @@ async def get_scenes(
 ):
     await _require_scene_access(db, current_user, agent_id, manage=True)
     return await list_scenes(db, agent_id)
+
+
+@router.get("/conversation-options")
+async def get_conversation_options(
+    agent_id: uuid.UUID,
+    q: str = Query(default="", max_length=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    agent = await _require_scene_access(db, current_user, agent_id, manage=True)
+    if agent.tenant_id != current_user.tenant_id:
+        raise HTTPException(404, detail="sceneAuto.targetUnavailable")
+    return await conversation_options(db, agent, current_user, q=q, offset=offset)
+
+
+@router.get("/tool-options")
+async def get_scene_tool_options(
+    agent_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_scene_access(db, current_user, agent_id, manage=True)
+    tools = await get_agent_tools_with_config(agent_id, current_user, db)
+    return {"tools": tools, "mcp_server_overrides": await scene_mcp_override_options(db, agent_id, tools)}
 
 
 @router.get("/{scene_key}")

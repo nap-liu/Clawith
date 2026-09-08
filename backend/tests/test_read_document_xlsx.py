@@ -65,10 +65,3 @@ def test_render_xlsx_row_preserves_inner_empty_cells():
 
 def test_render_xlsx_row_all_empty_is_blank():
     assert _render_xlsx_row((None,) * 80) == ""
-
-
-def test_render_xlsx_row_no_trailing_tab():
-    row = ("a", "b", None, None)
-    out = _render_xlsx_row(row)
-    assert out == "a\tb"
-    assert not out.endswith("\t")

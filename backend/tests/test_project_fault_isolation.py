@@ -397,24 +397,6 @@ async def test_standard_trigger_catalog_survives_project_query_failure(monkeypat
     assert trigger_id in {trigger.id for trigger in loaded}
 
 
-async def test_project_runtime_boundary_still_blocks_project_agents(monkeypatch):
-    from app.services.project_runtime_boundary import project_agent_runtime_allows
-
-    project_check = AsyncMock(return_value=False)
-    monkeypatch.setattr(
-        "app.services.project_service.project_runtime_allows_agent",
-        project_check,
-    )
-    project_agent = SimpleNamespace(
-        id=uuid.uuid4(),
-        scope="project",
-        project_id=uuid.uuid4(),
-    )
-
-    assert not await project_agent_runtime_allows(SimpleNamespace(), project_agent)
-    project_check.assert_awaited_once()
-
-
 async def test_standard_trigger_invocation_survives_broken_project_check(monkeypatch):
     from app.services.trigger_daemon import _invoke_agent_for_triggers
 
@@ -441,7 +423,7 @@ async def test_standard_trigger_invocation_survives_broken_project_check(monkeyp
         execution_user_id=owner_id,
     )
     broken_project_check = AsyncMock(side_effect=RuntimeError("project runtime unavailable"))
-    resume = AsyncMock()
+    resume = AsyncMock(return_value="trigger result")
     finalize = AsyncMock()
     monkeypatch.setattr(
         "app.services.project_service.project_runtime_allows_agent",

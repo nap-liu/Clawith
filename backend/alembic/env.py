@@ -3,61 +3,15 @@
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
-from sqlalchemy import pool
+from alembic import command, context
+from alembic.script import ScriptDirectory
+from sqlalchemy import inspect, pool, text
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.database import Base
 from app.config import get_settings
-
-# Import all models so they are registered with Base.metadata
-from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
-from app.models.user import User  # noqa: F401
-from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
-from app.models.task import Task, TaskLog  # noqa: F401
-from app.models.channel_config import ChannelConfig  # noqa: F401
-from app.models.channel_type_default import ChannelTypeDefault  # noqa: F401
-from app.models.chat_compaction import ChatCompaction  # noqa: F401
-from app.models.llm import LLMModel  # noqa: F401
-from app.models.mcp_server import MCPServer, MCPServerOverride  # noqa: F401
-from app.models.audit import AuditLog, ApprovalRequest, ChatMessage, EnterpriseInfo  # noqa: F401
-from app.models.skill import Skill, SkillFile  # noqa: F401
-from app.models.chat_session import ChatSession  # noqa: F401
-from app.models.participant import Participant  # noqa: F401
-from app.models.activity_log import AgentActivityLog  # noqa: F401
-from app.models.invitation_code import InvitationCode  # noqa: F401
-from app.models.org import OrgDepartment, OrgMember, AgentRelationship, AgentAgentRelationship  # noqa: F401
-from app.models.plaza import PlazaPost, PlazaComment, PlazaLike  # noqa: F401
-from app.models.schedule import AgentSchedule  # noqa: F401
-from app.models.system_settings import SystemSetting  # noqa: F401
-from app.models.tenant import Tenant  # noqa: F401
-from app.models.tool import Tool  # noqa: F401
-from app.models.cli_tool_binary import CliToolBinaryVersion  # noqa: F401
-from app.models.trigger import AgentTrigger  # noqa: F401
-from app.models.subagent_run import SubagentRun  # noqa: F401
-from app.models.project import (  # noqa: F401
-    Project,
-    ProjectAccessGrant,
-    ProjectCapabilityBinding,
-    ProjectEvent,
-    ProjectMemberSnapshot,
-    ProjectRepositoryOperation,
-    ProjectRun,
-    ProjectRunMemberSnapshot,
-    ProjectTemplate,
-    ProjectWorkItem,
-)
-from app.models.agent_credential import AgentCredential  # noqa: F401
-from app.models.onboarding import UserTenantOnboarding  # noqa: F401
-from app.models.personal_access_token import PersonalAccessToken  # noqa: F401
-from app.models.openapi_application import OpenAPIApplication, OpenAPICredential, OpenAPIUserBinding  # noqa: F401
-from app.models.speech_recognition_config import SpeechRecognitionConfig  # noqa: F401
-from app.models.published_page import (  # noqa: F401
-    PublishedPage,
-    PublishedPageAccess,
-    PublishedPageAnonymousVisitor,
-    PublishedPageVisitor,
-)
+from app.core.database_guards import ensure_current_database_guards
+from app.database import Base
+from app.models import registry  # noqa: F401
 
 config = context.config
 settings = get_settings()
@@ -83,10 +37,49 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _is_head_upgrade() -> bool:
+    # CLI upgrades and our standalone command opt into current-schema bootstrap.
+    # Keep historical targets, downgrade, stamp and autogenerate unchanged.
+    cli_command = getattr(config.cmd_opts, "cmd", (None,))[0]
+    return config.attributes.get("bootstrap_current_schema", False) or (
+        cli_command is command.upgrade
+        and getattr(config.cmd_opts, "revision", None) in {"head", "heads"}
+    )
+
+
 def do_run_migrations(connection):
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        context.run_migrations()
+    bootstrap = _is_head_upgrade()
+    if bootstrap:
+        # Session lock survives Alembic's concurrent-index autocommit blocks.
+        connection.execute(text("SELECT pg_advisory_lock(724019381)"))
+        connection.commit()
+    try:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            if bootstrap:
+                tables = set(inspect(connection).get_table_names()) - {"alembic_version"}
+                versions = context.get_context().get_current_heads()
+                if tables and not versions:
+                    raise RuntimeError(
+                        "Database has tables but no Alembic revision; refusing to replay "
+                        "historical migrations or stamp unknown data. Use a verified "
+                        "legacy migration baseline, or a new empty database."
+                    )
+                if not tables and not versions:
+                    # Create and stamp atomically; current models already include
+                    # historical columns, so replaying their ADD statements is wrong.
+                    Base.metadata.create_all(connection)
+                    ensure_current_database_guards(connection)
+                    context.get_context().stamp(ScriptDirectory.from_config(config), "heads")
+                    return
+            context.run_migrations()
+            if bootstrap:
+                ensure_current_database_guards(connection)
+    finally:
+        if bootstrap:
+            connection.rollback()
+            connection.execute(text("SELECT pg_advisory_unlock(724019381)"))
+            connection.commit()
 
 
 async def run_async_migrations() -> None:

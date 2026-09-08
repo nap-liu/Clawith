@@ -118,19 +118,8 @@ okay-{epoch}
         assert fail_reason is None
         assert recall >= UUID_RECALL_THRESHOLD
 
-    def test_rejects_too_short(self):
-        passed, reason, _ = validate_summary(
-            summary="too short",
-            original_text="anything",
-            max_tokens=2000,
-        )
-        assert passed is False
-        assert "too_short" in reason
-
     def test_rejects_low_id_recall(self):
         # Original has 5 paths; summary recalls 1 → 20% < 70% threshold.
-        # Summary padded to clear the MIN_SUMMARY_CHARS gate so we
-        # exercise the recall gate in isolation.
         original = (
             "Files referenced: workspace/a.md workspace/b.md workspace/c.md "
             "workspace/d.md workspace/e.md"
@@ -284,9 +273,10 @@ okay-{epoch}
         assert ".tool_results/session/report_call.txt" in identifiers
         assert len(filtered) < len(original)
 
-    def test_identifier_heavy_summary_cannot_exceed_configured_token_budget(self):
+    def test_identifier_heavy_summary_has_no_summary_length_ceiling(self):
         identifiers = " ".join(str(uuid.uuid4()) for _ in range(1_000))
         summary = f"{_GOOD_SUMMARY}\n\n### Preserved identifiers\n{identifiers}"
+        summary = pin_summary_objective(summary=summary, original_text=identifiers)
 
         passed, reason, _ = validate_summary(
             summary=summary,
@@ -294,9 +284,8 @@ okay-{epoch}
             max_tokens=2_000,
         )
 
-        assert passed is False
-        assert reason is not None
-        assert reason.startswith("too_long")
+        assert len(summary) > 24_000
+        assert passed is True, reason
 
     def test_deterministic_fallback_preserves_goal_sections_and_identifiers(self):
         original = (

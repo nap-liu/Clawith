@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
 from app.database import async_session, engine
-from app.models.personal_access_token import PersonalAccessToken
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 
@@ -45,14 +45,6 @@ async def _seed_user(tenant_id=None) -> User:
         await db.commit()
         await db.refresh(u)
         return u
-
-
-# ── Task A1: model column default ─────────────────────────────────────────────
-
-
-def test_pat_model_has_scope_default_read():
-    # python-side column default must resolve to "read"
-    assert PersonalAccessToken.__table__.c.scope.default.arg == "read"
 
 
 # ── Task A2: scope-aware service ──────────────────────────────────────────────
@@ -109,9 +101,6 @@ async def test_verify_pat_still_returns_two_tuple():
 
 # ── Task A3: MCP auth-layer PatContext ────────────────────────────────────────
 
-from types import SimpleNamespace
-
-
 def _ctx(token):
     # primary header path: ctx.request_context.request.headers
     headers = {"authorization": f"Bearer {token}"} if token else {}
@@ -131,19 +120,6 @@ async def test_resolve_pat_context_carries_scope():
     assert pc is not None and pc.scope == "write" and pc.user.id == user.id and pc.tenant_id == tenant.id
 
 
-async def test_resolve_pat_user_still_two_tuple():
-    from app.services.pat_service import issue_pat
-    from app.mcp_server.auth import resolve_pat_user
-
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-    async with async_session() as db:
-        token, _ = await issue_pat(db, user=user, name="r")
-    async with async_session() as db:
-        result = await resolve_pat_user(_ctx(token), db)
-    assert len(result) == 2 and result[0].id == user.id
-
-
 async def test_resolve_pat_context_none_when_unauth():
     from app.mcp_server.auth import resolve_pat_context
 
@@ -152,7 +128,6 @@ async def test_resolve_pat_context_none_when_unauth():
 
 
 def test_require_write_gate():
-    from types import SimpleNamespace
     from app.mcp_server.auth import require_write
 
     assert require_write(SimpleNamespace(scope="write")) is True

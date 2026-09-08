@@ -289,7 +289,7 @@ class OpenAICompatibleClient(LLMClient):
             return chunk, in_think, tag_buffer, json_buffer
 
         if "error" in data:
-            raise LLMError(f"Stream error: {data['error']}")
+            raise LLMError.from_payload(data)
 
         # Parse usage from stream (returned in the final chunk with include_usage)
         if data.get("usage"):
@@ -318,9 +318,29 @@ class OpenAICompatibleClient(LLMClient):
 
         # Tool calls
         if delta.get("tool_calls"):
-            for tc_delta in delta["tool_calls"]:
-                chunk.tool_call = tc_delta
-                break  # Return one at a time
+            raw_tool_calls = delta["tool_calls"]
+            if not isinstance(raw_tool_calls, list) or any(
+                not isinstance(tc_delta, dict) for tc_delta in raw_tool_calls
+            ):
+                raise LLMError(
+                    "Provider returned malformed tool-call deltas",
+                    error_code="invalid_tool_call_stream",
+                    error_type="protocol_error",
+                )
+            indices = [tc_delta.get("index", 0) for tc_delta in raw_tool_calls]
+            if any(
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index >= 128
+                for index in indices
+            ) or len(indices) != len(set(indices)):
+                raise LLMError(
+                    "Provider returned invalid tool-call indices in one stream event",
+                    error_code="invalid_tool_call_stream",
+                    error_type="protocol_error",
+                )
+            chunk.tool_calls = list(raw_tool_calls)
 
         return chunk, in_think, tag_buffer, json_buffer
 
@@ -385,13 +405,13 @@ class OpenAICompatibleClient(LLMClient):
         response = await client.post(url, json=payload, headers=self._get_headers())
 
         if response.status_code >= 400:
-            error_text = response.text[:500]
-            raise LLMError.from_http(response.status_code, error_text)
+            error_text = response.text
+            raise LLMError.from_http(response.status_code, error_text, response.headers)
 
         data = response.json()
 
         if "error" in data:
-            raise LLMError(f"API error: {data['error']}")
+            raise LLMError.from_payload(data)
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
@@ -428,7 +448,8 @@ class OpenAICompatibleClient(LLMClient):
         tag_buffer = ""
         json_buffer = ""  # Buffer for non-standard APIs with split JSON (inspired by PR #120)
 
-        max_retries = 3
+        # Request replay is owned by the shared provider retry state machine.
+        max_retries = 1
         client = await self._get_client()
         meaningful_progress = False
 
@@ -438,8 +459,9 @@ class OpenAICompatibleClient(LLMClient):
                     if resp.status_code >= 400:
                         error_body = ""
                         async for chunk in resp.aiter_bytes():
-                            error_body += chunk.decode(errors="replace")
-                        raise LLMError.from_http(resp.status_code, error_body[:500])
+                            if len(error_body) < 65536:
+                                error_body += chunk.decode(errors="replace")[: 65536 - len(error_body)]
+                        raise LLMError.from_http(resp.status_code, error_body, resp.headers)
 
                     async for line in resp.aiter_lines():
                         chunk, in_think, tag_buffer, json_buffer = self._parse_stream_line(
@@ -461,15 +483,28 @@ class OpenAICompatibleClient(LLMClient):
                             if on_thinking:
                                 await on_thinking(chunk.reasoning_content)
 
-                        if chunk.tool_call:
+                        for tool_call_delta in chunk.tool_calls:
                             meaningful_progress = True
-                            idx = chunk.tool_call.get("index", 0)
+                            idx = tool_call_delta.get("index", 0)
+                            if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx >= 128:
+                                raise LLMError(
+                                    "Provider returned an invalid tool-call index",
+                                    error_code="invalid_tool_call_stream",
+                                    error_type="protocol_error",
+                                )
                             while len(tool_calls_data) <= idx:
                                 tool_calls_data.append({"id": "", "function": {"name": "", "arguments": ""}})
                             tc = tool_calls_data[idx]
-                            if chunk.tool_call.get("id"):
-                                tc["id"] = chunk.tool_call["id"]
-                            fn_delta = chunk.tool_call.get("function", {})
+                            incoming_id = tool_call_delta.get("id")
+                            if incoming_id and tc["id"] and incoming_id != tc["id"]:
+                                raise LLMError(
+                                    "Provider changed a tool-call ID during streaming",
+                                    error_code="invalid_tool_call_stream",
+                                    error_type="protocol_error",
+                                )
+                            if incoming_id:
+                                tc["id"] = incoming_id
+                            fn_delta = tool_call_delta.get("function", {})
                             if fn_delta.get("name"):
                                 tc["function"]["name"] += fn_delta["name"]
                             if fn_delta.get("arguments") is not None:
@@ -503,9 +538,13 @@ class OpenAICompatibleClient(LLMClient):
                 # Response inactivity is terminal for this turn.  Let the
                 # shared caller normalize it without replaying the request.
                 raise
-            except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
+            except httpx.TransportError as e:
                 if meaningful_progress:
-                    raise LLMError(f"Connection interrupted after streaming started: {e}") from e
+                    raise LLMError(
+                        f"Connection interrupted after streaming started: {e}",
+                        error_code=type(e).__name__,
+                        error_type="connection_error",
+                    ) from e
                 if attempt < max_retries - 1:
                     wait = (attempt + 1) * 1
                     logger.warning(f"Stream attempt {attempt + 1} failed ({type(e).__name__}), retrying in {wait}s...")
@@ -517,7 +556,7 @@ class OpenAICompatibleClient(LLMClient):
                     tag_buffer = ""
                     json_buffer = ""
                 else:
-                    raise LLMError(f"Connection failed after {max_retries} attempts: {e}")
+                    raise
 
         # Clean up any remaining think tags
         full_content = re.sub(r"<think>[\s\S]*?</think>\s*", "", full_content).strip()

@@ -441,7 +441,7 @@ export function runH5ChatTimelinePart4(ctx) {
     assert.equal(parallel.length, 2);
     assert.equal(mergeHistoryMessages([first], [second]).length, 2);
 
-    const legacyResult = JSON.stringify({ path: 'same.txt', filename: 'same.txt' });
+    const legacyResult = 'File ready: [same.txt](/api/agents/agent/files/download?path=same.txt)';
     const legacyLive = { ...first, id: 'legacy-live', toolName: 'send_channel_file', toolResult: legacyResult, toolCallId: 'fallback-live', _toolCallIdExplicit: false };
     const legacyHistory = { ...first, id: 'legacy-history', toolName: 'send_channel_file', toolResult: legacyResult, toolCallId: 'row-id', _toolCallIdExplicit: false };
     assert.equal(mergeHistoryMessages([legacyLive], [legacyHistory]).length, 1);

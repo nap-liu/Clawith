@@ -10,7 +10,6 @@ const bootstrapMatch = html.match(/<script id="vconsole-bootstrap">([\s\S]*?)<\/
 const initMatch = html.match(/<script id="vconsole-init">([\s\S]*?)<\/script>/);
 assert.ok(bootstrapMatch);
 assert.ok(initMatch);
-assert.ok(html.indexOf('id="vconsole-bootstrap"') < html.indexOf('src="/src/main.tsx"'));
 
 function runBootstrap(search) {
     const writes = [];

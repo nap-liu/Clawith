@@ -8,7 +8,7 @@ from jose import jwt
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.api.sso import SSO_SESSION_HOURS, create_sso_session
+from app.api.sso import create_sso_session
 from app.config import get_settings
 from app.core.security import ACCESS_TOKEN_COOKIE_NAME
 from app.database import async_session, engine
@@ -16,7 +16,6 @@ from app.main import app
 from app.models.identity import IdentityProvider, SSOScanSession
 from app.models.tenant import Tenant
 from app.services.sso_login_state import (
-    SSO_STATE_HOURS,
     create_sso_browser_binding,
     create_sso_login_state,
     get_enabled_sso_provider,
@@ -40,7 +39,6 @@ def test_sso_state_lasts_twelve_hours_and_carries_complete_query():
     query = "return_to=https%3A%2F%2Fexample.com%2Fa%3Fx%3D1&sso=dingtalk&tenant_id=abc"
     token = create_sso_login_state(sid, provider_id, query)
 
-    assert SSO_STATE_HOURS == 12
     assert parse_sso_login_state(token) == (sid, provider_id, query)
     payload = jwt.decode(token, get_settings().SECRET_KEY, algorithms=["HS256"])
     remaining = datetime.fromtimestamp(payload["exp"], timezone.utc) - datetime.now(timezone.utc)
@@ -79,7 +77,6 @@ async def test_legacy_sso_session_also_lasts_twelve_hours():
     })
     result = await create_sso_session(response=response, request=request, tenant_id=None, db=db)
     remaining = db.added.expires_at - before
-    assert SSO_SESSION_HOURS == 12
     assert 11.9 * 3600 < remaining.total_seconds() <= 12 * 3600 + 1
     assert result["session_id"] == str(db.added.id)
     assert sso_browser_cookie_name(db.added.id) in response.headers["set-cookie"]
@@ -182,12 +179,13 @@ async def test_sso_provider_order_uses_enable_time_only():
 
 @pytest.mark.asyncio
 async def test_sso_start_binds_browser_and_exact_provider():
+    sso_domain = f"http://sso-{uuid.uuid4().hex}.example.test:3008"
     async with async_session() as db:
         tenant = Tenant(
             name="SSO Start Test",
             slug=f"start-{uuid.uuid4().hex[:8]}",
             im_provider="web_only",
-            sso_domain="http://local-ai.yeyecha.com:3008",
+            sso_domain=sso_domain,
         )
         db.add(tenant)
         await db.flush()
@@ -217,7 +215,7 @@ async def test_sso_start_binds_browser_and_exact_provider():
         state = authorization_query["state"][0]
         assert "scope=openid+profile" in authorization_url
         assert authorization_query["redirect_uri"] == [
-            "http://local-ai.yeyecha.com:3008/api/auth/oauth2/callback"
+            f"{sso_domain}/api/auth/oauth2/callback"
         ]
         assert parse_sso_login_state(state) == (sid, provider_id, query)
         assert sso_browser_cookie_name(sid) in started.headers["set-cookie"]

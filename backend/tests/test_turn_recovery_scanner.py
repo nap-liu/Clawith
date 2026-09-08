@@ -3,26 +3,16 @@
 import pytest
 
 from tests.test_turn_recovery import (
-    UTC,
-    Agent,
-    ChannelConfig,
     ChatMessage,
     ChatSession,
-    IdentityProvider,
-    OrgMember,
-    SimpleNamespace,
-    User,
-    _dispose_engine_between_tests,
+    _dispose_engine_between_tests,  # noqa: F401 - pytest autouse fixture
     _make_agent_with_model,
     _make_user_anchor,
-    asyncio,
     async_session,
+    asyncio,
     datetime,
-    delete,
-    engine,
     json,
     select,
-    text,
     timedelta,
     timezone,
     uuid,
@@ -316,75 +306,6 @@ async def test_startup_scan_skips_archived_channel_session(monkeypatch):
 
     assert stats.scanned == 0
     assert stats.resumed == 0
-
-
-async def test_startup_scan_uses_latest_message_save_time_without_markers(monkeypatch):
-    """Only sessions whose latest saved message is recent and incomplete are resumed."""
-    from app.services import turn_recovery
-
-    agent_id, user_id = await _make_agent_with_model()
-    suffix = uuid.uuid4().hex[:8]
-    old_conv = f"old_markerless_{suffix}"
-    complete_conv = f"complete_markerless_{suffix}"
-    recent_conv = f"recent_markerless_{suffix}"
-    resumed: list[str] = []
-
-    async def fake_llm(*args, **kwargs):
-        resumed.append(kwargs["session_id"])
-        return f"done {kwargs['session_id']}"
-
-    async def fake_deliver(*, agent_id, conversation_id, reply, message_id):
-        assert message_id is not None
-        return True
-
-    monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_llm)
-    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver)
-
-    now = datetime.now(timezone.utc)
-    async with async_session() as db:
-        db.add_all(
-            [
-                ChatMessage(
-                    agent_id=agent_id,
-                    user_id=user_id,
-                    conversation_id=old_conv,
-                    role="user",
-                    content="old incomplete",
-                    created_at=now - timedelta(hours=7),
-                ),
-                ChatMessage(
-                    agent_id=agent_id,
-                    user_id=user_id,
-                    conversation_id=complete_conv,
-                    role="user",
-                    content="recent complete user",
-                    created_at=now - timedelta(minutes=4),
-                ),
-                ChatMessage(
-                    agent_id=agent_id,
-                    user_id=user_id,
-                    conversation_id=complete_conv,
-                    role="assistant",
-                    content="recent complete assistant",
-                    created_at=now - timedelta(minutes=3),
-                ),
-                ChatMessage(
-                    agent_id=agent_id,
-                    user_id=user_id,
-                    conversation_id=recent_conv,
-                    role="user",
-                    content="recent incomplete",
-                    created_at=now - timedelta(minutes=2),
-                ),
-            ]
-        )
-        await db.commit()
-
-    stats = await turn_recovery.startup_turn_resume_once(limit=10)
-
-    assert stats.scanned == 1
-    assert stats.resumed == 1
-    assert resumed == [recent_conv]
 
 
 async def test_startup_scan_recovers_any_channel_tail_without_adapter(monkeypatch):

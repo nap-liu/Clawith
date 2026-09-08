@@ -141,10 +141,18 @@ export function reduceConversationTurnEvent(
     const advancesSnapshot = Boolean(
       incoming && compareSnapshot(incoming, current.snapshot) > 0,
     );
+    // A rejected send never started a turn. Reconcile optimistic waiting with
+    // the server's current state, without applying an older generation.
+    const reconcilesRejection = Boolean(
+      eventKind === "turn_rejected" && incoming &&
+      incoming.phase !== "active" &&
+      compareSnapshot(incoming, current.snapshot) === 0,
+    );
+    const controlsLifecycle = advancesSnapshot || reconcilesRejection;
     return {
       accepted: true,
       runtime:
-        incoming && advancesSnapshot
+        incoming && controlsLifecycle
           ? {
               snapshot: incoming,
               presentation: presentationFor(
@@ -156,7 +164,7 @@ export function reduceConversationTurnEvent(
             }
           : current,
       hasSnapshot: incoming !== null,
-      controlsLifecycle: advancesSnapshot,
+      controlsLifecycle,
       deliversTimeline: false,
       deliversTransport: true,
     };

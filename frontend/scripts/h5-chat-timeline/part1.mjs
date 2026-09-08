@@ -290,6 +290,24 @@ export function runH5ChatTimelinePart1(ctx) {
     assert.equal(receipt.deliversTransport, true);
     assert.equal(receipt.runtime.presentation, 'streaming');
 
+    const rejection = {
+        type: 'error', event_kind: 'turn_rejected', rejected_message_id: 'invalid-file-send',
+        turn: {
+            turn_anchor_id: 'turn-b', generation: 2, revision: 1,
+            status: 'running', phase: 'active',
+        },
+    };
+    const rejectedWhileActive = reduceConversationTurnEvent(active.runtime, rejection);
+    assert.equal(rejectedWhileActive.runtime.presentation, 'streaming');
+    assert.equal(conversationTurnEventClosesStream(rejectedWhileActive, rejection), false);
+    const completedTurn = { ...rejection.turn, revision: 2, status: 'completed', phase: 'idle' };
+    const idle = reduceConversationTurnEvent(active.runtime, { type: 'done', turn: completedTurn });
+    const rejectedWhileIdle = reduceConversationTurnEvent(idle.runtime, { ...rejection, turn: completedTurn });
+    assert.equal(rejectedWhileIdle.controlsLifecycle, true, 'rejected send clears optimistic waiting');
+    assert.equal(rejectedWhileIdle.runtime.presentation, 'idle');
+    assert.equal(reduceConversationTurnEvent(idle.runtime, rejection).controlsLifecycle, false,
+        'a delayed rejection must not roll back the current turn');
+
     const newerCohort = reduceConversationTurnEvent(active.runtime, {
         type: 'turn_state',
         turn: {

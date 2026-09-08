@@ -18,12 +18,10 @@ assert.equal(parseH5Theme(''), 'system');
 assert.equal(parseH5Theme('invalid'), 'system');
 assert.equal(parseH5Theme(null), 'system');
 
-assert.equal(typeof parseChatSessionId, 'function', 'shared chat params must export parseChatSessionId');
 assert.equal(parseChatSessionId(' session-1 '), 'session-1');
 assert.equal(parseChatSessionId(''), null);
 assert.equal(parseChatSessionId(null), null);
 
-assert.equal(typeof writeChatSessionIdToHref, 'function', 'shared chat params must export writeChatSessionIdToHref');
 assert.equal(
     writeChatSessionIdToHref('https://example.test/h5/agents/a1/chat?channel=wechat_miniprogram&theme=dark#view', 's2'),
     '/h5/agents/a1/chat?channel=wechat_miniprogram&theme=dark&session_id=s2#view',

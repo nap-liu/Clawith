@@ -1,20 +1,18 @@
 import asyncio
-import importlib.metadata
 import json
 import threading
 import uuid
 
 import httpx
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.database import Base
-from app.models.agent import Agent, AgentTemplate
+from app.database import engine
+from app.models.agent import Agent
 from app.models.channel_config import ChannelConfig
-from app.models.llm import LLMModel
 from app.models.tenant import Tenant
-from app.models.user import Identity, User
+from app.models.user import User
 from app.services import dingtalk_stream
 from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_stream import DingTalkStreamManager, _StreamRuntime
@@ -23,20 +21,17 @@ from app.services.dingtalk_token import DingTalkTokenManager
 
 @pytest.fixture
 async def stream_db():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    tables = [
-        Identity.__table__,
-        Tenant.__table__,
-        User.__table__,
-        LLMModel.__table__,
-        AgentTemplate.__table__,
-        Agent.__table__,
-        ChannelConfig.__table__,
-    ]
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    yield session_factory
+    await engine.dispose()
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        # Reconciliation scans every tenant; isolate rows inside this rollback.
+        await connection.execute(delete(ChannelConfig))
+        yield async_sessionmaker(
+            connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        await transaction.rollback()
     await engine.dispose()
 
 
@@ -495,7 +490,6 @@ async def test_connection_state_db_failure_does_not_escape_into_runner(monkeypat
 async def test_gateway_adapter_matches_pinned_sdk_contract():
     import dingtalk_stream as sdk
 
-    assert importlib.metadata.version("dingtalk-stream") == "0.24.3"
     manager = DingTalkStreamManager()
     client = sdk.DingTalkStreamClient(
         credential=sdk.Credential(

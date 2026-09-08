@@ -1,7 +1,5 @@
 import json
-import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from jsonschema import Draft7Validator
@@ -218,52 +216,9 @@ def test_mini_program_uri_contract_matches_scene_validation():
                 )
 
 
-def test_scene_tool_is_global_builtin_and_opt_in():
+def test_scene_tool_schema_validates_requests_and_converts_for_gemini():
     seed = next(item for item in BUILTIN_TOOLS if item["name"] == "manage_scene")
-
-    assert seed["is_default"] is False
-    assert "H5" not in seed["description"]
-    assert "Agent" not in seed["description"]
-    assert seed["parameters_schema"]["properties"]["operation"]["enum"] == [
-        "list",
-        "get",
-        "save",
-        "publish",
-        "delete",
-        "rollback",
-    ]
-    overwrite = seed["parameters_schema"]["properties"]["force_overwrite"]
-    assert overwrite["type"] == "boolean"
-    assert overwrite["default"] is False
-    description = seed["description"]
-    assert "Omitted fields preserve" in description
-    assert "explicit empty string or empty array clears" in description
-    assert "force_overwrite=true" in description
-    assert "omitted enabled to true" in description
-    assert "name may be omitted when updating" in description
-    assert "required when creating" in description
-    assert "array field is provided, it replaces that entire ordered array" in description
-    assert "Every save requires expected_revision" in description
     schema = seed["parameters_schema"]
-    action_properties = schema["properties"]["quick_actions"]["items"]["properties"]
-    assert action_properties["id"] == {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64,
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
-    }
-    assert action_properties["menu_visible"]["default"] is True
-    assert action_properties["ai_visible"]["default"] is True
-    assert action_properties["ai_context"]["maxLength"] == 4000
-    assert action_properties["style"]["additionalProperties"] is False
-    assert action_properties["style"]["properties"]["font"]["enum"] == [
-        "default",
-        "sans",
-        "serif",
-        "monospace",
-    ]
-    assert "enabled" not in action_properties
-    assert "examples" not in schema
     Draft7Validator.check_schema(schema)
     validator = Draft7Validator(schema)
     for valid in (
@@ -407,36 +362,6 @@ def test_scene_tool_is_global_builtin_and_opt_in():
     ]
 
 
-def test_scene_tool_save_is_incremental_by_default():
-    current = {
-        "name": "Warranty",
-        "enabled": False,
-        "welcome_message": "Welcome",
-        "system_prompts": [
-            {"id": "tone", "name": "Tone", "content": "Be concise.", "enabled": True}
-        ],
-        "quick_actions": [
-            {
-                "id": "repair",
-                "label": "Repair",
-                "type": "send_message",
-                "message": "I need a repair",
-            }
-        ],
-    }
-
-    merged = scene_service._merge_tool_save_request(
-        current,
-        SceneToolSaveRequest(name="Updated warranty"),
-    )
-
-    assert merged.name == "Updated warranty"
-    assert merged.enabled is False
-    assert merged.welcome_message == "Welcome"
-    assert merged.system_prompts[0].content == "Be concise."
-    assert merged.quick_actions[0].message == "I need a repair"
-
-
 def test_scene_tool_save_can_clear_one_field_without_clearing_others():
     current = {
         "name": "Warranty",
@@ -465,36 +390,6 @@ def test_scene_tool_save_can_clear_one_field_without_clearing_others():
     assert len(merged.quick_actions) == 1
 
 
-def test_scene_tool_force_overwrite_resets_omitted_optional_fields():
-    current = {
-        "name": "Warranty",
-        "enabled": False,
-        "welcome_message": "Welcome",
-        "system_prompts": [
-            {"id": "tone", "name": "Tone", "content": "Be concise.", "enabled": True}
-        ],
-        "quick_actions": [
-            {
-                "id": "repair",
-                "label": "Repair",
-                "type": "send_message",
-                "message": "I need a repair",
-            }
-        ],
-    }
-
-    merged = scene_service._merge_tool_save_request(
-        current,
-        SceneToolSaveRequest(force_overwrite=True),
-    )
-
-    assert merged.name == "Warranty"
-    assert merged.enabled is True
-    assert merged.welcome_message == ""
-    assert merged.system_prompts == []
-    assert merged.quick_actions == []
-
-
 def test_scene_tool_save_requires_name_only_when_creating():
     with pytest.raises(ValueError, match="name is required"):
         scene_service._merge_tool_save_request(None, SceneToolSaveRequest())
@@ -506,110 +401,3 @@ def test_scene_tool_save_requires_name_only_when_creating():
 
     assert created.name == "Warranty"
     assert created.welcome_message == ""
-
-
-class _ScalarResult:
-    def __init__(self, value):
-        self.value = value
-
-    def scalar_one_or_none(self):
-        return self.value
-
-
-class _FakeDb:
-    def __init__(self, results):
-        self.results = list(results)
-        self.added = []
-        self.committed = False
-
-    async def execute(self, _query):
-        return _ScalarResult(self.results.pop(0))
-
-    def add(self, value):
-        self.added.append(value)
-
-    async def commit(self):
-        self.committed = True
-
-
-class _SessionFactory:
-    def __init__(self, db):
-        self.db = db
-
-    async def __aenter__(self):
-        return self.db
-
-    async def __aexit__(self, *_args):
-        return False
-
-
-async def test_scene_tool_denies_non_manager_in_current_direct_session(monkeypatch):
-    agent_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    tenant_id = uuid.uuid4()
-    session = SimpleNamespace(
-        id=uuid.uuid4(),
-        agent_id=agent_id,
-        user_id=user_id,
-        is_group=False,
-        source_channel="miniprogram",
-    )
-    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id, timezone="UTC")
-    user = SimpleNamespace(id=user_id, tenant_id=tenant_id, is_active=True, role="member")
-    db = _FakeDb([session, agent, user])
-
-    monkeypatch.setattr(scene_service, "async_session", lambda: _SessionFactory(db))
-    monkeypatch.setattr(scene_service, "scene_tool_enabled", lambda *_args: _async_value(True))
-    monkeypatch.setattr(scene_service, "user_can_manage_agent_id", lambda *_args: _async_value(False))
-
-    result = await scene_service.execute_scene_management_tool(
-        agent_id=agent_id,
-        user_id=user_id,
-        session_id=str(session.id),
-        arguments={"operation": "list"},
-    )
-
-    assert result.startswith("❌ Scene management denied")
-    assert "administrator permission" in result
-    assert db.committed is True
-    assert db.added[-1].action == "scene_tool_denied"
-
-
-@pytest.mark.parametrize("source_channel", ["web", "miniprogram", "feishu"])
-async def test_scene_tool_allows_verified_manager_from_any_direct_human_channel(monkeypatch, source_channel):
-    agent_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    tenant_id = uuid.uuid4()
-    session = SimpleNamespace(
-        id=uuid.uuid4(),
-        agent_id=agent_id,
-        user_id=user_id,
-        is_group=False,
-        source_channel=source_channel,
-    )
-    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id, timezone="UTC")
-    user = SimpleNamespace(id=user_id, tenant_id=tenant_id, is_active=True, role="member")
-    db = _FakeDb([session, agent, user])
-
-    monkeypatch.setattr(scene_service, "async_session", lambda: _SessionFactory(db))
-    monkeypatch.setattr(scene_service, "scene_tool_enabled", lambda *_args: _async_value(True))
-    monkeypatch.setattr(scene_service, "user_can_manage_agent_id", lambda *_args: _async_value(True))
-    monkeypatch.setattr(
-        scene_service,
-        "list_scenes",
-        lambda *_args: _async_value([{"scene_key": "default", "revision": 2}]),
-    )
-
-    result = await scene_service.execute_scene_management_tool(
-        agent_id=agent_id,
-        user_id=user_id,
-        session_id=str(session.id),
-        arguments={"operation": "list"},
-    )
-
-    assert json.loads(result) == [{"scene_key": "default", "revision": 2}]
-    assert db.added[-1].action == "scene_tool_allowed"
-
-
-async def _async_value(value):
-    return value

@@ -433,10 +433,23 @@ async def _process_feishu_text_turn(
             except Exception as _flush_err:
                 logger.warning(f"[Feishu] tool-status flush failed (ignored): {_flush_err}")
 
+    async def _ws_on_status(status: dict):
+        if status.get("state") == "recovered":
+            _tool_status_running.pop("provider_retry", None)
+        content = str(status.get("content") or "").strip()
+        if content:
+            _tool_status_running["provider_retry"] = f"⏳ {content}"
+        if _patch_msg_id:
+            try:
+                await _flush_stream("provider_retry", force=True)
+            except Exception as exc:
+                logger.warning(f"[Feishu] retry-status flush failed (ignored): {exc}")
+
     # Register callbacks into the ChannelReactions bundle (single source of truth)
     reactions.on_chunk = _ws_on_chunk
     reactions.on_thinking = _ws_on_thinking
     reactions.on_tool_call = _ws_on_tool_call
+    reactions.on_status = _ws_on_status
 
     async def _heartbeat():
         while not _llm_done:
@@ -459,6 +472,7 @@ async def _process_feishu_text_turn(
             on_chunk=reactions.on_chunk,
             on_thinking=reactions.on_thinking,
             on_tool_call=reactions.on_tool_call,
+            on_status=reactions.on_status,
             is_group=(chat_type == "group"),
             turn_anchor_id=ingested.message.id,
         )
@@ -472,9 +486,11 @@ async def _process_feishu_text_turn(
                 pass
         _cfs.reset(_cfs_token)
         _cfso.reset(_cfso_token)
-    from app.services.llm.failure_outcome import llm_failure_code
+    _tool_status_running.pop("provider_retry", None)
+    from app.services.llm.failure_outcome import llm_failure_code, llm_failure_meta
 
     failure_code = llm_failure_code(reply_text)
+    failure_meta = llm_failure_meta(reply_text)
     logger.info(f"[Feishu] LLM reply: {reply_text[:100]}")
 
     # If task creation detected, create a real Task record
@@ -524,6 +540,7 @@ async def _process_feishu_text_turn(
         complete_turn=True,
         turn_terminal_status="failed" if failure_code else "completed",
         error_code=failure_code,
+        failure_meta=failure_meta,
     ):
         raise RuntimeError("feishu_stream_anchor_missing")
     delivery_reply_text = await project_agent_images_for_im(agent_id, final_reply_text)

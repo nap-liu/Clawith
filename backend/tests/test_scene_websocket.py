@@ -92,6 +92,7 @@ async def test_initial_assistant_message_has_stable_session_identity():
     handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
     handler.conv_id = session_id
     handler.pending_initial_assistant = {"content": "欢迎使用报修服务"}
+    handler.scene_manifest = None
     handler.welcome_message = ""
     handler.history_messages = []
     handler.onboarding_required = False
@@ -133,14 +134,3 @@ async def test_quota_check_uses_stable_authenticated_user_id(monkeypatch):
     assert await handler._check_quotas() is True
     check_conversation_quota.assert_awaited_once_with(user_id)
     check_agent_expired.assert_awaited_once_with(agent_id)
-
-
-def test_websocket_handler_does_not_retain_user_or_agent_orm_entities():
-    handler = WebSocketChatHandler(
-        websocket=SimpleNamespace(),
-        agent_id=uuid.uuid4(),
-        token="unused",
-    )
-
-    assert not hasattr(handler, "user")
-    assert not hasattr(handler, "agent")

@@ -331,15 +331,31 @@ async def test_client_cannot_promote_non_image_bytes_with_kind_or_mime(monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path",
-    ["private/secret.mp4", ".tool_results/session-1/result.mp4"],
+    ["private/secret.mp4", ".tool_results/session-1/result.mp4", "secrets.md", "memory/../../other/memory.md"],
 )
 async def test_client_attachment_validation_keeps_the_inbound_path_allowlist(
     path,
 ):
-    attachment = chat_attachments.attachment_from_workspace_path(path)
-
-    with pytest.raises(ValueError, match="client attachment paths are not allowed"):
+    with pytest.raises(ValueError):
+        attachment = chat_attachments.attachment_from_workspace_path(path)
         await chat_attachments.validate_client_attachments(
             uuid.uuid4(),
             [attachment],
         )
+
+
+@pytest.mark.asyncio
+async def test_generated_memory_references_require_files_in_the_current_agent(monkeypatch, tmp_path):
+    from app.services.storage_runtime.local import LocalStorageBackend
+
+    storage = LocalStorageBackend(str(tmp_path))
+    monkeypatch.setattr(chat_attachments, "get_storage_backend", lambda: storage)
+    agent_id, other_agent_id = uuid.uuid4(), uuid.uuid4()
+    paths = ["memory/reference.md", "memory.md", "soul.md", "skills/review/scripts/check.py"]
+    attachments = [chat_attachments.attachment_from_workspace_path(path) for path in paths]
+    for path in paths:
+        await storage.write_bytes(f"{agent_id}/{path}", b"reference validation")
+    result = await chat_attachments.validate_client_attachments(agent_id, attachments)
+    assert [item["path"] for item in result] == paths
+    with pytest.raises(ValueError, match="attachment is not available"):
+        await chat_attachments.validate_client_attachments(other_agent_id, attachments)

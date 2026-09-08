@@ -537,7 +537,8 @@ export function useH5AgentChatPresentation(
 
     const showBlockingError = authStatus === 'error' || !!agentError;
     const isBusy = authStatus === 'checking' || authStatus === 'exchanging' || (authStatus === 'ready' && !agent && !agentError);
-    messageRuntimeBlockedRef.current = generationActive
+    const turnBlocksInput = isStopping || (agent?.agent_type === "openclaw" && generationActive);
+    messageRuntimeBlockedRef.current = turnBlocksInput
         || isReadOnly
         || confirmationPending
         || showBlockingError
@@ -555,7 +556,7 @@ export function useH5AgentChatPresentation(
         || isReadOnly
         || showBlockingError
         || isBusy
-        || generationActive
+        || turnBlocksInput
         || confirmationPending
         || speech.isActive
         || isStartingNew
@@ -564,7 +565,7 @@ export function useH5AgentChatPresentation(
     const uploadDisabled = showBlockingError
         || isReadOnly
         || isBusy
-        || generationActive
+        || turnBlocksInput
         || confirmationPending
         || speech.isActive
         || isStartingNew
@@ -572,7 +573,7 @@ export function useH5AgentChatPresentation(
         || uploadDrafts.length > 0
         || attachedFiles.length >= 10;
     const agentAvatarUrl = resolveAgentAvatarUrl(agent?.avatar_url, token);
-    const quickMessageDisabled = generationActive
+    const quickMessageDisabled = turnBlocksInput
         || isReadOnly
         || confirmationPending
         || showBlockingError

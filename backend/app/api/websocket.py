@@ -148,6 +148,7 @@ async def _await_turn_with_abort(
     partial_chunks: list[str],
     *,
     on_abort=None,
+    on_message=None,
 ):
     return await websocket_shared.await_turn_with_abort_impl(
         MODULE,
@@ -155,6 +156,7 @@ async def _await_turn_with_abort(
         recv_json,
         partial_chunks,
         on_abort=on_abort,
+        on_message=on_message,
     )
 
 

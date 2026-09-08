@@ -201,7 +201,9 @@ async def lookup_overrides(
                     )
                 )
             ).scalar_one_or_none()
-    return t_ovr, a_ovr
+    from app.services.turn_tool_settings import effective_mcp_override
+
+    return t_ovr, effective_mcp_override(agent_id, server_id, a_ovr)
 
 
 async def lookup_project_source_tool_config(

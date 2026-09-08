@@ -319,6 +319,7 @@ async def _handle_feishu_file(
             _img_heartbeat_task: asyncio.Task | None = None
             _img_llm_done = False
             _img_last_flushed_hash: int = 0
+            _img_retry_status = ""
             _img_thinking_enabled = resolve_im_thinking_enabled(_ag_obj, _sess_img)
 
             async def _queue_image_patch(_card: dict, _stage: str):
@@ -340,6 +341,8 @@ async def _handle_feishu_file(
                 if not force and now - _img_last_flush < _img_flush_interval:
                     return
                 _answer_text = "".join(_img_stream_buf)
+                if _img_retry_status:
+                    _answer_text = f"{_answer_text}\n\n⏳ {_img_retry_status}".strip()
                 _thinking_text = "".join(_img_thinking_chunks) if _img_thinking_enabled else ""
                 _card = await _build_projected_stream_card(
                     agent_id,
@@ -365,6 +368,14 @@ async def _handle_feishu_file(
                 _img_thinking_chunks.append(text)
                 if _patch_msg_id:
                     await _flush_image_stream("thinking")
+
+            async def _img_on_status(status: dict):
+                nonlocal _img_retry_status
+                _img_retry_status = (
+                    "" if status.get("state") == "recovered" else str(status.get("content") or "").strip()
+                )
+                if _patch_msg_id:
+                    await _flush_image_stream("provider_retry", force=True)
 
             async def _img_heartbeat():
                 while not _img_llm_done:
@@ -396,6 +407,7 @@ async def _handle_feishu_file(
                         user_id=platform_user_id, session_id=session_conv_id_img,
                         on_chunk=_img_on_chunk,
                         on_thinking=_img_on_thinking,
+                        on_status=_img_on_status,
                         is_group=_is_group_file,
                         turn_anchor_id=_image_ingested.message.id,
                     )
@@ -408,9 +420,10 @@ async def _handle_feishu_file(
                         except Exception:
                             pass
 
-            from app.services.llm.failure_outcome import llm_failure_code
+            from app.services.llm.failure_outcome import llm_failure_code, llm_failure_meta
 
             failure_code = llm_failure_code(reply_text)
+            failure_meta = llm_failure_meta(reply_text)
             logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
 
             from app.services.im_delivery import (
@@ -430,6 +443,7 @@ async def _handle_feishu_file(
                 complete_turn=True,
                 turn_terminal_status="failed" if failure_code else "completed",
                 error_code=failure_code,
+                failure_meta=failure_meta,
             ):
                 raise RuntimeError("feishu_image_stream_anchor_missing")
             delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)

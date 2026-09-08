@@ -35,6 +35,13 @@ def _is_safe_test_database_url(raw_url: str) -> bool:
     )
 
 
+def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "bootstrap: verifies real schema entry points using disposable PostgreSQL databases",
+    )
+
+
 def pytest_sessionstart(session) -> None:
     del session
     database_url = os.environ.get(

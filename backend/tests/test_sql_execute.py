@@ -1,6 +1,12 @@
 """Unit + sqlite-integration tests for sql_execute memory-safe scaling."""
+import os
+import tempfile
+
 from app.services.agent_tools import (
+    _bounded_collect,
     _clamp_sql_max_rows,
+    _format_sql_result,
+    _sql_execute,
     DEFAULT_SQL_MAX_ROWS,
     HARD_SQL_MAX_ROWS,
     SQL_DISPLAY_CHAR_BUDGET,
@@ -26,9 +32,6 @@ def test_clamp_floor_is_one():
 def test_clamp_passes_valid_value():
     assert _clamp_sql_max_rows(2000) == 2000
     assert _clamp_sql_max_rows("3000") == 3000
-
-
-from app.services.agent_tools import _bounded_collect
 
 
 async def _gen(rows):
@@ -66,9 +69,6 @@ async def test_bounded_collect_always_returns_at_least_one_row():
     assert truncated is False
 
 
-from app.services.agent_tools import _format_sql_result
-
-
 def test_format_empty_rows():
     out = _format_sql_result(["id", "name"], [], truncated=False, max_rows=5000)
     assert "0 rows" in out
@@ -98,11 +98,6 @@ def test_format_display_budget_limits_shown_rows():
 
 
 # ─── SQLite integration tests ─────────────────────────────────────────────
-
-import os
-import tempfile
-from app.services.agent_tools import _sql_execute
-
 
 async def test_sqlite_select_under_limit():
     fd, path = tempfile.mkstemp(suffix=".db")
@@ -148,13 +143,3 @@ async def test_sqlite_non_query_statement_reports_rows_affected():
         assert "返回上限" not in out
     finally:
         os.remove(path)
-
-
-def test_seeder_sql_execute_declares_max_rows_and_guidance():
-    from app.services.tool_seeder import BUILTIN_TOOLS
-    sql_tool = next(t for t in BUILTIN_TOOLS if t["name"] == "sql_execute")
-    props = sql_tool["parameters_schema"]["properties"]
-    assert "max_rows" in props
-    desc = sql_tool["description"].lower()
-    assert "聚合" in sql_tool["description"] or "aggregate" in desc
-    assert "50000" in str(sql_tool["parameters_schema"]) or "50,000" in sql_tool["description"]

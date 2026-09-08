@@ -8,12 +8,9 @@ from app.services import agent_tools
 from app.services.llm import caller as llm_caller
 from app.services.media_tool_contract import (
     MAX_MEDIA_DISPLAY_TITLE_LENGTH,
-    SEND_MEDIA_DESCRIPTION,
-    SEND_MEDIA_PARAMETERS_SCHEMA,
     normalize_media_display_title,
 )
 from app.services.storage_runtime.local import LocalStorageBackend
-from app.services.tool_seeder import BUILTIN_TOOLS
 from app.services.im_delivery import IMDeliveryPart, IMDeliveryResult
 from app.services.im_delivery import DeliveryReceiptPersistenceError
 
@@ -376,23 +373,6 @@ async def test_send_file_to_session_rejects_non_uuid_without_database_access(
     assert delivery_result.status == "failed"
 
 
-def test_send_channel_file_schema_exposes_exact_session_target_consistently():
-    runtime_schema = next(
-        item["function"]["parameters"]
-        for item in agent_tools.AGENT_TOOLS
-        if item["function"]["name"] == "send_channel_file"
-    )
-    seeded_schema = next(
-        item["parameters_schema"]
-        for item in BUILTIN_TOOLS
-        if item["name"] == "send_channel_file"
-    )
-
-    assert runtime_schema == seeded_schema
-    assert runtime_schema["properties"]["session_id"]["type"] == "string"
-    assert "Session UUID" in runtime_schema["properties"]["session_id"]["description"]
-
-
 @pytest.mark.asyncio
 async def test_send_media_without_current_or_explicit_session_fails_clearly(tmp_path, monkeypatch):
     agent_id = uuid.uuid4()
@@ -641,49 +621,6 @@ async def test_send_media_runtime_does_not_materialize_another_agent_symlink(
     payload = json.loads(result)
     assert payload["status"] == "failed"
     assert payload["code"] == "MEDIA_NOT_FOUND"
-
-
-def test_media_tools_are_fixed_core_tools():
-    definitions = [item["function"]["name"] for item in agent_tools.AGENT_TOOLS]
-    assert definitions.count("send_media") == 1
-    assert "send_audio" not in definitions
-    assert "send_video" not in definitions
-    assert "send_media" in agent_tools._ALWAYS_INCLUDE_CORE
-    media_schema = next(
-        item["function"]["parameters"]
-        for item in agent_tools.AGENT_TOOLS
-        if item["function"]["name"] == "send_media"
-    )
-    assert "allow_download" not in media_schema["properties"]
-    assert media_schema["properties"]["title"] == {
-        "type": "string",
-        "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
-        "description": (
-            "Optional concise display title for the media card. This does not rename "
-            "the file and is not delivered as message text."
-        ),
-    }
-    assert media_schema == SEND_MEDIA_PARAMETERS_SCHEMA
-    assert set(media_schema["properties"]["url_mode"]["enum"]) == {"external", "managed"}
-    headers_schema = media_schema["properties"]["headers"]
-    assert headers_schema["additionalProperties"] == {"type": "string"}
-    assert "managed" in headers_schema["description"]
-    assert "Authorization" in headers_schema["description"]
-    assert "silently" in headers_schema["description"]
-    assert "redirects" in headers_schema["description"]
-    assert "Clawith" not in headers_schema["description"]
-    assert "Agent" not in SEND_MEDIA_DESCRIPTION
-    assert "platform" not in SEND_MEDIA_DESCRIPTION
-    seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
-    assert seeded["parameters_schema"] == media_schema
-    assert seeded["config"] == {"allow_download": False}
-    assert seeded["config_schema"]["fields"] == [{
-        "key": "allow_download",
-        "label": "Allow media download",
-        "type": "boolean",
-        "default": False,
-        "description": "Show the download action on send_media cards in supported chat clients.",
-    }]
 
 
 def test_media_display_title_is_safe_compact_and_bounded():

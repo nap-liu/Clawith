@@ -87,6 +87,11 @@ async def test_p2p_includes_current_conversation():
     # static_parts even for P2P (regression guard against someone making
     # the rules-block injection conditional on is_group).
     assert "## Message Sender Tag (Group Chat)" in static_p
+    assert "<sender id=" in static_p
+    assert "VERY BEGINNING" in static_p
+    assert "stable user identifier" in static_p
+    assert "across sessions" in static_p
+    assert "not a session-scoped" in static_p.lower()
 
 
 async def test_agent_daily_memory_zero_reaches_unified_memory_loader():
@@ -117,21 +122,6 @@ async def test_group_excludes_current_conversation():
     assert "## Current Conversation" not in dynamic_p
 
 
-async def test_static_includes_message_sender_tag_section():
-    """static_prompt (system prompt) 必含新加的 ## Message Sender Tag 段."""
-    agent_id = await _seed_basic_agent()
-    static_p, _ = await build_agent_context(
-        agent_id,
-        "Test Agent",
-        "role",
-        current_user_name=None,
-        is_group=False,
-    )
-    assert "## Message Sender Tag (Group Chat)" in static_p
-    assert "<sender id=" in static_p
-    assert "VERY BEGINNING" in static_p
-
-
 async def test_static_guides_agent_relative_markdown_images():
     agent_id = await _seed_basic_agent()
     static_p, _ = await build_agent_context(agent_id, "Test Agent", "role")
@@ -153,26 +143,6 @@ async def test_no_user_name_no_current_conversation_either_mode():
             is_group=is_group,
         )
         assert "## Current Conversation" not in dynamic_p
-
-
-async def test_static_message_sender_tag_section_documents_stable_user_id():
-    """The Message Sender Tag section must tell the LLM the `id` is the
-    platform's stable user identifier (not a session-scoped UUID), so the
-    model can safely feed it into tool calls."""
-    agent_id = await _seed_basic_agent()
-    static_p, _ = await build_agent_context(
-        agent_id,
-        "Test Agent",
-        "role",
-        current_user_name=None,
-        is_group=False,
-    )
-    # The section is present
-    assert "## Message Sender Tag (Group Chat)" in static_p
-    # The id stability invariant must be stated explicitly
-    assert "stable user identifier" in static_p
-    assert "across sessions" in static_p
-    assert "NOT a session-scoped" in static_p or "not a session-scoped" in static_p.lower()
 
 
 async def test_channel_context_is_dynamic_not_static():

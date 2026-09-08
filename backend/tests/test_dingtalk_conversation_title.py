@@ -1,61 +1,134 @@
-"""Unit tests verifying process_dingtalk_message threads conversation_title
-through to find_or_create_channel_session as group_name."""
+"""DingTalk titles must survive the platform ingress and persisted session."""
 
-from __future__ import annotations
+import asyncio
+import threading
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import dingtalk_stream
 import pytest
+from sqlalchemy import select
 
+from app.api import dingtalk as dingtalk_api
+from app.database import async_session, engine
+from app.models.agent import Agent
+from app.models.chat_session import ChatSession
+from app.models.identity import IdentityProvider
+from app.models.org import OrgMember
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
+from app.services import dingtalk_stream as stream_service
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_conversation_title_used_as_group_name(monkeypatch):
-    """When conversation_type=='2' (group) and conversation_title is non-empty,
-    find_or_create_channel_session is called with group_name=conversation_title."""
-    from app.api import dingtalk as dingtalk_module  # noqa: F401
-
-    # Replicate the exact branch from process_dingtalk_message:
-    def _compute_group_name(conversation_type: str, conversation_title: str, conversation_id: str):
-        _dt_group_name = None
-        if conversation_type == "2":
-            _dt_group_name = (
-                conversation_title.strip()
-                if conversation_title and conversation_title.strip()
-                else f"DingTalk Group {conversation_id[:12]}"
-            )
-        return _dt_group_name
-
-    # Real title preferred
-    assert _compute_group_name("2", "产品讨论组", "cidnBH1dM4abcdef") == "产品讨论组"
-    # Whitespace-only title falls back
-    assert _compute_group_name("2", "   ", "cidnBH1dM4abcdef") == "DingTalk Group cidnBH1dM4ab"
-    # Empty title falls back
-    assert _compute_group_name("2", "", "cidnBH1dM4abcdef") == "DingTalk Group cidnBH1dM4ab"
-    # P2P returns None regardless of title
-    assert _compute_group_name("1", "X", "cid") is None
+@pytest.fixture(autouse=True)
+async def _dispose_engine():
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
-async def test_dingtalk_stream_extracts_conversation_title(monkeypatch):
-    """The dingtalk_stream message handler should extract conversation_title
-    from the incoming ChatbotMessage and pass it through."""
-    from dingtalk_stream.chatbot import ChatbotMessage
+@pytest.mark.parametrize(
+    ("conversation_type", "conversation_title", "expected_group_name"),
+    [
+        ("2", "  产品讨论组  ", "产品讨论组"),
+        ("2", "   ", "DingTalk Group cidnBH1dM4ab"),
+        ("2", "", "DingTalk Group cidnBH1dM4ab"),
+        ("1", "Ignored P2P title", None),
+    ],
+)
+async def test_conversation_title_persisted_by_message_entry(
+    monkeypatch, conversation_type, conversation_title, expected_group_name,
+):
+    suffix = uuid.uuid4().hex
+    staff_id = f"staff_{suffix}"
+    async with async_session() as db:
+        tenant = Tenant(name="Title test", slug=f"title_{suffix}")
+        identity = Identity(username=f"title_{suffix}", password_hash="unused")
+        db.add_all([tenant, identity])
+        await db.flush()
+        user = User(
+            tenant_id=tenant.id, identity_id=identity.id, display_name="Title Tester",
+            role="member", is_active=True,
+        )
+        provider = IdentityProvider(
+            tenant_id=tenant.id, name="DingTalk", provider_type="dingtalk",
+            is_active=True, config={"app_key": "test-key", "app_secret": "test-secret"},
+        )
+        db.add_all([user, provider])
+        await db.flush()
+        agent = Agent(name="Title Agent", creator_id=user.id, tenant_id=tenant.id)
+        db.add(agent)
+        db.add(OrgMember(
+            tenant_id=tenant.id, provider_id=provider.id, external_id=staff_id,
+            name=user.display_name, status="active", user_id=user.id,
+        ))
+        await db.commit()
+        agent_id = agent.id
 
-    msg = ChatbotMessage()
-    msg.sender_staff_id = "staff_xxx"
-    msg.conversation_id = "cid_yyy"
-    msg.conversation_type = "2"
-    msg.conversation_title = "Real Group Name"
-    msg.sender_nick = "Alice"
+    monkeypatch.setattr(
+        dingtalk_api, "_get_dingtalk_user_detail_with_fallback",
+        AsyncMock(return_value={"name": "Title Tester"}),
+    )
+    llm = AsyncMock(return_value="")
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", llm)
+    await dingtalk_api.process_dingtalk_message(
+        agent_id=agent_id, sender_staff_id=staff_id, user_text="Hello from DingTalk",
+        conversation_id="cidnBH1dM4abcdef", conversation_type=conversation_type,
+        conversation_title=conversation_title, message_id=f"message_{suffix}",
+        sender_nick="Title Tester",
+    )
 
-    # The stream handler reads `incoming.conversation_title`. Verify the
-    # attribute exists and the SDK round-trips it through from_dict.
-    rebuilt = ChatbotMessage.from_dict({
-        "senderStaffId": "staff_xxx",
-        "conversationId": "cid_yyy",
-        "conversationType": "2",
-        "conversationTitle": "Real Group Name",
-        "senderNick": "Alice",
-        "msgtype": "text",
-        "text": {"content": "hi"},
-    })
-    assert rebuilt.conversation_title == "Real Group Name"
+    async with async_session() as db:
+        session = (await db.execute(
+            select(ChatSession).where(ChatSession.agent_id == agent_id)
+        )).scalar_one()
+        assert session.is_group is (conversation_type == "2")
+        assert session.group_name == expected_group_name
+        assert session.title == (expected_group_name or "Hello from DingTalk")
+    llm.assert_awaited_once()
+
+
+async def test_stream_handler_passes_conversation_title_to_platform_entry(monkeypatch):
+    """Exercise the registered platform callback, including its scheduled work."""
+    manager = stream_service.DingTalkStreamManager()
+    manager._main_loop = asyncio.get_running_loop()
+    entry = AsyncMock()
+    scheduled = []
+    callbacks = []
+    monkeypatch.setattr(dingtalk_api, "process_dingtalk_message", entry)
+    monkeypatch.setattr(dingtalk_api, "_check_message_dedup", AsyncMock(return_value=False))
+    monkeypatch.setattr(stream_service, "_parse_dingtalk_quoted_message", AsyncMock(return_value=None))
+    monkeypatch.setattr(stream_service, "_make_dingtalk_reactions", lambda *_: None)
+
+    async def run_work(_key, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr(stream_service, "run_channel_message", run_work)
+    monkeypatch.setattr(stream_service, "_fire_and_forget", lambda _loop, work: scheduled.append(work))
+    monkeypatch.setattr(manager, "_handle_runner_exit", AsyncMock())
+
+    async def receive_callback(**kwargs):
+        client = kwargs["client"]
+        handler = client.callback_handler_map[dingtalk_stream.ChatbotMessage.TOPIC]
+        callbacks.append(await handler.process(SimpleNamespace(data={
+            "senderStaffId": "staff_title", "conversationId": "cid_title",
+            "conversationType": "2", "conversationTitle": "  Real Group Name  ",
+            "senderNick": "Alice", "msgId": "title_message", "msgtype": "text",
+            "text": {"content": "hi"},
+        })))
+
+    monkeypatch.setattr(manager, "_run_managed_client", receive_callback)
+    await asyncio.to_thread(
+        manager._run_client_thread, uuid.uuid4(), "test-key", "test-secret",
+        threading.Event(), 1, "test-fingerprint",
+    )
+    assert callbacks == [(dingtalk_stream.AckMessage.STATUS_OK, "ok")]
+    assert len(scheduled) == 1
+    await scheduled[0]
+    entry.assert_awaited_once()
+    assert entry.await_args.kwargs["conversation_title"] == "Real Group Name"
+    assert entry.await_args.kwargs["conversation_id"] == "cid_title"
+    assert entry.await_args.kwargs["conversation_type"] == "2"
