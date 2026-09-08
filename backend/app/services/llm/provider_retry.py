@@ -12,6 +12,7 @@ import httpx
 from loguru import logger
 
 from .client import LLMError, get_provider_base_url
+from app.services.agent_execution.provider import RemoteProviderSlot, provider_bridge
 
 RATE_LIMIT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0)
 CONNECTION_RETRY_DELAYS = (1.0, 2.0)
@@ -225,7 +226,10 @@ async def _close_cancelled_provider_client(client) -> None:
 _provider_slots: dict[tuple[int, str, str, int, int], asyncio.Semaphore] = {}
 
 
-def _provider_slot(model) -> asyncio.Semaphore:
+def _provider_slot(model) -> asyncio.Semaphore | RemoteProviderSlot:
+    bridge = provider_bridge.get()
+    if bridge is not None:
+        return RemoteProviderSlot(model, bridge)
     try:
         limit = int(os.environ.get(PROVIDER_MAX_IN_FLIGHT_ENV, PROVIDER_MAX_IN_FLIGHT_DEFAULT))
     except ValueError:

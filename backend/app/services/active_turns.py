@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -53,6 +53,19 @@ _current_turn: ContextVar[ActiveTurn | None] = ContextVar(
 )
 
 
+async def resolve_execution_owner(agent_id: UUID, user_id: UUID) -> UUID:
+    """Preserve creator ownership for Agent-originated root invocations."""
+    if agent_id != user_id:
+        return user_id
+    from sqlalchemy import select
+    from app.database import async_session
+    from app.models.agent import Agent
+
+    async with async_session() as db:
+        creator_id = await db.scalar(select(Agent.creator_id).where(Agent.id == agent_id))
+    return creator_id or user_id
+
+
 async def ensure_active_turn(
     *,
     owner_user_id: UUID,
@@ -64,6 +77,16 @@ async def ensure_active_turn(
     turn_anchor_agent_id: UUID | None = None,
 ) -> ActiveTurn:
     """Return the inherited root turn, or register the current task as one."""
+
+    from app.services.agent_execution.bridge import supervisor_calls
+
+    calls = supervisor_calls.get()
+    if calls is not None:
+        await calls["register"](
+            owner_user_id=owner_user_id, agent_id=agent_id, session_id=session_id,
+            turn_type=turn_type, turn_anchor_id=turn_anchor_id, title=title,
+            turn_anchor_agent_id=turn_anchor_agent_id,
+        )
 
     task = asyncio.current_task()
     if task is None:
@@ -172,6 +195,35 @@ async def active_turn_boundary() -> AsyncIterator[None]:
             _current_turn.set(inherited)
 
 
+@contextmanager
+def inherit_active_turn():
+    """Attach an awaited callback task without replacing the cancel target."""
+    record = _current_turn.get()
+    task = asyncio.current_task()
+    owns_registration = bool(
+        record and task and task is not record.task and task not in record.inherited_tasks
+    )
+    if owns_registration:
+        record.inherited_tasks.add(task)
+    try:
+        yield
+    finally:
+        if owns_registration:
+            record.inherited_tasks.discard(task)
+
+
+def shares_active_turn(owner: asyncio.Task[object] | None) -> bool:
+    """Whether this registered callback and a lease owner share one root."""
+    record = _current_turn.get()
+    task = asyncio.current_task()
+    if record is None or owner is None or record.task.done():
+        return False
+    return (
+        (owner is record.task or owner in record.inherited_tasks)
+        and (task is record.task or task in record.inherited_tasks)
+    )
+
+
 def set_active_turn_cancel_task(task: asyncio.Task[object] | None) -> None:
     """Temporarily direct cancellation to a child task with normalized handling."""
 
@@ -255,6 +307,13 @@ async def commit_current_turn_anchor(
     message_id: UUID,
 ) -> ActiveTurn:
     """Atomically admit one durable anchor and commit it before stop snapshots."""
+
+    from app.services.agent_execution.bridge import supervisor_calls
+
+    calls = supervisor_calls.get()
+    if calls is not None:
+        await calls["commit"](commit, agent_id=agent_id, session_id=session_id, message_id=message_id)
+        return _current_turn.get()
 
     task = asyncio.current_task()
     record = _current_turn.get()
@@ -352,6 +411,13 @@ async def finalize_active_turn_stop(
 
 async def wait_for_current_turn_stop_resolution(*, allow_cancelled: bool = False) -> None:
     """Pause a terminal write while its control-plane stop is unresolved."""
+
+    from app.services.agent_execution.bridge import supervisor_calls
+
+    calls = supervisor_calls.get()
+    if calls is not None:
+        await calls["wait_for_stop"](allow_cancelled=allow_cancelled)
+        return
 
     record = _current_turn.get()
     if record is None:

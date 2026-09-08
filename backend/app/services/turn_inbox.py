@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 from sqlalchemy import select
@@ -44,12 +43,21 @@ async def _resume_promoted_turn(anchor: ChatMessage) -> None:
     )
 
 
-def schedule_durable_turn_resume(anchor: ChatMessage) -> None:
+async def _resume_promoted_turn_by_id(anchor_id: uuid.UUID) -> None:
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+    if anchor is not None:
+        await _resume_promoted_turn(anchor)
+
+
+async def schedule_durable_turn_resume(anchor: ChatMessage) -> None:
     """Resume any admitted durable turn after its foreground owner exits."""
 
-    asyncio.create_task(
-        _resume_promoted_turn(anchor),
-        name=f"durable-turn-resume:{anchor.id}",
+    from app.services.agent_execution.bridge import dispatch_background
+
+    await dispatch_background(
+        "app.services.turn_inbox:_resume_promoted_turn_by_id", anchor.id,
+        _task_name=f"durable-turn-resume:{anchor.id}",
     )
 
 
@@ -133,5 +141,5 @@ async def kick_promoted_turn_inbox(
         if anchor is None or dict(anchor.message_meta or {}).get("turn_inbox_state") != "promoted":
             return False
 
-    schedule_durable_turn_resume(anchor)
+    await schedule_durable_turn_resume(anchor)
     return True

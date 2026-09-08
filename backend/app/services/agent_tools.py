@@ -49,6 +49,7 @@ from app.models.channel_config import ChannelConfig
 from app.models.participant import Participant  # noqa: F401 - register chat FK target
 from app.models.user import User as UserModel
 from app.services.auth_registry import auth_provider_registry
+from app.services.agent_execution.runtime import isolate_agent_execution
 from app.services.agent_memory import CORE_MEMORY_TEMPLATE
 from app.services.agent_runtime_workspace import (
     current_agent_runtime_workspace,
@@ -541,6 +542,7 @@ _FORCED_AUTONOMY_LEVELS = {
     "withdraw_skill_from_market": "L3",
 }
 
+@isolate_agent_execution
 async def execute_tool(
     tool_name: str,
     arguments: dict,

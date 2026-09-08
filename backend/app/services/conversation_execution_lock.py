@@ -20,6 +20,20 @@ _held_resources: ContextVar[dict[str, asyncio.Task[Any]]] = ContextVar(
     "conversation_execution_resources",
     default={},
 )
+_inherited_resources: ContextVar[frozenset[str]] = ContextVar(
+    "supervised_conversation_execution_resources", default=frozenset(),
+)
+
+
+def supervised_conversation_resources() -> frozenset[str]:
+    """Only leases owned by this awaited execution may cross into its child."""
+    from app.services.active_turns import shares_active_turn
+
+    task = asyncio.current_task()
+    return _inherited_resources.get() | frozenset(
+        resource for resource, owner in _held_resources.get().items()
+        if owner is task or shares_active_turn(owner)
+    )
 
 
 def _durable_resource(session_id: object) -> str | None:
@@ -45,8 +59,16 @@ async def conversation_execution_lock(
         yield
         return
 
+    from app.services.agent_execution.runtime import execution_agent
+
+    if execution_agent.get() is not None and resource in _inherited_resources.get():
+        yield
+        return
+
     held = _held_resources.get()
-    if held.get(resource) is task:
+    from app.services.active_turns import shares_active_turn
+
+    if held.get(resource) is task or shares_active_turn(held.get(resource)):
         yield
         return
 

@@ -100,14 +100,9 @@ async def _call_llm_resolve_execution_identity_and_active_turn(state: CallLlmSta
     viewer_uuid = _coerce_uuid(state.user_id)
 
     if state.agent_uuid is not None and viewer_uuid == state.agent_uuid:
-        from app.models.agent import Agent as AgentModel
+        from app.services.active_turns import resolve_execution_owner
 
-        async with async_session() as identity_db:
-            creator_id = await identity_db.scalar(
-                select(AgentModel.creator_id).where(AgentModel.id == state.agent_uuid)
-            )
-        if creator_id is not None:
-            state.user_id = creator_id
+        state.user_id = await resolve_execution_owner(state.agent_uuid, viewer_uuid)
 
     if state.agent_id and state.user_id and state.session_id:
         try:

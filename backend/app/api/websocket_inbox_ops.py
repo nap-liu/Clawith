@@ -92,7 +92,7 @@ async def receive_followup(api, active_handler, data):
         # A STOP/terminal race can leave this frame as the next admitted root.
         # The existing durable resume path owns it, including reconnect recovery.
         if result.created and not result.consumed_by_onmessage:
-            schedule_durable_turn_resume(result.message)
+            await schedule_durable_turn_resume(result.message)
     except Exception:
         api.logger.exception("[WS] Follow-up admission failed")
         await handler._send_current_turn_event({
