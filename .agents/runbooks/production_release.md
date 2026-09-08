@@ -120,6 +120,11 @@ observable behavior.
 Build on the authorized build machine from a clean context at `RELEASE_SHA`.
 Production-host source builds are emergency-only and require separate approval.
 
+An exported context must live outside unrelated Git checkouts. Verify generated
+build provenance as well as OCI labels: an enclosing checkout can otherwise
+contribute a different `vcs:revision`. Reject such artifacts. For archive builds,
+disable automatic Git discovery and record the archive's source SHA explicitly.
+
 1. Put the full SHA in the backend `COMMIT` build-context file.
 2. Build backend and frontend together for `linux/amd64` with OCI revision and
    version labels.
