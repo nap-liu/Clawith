@@ -8,11 +8,13 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import async_session
 from app.models.tool import AgentTool, Tool
-from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields
 from app.services.agent_tools_file_support import _agent_workspace_root
 from app.services.mcp_access import resolve_mcp_execution
-from app.services.mcp_catalog_policy import shared_catalog, SHARED_TOOL_CONFIG_FIELDS, apply_shared_tool_config
+from app.models.agent import Agent
+from app.services.mcp_connection_resolution import (
+    render_http_connection, resolve_agent_connection, resolve_assignment_config, resolve_smithery_connection,
+)
 from app.services.llm.failure_outcome import render_message
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
@@ -37,12 +39,6 @@ async def _execute_mcp_tool(
             DisallowedPlaceholderError,
             UnknownPlaceholderError,
         )
-        from app.services.mcp_server_service import (
-            compose_runtime_config,
-            lookup_overrides,
-            lookup_project_source_tool_config,
-            build_placeholder_context_for_call,
-        )
 
         async with async_session() as db:
             if not agent_id:
@@ -53,59 +49,19 @@ async def _execute_mcp_tool(
             if not candidates:
                 return render_message("mcpAccess.unavailable")
             tool, live_assignment = candidates[0]
-            runtime_workspace = current_agent_runtime_workspace(agent_id)
-            referenced_source_config = (
-                await lookup_project_source_tool_config(
-                    db,
-                    project_agent_id=agent_id,
-                    tool_id=tool.id,
-                    execution_user_id=user_id,
-                )
-                if runtime_workspace.is_project
-                else {}
-            )
-            effective_assignment_config = _decrypt_sensitive_fields(
-                {**referenced_source_config, **dict(live_assignment.config or {})},
-                tool.config_schema,
-            )
+            agent = await db.get(Agent, agent_id)
 
             # NEW PATH: when tool.mcp_server_id is populated (P0a migration done),
             # use the mcp_servers table + overrides + placeholder rendering.
             if tool.mcp_server_id:
-                from app.models.agent import Agent
-
                 srv = (
                     await db.execute(select(MCPServer).where(MCPServer.id == tool.mcp_server_id))
                 ).scalar_one_or_none()
                 if srv is None:
                     return f"❌ MCP tool {tool_name}: server row {tool.mcp_server_id} not found"
 
-                # Load agent → derive tenant_id for tenant override lookup
-                agent_row = None
-                if agent_id:
-                    agent_row = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
-                tenant_id = agent_row.tenant_id if agent_row else None
-
-                t_ovr, a_ovr = await lookup_overrides(
-                    db,
-                    srv.id,
-                    tenant_id,
-                    agent_id,
-                    execution_user_id=user_id,
-                    allow_project_source_reference=runtime_workspace.is_project,
-                )
-                cfg = compose_runtime_config(srv, t_ovr, a_ovr)
-                if await shared_catalog(db, srv):
-                    effective_assignment_config = {
-                        key: value for key, value in effective_assignment_config.items() if key in SHARED_TOOL_CONFIG_FIELDS
-                    }
-                    cfg = apply_shared_tool_config(cfg, effective_assignment_config)
-
-                ctx = await build_placeholder_context_for_call(
-                    db,
-                    agent_id,
-                    user_id,
-                    session_id=session_id,
+                cfg, effective_assignment_config, ctx = await resolve_agent_connection(
+                    db, srv, agent, tool, live_assignment, user_id, session_id,
                 )
                 # Configuration and identity are resolved; provider waits must
                 # not keep this read transaction open.
@@ -193,41 +149,10 @@ async def _execute_mcp_tool(
                             )
                 # else: existing http path continues below.
 
-                # Render — MCP connection-time gets the FULL ALL_ROOTS context.
-                # Unknown placeholders fail loudly so the LLM sees the config error.
                 try:
-                    resolved_url = render(cfg.url_template, ctx, ALL_ROOTS, on_unknown="raise")
-                except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
-                    return f"❌ MCP tool {tool_name}: URL placeholder error — {e}"
-
-                try:
-                    resolved_headers = render_dict(cfg.headers_template or {}, ctx, ALL_ROOTS, on_unknown="raise")
-                except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
-                    return f"❌ MCP tool {tool_name}: header placeholder error — {e}"
-
-                # HTTP headers are ASCII-only on the wire (RFC 7230). When a
-                # placeholder renders to non-ASCII (e.g. ${agent.name} = "小智"),
-                # percent-encode the value so the receiving server can decode it
-                # via standard urllib.parse.unquote. Pure-ASCII values pass through
-                # unchanged.
-                from urllib.parse import quote as _url_quote
-
-                def _ascii_safe_header(v):
-                    s = str(v)
-                    try:
-                        s.encode("ascii")
-                        return s
-                    except UnicodeEncodeError:
-                        return _url_quote(s, safe="")
-
-                resolved_headers = {k: _ascii_safe_header(v) for k, v in resolved_headers.items()}
-
-                resolved_credential = None
-                if cfg.credential_template:
-                    try:
-                        resolved_credential = render(cfg.credential_template, ctx, ALL_ROOTS, on_unknown="raise")
-                    except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
-                        return f"❌ MCP tool {tool_name}: credential placeholder error — {e}"
+                    resolved_url, resolved_headers, resolved_credential = render_http_connection(cfg, ctx)
+                except (DisallowedPlaceholderError, UnknownPlaceholderError) as exc:
+                    return f"{render_message('mcpAccess.placeholderError')} — {exc}"
 
                 mcp_name = tool.mcp_tool_name or tool_name
                 # Smithery routing: if the URL still contains run.tools and we have config,
@@ -258,7 +183,7 @@ async def _execute_mcp_tool(
                 return await client.call_tool(mcp_name, arguments)
 
             # Legacy MCP uses the same effective assignment as server-backed MCP.
-            agent_config = effective_assignment_config
+            agent_config = await resolve_assignment_config(db, tool, live_assignment, agent, user_id)
 
         if not tool.mcp_server_url:
             logger.error(f"[MCP] Tool {tool_name} has no server URL configured")
@@ -308,42 +233,12 @@ async def _execute_via_smithery_connect(
     import httpx
     import json as json_mod
 
-    # Get Smithery API key centrally (from discover_resources/import_mcp_server AgentTool config)
-    from app.services.resource_discovery import _get_smithery_api_key
-
-    api_key = config.get("smithery_api_key") or await _get_smithery_api_key(agent_id)
-    if not api_key:
-        return (
-            "❌ Smithery API key not configured.\n\n"
-            "请提供你的 Smithery API Key，你可以通过以下步骤获取：\n"
-            "1. 注册/登录 https://smithery.ai\n"
-            "2. 前往 https://smithery.ai/account/api-keys 创建 API Key\n"
-            "3. 将 Key 提供给我，我会帮你配置"
+    try:
+        endpoint, api_key, namespace, connection_id = await resolve_smithery_connection(
+            config, agent_id, allow_legacy_defaults=server_id is None,
         )
-
-    # Get namespace + connection from tool config, or use defaults
-    namespace = config.pop("smithery_namespace", None)
-    connection_id = config.pop("smithery_connection_id", None)
-
-    if not namespace or not connection_id:
-        # Fallback: try to get from Smithery settings
-        try:
-            from app.models.tool import Tool
-
-            async with async_session() as db:
-                r = await db.execute(select(Tool).where(Tool.name == "discover_resources"))
-                disc_tool = r.scalar_one_or_none()
-                if disc_tool and disc_tool.config:
-                    namespace = namespace or disc_tool.config.get("smithery_namespace")
-                    connection_id = connection_id or disc_tool.config.get("smithery_connection_id")
-        except Exception:
-            pass
-
-    if not namespace or not connection_id:
-        return (
-            "❌ Smithery Connect namespace/connection not configured. "
-            "Please set smithery_namespace and smithery_connection_id in the tool configuration."
-        )
+    except ValueError as exc:
+        return str(exc)
 
     # Smithery Connect (and many MCP servers) emit SSE responses for tools/call.
     # The server returns 406 Not Acceptable if the client doesn't declare both
@@ -359,7 +254,7 @@ async def _execute_via_smithery_connect(
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             # Call the tool via the existing connection
             tool_resp = await client.post(
-                f"https://api.smithery.ai/connect/{namespace}/{connection_id}/mcp",
+                endpoint,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,

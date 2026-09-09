@@ -30,9 +30,12 @@ async def shared_catalog(db, server):
 def safe_shared_override(override):
     if override is None:
         return None
-    return SimpleNamespace(**{
+    values = {
         key: getattr(override, key, None) if key in SHARED_OVERRIDE_FIELDS else None for key in OVERRIDE_FIELDS
-    })
+    }
+    values.update({key: getattr(override, key, None)
+                   for key in ("id", "scope_type", "scope_id", "mcp_server_id")})
+    return SimpleNamespace(**values)
 
 
 async def validate_agent_override(db, server, values):

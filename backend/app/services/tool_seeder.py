@@ -9,7 +9,10 @@ from app.core.plaza_feature import PLAZA_TOOL_NAMES
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
-from app.models.tool import Tool
+from app.models.tool import AgentTool, Tool
+from app.models.project import ProjectCapabilityBinding
+from app.services.mcp_catalog_locks import lock_mcp_catalogs
+from app.services.mcp_catalog_policy import can_remove_private_tool
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
 from app.services.tool_config import meaningful_config, tenant_tool_config_key
@@ -392,34 +395,32 @@ async def seed_builtin_tools():
 
 
 async def clean_orphaned_mcp_tools():
-    """Clean up orphan MCP tools that lost all their AgentTool assignments.
-
-    This happens when an Agent is deleted (cascade deletes AgentTool) but the
-    shared Tool record remains. We run this periodically/on-startup to prevent
-    the database from filling up with abandoned tool records.
-    """
-    from sqlalchemy import and_, delete
-
-    from app.models.tool import AgentTool
-
+    """Remove proven private orphans; shared and unclassified catalogs survive."""
     async with async_session() as db:
-        # 1. Get all currently assigned tool IDs
-        all_assigned_r = await db.execute(select(AgentTool.tool_id).distinct())
-        assigned_ids = [row[0] for row in all_assigned_r.fetchall()]
-        
-        # 2. Delete MCP tools that have NO tenant_id AND are NOT in the assigned list
-        # tenant_id IS NULL ensures we don't delete Global Tools manually added by company admins
-        stmt = delete(Tool).where(
-            and_(
-                Tool.type == "mcp",
-                Tool.tenant_id.is_(None),
-                ~Tool.id.in_(assigned_ids) if assigned_ids else True
-            )
+        candidates = (await db.execute(select(Tool.id, Tool.mcp_server_id).where(
+            Tool.type == "mcp", Tool.source == "agent",
+            ~select(AgentTool.id).where(AgentTool.tool_id == Tool.id).exists(),
+        ))).all()
+        await lock_mcp_catalogs(
+            db, sorted({server_id for _, server_id in candidates if server_id}),
+            tool_ids=[tool_id for tool_id, _ in candidates],
         )
-        result = await db.execute(stmt)
-        deleted_count = result.rowcount
+        # Re-read after acquiring the same locks as assignment/refresh writers.
+        deleted_count = 0
+        for tool_id, server_id in candidates:
+            tool = await db.get(Tool, tool_id, populate_existing=True)
+            if tool is None or not await can_remove_private_tool(db, tool):
+                continue
+            if await db.scalar(select(AgentTool.id).where(AgentTool.tool_id == tool_id).limit(1)):
+                continue
+            if server_id and await db.scalar(select(ProjectCapabilityBinding.id).where(
+                ProjectCapabilityBinding.capability_type == "mcp",
+                ProjectCapabilityBinding.capability_id == server_id,
+            ).limit(1)):
+                continue
+            await db.delete(tool)
+            deleted_count += 1
         await db.commit()
-        
         if deleted_count > 0:
             logger.info(f"[ToolSeeder] Cleaned up {deleted_count} orphaned MCP tools")
 

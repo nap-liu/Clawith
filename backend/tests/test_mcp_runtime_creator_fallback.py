@@ -119,6 +119,8 @@ async def test_user_id_none_does_not_receive_creator_placeholders():
             f"mcp_none_{suffix}", {}, agent_id=agent_id, user_id=None,  # absent user
         )
 
-    assert "placeholder error" in result
+    from app.services.llm.failure_outcome import render_message
+
+    assert render_message("mcpAccess.placeholderError") in result
     fake_client.call_tool.assert_not_awaited()
     mock_cls.assert_not_called()

@@ -26,6 +26,7 @@ from app.services.mcp_catalog_policy import shared_catalog
 from app.services.llm.failure_outcome import render_message
 from app.services.mcp_refresh_snapshot import MCPRefreshChanged, plan_refresh
 from app.services.mcp_naming import tool_function_name
+from app.services.mcp_connection_resolution import render_http_connection
 from app.services.mcp_server_service import (
     agent_private_server_name,
     compose_runtime_config,
@@ -95,6 +96,7 @@ async def _discover_tools(
             str(agent_id) if agent_id else "__refresh__",
             {"command": command, "args": args, "env": env},
             cwd=work_dir,
+            invocation_id=uuid.uuid4().hex,
         )
         hub = SandboxMcpHubClient(settings.SANDBOX_API_URL, settings.SANDBOX_API_KEY)
         try:
@@ -106,13 +108,7 @@ async def _discover_tools(
                 pass
         return tools, f"stdio MCP server; {len(tools)} tools discovered"
 
-    url = render(config.url_template or "", context, ALL_ROOTS, on_unknown="raise")
-    headers = render_dict(config.headers_template or {}, context, ALL_ROOTS, on_unknown="raise")
-    credential = (
-        render(config.credential_template, context, ALL_ROOTS, on_unknown="raise")
-        if config.credential_template
-        else None
-    )
+    url, headers, credential = render_http_connection(config, context)
     client = MCPClient(url, api_key=credential, headers=headers or None)
     tools = await client.list_tools()
     return tools, client.server_instructions
@@ -471,6 +467,7 @@ async def refresh_mcp_server_tools(
     created = 0
     updated = 0
     assigned = 0
+    catalog_source = "admin" if await shared_catalog(db, server) else "agent"
     refreshed_tool_ids: set[uuid.UUID] = set()
     for item in discovered_tools:
         remote_name = str(item.get("name") or "").strip()
@@ -498,12 +495,7 @@ async def refresh_mcp_server_tools(
                 mcp_server_id=server.id,
                 enabled=True,
                 is_default=False,
-                source=(
-                    "agent"
-                    if assignment_seed is not None
-                    and assignment_seed.source == "user_installed"
-                    else "admin"
-                ),
+                source=catalog_source,
                 tenant_id=server.tenant_id,
             )
             db.add(tool)

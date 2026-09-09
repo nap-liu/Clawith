@@ -135,6 +135,9 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
   including the same tenant boundary used by Agent settings. Removing one
   binding preserves other Agents' installations. Only a private MCP tool may
   be deleted when its final binding is removed; shared catalogs survive unbinding.
+  Startup orphan cleanup uses the same catalog policy and lock order, rechecks
+  assignments and Project references after locking, and preserves shared or
+  unclassified catalogs even when they have never been assigned.
   Alias resolution only reserves canonical
   MCP names visible to the current Agent, so another tenant's names cannot
   suppress its available remote aliases.
@@ -173,6 +176,17 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
   results. `Tool.source` identifies catalog origin; binding provenance alone never
   turns an admin catalog into a private one. Empty or unclassified catalogs are
   treated conservatively as shared.
+  Private discovery/check endpoints require the owning Agent scope. New tools
+  retain the catalog's origin regardless of assignment creation or omitted upsert
+  arguments. Unbound shared catalogs may be checked without creating bindings;
+  an all-platform-disabled catalog cannot use this fallback.
+  Checks and execution share configuration, placeholder/header rendering and
+  exact Smithery installation routing. Known installations never borrow another
+  installation's route or key, and a check cannot trigger recovery. Project
+  checks use the Project workspace and source-creator credential rules; historical
+  Project overrides are ignored even when the local binding is disabled. Temporary
+  stdio discovery registrations have unique invocation identities and are removed
+  independently of concurrent calls.
 - Smithery connections and recovery belong to exact private installations, never
   to matching URLs or display names. Execution prefers the installation's key.
   Concurrent imports must retain the winning installation's routing and must not

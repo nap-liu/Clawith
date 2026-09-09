@@ -270,6 +270,8 @@ async def test_mcp_server_connection(
     await _assert_can_patch_server(current_user, srv, db)
 
     # Transport-aware routing: stdio → aio-sandbox hub; http → MCPClient (unchanged).
+    if not await shared_catalog(db, srv):
+        raise HTTPException(403, detail=render_message("mcpAccess.agentScopeRequired"))
     transport = getattr(srv, "transport", "http") or "http"
     try:
         if transport == "stdio":

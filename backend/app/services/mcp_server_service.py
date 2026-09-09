@@ -166,7 +166,7 @@ async def lookup_overrides(
         # credentials are never read from that scope: an eligible execution
         # references the source Agent override below, and all others inherit
         # only server/tenant configuration.
-        if project_uses_private_tool:
+        if project_agent is not None and project_agent.scope == "project":
             a_ovr = None
         source_has_private_tool = False
         if (
@@ -393,6 +393,12 @@ async def persist_stdio_discovered_tools(
     from app.models.tool import Tool
     from sqlalchemy import select
 
+    from app.services.mcp_catalog_policy import shared_catalog
+
+    # Discovery cannot change the origin of an existing catalog.
+    has_tools = await db.scalar(select(Tool.id).where(Tool.mcp_server_id == srv.id).limit(1))
+    if srv.created_by_user_id is not None or has_tools is not None:
+        source = "admin" if await shared_catalog(db, srv) else "agent"
     upserted = 0
     for t in tools:
         raw_name: str = t.get("name") or ""

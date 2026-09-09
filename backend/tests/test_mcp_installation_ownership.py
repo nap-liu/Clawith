@@ -13,6 +13,9 @@ from app.models.mcp_server import MCPServer
 from app.models.tool import AgentTool, Tool
 from app.services.agent_tools_mcp_runtime import _execute_mcp_tool
 from app.services.resource_discovery import import_mcp_direct
+from app.services.mcp_catalog_policy import shared_catalog
+from app.services.tool_seeder import clean_orphaned_mcp_tools
+from app.services.tool_enablement import tool_visible_to_agent
 from mcp_tool_refresh_support import _isolate, _make_agent  # noqa: F401 -- autouse fixture
 
 pytestmark = pytest.mark.asyncio
@@ -70,6 +73,9 @@ async def test_stdio_environment_variants_preserve_catalog_origin_and_retries():
             await db.commit()
             assert tool.source == "agent"
             ids.append(server.id)
+        await persist_stdio_discovered_tools(db, server, [{"name": "new_method"}])
+        await db.commit()
+        assert not await shared_catalog(db, server)
     assert ids[0] == ids[2] != ids[1]
 
 
@@ -121,8 +127,40 @@ async def test_shared_agent_can_override_and_filter_but_never_mutate_catalog(pla
             provider.assert_not_called()
         response = await client.delete(f"/api/tools/agent-tool/{bid}")
         assert response.status_code == 200, response.text
+        with patch("app.services.mcp_refresh_service.MCPClient", Provider):
+            response = await client.post(f"/api/admin/mcp-servers/{sid}/test-connection?agent_id={agent.id}")
+            assert response.json()["success"], response.text
+    await clean_orphaned_mcp_tools()
     async with async_session() as db:
         server, tool = await db.get(MCPServer, sid), await db.get(Tool, tid)
         assert server.credential_template == "shared-key" and server.instructions is None
         assert tool.enabled and tool.description == "immutable"
         assert not await db.get(AgentTool, bid)
+
+
+async def test_private_refresh_requires_owner_scope_and_preserves_private_origin():
+    user, agent, _ = await _make_agent()
+    with patch("app.services.mcp_client.MCPClient", Provider):
+        await import_mcp_direct(mcp_url="https://private.example/mcp", agent_id=agent.id, server_name="Private")
+    async with async_session() as db:
+        server = await db.scalar(select(MCPServer).join(Tool).join(AgentTool).where(AgentTool.agent_id == agent.id))
+        sid = server.id
+    headers = {"Authorization": f"Bearer {create_access_token(str(user.id), user.role)}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers) as client:
+        with patch("app.services.mcp_refresh_service.MCPClient") as provider:
+            for action in ("refresh-tools", "test-connection"):
+                response = await client.post(f"/api/admin/mcp-servers/{sid}/{action}")
+                assert response.status_code == 403, response.text
+            provider.assert_not_called()
+        with patch("app.services.mcp_refresh_service._discover_tools", return_value=([{"name": "new_method"}], None)):
+            response = await client.post(f"/api/admin/mcp-servers/{sid}/refresh-tools?agent_id={agent.id}")
+            assert response.status_code == 200, response.text
+        response = await client.patch(f"/api/admin/mcp-servers/{sid}", json={"display_name": "Still private"})
+        assert response.status_code == 200, response.text
+    async with async_session() as db:
+        server = await db.get(MCPServer, sid)
+        assert not await shared_catalog(db, server)
+        tools = (await db.scalars(select(Tool).where(Tool.mcp_server_id == sid))).all()
+        assert {tool.mcp_tool_name for tool in tools} == {"read", "new_method"}
+        assert all(tool.source == "agent" for tool in tools)
+        assert all(not tool_visible_to_agent(tool, agent.tenant_id, set()) for tool in tools)

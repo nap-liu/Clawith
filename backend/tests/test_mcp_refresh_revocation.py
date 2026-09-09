@@ -125,6 +125,7 @@ async def test_admin_refresh_preserves_disabled_rows_and_keeps_new_tool_contract
     async with async_session() as db:
         tool = await db.get(Tool, tid)
         tool.enabled = False
+        tool.source = "admin"
         await db.commit()
     class Provider:
         server_instructions = None

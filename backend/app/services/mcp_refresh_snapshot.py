@@ -12,6 +12,7 @@ from app.models.project import ProjectCapabilityBinding
 from app.models.tool import AgentTool, Tool
 from app.services.llm.failure_outcome import render_message
 from app.services.mcp_access import visible_mcp_installations
+from app.services.mcp_catalog_policy import shared_catalog
 from app.services.mcp_server_service import (
     build_placeholder_context_for_call, compose_runtime_config, lookup_overrides,
 )
@@ -53,6 +54,8 @@ async def plan_refresh(db, server_id, agent_id, user_id, session_id):
     server = await db.get(MCPServer, server_id)
     if server is None:
         raise LookupError(render_message("mcpAccess.refreshUnavailable"))
+    if agent_id is None and not await shared_catalog(db, server):
+        raise PermissionError(render_message("mcpAccess.agentScopeRequired"))
     prospective = server
     tenant_id = server.tenant_id
     references = {}
