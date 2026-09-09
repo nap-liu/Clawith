@@ -75,7 +75,7 @@ async def test_startup_scan_closes_database_before_resuming_turn(monkeypatch):
         return True
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 

@@ -87,15 +87,25 @@ async def execute_web_turn_impl(
                 return "continue"
 
             if assistant_response == "":
-                turn_snapshot = await self._transition_turn(turn_anchor_id, "suspended")
-                await self._publish_turn_lifecycle(turn_snapshot)
-                await self._safe_send(
-                    api.with_turn_envelope(
-                        {"type": "done", "role": "assistant", "content": ""},
-                        turn_snapshot,
-                        event_kind="turn_suspended",
+                # The shared tool loop persisted suspension before exposing the
+                # confirmation. Its response may already have resumed this anchor
+                # while the old execution was finishing. Project durable state;
+                # never write a second suspension from this late finalizer.
+                current_snapshot = await self._load_turn_snapshot()
+                if (
+                    turn_snapshot is not None
+                    and current_snapshot.anchor_id == turn_anchor_id
+                    and current_snapshot.generation == turn_snapshot.generation
+                    and current_snapshot.status == "suspended"
+                ):
+                    await self._publish_turn_lifecycle(current_snapshot)
+                    await self._safe_send(
+                        api.with_turn_envelope(
+                            {"type": "done", "role": "assistant", "content": ""},
+                            current_snapshot,
+                            event_kind="turn_suspended",
+                        )
                     )
-                )
                 if self.client_disconnected:
                     await api.manager.disconnect(str(self.agent_id), self.websocket)
                     return "disconnect"

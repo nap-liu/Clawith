@@ -37,7 +37,7 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
         return True
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
 
     scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=1))
     await asyncio.wait_for(recovery_started.wait(), timeout=1)
@@ -48,7 +48,7 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
     async def resumed_after_shutdown(_anchor):
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_turn", resumed_after_shutdown)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", resumed_after_shutdown)
     retry_stats = await asyncio.wait_for(
         turn_recovery.startup_turn_resume_once(limit=1),
         timeout=1,
@@ -300,7 +300,7 @@ async def test_startup_scan_skips_archived_channel_session(monkeypatch):
     async def fail_if_resumed(_anchor):
         raise AssertionError("archived sessions must not be resumed after restart")
 
-    monkeypatch.setattr(turn_recovery, "resume_turn", fail_if_resumed)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fail_if_resumed)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=10)
 

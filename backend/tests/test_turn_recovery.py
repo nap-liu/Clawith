@@ -367,7 +367,7 @@ async def test_startup_recovery_scans_recent_incomplete_message_tails(monkeypatc
         resumed.append(anchor.id)
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
@@ -434,7 +434,7 @@ async def test_startup_scan_does_not_drop_recoverable_tail_after_two_hundred_com
         resumed.append(anchor.id)
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
     assert resumed == [target_id]
@@ -496,7 +496,7 @@ async def test_startup_scan_prefers_durable_owner_over_newer_queued_user(monkeyp
         resumed.append(anchor.id)
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
     assert resumed == [owner_id]
@@ -585,7 +585,7 @@ async def test_startup_scan_skips_cancelled_turn(monkeypatch):
     async def fail_if_resumed(_anchor):
         raise AssertionError("cancelled turns must not be resumed after restart")
 
-    monkeypatch.setattr(turn_recovery, "resume_turn", fail_if_resumed)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fail_if_resumed)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=10)
 
@@ -633,7 +633,7 @@ async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatc
         return True
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
 
     scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=2))
     await first_ready.wait()
@@ -680,7 +680,7 @@ async def test_startup_recovery_starts_every_eligible_anchor_in_parallel(monkeyp
             in_flight -= 1
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
 
     scanner = asyncio.create_task(
         turn_recovery.startup_turn_resume_once(limit=len(anchors))
@@ -716,7 +716,7 @@ async def test_startup_recovery_failure_does_not_cancel_siblings(monkeypatch):
         return True
 
     monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_turn", fake_resume)
+    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=2)
     assert successful_anchor.is_set()
