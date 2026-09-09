@@ -692,3 +692,88 @@ async def test_compat_single_event_dispatch_resolves_materialized_batch_root_onc
     assert resumed == [root.id]
     pending = await runtime._pending_parent_events(debounce_seconds=0)
     assert not set(event_ids).intersection(pending)
+
+
+@pytest.mark.parametrize("external_delivery", [True, False])
+async def test_late_delivery_audit_does_not_block_idle_parent_wake(
+    monkeypatch, external_delivery,
+):
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id, execution_user_id=user_id,
+        parent_session_id=str(parent_id), origin_tool_call_id="late-media",
+        task="child", mode="async", turn_anchor_id=anchor_id,
+    )
+    await runtime.send_subagent_message_to_parent(
+        agent_id=agent_id, execution_user_id=user_id,
+        origin_tool_call_id="late-media-result", subagent_session_id=str(run.id),
+        message="video completed",
+    )
+    async with async_session() as db:
+        for state in ("running", "completed"):
+            await transition_conversation_turn(
+                db, agent_id=agent_id, conversation_id=str(parent_id),
+                turn_anchor_id=anchor_id, status=state,
+            )
+        now = datetime.now(UTC)
+        db.add(ChatMessage(
+            agent_id=agent_id, user_id=user_id, role="assistant",
+            conversation_id=str(parent_id), content="video still processing",
+            message_meta={"turn_anchor_id": str(anchor_id), "turn_status": "completed"},
+            created_at=now,
+        ))
+        db.add(ChatMessage(
+            agent_id=agent_id, user_id=user_id, role="tool_call",
+            conversation_id=str(parent_id), content="media delivery",
+            message_meta={
+                "direction": "outbound", "delivery_status": "sent",
+                "origin_session_id": str(run.id if external_delivery else parent_id),
+                "target_session_id": str(parent_id),
+            },
+            created_at=now + timedelta(microseconds=1),
+        ))
+        await db.commit()
+        event = await db.scalar(select(ChatMessage).where(
+            ChatMessage.conversation_id == str(run.id),
+            ChatMessage.message_meta["kind"].as_string() == runtime.SUBAGENT_PARENT_MESSAGE,
+        ))
+
+    resumed = []
+
+    async def fake_resume(anchor):
+        resumed.append(anchor.id)
+        async with async_session() as db:
+            db.add(ChatMessage(
+                agent_id=agent_id, user_id=user_id, role="assistant",
+                conversation_id=str(parent_id), content="video completed",
+                message_meta={"turn_anchor_id": str(anchor.id), "turn_status": "completed"},
+            ))
+            await transition_conversation_turn(
+                db, agent_id=agent_id, conversation_id=str(parent_id),
+                turn_anchor_id=anchor.id, status="completed",
+            )
+            await db.commit()
+        return True
+
+    async def fake_channel(_lock_key, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr("app.services.turn_recovery.resume_turn", fake_resume)
+    monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_channel)
+    assert await runtime._dispatch_parent_event_batch([event.id]) is external_delivery
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, event.id)
+        projection = await db.scalar(select(ChatMessage).where(
+            ChatMessage.external_event_key == f"subagent-parent:{event.id}",
+        ))
+    assert bool(resumed) is external_delivery
+    assert (projection is not None) is external_delivery
+    assert stored.message_meta["subagent_dispatch_state"] == (
+        runtime.SUBAGENT_DISPATCH_DELIVERED if external_delivery
+        else runtime.SUBAGENT_DISPATCH_PENDING
+    )
+    if external_delivery:
+        assert await runtime._dispatch_parent_event_batch([event.id]) is True
+        assert len(resumed) == 1

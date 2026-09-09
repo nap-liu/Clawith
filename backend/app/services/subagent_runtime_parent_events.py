@@ -305,10 +305,24 @@ async def _materialize_parent_event_batch(
                     return None, [], "busy"
                 root = None
         else:
+            # Cross-session outbound delivery rows are audit records, not work
+            # in this parent's turn. A late child artifact can arrive after the
+            # parent's final answer and must not block its completion wake.
+            external_delivery = and_(
+                ChatMessage.role == "tool_call",
+                func.coalesce(ChatMessage.message_meta["direction"].as_string(), "")
+                == "outbound",
+                func.coalesce(
+                    ChatMessage.message_meta["origin_session_id"].as_string(), ""
+                ).notin_(["", str(parent.id)]),
+            )
             latest = (
                 await db.execute(
                     select(ChatMessage)
-                    .where(ChatMessage.conversation_id == str(parent.id))
+                    .where(
+                        ChatMessage.conversation_id == str(parent.id),
+                        ~external_delivery,
+                    )
                     .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
                     .limit(1)
                 )

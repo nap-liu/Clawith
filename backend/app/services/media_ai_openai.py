@@ -49,7 +49,7 @@ def generation_payload(config: dict, args: dict, media: list[MediaInput]) -> tup
             # The current standard accepts URL/data-URL references directly.
             payload["images"] = [{"image_url": item.data_url} for item in media]
         return "/images/edits" if media else "/images/generations", {**options, **payload, "n": 1}
-    if len(media) > 1 or any(item.kind != "image" or item.role not in {None, "first_frame", "reference_image"} for item in media):
+    if len(media) > 1 or any(item.kind != "image" or item.role not in {None, "", "first_frame", "reference_image"} for item in media):
         raise MediaAIError("unsupportedOptions")
     if media:
         payload["input_reference"] = {"image_url": media[0].data_url}

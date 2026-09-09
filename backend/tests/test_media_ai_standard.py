@@ -54,20 +54,27 @@ async def test_standard_speech_returns_bytes_without_bailian_fields(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_standard_video_resumes_original_id_and_downloads_with_auth(monkeypatch):
+@pytest.mark.parametrize("with_reference", [False, True])
+async def test_standard_video_resumes_original_id_and_downloads_with_auth(monkeypatch, with_reference):
     seen = []
+    reference = "https://storage.example/reference.png?signature=exact"
     def upstream(request):
         seen.append((request.method, request.url.path))
         assert request.headers["authorization"] == "Bearer test-key"
         if request.method == "POST":
             body = json.loads(request.content)
             assert body["seconds"] == "8"
+            if with_reference:
+                assert body["input_reference"] == {"image_url": reference}
+            else:
+                assert "input_reference" not in body
             return httpx.Response(200, json={"id": "original-video", "status": "queued"})
         if request.url.path.endswith("/content"):
             return httpx.Response(200, content=b"video bytes")
         return httpx.Response(200, json={"id": "original-video", "status": "completed"})
     mock_http(monkeypatch, upstream)
-    path, body = provider.generation_payload(config(), {"prompt": "move", "output_type": "video", "duration": 8}, [])
+    media = [MediaInput("workspace/reference.png", "image/png", url=reference)] if with_reference else []
+    path, body = provider.generation_payload(config(), {"prompt": "move", "output_type": "video", "duration": 8}, media)
     task = await provider.request(config(), path, body, asynchronous=True)
     result = await provider.poll_generation(config(), task["output"]["task_id"])
     assert result["output"]["task_status"] == "SUCCEEDED"
