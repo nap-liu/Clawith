@@ -20,14 +20,13 @@ export default function ChatExternalContext({ context }: { context: unknown }) {
             className="chat-external-context"
             onToggle={(event) => setExpanded(event.currentTarget.open)}
         >
-            <summary title={t('chat.externalContextHint')}>
+            <summary>
                 <IconFileText size={16} aria-hidden="true" />
                 <span>{t('chat.externalContext')}</span>
                 {label ? <span className="chat-external-context__source">{label}</span> : null}
                 <IconChevronRight className="chat-external-context__chevron" size={16} aria-hidden="true" />
             </summary>
             {expanded ? <div className="chat-external-context__body">
-                <p>{t('chat.externalContextHint')}</p>
                 <pre>{JSON.stringify(context, null, 2)}</pre>
             </div> : null}
         </details>

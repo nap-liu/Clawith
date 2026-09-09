@@ -3554,7 +3554,6 @@
   },
   "chat": {
     "externalContext": "参考资料",
-    "externalContextHint": "发送这条消息时附带的数据。",
     "placeholder": "输入消息...",
     "send": "发送",
     "deleteSession": "删除会话",

@@ -3565,7 +3565,6 @@
   },
   "chat": {
     "externalContext": "Reference data",
-    "externalContextHint": "Data included when this message was sent.",
     "placeholder": "Type a message...",
     "send": "Send",
     "deleteSession": "Delete session",

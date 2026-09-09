@@ -52,10 +52,6 @@
     padding: 10px;
 }
 
-.chat-external-context__body > p {
-    margin: 0 0 8px;
-}
-
 .chat-external-context__body > pre {
     margin: 0;
     max-height: 360px;
