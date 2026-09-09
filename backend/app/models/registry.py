@@ -20,6 +20,7 @@ import app.models.notification  # noqa: F401
 import app.models.okr  # noqa: F401
 import app.models.onboarding  # noqa: F401
 import app.models.openapi_application  # noqa: F401
+import app.models.openapi_interaction  # noqa: F401
 import app.models.org  # noqa: F401
 import app.models.participant  # noqa: F401
 import app.models.personal_access_token  # noqa: F401

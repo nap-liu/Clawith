@@ -4,6 +4,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { IconAlertTriangle } from '@tabler/icons-react';
 import type { SceneManifestQuickAction } from '../../../services/api';
 import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
+import ChatExternalContext from '../../../components/ChatExternalContext';
 import ChatMediaCard from '../../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../../components/ChatToolCallRenderer';
 import MarkdownRenderer from '../../../components/MarkdownRenderer';
@@ -335,7 +336,10 @@ export function useH5AgentChatPresentation(
         }
 
         const msg = entry.msg;
-        const rawDisplayContent = msg.fileName ? stripAttachmentDisplayPrefix(msg.content) : msg.content;
+        const visibleContent = msg.role === 'user' && msg.external_context !== undefined
+            ? msg.display_content ?? msg.content
+            : msg.content;
+        const rawDisplayContent = msg.fileName ? stripAttachmentDisplayPrefix(visibleContent) : visibleContent;
         const displayContent = stripChatImageDataMarkers(rawDisplayContent);
         const quotedMessage = msg.quoted_message;
         const filePreviewImages = msg.previewImages || (msg.imageUrl ? [buildPreviewImage(msg.imageUrl, msg.fileName)] : []);
@@ -515,6 +519,7 @@ export function useH5AgentChatPresentation(
                     ) : msg.streaming ? (
                         <div className="h5-chat__typing"><span /><span /><span /></div>
                     ) : null}
+                    {msg.role === 'user' ? <ChatExternalContext context={msg.external_context} /> : null}
                 </div>
             </article>
         );

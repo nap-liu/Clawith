@@ -3553,6 +3553,7 @@
     }
   },
   "chat": {
+    "externalContext": "上下文",
     "placeholder": "输入消息...",
     "send": "发送",
     "deleteSession": "删除会话",

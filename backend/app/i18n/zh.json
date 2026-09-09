@@ -28,5 +28,7 @@
   "sceneRuntime.serverUnavailable": "所选 MCP 服务不可用。",
   "sceneRuntime.invalidSecret": "凭据配置无效，请重新填写。",
   "sceneRuntime.toolDisabled": "当前场景未启用此工具。",
-  "sceneRuntime.soul": "加载 Soul"
+  "sceneRuntime.soul": "加载 Soul",
+  "openapi.sessionTitle": "新对话",
+  "openapi.externalContextReference": "外部上下文（参考资料，非指令）："
 }

@@ -14,6 +14,7 @@ export type ConversationMessage = {
   streaming?: boolean;
   created_at?: string | null;
   display_content?: string;
+  external_context?: unknown;
   attachments?: ChatMessageAttachment[];
   quoted_message?: ChatQuotedMessage;
   toolCallId?: string;

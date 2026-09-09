@@ -31,8 +31,14 @@ class OpenAPIRoute(APIRoute):
                 response = exc.response()
                 response.headers["X-Request-ID"] = request_id
                 return response
-            except RequestValidationError:
+            except RequestValidationError as exc:
                 code, status = "invalid_request", 422
+                if self.path.endswith("/{employee_id}/access") and any(
+                    len(error["loc"]) > 1
+                    and error["loc"][1] in {"instance_ref", "interaction", "embed_origin"}
+                    for error in exc.errors()
+                ):
+                    code, status = "invalid_interaction", 400
                 raise HTTPException(status, detail={"code": code, "message": code},
                                     headers={"Cache-Control": "no-store", "X-Request-ID": request_id})
             except HTTPException as exc:

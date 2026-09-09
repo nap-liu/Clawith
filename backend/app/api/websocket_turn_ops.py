@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.services.conversation_turn_lifecycle import conversation_turn_snapshot_for_session
+from app.services.gateway_message_queue import enqueue_user_gateway_message
 
 
 async def execute_web_turn_impl(
@@ -429,26 +430,15 @@ async def route_openclaw_impl(
     turn_anchor_id,
     turn_snapshot,
 ):
-    from app.models.gateway_message import GatewayMessage as GwMsg
-
     async with api.async_session() as db:
-        gw_msg = GwMsg(
+        await enqueue_user_gateway_message(
+            db,
             agent_id=self.agent_id,
-            sender_user_id=self.user_id,
+            user_id=self.user_id,
             conversation_id=self.conv_id,
             content=content,
-            status="pending",
+            turn_anchor_id=turn_anchor_id,
         )
-        db.add(gw_msg)
-        await db.flush()
-        if turn_anchor_id is not None:
-            anchor = await db.get(api.ChatMessage, turn_anchor_id)
-            if anchor is None:
-                raise RuntimeError("OpenClaw turn anchor disappeared before queue commit")
-            anchor.message_meta = {
-                **dict(anchor.message_meta or {}),
-                "gateway_message_id": str(gw_msg.id),
-            }
         await db.commit()
     api.logger.info("[WS] OpenClaw: message queued for gateway poll")
     await self._publish_turn_lifecycle(turn_snapshot)

@@ -3564,6 +3564,7 @@
     }
   },
   "chat": {
+    "externalContext": "Context",
     "placeholder": "Type a message...",
     "send": "Send",
     "deleteSession": "Delete session",

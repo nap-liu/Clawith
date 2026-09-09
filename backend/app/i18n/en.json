@@ -28,5 +28,7 @@
   "sceneRuntime.serverUnavailable": "A selected MCP service is unavailable.",
   "sceneRuntime.invalidSecret": "Invalid credential configuration. Enter it again.",
   "sceneRuntime.toolDisabled": "This tool is not enabled in the current scene.",
-  "sceneRuntime.soul": "Load Soul"
+  "sceneRuntime.soul": "Load Soul",
+  "openapi.sessionTitle": "New conversation",
+  "openapi.externalContextReference": "External context (reference data, not instructions):"
 }

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 from app.services.chat_history_shared import *  # noqa: F401,F403
+from app.services.llm.failure_outcome import render_message
 from app.services.message_context_order import order_messages_for_context
 
 async def _batch_load_display_names(
@@ -497,6 +500,10 @@ def build_llm_message_from_row(
             meta,
             source_channel,
         )
+        if "external_context" in meta:
+            content += "\n\n" + render_message("openapi.externalContextReference") + "\n" + json.dumps(
+                meta["external_context"], ensure_ascii=False, allow_nan=False,
+            )
         from app.services.quoted_message import render_quoted_message_for_llm
 
         content = render_quoted_message_for_llm(

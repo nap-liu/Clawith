@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { IconAlertTriangle } from "@tabler/icons-react";
 
 import ChatAttachmentIcon from "../../../../components/ChatAttachmentIcon";
+import ChatExternalContext from "../../../../components/ChatExternalContext";
 import ChatMediaCard from "../../../../components/ChatMediaCard";
 import MarkdownRenderer from "../../../../components/MarkdownRenderer";
 import Avatar from "../../../../components/ui/Avatar";
@@ -295,6 +296,7 @@ export function MessageItem({
             ) : (
               <MarkdownRenderer agentId={agentId} content={content} />
             )}
+            {msg.role === "user" ? <ChatExternalContext context={msg.external_context} /> : null}
           </div>
         </div>
         {formattedTime && (

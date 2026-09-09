@@ -17,6 +17,23 @@ import {
   toolTurnScope,
 } from "./tooling";
 
+function userContextProjection(raw: Record<string, any>) {
+  const metadata = raw.message_meta ?? raw.metadata ?? {};
+  const contextSource = Object.prototype.hasOwnProperty.call(raw, "external_context")
+    ? raw
+    : metadata;
+  return {
+    ...(typeof raw.display_content === "string"
+      ? { display_content: raw.display_content }
+      : typeof metadata.display_content === "string"
+        ? { display_content: metadata.display_content }
+        : {}),
+    ...(Object.prototype.hasOwnProperty.call(contextSource, "external_context")
+      ? { external_context: contextSource.external_context }
+      : {}),
+  };
+}
+
 export function normalizeTurnTimelinePartition<T extends ConversationMessage>(
   messages: T[],
   turnAnchorId?: string,
@@ -139,6 +156,7 @@ export function mapHistoryMessage(
     ...(Object.prototype.hasOwnProperty.call(raw, "display_content")
       ? { display_content: raw.display_content || "" }
       : {}),
+    ...(raw.role === "user" ? userContextProjection(raw) : {}),
     ...(Object.prototype.hasOwnProperty.call(raw, "attachments")
       ? { attachments: raw.attachments || [] }
       : {}),
@@ -184,6 +202,7 @@ export function applyUserMessageCommitted<T extends Record<string, any>>(
     ...(Object.prototype.hasOwnProperty.call(event, "display_content")
       ? { display_content: String(event.display_content || "") }
       : {}),
+    ...userContextProjection(event),
     ...(Object.prototype.hasOwnProperty.call(event, "attachments")
       ? { attachments: event.attachments || [] }
       : {}),

@@ -1,0 +1,882 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Clawith system OpenAPI",
+    "version": "1",
+    "description": "Generated from FastAPI. Context interactions and instance sessions are implemented. Check capabilities on the target environment for availability."
+  },
+  "paths": {
+    "/api/openapi/v1/auth/token": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Token",
+        "operationId": "token_api_openapi_v1_auth_token_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "grant_type": {
+                    "type": "string",
+                    "enum": [
+                      "client_credentials"
+                    ]
+                  },
+                  "scope": {
+                    "type": "string"
+                  }
+                },
+                "type": "object",
+                "required": [
+                  "grant_type"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthTokenOut"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ClientSecretBasic": []
+          },
+          {
+            "ClientSecretBasic": []
+          }
+        ]
+      }
+    },
+    "/api/openapi/v1/auth/revoke": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Revoke Token",
+        "operationId": "revoke_token_api_openapi_v1_auth_revoke_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "token_type_hint": {
+                    "type": "string"
+                  }
+                },
+                "type": "object",
+                "required": [
+                  "token"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ClientSecretBasic": []
+          }
+        ]
+      }
+    },
+    "/api/openapi/v1/capabilities": {
+      "get": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Capabilities",
+        "operationId": "capabilities_api_openapi_v1_capabilities_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesOut"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "SystemOAuth2": []
+          }
+        ]
+      }
+    },
+    "/api/openapi/v1/digital-employees/search": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Employees",
+        "operationId": "employees_api_openapi_v1_digital_employees_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmployeeSearchInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmployeePageOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "SystemOAuth2": [
+              "employees:read"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/openapi/v1/digital-employees/{employee_id}/access": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Employee",
+        "description": "With only user, returns the existing employee information and access URL. Adding instance_ref, interaction or embed_origin also requires auth:login and returns a temporary login URL. An interaction prepares a first question and optional JSON context without executing it. Opening the login URL activates one new conversation and one first question; identical request_id retries reuse that interaction. instance_ref alone resumes its current conversation.",
+        "operationId": "employee_api_openapi_v1_digital_employees__employee_id__access_post",
+        "security": [
+          {
+            "SystemOAuth2": [
+              "employees:read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "employee_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Employee Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmployeeAccessInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmployeeAccessOut"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_interaction: invalid optional launch fields or an empty question/request ID."
+          },
+          "409": {
+            "description": "interaction_conflict: request_id was already used with different business content."
+          },
+          "410": {
+            "description": "interaction_expired or interaction_unavailable: the interaction can no longer be activated."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/openapi/v1/auth/links": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Login Link",
+        "operationId": "login_link_api_openapi_v1_auth_links_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginLinkInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginLinkOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "SystemOAuth2": [
+              "auth:login"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/openapi/v1/auth/link-exchange": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Exchange Link",
+        "description": "Exchange a single-use login code for the delegated user's ordinary login. Codes from extended employee access recheck employee permission and activate the prepared conversation before returning its redirect URI. First-question execution starts only after the activation commits; repeated activation through newly issued codes does not submit another question. Generic auth/links codes retain their existing login and redirect behavior.",
+        "operationId": "exchange_link_api_openapi_v1_auth_link_exchange_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginExchangeInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_interaction: the launch reference is invalid."
+          },
+          "410": {
+            "description": "interaction_expired or interaction_unavailable: the prepared interaction is no longer available."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/oauth-authorization-server": {
+      "get": {
+        "tags": [
+          "OAuth server metadata"
+        ],
+        "summary": "Authorization Server Metadata",
+        "operationId": "authorization_server_metadata__well_known_oauth_authorization_server_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "LoginExchangeInput": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 20,
+            "title": "Code"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "LoginExchangeInput"
+      },
+      "LoginLinkOut": {
+        "properties": {
+          "login_url": {
+            "type": "string",
+            "title": "Login Url"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          }
+        },
+        "type": "object",
+        "required": [
+          "login_url",
+          "expires_in"
+        ],
+        "title": "LoginLinkOut"
+      },
+      "LoginLinkInput": {
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/DelegatedUser"
+          },
+          "redirect_uri": {
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Redirect Uri"
+          },
+          "embed_origin": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embed Origin"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "user",
+          "redirect_uri"
+        ],
+        "title": "LoginLinkInput"
+      },
+      "DelegatedUser": {
+        "properties": {
+          "subject": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Subject"
+          },
+          "phone": {
+            "type": "string",
+            "maxLength": 50,
+            "minLength": 5,
+            "title": "Phone"
+          },
+          "asserted_at": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Asserted At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "subject",
+          "phone",
+          "asserted_at"
+        ],
+        "title": "DelegatedUser"
+      },
+      "EmployeeAccessOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "access_url": {
+            "type": "string",
+            "title": "Access Url"
+          },
+          "login_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login Url"
+          },
+          "expires_in": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "avatar_url",
+          "description",
+          "access_url"
+        ],
+        "title": "EmployeeAccessOut"
+      },
+      "EmployeeAccessInput": {
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/DelegatedUser"
+          },
+          "instance_ref": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instance Ref"
+          },
+          "interaction": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContextInteractionInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "embed_origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embed Origin"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "user"
+        ],
+        "title": "EmployeeAccessInput"
+      },
+      "ContextInteractionInput": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Request Id"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Message"
+          },
+          "context": {
+            "$ref": "#/components/schemas/JsonValue"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "request_id",
+          "message"
+        ],
+        "title": "ContextInteractionInput"
+      },
+      "JsonValue": {},
+      "EmployeePageOut": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EmployeeOut"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "has_more"
+        ],
+        "title": "EmployeePageOut"
+      },
+      "EmployeeOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "access_url": {
+            "type": "string",
+            "title": "Access Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "avatar_url",
+          "description",
+          "access_url"
+        ],
+        "title": "EmployeeOut"
+      },
+      "EmployeeSearchInput": {
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/DelegatedUser"
+          },
+          "search": {
+            "type": "string",
+            "maxLength": 100,
+            "title": "Search",
+            "default": ""
+          },
+          "page": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Page",
+            "default": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "default": 20
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "user"
+        ],
+        "title": "EmployeeSearchInput"
+      },
+      "CapabilitiesOut": {
+        "properties": {
+          "protocol_version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Protocol Version"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Scopes"
+          },
+          "trust_user_identity": {
+            "type": "boolean",
+            "title": "Trust User Identity"
+          },
+          "h5_launcher": {
+            "$ref": "#/components/schemas/H5LauncherCapability"
+          }
+        },
+        "type": "object",
+        "required": [
+          "protocol_version",
+          "scopes",
+          "trust_user_identity"
+        ],
+        "title": "CapabilitiesOut"
+      },
+      "H5LauncherCapability": {
+        "properties": {
+          "interaction": {
+            "$ref": "#/components/schemas/InteractionCapability"
+          },
+          "instance_ref": {
+            "type": "boolean",
+            "const": true,
+            "title": "Instance Ref",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "H5LauncherCapability"
+      },
+      "InteractionCapability": {
+        "properties": {
+          "supported": {
+            "type": "boolean",
+            "const": true,
+            "title": "Supported",
+            "default": true
+          },
+          "version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Version",
+            "default": 1
+          }
+        },
+        "type": "object",
+        "title": "InteractionCapability"
+      },
+      "OAuthTokenOut": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "token_type": {
+            "type": "string",
+            "const": "Bearer",
+            "title": "Token Type"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope"
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in",
+          "scope"
+        ],
+        "title": "OAuthTokenOut"
+      }
+    },
+    "securitySchemes": {
+      "ClientSecretBasic": {
+        "type": "http",
+        "scheme": "basic"
+      },
+      "SystemOAuth2": {
+        "type": "oauth2",
+        "flows": {
+          "clientCredentials": {
+            "scopes": {
+              "employees:read": "Read delegated user's visible digital employees",
+              "auth:login": "Create temporary login links for delegated users"
+            },
+            "tokenUrl": "/api/openapi/v1/auth/token"
+          }
+        }
+      }
+    }
+  }
+}

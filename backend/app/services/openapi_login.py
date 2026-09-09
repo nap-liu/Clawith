@@ -32,7 +32,7 @@ def redirect_target(app, value: str, public_base_url="") -> str:
     return value
 
 
-async def issue_login_code(db, app, user, redirect_uri, embed_origin):
+async def issue_login_code(db, app, user, redirect_uri, embed_origin, *, launcher=None):
     expires_at = now() + timedelta(seconds=60)
     settings = get_settings()
     payload = {"aud": AUDIENCE, "jti": secrets.token_urlsafe(24),
@@ -41,7 +41,8 @@ async def issue_login_code(db, app, user, redirect_uri, embed_origin):
     code = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
     db.add(OpenAPICredential(token_hash=digest(code), application_id=app.id,
                             generation=app.generation, kind="login", user_id=user.id,
-                            redirect_uri=redirect_uri, embed_origin=embed_origin, expires_at=expires_at))
+                            redirect_uri=redirect_uri, embed_origin=embed_origin,
+                            launcher=launcher, expires_at=expires_at))
     await db.flush()
     return code
 

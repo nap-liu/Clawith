@@ -58,6 +58,8 @@ def serialize_chat_message_for_client(
         "created_at": created_at.isoformat() if created_at else None,
     }
     if role == "user" and isinstance(meta, dict):
+        if "external_context" in meta:
+            entry["external_context"] = meta["external_context"]
         quoted_message = normalize_quoted_message(meta.get("quoted_message"))
         if quoted_message is not None:
             entry["quoted_message"] = quoted_message

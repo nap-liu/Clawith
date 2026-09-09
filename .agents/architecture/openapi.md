@@ -95,16 +95,17 @@ platform-administrator login through trusted phone assertions.
 |---|---|---|
 | GET `/capabilities` | Bearer token | Version, granted scopes and delegation availability |
 | POST `/digital-employees/search` | `user`, optional `search`, `page`, `page_size` | `items`, `total`, `page`, `page_size`, `has_more` |
-| POST `/digital-employees/{id}/access` | `user` | Employee display item and `access_url` |
+| POST `/digital-employees/{id}/access` | `user`, optional `instance_ref`, `interaction`, `embed_origin` | Employee display item; extended requests also return a temporary `login_url` |
 | POST `/auth/links` | `user`, `redirect_uri`, optional `embed_origin` | `login_url`, `expires_in` |
 | POST `/auth/link-exchange` | One-use `code` | Normal platform login response and bound `redirect_uri` |
 
 Employee display items contain `id`, `name`, `avatar_url`, `description` and
 `access_url`. Visibility and access use existing employee permission owners.
-The employee resource owns the access URL. The generic login service treats its
-target as a validated URL and contains no employee ID, H5 path construction,
-chat API allowlist, media bridge or alternative turn loop. Other resource types
-can use the same login-link service without adding login branches.
+The employee resource owns the access URL and optional H5 activation adapter.
+The generic login issuer treats its target as a validated URL, stores an optional
+opaque activation reference and does not construct employee paths or execute
+chat turns. Exchange dispatches that reference to the employee activation owner
+after ordinary login validation. Generic login links retain their existing path.
 
 ## Generic temporary login lifecycle
 
@@ -145,9 +146,9 @@ scope reduction, cross-client revocation, replay/concurrent consume, altered or
 expired code, disabled/rotated client, inactive account, cross-tenant discovery,
 redirect tampering and code rejection by ordinary REST/WS authentication.
 
-Migrations create only system applications, client-scoped subject bindings and
-short-lived credential records; normal identity, RBAC, chat and turn tables keep
-their existing ownership. Cleanup must preserve unmerged work and the user's
+Migrations create system applications, client-scoped subject bindings,
+short-lived credentials and optional interaction records; normal identity, RBAC,
+chat and turn tables keep their existing ownership. Cleanup must preserve unmerged work and the user's
 other worktrees and shared local stacks.
 
 OpenAPI models register through `app.models.registry`. The shared bootstrap and
@@ -167,3 +168,60 @@ Keep integrations simple, efficient and normalized. Use the fewest services and
 models required by a real caller. Reuse the existing identity, permission, login,
 conversation and shared UI owners; do not build an integration framework or a
 parallel authentication, session, renderer or synchronization mechanism.
+
+## Optional context interaction for H5 access
+
+The H5 access extension must stay simple, normalized and compatible. Extend
+`POST /digital-employees/{id}/access` with optional `instance_ref`, `interaction`
+and `embed_origin`. Requests without these additions retain the existing employee
+response and ordinary H5 behavior. Extended access returns the existing employee
+fields plus `login_url`, `expires_in` and, for an interaction, `request_id`.
+It reuses `employees:read`, `auth:login`, trusted delegation and generic login
+issuance; no new endpoint, OAuth grant, scope or separate chat runtime is added.
+
+An opaque instance reference selects the current ordinary ChatSession for the
+OAuth application, delegated user, employee and instance. A first ordinary open
+creates that instance's session; later opens resume it. A new interaction starts
+a new session and updates the instance association only on successful activation.
+Sessions remain independently addressable through ordinary history and access
+checks. Omitting the instance preserves the ordinary H5 selection behavior.
+
+One interaction record owns the application/user/request-id idempotency key,
+business-content fingerprint, pending payload and activated session/message
+references. Same-key same-content requests reuse it and may issue another login
+link; changed employee, instance, message or context returns 409. The assertion
+time and OAuth token are not business content. Issuance never executes the model.
+Successful login and current employee authorization atomically activate one
+ordinary session and user message, then use the existing durable execution owner.
+Repeat activation never resends, including after a failed first answer. Pending
+snapshots expire after ten minutes; expired identities remain as tombstones for
+at least 24 hours. Activated snapshots follow ordinary conversation retention.
+
+Context is generic JSON. Preserve its structure and value types in message
+metadata and the model's user-level reference material, without interpreting
+external business models or promoting data into system/developer instructions.
+H5 adds an optional collapsible context view using shared presentation components;
+its original composer, session selection, streaming, attachments, confirmation,
+STOP and recovery remain the authoritative behavior.
+
+Do not add arbitrary message-length, interaction-byte, dataset-row, concurrency,
+execution-time, domain-binding or dedicated-scope restrictions for this extension.
+Existing application/user/employee authorization, request/model capacity handling,
+URL syntax checks and explicit application origin configuration remain in force.
+The suggested 8000-character/128-KiB/200-row budgets are not new hard limits.
+Capabilities publish support and version through the existing response; no new
+configuration center, business-instance table, message queue or polling API.
+URLs and ordinary audit contain references and outcomes, never question/context
+payloads. Validate actual first-question, isolation and existing H5 behavior with
+focused Docker checks; test volume is not a delivery goal.
+
+Native turns use the existing durable resume owner after commit; OpenClaw turns
+enter its existing gateway queue in the activation transaction. User-facing
+`display_content` remains the question, while the shared LLM history projection
+includes `external_context` as user-level reference JSON. Pending-payload cleanup
+runs opportunistically during system-token issuance; expiry is enforced on every
+interaction access even when no cleanup traffic has occurred.
+
+The external integration contract and runnable requests are maintained in
+[`docs/openapi-integration.md`](../../docs/openapi-integration.md); the generated
+[`docs/openapi-v1.json`](../../docs/openapi-v1.json) describes the system routes.

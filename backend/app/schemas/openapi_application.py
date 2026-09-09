@@ -4,7 +4,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 SCOPES = {"employees:read", "auth:login"}
 
@@ -75,12 +75,44 @@ class LoginExchangeInput(BaseModel):
     code: str = Field(min_length=20, max_length=4096)
 
 
-class EmployeeAccessInput(BaseModel):
+class EmployeeUserInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user: DelegatedUser
 
 
-class EmployeeSearchInput(EmployeeAccessInput):
+class ContextInteractionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    request_id: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    context: JsonValue = None
+
+    @field_validator("request_id", "message")
+    @classmethod
+    def nonempty(cls, value):
+        if not value.strip():
+            raise ValueError("Nonempty value required")
+        return value
+
+
+class EmployeeAccessInput(EmployeeUserInput):
+    instance_ref: str | None = Field(default=None, min_length=1)
+    interaction: ContextInteractionInput | None = None
+    embed_origin: str | None = None
+
+    @field_validator("instance_ref")
+    @classmethod
+    def instance_nonempty(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("Nonempty instance required")
+        return value
+
+    @field_validator("embed_origin")
+    @classmethod
+    def optional_origin(cls, value):
+        return validate_origin(value) if value else None
+
+
+class EmployeeSearchInput(EmployeeUserInput):
     search: str = Field(default="", max_length=100)
     page: int = Field(default=1, ge=1, le=10000)
     page_size: int = Field(default=20, ge=1, le=100)
@@ -102,6 +134,12 @@ class EmployeePageOut(BaseModel):
     has_more: bool
 
 
+class EmployeeAccessOut(EmployeeOut):
+    login_url: str | None = None
+    expires_in: int | None = None
+    request_id: str | None = None
+
+
 class OAuthTokenOut(BaseModel):
     access_token: str
     token_type: Literal["Bearer"]
@@ -114,7 +152,18 @@ class LoginLinkOut(BaseModel):
     expires_in: int
 
 
+class InteractionCapability(BaseModel):
+    supported: Literal[True] = True
+    version: Literal[1] = 1
+
+
+class H5LauncherCapability(BaseModel):
+    interaction: InteractionCapability = Field(default_factory=InteractionCapability)
+    instance_ref: Literal[True] = True
+
+
 class CapabilitiesOut(BaseModel):
     protocol_version: Literal[1]
     scopes: list[str]
     trust_user_identity: bool
+    h5_launcher: H5LauncherCapability = Field(default_factory=H5LauncherCapability)

@@ -15,11 +15,13 @@ from app.models.agent import Agent
 from app.models.openapi_application import OpenAPICredential
 from app.schemas.openapi_application import LoginLinkInput, LoginExchangeInput, EmployeeSearchInput, EmployeeAccessInput
 from app.schemas.schemas import UserOut
-from app.schemas.openapi_application import EmployeeOut, EmployeePageOut, OAuthTokenOut, LoginLinkOut, CapabilitiesOut
+from app.schemas.openapi_application import EmployeeAccessOut, EmployeePageOut, OAuthTokenOut, LoginLinkOut, CapabilitiesOut
 from app.services.openapi_applications import (
     audit, authenticate_client, credential, delegated_user, digest, login_user, fail, issue_system_token, now,
 )
 from app.services.openapi_login import issue_login_code, redirect_target, verify_login_code
+from app.services.openapi_interactions import activate_launcher, cleanup_pending_interactions, prepare_interaction
+from app.services.turn_inbox import schedule_durable_turn_resume
 from app.services.platform_service import platform_service
 from app.services.openapi_oauth import (
     OAuthFailure, SystemContext, client_credentials_request, client_request, client_basic, oauth2, require_scope,
@@ -81,6 +83,7 @@ async def token(request: Request, response: Response, basic=Depends(client_basic
     scopes = set(app.scopes) if requested_scope is None else requested_scope
     if not scopes <= set(app.scopes):
         raise OAuthFailure("invalid_scope")
+    await cleanup_pending_interactions(db)
     access_token = await issue_system_token(db, app, sorted(scopes))
     await db.commit()
     response.headers["Pragma"] = "no-cache"
@@ -129,7 +132,21 @@ async def employees(body: EmployeeSearchInput, request: Request,
     return result
 
 
-@router.post("/digital-employees/{employee_id}/access", response_model=EmployeeOut)
+@router.post("/digital-employees/{employee_id}/access", response_model=EmployeeAccessOut,
+             response_model_exclude_unset=True,
+             description=(
+                 "With only user, returns the existing employee information and access URL. "
+                 "Adding instance_ref, interaction or embed_origin also requires auth:login and "
+                 "returns a temporary login URL. An interaction prepares a first question and "
+                 "optional JSON context without executing it. Opening the login URL activates "
+                 "one new conversation and one first question; identical request_id retries "
+                 "reuse that interaction. instance_ref alone resumes its current conversation."
+             ),
+             responses={
+                 400: {"description": "invalid_interaction: invalid optional launch fields or an empty question/request ID."},
+                 409: {"description": "interaction_conflict: request_id was already used with different business content."},
+                 410: {"description": "interaction_expired or interaction_unavailable: the interaction can no longer be activated."},
+             })
 async def employee(employee_id: uuid.UUID, body: EmployeeAccessInput, request: Request,
                    context=Security(system_context, scopes=["employees:read"]), db: AsyncSession = Depends(get_db)):
     require_scope(context, "employees:read")
@@ -138,8 +155,27 @@ async def employee(employee_id: uuid.UUID, body: EmployeeAccessInput, request: R
     if agent.tenant_id != context.application.tenant_id or agent.scope != "standard" or agent.is_deleted:
         fail("employee_unavailable", 404)
     base = await platform_service.get_configured_public_base_url(db)
+    result = employee_projection(agent, base)
+    if body.instance_ref is not None or body.interaction is not None or body.embed_origin is not None:
+        require_scope(context, "auth:login")
+        app = context.application
+        if body.embed_origin and app.embed_origins and body.embed_origin not in app.embed_origins:
+            fail("embed_origin_denied")
+        record = None
+        if body.interaction is not None:
+            record = await prepare_interaction(
+                db, app, user, agent.id, body.instance_ref, body.interaction.model_dump(),
+            )
+        launcher = {"employee_id": str(agent.id), "instance_ref": body.instance_ref,
+                    "interaction_id": str(record.id) if record else None}
+        code = await issue_login_code(
+            db, app, user, f"/h5/agents/{agent.id}/chat", body.embed_origin, launcher=launcher,
+        )
+        result.update(login_url=f"{base}/openapi/login?{urlencode({'code': code})}", expires_in=60)
+        if record:
+            result["request_id"] = record.request_id
     await db.commit()
-    return employee_projection(agent, base)
+    return result
 
 
 @router.post("/auth/links", response_model=LoginLinkOut)
@@ -158,7 +194,19 @@ async def login_link(body: LoginLinkInput, request: Request,
     return {"login_url": login_url, "expires_in": 60}
 
 
-@router.post("/auth/link-exchange")
+@router.post("/auth/link-exchange",
+             description=(
+                 "Exchange a single-use login code for the delegated user's ordinary login. "
+                 "Codes from extended employee access recheck employee permission and activate "
+                 "the prepared conversation before returning its redirect URI. First-question "
+                 "execution starts only after the activation commits; repeated activation "
+                 "through newly issued codes does not submit another question. Generic auth/links "
+                 "codes retain their existing login and redirect behavior."
+             ),
+             responses={
+                 400: {"description": "invalid_interaction: the launch reference is invalid."},
+                 410: {"description": "interaction_expired or interaction_unavailable: the prepared interaction is no longer available."},
+             })
 async def exchange_link(body: LoginExchangeInput, request: Request, response: Response,
                         db: AsyncSession = Depends(get_db)):
     payload = verify_login_code(body.code)
@@ -171,10 +219,15 @@ async def exchange_link(body: LoginExchangeInput, request: Request, response: Re
     user = await login_user(db, app, value)
     base = await platform_service.get_configured_public_base_url(db)
     redirect_uri = redirect_target(app, value.redirect_uri, base)
+    anchor = None
+    if value.launcher is not None:
+        redirect_uri, anchor = await activate_launcher(db, app, user, value.launcher)
     value.consumed_at = now()
     jwt_token = create_access_token(str(user.id), user.role)
     await audit(db, "login.complete", application_id=app.id, user_id=user.id)
     await db.commit()
+    if anchor is not None:
+        await schedule_durable_turn_resume(anchor)
     set_access_token_cookie(response, request, jwt_token)
     return {"access_token": jwt_token, "token_type": "bearer", "user": UserOut.model_validate(user),
             "redirect_uri": redirect_uri}
