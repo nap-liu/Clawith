@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from app.api.websocket_inbox_ops import publish_inbox_receipt, receive_turn_message
+from app.api.websocket_context import reject_context_message
+from app.services.external_chat_context import InvalidExternalContext, MessageConflict, external_context_metadata
 from app.services.llm.failure_outcome import render_message
 from app.services.turn_inbox import schedule_durable_turn_resume
 
@@ -12,7 +14,7 @@ async def message_loop_impl(api, self):
         str(self.pending_initial_assistant["content"]) if self.pending_initial_assistant else self.welcome_message
     )
     automatic_scene = (self.scene_manifest or {}).get("activation_source") == "automatic"
-    if initial_content and not self.history_messages and not self.onboarding_required and not automatic_scene:
+    if initial_content and not self.history_messages and not self.onboarding_required and not automatic_scene and not getattr(self, "host_context", False):
         await self.websocket.send_json(
             {
                 "type": "done",
@@ -83,6 +85,12 @@ async def message_loop_impl(api, self):
             from app.api.websocket_continue import handle_continue
 
             await handle_continue(self, data)
+            continue
+
+        try:
+            context_meta = external_context_metadata(data)
+        except InvalidExternalContext as exc:
+            await reject_context_message(self, exc)
             continue
 
         validated_attachments = None
@@ -176,7 +184,13 @@ async def message_loop_impl(api, self):
                 model_id=(str(effective_llm_model.id) if effective_llm_model is not None else None),
                 reasoning_effort=(effective_llm_model.reasoning_effort if effective_llm_model is not None else None),
                 attachments=validated_attachments,
+                external_context_meta=context_meta,
             )
+        except MessageConflict as exc:
+            if turn_lease is not None:
+                await turn_lease.release()
+            await reject_context_message(self, exc)
+            continue
         except (api.SessionTurnBusyError, api.ConversationTurnConflict):
             if turn_lease is not None:
                 await turn_lease.release()
@@ -215,6 +229,7 @@ async def message_loop_impl(api, self):
                     "display_content": display_content,
                     "attachments": validated_attachments or [],
                     "sender_user_id": str(self.user_id),
+                    **context_meta,
                 },
                 snapshot=turn_snapshot,
                 event_kind="turn_user_committed",
@@ -306,6 +321,10 @@ async def message_loop_impl(api, self):
         current_message = {"role": "user", "content": current_content}
         if current_attachments:
             current_message["attachments"] = current_attachments
+        if context_meta and ingested is not None:
+            from app.services.chat_history import build_llm_message_from_row
+
+            current_message = build_llm_message_from_row(ingested.message)
         self.conversation.append(current_message)
 
         if self.agent_type == "openclaw":

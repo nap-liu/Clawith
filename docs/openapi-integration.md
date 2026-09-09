@@ -434,3 +434,23 @@ jq -n --arg subject "$USER_SUBJECT" --arg phone "$USER_PHONE" \
 - 原有 H5 聊天能力继续由平台自身提供；业务系统负责自己的页面、数据授权和嵌入窗口生命周期。
 
 内部实现约束见 [OpenAPI 架构文档](../.agents/architecture/openapi.md)。
+
+## 12. H5 每条消息携带宿主上下文
+
+在既有员工 `/access` 请求中添加：
+
+```json
+{
+  "instance_ref": "assistant-window",
+  "embed_origin": "https://business.example.com",
+  "host_context": {"enabled": true, "version": 1}
+}
+```
+
+能力发现新增 `h5_launcher.host_context`；响应追加
+`host_context: {version: 1, frame_origin: "https://chat.example.com"}`。
+仍由现有 OAuth 客户端在业务后端调用，仍使用 `employees:read` 和 `auth:login`。
+浏览器打开返回的 `login_url`，在原 H5 输入框提问时按消息获取宿主快照。
+
+完整请求、postMessage 协议、重试语义和可选 `createHostContextBridge` SDK 见
+[H5 宿主上下文接入](h5-host-context.md)。省略该配置，原 H5 行为不变。

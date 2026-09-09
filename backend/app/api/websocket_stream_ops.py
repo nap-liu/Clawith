@@ -262,15 +262,16 @@ async def run_llm_and_stream_impl(
                     _agent = _agent_result.scalar_one_or_none()
                     if _agent is None:
                         raise RuntimeError("Agent no longer exists")
-                    _onb = await api.resolve_onboarding_prompt(
-                        _ob_db,
-                        _agent,
-                        self.user_id,
-                        user_name=self.user_display_name,
-                        user_locale=self.lang,
-                        is_onboarding_trigger=is_onboarding_trigger,
-                        complete_after_greeting=self.source_channel != "web",
-                    )
+                    if not getattr(self, "host_context", False):
+                        _onb = await api.resolve_onboarding_prompt(
+                            _ob_db,
+                            _agent,
+                            self.user_id,
+                            user_name=self.user_display_name,
+                            user_locale=self.lang,
+                            is_onboarding_trigger=is_onboarding_trigger,
+                            complete_after_greeting=self.source_channel != "web",
+                        )
                 if _onb:
                     ephemeral_overlays = [{"role": "system", "content": _onb.prompt}]
                     _truncated = ephemeral_overlays + _truncated

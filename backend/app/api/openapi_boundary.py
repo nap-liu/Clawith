@@ -39,6 +39,17 @@ class OpenAPIRoute(APIRoute):
                     for error in exc.errors()
                 ):
                     code, status = "invalid_interaction", 400
+                if self.path.endswith("/{employee_id}/access"):
+                    body = exc.body if isinstance(exc.body, dict) else {}
+                    host = body.get("host_context")
+                    enabled = isinstance(host, dict) and host.get("enabled") is True
+                    if any(
+                        error["loc"][1:2] == ("host_context",)
+                        or enabled and (error["loc"] == ("body",)
+                                        or error["loc"][1:2] in (("instance_ref",), ("embed_origin",)))
+                        for error in exc.errors()
+                    ):
+                        code, status = "invalid_host_context", 400
                 raise HTTPException(status, detail={"code": code, "message": code},
                                     headers={"Cache-Control": "no-store", "X-Request-ID": request_id})
             except HTTPException as exc:

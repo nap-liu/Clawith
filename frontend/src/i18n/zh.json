@@ -3565,6 +3565,11 @@
     },
     "stop": "停止"
   },
+  "hostContext": {
+    "unavailable": "未能获取页面上下文，请重新发送。",
+    "timeout": "获取页面上下文超时，请重新发送。",
+    "connectionUnavailable": "连接恢复后可重新发送。"
+  },
   "messages": {
     "title": "消息中心",
     "markAllRead": "全部标为已读 ({{count}})",

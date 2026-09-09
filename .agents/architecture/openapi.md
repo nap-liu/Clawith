@@ -95,7 +95,7 @@ platform-administrator login through trusted phone assertions.
 |---|---|---|
 | GET `/capabilities` | Bearer token | Version, granted scopes and delegation availability |
 | POST `/digital-employees/search` | `user`, optional `search`, `page`, `page_size` | `items`, `total`, `page`, `page_size`, `has_more` |
-| POST `/digital-employees/{id}/access` | `user`, optional `instance_ref`, `interaction`, `embed_origin`, `scene_key` | Employee display item; extended requests also return a temporary `login_url` |
+| POST `/digital-employees/{id}/access` | `user`, optional `instance_ref`, `interaction`, `embed_origin`, `scene_key`, `host_context` | Employee display item; extended requests also return a temporary `login_url` |
 | POST `/digital-employees/{id}/scenes/search` | `user` | Currently available published scene manifests for that employee |
 | POST `/auth/links` | `user`, `redirect_uri`, optional `embed_origin` | `login_url`, `expires_in` |
 | POST `/auth/link-exchange` | One-use `code` | Normal platform login response and bound `redirect_uri` |
@@ -254,3 +254,55 @@ Active-turn revision snapshots remain immutable when session preferences change.
 Unavailable explicit scenes return `scene_unavailable` rather than silently
 falling back. OpenClaw retains its existing H5 scene presentation and gateway
 protocol; Native prompt/tool scene execution is not added to remote gateways.
+
+## Optional per-message host context
+
+`host_context: {enabled: true, version: 1}` extends the existing employee access
+request. It requires `instance_ref` and `embed_origin`, uses existing login scopes,
+and advertises support under `h5_launcher.host_context`. The access response
+returns the browser `frame_origin` derived from trusted public URL configuration.
+The existing login credential launcher JSON carries the non-secret bootstrap;
+exchange returns it alongside ordinary login. No new table, token or API owner
+is introduced. Normal access and generic login retain their behavior.
+
+H5 stores bootstrap under a fresh per-launch sessionStorage reference carried in
+its destination URL. Only that marked window opts in; missing marked bootstrap
+blocks sending visibly. The WebSocket connection flag suppresses automatic
+welcome/onboarding before any durable claim, without altering global user or
+session policy. Explicit interaction first questions still use their supplied
+snapshot; subsequent user questions request fresh host snapshots.
+
+Before each real user send, H5 freezes its message UUID, draft, attachments,
+model and session, then requests the parent snapshot through postMessage.
+Source window, exact configured origin, protocol version, message request ID
+and a fresh transport attempt ID must match. The host fixes its original page
+reference on the first request ID, including retries after unavailable results.
+A thin optional ES module wraps messaging and disposal; the host owns business
+data authorization and fixed snapshots. It is not a second chat SDK/runtime.
+
+Unsent context waits preserve the draft and are cancelled by edits, session or
+identity switches, suspension and STOP. Late replies cannot submit cancelled
+work. Sent messages awaiting durable acknowledgment keep their frozen payload
+and UUID for reconnect reconciliation/resend; new input cannot overwrite them.
+This distinction preserves existing streaming, in-turn questions and STOP.
+
+The ordinary message `external_context` metadata is the single snapshot owner.
+Presence matters, including JSON null and false. Shared rendering covers initial
+provider input, in-turn inbox, history/recovery and gateway delivery. Context
+remains user reference material, never a system instruction or authorization.
+For retries where either existing or incoming message has context, compare the
+question, attachment descriptors and JSON snapshot before any side effect, also
+under the session lock and after a unique-key race. A mismatch returns
+`message_conflict` with its client message ID; both-absent messages retain their
+original behavior. No snapshot-specific row, byte or question limits are added.
+
+The public protocol and SDK usage live in `docs/h5-host-context.md`.
+The frontend automatically hosts `/sdk/h5-host-context.js` and its `.d.ts`.
+The public `/sdk/` static location supports credential-free cross-origin module
+loading and revalidates its stable URL on updates. This static CORS policy does
+not change API authorization or exact-origin postMessage routing.
+Definitive admission rejection also uses the existing `rejected_message_id`;
+it removes the corresponding automatic resend and restores an untouched draft.
+STOP retains unknown sends for history acknowledgment but disables their
+current-session automatic replay. `/continue`, `/new` and `/reset` stay on the
+existing control path without requesting snapshots.

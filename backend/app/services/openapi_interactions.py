@@ -206,7 +206,7 @@ async def activate_launcher(db, application, user, launcher: dict) -> tuple[str,
         if agent.agent_type == "openclaw":
             await enqueue_user_gateway_message(
                 db, agent_id=employee_id, user_id=user.id,
-                conversation_id=str(session.id), content=content,
+                conversation_id=str(session.id), content=message,
                 turn_anchor_id=result.message.id,
             )
             anchor = None

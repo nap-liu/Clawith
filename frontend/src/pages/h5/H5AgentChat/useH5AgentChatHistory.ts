@@ -153,6 +153,7 @@ export function useH5AgentChatHistory(state: ReturnType<typeof useH5AgentChatSta
                         || sessionIdRef.current !== nextSessionId
                     ) return false;
                     const safePageRows = Array.isArray(pageRows) ? pageRows : [];
+                    safePageRows.forEach((row) => state.hostContext.acknowledge({ ...row, type: 'history' }));
                     collectedRows = [...safePageRows, ...collectedRows];
                     responseCursor = pageCursor;
                     responseHasMore = pageHasMore;
@@ -203,7 +204,7 @@ export function useH5AgentChatHistory(state: ReturnType<typeof useH5AgentChatSta
         })();
         historyLoadRef.current = { sessionId: nextSessionId, controller, promise };
         return promise;
-    }, [agentId, normalizeHistoryMessage, token]);
+    }, [agentId, normalizeHistoryMessage, token, state.hostContext]);
 
     const loadOlderHistory = useCallback(async () => {
         const activeSessionId = sessionIdRef.current;

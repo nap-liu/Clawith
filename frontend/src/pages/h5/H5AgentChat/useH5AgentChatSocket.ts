@@ -77,6 +77,8 @@ export function useH5AgentChatSocket(
         releaseResumeReconcileOwner,
         resumeEventConsumerRef,
         sceneKey,
+        hostContext,
+        messageRuntimeBlockedRef,
     } = state;
     const {
         cancelRecoveryPolling,
@@ -86,6 +88,14 @@ export function useH5AgentChatSocket(
         startRecoveryPolling,
     } = history;
     const { refreshSceneManifest } = lifecycle;
+
+    const reconcileHostOutbox = useCallback((socket: WebSocket, activeSessionId: string) => {
+        if (!hostContext.enabled || wsRef.current !== socket || sessionIdRef.current !== activeSessionId) return;
+        hostContext.reconcile(socket);
+        hostContext.retry(socket, activeSessionId,
+            !messageRuntimeBlockedRef.current && !pageSuspendedRef.current
+            && !unmountedRef.current && !document.hidden && !(socket as any)._readOnly);
+    }, [hostContext]);
 
     const scheduleReconnect = useCallback(() => {
         if (
@@ -185,22 +195,26 @@ export function useH5AgentChatSocket(
             setSessionId(nextSessionId);
             setConnectionStatus('connected');
             setIsReadOnly(data.read_only === true);
+            (socket as any)._readOnly = data.read_only === true;
             void refreshSceneManifest();
-            if (data.onboarding_required === true) {
+            if (data.onboarding_required === true && !hostContext.enabled) {
                 generationActiveRef.current = true;
                 setIsWaiting(true);
                 setIsStreaming(false);
             }
             setOnboardingKickoffRequest({
                 sessionId: nextSessionId,
-                required: data.onboarding_required === true,
+                required: data.onboarding_required === true && !hostContext.enabled,
                 socket,
             });
             window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
             if (skipNextConnectedHistoryRef.current === nextSessionId) {
                 skipNextConnectedHistoryRef.current = null;
+                if (!resumeEventGateRef.current) reconcileHostOutbox(socket, nextSessionId);
             } else {
-                loadHistory(nextSessionId);
+                void loadHistory(nextSessionId).then((loaded) => {
+                    if (loaded) reconcileHostOutbox(socket, nextSessionId);
+                });
             }
             return;
         }
@@ -319,7 +333,7 @@ export function useH5AgentChatSocket(
                 created_at: new Date().toISOString(),
             }]);
         }
-    }, [cancelRecoveryPolling, clearSocketConnectTimer, enqueueStreamEvent, flushStreamBatch, loadHistory, normalizeHistoryMessage, refreshSceneManifest]);
+    }, [cancelRecoveryPolling, clearSocketConnectTimer, enqueueStreamEvent, flushStreamBatch, loadHistory, normalizeHistoryMessage, refreshSceneManifest, hostContext, reconcileHostOutbox]);
 
     resumeEventConsumerRef.current = ({ data, socket }) => handleSocketMessage(data, socket);
 
@@ -347,6 +361,7 @@ export function useH5AgentChatSocket(
         });
         const effectiveSessionId = requestedSessionId || sessionIdRef.current;
         if (effectiveSessionId) params.set('session_id', effectiveSessionId);
+        if (hostContext.enabled) params.set('host_context', 'true');
 
         let ws: WebSocket;
         try {
@@ -381,6 +396,7 @@ export function useH5AgentChatSocket(
             if (wsRef.current !== ws) return;
             try {
                 const data = JSON.parse(event.data);
+                hostContext.acknowledge(data);
                 if (data.type === 'connected') {
                     (ws as any)._serverConnected = true;
                     if (data.session_id) (ws as any)._runtimeSessionId = String(data.session_id);
@@ -434,6 +450,7 @@ export function useH5AgentChatSocket(
         clearSocketConnectTimer,
         closeCurrentSocket,
         handleSocketMessage,
+        hostContext,
         scheduleReconnect,
         sceneKey,
         startRecoveryPolling,
@@ -507,6 +524,7 @@ export function useH5AgentChatSocket(
                 && !document.hidden
                 && sessionIdRef.current === activeSessionId;
             finishResumeEventGate(gate, stillActive);
+            if (loaded && stillActive && socket) reconcileHostOutbox(socket, activeSessionId);
             if (stillActive && recoveryPollingNeededRef.current) startRecoveryPolling();
         })().finally(() => {
             // A reconnect timer can fire while either this coordinator or a
@@ -521,6 +539,7 @@ export function useH5AgentChatSocket(
         cancelRecoveryPolling,
         finishResumeEventGate,
         releaseResumeReconcileOwner,
+        reconcileHostOutbox,
         startRecoveryPolling,
         waitForSocketServerConnection,
     ]);
@@ -541,6 +560,7 @@ export function useH5AgentChatSocket(
 
     useLayoutEffect(() => installH5PageLifecycle({
         onSuspend: () => {
+            hostContext.cancelPending();
             pageSuspendedRef.current = true;
             setPageActive(false);
             const activeGate = resumeEventGateRef.current;
@@ -607,6 +627,7 @@ export function useH5AgentChatSocket(
         closeCurrentSocket,
         discardStreamBatch,
         finishResumeEventGate,
+        hostContext,
         token,
     ]);
 
@@ -627,6 +648,7 @@ export function useH5AgentChatSocket(
     }, [agent, authStatus, token]);
 
     const prepareForNativeNavigation = useCallback(() => {
+        hostContext.cancelPending();
         if (reconnectTimerRef.current) {
             window.clearTimeout(reconnectTimerRef.current);
             reconnectTimerRef.current = null;
@@ -649,7 +671,7 @@ export function useH5AgentChatSocket(
             nativeNavigationFallbackTimerRef.current = null;
             recoverFromNativeNavigation();
         }, 2000);
-    }, [cancelHistoryLoad, closeCurrentSocket, discardStreamBatch, recoverFromNativeNavigation]);
+    }, [cancelHistoryLoad, closeCurrentSocket, discardStreamBatch, recoverFromNativeNavigation, hostContext]);
 
     return {
         openSocket,

@@ -3,7 +3,7 @@
   "info": {
     "title": "Clawith system OpenAPI",
     "version": "1",
-    "description": "Generated from FastAPI. Context interactions, instance sessions and explicit scene selection are implemented. Check capabilities on the target environment for availability."
+    "description": "Generated from FastAPI. Context interactions, instance sessions, scene selection and optional per-message H5 host context. Check capabilities on the target environment for availability."
   },
   "paths": {
     "/api/openapi/v1/auth/token": {
@@ -245,7 +245,7 @@
           "OpenAPI v1"
         ],
         "summary": "Employee",
-        "description": "With only user, returns the existing employee information and access URL. Adding instance_ref, interaction, embed_origin or scene_key also requires auth:login and returns a temporary login URL. An interaction prepares a first question and optional JSON context without executing it. Opening the login URL activates one new conversation and one first question; identical request_id retries reuse that interaction. instance_ref alone resumes its current conversation. scene_key selects an enabled published scene when the login URL is opened.",
+        "description": "With only user, returns the existing employee information and access URL. Adding instance_ref, interaction, embed_origin or scene_key also requires auth:login and returns a temporary login URL. An interaction prepares a first question and optional JSON context without executing it. Opening the login URL activates one new conversation and one first question; identical request_id retries reuse that interaction. instance_ref alone resumes its current conversation. scene_key selects an enabled published scene when the login URL is opened. host_context.enabled adds per-message host snapshots; instance_ref and embed_origin are required. Enabling it does not create an automatic question.",
         "operationId": "employee_api_openapi_v1_digital_employees__employee_id__access_post",
         "security": [
           {
@@ -288,7 +288,7 @@
             }
           },
           "400": {
-            "description": "invalid_interaction: invalid optional launch fields or an empty question/request ID."
+            "description": "invalid_interaction or invalid_host_context: invalid optional launch fields."
           },
           "404": {
             "description": "scene_unavailable: the selected scene is not available for activation."
@@ -383,7 +383,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LoginExchangeOut"
+                }
               }
             }
           },
@@ -663,6 +665,16 @@
               }
             ],
             "title": "Scene Revision"
+          },
+          "host_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostContextOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -723,6 +735,16 @@
               }
             ],
             "title": "Scene Key"
+          },
+          "host_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostContextInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -1020,6 +1042,9 @@
           },
           "scenes": {
             "$ref": "#/components/schemas/SceneCapability"
+          },
+          "host_context": {
+            "$ref": "#/components/schemas/InteractionCapability"
           }
         },
         "type": "object",
@@ -1089,6 +1114,256 @@
           "scope"
         ],
         "title": "OAuthTokenOut"
+      },
+      "HostContextBootstrap": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Version",
+            "default": 1
+          },
+          "frame_origin": {
+            "type": "string",
+            "title": "Frame Origin"
+          },
+          "embed_origin": {
+            "type": "string",
+            "title": "Embed Origin"
+          },
+          "instance_ref": {
+            "type": "string",
+            "title": "Instance Ref"
+          }
+        },
+        "type": "object",
+        "required": [
+          "frame_origin",
+          "embed_origin",
+          "instance_ref"
+        ],
+        "title": "HostContextBootstrap"
+      },
+      "HostContextInput": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "default": false
+          },
+          "version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Version",
+            "default": 1
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "HostContextInput"
+      },
+      "HostContextOut": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Version",
+            "default": 1
+          },
+          "frame_origin": {
+            "type": "string",
+            "title": "Frame Origin"
+          }
+        },
+        "type": "object",
+        "required": [
+          "frame_origin"
+        ],
+        "title": "HostContextOut"
+      },
+      "LoginExchangeOut": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "token_type": {
+            "type": "string",
+            "const": "bearer",
+            "title": "Token Type"
+          },
+          "user": {
+            "$ref": "#/components/schemas/app__schemas__schemas__UserOut"
+          },
+          "redirect_uri": {
+            "type": "string",
+            "title": "Redirect Uri"
+          },
+          "host_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostContextBootstrap"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "token_type",
+          "user",
+          "redirect_uri"
+        ],
+        "title": "LoginExchangeOut"
+      },
+      "app__schemas__schemas__UserOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "identity_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity Id"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "display_name": {
+            "type": "string",
+            "title": "Display Name"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "is_platform_admin": {
+            "type": "boolean",
+            "title": "Is Platform Admin",
+            "default": false
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "department_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Department Path"
+          },
+          "primary_mobile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Mobile"
+          },
+          "registration_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registration Source"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active"
+          },
+          "email_verified": {
+            "type": "boolean",
+            "title": "Email Verified",
+            "default": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "display_name",
+          "role",
+          "is_active",
+          "created_at"
+        ],
+        "title": "UserOut"
       }
     },
     "securitySchemes": {

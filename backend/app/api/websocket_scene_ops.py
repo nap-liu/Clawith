@@ -52,13 +52,15 @@ def has_configured_scene_welcome_impl(_api, self) -> bool:
 
 
 def resolve_onboarding_required_impl(_api, self, onboarding_required: bool) -> bool:
+    if getattr(self, "host_context", False):
+        return False
     automatic = (self.scene_manifest or {}).get("activation_source") == "automatic"
     return bool(onboarding_required and not automatic and not self._has_configured_scene_welcome())
 
 
 async def prepare_initial_greeting_impl(api, self, db, user_id) -> None:
     self.pending_initial_assistant = None
-    if self.history_messages or not self._has_configured_scene_welcome():
+    if getattr(self, "host_context", False) or self.history_messages or not self._has_configured_scene_welcome():
         return
     if not await api.claim_fixed_welcome_slot(db, self.agent_id, user_id):
         api.logger.info("[WS] Fixed scene welcome skipped because onboarding already published visible output")

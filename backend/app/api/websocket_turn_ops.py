@@ -202,6 +202,9 @@ async def execute_web_turn_impl(
 
 
 async def claim_onboarding_trigger_impl(api, self):
+    if getattr(self, "host_context", False):
+        await self.websocket.send_json({"type": "onboarding_skipped", "reason": "host_context"})
+        return None
     async with api.async_session() as _gdb:
         claim = await api.claim_onboarding_greeting(
             _gdb,
@@ -223,6 +226,8 @@ async def claim_onboarding_trigger_impl(api, self):
 
 
 async def wait_for_normal_turn_onboarding_impl(api, self) -> None:
+    if getattr(self, "host_context", False):
+        return
     while True:
         async with api.async_session() as _normal_db:
             phase = await api.claim_normal_first_turn(_normal_db, self.agent_id, self.user_id)
@@ -285,10 +290,12 @@ async def save_user_message_impl(
     model_id: str | None = None,
     reasoning_effort: str | None = None,
     attachments: list[dict] | None = None,
+    external_context_meta: dict | None = None,
 ):
     from app.services.chat_attachments import strip_image_data_markers
 
     self.last_ingest_result = None
+    context_meta = external_context_meta or {}
 
     has_image_marker = "[image_data:" in content
     if attachments is not None:
@@ -380,6 +387,9 @@ async def save_user_message_impl(
                 **({"model_id": model_id} if model_id else {}),
                 **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
                 **({"attachments": attachments, "display_content": display_content} if attachments is not None else {}),
+                **({"client_message_id": str(client_message_id)} if client_message_id else {}),
+                **({"external_context": context_meta["external_context"], "display_content": display_content or saved_content}
+                   if "external_context" in context_meta else {}),
             },
             created_at=first_user_created_at,
         )

@@ -5,6 +5,8 @@ import copy
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from app.services.chat_attachments import validate_client_attachments
+from app.api.websocket_context import reject_context_message
+from app.services.external_chat_context import InvalidExternalContext, MessageConflict, external_context_metadata
 from app.services.llm.failure_outcome import render_message
 from app.services.turn_inbox import schedule_durable_turn_resume
 
@@ -34,6 +36,7 @@ async def publish_inbox_receipt(api, handler, result, snapshot):
             "display_content": meta.get("display_content", ""),
             "attachments": meta.get("attachments", []),
             "sender_user_id": str(handler.user_id),
+            **({"external_context": meta["external_context"]} if "external_context" in meta else {}),
         },
         snapshot=snapshot,
         event_kind="turn_user_committed",
@@ -66,6 +69,7 @@ async def receive_followup(api, active_handler, data):
             await handle_continue(handler, data)
             return
         attachments = None
+        context_meta = external_context_metadata(data)
         if "attachments" in data:
             attachments = await validate_client_attachments(handler.agent_id, data["attachments"])
         if not await handler._check_quotas():
@@ -77,6 +81,7 @@ async def receive_followup(api, active_handler, data):
             model_id=str(model.id) if model else None,
             reasoning_effort=getattr(model, "reasoning_effort", None),
             attachments=attachments,
+            external_context_meta=context_meta,
         )
         if confirmation is not None:
             await handler._send_current_turn_event({
@@ -93,9 +98,12 @@ async def receive_followup(api, active_handler, data):
         # The existing durable resume path owns it, including reconnect recovery.
         if result.created and not result.consumed_by_onmessage:
             await schedule_durable_turn_resume(result.message)
+    except (InvalidExternalContext, MessageConflict) as exc:
+        await reject_context_message(handler, exc)
     except Exception:
         api.logger.exception("[WS] Follow-up admission failed")
         await handler._send_current_turn_event({
             "type": "error", "code": "message_rejected", "retryable": True,
+            "client_message_id": handler.current_client_message_id,
             "content": render_message("chat.messageRejected", handler.lang),
         })

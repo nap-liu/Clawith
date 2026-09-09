@@ -4,9 +4,10 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from app.schemas.scene import validate_scene_key
+from app.schemas.schemas import UserOut
 
 SCOPES = {"employees:read", "auth:login"}
 
@@ -96,11 +97,24 @@ class ContextInteractionInput(BaseModel):
         return value
 
 
+class HostContextInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    version: Literal[1] = 1
+
+
 class EmployeeAccessInput(EmployeeUserInput):
     instance_ref: str | None = Field(default=None, min_length=1)
     interaction: ContextInteractionInput | None = None
     embed_origin: str | None = None
     scene_key: str | None = None
+    host_context: HostContextInput | None = None
+
+    @model_validator(mode="after")
+    def host_context_requires_target(self):
+        if self.host_context and self.host_context.enabled and not (self.instance_ref and self.embed_origin):
+            raise ValueError("Host context requires an instance and embedding origin")
+        return self
 
     @field_validator("scene_key")
     @classmethod
@@ -142,12 +156,31 @@ class EmployeePageOut(BaseModel):
     has_more: bool
 
 
+class HostContextOut(BaseModel):
+    version: Literal[1] = 1
+    frame_origin: str
+
+
+class HostContextBootstrap(HostContextOut):
+    embed_origin: str
+    instance_ref: str
+
+
+class LoginExchangeOut(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"]
+    user: UserOut
+    redirect_uri: str
+    host_context: HostContextBootstrap | None = None
+
+
 class EmployeeAccessOut(EmployeeOut):
     login_url: str | None = None
     expires_in: int | None = None
     request_id: str | None = None
     scene_key: str | None = None
     scene_revision: int | None = None
+    host_context: HostContextOut | None = None
 
 
 class EmployeeSceneOut(BaseModel):
@@ -194,6 +227,7 @@ class H5LauncherCapability(BaseModel):
     interaction: InteractionCapability = Field(default_factory=InteractionCapability)
     instance_ref: Literal[True] = True
     scenes: SceneCapability = Field(default_factory=SceneCapability)
+    host_context: InteractionCapability = Field(default_factory=InteractionCapability)
 
 
 class CapabilitiesOut(BaseModel):

@@ -16,13 +16,14 @@ from app.models.openapi_application import OpenAPICredential
 from app.schemas.openapi_application import LoginLinkInput, LoginExchangeInput, EmployeeSearchInput, EmployeeAccessInput
 from app.schemas.schemas import UserOut
 from app.schemas.openapi_application import EmployeeAccessOut, EmployeePageOut, OAuthTokenOut, LoginLinkOut, CapabilitiesOut
-from app.schemas.openapi_application import EmployeeScenesOut, EmployeeUserInput
+from app.schemas.openapi_application import EmployeeScenesOut, EmployeeUserInput, LoginExchangeOut
 from app.services.openapi_applications import (
     audit, authenticate_client, credential, delegated_user, digest, login_user, fail, issue_system_token, now,
 )
 from app.services.openapi_login import issue_login_code, redirect_target, verify_login_code
 from app.services.openapi_interactions import activate_launcher, cleanup_pending_interactions, prepare_interaction
 from app.services.openapi_scenes import available_scenes, require_available_scene
+from app.services.openapi_host_context import host_context_bootstrap
 from app.services.turn_inbox import schedule_durable_turn_resume
 from app.services.platform_service import platform_service
 from app.services.openapi_oauth import (
@@ -158,10 +159,12 @@ async def employee_scenes(employee_id: uuid.UUID, body: EmployeeUserInput, reque
                  "optional JSON context without executing it. Opening the login URL activates "
                  "one new conversation and one first question; identical request_id retries "
                  "reuse that interaction. instance_ref alone resumes its current conversation. "
-                 "scene_key selects an enabled published scene when the login URL is opened."
+                 "scene_key selects an enabled published scene when the login URL is opened. "
+                 "host_context.enabled adds per-message host snapshots; instance_ref and embed_origin "
+                 "are required. Enabling it does not create an automatic question."
              ),
              responses={
-                 400: {"description": "invalid_interaction: invalid optional launch fields or an empty question/request ID."},
+                 400: {"description": "invalid_interaction or invalid_host_context: invalid optional launch fields."},
                  404: {"description": "scene_unavailable: the selected scene is not available for activation."},
                  409: {"description": "interaction_conflict: request_id was already used with different business content."},
                  410: {"description": "interaction_expired or interaction_unavailable: the interaction can no longer be activated."},
@@ -175,6 +178,7 @@ async def employee(employee_id: uuid.UUID, body: EmployeeAccessInput, request: R
         fail("employee_unavailable", 404)
     base = await platform_service.get_configured_public_base_url(db)
     result = employee_projection(agent, base)
+    host_context = host_context_bootstrap(body, base)
     if any(value is not None for value in (body.instance_ref, body.interaction, body.embed_origin, body.scene_key)):
         require_scope(context, "auth:login")
         app = context.application
@@ -190,6 +194,9 @@ async def employee(employee_id: uuid.UUID, body: EmployeeAccessInput, request: R
             )
         launcher = {"employee_id": str(agent.id), "instance_ref": body.instance_ref,
                     "interaction_id": str(record.id) if record else None, "scene_key": body.scene_key}
+        if host_context is not None:
+            launcher["host_context"] = host_context
+            result["host_context"] = {"version": 1, "frame_origin": host_context["frame_origin"]}
         code = await issue_login_code(
             db, app, user, f"/h5/agents/{agent.id}/chat", body.embed_origin, launcher=launcher,
         )
@@ -226,6 +233,7 @@ async def login_link(body: LoginLinkInput, request: Request,
                  "codes retain their existing login and redirect behavior."
              ),
              responses={
+                 200: {"model": LoginExchangeOut},
                  400: {"description": "invalid_interaction: the launch reference is invalid."},
                  404: {"description": "scene_unavailable: the selected scene is no longer available."},
                  410: {"description": "interaction_expired or interaction_unavailable: the prepared interaction is no longer available."},
@@ -252,5 +260,8 @@ async def exchange_link(body: LoginExchangeInput, request: Request, response: Re
     if anchor is not None:
         await schedule_durable_turn_resume(anchor)
     set_access_token_cookie(response, request, jwt_token)
-    return {"access_token": jwt_token, "token_type": "bearer", "user": UserOut.model_validate(user),
-            "redirect_uri": redirect_uri}
+    result = {"access_token": jwt_token, "token_type": "bearer", "user": UserOut.model_validate(user),
+              "redirect_uri": redirect_uri}
+    if value.launcher and value.launcher.get("host_context"):
+        result["host_context"] = value.launcher["host_context"]
+    return result

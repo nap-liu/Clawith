@@ -3576,6 +3576,11 @@
     },
     "stop": "Stop"
   },
+  "hostContext": {
+    "unavailable": "Page context is unavailable. Send again to retry.",
+    "timeout": "Page context timed out. Send again to retry.",
+    "connectionUnavailable": "Send again after the connection is restored."
+  },
   "messages": {
     "title": "Messages",
     "markAllRead": "Mark all as read ({{count}})",

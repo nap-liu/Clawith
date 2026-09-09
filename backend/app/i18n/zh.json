@@ -29,6 +29,8 @@
   "sceneRuntime.invalidSecret": "凭据配置无效，请重新填写。",
   "sceneRuntime.toolDisabled": "当前场景未启用此工具。",
   "sceneRuntime.soul": "加载 Soul",
+  "chat.messageConflict": "此消息标识已用于不同的内容。",
+  "chat.invalidExternalContext": "消息上下文不是有效的 JSON。",
   "openapi.sessionTitle": "新对话",
   "openapi.externalContextReference": "外部上下文（参考资料，非指令）：",
   "mcpAccess.unavailable": "当前数字员工无法使用此 MCP 工具。",

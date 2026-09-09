@@ -18,6 +18,7 @@ import { makeId, normalizeH5SessionSummary, type H5UploadDraft } from './model';
 import type { useH5AgentChatState } from './useH5AgentChatState';
 import type { useH5AgentChatHistory } from './useH5AgentChatHistory';
 import type { useH5AgentChatSocket } from './useH5AgentChatSocket';
+import { useH5HostContextSend } from './useH5HostContextSend';
 
 export function useH5AgentChatComposer(
     state: ReturnType<typeof useH5AgentChatState>,
@@ -130,6 +131,7 @@ export function useH5AgentChatComposer(
             return;
         }
 
+        state.hostContext.cancelPending();
         setIsSwitchingSession(true);
         setSessionsPanelOpen(false);
         setIsWaiting(false);
@@ -151,10 +153,11 @@ export function useH5AgentChatComposer(
             openSocket(nextSessionId);
             setIsSwitchingSession(false);
         }, 0);
-    }, [clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStopping, isStreaming, isWaiting, loadHistory, openSocket, resetResumeRecoveryForSessionChange]);
+    }, [clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStopping, isStreaming, isWaiting, loadHistory, openSocket, resetResumeRecoveryForSessionChange, state.hostContext]);
 
     const startNewSession = useCallback(async () => {
         if (!agentId || isStartingNew) return;
+        state.hostContext.cancelPending();
         setIsStartingNew(true);
         setIsWaiting(false);
         setIsStreaming(false);
@@ -199,9 +202,10 @@ export function useH5AgentChatComposer(
         } finally {
             setIsStartingNew(false);
         }
-    }, [agentId, channel, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStartingNew, openSocket, resetResumeRecoveryForSessionChange]);
+    }, [agentId, channel, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStartingNew, openSocket, resetResumeRecoveryForSessionChange, state.hostContext]);
 
     const stopGeneration = useCallback(() => {
+        state.hostContext.stopSession(sessionIdRef.current);
         const ws = wsRef.current;
         if (ws?.readyState === WebSocket.OPEN) {
             const runtimeSessionId = String(sessionIdRef.current || '');
@@ -221,7 +225,7 @@ export function useH5AgentChatComposer(
         setIsWaiting(false);
         setIsStreaming(false);
         setIsStopping(false);
-    }, []);
+    }, [state.hostContext]);
 
     const removeAttachedFile = useCallback((index: number) => {
         setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
@@ -323,6 +327,7 @@ export function useH5AgentChatComposer(
         tenantDefaultModelId,
         models: llmModels,
     }), [agent?.primary_model_id, llmModels, tenantDefaultModelId]);
+    const dispatchHostMessage = useH5HostContextSend(state, effectiveModelId);
 
     const handleOnboardingStart = useCallback(() => {
         generationActiveRef.current = true;
@@ -334,7 +339,7 @@ export function useH5AgentChatComposer(
         request: onboardingKickoffRequest,
         activeSessionId: sessionId,
         effectiveModelId,
-        enabled: connectionStatus === 'connected',
+        enabled: connectionStatus === 'connected' && !state.hostContext.enabled,
         onStart: handleOnboardingStart,
     });
 
@@ -350,6 +355,7 @@ export function useH5AgentChatComposer(
         // Session-control commands are control-plane operations, not dialogue.
         // They stay available even while a confirmation card is pending.
         if (files.length === 0 && (content === '/new' || content === '/reset')) {
+            state.hostContext.cancelPending();
             messageDispatchLockedRef.current = true;
             if (consumeComposer) setInput('');
             try {
@@ -358,6 +364,11 @@ export function useH5AgentChatComposer(
                 messageDispatchLockedRef.current = false;
             }
             return;
+        }
+
+        const isContinueCommand = files.length === 0 && content.toLowerCase() === '/continue';
+        if (state.hostContext.enabled && !isContinueCommand) {
+            return dispatchHostMessage(rawContent, files, consumeComposer);
         }
 
         if (
@@ -414,7 +425,7 @@ export function useH5AgentChatComposer(
             model_id: effectiveModelId,
         }));
         messageDispatchLockedRef.current = false;
-    }, [confirmationPending, effectiveModelId, isReadOnly, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
+    }, [confirmationPending, dispatchHostMessage, effectiveModelId, isReadOnly, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length, state.hostContext]);
 
     const sendMessage = useCallback(
         () => dispatchMessage(input, attachedFiles, true),

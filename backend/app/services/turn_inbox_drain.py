@@ -11,6 +11,7 @@ from sqlalchemy import String, cast, func, select
 from app.database import async_session
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.services.chat_history import build_llm_message_from_row
 from app.services.turn_inbox_receipts import _acknowledge_live_receipt_handoff
 from app.services.turn_inbox_shared import (
     CHANNEL_RECEIPT_ANCHOR_KEY,
@@ -119,6 +120,12 @@ async def drain_turn_inbox(
             attachments = list(meta.get("attachments") or [])
             if attachments:
                 message["attachments"] = attachments
+            if "external_context" in meta:
+                sender = row.sender_user_id or row.user_id
+                message = build_llm_message_from_row(
+                    row, wrap_user_names=session.is_group,
+                    name_map={sender: meta.get("sender_display_name") or meta.get("sender_nickname")},
+                )
             injected.append(message)
             # The live session snapshot fences the consumer. Pending inputs
             # belong to the conversation, including a prior owner's backlog.

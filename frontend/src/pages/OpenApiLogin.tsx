@@ -3,8 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
 import { safeLoginReturnTo } from '../utils/loginReturn';
 import type { User } from '../types';
+import { bindHostContextToDestination, type HostContextBootstrap } from '../utils/h5HostContextBootstrap';
 
-type LoginResult = { access_token: string; user: User; redirect_uri: string };
+type LoginResult = { access_token: string; user: User; redirect_uri: string; host_context?: HostContextBootstrap };
 const exchanges = new Map<string, Promise<LoginResult>>();
 
 // A single-use link must also work with React's development effect remounts.
@@ -52,7 +53,7 @@ export default function OpenApiLogin() {
                 return;
             }
             setAuth(result.user, result.access_token);
-            window.location.replace(destination);
+            window.location.replace(bindHostContextToDestination(destination, result.host_context, result.user.id));
         }).catch((error: unknown) => {
             if (!active) return;
             const status = (error as { status?: number }).status;

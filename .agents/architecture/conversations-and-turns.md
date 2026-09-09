@@ -329,3 +329,16 @@ Fully recalled messages remain in the audit trail and render as a tombstone. LLM
 - Web and H5 normalize completed assistant/tool content from the same durable
   message contract. Channel-specific card rendering must not create duplicate
   assistant text or empty presentation bubbles.
+
+## User reference snapshots
+
+Optional `external_context` is ordinary user-message JSON metadata shared by
+OpenAPI interaction activation and H5 host-assisted sends. Its presence includes
+null and false. The shared projection appends it as user reference material for
+initial input, history/recovery, active-turn inbox drain and gateway delivery;
+it must not be promoted to system instructions or silently dropped on one path.
+Message serialization preserves it and the client message ID for live/history
+reconciliation. Context-bearing retries compare question, attachments and JSON
+before side effects on all duplicate paths, including session-lock and unique-key
+races. Ordinary messages without context retain their existing semantics.
+The opt-in browser lifecycle and SDK contract are owned by `openapi.md`.

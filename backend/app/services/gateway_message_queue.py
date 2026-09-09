@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.gateway_message import GatewayMessage
+from app.services.external_chat_context import render_external_context
+from app.services.chat_attachments import normalize_attachment_metadata, render_attachment_context
 
 
 async def enqueue_user_gateway_message(
@@ -29,6 +31,10 @@ async def enqueue_user_gateway_message(
         ):
             raise PermissionError("Gateway turn anchor ownership changed")
 
+    metadata = dict(anchor.message_meta or {}) if anchor else {}
+    if "external_context" in metadata:
+        content = render_attachment_context(content, normalize_attachment_metadata(metadata.get("attachments")))
+        content = render_external_context(content, metadata)
     message = GatewayMessage(
         agent_id=agent_id,
         sender_user_id=user_id,

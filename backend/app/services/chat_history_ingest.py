@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.services.chat_history_loading import *  # noqa: F401,F403
+from app.services.external_chat_context import context_message_fingerprint, require_same_context_message
 
 async def persist_incoming_user_message(
     db: AsyncSession,
@@ -340,6 +341,7 @@ async def persist_incoming_user_message_once(
             await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == external_event_key))
         ).scalar_one_or_none()
         if existing is not None:
+            require_same_context_message(existing, content, message_meta, user_id)
             return existing, False
 
     try:
@@ -365,6 +367,7 @@ async def persist_incoming_user_message_once(
         ).scalar_one_or_none()
         if existing is None:
             raise
+        require_same_context_message(existing, content, message_meta, user_id)
         return existing, False
 
 
@@ -379,6 +382,21 @@ class IncomingMessageIngestResult:
     ignored_confirmation: PendingConfirmation | None = None
     ignored_confirmation_result: str | None = None
     queued_to_running_turn: bool = False
+
+
+def _duplicate_ingest_result(existing, content, metadata, user_id):
+    require_same_context_message(existing, content, metadata, user_id)
+    previous = dict(existing.message_meta or {})
+    execution_ids = []
+    for raw_id in previous.get("onmessage_execution_ids") or []:
+        try:
+            execution_ids.append(uuid.UUID(str(raw_id)))
+        except (TypeError, ValueError):
+            continue
+    return IncomingMessageIngestResult(
+        message=existing, created=False, consumed_by_onmessage=True,
+        execution_ids=tuple(execution_ids), queued_to_running_turn=_turn_inbox_state(previous),
+    )
 
 
 def _turn_inbox_state(meta: dict[str, Any]) -> bool:
@@ -469,22 +487,7 @@ async def ingest_incoming_chat_message(
             )
         ).scalar_one_or_none()
         if existing is not None:
-            existing_meta = (
-                existing.message_meta if isinstance(existing.message_meta, dict) else {}
-            )
-            execution_ids: list[uuid.UUID] = []
-            for raw_id in existing_meta.get("onmessage_execution_ids") or []:
-                try:
-                    execution_ids.append(uuid.UUID(str(raw_id)))
-                except (TypeError, ValueError):
-                    continue
-            return IncomingMessageIngestResult(
-                message=existing,
-                created=False,
-                consumed_by_onmessage=True,
-                execution_ids=tuple(execution_ids),
-                queued_to_running_turn=_turn_inbox_state(existing_meta),
-            )
+            return _duplicate_ingest_result(existing, content, message_meta, user_id)
 
     # Use the normal ChatSession row as the cross-process ordering boundary.  The
     # confirmation writer takes the same lock, so a message can never slip between
@@ -501,6 +504,13 @@ async def ingest_incoming_chat_message(
     ).scalar_one_or_none()
     if locked_session is None:
         raise RuntimeError("chat session no longer exists")
+
+    # A competing first delivery can commit while we await the session lock.
+    # Recheck before touching pending confirmation or any other turn state.
+    if event_key:
+        existing = await db.scalar(select(ChatMessage).where(ChatMessage.external_event_key == event_key))
+        if existing is not None:
+            return _duplicate_ingest_result(existing, content, message_meta, user_id)
 
     from app.services.confirmation_service import find_pending_confirmation
 
@@ -558,6 +568,8 @@ async def ingest_incoming_chat_message(
     # metadata, including an empty list. Rows without this key are therefore
     # unambiguously legacy and may use the historical [file:...] parser.
     meta.setdefault("attachments", [])
+    if "external_context" in meta:
+        meta["context_payload_fingerprint"] = context_message_fingerprint(content, meta)
     # Snapshot the published scene while holding the same session-row lock used
     # to order inbound events.  A /scene command racing with an older in-flight
     # turn can therefore affect only messages ingested after the command wins
@@ -613,22 +625,7 @@ async def ingest_incoming_chat_message(
         created_at=created_at,
     )
     if not created:
-        existing_meta = row.message_meta if isinstance(row.message_meta, dict) else {}
-        execution_ids: list[uuid.UUID] = []
-        for raw_id in existing_meta.get("onmessage_execution_ids") or []:
-            try:
-                execution_ids.append(uuid.UUID(str(raw_id)))
-            except (TypeError, ValueError):
-                continue
-        return IncomingMessageIngestResult(
-            message=row,
-            created=False,
-            # A provider retry must never start a second ordinary LLM turn,
-            # whether or not the first delivery matched a subscription.
-            consumed_by_onmessage=True,
-            execution_ids=tuple(execution_ids),
-            queued_to_running_turn=_turn_inbox_state(existing_meta),
-        )
+        return _duplicate_ingest_result(row, content, meta, user_id)
 
     from app.services.trigger_runtime.evaluator import match_incoming_chat_message
 

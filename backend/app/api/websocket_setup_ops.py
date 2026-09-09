@@ -103,13 +103,14 @@ async def setup_impl(api, self) -> bool:
             await self._load_scene_manifest(db)
             await self._load_history(db)
             await self._prepare_initial_greeting(db, user_id)
-            onboarding_eligibility = await api.resolve_onboarding_eligibility(
-                db,
-                self.agent_id,
-                user_id,
-                api.uuid.UUID(self.conv_id),
-            )
-            self.onboarding_required = self._resolve_onboarding_required(onboarding_eligibility.required)
+            if not getattr(self, "host_context", False):
+                onboarding_eligibility = await api.resolve_onboarding_eligibility(
+                    db,
+                    self.agent_id,
+                    user_id,
+                    api.uuid.UUID(self.conv_id),
+                )
+                self.onboarding_required = self._resolve_onboarding_required(onboarding_eligibility.required)
             await db.commit()
     except Exception as e:
         api.logger.exception(f"[WS] Setup error: {e}")

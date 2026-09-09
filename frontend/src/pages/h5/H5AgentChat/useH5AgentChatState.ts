@@ -32,6 +32,7 @@ import {
 } from '../chatTimeline';
 import { parseH5Theme } from '../h5Params';
 import { parseChatSessionId } from '../../../utils/chatUrlParams';
+import { H5HostContext } from '../../../utils/h5HostContext';
 import {
     detectH5ContainerRuntime,
     type H5ContainerRuntime,
@@ -70,6 +71,10 @@ export function useH5AgentChatState() {
     const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime | 'detecting'>('detecting');
 
     const token = useAuthStore((s) => s.token);
+    const userId = useAuthStore((s) => s.user?.id);
+    const hostContextReference = searchParams.get('host_context') || '';
+    const hostContext = useMemo(() => new H5HostContext(hostContextReference, userId), [hostContextReference, agentId, userId]);
+    useEffect(() => () => hostContext.dispose(), [hostContext]);
     const setAuth = useAuthStore((s) => s.setAuth);
 
     const [authStatus, setAuthStatus] = useState<AuthStatus>('checking');
@@ -436,6 +441,7 @@ export function useH5AgentChatState() {
         containerRuntime,
         setContainerRuntime,
         token,
+        hostContext,
         setAuth,
         authStatus,
         setAuthStatus,

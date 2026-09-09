@@ -169,9 +169,10 @@ async def websocket_chat(
     lang: str = Query("en"),
     channel: str = Query("web"),
     scene: str | None = Query(None),
+    host_context: bool = Query(False),
 ):
     """WebSocket endpoint for real-time chat with an agent."""
-    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang, channel, scene)
+    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang, channel, scene, host_context)
     await handler.run()
 
 
@@ -187,6 +188,7 @@ class WebSocketChatHandler:
         lang: str = "en",
         channel: str = "web",
         scene: str | None = None,
+        host_context: bool = False,
     ):
         self.websocket = websocket
         self.agent_id = agent_id
@@ -195,6 +197,7 @@ class WebSocketChatHandler:
         self.lang = lang
         self.source_channel = validate_platform_login_channel(channel)
         self.scene_key = scene
+        self.host_context = host_context
         self.scene_manifest: dict | None = None
         self.pending_initial_assistant: dict | None = None
         self.user_id: uuid.UUID | None = None
@@ -384,6 +387,7 @@ class WebSocketChatHandler:
         model_id: str | None = None,
         reasoning_effort: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        external_context_meta: dict | None = None,
     ) -> tuple[
         uuid.UUID | None,
         bool,
@@ -403,6 +407,7 @@ class WebSocketChatHandler:
             model_id=model_id,
             reasoning_effort=reasoning_effort,
             attachments=attachments,
+            external_context_meta=external_context_meta,
         )
 
     async def _route_openclaw(
