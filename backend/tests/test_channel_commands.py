@@ -212,7 +212,7 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
         agent_id=agent_id,
         source_channel="dingtalk",
         external_conv_id="dingtalk_group_1",
-        im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"},
+        im_config={"model_id": str(uuid.uuid4())},
         is_group=True,
         context_terminated_reason=None,
     )
@@ -238,6 +238,10 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     async def fake_count(*_args, **_kwargs):
         return 12
 
+    async def fake_scene(_db, requested_agent_id, requested_session):
+        assert requested_agent_id == agent_id and requested_session is session
+        return {"scene_key": "warranty", "activation_source": "automatic"}
+
     async def fake_running(*_args, **_kwargs):
         return True
 
@@ -256,6 +260,7 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
     monkeypatch.setattr(channel_commands, "_count_session_messages", fake_count)
+    monkeypatch.setattr(channel_commands, "resolve_session_scene", fake_scene)
     monkeypatch.setattr(channel_commands, "has_running_turn", fake_running)
     monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
     monkeypatch.setattr(session_token_usage, "load_session_token_usage", fake_usage)
@@ -619,7 +624,7 @@ async def test_scene_off_clears_only_scene_session_preference(monkeypatch):
 
     assert result["action"] == "scene_off"
     assert "恢复默认对话模式" in result["message"]
-    assert session.im_config == {"other": "keep"}
+    assert session.im_config == {"other": "keep", "scene_disabled": True}
     assert db.flushes == 1
 
 

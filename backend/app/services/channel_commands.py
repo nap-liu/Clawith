@@ -29,6 +29,7 @@ from app.services.im_thinking_output import (
     THINKING_ON,
 )
 from app.services.llm.reasoning import reasoning_effort_display_name
+from app.services.scene_activation import resolve_session_scene
 
 
 def is_channel_command(text: str) -> bool:
@@ -177,7 +178,6 @@ async def handle_channel_command(
             REASONING_SESSION_CONFIG_KEY,
             resolve_runtime_models,
         )
-        from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
         from app.services.session_token_usage import load_session_token_usage
         from app.services.token_tracker import TokenUsage
 
@@ -265,8 +265,8 @@ async def handle_channel_command(
             else ""
         )
 
-        scene_key = str(config.get(SCENE_SESSION_CONFIG_KEY) or "")
-        scene_status = scene_key or "未激活"
+        active_scene = await resolve_session_scene(db, agent_id, session)
+        scene_status = str((active_scene or {}).get("scene_key") or "未激活")
         return {
             "action": "status",
             "message": (
@@ -539,7 +539,6 @@ async def handle_channel_command(
 
     if parsed_cmd == "/scene":
         from app.schemas.scene import validate_scene_key
-        from app.services.scene_activation import resolve_session_scene
         from app.services.channel_session import find_or_create_channel_session
         from app.services.scene_service import (
             SCENE_SESSION_CONFIG_KEY,
