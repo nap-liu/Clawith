@@ -33,5 +33,6 @@
   "mcpAccess.ambiguous": "此 MCP 工具名称存在歧义，请使用当前可用工具的完整名称。",
   "mcpAccess.refreshUnavailable": "当前无法刷新此 MCP 安装。",
   "mcpAccess.refreshChanged": "发现工具期间 MCP 配置或权限已变化，未保存任何更改。",
-  "mcpAccess.pendingWrites": "请先保存待处理的更改，再刷新 MCP 工具。"
+  "mcpAccess.pendingWrites": "请先保存待处理的更改，再刷新 MCP 工具。",
+  "mcpAccess.manageRequired": "需要此数字员工的管理权限。"
 }

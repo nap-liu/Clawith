@@ -33,5 +33,6 @@
   "mcpAccess.ambiguous": "This MCP tool name is ambiguous. Use the exact available tool name.",
   "mcpAccess.refreshUnavailable": "This MCP installation is unavailable for refresh.",
   "mcpAccess.refreshChanged": "MCP settings or permissions changed during discovery. No changes were saved.",
-  "mcpAccess.pendingWrites": "Save pending changes before refreshing MCP tools."
+  "mcpAccess.pendingWrites": "Save pending changes before refreshing MCP tools.",
+  "mcpAccess.manageRequired": "Manage access to this digital employee is required."
 }

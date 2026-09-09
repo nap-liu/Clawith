@@ -131,6 +131,12 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
   installation. Removability means self-install provenance, not refresh
   authorization or provider health. An authorized owner can still uninstall a
   hidden self-installation by its known server ID.
+- Single-binding deletion requires management access to the owning Agent,
+  including the same tenant boundary used by Agent settings. Removing one
+  binding preserves other Agents' installations; the MCP tool is deleted only
+  when its final binding is removed. Alias resolution only reserves canonical
+  MCP names visible to the current Agent, so another tenant's names cannot
+  suppress its available remote aliases.
 - Agent refresh requires a visible installation and isolated ownership before
   provider discovery. Read-only planning includes any existing private target
   of a legacy shared installation; an existing target catalog with no

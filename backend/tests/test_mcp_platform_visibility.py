@@ -4,10 +4,12 @@ import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from sqlalchemy import select
 
 from app.database import async_session
+from app.core.security import create_access_token
 from app.models.tool import AgentTool, Tool
 from app.services.agent_mcp_lifecycle import list_installed_mcp_servers, uninstall_mcp_server
 from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
@@ -15,7 +17,7 @@ from app.services.agent_context_extensions import _collect_extension_prompts
 from app.services.agent_tools_mcp_runtime import _execute_mcp_tool
 from app.services.mcp_access import resolve_mcp_execution
 from app.services.turn_tool_settings import scene_tool_settings_scope
-from mcp_tool_refresh_support import _isolate  # noqa: F401 -- shared autouse fixture
+from mcp_tool_refresh_support import _isolate, _make_agent  # noqa: F401 -- shared autouse fixture
 from test_agent_mcp_lifecycle import _make_agents, _make_server_tool
 
 pytestmark = pytest.mark.asyncio
@@ -142,3 +144,53 @@ async def test_ambiguous_alias_and_disabled_canonical_name_cannot_fall_through()
     with patch("app.services.mcp_client.MCPClient") as provider:
         await _execute_mcp_tool(canonical, {}, agent_id=aid)
         provider.assert_not_called()
+
+
+@pytest.mark.parametrize("blocker_type", ["mcp", "builtin"])
+async def test_foreign_canonical_name_does_not_shadow_current_agent_alias(blocker_type):
+    tenant, (aid,) = await _make_agents(1)
+    foreign, _ = await _make_agents(1)
+    alias = f"alias_{uuid.uuid4().hex}"
+    async with async_session() as db:
+        _, tool = await _make_server_tool(db, tenant)
+        tool.mcp_tool_name = alias
+        db.add(AgentTool(agent_id=aid, tool_id=tool.id, enabled=True))
+        db.add(Tool(name=alias, display_name="Foreign", type=blocker_type,
+                    source="admin", tenant_id=foreign, enabled=True))
+        await db.commit()
+    with patch("app.services.mcp_client.MCPClient") as provider:
+        provider.return_value.call_tool = AsyncMock(return_value="current-agent-result")
+        assert await _execute_mcp_tool(alias, {}, agent_id=aid) == "current-agent-result"
+        provider.return_value.call_tool.assert_awaited_once_with(alias, {})
+
+
+async def test_platform_catalog_retains_disabled_mcp_while_agent_catalog_keeps_independent_cli():
+    from app.main import app
+
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        mcp = Tool(name=f"mcp_{server.name}_read", display_name="Read", type="mcp", category="mcp",
+                   tenant_id=agent.tenant_id, source="admin", enabled=False, mcp_server_id=server.id)
+        cli = Tool(name=f"cli_{uuid.uuid4().hex[:10]}", display_name="Executable", type="cli", category="cli",
+                   tenant_id=agent.tenant_id, source="admin", enabled=True,
+                   config={"binary": {"sha256": "a" * 64}})
+        db.add_all([mcp, cli])
+        await db.flush()
+        db.add_all([AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True) for tool in (mcp, cli)])
+        await db.commit()
+        mcp_id, cli_id = str(mcp.id), str(cli.id)
+        cli_name = cli.name
+    headers = {"Authorization": f"Bearer {create_access_token(str(user.id), user.role)}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/tools", headers=headers)
+        assert response.status_code == 200, response.text
+        catalog = {tool["id"]: tool for tool in response.json()}
+        assert catalog[mcp_id]["enabled"] is False
+        assert catalog[cli_id]["category"] == "cli"
+        response = await client.get(f"/api/tools/agents/{agent.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        catalog = {tool["id"]: tool for tool in response.json()}
+        assert mcp_id not in catalog
+        assert catalog[cli_id]["enabled"] is True
+    definitions = await get_agent_tools_for_llm(agent.id)
+    assert cli_name in {definition["function"]["name"] for definition in definitions}

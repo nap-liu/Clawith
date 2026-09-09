@@ -28,12 +28,14 @@ from app.api.tools_shared import (
     tool_is_required,
 )
 from app.core.okr_feature import is_retired_okr_tool
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.services.mcp_naming import load_mcp_display_names
+from app.services.llm.failure_outcome import render_message
 
 
 @router.get("/agents/{agent_id}")
@@ -357,11 +359,14 @@ async def delete_agent_tool(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: remove an agent-tool assignment. Also deletes the tool record if no other agents use it."""
+    """An Agent manager can remove a binding and its orphaned MCP tool."""
     at_r = await db.execute(select(AgentTool).where(AgentTool.id == agent_tool_id))
     at = at_r.scalar_one_or_none()
     if not at:
         raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    _agent, access_level = await check_agent_access(db, current_user, at.agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail=render_message("mcpAccess.manageRequired"))
     from app.services.mcp_catalog_locks import lock_tool_catalog
 
     await db.execute(select(Agent.id).where(Agent.id == at.agent_id).with_for_update())

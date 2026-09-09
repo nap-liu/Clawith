@@ -33,7 +33,10 @@ async def visible_mcp_installations(db, agent_id, *, name=None):
     if name is not None:
         # A canonical name cannot fall through to another tool's alias when
         # its assignment or platform permission has been revoked.
-        exact = await db.scalar(select(Tool.id).where(Tool.name == name))
+        exact = await db.scalar(select(Tool.id).where(
+            Tool.name == name, Tool.type == "mcp",
+            tool_visibility_clause(row[0], assigned_ids),
+        ))
         query = query.where(Tool.name == name if exact else Tool.mcp_tool_name == name)
     return (await db.execute(query)).all()
 
