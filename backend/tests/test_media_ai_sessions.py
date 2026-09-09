@@ -142,7 +142,9 @@ async def test_read_followup_receives_prior_answer_even_when_queued_before_it(co
     results = await run_task(first)
     assert len(results) == 2 and histories[0] == []
     assert histories[1][-1] == {"role": "assistant", "content": "There is a blue circle"}
-    assert histories[1][0]["content"][1]["type"] == "image_url"
+    content = histories[1][0]["content"]
+    assert content[1] == {"type": "text", "text": "Input 1 (image): image.png"}
+    assert len([part for part in content if part["type"] == "image_url"]) == 1
     assert results[1].message_meta["media_result"]["task_id"] == second["task_id"]
 
 

@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.services.media_ai_contract import MEDIA_AI_DEFAULTS
-from app.services.media_ai_io import MediaAIError, MediaInput
+from app.services.media_ai_io import MediaAIError, MediaInput, media_content
 
 MULTIMODAL_PATH = "/api/v1/services/aigc/multimodal-generation/generation"
 VIDEO_PATH = "/api/v1/services/aigc/video-generation/video-synthesis"
@@ -73,13 +73,7 @@ async def request(config: dict, path: str, payload: dict | None = None, *, async
 async def understand(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None) -> tuple[str, dict]:
     if not media and not history:
         raise MediaAIError("inputCombination")
-    content = [{"type": "text", "text": prompt}]
-    for item in media:
-        if item.kind == "audio":
-            content.append({"type": "input_audio", "input_audio": {"data": item.data_url}})
-        else:
-            kind = "image_url" if item.kind == "image" else "video_url"
-            content.append({"type": kind, kind: {"url": item.data_url}})
+    content = media_content(prompt, media)
     payload = {
         "model": config["understanding_model"],
         "messages": [*(history or []), {"role": "user", "content": content}],

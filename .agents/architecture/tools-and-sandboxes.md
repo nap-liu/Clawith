@@ -83,6 +83,11 @@ one provider request, subject to the selected provider's actual capabilities.
 Base64 media data URLs remain supported without lossy compression. Missing or
 unreadable batch members are reported individually while valid members are
 understood together; an entirely unreadable batch fails explicitly.
+Admission validates source structure and path/URL safety; media decoding happens
+per input in the worker. Current requests and history use the same content
+projection, preserving original input numbers and marking unreadable numbers
+explicitly so filtering a bad input cannot renumber later images. Data payloads
+and signed URLs are not repeated inside those text labels.
 
 Startup moves old Agent assignments and tenant model references into `read_media`,
 preserving disabled states and preferring existing explicit media assignments.

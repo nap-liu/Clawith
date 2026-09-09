@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import mimetypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -36,6 +36,8 @@ class MediaInput:
     data: bytes = b""
     url: str = ""
     role: str = ""
+    input_index: int = 0
+    input_count: int = 0
 
     @property
     def kind(self) -> str:
@@ -98,7 +100,7 @@ def normalize_sources(files: list) -> list[dict]:
         item = dict(value) if isinstance(value, dict) else {"source": value}
         source = item["source"]
         if source.startswith("data:"):
-            _data_media(source)
+            pass  # Content decoding is per-item worker I/O, not batch admission.
         elif source.startswith(("https://", "http://")):
             parsed = urlsplit(source)
             if not parsed.hostname or parsed.username or parsed.password:
@@ -179,7 +181,8 @@ async def load_understanding_media(agent_id, files: list, *, loader=load_media):
     media, failures = [], []
     for index, item in enumerate(files):
         try:
-            media.extend(await loader(agent_id, [item]))
+            loaded = await loader(agent_id, [item])
+            media.extend(replace(value, input_index=index + 1, input_count=len(files)) for value in loaded)
         except (MediaAIError, MediaUrlError, httpx.HTTPError, OSError) as exc:
             source = item.get("source", "") if isinstance(item, dict) else item
             failures.append({"index": index + 1, "source": source,
@@ -187,3 +190,28 @@ async def load_understanding_media(agent_id, files: list, *, loader=load_media):
     if files and not media:
         raise MediaAIError(failures[0]["code"])
     return media, failures
+
+
+def media_content(prompt: str, media: list[MediaInput]) -> list[dict]:
+    """One content projection for current inputs and durable history replay."""
+    content = [{"type": "text", "text": prompt}]
+    count = max((item.input_count for item in media), default=0)
+    present = {item.input_index for item in media}
+    missing = [f"Input {index}" for index in range(1, count + 1) if index not in present]
+    if missing:
+        content.append({"type": "text", "text": (
+            ", ".join(missing) + " unavailable. These inputs could not be read; "
+            "do not infer their content or renumber the remaining inputs."
+        )})
+    for item in media:
+        if item.input_index:
+            label = f"Input {item.input_index} ({item.kind})"
+            if not item.source.startswith(("http://", "https://", "data:")):
+                label += f": {item.source}"
+            content.append({"type": "text", "text": label})
+        if item.kind == "audio":
+            content.append({"type": "input_audio", "input_audio": {"data": item.data_url}})
+        else:
+            field = "image_url" if item.kind == "image" else "video_url"
+            content.append({"type": field, field: {"url": item.data_url}})
+    return content

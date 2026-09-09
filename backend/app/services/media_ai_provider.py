@@ -9,7 +9,7 @@ import httpx
 from app.services import media_ai_bailian as bailian, media_ai_openai as standard
 from app.services.llm.client import LLMError, LLMMessage, LLMResponse, create_llm_client
 from app.services.llm.client_registry import resolve_api_protocol
-from app.services.media_ai_io import MediaAIError, MediaInput
+from app.services.media_ai_io import MediaAIError, MediaInput, media_content
 
 
 def connection(config: dict) -> dict:
@@ -91,13 +91,7 @@ async def understand_response(config: dict, prompt: str, media: list[MediaInput]
     if not media and not history:
         raise MediaAIError("inputCombination")
     _validate_inputs(config, media)
-    content = [{"type": "text", "text": prompt}]
-    for item in media:
-        if item.kind == "audio":
-            content.append({"type": "input_audio", "input_audio": {"data": item.data_url}})
-        else:
-            kind = "image_url" if item.kind == "image" else "video_url"
-            content.append({"type": kind, kind: {"url": item.data_url}})
+    content = media_content(prompt, media)
     messages = [LLMMessage(**message) for message in (history or [])]
     messages.append(LLMMessage(role="user", content=content))
     return await _understanding_attempt(config, media, messages)

@@ -8,20 +8,10 @@ from app.database import async_session
 from app.models.audit import ChatMessage
 from app.services.chat_history_loading import load_messages_for_session
 from app.services.llm.compactor import maybe_compact
-from app.services.media_ai_io import load_media, load_understanding_media
+from app.services.media_ai_io import load_media, load_understanding_media, media_content
 from app.services.media_ai_model import media_context_model
 from app.services.read_media_compat import media_input_workspace
 
-
-def media_content(prompt: str, media: list) -> list[dict]:
-    content = [{"type": "text", "text": prompt}]
-    for item in media:
-        if item.kind == "audio":
-            content.append({"type": "input_audio", "input_audio": {"data": item.data_url}})
-        else:
-            field = "image_url" if item.kind == "image" else "video_url"
-            content.append({"type": field, field: {"url": item.data_url}})
-    return content
 
 
 async def prepare_media_context(agent, child, anchor, request: dict) -> tuple[dict, list[dict]]:

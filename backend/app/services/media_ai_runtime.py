@@ -135,7 +135,7 @@ async def execute_media_turn(run_id, anchor, *, recovering=False) -> bool:
                             actual_model = config["understanding_model"]
                         if input_errors:
                             text += "\n\n" + render_message("mediaAI.partialInputs") + "\n" + "\n".join(
-                                f"{item['index']}: {item['code']}" for item in input_errors
+                                f"{item['index']}: " + render_message(f"mediaAI.{item['code']}") for item in input_errors
                             )
                         result = {"status": "completed", "text": text, "usage": usage,
                                   "input_errors": input_errors,
