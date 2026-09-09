@@ -34,5 +34,10 @@
   "mcpAccess.refreshUnavailable": "This MCP installation is unavailable for refresh.",
   "mcpAccess.refreshChanged": "MCP settings or permissions changed during discovery. No changes were saved.",
   "mcpAccess.pendingWrites": "Save pending changes before refreshing MCP tools.",
-  "mcpAccess.manageRequired": "Manage access to this digital employee is required."
+  "mcpAccess.manageRequired": "Manage access to this digital employee is required.",
+  "mcpAccess.sharedDefinition": "Shared MCP tools can only use credential, header, or environment overrides. Change tool definitions in company or platform management.",
+  "mcpAccess.exactServerRequired": "Multiple MCP installations match. Select the exact installation.",
+  "mcpAccess.invalidConfig": "Invalid credential configuration.",
+  "mcpAccess.noDiscoveredTools": "No tools were discovered. The installation was not saved. Check the package, arguments and credentials.",
+  "mcpAccess.existingInstallation": "An identical installation already exists. Its connection was preserved. Complete any pending authorization for that installation or test its connection."
 }

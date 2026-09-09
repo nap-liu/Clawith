@@ -21,7 +21,7 @@ async def _isolate():
     await engine.dispose()
 
 
-async def test_three_layer_prompts_appended_in_order():
+async def test_shared_catalog_ignores_legacy_prompt_overrides():
     suffix = uuid.uuid4().hex[:6]
     async with async_session() as db:
         tenant = Tenant(name=f"T_{suffix}", slug=f"t-{suffix}")
@@ -69,11 +69,9 @@ async def test_three_layer_prompts_appended_in_order():
 
     blocks = await _collect_extension_prompts(agent_id)
     merged = "\n\n".join(blocks)
-    # Order check
-    assert merged.index("LAYER-PLATFORM") < merged.index("LAYER-TENANT") < merged.index("LAYER-AGENT")
-    # Single block joined with blank line within the per-server group
-    expected_block = "LAYER-PLATFORM\n\nLAYER-TENANT\n\nLAYER-AGENT"
-    assert expected_block in merged
+    assert "LAYER-PLATFORM" in merged
+    assert "LAYER-TENANT" not in merged
+    assert "LAYER-AGENT" not in merged
 
 
 async def test_skips_empty_override_layer():

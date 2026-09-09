@@ -33,7 +33,7 @@ export function visibleTabs(role: EditorRole, mode: EditorMode): EditorTab[] {
     // Agent flow: only the override surface (+ test, so admins can probe the
     // resulting connection without leaving the dialog).
     tabs.push('override');
-    if (isAdmin) tabs.push('test');
+    tabs.push('test');
     return tabs;
   }
 

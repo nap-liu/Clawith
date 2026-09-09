@@ -7,11 +7,9 @@ One source of truth so the role taxonomy stays in lockstep across endpoints.
 from __future__ import annotations
 
 from fastapi import HTTPException
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.mcp_server import MCPServer
-from app.models.tool import Tool
 from app.models.user import User
 
 
@@ -83,16 +81,28 @@ async def assert_can_patch_server(
     server: MCPServer,
     db: AsyncSession,
 ) -> None:
-    """Apply company-admin policy only to tenant-wide imported definitions."""
-    company_tool_id = await db.scalar(
-        select(Tool.id)
-        .where(Tool.mcp_server_id == server.id, Tool.source == "admin")
-        .limit(1)
-    )
-    if company_tool_id is not None:
+    """Shared definitions require catalog authority; private ones require Agent management."""
+    from app.services.mcp_catalog_policy import shared_catalog
+
+    if await shared_catalog(db, server):
         assert_can_manage_company_server(user, server)
     else:
-        assert_can_edit_server(user, server)
+        from sqlalchemy import select
+        from app.models.tool import AgentTool, Tool
+        from app.core.permissions import check_agent_access
+        from app.services.llm.failure_outcome import render_message
+
+        if is_platform_admin(user):
+            return
+        owner_ids = (await db.scalars(select(AgentTool.agent_id).join(
+            Tool, Tool.id == AgentTool.tool_id,
+        ).where(Tool.mcp_server_id == server.id).distinct())).all()
+        if not owner_ids:
+            assert_can_manage_company_server(user, server)
+        for owner_id in owner_ids:
+            _, access = await check_agent_access(db, user, owner_id)
+            if access != "manage":
+                raise HTTPException(403, detail=render_message("mcpAccess.manageRequired"))
 
 
 def assert_can_create_server_in_tenant(

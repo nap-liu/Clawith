@@ -16,6 +16,7 @@ from app.models.agent import Agent
 from app.models.mcp_server import MCPServer
 from app.models.tool import AgentTool, Tool
 from app.services.mcp_access import removable_mcp_server_ids, visible_mcp_installations
+from app.services.mcp_catalog_policy import shared_catalog
 from app.services.turn_tool_settings import effective_assignment
 from app.services.mcp_refresh_snapshot import MCPRefreshChanged, MCPRefreshUnavailable
 from app.services.mcp_refresh_service import (
@@ -164,6 +165,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                 ensure_ascii=False,
             )
 
+        is_shared = await shared_catalog(db, server)
         pairs = (
             await db.execute(
                 select(AgentTool, Tool)
@@ -208,7 +210,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                     tool is not None
                     and tool.type == "mcp"
                     and tool.source == "agent"
-                    and server.created_by_user_id is None
+                    and not is_shared
                 ):
                     await db.delete(tool)
                     deleted_orphan_tools += 1
@@ -224,7 +226,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
         ).scalar_one_or_none()
         if (
             remaining_server_assignments is None
-            and server.created_by_user_id is None
+            and not is_shared
         ):
             stale_agent_tools = (
                 await db.execute(
@@ -246,7 +248,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                 .limit(1)
             )
         ).scalar_one_or_none()
-        server_deleted = remaining_server_tools is None
+        server_deleted = remaining_server_tools is None and not is_shared
         if server_deleted:
             await db.delete(server)
 

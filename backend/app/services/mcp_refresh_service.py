@@ -22,6 +22,7 @@ from app.models.project import ProjectCapabilityBinding
 from app.models.tool import AgentTool, Tool
 from app.services.mcp_client import MCPClient
 from app.services.mcp_catalog_locks import lock_mcp_catalogs
+from app.services.mcp_catalog_policy import shared_catalog
 from app.services.llm.failure_outcome import render_message
 from app.services.mcp_refresh_snapshot import MCPRefreshChanged, plan_refresh
 from app.services.mcp_naming import tool_function_name
@@ -184,7 +185,10 @@ async def _assert_agent_refresh_is_isolated(
     incoming_owner: bool = False,
 ) -> dict[uuid.UUID, bool]:
     """Allow one owner plus explicit project references to refresh a server."""
-    if server.created_by_user_id is not None:
+    if await shared_catalog(db, server) and not (
+        incoming_owner and server.created_by_user_id is None
+        and await db.scalar(select(Tool.id).where(Tool.mcp_server_id == server.id).limit(1)) is None
+    ):
         raise PermissionError(
             "Inherited enterprise MCP servers cannot be refreshed by an Agent; "
             "use the administrator global refresh instead"
@@ -236,7 +240,7 @@ async def ensure_agent_mcp_server_isolated(
     Agent's bindings to a private clone before refresh. Enterprise/inherited
     sharing is intentionally left untouched so the normal guard rejects it.
     """
-    if server.created_by_user_id is not None:
+    if await shared_catalog(db, server):
         return server
 
     pairs = (

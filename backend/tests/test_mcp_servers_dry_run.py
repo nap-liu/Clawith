@@ -118,10 +118,12 @@ async def test_dry_run_uses_authenticated_user_despite_supplied_user_id(client):
     assert body["resolved_headers"]["X-User-Id"] != foreign_user_id
 
 
-async def test_dry_run_with_three_layers_appends_prompts(client):
+async def test_shared_dry_run_ignores_historical_prompt_overrides(client):
     srv = await _make_server_with_creds()
-    t_id = uuid.uuid4()
-    a_id = uuid.uuid4()
+    from mcp_tool_refresh_support import _make_agent
+
+    _, agent, _ = await _make_agent()
+    t_id, a_id = agent.tenant_id, agent.id
     async with async_session() as db:
         db.add_all([
             MCPServerOverride(
@@ -147,6 +149,6 @@ async def test_dry_run_with_three_layers_appends_prompts(client):
     assert r.status_code == 200
     body = r.json()
     prompt = body["resolved_prompt"]
-    # 3-layer order
-    assert prompt.index("prompt for ") < prompt.index("TENANT-LAYER") < prompt.index("AGENT-LAYER")
+    assert "prompt for " in prompt
+    assert "TENANT-LAYER" not in prompt and "AGENT-LAYER" not in prompt
     assert set(body["used_layers"]) == {"platform", "tenant", "agent"}

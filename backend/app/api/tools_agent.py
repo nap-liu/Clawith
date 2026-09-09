@@ -36,6 +36,7 @@ from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.services.mcp_naming import load_mcp_display_names
 from app.services.llm.failure_outcome import render_message
+from app.services.mcp_catalog_policy import can_remove_private_tool, validate_shared_tool_config
 
 
 @router.get("/agents/{agent_id}")
@@ -384,7 +385,7 @@ async def delete_agent_tool(
     if not remaining_r.scalar_one_or_none():
         tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
         tool = tool_r.scalar_one_or_none()
-        if tool and tool.type == "mcp":
+        if tool and await can_remove_private_tool(db, tool):
             await db.delete(tool)
     await db.commit()
     return {"ok": True}
@@ -432,7 +433,9 @@ async def get_agent_tool_config(
 
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     assignments = await _load_agent_tool_assignments(db, agent_id)
-    tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
+    tool_r = await db.execute(select(Tool).where(
+        Tool.id == tool_id, _agent_visible_tool_clause(agent.tenant_id, assignments),
+    ))
     tool = tool_r.scalar_one_or_none()
     if tool and is_retired_okr_tool(tool.name):
         tool = None
@@ -493,7 +496,10 @@ async def update_agent_tool_config(
             )
 
     # Encrypt sensitive fields using the tool's config_schema for field type awareness
-    tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id))
+    assigned_ids = select(AgentTool.tool_id).where(AgentTool.agent_id == agent_id)
+    from app.services.tool_enablement import tool_visibility_clause
+
+    tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id, tool_visibility_clause(agent.tenant_id, assigned_ids)))
     tool_for_schema = tool_r2.scalar_one_or_none()
     if tool_for_schema and is_retired_okr_tool(tool_for_schema.name):
         tool_for_schema = None
@@ -502,6 +508,7 @@ async def update_agent_tool_config(
         tool_for_schema, agent.tenant_id, assignments
     ):
         raise HTTPException(status_code=404, detail="Tool not found")
+    await validate_shared_tool_config(db, tool_for_schema, data.config)
     encrypted_config = _encrypt_sensitive_fields(data.config, tool_for_schema.config_schema if tool_for_schema else None)
 
     at_r = await db.execute(

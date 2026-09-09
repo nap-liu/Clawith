@@ -1,12 +1,17 @@
 """Resource discovery — search Smithery & ModelScope registries and import MCP servers."""
 
+from app.services.llm.failure_outcome import render_message
+
 import uuid
 import httpx
 from loguru import logger
 from sqlalchemy import select
 from app.database import async_session
 from app.models.tool import Tool, AgentTool
-from app.services.tool_config import decrypt_sensitive_fields, get_tenant_tool_config
+from app.services.tool_config import (
+    decrypt_sensitive_fields as decrypt_sensitive_fields,
+    get_tenant_tool_config as get_tenant_tool_config,
+)
 # Module-level bindings for patchability in tests — no circular import risk
 # since agent_tools only imports resource_discovery inside function bodies.
 # ensure_workspace was removed in the v1.10 storage refactor; _agent_workspace_root
@@ -16,27 +21,27 @@ from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 from app.config import get_settings
 from app.services.resource_atlassian import (
-    ATLASSIAN_ROVO_MCP_URL,
-    ATLASSIAN_ROVO_SERVER_NAME,
-    ATLASSIAN_ROVO_TOOL_PREFIX,
-    refresh_atlassian_rovo_api_key,
-    seed_atlassian_rovo_tools,
+    ATLASSIAN_ROVO_MCP_URL as ATLASSIAN_ROVO_MCP_URL,
+    ATLASSIAN_ROVO_SERVER_NAME as ATLASSIAN_ROVO_SERVER_NAME,
+    ATLASSIAN_ROVO_TOOL_PREFIX as ATLASSIAN_ROVO_TOOL_PREFIX,
+    refresh_atlassian_rovo_api_key as refresh_atlassian_rovo_api_key,
+    seed_atlassian_rovo_tools as seed_atlassian_rovo_tools,
 )
 from app.services.resource_registry_search import (
-    MODELSCOPE_API_BASE,
+    MODELSCOPE_API_BASE as MODELSCOPE_API_BASE,
     SMITHERY_API_BASE,
-    _get_modelscope_api_token,
+    _get_modelscope_api_token as _get_modelscope_api_token,
     _get_smithery_api_key,
-    _search_modelscope_api,
-    _search_smithery_api,
-    search_registries,
-    search_smithery,
+    _search_modelscope_api as _search_modelscope_api,
+    _search_smithery_api as _search_smithery_api,
+    search_registries as search_registries,
+    search_smithery as search_smithery,
 )
 
 
 # ── Import MCP Server ───────────────────────────────────────────
 
-async def _ensure_smithery_connection(api_key: str, mcp_url: str, display_name: str) -> dict:
+async def _ensure_smithery_connection(api_key: str, mcp_url: str, display_name: str, *, connection_id=None) -> dict:
     """Create or reuse a Smithery Connect namespace + connection.
 
     Returns dict with keys: namespace, connection_id, auth_url (if OAuth needed).
@@ -60,7 +65,7 @@ async def _ensure_smithery_connection(api_key: str, mcp_url: str, display_name: 
                 namespace = create_ns.json()["name"]
 
             # Create connection
-            conn_id = display_name.lower().replace(" ", "-").replace(":", "")
+            conn_id = connection_id or f"mcp-{uuid.uuid4().hex}"
             conn_resp = await client.post(
                 f"https://api.smithery.ai/connect/{namespace}",
                 json={"connectionId": conn_id, "mcpUrl": mcp_url, "name": display_name},
@@ -144,51 +149,6 @@ async def import_mcp_from_smithery(
     except Exception:
         pass  # non-critical — key is still usable from MCP tool configs
 
-    # ---- Early exit: check if this server's tools are already installed for this agent ----
-    # Check by both tool name prefix AND mcp_server_name to catch different server_id variants
-    # (e.g., "github" vs "@anthropic/github" both produce server_name "GitHub")
-    clean_id_check = server_id.replace("/", "_").replace("@", "")
-    try:
-        async with async_session() as db:
-            from sqlalchemy import or_
-            existing_server_r = await db.execute(
-                select(Tool).where(
-                    Tool.type == "mcp",
-                    or_(
-                        Tool.name.like(f"mcp_{clean_id_check}%"),
-                        Tool.name.like(f"mcp_{clean_id_check.split('_')[-1]}%"),
-                    ),
-                )
-            )
-            existing_server_tools = existing_server_r.scalars().all()
-            if (
-                existing_server_tools
-                and all(tool.mcp_server_id is not None for tool in existing_server_tools)
-                and not config
-                and not reauthorize
-            ):
-                # Check if this agent has assignments for these tools
-                tool_ids = [t.id for t in existing_server_tools]
-                agent_assignments_r = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id.in_(tool_ids),
-                    )
-                )
-                agent_assignments = agent_assignments_r.scalars().all()
-                if len(agent_assignments) >= len(existing_server_tools):
-                    tool_names = [t.display_name for t in existing_server_tools[:5]]
-                    more = f" ... and {len(existing_server_tools) - 5} more" if len(existing_server_tools) > 5 else ""
-                    return (
-                        f"⏭️ You already have **{len(existing_server_tools)}** tools from this MCP server installed:\n"
-                        + "\n".join(f"  • {n}" for n in tool_names) + more
-                        + f"\n\n🆔 MCP Server ID: `{existing_server_tools[0].mcp_server_id}`"
-                        + "\n\nNo action needed. These tools are ready to use."
-                        + "\n\n💡 If tools stopped working (e.g. OAuth expired), use `import_mcp_server(server_id=\"....\", reauthorize=true)` to re-authorize."
-                    )
-    except Exception:
-        pass  # non-critical — proceed to normal import flow
-
     # Step 1: Search for server by ID
     headers = {"Accept": "application/json"}
 
@@ -261,7 +221,33 @@ async def import_mcp_from_smithery(
     # Step 3.5: Auto-create Smithery Connect namespace + connection
     smithery_config = {}  # will be merged into every AgentTool.config
     auth_message = ""
-    conn_result = await _ensure_smithery_connection(api_key, base_mcp_url, display_name)
+    from app.models.agent import Agent as _Agent
+    from app.services.mcp_private_installations import private_server
+
+    identity_config = {**config, "server_id": qualified_name, "mcp_url": base_mcp_url,
+                       "smithery_api_key": api_key}
+    existing_config = {}
+    async with async_session() as db:
+        agent_row = await db.get(_Agent, agent_id)
+        tenant_id = agent_row.tenant_id if agent_row else None
+        existing = await private_server(db, agent_id, tenant_id, display_name, {
+            "transport": "http", "base_url_template": base_mcp_url,
+            "headers_template": {}, "credential_template": None,
+        }, installation_config=identity_config, create=False)
+        if existing is not None:
+            stored = await db.scalar(select(AgentTool.config).join(Tool).where(
+                Tool.mcp_server_id == existing.id, AgentTool.agent_id == agent_id,
+            ).limit(1))
+            existing_config = dict(stored or {})
+        await db.rollback()
+    if existing_config.get("smithery_connection_id") and not reauthorize:
+        conn_result = {"namespace": existing_config["smithery_namespace"],
+                       "connection_id": existing_config["smithery_connection_id"]}
+    else:
+        conn_result = await _ensure_smithery_connection(
+            api_key, base_mcp_url, display_name,
+            connection_id=existing_config.get("smithery_connection_id"),
+        )
     if "error" in conn_result:
         auth_message = f"\n\n⚠️ Could not auto-create Smithery connection: {conn_result['error']}"
     else:
@@ -347,137 +333,32 @@ async def import_mcp_from_smithery(
 
     async with async_session() as db:
         from app.models.agent import Agent as _Agent
-        from app.services.mcp_server_service import upsert_mcp_server_from_tools
-
         imported_tools = []
         agent_row = (
             await db.execute(select(_Agent).where(_Agent.id == agent_id))
         ).scalar_one_or_none()
         tenant_id = agent_row.tenant_id if agent_row else None
-        mcp_server_id = await upsert_mcp_server_from_tools(
-            db,
-            tenant_id=tenant_id,
-            server_url=base_mcp_url,
-            server_name=display_name,
-        )
+        from app.services.mcp_private_installations import private_server, persist_private_catalog
 
-        # Helper: ensure AgentTool link exists and save config
-        async def _ensure_agent_tool(tool_id: uuid.UUID):
-            agent_check = await db.execute(
-                select(AgentTool).where(
-                    AgentTool.agent_id == agent_id,
-                    AgentTool.tool_id == tool_id,
-                )
-            )
-            at = agent_check.scalar_one_or_none()
-            if at:
-                at.config = {**(at.config or {}), **agent_tool_config}
-            else:
-                db.add(AgentTool(
-                    agent_id=agent_id, tool_id=tool_id, enabled=True,
-                    source="user_installed", installed_by_agent_id=agent_id,
-                    config=agent_tool_config,
-                ))
-
-        # On re-import/reauthorize: update ALL existing tools for this server
-        if config or reauthorize:
-            existing_server_tools_r = await db.execute(
-                select(Tool).where(Tool.mcp_server_name == display_name, Tool.type == "mcp")
-            )
-            for et in existing_server_tools_r.scalars().all():
-                et.mcp_server_url = base_mcp_url
-                await _ensure_agent_tool(et.id)
-
-        if tools_discovered:
-            # Clean up old generic entry if individual tools are now discovered
-            generic_name = f"mcp_{server_id.replace('/', '_').replace('@', '')}"
-            old_generic_r = await db.execute(select(Tool).where(Tool.name == generic_name))
-            old_generic = old_generic_r.scalar_one_or_none()
-            if old_generic:
-                await db.execute(
-                    AgentTool.__table__.delete().where(AgentTool.tool_id == old_generic.id)
-                )
-                await db.delete(old_generic)
-                await db.flush()
-
-            # Create one Tool record per MCP tool
-            for mcp_tool in tools_discovered:
-                tool_name = f"mcp_{server_id.replace('/', '_').replace('@', '')}_{mcp_tool['name']}"
-                tool_display = f"{display_name}: {mcp_tool['name']}"
-
-                existing_r = await db.execute(select(Tool).where(Tool.name == tool_name))
-                existing_tool = existing_r.scalar_one_or_none()
-                if existing_tool:
-                    existing_tool.mcp_server_url = base_mcp_url
-                    existing_tool.mcp_server_id = mcp_server_id
-                    await _ensure_agent_tool(existing_tool.id)
-                    if reauthorize:
-                        imported_tools.append(f"🔄 {tool_display} (reauthorized)")
-                    elif config:
-                        imported_tools.append(f"🔄 {tool_display} (config updated)")
-                    else:
-                        imported_tools.append(f"⏭️ {tool_display} (already imported)")
-                    continue
-
-                tool = Tool(
-                    name=tool_name,
-                    display_name=tool_display,
-                    description=mcp_tool.get("description", description)[:500],
-                    type="mcp",
-                    category="mcp",
-                    icon="🔌",
-                    parameters_schema=mcp_tool.get("inputSchema", {"type": "object", "properties": {}}),
-                    mcp_server_url=base_mcp_url,
-                    mcp_server_name=display_name,
-                    mcp_tool_name=mcp_tool["name"],
-                    mcp_server_id=mcp_server_id,
-                    enabled=True,
-                    is_default=False,
-                    source="agent",
-                )
-                db.add(tool)
-                await db.flush()
-                await _ensure_agent_tool(tool.id)
-                imported_tools.append(f"✅ {tool_display}")
+        srv = await private_server(db, agent_id, tenant_id, display_name, {
+            "transport": "http", "base_url_template": base_mcp_url,
+            "headers_template": {}, "credential_template": None,
+        }, installation_config=agent_tool_config)
+        mcp_server_id = srv.id
+        stored_config = await db.scalar(select(AgentTool.config).join(Tool).where(
+            Tool.mcp_server_id == srv.id, AgentTool.agent_id == agent_id,
+        ).limit(1))
+        route_keys = ("smithery_namespace", "smithery_connection_id")
+        if stored_config and any(stored_config.get(key) != agent_tool_config.get(key) for key in route_keys):
+            # Another import committed while discovery was waiting on the provider.
+            # Its connection owns this installation, including any pending OAuth.
+            imported_tools = list(await db.scalars(select(Tool.display_name).join(AgentTool).where(
+                Tool.mcp_server_id == srv.id, AgentTool.agent_id == agent_id,
+            )))
+            auth_message = "\n\n" + render_message("mcpAccess.existingInstallation")
         else:
-            # Fallback: create a single generic tool entry
-            tool_name = f"mcp_{server_id.replace('/', '_').replace('@', '')}"
-            tool_display = display_name
-
-            existing_r = await db.execute(select(Tool).where(Tool.name == tool_name))
-            existing_tool = existing_r.scalar_one_or_none()
-            if existing_tool:
-                existing_tool.mcp_server_url = base_mcp_url
-                existing_tool.mcp_server_id = mcp_server_id
-                await _ensure_agent_tool(existing_tool.id)
-                await db.commit()
-                if config:
-                    return f"🔄 {tool_display} config updated. The tool is now ready to use."
-                else:
-                    return (
-                        f"⏭️ {tool_display} is already imported.\n\n"
-                        f"🆔 MCP Server ID: `{mcp_server_id}`"
-                    )
-
-            tool = Tool(
-                name=tool_name,
-                display_name=tool_display,
-                description=description[:500] or f"MCP Server: {server_id}",
-                type="mcp",
-                category="mcp",
-                icon="🔌",
-                parameters_schema={"type": "object", "properties": {}},
-                mcp_server_url=base_mcp_url,
-                mcp_server_name=display_name,
-                mcp_server_id=mcp_server_id,
-                enabled=True,
-                is_default=False,
-                source="agent",
-            )
-            db.add(tool)
-            await db.flush()
-            await _ensure_agent_tool(tool.id)
-            imported_tools.append(f"✅ {tool_display} (tool list not available from registry — may need configuration)")
+            catalog = tools_discovered or [{"name": None, "description": description}]
+            imported_tools = await persist_private_catalog(db, srv, agent_id, catalog, agent_tool_config)
 
         await db.commit()
 
@@ -590,7 +471,7 @@ async def import_mcp_direct(
 
         # Find-or-create an Agent-private mcp_servers row FIRST. Every
         # tool we import is then named after — and bound to — THIS server. The
-        # server name is stable per (Agent, URL), so per-server tool names are
+        # server identity is stable per (Agent, connection configuration), so per-server tool names are
         # unique too: this is what stops the global Tool.name dedup from merging
         # different Agent installations onto one mutable catalog.
         srv_id = await upsert_mcp_server_from_tools(
@@ -626,7 +507,9 @@ async def import_mcp_direct(
             agent, and return True iff it was newly created. Dedup is per-server
             (mcp_server_id, mcp_tool_name) — never the global Tool.name."""
             # Tool.name is varchar(100); cap defensively for long tool names.
-            tool_name = (f"mcp_{srv.name}_{raw_name}" if raw_name else f"mcp_{srv.name}")[:100]
+            from app.services.mcp_naming import tool_function_name
+
+            tool_name = tool_function_name(srv, raw_name or "server")
             dedup = select(Tool).where(Tool.mcp_server_id == srv.id)
             dedup = dedup.where(Tool.mcp_tool_name == raw_name) if raw_name else dedup.where(Tool.mcp_tool_name.is_(None))
             existing = (await db.execute(dedup)).scalar_one_or_none()
@@ -716,7 +599,8 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
             return "❌ 找不到当前 agent。"
         tenant_id = agent_row.tenant_id
 
-        srv = await get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg)
+        await db.rollback()
+        discovery_name = f"mcp-discovery-{_uuid.uuid4().hex}"
 
         # 发现:按 agent workspace cwd 注册临时条目 → list → 持久化 → 注销
         host = SandboxMcpHost(_settings.SANDBOX_API_URL, _settings.SANDBOX_API_KEY)
@@ -725,7 +609,7 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
         ws.mkdir(parents=True, exist_ok=True)
         work_dir = str(ws.resolve())
         try:
-            entry = await host.ensure_registered(srv.name, str(agent_id), cfg, cwd=work_dir)
+            entry = await host.ensure_registered(discovery_name, str(agent_id), cfg, cwd=work_dir)
         except Exception as e:
             return f"❌ 注册到沙箱失败:{e}"
         try:
@@ -744,9 +628,10 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
                 pass
 
         if not tools:
-            return f"⚠️ 已创建 stdio 服务 `{srv.name}`,但未发现任何工具(检查包名/参数/凭证)。"
+            return render_message("mcpAccess.noDiscoveredTools")
 
-        count = await persist_stdio_discovered_tools(db, srv, tools)
+        srv = await get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg)
+        count = await persist_stdio_discovered_tools(db, srv, tools, source="agent")
 
         # 分配给当前 agent
         assigned = []
@@ -758,11 +643,6 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
                 db.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True,
                                  source="user_installed", installed_by_agent_id=agent_id,
                                  config=dict(cfg)))
-            else:
-                at.enabled = True
-                at.source = "user_installed"
-                at.installed_by_agent_id = agent_id
-                at.config = dict(cfg)
             assigned.append(tool.mcp_tool_name)
         await db.commit()
 

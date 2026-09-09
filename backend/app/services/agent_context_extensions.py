@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.models.agent import Agent
 from app.models.tool import Tool, AgentTool
 from app.services.tool_enablement import tool_visibility_clause
+from app.services.mcp_catalog_policy import shared_catalog, safe_shared_override
 from app.services.turn_tool_settings import current_tool_settings, effective_mcp_override
 
 
@@ -172,6 +173,9 @@ async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
         for srv in servers:
             t_ovr = ovr_index.get((srv.id, "tenant", tenant_id)) if tenant_id else None
             a_ovr = effective_mcp_override(agent_id, srv.id, ovr_index.get((srv.id, "agent", agent_id)))
+            if await shared_catalog(db, srv):
+                t_ovr = safe_shared_override(t_ovr)
+                a_ovr = safe_shared_override(a_ovr)
             parts = [
                 (srv.system_prompt_block or "").strip(),
                 (t_ovr.system_prompt_block or "").strip() if t_ovr else "",

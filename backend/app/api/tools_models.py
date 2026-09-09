@@ -1,5 +1,7 @@
 """Pydantic models for the tools API."""
 
+import uuid
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -58,6 +60,7 @@ class BulkToolUpdateItem(BaseModel):
 
 
 class MCPServerUpdate(BaseModel):
+    server_id: uuid.UUID | None = None
     server_name: str            # Identifies which server's tools to update
     server_url: str             # New MCP server URL (may contain embedded key)
     api_key: str | None = None  # Optional standalone Bearer key

@@ -29,7 +29,8 @@ async def test_mcp_transport_error_keeps_streamable_failure_message(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_smithery_recovery_does_not_store_auth_required_connection(monkeypatch):
-    async def fake_ensure_connection(_api_key, _mcp_url, _display_name):
+    async def fake_ensure_connection(_api_key, _mcp_url, _display_name, *, connection_id=None):
+        assert connection_id == "old-working-connection"
         return {
             "namespace": "shadowsseven",
             "connection_id": "new-auth-required",

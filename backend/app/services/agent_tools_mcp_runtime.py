@@ -12,6 +12,7 @@ from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields
 from app.services.agent_tools_file_support import _agent_workspace_root
 from app.services.mcp_access import resolve_mcp_execution
+from app.services.mcp_catalog_policy import shared_catalog, SHARED_TOOL_CONFIG_FIELDS, apply_shared_tool_config
 from app.services.llm.failure_outcome import render_message
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
@@ -94,6 +95,11 @@ async def _execute_mcp_tool(
                     allow_project_source_reference=runtime_workspace.is_project,
                 )
                 cfg = compose_runtime_config(srv, t_ovr, a_ovr)
+                if await shared_catalog(db, srv):
+                    effective_assignment_config = {
+                        key: value for key, value in effective_assignment_config.items() if key in SHARED_TOOL_CONFIG_FIELDS
+                    }
+                    cfg = apply_shared_tool_config(cfg, effective_assignment_config)
 
                 ctx = await build_placeholder_context_for_call(
                     db,
@@ -231,7 +237,7 @@ async def _execute_mcp_tool(
                     # Adapter: stuff resolved values back into a dict matching the legacy contract.
                     smithery_cfg = {
                         **effective_assignment_config,
-                        "smithery_api_key": resolved_credential,
+                        "smithery_api_key": resolved_credential or effective_assignment_config.get("smithery_api_key"),
                         "headers": resolved_headers if resolved_headers else None,
                     }
                     smithery_cfg = {k: v for k, v in smithery_cfg.items() if v}
@@ -241,6 +247,7 @@ async def _execute_mcp_tool(
                         arguments,
                         smithery_cfg,
                         agent_id=agent_id,
+                        server_id=srv.id,
                     )
 
                 client = MCPClient(
@@ -267,7 +274,7 @@ async def _execute_mcp_tool(
         # Detect Smithery-hosted MCP servers (*.run.tools URLs)
         # These need Smithery Connect to route tool calls
         if ".run.tools" in mcp_url and merged_config:
-            return await _execute_via_smithery_connect(mcp_url, mcp_name, arguments, merged_config, agent_id=agent_id)
+            return await _execute_via_smithery_connect(mcp_url, mcp_name, arguments, merged_config, agent_id=agent_id, tool_id=tool.id)
 
         # Direct MCP call for non-Smithery servers
         # Priority for API key:
@@ -291,7 +298,7 @@ async def _execute_mcp_tool(
 
 
 async def _execute_via_smithery_connect(
-    mcp_url: str, tool_name: str, arguments: dict, config: dict, agent_id=None
+    mcp_url: str, tool_name: str, arguments: dict, config: dict, agent_id=None, server_id=None, tool_id=None
 ) -> str:
     """Execute an MCP tool via Smithery Connect API.
 
@@ -304,7 +311,7 @@ async def _execute_via_smithery_connect(
     # Get Smithery API key centrally (from discover_resources/import_mcp_server AgentTool config)
     from app.services.resource_discovery import _get_smithery_api_key
 
-    api_key = await _get_smithery_api_key(agent_id)
+    api_key = config.get("smithery_api_key") or await _get_smithery_api_key(agent_id)
     if not api_key:
         return (
             "❌ Smithery API key not configured.\n\n"
@@ -367,7 +374,7 @@ async def _execute_via_smithery_connect(
 
             # Detect auth/connection failures and attempt auto-recovery
             if tool_resp.status_code in (401, 403, 404):
-                recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id)
+                recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id, server_id, tool_id)
                 if recovery_result:
                     return recovery_result
                 # If recovery returned None, fall through to normal parsing
@@ -399,7 +406,7 @@ async def _execute_via_smithery_connect(
                 # Check if error indicates auth/connection issue
                 auth_keywords = ["auth", "unauthorized", "forbidden", "expired", "not found", "connection"]
                 if any(kw in msg.lower() for kw in auth_keywords):
-                    recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id)
+                    recovery_result = await _smithery_auto_recover(api_key, mcp_url, namespace, connection_id, agent_id, server_id, tool_id)
                     if recovery_result:
                         return recovery_result
                 return f"❌ MCP tool error: {msg[:300]}"
@@ -430,7 +437,7 @@ async def _execute_via_smithery_connect(
 
 
 async def _smithery_auto_recover(
-    api_key: str, mcp_url: str, namespace: str, connection_id: str, agent_id=None
+    api_key: str, mcp_url: str, namespace: str, connection_id: str, agent_id=None, server_id=None, tool_id=None
 ) -> str | None:
     """Attempt to auto-recover a failed Smithery connection.
 
@@ -442,7 +449,7 @@ async def _smithery_auto_recover(
 
         display_name = connection_id.replace("-", " ").title() if connection_id else "MCP Server"
 
-        conn_result = await _ensure_smithery_connection(api_key, mcp_url, display_name)
+        conn_result = await _ensure_smithery_connection(api_key, mcp_url, display_name, connection_id=connection_id)
         if "error" in conn_result:
             return (
                 f"❌ MCP tool connection expired and auto-recovery failed: {conn_result['error']}\n\n"
@@ -466,11 +473,12 @@ async def _smithery_auto_recover(
             "smithery_namespace": conn_result["namespace"],
             "smithery_connection_id": conn_result["connection_id"],
         }
-        if agent_id:
+        if agent_id and (server_id or tool_id):
             try:
                 async with async_session() as db:
-                    # Update all MCP tools for this server URL
-                    r = await db.execute(select(Tool).where(Tool.mcp_server_url == mcp_url, Tool.type == "mcp"))
+                    # Recovery belongs to one installation, never to a URL.
+                    identity = Tool.mcp_server_id == server_id if server_id else Tool.id == tool_id
+                    r = await db.execute(select(Tool).where(identity, Tool.type == "mcp"))
                     for tool in r.scalars().all():
                         at_r = await db.execute(
                             select(AgentTool).where(

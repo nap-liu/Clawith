@@ -19,8 +19,14 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.mcp_server_import import router as import_router
+from app.api.mcp_server_access import (
+    _require_tenant_override_access as _require_tenant_override_access,
+    _require_agent_override_access as _require_agent_override_access, _require_agent_server_access,
+    require_tenant_server_access,
+)
 from app.api.mcp_server_updates import normalize_masked_secret_update
 from app.core.security import get_current_user, require_role
+from app.services.llm.failure_outcome import render_message
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer, MCPServerOverride
@@ -42,6 +48,7 @@ from app.services.audit_logger import write_audit_log
 from app.services.mcp_client import MCPClient
 from app.services.mcp_dry_run_context import _build_user_ctx, _mask_auth_headers
 from app.services.mcp_refresh_service import refresh_mcp_server_tools
+from app.services.mcp_catalog_policy import shared_catalog, validate_agent_override
 from app.services.mcp_server_service import compose_runtime_config, lookup_overrides
 from app.services.placeholder_engine import (
     ALL_ROOTS,
@@ -55,22 +62,24 @@ from app.services.placeholder_engine import (
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
-router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
-router.include_router(import_router)
-
-
-from app.services.mcp_permissions import (  # noqa: E402
+from app.services.mcp_permissions import (
     assert_can_edit_server as _assert_can_edit_server_sync,
 )
 from app.services.mcp_permissions import (
     assert_can_patch_server as _assert_can_patch_server,
 )
 from app.services.mcp_permissions import (
-    can_edit_server as _can_edit_server,
+    can_edit_server as _can_edit_server,  # noqa: F401 -- compatibility export
 )
 from app.services.mcp_permissions import (
     is_platform_admin as _is_platform_admin,
 )
+
+
+router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
+router.include_router(import_router)
+
+
 
 
 async def _assert_can_edit_server(current_user: User, server: MCPServer) -> None:
@@ -125,9 +134,11 @@ async def get_mcp_server(
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    if not _can_edit_server(current_user, srv):
-        await _assert_can_view_server_for_agent(current_user, srv, agent_id, db)
-    return MCPServerOut.from_orm_model(srv)
+    if agent_id is not None:
+        await _require_agent_server_access(current_user, agent_id, srv, db)
+    else:
+        await _assert_can_patch_server(current_user, srv, db)
+    return MCPServerOut.from_orm_model(srv).model_copy(update={"is_shared": await shared_catalog(db, srv)})
 
 
 @router.post("", response_model=MCPServerOut, status_code=status.HTTP_201_CREATED)
@@ -246,11 +257,17 @@ async def test_mcp_server_connection(
     server_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    agent_id: uuid.UUID | None = None,
 ) -> TestConnectionResult:
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    await _assert_can_edit_server(current_user, srv)
+    if agent_id is not None:
+        from app.services.mcp_connection_check import check_agent_connection
+
+        agent = await _require_agent_server_access(current_user, agent_id, srv, db)
+        return await check_agent_connection(db, srv, agent_id, current_user.id, agent.tenant_id)
+    await _assert_can_patch_server(current_user, srv, db)
 
     # Transport-aware routing: stdio → aio-sandbox hub; http → MCPClient (unchanged).
     transport = getattr(srv, "transport", "http") or "http"
@@ -362,75 +379,6 @@ async def test_mcp_server_connection(
 # ---------------------------------------------------------------------------
 
 
-async def _require_tenant_override_access(
-    current_user: User, scope_id: uuid.UUID,
-) -> None:
-    """Platform admin OR org_admin of the given tenant."""
-    is_platform = (current_user.role == "platform_admin"
-                   or (current_user.identity and current_user.identity.is_platform_admin))
-    if is_platform:
-        return
-    if current_user.role == "org_admin" and current_user.tenant_id == scope_id:
-        return
-    raise HTTPException(status_code=403, detail="not authorized for this tenant override")
-
-
-async def _require_agent_override_access(
-    current_user: User, agent_id: uuid.UUID, db: AsyncSession,
-) -> Agent:
-    """Require authority to mutate one Agent's override, including project ACL."""
-    agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="agent not found")
-    if _is_platform_admin(current_user):
-        return agent
-    if agent.scope == "project" and agent.project_id is not None:
-        from app.services.project_service import require_project
-
-        await require_project(db, current_user, agent.project_id, edit=True)
-        return agent
-    if agent.creator_id == current_user.id:
-        return agent
-    # Same-tenant admin: can manage all agent overrides in their tenant
-    if (
-        current_user.role in ("org_admin", "agent_admin")
-        and agent.tenant_id is not None
-        and current_user.tenant_id == agent.tenant_id
-    ):
-        return agent
-    raise HTTPException(status_code=403, detail="not authorized for this agent override")
-
-
-async def _require_agent_server_access(
-    current_user: User,
-    agent_id: uuid.UUID,
-    server: MCPServer,
-    db: AsyncSession,
-) -> Agent:
-    """Authorize one Agent-scoped MCP view or override without global edit authority."""
-    agent = await _require_agent_override_access(current_user, agent_id, db)
-    if server.tenant_id is not None and server.tenant_id != agent.tenant_id:
-        raise HTTPException(status_code=404, detail="MCP server not found")
-    if agent.scope != "project":
-        return agent
-
-    assigned_tool_id = await db.scalar(
-        select(AgentTool.id)
-        .join(Tool, Tool.id == AgentTool.tool_id)
-        .where(
-            AgentTool.agent_id == agent.id,
-            Tool.type == "mcp",
-            Tool.mcp_server_id == server.id,
-        )
-        .limit(1)
-    )
-    if assigned_tool_id is None:
-        # Project configuration may only override MCP servers already copied
-        # into this project's isolated Digital Employee snapshot.
-        raise HTTPException(status_code=404, detail="MCP server not found")
-    return agent
-
-
 @router.post("/{server_id}/refresh-tools", response_model=MCPToolRefreshResultOut)
 async def refresh_mcp_server_tool_catalog(
     server_id: uuid.UUID,
@@ -447,7 +395,7 @@ async def refresh_mcp_server_tool_catalog(
         raise HTTPException(status_code=404, detail="MCP server not found")
 
     if agent_id is None:
-        await _assert_can_edit_server(current_user, server)
+        await _assert_can_patch_server(current_user, server, db)
     else:
         agent = await _require_agent_server_access(current_user, agent_id, server, db)
         if agent.scope == "project":
@@ -556,7 +504,7 @@ async def list_mcp_overrides(
     Non-admin without agent_id: 403.
     """
     is_platform = _is_platform_admin(current_user)
-    if not is_platform:
+    if not is_platform or agent_id is not None:
         if agent_id is None:
             raise HTTPException(status_code=403, detail="agent_id required for non-admin callers")
         server = (
@@ -596,9 +544,8 @@ async def put_tenant_override(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOverrideOut:
-    await _require_tenant_override_access(current_user, tenant_id)
-    if (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail="MCP server not found")
+    server = await require_tenant_server_access(db, current_user, tenant_id, server_id)
+    await validate_agent_override(db, server, payload.model_dump(exclude_unset=True))
     ovr = await _upsert_override(db, server_id, "tenant", tenant_id, payload, current_user.id)
     await write_audit_log(
         action="MCP_SERVER_OVERRIDE_UPSERT",
@@ -615,7 +562,7 @@ async def delete_tenant_override(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await _require_tenant_override_access(current_user, tenant_id)
+    await require_tenant_server_access(db, current_user, tenant_id, server_id)
     rows = (await db.execute(
         select(MCPServerOverride).where(
             MCPServerOverride.mcp_server_id == server_id,
@@ -647,6 +594,7 @@ async def put_agent_override(
     if server is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     await _require_agent_server_access(current_user, agent_id, server, db)
+    await validate_agent_override(db, server, payload.model_dump(exclude_unset=True))
     ovr = await _upsert_override(db, server_id, "agent", agent_id, payload, current_user.id)
     await write_audit_log(
         action="MCP_SERVER_OVERRIDE_UPSERT",
@@ -711,22 +659,21 @@ async def dry_run_mcp_server(
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    if not _can_edit_server(current_user, srv):
-        if payload.scope != "agent":
-            raise HTTPException(status_code=403, detail="Agent scope required for project configuration")
-        await _assert_can_view_server_for_agent(current_user, srv, payload.agent_id, db)
-
-    # Determine layers + lookup overrides
-    used: list[str] = ["platform"]
-    # If caller omits tenant_id, infer it: prefer the server's tenant_id,
-    # falling back to the caller's. This lets the unified editor preview
-    # without redundantly sending tenant context the server already knows.
     effective_tenant_id = payload.tenant_id or srv.tenant_id or current_user.tenant_id
-    if payload.scope in ("tenant", "agent"):
+    if payload.scope == "agent":
+        if payload.agent_id is None:
+            raise HTTPException(400, detail="agent_id required for scope=agent")
+        agent = await _require_agent_server_access(current_user, payload.agent_id, srv, db)
+        if payload.tenant_id is not None and payload.tenant_id != agent.tenant_id:
+            raise HTTPException(404, detail=render_message("mcpAccess.unavailable"))
+        effective_tenant_id = agent.tenant_id
+    elif payload.scope == "tenant":
         if effective_tenant_id is None:
-            raise HTTPException(status_code=400, detail="tenant_id required for scope=tenant|agent")
-    if payload.scope == "agent" and payload.agent_id is None:
-        raise HTTPException(status_code=400, detail="agent_id required for scope=agent")
+            raise HTTPException(400, detail="tenant_id required for scope=tenant")
+        await require_tenant_server_access(db, current_user, effective_tenant_id, server_id)
+    else:
+        await _assert_can_patch_server(current_user, srv, db)
+    used: list[str] = ["platform"]
 
     t_ovr, a_ovr = await lookup_overrides(
         db, server_id,
@@ -747,6 +694,8 @@ async def dry_run_mcp_server(
     if payload.draft_overrides is not None:
         from dataclasses import replace
         d = payload.draft_overrides
+        if payload.scope in ("agent", "tenant"):
+            await validate_agent_override(db, srv, d.model_dump(exclude_unset=True))
         new_prompts = cfg.prompt_blocks
         if d.system_prompt_block is not None and d.system_prompt_block.strip():
             new_prompts = cfg.prompt_blocks + [d.system_prompt_block]

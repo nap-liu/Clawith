@@ -68,12 +68,12 @@ async def _patch(client: AsyncClient, sid: uuid.UUID, token: str) -> int:
     return resp.status_code
 
 
-async def test_owner_member_can_patch():
+async def test_creator_member_cannot_patch_shared_catalog():
     owner_id, owner_token = await _mk_user("member")
     sid = await _mk_server(owner_id)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        assert await _patch(client, sid, owner_token) == 200
+        assert await _patch(client, sid, owner_token) == 403
 
 
 async def test_non_owner_member_is_forbidden():
@@ -106,14 +106,14 @@ async def test_cross_tenant_org_admin_is_forbidden():
         assert await _patch(client, sid, foreign_token) == 403
 
 
-async def test_same_tenant_agent_admin_can_patch():
+async def test_same_tenant_agent_admin_cannot_patch_shared_catalog():
     tid = await _mk_tenant()
     owner_id, _ = await _mk_user("member", tenant_id=tid)
     sid = await _mk_server(owner_id, tenant_id=tid)
     _, aa_token = await _mk_user("agent_admin", tenant_id=tid)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        assert await _patch(client, sid, aa_token) == 200
+        assert await _patch(client, sid, aa_token) == 403
 
 
 async def test_platform_admin_can_patch_cross_tenant():

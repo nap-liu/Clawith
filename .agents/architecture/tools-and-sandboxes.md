@@ -133,8 +133,9 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
   hidden self-installation by its known server ID.
 - Single-binding deletion requires management access to the owning Agent,
   including the same tenant boundary used by Agent settings. Removing one
-  binding preserves other Agents' installations; the MCP tool is deleted only
-  when its final binding is removed. Alias resolution only reserves canonical
+  binding preserves other Agents' installations. Only a private MCP tool may
+  be deleted when its final binding is removed; shared catalogs survive unbinding.
+  Alias resolution only reserves canonical
   MCP names visible to the current Agent, so another tenant's names cannot
   suppress its available remote aliases.
 - Agent refresh requires a visible installation and isolated ownership before
@@ -156,6 +157,28 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
 - Preserve tenant, Agent, server, and workspace isolation in names, queries, and
   sandbox registration. Global display-name deduplication is not an identity
   boundary.
+- Private HTTP/stdio installation identity includes the complete connection
+  configuration, including credentials, headers and environment. Serialize
+  imports per Agent; reuse an unchanged installation and allocate an independent
+  server ID plus a display-name suffix for different configurations. Never put
+  credentials or their hashes in names, or infer a stdio display name from an
+  arbitrary command argument. New function names fit the provider's 64-character
+  boundary. Existing connection overrides prevent silent reuse of an installation.
+- Company/platform MCP catalogs are shared definitions. Their owning org/platform
+  administrators alone may modify definitions or refresh the catalog. Agents may
+  filter tool enablement and override credential/header/environment configuration;
+  URL, command, arguments and instructions remain canonical. Runtime ignores
+  historical shared definition overrides, including scene overrides. Agent
+  connection checks use effective private credentials without persisting discovery
+  results. `Tool.source` identifies catalog origin; binding provenance alone never
+  turns an admin catalog into a private one. Empty or unclassified catalogs are
+  treated conservatively as shared.
+- Smithery connections and recovery belong to exact private installations, never
+  to matching URLs or display names. Execution prefers the installation's key.
+  Concurrent imports must retain the winning installation's routing and must not
+  return another connection's authorization URL or mix its discovered tools.
+- Legacy bulk configuration resolves an exact server ID, or an unambiguous name
+  within the target tenant. Updating a URL never merges another server's catalog.
 - Do not mask nested MCP/TaskGroup failures with a generic HTTP error; surface a
   bounded actionable leaf error to the shared tool loop.
 - HTTP behavior must remain unchanged when adding stdio lifecycle support.

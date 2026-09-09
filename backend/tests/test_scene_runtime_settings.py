@@ -191,12 +191,11 @@ async def test_mcp_config_prompt_and_execution_share_settings(monkeypatch):
         server_id = server.id
         await db.commit()
     context = await persist(aid, uid, tid, [{"tool_id": str(tool_id), "enabled": True, "config": {}}],
-                            mcp_server_overrides=[{"server_id": str(server_id), "url_template": "https://example.com/scene",
-                                                   "system_prompt_block": "scene instructions"}])
+                            mcp_server_overrides=[{"server_id": str(server_id), "credential_template": "scene-key"}])
     calls = []
 
     def client_init(self, url, **kwargs):
-        calls.append(url)
+        calls.append((url, kwargs.get("api_key")))
 
     monkeypatch.setattr(MCPClient, "__init__", client_init)
     monkeypatch.setattr(MCPClient, "call_tool", AsyncMock(return_value="scene result"))
@@ -204,11 +203,11 @@ async def test_mcp_config_prompt_and_execution_share_settings(monkeypatch):
     @with_scene_tool_settings
     async def run(*, agent_id, channel_context):
         prompts = await _collect_extension_prompts(agent_id)
-        assert "scene instructions" in "\n".join(prompts)
+        assert "base instructions" in "\n".join(prompts)
         return await _execute_mcp_tool(name, {}, agent_id=agent_id, user_id=uid)
 
     assert await run(agent_id=aid, channel_context=context) == "scene result"
-    assert calls == ["https://example.com/scene"]
+    assert calls == [("https://example.com/mcp", "scene-key")]
     assert "scene instructions" not in "\n".join(await _collect_extension_prompts(aid))
 
 

@@ -1,4 +1,4 @@
-"""MCP server registry — one row per (tenant_id, server URL).
+"""MCP server registry — shared catalogs and independently identified private installations.
 
 Replaces the prior pattern of repeating ``mcp_server_url`` / ``instructions`` /
 ``system_prompt_block`` across every tool row of the same server. Tools FK

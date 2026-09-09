@@ -70,20 +70,19 @@ async def test_agent_stdio_server_name_is_deterministic_and_agent_scoped():
 
     assert srv1_id == srv2_id                       # idempotent
     assert srv1.transport == "stdio"
-    agent8 = str(agent_id).replace("-", "")[:8]
-    assert srv1_name.endswith(f"-a{agent8}")        # 带 agent 短码隔离
+    assert srv1_name == srv2.name
 
 
 async def test_two_agents_same_pkg_get_different_servers():
     agent1_id, tenant_id, _ = await _make_agent()
-    agent2_id, _, _ = await _make_agent()
+    agent2_id, tenant2_id, _ = await _make_agent()
     cfg = {"command": "npx", "args": ["-y", "some-pkg"], "env": {}}
 
     from app.services.mcp_server_service import get_or_create_agent_stdio_server
 
     async with async_session() as db:
         srv1 = await get_or_create_agent_stdio_server(db, agent1_id, tenant_id, cfg)
-        srv2 = await get_or_create_agent_stdio_server(db, agent2_id, tenant_id, cfg)
+        srv2 = await get_or_create_agent_stdio_server(db, agent2_id, tenant2_id, cfg)
         await db.commit()
         srv1_name = srv1.name
         srv2_name = srv2.name
@@ -135,12 +134,11 @@ async def test_import_mcp_stdio_direct_discovers_and_assigns():
     assert "MCP 服务" in result and str(agent_id).replace("-", "")[:8] in result
 
     # Find the tool scoped to this agent's server (name ends with -a{agent8})
-    agent8 = str(agent_id).replace("-", "")[:8]
     async with async_session() as db:
         rows = (await db.execute(
-            select(Tool).where(
+            select(Tool).join(AgentTool).where(
                 Tool.mcp_tool_name == "list_repositories",
-                Tool.mcp_server_name.like(f"%-a{agent8}"),
+                AgentTool.agent_id == agent_id,
             )
         )).scalars().all()
         assert len(rows) == 1, f"Expected exactly 1 tool row for this agent, got {len(rows)}"
@@ -268,7 +266,9 @@ async def test_import_mcp_stdio_direct_zero_tools():
         from app.services.resource_discovery import import_mcp_stdio_direct
         result = await import_mcp_stdio_direct(agent_id, {"transport": "stdio", "command": "npx", "args": [], "env": {}})
 
-    assert "⚠️" in result or "0" in result
+    assert "未保存安装" in result
+    async with async_session() as db:
+        assert not await db.scalar(select(AgentTool.id).where(AgentTool.agent_id == agent_id))
 
 
 # ── Task 4: idempotency (reinstall same agent same pkg) ──────────────────────
@@ -311,10 +311,9 @@ async def test_import_mcp_stdio_direct_idempotent():
 
     # Tool rows should not be duplicated
     async with async_session() as db:
-        rows = (await db.execute(select(Tool).where(Tool.mcp_tool_name == "do_thing"))).scalars().all()
-        # Filter to our agent's server (same-pkg for this agent)
-        agent8 = str(agent_id).replace("-", "")[:8]
-        agent_rows = [r for r in rows if r.mcp_server_name and r.mcp_server_name.endswith(f"-a{agent8}")]
+        agent_rows = (await db.scalars(select(Tool).join(AgentTool).where(
+            AgentTool.agent_id == agent_id, Tool.mcp_tool_name == "do_thing",
+        ))).all()
         assert len(agent_rows) == 1, f"Expected 1 Tool row, got {len(agent_rows)}"
 
         # AgentTool also not duplicated

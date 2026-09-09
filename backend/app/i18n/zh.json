@@ -34,5 +34,10 @@
   "mcpAccess.refreshUnavailable": "当前无法刷新此 MCP 安装。",
   "mcpAccess.refreshChanged": "发现工具期间 MCP 配置或权限已变化，未保存任何更改。",
   "mcpAccess.pendingWrites": "请先保存待处理的更改，再刷新 MCP 工具。",
-  "mcpAccess.manageRequired": "需要此数字员工的管理权限。"
+  "mcpAccess.manageRequired": "需要此数字员工的管理权限。",
+  "mcpAccess.sharedDefinition": "共享 MCP 仅允许覆盖凭据、请求头或环境配置。工具定义请在公司或平台管理中修改。",
+  "mcpAccess.exactServerRequired": "匹配到多个 MCP 安装，请选择准确的安装。",
+  "mcpAccess.invalidConfig": "凭证配置格式无效。",
+  "mcpAccess.noDiscoveredTools": "未发现工具，未保存安装。请检查包名、参数和凭证。",
+  "mcpAccess.existingInstallation": "已有相同配置的安装，已保留现有连接。请完成该安装待处理的授权，或测试连接。"
 }
