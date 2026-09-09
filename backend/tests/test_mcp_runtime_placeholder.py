@@ -123,9 +123,9 @@ async def test_unknown_placeholder_returns_error_to_llm():
 
     # Should NOT have constructed the client
     mock_cls.assert_not_called()
-    # Result should be structured error
-    assert "❌ MCP tool" in result
-    assert "URL placeholder error" in result or "unresolved" in result.lower()
+    # The error identifies the unresolved field independently of UI language.
+    assert "user.unknown_field" in result
+    assert "unresolved" in result.lower()
 
 
 async def test_legacy_path_unchanged_when_mcp_server_id_null():

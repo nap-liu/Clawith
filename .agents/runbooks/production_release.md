@@ -315,6 +315,25 @@ remains live. Prefer a quiet window and allow work to drain within the approved
 bound without closing ingress early. Record any active operation that may need
 durable recovery.
 
+Use the actual durable state vocabulary: trigger executions waiting to run are
+`pending`; in-flight trigger executions are `processing`, not `running`.
+Inspect their lease expiry and scheduled time separately. Count recent inputs
+by source channel so timer-generated `user` messages are not mistaken for human
+traffic. Historical message status alone is not an execution heartbeat: compare
+the current session generation/anchor with its live execution lease. Take the
+final sample and protected identifier snapshot immediately before replacement;
+open ingress can admit additional work after a GO sample, which must be included
+in post-cutover verification.
+
+Startup recovery is not a guarantee that every background invocation continues.
+Triggers without a durable generation/origin cannot pass the normal recovery
+fence; shutdown may leave their executions durably `failed`. For a permitted
+short-interruption release, record such failures, verify subsequent scheduled
+executions, and distinguish them from recovered human turns. Do not blindly
+replay an invocation that already performed tools or sent external output.
+If even one missed background invocation is unacceptable, wait for its actual
+`processing` work to drain or use a separately tested continuity topology.
+
 The standard single-replica Compose replacement may cause a brief interruption.
 It is permitted only when the release record explicitly authorizes that policy.
 If the requirement is strict request/turn continuity, this topology is NO-GO;
