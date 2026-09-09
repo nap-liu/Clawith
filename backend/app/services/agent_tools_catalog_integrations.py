@@ -39,7 +39,7 @@ AGENT_TOOL_INTEGRATIONS = [
         "type": "function",
         "function": {
             "name": "list_installed_mcp_servers",
-            "description": "List a concise summary of every MCP server currently assigned to you. Each item includes the exact mcp_server_id required by refresh_mcp_server and uninstall_mcp_server, display name, transport, tool counts, and uninstallability. Tool definitions and installation credentials are intentionally omitted because your available MCP tools are already provided separately.",
+            "description": "List your installed MCP servers that still have platform-permitted tools. tool_count counts platform-visible installations; enabled_tool_count counts those enabled by your current Agent or scene settings. Zero enabled tools means installed but unavailable, not a working connection. Scene-only tools without an installation are defined separately. removable only permits uninstalling your own bindings; it does not grant refresh permission. Server IDs identify installations, not credentials or authentication health.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -47,7 +47,7 @@ AGENT_TOOL_INTEGRATIONS = [
         "type": "function",
         "function": {
             "name": "refresh_mcp_server",
-            "description": "Refresh one MCP server installed exclusively by you, using your Agent configuration. Use the exact mcp_server_id returned by list_installed_mcp_servers. Inherited enterprise or shared MCP servers cannot be refreshed here and must use the administrator global refresh. Existing tool enablement and configuration are preserved; newly discovered tools become available on your next turn.",
+            "description": "Refresh one MCP server installed exclusively by you, using your Agent configuration. Use the exact mcp_server_id returned by list_installed_mcp_servers. Inherited enterprise or shared MCP servers cannot be refreshed here and must use the administrator global refresh. Existing tool enablement and configuration are preserved; newly discovered tools become available on your next turn. Refresh discovers tool definitions; it does not repair CLI credentials or bypass platform disablement.",
             "parameters": {
                 "type": "object",
                 "properties": {

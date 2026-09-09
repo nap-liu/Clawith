@@ -448,7 +448,8 @@ async def test_runtime_rechecks_assignment_after_schema_was_built():
             agent_id=agent_id,
             user_id=agent_id,
         )
-    assert "no longer installed" in result
+    from app.services.llm.failure_outcome import render_message
+    assert result == render_message("mcpAccess.unavailable")
     call.assert_not_awaited()
 
 

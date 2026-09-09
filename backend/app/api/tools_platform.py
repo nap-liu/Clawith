@@ -144,6 +144,7 @@ async def update_tools_bulk(
     tool_ids = [uuid.UUID(u.tool_id) for u in updates]
     result = await db.execute(
         select(Tool).where(Tool.id.in_(tool_ids), _feature_visible_tool_clause())
+        .order_by(Tool.id).with_for_update()
     )
     tools_map = {str(t.id): t for t in result.scalars().all()}
 
@@ -215,6 +216,16 @@ async def update_mcp_server(
         await assert_can_patch_server(current_user, srv, db)
     else:
         assert_can_create_server_in_tenant(current_user, target_tenant_id)
+
+    from app.services.mcp_catalog_locks import lock_mcp_catalogs
+
+    # The legacy bridge can move tools to an existing same-tenant URL catalog.
+    # Resolve both ends before writing tools, then lock in canonical order.
+    target_server_id = await db.scalar(select(MCPServer.id).where(
+        MCPServer.tenant_id == target_tenant_id,
+        MCPServer.base_url_template == data.server_url,
+    ))
+    await lock_mcp_catalogs(db, {srv.id if srv else None, target_server_id} - {None})
 
     # Load all tools from this server under the target tenant
     result = await db.execute(
@@ -337,6 +348,9 @@ async def delete_tool(
     else:
         _require_tenant_tool_admin(current_user, tool.tenant_id)
 
+    from app.services.mcp_catalog_locks import lock_tool_catalog
+
+    await lock_tool_catalog(db, tool_id)
     await db.execute(delete(AgentTool).where(AgentTool.tool_id == tool_id))
     await db.delete(tool)
     await db.commit()

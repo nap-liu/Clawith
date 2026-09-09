@@ -17,9 +17,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, select
 
 from app.models.tool import Tool
+from app.models.mcp_server import MCPServer
 
 # Protocol tools whose schemas must remain present for every Agent. Keeping
 # this set here makes the runtime resolver, management APIs, and startup seed
@@ -43,7 +44,19 @@ def tool_visibility_clause(tenant_id, assigned_tool_ids):
     return and_(
         or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
         or_(Tool.source.in_(["builtin", "admin"]), Tool.id.in_(assigned_tool_ids)),
+        or_(
+            Tool.type != "mcp",
+            Tool.mcp_server_id.is_(None),
+            _mcp_server_visible(tenant_id),
+        ),
     )
+
+
+def _mcp_server_visible(tenant_id):
+    return select(MCPServer.id).where(
+        MCPServer.id == Tool.mcp_server_id,
+        or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None)),
+    ).correlate(Tool).exists()
 
 
 def tool_visible_to_agent(tool, tenant_id, assigned_tool_ids) -> bool:

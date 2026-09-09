@@ -7,10 +7,12 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import async_session
+from app.models.tool import AgentTool, Tool
 from app.services.agent_runtime_workspace import current_agent_runtime_workspace
 from app.services.agent_tools_config_runtime import _decrypt_sensitive_fields
 from app.services.agent_tools_file_support import _agent_workspace_root
-from app.services.turn_tool_settings import effective_assignment
+from app.services.mcp_access import resolve_mcp_execution
+from app.services.llm.failure_outcome import render_message
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
@@ -25,7 +27,6 @@ async def _execute_mcp_tool(
 ) -> str:
     """Execute a tool via MCP if it exists in the DB as an MCP tool."""
     try:
-        from app.models.tool import Tool, AgentTool
         from app.models.mcp_server import MCPServer
         from app.services.mcp_client import MCPClient
         from app.services.placeholder_engine import (
@@ -43,62 +44,14 @@ async def _execute_mcp_tool(
         )
 
         async with async_session() as db:
-            # Primary lookup: legacy-prefixed name (e.g.
-            # mcp_shibui_finance_unlock_financial_analysis).
-            result = await db.execute(
-                select(Tool).where(Tool.name == tool_name, Tool.type == "mcp", Tool.enabled == True)
-            )
-            tool = result.scalar_one_or_none()
-
-            # Fallback: LLM sometimes drops the mcp_<server>_ prefix and calls
-            # the bare MCP-side tool name (e.g. unlock_financial_analysis).
-            # Resolve by mcp_tool_name when the prefixed name doesn't match.
-            if not tool:
-                if not agent_id:
-                    return f"❌ MCP tool {tool_name}: current agent identity is required"
-                candidates = (
-                    (
-                        await db.execute(
-                            select(Tool)
-                            .join(AgentTool, AgentTool.tool_id == Tool.id)
-                            .where(
-                                Tool.mcp_tool_name == tool_name,
-                                Tool.type == "mcp",
-                                Tool.enabled == True,
-                                AgentTool.agent_id == agent_id,
-                                AgentTool.enabled == True,
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                if len(candidates) > 1:
-                    return (
-                        f"❌ MCP tool name '{tool_name}' is ambiguous for this agent; use the exact platform tool name."
-                    )
-                tool = candidates[0] if candidates else None
-
-            if not tool:
-                logger.warning(f"[MCP] Unknown tool: {tool_name}")
-                return f"Unknown tool: {tool_name}"
-
-            # The LLM tool schema is frozen at the beginning of a turn.  A
-            # server may be uninstalled later in that same turn, so execution
-            # must re-check the live assignment immediately before every call.
             if not agent_id:
-                return f"❌ MCP tool {tool_name}: current agent identity is required"
-            live_assignment = (
-                await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
-                    )
-                )
-            ).scalar_one_or_none()
-            live_assignment = effective_assignment(agent_id, tool, live_assignment)
-            if live_assignment is None:
-                return f"❌ MCP tool {tool_name}: no longer installed or enabled for this agent"
+                return render_message("mcpAccess.unavailable")
+            candidates = await resolve_mcp_execution(db, agent_id, tool_name)
+            if len(candidates) > 1:
+                return render_message("mcpAccess.ambiguous")
+            if not candidates:
+                return render_message("mcpAccess.unavailable")
+            tool, live_assignment = candidates[0]
             runtime_workspace = current_agent_runtime_workspace(agent_id)
             referenced_source_config = (
                 await lookup_project_source_tool_config(
@@ -515,8 +468,6 @@ async def _smithery_auto_recover(
         }
         if agent_id:
             try:
-                from app.models.tool import Tool, AgentTool
-
                 async with async_session() as db:
                     # Update all MCP tools for this server URL
                     r = await db.execute(select(Tool).where(Tool.mcp_server_url == mcp_url, Tool.type == "mcp"))

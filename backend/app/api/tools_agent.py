@@ -30,6 +30,7 @@ from app.api.tools_shared import (
 from app.core.okr_feature import is_retired_okr_tool
 from app.core.security import get_current_user
 from app.database import get_db
+from app.models.agent import Agent
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.services.mcp_naming import load_mcp_display_names
@@ -361,6 +362,15 @@ async def delete_agent_tool(
     at = at_r.scalar_one_or_none()
     if not at:
         raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    from app.services.mcp_catalog_locks import lock_tool_catalog
+
+    await db.execute(select(Agent.id).where(Agent.id == at.agent_id).with_for_update())
+    at = await db.scalar(select(AgentTool).where(
+        AgentTool.id == agent_tool_id,
+    ).execution_options(populate_existing=True))
+    if at is None:
+        raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    await lock_tool_catalog(db, at.tool_id)
     tool_id = at.tool_id
     await db.delete(at)
     await db.flush()

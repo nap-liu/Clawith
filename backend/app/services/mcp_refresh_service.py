@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -21,10 +21,12 @@ from app.models.mcp_server import MCPServer
 from app.models.project import ProjectCapabilityBinding
 from app.models.tool import AgentTool, Tool
 from app.services.mcp_client import MCPClient
+from app.services.mcp_catalog_locks import lock_mcp_catalogs
+from app.services.llm.failure_outcome import render_message
+from app.services.mcp_refresh_snapshot import MCPRefreshChanged, plan_refresh
 from app.services.mcp_naming import tool_function_name
 from app.services.mcp_server_service import (
     agent_private_server_name,
-    build_placeholder_context_for_call,
     compose_runtime_config,
     lookup_overrides,
 )
@@ -39,9 +41,11 @@ class MCPToolRefreshResult:
     created: int
     updated: int
     assigned: int
+    server_id: uuid.UUID | None = None
 
     def to_dict(self) -> dict[str, int]:
-        return asdict(self)
+        return {"discovered": self.discovered, "created": self.created,
+                "updated": self.updated, "assigned": self.assigned}
 
 
 def _platform_context(server: MCPServer) -> PlaceholderContext:
@@ -176,6 +180,8 @@ async def _assert_agent_refresh_is_isolated(
     db,
     server: MCPServer,
     agent_id: uuid.UUID,
+    *,
+    incoming_owner: bool = False,
 ) -> dict[uuid.UUID, bool]:
     """Allow one owner plus explicit project references to refresh a server."""
     if server.created_by_user_id is not None:
@@ -192,7 +198,7 @@ async def _assert_agent_refresh_is_isolated(
         )
     ).scalars().all()
     project_references = await _project_mcp_references(db, server, agent_id)
-    owns_server = any(
+    owns_server = incoming_owner or any(
         assignment.agent_id == agent_id
         and assignment.source == "user_installed"
         and assignment.installed_by_agent_id == agent_id
@@ -220,6 +226,8 @@ async def ensure_agent_mcp_server_isolated(
     db,
     server: MCPServer,
     agent_id: uuid.UUID,
+    *,
+    plan_only: bool = False,
 ) -> MCPServer:
     """Split a historical same-URL catalog shared by self-installing Agents.
 
@@ -339,8 +347,12 @@ async def ensure_agent_mcp_server_isolated(
                 or resolved.env_template
             ),
         )
-        db.add(private_server)
-        await db.flush()
+        if not plan_only:
+            db.add(private_server)
+            await db.flush()
+
+    if plan_only:
+        return private_server
 
     for assignment, old_tool in current_pairs:
         remote_name = old_tool.mcp_tool_name
@@ -415,59 +427,28 @@ async def refresh_mcp_server_tools(
     Existing Tool and AgentTool state is preserved. When ``assign_to_agent`` is
     true, only newly created/missing assignments are enabled for that Agent.
     """
-    server = (
-        await db.execute(select(MCPServer).where(MCPServer.id == server_id))
-    ).scalar_one_or_none()
-    if server is None:
-        raise LookupError("MCP server not found")
-
-    agent = None
-    tenant_id = server.tenant_id
-    if agent_id is not None:
-        agent = (
-            await db.execute(select(Agent).where(Agent.id == agent_id))
-        ).scalar_one_or_none()
-        if agent is None:
-            raise LookupError("未找到数字员工")
-        if (
-            server.tenant_id is not None
-            and agent.tenant_id != server.tenant_id
-        ):
-            raise PermissionError("Agent and MCP server belong to different tenants")
-        tenant_id = agent.tenant_id
-        server = await ensure_agent_mcp_server_isolated(db, server, agent_id)
-        project_references = await _assert_agent_refresh_is_isolated(
-            db,
-            server,
-            agent_id,
-        )
-    else:
-        project_references = {}
-
-    tenant_override, agent_override = await lookup_overrides(
-        db,
-        server.id,
-        tenant_id,
-        agent_id,
-    )
-    config = compose_runtime_config(server, tenant_override, agent_override)
-    context = (
-        await build_placeholder_context_for_call(
-            db,
-            agent_id,
-            user_id,
-            session_id=session_id,
-        )
-        if agent_id is not None
-        else _platform_context(server)
-    )
-
+    # Callers supply a clean session. Never commit caller-owned pending work
+    # merely to release the read transaction before provider discovery.
+    if db.new or db.dirty or db.deleted:
+        raise ValueError(render_message("mcpAccess.pendingWrites"))
+    plan = await plan_refresh(db, server_id, agent_id, user_id, session_id)
+    await db.rollback()
     discovered_tools, instructions = await _discover_tools(
-        server,
-        config,
-        context,
-        agent_id,
+        plan.server, plan.config, plan.context, agent_id,
     )
+
+    # Rollback expired the identity map; explicit expiration also protects
+    # callers using a session configured with expire_on_commit=False.
+    db.expire_all()
+    await lock_mcp_catalogs(db, plan.server_ids, agent_id=agent_id)
+    current = await plan_refresh(db, server_id, agent_id, user_id, session_id)
+    if current.fingerprint != plan.fingerprint:
+        raise MCPRefreshChanged()
+    server = await db.get(MCPServer, server_id)
+    project_references = {}
+    if agent_id is not None:
+        server = await ensure_agent_mcp_server_isolated(db, server, agent_id)
+        project_references = await _assert_agent_refresh_is_isolated(db, server, agent_id)
 
     existing_rows = (
         await db.execute(select(Tool).where(Tool.mcp_server_id == server.id))
@@ -592,4 +573,5 @@ async def refresh_mcp_server_tools(
         created=created,
         updated=updated,
         assigned=assigned,
+        server_id=server.id,
     )

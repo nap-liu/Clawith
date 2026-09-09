@@ -225,13 +225,9 @@ async def delete_mcp_server(
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     name = srv.name
-    tool_ids = list(
-        (
-            await db.execute(
-                select(Tool.id).where(Tool.mcp_server_id == server_id)
-            )
-        ).scalars()
-    )
+    from app.services.mcp_catalog_locks import lock_mcp_catalogs
+
+    tool_ids = await lock_mcp_catalogs(db, [server_id])
     if tool_ids:
         await db.execute(delete(AgentTool).where(AgentTool.tool_id.in_(tool_ids)))
         await db.execute(delete(Tool).where(Tool.id.in_(tool_ids)))
@@ -443,6 +439,7 @@ async def refresh_mcp_server_tool_catalog(
     agent_id: uuid.UUID | None = None,
 ) -> MCPToolRefreshResultOut:
     """Refresh globally, or refresh an Agent's exclusively self-installed server."""
+    operator_id = current_user.id
     server = (
         await db.execute(select(MCPServer).where(MCPServer.id == server_id))
     ).scalar_one_or_none()
@@ -464,7 +461,7 @@ async def refresh_mcp_server_tool_catalog(
             db,
             server_id,
             agent_id=agent_id,
-            user_id=current_user.id,
+            user_id=operator_id,
             assign_to_agent=agent_id is not None,
         )
         await db.commit()
@@ -482,7 +479,7 @@ async def refresh_mcp_server_tool_catalog(
                 "ok": False,
                 "error": str(exc)[:200],
             },
-            user_id=current_user.id,
+            user_id=operator_id,
         )
         raise HTTPException(status_code=502, detail=f"MCP tool refresh failed: {exc}") from exc
 
@@ -494,7 +491,7 @@ async def refresh_mcp_server_tool_catalog(
             "ok": True,
             **result.to_dict(),
         },
-        user_id=current_user.id,
+        user_id=operator_id,
     )
     return MCPToolRefreshResultOut(
         success=True,

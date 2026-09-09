@@ -28,5 +28,10 @@
   "sceneRuntime.serverUnavailable": "所选 MCP 服务不可用。",
   "sceneRuntime.invalidSecret": "凭据配置无效，请重新填写。",
   "sceneRuntime.toolDisabled": "当前场景未启用此工具。",
-  "sceneRuntime.soul": "加载 Soul"
+  "sceneRuntime.soul": "加载 Soul",
+  "mcpAccess.unavailable": "当前数字员工无法使用此 MCP 工具。",
+  "mcpAccess.ambiguous": "此 MCP 工具名称存在歧义，请使用当前可用工具的完整名称。",
+  "mcpAccess.refreshUnavailable": "当前无法刷新此 MCP 安装。",
+  "mcpAccess.refreshChanged": "发现工具期间 MCP 配置或权限已变化，未保存任何更改。",
+  "mcpAccess.pendingWrites": "请先保存待处理的更改，再刷新 MCP 工具。"
 }

@@ -119,6 +119,34 @@ registration, lifecycle deadlines, child cleanup, and truthful error forwarding.
   group and never reuses another server merely because its URL matches.
 - A newly imported tool becomes available on the next turn because the tool set
   is assembled at turn start. Do not claim same-turn availability.
+- Platform `Tool.enabled` is a veto for MCP schemas, extension prompts,
+  execution (canonical names and remote aliases), and Agent inventory.
+  Tenant visibility covers both the tool and its referenced server. Scene
+  settings may replace Agent enablement, but cannot override this veto.
+- `list_installed_mcp_servers` reports actual persistent installations:
+  `tool_count` counts platform-visible installed tools; `enabled_tool_count`
+  additionally applies the current Agent/scene selection. A locally disabled
+  installation remains visible with zero enabled tools, while a group with no
+  platform-visible tools is omitted. Scene-only tools do not create an
+  installation. Removability means self-install provenance, not refresh
+  authorization or provider health. An authorized owner can still uninstall a
+  hidden self-installation by its known server ID.
+- Agent refresh requires a visible installation and isolated ownership before
+  provider discovery. Read-only planning includes any existing private target
+  of a legacy shared installation; an existing target catalog with no
+  platform-visible enabled tools also vetoes Agent refresh. An empty target
+  catalog may receive the authorized migration. Discovery holds no database transaction;
+  a short final transaction locks and rechecks catalog, assignments, project
+  references, and resolved configuration before any migration or persistence.
+  Changed state discards discovery results. Catalog deletion shares the lock
+  order: Agent (when applicable), servers, project references, tools,
+  assignments, overrides. Provider failure must not leave a private clone.
+- The platform bulk toggle operates on the requested tool IDs; it is not a
+  persistent server-wide switch for future tools. Explicit administrator
+  discovery remains allowed with current tools disabled and preserves their
+  flags. Revocation rejects calls reaching authorization after its commit;
+  already admitted provider calls may finish. Refresh does not repair CLI
+  credentials, and CLI enablement remains an independent capability.
 - Preserve tenant, Agent, server, and workspace isolation in names, queries, and
   sandbox registration. Global display-name deduplication is not an identity
   boundary.
