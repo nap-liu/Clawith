@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.services.conversation_turn_lifecycle import conversation_turn_snapshot_for_session
 from app.services.gateway_message_queue import enqueue_user_gateway_message
+from app.services.turn_interruption import TurnInterrupted
 
 
 async def execute_web_turn_impl(
@@ -154,7 +155,23 @@ async def execute_web_turn_impl(
                 await api.manager.disconnect(str(self.agent_id), self.websocket)
                 return "disconnect"
             return "done"
+        except TurnInterrupted:
+            api.logger.info("[WS] Durable turn interrupted; recovery retains anchor={}", turn_anchor_id)
+            return "continue"
         except api.asyncio.CancelledError:
+            interrupted_snapshot = await self._load_turn_snapshot(turn_anchor_id)
+            if interrupted_snapshot.status in {"completed", "failed"}:
+                if self.conversation and self.conversation[-1].get("role") == "assistant":
+                    await self._safe_send(api.with_turn_envelope(
+                        {"type": "done", "role": "assistant",
+                         "content": self.conversation[-1].get("content", ""),
+                         "message_id": str(terminal_message_id)},
+                        interrupted_snapshot, event_kind="turn_terminal",
+                    ))
+                return "continue"
+            if interrupted_snapshot.status != "cancelled":
+                # Process shutdown is not a user STOP. Keep the committed Turn.
+                raise
             stopped = "*[Generation stopped]*"
             saved_cancelled = False
             try:
@@ -440,6 +457,8 @@ async def route_openclaw_impl(
     turn_anchor_id,
     turn_snapshot,
 ):
+    # Remote execution recovery belongs to the external agent protocol;
+    # this iteration only changes the platform-hosted execution lifecycle.
     async with api.async_session() as db:
         await enqueue_user_gateway_message(
             db,

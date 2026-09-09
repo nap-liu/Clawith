@@ -1,6 +1,24 @@
 """Feishu text-turn execution inside the serialized channel lock."""
 
-from app.api.feishu_shared import *  # noqa: F401,F403
+import json as _json
+
+from app.api.feishu_shared import (
+    _SerialPatchQueue,
+    _TOOL_STATUS_KEEP_LINES,
+    _append_error_details,
+    _build_card,
+    _build_projected_stream_card,
+    _call_agent_llm,
+    _normalize_tool_error,
+    agent_storage_key,
+    asyncio,
+    feishu_service,
+    get_storage_backend,
+    logger,
+    normalize_attachment_metadata,
+    select,
+    time,
+)
 from app.services.im_markdown_media import project_agent_images_for_im
 
 
@@ -499,8 +517,8 @@ async def _process_feishu_text_turn(
         if task_title:
             try:
                 from app.models.task import Task as TaskModel
-                from app.services.task_executor import execute_task
-                import asyncio as _asyncio
+                from app.services.agent_execution.bridge import dispatch_background
+                from app.services.task_executor import prepare_created_task_turn
 
                 task_obj = TaskModel(
                     agent_id=agent_id,
@@ -510,12 +528,10 @@ async def _process_feishu_text_turn(
                     status="pending",
                     priority="medium",
                 )
-                db.add(task_obj)
+                anchor = await prepare_created_task_turn(db, task_obj)
                 await db.commit()
-                await db.refresh(task_obj)
-                _asyncio.create_task(
-                    execute_task(task_obj.id, agent_id, task_obj.execution_user_id)
-                )
+                if anchor is not None:
+                    await dispatch_background("app.services.background_turns:run_background_turn", anchor.id)
                 reply_text += f"\n\n📋 已同步创建任务到任务面板：【{task_title}】"
                 logger.info(f"[Feishu] Created task: {task_title}")
             except Exception as e:

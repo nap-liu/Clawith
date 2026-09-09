@@ -24,6 +24,11 @@ class ChatSession(Base):
 
     __tablename__ = "chat_sessions"
     __table_args__ = (
+        Index(
+            "ix_chat_sessions_active_turn",
+            "id",
+            postgresql_where=text("im_config->'conversation_turn'->>'status' IN ('running', 'suspended')"),
+        ).ddl_if(dialect="postgresql"),
         UniqueConstraint(
             "agent_id",
             "source_channel",

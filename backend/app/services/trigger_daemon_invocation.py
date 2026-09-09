@@ -2,7 +2,9 @@
 
 from app.services.trigger_daemon_delivery import *  # noqa: F401,F403
 
-async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTrigger]):
+async def _invoke_agent_for_triggers(
+    agent_id: uuid.UUID, triggers: list[AgentTrigger], *, admit_only: bool = False,
+):
     """Invoke an agent with context from one or more fired triggers.
 
     Creates a Reflection Session and calls the LLM.
@@ -11,8 +13,9 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
     from app.models.participant import Participant
-    from app.services.audit_logger import write_audit_log
-    from app.services.llm import call_llm
+    from app.services.background_turns import initialize_background_turn, run_background_turn
+    from app.services.trigger_turn_completion import trigger_completion_snapshot
+    from app.services.turn_interruption import TurnInterrupted
 
     retired_triggers, active_triggers = partition_retired_okr_triggers(triggers)
     if retired_triggers:
@@ -54,7 +57,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     reply: str | None = None
     conversation_id: uuid.UUID | None = None
     lease_heartbeat_task: asyncio.Task | None = None
-    capacity_stack = AsyncExitStack()
+    turn_anchor_id = None
 
     if execution_ids:
 
@@ -119,6 +122,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             trigger_config = dict(triggers[0].config or {})
             trigger_config["_execution_user_id"] = str(execution_user_id)
             triggers[0].config = trigger_config
+            turn_anchor_id = uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"anchor:{execution_ids[0]}")
             reply = await _resume_origin_session_for_on_message(
                 agent_id,
                 triggers[0],
@@ -132,9 +136,30 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 invocation_retryable = False
             return
 
-        # Admission is deliberately outside the identity transaction. A busy
-        # scheduled lane can queue without consuming a database connection.
-        await capacity_stack.enter_async_context(get_workload_capacity().slot(WorkloadKind.SCHEDULED, tenant_key))
+        # Reclaimed executions continue their committed turn, never a new reflection.
+        if execution_ids:
+            async with async_session() as db:
+                linked = (await db.execute(
+                    select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
+                )).scalars().all()
+                linked_ids = {row.conversation_id for row in linked if row.conversation_id}
+                if len(linked_ids) > 1:
+                    raise RuntimeError("Trigger invocation has inconsistent conversations")
+                if linked_ids:
+                    conversation_id = next(iter(linked_ids))
+                    turn_anchor = (await db.execute(
+                        select(ChatMessage).where(
+                            ChatMessage.conversation_id == str(conversation_id),
+                            ChatMessage.role == "user",
+                            ChatMessage.message_meta["background_execution"]["kind"].as_string() == "trigger",
+                        ).order_by(ChatMessage.created_at.asc()).limit(1)
+                    )).scalar_one_or_none()
+                    if turn_anchor is None:
+                        raise RuntimeError("Trigger execution has no recoverable turn anchor")
+                    turn_anchor_id = turn_anchor.id
+            if turn_anchor_id:
+                reply = await run_background_turn(turn_anchor_id)
+                return
 
         async with async_session() as db:
             # Load agent
@@ -277,8 +302,9 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             agent_participant = result.scalar_one_or_none()
 
             session = ChatSession(
+                id=uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"session:{execution_ids[0]}") if execution_ids else uuid.uuid4(),
                 agent_id=agent_id,
-                user_id=agent.creator_id,
+                user_id=execution_user_id,
                 participant_id=agent_participant.id if agent_participant else None,
                 source_channel="trigger",
                 title=title[:200],
@@ -287,18 +313,14 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             await db.flush()
             session_id = session.id
 
-            # Messages: trigger context only (call_llm builds system prompt internally)
-            messages = [
-                {"role": "user", "content": trigger_context},
-            ]
-
             # Store trigger context as a message in the session
             turn_anchor = ChatMessage(
+                id=uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"anchor:{execution_ids[0]}") if execution_ids else uuid.uuid4(),
                 agent_id=agent_id,
                 conversation_id=str(session_id),
                 role="user",
                 content=trigger_context,
-                user_id=agent.creator_id,
+                user_id=execution_user_id,
                 participant_id=agent_participant.id if agent_participant else None,
             )
             db.add(turn_anchor)
@@ -310,359 +332,69 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 )
                 for execution in execution_rows:
                     execution.conversation_id = session_id
+            await db.flush()
+            turn_anchor.sender_user_id = None
+            await initialize_background_turn(
+                db,
+                session=session,
+                anchor=turn_anchor,
+                kind="trigger",
+                reference_id=str(execution_ids[0] if execution_ids else turn_anchor.id),
+                settings={
+                    "execution_agent_id": str(agent_id),
+                    "model_override_id": str(triggers[0].model_id) if triggers[0].model_id else None,
+                    "temperature_override": triggers[0].temperature,
+                    "reasoning_effort_override": triggers[0].reasoning_effort,
+                    "include_soul": triggers[0].soul,
+                    "include_memory": triggers[0].memory,
+                },
+                completion={
+                    "execution_ids": [str(value) for value in execution_ids],
+                    "triggers": trigger_completion_snapshot(triggers),
+                },
+            )
+            turn_anchor_id = turn_anchor.id
             await db.commit()
             # Treat the link as durable only after the session, first message,
             # and execution FK have committed atomically.
             conversation_id = session_id
-            # Cache participant ID for callbacks
-            agent_participant_id = agent_participant.id if agent_participant else None
 
-        # Call LLM (outside the DB session to avoid long transactions)
-        collected_content = []
-        collected_thinking = []
-        delivered_platform_message_via_tool = False
-
-        async def on_chunk(text):
-            collected_content.append(text)
-
-        # Collect reasoning/thinking for UI persistence — shown when a human
-        # views the session, NEVER fed back into the LLM. Mirrors web chat.
-        async def on_thinking(text):
-            collected_thinking.append(text)
-
-        # Persist tool calls into Reflection Session for Reflections visibility
-        async def on_tool_call(data):
-            nonlocal delivered_platform_message_via_tool
-            try:
-                tool_name = data.get("name")
-                tool_status = data.get("status")
-                if tool_status == "done" and tool_name == "send_platform_message":
-                    result_text = str(data.get("result", ""))
-                    if result_text.startswith("✅"):
-                        delivered_platform_message_via_tool = True
-
-                async with async_session() as _tc_db:
-                    if data["status"] == "running":
-                        # Store args RAW — this row is replayed into the LLM context;
-                        # masking here poisons the model (it copies "******" back into
-                        # tool calls). Secrets are masked at output boundaries only.
-                        _tc_db.add(
-                            ChatMessage(
-                                agent_id=agent_id,
-                                conversation_id=str(session_id),
-                                role="tool_call",
-                                content=_json.dumps(
-                                    {"name": data["name"], "args": data.get("args")}, ensure_ascii=False, default=str
-                                ),
-                                user_id=agent.creator_id,
-                                participant_id=agent_participant_id,
-                            )
-                        )
-                    elif data["status"] == "done":
-                        # data["result"] is already the bounded llm_view
-                        # from tool_output_store.finalize_tool_output.
-                        result_str = str(data.get("result", ""))
-                        _tc_db.add(
-                            ChatMessage(
-                                agent_id=agent_id,
-                                conversation_id=str(session_id),
-                                role="tool_call",
-                                content=_json.dumps(
-                                    {"name": data["name"], "result": result_str}, ensure_ascii=False, default=str
-                                ),
-                                user_id=agent.creator_id,
-                                participant_id=agent_participant_id,
-                            )
-                        )
-                    await _tc_db.commit()
-            except Exception as e:
-                logger.warning(f"Failed to persist tool call for trigger session: {e}")
-
-        reply = await call_llm(
-            model=model,
-            messages=messages,
-            agent_name=agent.name,
-            role_description=agent.role_description or "",
-            agent_id=agent_id,
-            user_id=execution_user_id,
-            session_id=str(session_id),
-            on_chunk=on_chunk,
-            on_tool_call=on_tool_call,
-            on_thinking=on_thinking,
-            turn_anchor_id=turn_anchor.id,
-            turn_type="trigger",
-            include_soul=triggers[0].soul,
-            include_memory=triggers[0].memory,
-            # A2A wake uses the agent's own max_tool_rounds setting (no override)
-        )
-
-        # Cap the turn's accumulated thinking once; reused by all assistant rows
-        # persisted below (Reflection / A2A mirror / delivery). UI-only field.
-        from app.services.chat_history import (
-            cap_thinking,
-            persist_assistant_reply_row,
-        )
-
-        _capped_thinking = cap_thinking("".join(collected_thinking))
-
-        # Compute final reply text once
-        from app.services.llm.failure_outcome import llm_failure_code
-
-        failure_code = llm_failure_code(reply)
-        final_reply = reply or "".join(collected_content)
-        if failure_code:
-            invocation_error = str(final_reply)
-            invocation_retryable = False
-
-        # Save assistant reply to Reflection session
-        async with async_session() as db:
-            result = await db.execute(
-                select(Participant).where(Participant.type == "agent", Participant.ref_id == agent_id)
-            )
-            agent_participant = result.scalar_one_or_none()
-
-            await persist_assistant_reply_row(
-                db,
-                agent_id=agent_id,
-                user_id=agent.creator_id,
-                conversation_id=str(session_id),
-                content=final_reply,
-                thinking=_capped_thinking,
-                turn_anchor_id=turn_anchor.id,
-                participant_id=agent_participant.id if agent_participant else None,
-                turn_terminal_status="failed" if failure_code else "completed",
-            )
-
-            # NOTE: trigger state (last_fired_at, fire_count, auto-disable)
-            # is already updated in _tick() BEFORE this task was launched,
-            # to prevent race-condition duplicate fires.
-
-            await db.commit()
-
-        # ── Save reply to A2A session if this was an agent-to-agent wake ──
-        # This makes the target agent's reply visible in the A2A chat history
-        for t in triggers:
-            a2a_sid = (t.config or {}).get("_a2a_session_id")
-            if a2a_sid and final_reply:
-                try:
-                    async with async_session() as db:
-                        from app.models.participant import Participant as _P
-
-                        _p_r = await db.execute(select(_P).where(_P.type == "agent", _P.ref_id == agent_id))
-                        _p = _p_r.scalar_one_or_none()
-                        from app.models.chat_session import ChatSession as _CS
-
-                        _cs_r = await db.execute(select(_CS).where(_CS.id == uuid.UUID(a2a_sid)))
-                        _cs = _cs_r.scalar_one_or_none()
-                        _source_execution_id = str((t.config or {}).get("_execution_id") or "").strip()
-                        _reply_id = (
-                            uuid.uuid5(
-                                _ONMESSAGE_TURN_NAMESPACE,
-                                f"a2a-reply:{_source_execution_id}",
-                            )
-                            if _source_execution_id
-                            else uuid.uuid4()
-                        )
-                        _existing_reply = await db.get(ChatMessage, _reply_id)
-                        if _existing_reply is not None:
-                            logger.info(
-                                "[A2A] Reply already persisted for execution %s",
-                                _source_execution_id,
-                            )
-                            break
-                        reply_row = ChatMessage(
-                            id=_reply_id,
-                            agent_id=_cs.agent_id if _cs else agent_id,
-                            conversation_id=a2a_sid,
-                            role="assistant",
-                            content=final_reply,
-                            user_id=agent.creator_id,
-                            participant_id=_p.id if _p else None,
-                            thinking=_capped_thinking,
-                            external_event_key=(
-                                f"a2a-inbound:{_source_execution_id}"[:500] if _source_execution_id else None
-                            ),
-                            message_meta={
-                                "direction": "inbound",
-                                "source_channel": "agent",
-                                "actor_ref": str(_p.id if _p else agent_id),
-                            },
-                        )
-                        db.add(reply_row)
-                        # Update session timestamp
-                        if _cs:
-                            _cs.last_message_at = datetime.now(timezone.utc)
-                            await db.flush()
-                            from app.services.trigger_runtime.evaluator import (
-                                match_incoming_chat_message,
-                            )
-
-                            await match_incoming_chat_message(db, reply_row, _cs)
-                        await db.commit()
-                        logger.info(f"[A2A] Saved reply to A2A session {a2a_sid}")
-                except Exception as e:
-                    logger.warning(f"[A2A] Failed to save reply to A2A session {a2a_sid}: {e}")
-                break  # Only save once
-
-        # Route trigger results to a single deterministic destination. Pure reflection/system
-        # wakes stay inside the reflection session and should not spill into arbitrary user chats.
-        is_a2a_internal = all(t.name == "a2a_wake" for t in triggers)
-        delivery_target = None if is_a2a_internal else await _resolve_trigger_delivery_target(agent, triggers)
-
-        if final_reply and delivery_target and not delivered_platform_message_via_tool:
-            try:
-                from app.api.websocket import manager as ws_manager
-
-                agent_id_str = str(agent_id)
-
-                # Build notification message with trigger badge
-                trigger_reasons = []
-                for t in triggers:
-                    ns = (t.config or {}).get("_notification_summary", "").strip()
-                    if ns:
-                        trigger_reasons.append(ns)
-                    else:
-                        r = (t.reason or "").strip()
-                        if r and len(r) <= 80:
-                            trigger_reasons.append(r)
-                        elif r:
-                            trigger_reasons.append(r[:77] + "...")
-                summary = trigger_reasons[0] if trigger_reasons else "有新的事件需要处理"
-
-                _is_a2a_wait = any(t.name.startswith("a2a_wait_") for t in triggers)
-                if _is_a2a_wait:
-                    import re as _re
-
-                    cleaned = final_reply
-                    _internal_patterns = [
-                        r"\b(a2a_wait_\w+|a2a_wake)\b",
-                        r"\bwait_?\w+_?(task|reply|followup|meeting|sync|api_key)\w*\b",
-                        r"\bresolve_\w+\b",
-                        r"\bfocus[_ ]?item\b",
-                        r"\btask_delegate\b",
-                        r"\bfocus_ref\b",
-                        r"✅\s*(a2a\w+|wait\w+|触发器\w*|focus\w*).*(?:已取消|已为|保持|活跃|完成状态)[^\n]*",
-                        r"[\-•]\s*(?:触发器|trigger|focus|wait_\w+|a2a\w+).*[^\n]*",
-                        r"(?:触发器|trigger)\s+\S+\s*(?:已取消|保持活跃|已为完成状态|fired)",
-                        r"已静默清理触发器",
-                        r"已静默处理完毕",
-                        r"继续待命[。，]?\s*",
-                        r"，?\s*(?:继续)?待命。",
-                    ]
-                    for _pat in _internal_patterns:
-                        cleaned = _re.sub(_pat, "", cleaned, flags=_re.IGNORECASE)
-                    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-                    cleaned = _re.sub(r"[。，]\s*$", "", cleaned).strip()
-                    if not cleaned:
-                        cleaned = final_reply
-                else:
-                    cleaned = final_reply
-
-                notification = f"⚡ {summary}\n\n{cleaned}"
-
-                target_session_id = delivery_target["session_id"]
-                owner_user_id = delivery_target.get("owner_user_id")
-
-                # Save to the resolved destination session for persistence.
-                async with async_session() as db:
-                    from app.api.websocket import maybe_mark_session_read_for_active_viewer
-                    from app.models.chat_session import ChatSession
-
-                    db.add(
-                        ChatMessage(
-                            agent_id=agent_id,
-                            conversation_id=target_session_id,
-                            role="assistant",
-                            content=notification,
-                            user_id=agent.creator_id,
-                            thinking=_capped_thinking,
-                        )
-                    )
-                    session_row = await db.get(ChatSession, uuid.UUID(target_session_id))
-                    if session_row:
-                        session_row.last_message_at = datetime.now(timezone.utc)
-                    if owner_user_id:
-                        await maybe_mark_session_read_for_active_viewer(
-                            db,
-                            agent_id=agent_id,
-                            session_id=target_session_id,
-                            user_id=uuid.UUID(owner_user_id),
-                        )
-                    await db.commit()
-
-                payload = {
-                    "type": "trigger_notification",
-                    "content": notification,
-                    "triggers": [t.name for t in triggers],
-                    "session_id": target_session_id,
-                }
-
-                # Notify only the user who owns the destination session. The frontend will append
-                # the message only when that exact session is open; otherwise it just refreshes
-                # unread/session state.
-                if owner_user_id:
-                    await ws_manager.send_to_user(agent_id_str, owner_user_id, payload)
-            except Exception as e:
-                logger.error(f"Failed to push trigger result to WebSocket: {e}")
-                import traceback
-
-                traceback.print_exc()
-
-        # Audit log
-        await write_audit_log(
-            "trigger_fired",
-            {
-                "agent_name": agent.name,
-                "triggers": [{"name": t.name, "type": t.type} for t in triggers],
-            },
-            agent_id=agent_id,
-        )
-
-        logger.info(f"⚡ Triggers fired for {agent.name}: {[t.name for t in triggers]}")
-
-    except asyncio.CancelledError:
-        invocation_error = "cancelled by control plane"
-        invocation_retryable = False
+        if admit_only:
+            return turn_anchor_id
+        reply = await run_background_turn(turn_anchor_id)
+    except (asyncio.CancelledError, TurnInterrupted):
+        # Process shutdown is not STOP. Leave its durable anchor and webhook
+        # batch untouched; a new worker claims the same execution and Session.
+        invocation_error = "Execution interrupted; awaiting recovery"
+        invocation_retryable = True
         raise
-    except Exception as e:
-        invocation_error = str(e)
-        invocation_retryable = _is_retryable_invocation_error(e)
+    except Exception as exc:
+        invocation_error = str(exc)
+        if turn_anchor_id:
+            async with async_session() as db:
+                admitted = await db.get(ChatMessage, turn_anchor_id)
+                if admitted is None or not (admitted.message_meta or {}).get("background_execution"):
+                    turn_anchor_id = None
+        invocation_retryable = bool(turn_anchor_id) or _is_retryable_invocation_error(exc)
         if conversation_id is None and execution_ids and not invocation_retryable:
-            conversation_id = await _create_failed_trigger_conversation(
-                agent_id,
-                triggers,
-                invocation_error,
-            )
-        logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
-        import traceback
-
-        traceback.print_exc()
+            conversation_id = await _create_failed_trigger_conversation(agent_id, triggers, invocation_error)
+        logger.exception("Failed to invoke agent {} for triggers", agent_id)
+        if admit_only:
+            raise
     finally:
         if lease_heartbeat_task is not None:
             lease_heartbeat_task.cancel()
             await asyncio.gather(lease_heartbeat_task, return_exceptions=True)
-        # Release the lease on every claimed execution so it is not re-fired.
-        # Runs on success, on early return (agent expired / model disabled), and
-        # on exception. Early returns leave invocation_error=None → completed,
-        # which is correct: the trigger was handled (decided to skip), so re-firing
-        # would not help.
-        if execution_ids:
+        # Once initialized, the shared turn finalizer owns business completion.
+        # Retry release is safe even if a terminal commit won concurrently.
+        if execution_ids and (turn_anchor_id is None or invocation_retryable):
             try:
                 await _finalize_invocation_executions(
-                    execution_ids,
-                    triggers,
-                    reply,
-                    invocation_error,
-                    invocation_retryable,
-                    conversation_id,
+                    execution_ids, triggers, reply, invocation_error,
+                    invocation_retryable, conversation_id,
                 )
-            except Exception as _mark_err:
-                logger.warning(
-                    f"Failed to finalize trigger executions {execution_ids} for agent {agent_id}: {_mark_err}"
-                )
-        await capacity_stack.aclose()
+            except Exception:
+                logger.exception("Failed to release trigger executions {}", execution_ids)
 
-
-# ── Main Tick Loop ──────────────────────────────────────────────────
 
 __all__ = [name for name in globals() if not name.startswith("__")]

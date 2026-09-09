@@ -148,7 +148,7 @@ async def test_normal_completion_returns_reply():
     assert resp == "正常回复"
 
 
-async def test_external_control_plane_cancel_is_normalized_as_abort():
+async def test_execution_cancellation_without_stop_reaches_durable_root():
     async def _turn():
         await asyncio.sleep(5)
         return "nope"
@@ -160,10 +160,8 @@ async def test_external_control_plane_cancel_is_normalized_as_abort():
         return {}
 
     asyncio.get_running_loop().call_later(0.01, task.cancel)
-    resp, outcome = await _await_turn_with_abort(task, _recv, ["partial"])
-
-    assert outcome == "aborted"
-    assert resp == "partial\n\n*[Generation stopped]*"
+    with pytest.raises(asyncio.CancelledError):
+        await _await_turn_with_abort(task, _recv, ["partial"])
 
 
 async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatch):
@@ -227,7 +225,7 @@ async def test_completed_commit_wins_cancel_race_and_still_sends_done(monkeypatc
     )
 
     assert disposition == "continue"
-    assert save_calls[0] == save_calls[1]
+    assert len(save_calls) == 1
     assert handler.conversation[-1] == {
         "role": "assistant",
         "content": "completed reply",

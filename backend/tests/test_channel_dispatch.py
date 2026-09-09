@@ -383,3 +383,21 @@ async def test_cancelled_turn_runs_error_reaction_before_reraising():
 
     assert len(errors) == 1
     assert isinstance(errors[0], asyncio.CancelledError)
+
+
+async def test_interrupted_execution_keeps_channel_consumer_alive():
+    from app.services.turn_interruption import TurnInterrupted
+
+    async def interrupted():
+        raise TurnInterrupted()
+
+    async def next_message():
+        return "next reply"
+
+    reactions = cd.ChannelReactions()
+    assert await cd.run_channel_message(
+        "interrupted-channel", is_command=False, reactions=reactions, work=interrupted,
+    ) == ""
+    assert await cd.run_channel_message(
+        "interrupted-channel", is_command=False, reactions=reactions, work=next_message,
+    ) == "next reply"

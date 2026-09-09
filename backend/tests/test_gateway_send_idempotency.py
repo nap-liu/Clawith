@@ -10,6 +10,8 @@ from sqlalchemy import func, select
 from app.api import gateway as gateway_api
 from app.database import async_session, engine
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.gateway_message import GatewayMessage, GatewaySendReceipt
 from app.models.org import AgentAgentRelationship, AgentRelationship
 from app.models.tenant import Tenant
@@ -171,6 +173,16 @@ async def test_native_agent_send_is_scheduled_once_and_conflict_safe(monkeypatch
         await asyncio.sleep(0)
     assert results[0] == results[1]
     assert calls == 1
+    # Accepted work survives a process exit before the model starts.
+    async with async_session() as db:
+        anchor = await db.scalar(select(ChatMessage).where(
+            ChatMessage.message_meta["execution_agent_id"].as_string() == str(target_id),
+            ChatMessage.role == "user",
+        ))
+        assert anchor is not None
+        assert anchor.message_meta["turn_status"] == "running"
+        session = await db.get(ChatSession, uuid.UUID(anchor.conversation_id))
+        assert session.im_config["conversation_turn"]["turn_anchor_id"] == str(anchor.id)
     await _assert_conflicting_payload_rejected(api_key, target_id, "agent_id", key)
 
 

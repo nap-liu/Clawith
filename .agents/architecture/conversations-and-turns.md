@@ -33,12 +33,14 @@ force. An independently executing Agent cannot hold another Turn's Python GIL
 or ingress event loop. Shared host capacity, storage, provider quotas and the
 external sandbox remain the existing platform dependencies.
 
-An unexpected child exit yields the normalized `agent_execution_unavailable`
-failure, without automatically replaying tools or failing over. Explicit
-cancellation reaps the child process group, and Linux parent-death signalling
-prevents orphan execution after supervisor exit. `AGENT_EXECUTION_ISOLATION=1`
-enables the boundary; the switch can be disabled for rollback or in-process
-contract tests.
+An unexpected child exit during an admitted durable Turn raises
+`TurnInterrupted`; entry points preserve that anchor for the shared recovery
+owner instead of writing a model failure. Invocations without a durable anchor
+retain the normalized `agent_execution_unavailable` failure. Neither outcome
+starts model failover. Explicit cancellation reaps the child process group, and
+Linux parent-death signalling prevents orphan execution after supervisor exit.
+`AGENT_EXECUTION_ISOLATION=1` enables the boundary; the switch can be disabled
+for rollback or in-process contract tests.
 
 Independent background work is acknowledged by the supervisor before the
 originating Turn can exit. It uses the existing task/schedule/wake/recovery
@@ -77,6 +79,82 @@ original durable origin, anchor, and generation remain current; completion,
 STOP, or replacement ends the wait. The original owner may renew normally, and
 only its release or lease expiry permits recovery. Waiting never holds a database
 transaction, steals a lease, or blocks recovery of another conversation.
+
+### Durable background admission and recovery
+
+Platform-hosted Trigger, Task, Schedule, heartbeat and oneshot executions persist a real
+`ChatSession`, input anchor, generation and business reference before dispatch.
+Manual execution and auto-executing task creation commit this admission before
+returning acceptance. Background sessions reuse the non-human `trigger` source
+with no Session `user_id`; the anchor preserves the execution principal without
+attributing the input to a human sender. `background_execution.kind` identifies
+the business adapter rather than introducing new channel identities.
+
+Automatic Task creation saves the Task, its TaskLog and its turn anchor in one
+transaction. Context preparation happens before inserting the Task; Web, IM,
+API and tool entry points cannot acknowledge or dispatch a half-admitted task.
+
+`background_execution` stores the existing business reference, model and memory
+settings, completion data, and finalization/delivery markers. Task runs use
+`TaskLog.id`; a Schedule occurrence has a stable identity derived from that
+schedule and its due time. Its anchor and schedule counters/next due time commit
+atomically. Recovery continues that occurrence without resetting the schedule
+or creating a second run. Fixed task prompts may be preserved through the shared
+`prepared_turn_context` option; adapters do not own separate model/tool loops.
+
+`run_background_turn` uses `resume_startup_anchor` and `resume_turn` for both
+initial execution and recovery, then the ordinary channel/LLM caller. The
+conversation lease covers recovery writes, tool materialization, model execution
+and finalization. Workload capacity is acquired once by the execution owner;
+native Gateway admission must not retain another permit around this path.
+Foreground Web/H5, IM and MCP keep their transport behavior and ordinary
+admission while converging on the same durable recovery core. Subagent/project
+execution retains its existing business claimant; the generic scanner excludes
+subagent Sessions. Deterministic supervision reminders remain delivery operations.
+
+Normal and recovered background completion share the same per-kind finalizer.
+The terminal reply, business state and finalization marker commit together;
+later reconciliation only finishes missing business writes or delivery. Trigger
+completion owns webhook consumption; Task completion owns task status/logs;
+Schedule completion owns successful manual counters; oneshot completion owns
+its notification; heartbeat completion owns its activity record. Heartbeat
+admission atomically saves the input and consumed inbox snapshot with its
+occurrence timestamp. It has no independent model/tool loop.
+STOP and service interruption do not consume a webhook batch.
+A stopped Task may be made available for an explicit new run, but its cancelled
+anchor is never automatically reopened. Durable failed replies preserve their
+typed failure code when returned to callers.
+
+Startup and the existing trigger worker tick share recovery discovery. Current
+Session Turn pointers, unfinished background completion and pending terminal
+delivery are authoritative; new durable turns have no age-based recovery cutoff.
+The three partial indexes `ix_chat_sessions_active_turn`,
+`ix_chat_messages_background_unfinished` and `ix_chat_messages_terminal_pending`
+support those queries. This adds no table, execution engine, recovery retry
+count, recovery deadline or source restriction. Existing provider and workload
+policies remain authoritative. Waiting for confirmation or project runtime
+availability must not be bypassed by making another execution.
+
+Losing a durable model invocation's conversation lease raises the same
+`TurnInterrupted` signal as process loss. It must not become a business failure
+or allow an old owner to write the new owner's terminal result. Confirmation
+continuations use the original anchor's execution identity and completion owner;
+background continuations cannot bypass their business finalizer to send a second
+reply. A2A confirmation storage uses the canonical Session owner while execution
+and reply attribution retain the actual peer Agent.
+
+The rollback snapshot helper reuses these same discovery and execution owners
+for only its recorded root IDs and generations, including terminal delivery
+tails. It reports business failure, unresolved confirmation and incomplete
+finalization explicitly. Its scoped invocation does not start a promoted Turn
+outside that snapshot; ordinary application completion still starts the next
+Turn by default. This helper does not make legacy background workers compatible
+with the new admission metadata.
+
+This recovery change covers platform-hosted execution only. External OpenClaw
+runtime and recovery protocols are outside this iteration; native recovery does
+not execute their work locally. A native employee receiving a Gateway message
+is still covered by the platform's ordinary durable execution contract.
 
 A provider response that sends no bytes within the selected model's request
 timeout ends as `model_response_idle_timeout`. This failure never triggers an

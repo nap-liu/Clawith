@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.services.subagent_runtime_shared import *  # noqa: F401,F403
 from app.services.subagent_runtime_tools import prepare_subagent_tools
 from app.services.turn_tool_settings import restore_turn_tool_settings
+from app.services.turn_interruption import TurnInterrupted
 from app.services.subagent_runtime_worker_claim import _claim_subagent
 from app.services.subagent_runtime_worker_resume import _finish_subagent_turn
 
@@ -426,7 +427,7 @@ async def execute_claimed_subagent(
             active_turn_capacity = None
             if terminal:
                 return
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, TurnInterrupted) as interruption:
         try:
             from app.services.active_turns import is_current_turn_cancel_requested
 
@@ -471,7 +472,8 @@ async def execute_claimed_subagent(
                     await cancel_db.commit()
         except Exception as exc:  # noqa: BLE001 - lease expiry remains the fallback
             logger.warning(f"[subagent] cancelled run release deferred run={run_id}: {exc}")
-        raise
+        if isinstance(interruption, asyncio.CancelledError):
+            raise
     except Exception as exc:  # noqa: BLE001 - durable worker failure boundary
         logger.exception(f"[subagent] execution failed run={run_id}: {exc}")
         if current_anchor_id is not None:

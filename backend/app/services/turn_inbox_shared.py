@@ -16,6 +16,7 @@ CHANNEL_RECEIPT_STARTUP_MAX_BATCHES = 512
 TURN_INBOX_CHANNELS = frozenset(
     {
         "web",
+        "mcp",
         "miniprogram",
         "wechat_miniprogram",
         "agent",

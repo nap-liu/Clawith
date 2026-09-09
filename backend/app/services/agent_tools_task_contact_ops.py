@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 import uuid
 
@@ -128,21 +127,25 @@ async def _manage_tasks(
                 supervision_channel=(resolved_target.channel if resolved_target else None),
                 remind_schedule=args.get("remind_schedule"),
             )
-            db.add(task)
-            await db.commit()
-            await db.refresh(task)
-
             if task_type == "todo":
-                # Trigger auto-execution for todo tasks
                 from app.services.agent_execution.bridge import dispatch_background
+                from app.services.task_executor import prepare_created_task_turn
 
-                await dispatch_background(
-                    "app.services.task_executor:execute_task", task.id, agent_id, task.execution_user_id,
-                )
+                anchor = await prepare_created_task_turn(db, task)
+                await db.commit()
+                if anchor is not None:
+                    anchor_id = anchor.id
+                    await dispatch_background("app.services.background_turns:run_background_turn", anchor_id)
                 await _sync_tasks_to_file(agent_id, ws)
+                if anchor is None:
+                    from app.services.llm.failure_outcome import render_message
+
+                    return f"✅ Task created: {title} — {render_message('background.unavailable')}"
                 return f"✅ Task created: {title} — auto-execution started"
             else:
                 # Supervision task — reminder engine will pick it up
+                db.add(task)
+                await db.commit()
                 target = resolved_target.display_name if resolved_target else "unknown"
                 schedule = args.get("remind_schedule", "not set")
                 await _sync_tasks_to_file(agent_id, ws)

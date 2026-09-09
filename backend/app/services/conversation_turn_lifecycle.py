@@ -482,6 +482,10 @@ async def publish_conversation_turn_event(
             str(conversation_id),
             with_turn_envelope(payload, snapshot, event_kind=event_kind),
         )
+        if event_kind == "turn_terminal" and payload.get("message_id"):
+            from app.services.turn_delivery_recovery import acknowledge_terminal_event
+
+            await acknowledge_terminal_event(payload["message_id"])
     except Exception:  # noqa: BLE001 - observer transport must not affect durable state
         # A web observer is optional for IM/background turns. Durable state is
         # authoritative and reconnecting clients recover it from the snapshot.
@@ -495,6 +499,7 @@ async def publish_committed_turn_terminal(
     turn_anchor_id: uuid.UUID,
     message_id: uuid.UUID | None,
     content: str,
+    resume_promoted_turn: bool = True,
 ) -> None:
     """Publish terminal state after a caller-owned transaction has committed."""
 
@@ -524,6 +529,8 @@ async def publish_committed_turn_terminal(
         snapshot=snapshot,
         event_kind="turn_terminal",
     )
+    if not resume_promoted_turn:
+        return
     try:
         from app.services.turn_inbox import kick_promoted_turn_inbox
 

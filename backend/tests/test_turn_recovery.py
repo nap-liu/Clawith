@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import json as json
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -14,14 +14,15 @@ from sqlalchemy import delete, select, text
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
-from app.models.channel_config import ChannelConfig
+from app.models.channel_config import ChannelConfig as ChannelConfig
 from app.models.chat_session import ChatSession
-from app.models.identity import IdentityProvider
+from app.models.identity import IdentityProvider as IdentityProvider
 from app.models.llm import LLMModel
-from app.models.org import OrgMember
+from app.models.org import OrgMember as OrgMember
 from app.models.participant import Participant  # noqa: F401
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
+from app.services import turn_recovery_dispatch, turn_recovery_scanner
 
 pytestmark = pytest.mark.asyncio
 
@@ -228,6 +229,36 @@ async def _make_user_anchor(agent_id, user_id, *, conv: str, content: str = "mes
         return row.id
 
 
+async def _make_durable_anchor(agent_id, user_id, *, status="running", age_hours=0):
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
+
+    async with async_session() as db:
+        session = ChatSession(agent_id=agent_id, user_id=user_id, source_channel="web")
+        db.add(session)
+        await db.flush()
+        row = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            role="user",
+            content="durable input",
+            conversation_id=str(session.id),
+            created_at=datetime.now(UTC) - timedelta(hours=age_hours),
+        )
+        db.add(row)
+        await db.flush()
+        await transition_conversation_turn(
+            db, agent_id=agent_id, conversation_id=str(session.id),
+            turn_anchor_id=row.id, status="running",
+        )
+        if status != "running":
+            await transition_conversation_turn(
+                db, agent_id=agent_id, conversation_id=str(session.id),
+                turn_anchor_id=row.id, status=status,
+            )
+        await db.commit()
+        return row
+
+
 @pytest.mark.parametrize("injection_kind", ["subagent", "im"])
 async def test_recovery_anchor_allows_different_sender_inside_same_execution_scope(
     monkeypatch,
@@ -319,68 +350,35 @@ async def test_recovery_anchor_rejects_cross_execution_scope(changed_attr):
     assert await _find_turn_anchor_for_latest(_DB(), projection) is None
 
 
-async def test_startup_recovery_scans_recent_incomplete_message_tails(monkeypatch):
-    """Recovery scans recent message tails whose current user turn has no final assistant reply."""
+async def test_startup_recovery_scans_durable_owners_without_an_age_cutoff(monkeypatch):
+    """Old unfinished owners remain eligible; completed owners do not rerun."""
     from app.services import turn_recovery
-    from app.services.chat_history import persist_pending_confirmation
 
     agent_id, user_id = await _make_agent_with_model()
-    old_anchor = await _make_user_anchor(agent_id, user_id, conv=f"old_{uuid.uuid4().hex}", content="old")
-    async with async_session() as db:
-        old = (await db.execute(select(ChatMessage).where(ChatMessage.id == old_anchor))).scalar_one()
-        old.created_at = datetime.now(timezone.utc) - timedelta(hours=7)
-        await db.commit()
-
-    complete_conv = f"complete_{uuid.uuid4().hex}"
-    complete_anchor = await _make_user_anchor(agent_id, user_id, conv=complete_conv, content="complete")
-    async with async_session() as db:
-        complete_user = (await db.execute(select(ChatMessage).where(ChatMessage.id == complete_anchor))).scalar_one()
-        complete_user.created_at = datetime.now(timezone.utc) - timedelta(minutes=5)
-        db.add(
-            ChatMessage(
-                agent_id=agent_id,
-                user_id=user_id,
-                conversation_id=complete_conv,
-                role="assistant",
-                content="complete reply",
-                created_at=datetime.now(timezone.utc) - timedelta(minutes=4),
-            )
-        )
-        await db.commit()
-
-    pending_conv = f"pending_{uuid.uuid4().hex}"
-    pending_anchor = await _make_user_anchor(agent_id, user_id, conv=pending_conv, content="needs approval")
-    await persist_pending_confirmation(
-        async_session,
-        agent_id=agent_id,
-        user_id=user_id,
-        conversation_id=pending_conv,
-        name="request_confirmation",
-        args={"title": "确认", "summary": "等待"},
-        turn_anchor_id=pending_anchor,
-    )
-    first_anchor = await _make_user_anchor(agent_id, user_id, conv=f"first_{uuid.uuid4().hex}", content="first")
-    second_anchor = await _make_user_anchor(agent_id, user_id, conv=f"second_{uuid.uuid4().hex}", content="second")
+    old_anchor = await _make_durable_anchor(agent_id, user_id, age_hours=7)
+    await _make_durable_anchor(agent_id, user_id, status="completed")
+    first_anchor = await _make_durable_anchor(agent_id, user_id)
+    second_anchor = await _make_durable_anchor(agent_id, user_id)
     resumed: list[uuid.UUID] = []
 
     async def fake_resume(anchor):
         resumed.append(anchor.id)
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
-    assert resumed == [first_anchor, second_anchor]
-    assert stats.scanned == 2
-    assert stats.resumed == 2
+    assert resumed == [old_anchor.id, first_anchor.id, second_anchor.id]
+    assert stats.scanned == 3
+    assert stats.resumed == 3
 
     resumed.clear()
     stats = await turn_recovery.startup_turn_resume_once(limit=2)
 
-    assert resumed == [first_anchor, second_anchor]
-    assert stats.scanned == 2
-    assert stats.resumed == 2
+    assert resumed == [old_anchor.id, first_anchor.id, second_anchor.id]
+    assert stats.scanned == 3
+    assert stats.resumed == 3
 
 
 async def test_startup_scan_does_not_drop_recoverable_tail_after_two_hundred_complete_conversations(
@@ -415,18 +413,10 @@ async def test_startup_scan_does_not_drop_recoverable_tail_after_two_hundred_com
                     ),
                 ]
             )
-        target = ChatMessage(
-            agent_id=agent_id,
-            user_id=user_id,
-            conversation_id=f"recover-after-200-{uuid.uuid4().hex}",
-            role="user",
-            content="must still recover",
-            created_at=now - timedelta(seconds=1),
-        )
-        rows.append(target)
         db.add_all(rows)
         await db.commit()
-        target_id = target.id
+    target = await _make_durable_anchor(agent_id, user_id)
+    target_id = target.id
 
     resumed: list[uuid.UUID] = []
 
@@ -434,7 +424,7 @@ async def test_startup_scan_does_not_drop_recoverable_tail_after_two_hundred_com
         resumed.append(anchor.id)
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
     assert resumed == [target_id]
@@ -496,7 +486,7 @@ async def test_startup_scan_prefers_durable_owner_over_newer_queued_user(monkeyp
         resumed.append(anchor.id)
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
     assert resumed == [owner_id]
@@ -505,8 +495,8 @@ async def test_startup_scan_prefers_durable_owner_over_newer_queued_user(monkeyp
     assert stats.resumed == 1
 
 
-async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(monkeypatch):
-    """Restart recovery is inferred from recent saved message order, not explicit turn markers."""
+async def test_explicit_legacy_scan_can_recover_a_markerless_tail(monkeypatch):
+    """The legacy scanner remains callable without joining normal discovery."""
     from app.services import turn_recovery
 
     agent_id, user_id = await _make_agent_with_model()
@@ -540,11 +530,12 @@ async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(
         )
         await db.commit()
 
-    stats = await turn_recovery.startup_turn_resume_once(limit=10)
+    async with async_session() as db:
+        anchors = await turn_recovery_scanner._load_recoverable_anchors(db, include_legacy=True)
+    assert len(anchors) == 1
+    resumed = await turn_recovery_dispatch.resume_startup_anchor(anchors[0])
 
-    assert stats.scanned == 1
-    assert stats.resumed == 1
-    assert stats.failed == 0
+    assert resumed is True
     assert deliveries == [(agent_id, conv, "markerless recovered")]
     async with async_session() as db:
         rows = (
@@ -565,27 +556,27 @@ async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(
 async def test_startup_scan_skips_cancelled_turn(monkeypatch):
     """A durable /stop marker must survive restart and suppress recovery."""
     from app.services import turn_recovery
-    from app.services.chat_history import mark_latest_incomplete_turn_cancelled
+    from app.services.conversation_turn_lifecycle import cancel_current_conversation_turn
 
     agent_id, user_id = await _make_agent_with_model()
-    conv = f"cancelled_{uuid.uuid4().hex}"
-    anchor_id = await _make_user_anchor(agent_id, user_id, conv=conv, content="stop this")
+    anchor = await _make_durable_anchor(agent_id, user_id)
+    conv, anchor_id = anchor.conversation_id, anchor.id
 
     async with async_session() as db:
-        marked_id = await mark_latest_incomplete_turn_cancelled(
+        cancelled = await cancel_current_conversation_turn(
             db,
             agent_id=agent_id,
             conversation_id=conv,
-            reason="stop",
         )
         await db.commit()
 
-    assert marked_id == anchor_id
+    assert cancelled.anchor_id == anchor_id
+    assert cancelled.status == "cancelled"
 
     async def fail_if_resumed(_anchor):
         raise AssertionError("cancelled turns must not be resumed after restart")
 
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fail_if_resumed)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fail_if_resumed)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=10)
 
@@ -594,7 +585,6 @@ async def test_startup_scan_skips_cancelled_turn(monkeypatch):
     async with async_session() as db:
         anchor = await db.get(ChatMessage, anchor_id)
     assert anchor.message_meta["turn_status"] == "cancelled"
-    assert anchor.message_meta["cancel_reason"] == "stop"
 
 
 async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatch):
@@ -612,11 +602,14 @@ async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatc
     await reset_active_turns_for_testing()
     owner_id = uuid.uuid4()
     agent_id = uuid.uuid4()
-    anchors = [SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())]
+    anchors = [
+        SimpleNamespace(id=uuid.uuid4(), conversation_id=str(uuid.uuid4()), role="user")
+        for _ in range(2)
+    ]
     first_ready = asyncio.Event()
     resumed_ids: list[uuid.UUID] = []
 
-    async def fake_load(_db):
+    async def fake_load(_db, **_kwargs):
         return anchors
 
     async def fake_resume(anchor):
@@ -632,11 +625,11 @@ async def test_stopping_one_startup_recovery_turn_keeps_batch_running(monkeypatc
             await asyncio.Event().wait()
         return True
 
-    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_scanner, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
 
     scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=2))
-    await first_ready.wait()
+    await asyncio.wait_for(first_ready.wait(), timeout=2)
     records = await list_active_turns(owner_user_id=owner_id)
     record = next(item for item in records if item.session_id == str(anchors[0].id))
     await cancel_active_turn(record.turn_id, owner_user_id=owner_id)
@@ -656,7 +649,7 @@ async def test_startup_recovery_starts_every_eligible_anchor_in_parallel(monkeyp
     from app.services import turn_recovery
 
     anchors = [
-        SimpleNamespace(id=uuid.uuid4())
+        SimpleNamespace(id=uuid.uuid4(), conversation_id=str(uuid.uuid4()), role="user")
         for _ in range(4)
     ]
     first_wave_ready = asyncio.Event()
@@ -664,7 +657,7 @@ async def test_startup_recovery_starts_every_eligible_anchor_in_parallel(monkeyp
     in_flight = 0
     peak_in_flight = 0
 
-    async def fake_load(_db):
+    async def fake_load(_db, **_kwargs):
         return anchors
 
     async def fake_resume(_anchor):
@@ -679,8 +672,8 @@ async def test_startup_recovery_starts_every_eligible_anchor_in_parallel(monkeyp
         finally:
             in_flight -= 1
 
-    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_scanner, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
 
     scanner = asyncio.create_task(
         turn_recovery.startup_turn_resume_once(limit=len(anchors))
@@ -703,10 +696,13 @@ async def test_startup_recovery_failure_does_not_cancel_siblings(monkeypatch):
 
     from app.services import turn_recovery
 
-    anchors = [SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4())]
+    anchors = [
+        SimpleNamespace(id=uuid.uuid4(), conversation_id=str(uuid.uuid4()), role="user")
+        for _ in range(2)
+    ]
     successful_anchor = asyncio.Event()
 
-    async def fake_load(_db):
+    async def fake_load(_db, **_kwargs):
         return anchors
 
     async def fake_resume(anchor):
@@ -715,8 +711,8 @@ async def test_startup_recovery_failure_does_not_cancel_siblings(monkeypatch):
         successful_anchor.set()
         return True
 
-    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_scanner, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=2)
     assert successful_anchor.is_set()

@@ -366,6 +366,9 @@ async def lifespan(fastapi_app: FastAPI):
 
     yield
 
+    from app.services.turn_recovery_dispatch import cancel_recovery_dispatch
+
+    await cancel_recovery_dispatch()
     turn_recovery_task = getattr(fastapi_app.state, "turn_recovery_task", None)
     if turn_recovery_task and not turn_recovery_task.done():
         turn_recovery_task.cancel()

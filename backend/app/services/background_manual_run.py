@@ -130,6 +130,7 @@ async def run_background_resource(
 
     now = datetime.now(UTC)
     execution_id = None
+    anchor_id = None
     if resource_type == "trigger":
         execution, created = await enqueue_trigger_execution(
             db,
@@ -143,6 +144,32 @@ async def run_background_resource(
         if not created or execution is None:
             raise BackgroundManualRunConflict("Trigger run could not be queued")
         execution_id = execution.id
+    elif resource_type == "task" and item.type != "supervision":
+        from app.services.task_executor import prepare_task_turn
+
+        # Finish identity assignment before loading workspace context. Acceptance
+        # is returned only after the resulting run and audit commit below.
+        await db.commit()
+        anchor = await prepare_task_turn(db, item.id, agent_id, actor_user_id)
+        if anchor is None:
+            from app.services.llm.failure_outcome import render_message
+
+            raise BackgroundManualRunConflict(render_message("background.unavailable"))
+        anchor_id = anchor.id
+        execution_id = uuid.UUID(anchor.message_meta["background_execution"]["reference_id"])
+    elif resource_type == "schedule":
+        from app.services.scheduler import prepare_schedule_turn
+
+        anchor = await prepare_schedule_turn(
+            db, item.id, agent_id, item.instruction, actor_user_id,
+            item.model_id, item.temperature, item.reasoning_effort, item.soul, item.memory,
+        )
+        if anchor is None:
+            from app.services.llm.failure_outcome import render_message
+
+            raise BackgroundManualRunConflict(render_message("background.unavailable"))
+        anchor_id = anchor.id
+        execution_id = uuid.UUID(anchor.message_meta["background_execution"]["reference_id"])
 
     name_column = _RESOURCE_MODELS[resource_type][1]
     resource_name = getattr(item, name_column.key)
@@ -162,21 +189,10 @@ async def run_background_resource(
 
     from app.services.agent_execution.bridge import dispatch_background
 
-    if resource_type == "task":
+    if anchor_id is not None:
+        await dispatch_background("app.services.background_turns:run_background_turn", anchor_id)
+    elif resource_type == "task":
         await dispatch_background("app.services.task_executor:execute_task", item.id, agent_id, actor_user_id)
-    elif resource_type == "schedule":
-        await dispatch_background(
-            "app.services.background_manual_run:_execute_and_track_schedule",
-            item.id,
-            agent_id,
-            item.instruction,
-            actor_user_id,
-            item.model_id,
-            item.temperature,
-            item.reasoning_effort,
-            item.soul,
-            item.memory,
-        )
 
     return BackgroundManualRunResult(
         resource_type=resource_type,
@@ -197,19 +213,18 @@ async def _execute_and_track_schedule(
     soul: bool = True,
     memory: bool = True,
 ) -> None:
-    """Persist manual counters only after a successful schedule execution."""
-    from app.database import async_session
-    from app.services.scheduler import ScheduleExecutionOutcome, _execute_schedule
+    """Dispatch one manual occurrence; its durable finalizer owns counters."""
+    from app.services.scheduler import _execute_schedule
 
     if model_id is None and temperature is None and reasoning_effort is None and soul and memory:
-        outcome = await _execute_schedule(
+        await _execute_schedule(
             schedule_id,
             agent_id,
             instruction,
             execution_user_id,
         )
     else:
-        outcome = await _execute_schedule(
+        await _execute_schedule(
             schedule_id,
             agent_id,
             instruction,
@@ -220,15 +235,6 @@ async def _execute_and_track_schedule(
             soul,
             memory,
         )
-    if outcome is not ScheduleExecutionOutcome.SUCCEEDED:
-        return
-    async with async_session() as db:
-        schedule = await db.scalar(select(AgentSchedule).where(AgentSchedule.id == schedule_id).with_for_update())
-        if schedule is None:
-            return
-        schedule.last_run_at = datetime.now(UTC)
-        schedule.run_count = (schedule.run_count or 0) + 1
-        await db.commit()
 
 
 async def handle_run_background_resource(

@@ -325,14 +325,23 @@ final sample and protected identifier snapshot immediately before replacement;
 open ingress can admit additional work after a GO sample, which must be included
 in post-cutover verification.
 
-Startup recovery is not a guarantee that every background invocation continues.
-Triggers without a durable generation/origin cannot pass the normal recovery
+For releases predating durable background admission, startup recovery is not a
+guarantee that every background invocation continues. Triggers without a durable generation/origin cannot pass the normal recovery
 fence; shutdown may leave their executions durably `failed`. For a permitted
 short-interruption release, record such failures, verify subsequent scheduled
 executions, and distinguish them from recovered human turns. Do not blindly
 replay an invocation that already performed tools or sent external output.
 If even one missed background invocation is unacceptable, wait for its actual
 `processing` work to drain or use a separately tested continuity topology.
+
+Platform-hosted background turns admitted under the unified durable contract
+resume through the shared turn owner, including business finalization and
+delivery. Verify both the outgoing version's admission and the incoming
+version's recovery behavior; new code cannot reconstruct inputs an old version
+never persisted. Binary rollback must also account for unfinished background
+anchors and terminal delivery tails. Schema compatibility alone does not prove
+that an old worker can safely own these states. External OpenClaw execution
+remains outside the native recovery contract.
 
 The standard single-replica Compose replacement may cause a brief interruption.
 It is permitted only when the release record explicitly authorizes that policy.
@@ -461,6 +470,12 @@ claims new turns accepted by the old roles after replacement. Verify each
 selected anchor's terminal/suspended
 state and delivery; a skipped/failed anchor is not a successful handoff. Keep the
 candidate image available for any unresolved continuation or suspended tool.
+The helper also covers fixed-identity terminal tails. It does not start newly
+promoted turns outside the snapshot; business failure, waiting confirmation,
+incomplete delivery/finalization and superseded identities return a nonzero
+result. This is not a compatibility adapter for legacy background workers: do
+not start a legacy owner over unfinished new background state merely because
+the helper exists or the schema is additive.
 Only after checking that no unfinished explicit continuation remains, restore
 the previous startup-recovery setting in canonical compose without restarting
 roles. Do not use a second concurrent recovery implementation or rewrite audit

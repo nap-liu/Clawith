@@ -194,7 +194,7 @@ async def test_control_plane_cancel_is_terminal_not_requeued(monkeypatch):
 
     monkeypatch.setattr(channel_llm, "_call_agent_llm", fake_call)
     worker = asyncio.create_task(runtime.execute_claimed_subagent(run.id))
-    await ready.wait()
+    await asyncio.wait_for(ready.wait(), timeout=5)
     record = (await list_active_turns(owner_user_id=user_id))[0]
     await cancel_active_turn(record.turn_id, owner_user_id=user_id)
     with pytest.raises(asyncio.CancelledError):
@@ -635,3 +635,37 @@ async def test_subagent_finish_waits_for_reserved_stop_before_mutating_anchor():
     assert fresh_anchor.message_meta["subagent_input_state"] == "processing"
     assert terminal_reply is None
     await reset_active_turns_for_testing()
+
+
+async def test_execution_process_loss_requeues_same_subagent_turn(monkeypatch):
+    from app.services.turn_interruption import TurnInterrupted
+
+    agent_id, user_id, parent_id, anchor_id = await _make_context()
+    run, _ = await runtime.create_subagent(
+        agent_id=agent_id, execution_user_id=user_id,
+        parent_session_id=str(parent_id), origin_tool_call_id="interrupted-child",
+        task="resume original child", mode="async", turn_anchor_id=anchor_id,
+    )
+    assert await runtime._claim_subagent(run.id) == run.id
+
+    async def no_tools(*_args, **_kwargs):
+        return []
+
+    async def interrupted(*_args, **_kwargs):
+        raise TurnInterrupted()
+
+    monkeypatch.setattr(runtime, "prepare_subagent_tools", no_tools)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", interrupted)
+    await runtime.execute_claimed_subagent(run.id)
+    async with async_session() as db:
+        stored = await db.get(SubagentRun, run.id)
+        assert stored.status == runtime.RUN_QUEUED
+        assert stored.lease_owner is None
+        child = await db.get(ChatSession, run.id)
+        current = child.im_config["conversation_turn"]
+        assert current["status"] == "running"
+        original_anchor = current["turn_anchor_id"]
+    assert await runtime._claim_subagent(run.id) == run.id
+    async with async_session() as db:
+        child = await db.get(ChatSession, run.id)
+        assert child.im_config["conversation_turn"]["turn_anchor_id"] == original_anchor

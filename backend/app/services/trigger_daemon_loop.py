@@ -45,6 +45,9 @@ async def _load_enabled_triggers() -> list[AgentTrigger]:
 
 async def _tick():
     """One daemon tick: evaluate all triggers, group by agent, invoke."""
+    from app.services.turn_recovery_dispatch import dispatch_recovery_candidates
+
+    await dispatch_recovery_candidates()
     new_trace_id()
     now = datetime.now(timezone.utc)
 
@@ -239,7 +242,13 @@ async def wake_agent_with_context(
         last_fired_at=now,
         fire_count=0,
     )
-    asyncio.create_task(_invoke_agent_for_triggers(agent_id, [dummy_trigger]))
+    # The wake is accepted only after its original input is durable. The
+    # supervisor then starts the same executor used by every recovered turn.
+    anchor_id = await _invoke_agent_for_triggers(agent_id, [dummy_trigger], admit_only=True)
+    if anchor_id is not None:
+        from app.services.agent_execution.bridge import dispatch_background
+
+        await dispatch_background("app.services.background_turns:run_background_turn", anchor_id)
 
 
 async def start_trigger_daemon():

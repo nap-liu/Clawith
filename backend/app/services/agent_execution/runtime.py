@@ -170,6 +170,10 @@ def isolate_agent_execution(func):
             return await run_isolated(entrypoint, arguments, agent_id=agent_id)
         except ExecutionProcessError as exc:
             logger.error("[agent_execution] failed agent={} session={}: {}", agent_id, session_id, exc)
+            if arguments.get("turn_anchor_id"):
+                from app.services.turn_interruption import TurnInterrupted
+
+                raise TurnInterrupted(str(exc)) from exc
             return make_llm_failure(
                 code="agent_execution_unavailable", message_key="errors.agentExecutionUnavailable",
             )

@@ -192,9 +192,8 @@ async def await_turn_with_abort_impl(
             disconnected = True
             break
 
-    if llm_task.cancelled():
-        aborted = True
-
+    # Only an accepted STOP is an abort. Supervisor shutdown cancellation
+    # propagates to the root, which checks the durable STOP before finalizing.
     if aborted:
         try:
             await llm_task

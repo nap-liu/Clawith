@@ -216,6 +216,8 @@ def _merge_delivery_into_meta(message_meta: dict | None, result: IMDeliveryResul
         return attach_delivery_to_meta(current_meta, result)
 
     incoming = result.to_meta()
+    if "origin" in current:
+        incoming["origin"] = current["origin"]
     if not incoming.get("channel"):
         incoming["channel"] = str(current.get("channel") or "")
     combined: list[dict[str, Any]] = []

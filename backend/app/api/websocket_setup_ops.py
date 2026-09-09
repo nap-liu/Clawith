@@ -6,6 +6,10 @@ from __future__ import annotations
 async def safe_send_impl(api, self, payload: dict):
     try:
         await api.manager.send_to_session(str(self.agent_id), self.conv_id, payload)
+        if payload.get("event_kind") == "turn_terminal" and payload.get("message_id"):
+            from app.services.turn_delivery_recovery import acknowledge_terminal_event
+
+            await acknowledge_terminal_event(payload["message_id"])
     except Exception:
         pass
 

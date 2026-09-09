@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import turn_recovery
+from app.services import turn_recovery, turn_recovery_dispatch, turn_recovery_scanner
 from app.services.workload_capacity import WorkloadKind
 
 pytestmark = pytest.mark.asyncio
@@ -39,32 +39,19 @@ class _FakeDatabaseSession:
         return SimpleNamespace(scalar_one_or_none=lambda: self._agent)
 
 
-class _FakeRedisLease:
-    def __init__(self, resource: str, *, namespace: str) -> None:
-        assert resource == turn_recovery.STARTUP_RECOVERY_LEASE_RESOURCE
-        assert namespace == "turn-recovery"
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-
 async def test_startup_scan_closes_database_before_resuming_turn(monkeypatch):
     """The cross-replica gate and recovered turns never retain the scan session."""
 
     sessions: list[_FakeDatabaseSession] = []
-    anchor = SimpleNamespace(id=uuid.uuid4())
+    anchor = SimpleNamespace(id=uuid.uuid4(), conversation_id=str(uuid.uuid4()), role="user")
 
-    monkeypatch.setattr(turn_recovery, "RedisLeaseLock", _FakeRedisLease)
     monkeypatch.setattr(
-        turn_recovery,
+        turn_recovery_dispatch,
         "async_session",
         lambda: _FakeDatabaseSession(sessions),
     )
 
-    async def fake_load(db):
+    async def fake_load(db, **_kwargs):
         assert db.active is True
         return [anchor]
 
@@ -74,8 +61,15 @@ async def test_startup_scan_closes_database_before_resuming_turn(monkeypatch):
         assert all(session.active is False for session in sessions)
         return True
 
-    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    async def fake_cleanup(**_kwargs):
+        return 0
+
+    monkeypatch.setattr(
+        "app.services.turn_inbox.cleanup_stale_channel_receipt_anchors", fake_cleanup,
+    )
+
+    monkeypatch.setattr(turn_recovery_scanner, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=1)
 
@@ -94,6 +88,7 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
         agent_id=uuid.uuid4(),
         user_id=uuid.uuid4(),
         conversation_id=str(uuid.uuid4()),
+        message_meta={},
     )
     origin = turn_recovery._RecoveryOrigin(False, None, None)
     agent = SimpleNamespace(
@@ -198,6 +193,7 @@ async def test_resume_turn_admits_background_work_without_holding_database(monke
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_llm)
     monkeypatch.setattr(turn_recovery, "persist_assistant_reply_row", fake_persist)
     monkeypatch.setattr(turn_recovery, "_deliver_recovered_reply", fake_deliver)
+    monkeypatch.setattr(turn_recovery, "_kick_recovered_promoted_turn", fake_publish)
     monkeypatch.setattr(turn_recovery, "load_turn_runtime", fake_runtime)
     monkeypatch.setattr(
         "app.services.conversation_turn_lifecycle.get_conversation_turn_snapshot",

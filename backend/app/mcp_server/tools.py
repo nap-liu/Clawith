@@ -33,6 +33,8 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.services import session_query as sq
+from app.services.turn_interruption import TurnInterrupted
+from app.services.llm.failure_outcome import render_message
 
 # ── Shared text constants ────────────────────────────────────────────────────
 
@@ -551,19 +553,20 @@ async def chat_with_agent(  # noqa: D401
             is_group=False,
         )
 
-        # Persist the user message and update session timestamp.
-        turn_anchor = ChatMessage(
-            agent_id=target_agent_id,
-            user_id=user.id,
-            role="user",
-            content=message,
-            conversation_id=conv_id,
-            created_at=datetime.now(timezone.utc),
+        # Input and the ordinary Turn admission share one transaction.
+        from app.services.chat_history import ingest_incoming_chat_message
+
+        ingested = await ingest_incoming_chat_message(
+            db, session=sess, agent_id=target_agent_id, user_id=user.id,
+            content=message, source_channel=sess.source_channel,
         )
-        db.add(turn_anchor)
-        await db.flush()
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
+        if ingested.blocked_by_confirmation:
+            return render_message("chat.confirmationRequired")
+        turn_anchor = ingested.message
+        if ingested.consumed_by_onmessage:
+            return render_message("turn.recovering")
 
         # Mirror the inbound message to any web client watching this session.
         await broadcast_channel_user_message(
@@ -589,19 +592,22 @@ async def chat_with_agent(  # noqa: D401
 
         # Execute the LLM call.  recovery_hint=None disables the IM-specific
         # "/new 开启新对话" suffix on error replies — not applicable for MCP.
-        reply = await _call_agent_llm(
-            db,
-            target_agent_id,
-            message,
-            session_id=conv_id,
-            user_id=user.id,
-            history=history,
-            on_tool_call=on_tool_call,
-            is_group=False,
-            recovery_hint=None,
-            turn_anchor_id=turn_anchor.id,
-            turn_type="mcp",
-        )
+        try:
+            reply = await _call_agent_llm(
+                db,
+                target_agent_id,
+                message,
+                session_id=conv_id,
+                user_id=user.id,
+                history=history,
+                on_tool_call=on_tool_call,
+                is_group=False,
+                recovery_hint=None,
+                turn_anchor_id=turn_anchor.id,
+                turn_type="mcp",
+            )
+        except TurnInterrupted:
+            return render_message("turn.recovering")
 
     # Persist the assistant reply in its own session so created_at is stamped
     # AFTER the tool-call rows, keeping the message order correct.

@@ -2,25 +2,20 @@
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.api import gateway as gateway_api
-from app.database import async_session, engine
+from app.database import async_session
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.gateway_message import GatewayMessage, GatewaySendReceipt
-from app.models.llm import LLMModel
-from app.models.org import AgentAgentRelationship
-from app.models.tenant import Tenant
-from app.models.user import Identity, User
 from app.schemas.schemas import GatewaySendMessageRequest
 from app.services.workload_capacity import (
-    WorkloadCapacity,
     WorkloadKind,
 )
 from app.services.redis_lease_lock import (
@@ -30,7 +25,7 @@ from app.services.redis_lease_lock import (
 )
 from gateway_workload_capacity_support import (
     _capacity,
-    _dispose_engine_between_cases,
+    _dispose_engine_between_cases,  # noqa: F401 - pytest autouse fixture
     _native_background_args,
     _seed_native_pair,
 )
@@ -62,7 +57,7 @@ async def test_gateway_same_creator_different_execution_agent_queues_next_turn(
         source_event_id=f"gateway-identity-{uuid.uuid4()}",
     )
     first = asyncio.create_task(gateway_api._send_to_agent_background(*first_args))
-    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await asyncio.wait_for(first_started.wait(), timeout=5)
 
     async with async_session() as db:
         session = await db.scalar(
@@ -518,28 +513,13 @@ async def test_native_gateway_lease_failure_remains_durably_recoverable(
         raise lease_error
 
     monkeypatch.setattr("app.services.llm.call_llm_with_failover", fail_call_llm)
-    scheduled: list[ChatMessage] = []
-    lease_released = False
-
-    class FakeLease:
-        async def release(self):
-            nonlocal lease_released
-            lease_released = True
-
-    monkeypatch.setattr(
-        gateway_api,
-        "_schedule_gateway_turn_recovery",
-        scheduled.append,
-    )
     args = await _native_background_args(
         source_id,
         target_id,
         content="recover this accepted gateway message",
         source_event_id=f"gateway-recovery-{uuid.uuid4()}",
     )
-    await gateway_api._run_gateway_native_turn_with_lease(FakeLease(), *args)
-    assert lease_released is True
-    assert len(scheduled) == 1
+    await gateway_api._send_to_agent_background(*args)
 
     async with async_session() as db:
         session = await db.scalar(
@@ -554,7 +534,10 @@ async def test_native_gateway_lease_failure_remains_durably_recoverable(
         assert snapshot.status == "running" and snapshot.anchor_id is not None
         anchor = await db.get(ChatMessage, snapshot.anchor_id)
         assert anchor is not None
-        assert scheduled[0].id == anchor.id
+        from app.services.turn_recovery_scanner import _load_recoverable_anchors
+
+        candidates = await _load_recoverable_anchors(db, include_legacy=False)
+        assert anchor.id in {candidate.id for candidate in candidates}
 
     async def recovered_llm(*_args, **_kwargs):
         return "recovered gateway reply"
@@ -571,7 +554,7 @@ async def test_native_gateway_lease_failure_remains_durably_recoverable(
         fail_gateway_outbox,
     )
     with pytest.raises(ConnectionError):
-        await turn_recovery.resume_turn(anchor)
+        await turn_recovery.resume_startup_anchor(anchor)
     async with async_session() as db:
         failed_session = await db.get(ChatSession, session.id)
         terminal_reply = await db.scalar(
@@ -588,7 +571,7 @@ async def test_native_gateway_lease_failure_remains_durably_recoverable(
         "_upsert_gateway_direct_reply",
         real_upsert,
     )
-    assert await turn_recovery.resume_turn(anchor) is True
+    assert await turn_recovery.resume_startup_anchor(anchor) is True
 
     async with async_session() as db:
         session = await db.get(ChatSession, session.id)
@@ -604,7 +587,7 @@ async def test_native_gateway_lease_failure_remains_durably_recoverable(
 
 
 @pytest.mark.asyncio
-async def test_native_gateway_turn_uses_project_tenant_capacity_without_db_held_wait(
+async def test_native_gateway_turn_uses_shared_tenant_capacity_without_db_held_wait(
     monkeypatch,
 ) -> None:
     api_key, target_id, tenant_id, _source_id = await _seed_native_pair()
@@ -614,24 +597,26 @@ async def test_native_gateway_turn_uses_project_tenant_capacity_without_db_held_
     async with async_session() as request_db:
 
         class InspectingCapacity:
-            async def acquire(self, kind, resolved_tenant_id):
+            @asynccontextmanager
+            async def slot(self, kind, resolved_tenant_id):
                 assert not request_db.in_transaction()
-                return await capacity.acquire(kind, resolved_tenant_id)
+                async with capacity.slot(kind, resolved_tenant_id):
+                    yield
 
         monkeypatch.setattr(
-            gateway_api,
-            "get_workload_capacity",
+            "app.services.turn_recovery.get_workload_capacity",
             lambda: InspectingCapacity(),
         )
 
-        async def fake_background(*_args):
+        async def fake_provider(**_kwargs):
             snapshot = await capacity.snapshot()
-            assert snapshot.categories[WorkloadKind.PROJECT.value].active == 1
+            assert snapshot.categories[WorkloadKind.BACKGROUND.value].active == 1
             assert snapshot.categories[WorkloadKind.INTERACTIVE.value].active == 0
             assert snapshot.tenants[str(tenant_id)].active == 1
             started.set()
+            return "capacity reply"
 
-        monkeypatch.setattr(gateway_api, "_send_to_agent_background", fake_background)
+        monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_provider)
         response = await gateway_api.send_message(
             GatewaySendMessageRequest(agent_id=target_id, content="capacity admitted"),
             x_api_key=api_key,
@@ -641,43 +626,37 @@ async def test_native_gateway_turn_uses_project_tenant_capacity_without_db_held_
 
     assert response["status"] == "accepted"
     await asyncio.wait_for(started.wait(), timeout=1)
-    for _ in range(20):
-        snapshot = await capacity.snapshot()
-        if snapshot.global_capacity.active == 0:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*gateway_api._background_tasks), timeout=2)
+    snapshot = await capacity.snapshot()
     assert snapshot.global_capacity.active == 0
-    assert snapshot.categories[WorkloadKind.PROJECT.value].completed_total == 1
+    assert snapshot.categories[WorkloadKind.BACKGROUND.value].completed_total == 1
 
 
 @pytest.mark.asyncio
-async def test_native_gateway_overload_returns_durable_retryable_503_before_acceptance(
+async def test_native_gateway_accepts_under_capacity_pressure_and_recovers_same_anchor(
     monkeypatch,
 ) -> None:
     api_key, target_id, tenant_id, source_id = await _seed_native_pair()
     capacity = _capacity(timeout_seconds=0.01)
     blocker = await capacity.acquire(WorkloadKind.PROJECT, tenant_id)
-    monkeypatch.setattr(gateway_api, "get_workload_capacity", lambda: capacity)
+    monkeypatch.setattr("app.services.turn_recovery.get_workload_capacity", lambda: capacity)
     calls = 0
 
-    async def fake_background(*_args):
+    async def fake_provider(**_kwargs):
         nonlocal calls
         calls += 1
+        return "accepted work recovered"
 
-    monkeypatch.setattr(gateway_api, "_send_to_agent_background", fake_background)
-    body = GatewaySendMessageRequest(agent_id=target_id, content="capacity rejected")
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_provider)
+    body = GatewaySendMessageRequest(agent_id=target_id, content="capacity deferred")
     idempotency_key = f"gateway-overload-{uuid.uuid4()}"
 
     async with async_session() as db:
-        with pytest.raises(HTTPException) as exc_info:
-            await gateway_api.send_message(
-                body,
-                x_api_key=api_key,
-                x_idempotency_key=idempotency_key,
-                db=db,
-            )
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.detail["retryable"] is True
+        accepted = await gateway_api.send_message(
+            body, x_api_key=api_key, x_idempotency_key=idempotency_key, db=db,
+        )
+    assert accepted["status"] == "accepted"
+    await asyncio.wait_for(asyncio.gather(*gateway_api._background_tasks), timeout=2)
     assert calls == 0
 
     async with async_session() as db:
@@ -689,43 +668,52 @@ async def test_native_gateway_overload_returns_durable_retryable_503_before_acce
         )
         assert receipt is not None
         assert receipt.status == "completed"
-        assert receipt.response_payload["__http_status"] == 503
-        assert receipt.response_payload["detail"]["retryable"] is True
-
-        with pytest.raises(HTTPException) as replay_exc:
-            await gateway_api.send_message(
-                body,
-                x_api_key=api_key,
-                x_idempotency_key=idempotency_key,
-                db=db,
-            )
-    assert replay_exc.value.status_code == 503
-    assert replay_exc.value.detail["code"] == "gateway_capacity_busy"
+        assert receipt.response_payload == accepted
+        replay = await gateway_api.send_message(
+            body, x_api_key=api_key, x_idempotency_key=idempotency_key, db=db,
+        )
+        anchors = list(await db.scalars(select(ChatMessage).where(
+            ChatMessage.role == "user",
+            ChatMessage.message_meta["gateway_direct_reply"]["agent_id"].as_string() == str(source_id),
+        )))
+    assert replay == accepted
+    assert len(anchors) == 1 and anchors[0].message_meta["turn_status"] == "running"
     assert calls == 0
 
     snapshot = await capacity.snapshot()
-    assert snapshot.categories[WorkloadKind.PROJECT.value].rejected_total == 1
+    assert snapshot.categories[WorkloadKind.BACKGROUND.value].rejected_total == 1
     await blocker.release()
+    from app.services.turn_recovery_startup import resume_startup_anchor
+
+    assert await resume_startup_anchor(anchors[0]) is True
+    assert calls == 1
+    async with async_session() as db:
+        reply = await db.get(GatewayMessage, uuid.UUID(anchors[0].message_meta["gateway_direct_reply"]["message_id"]))
+        assert reply.content == "accepted work recovered"
 
 
 @pytest.mark.asyncio
-async def test_concurrent_native_gateway_turns_respect_project_capacity(
+async def test_concurrent_native_gateway_inputs_share_one_execution_capacity(
     monkeypatch,
 ) -> None:
     api_key, target_id, tenant_id, _source_id = await _seed_native_pair()
     capacity = _capacity(timeout_seconds=0.01)
-    monkeypatch.setattr(gateway_api, "get_workload_capacity", lambda: capacity)
+    monkeypatch.setattr("app.services.turn_recovery.get_workload_capacity", lambda: capacity)
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     calls = 0
 
-    async def fake_background(*_args):
+    injected = []
+
+    async def fake_provider(**kwargs):
         nonlocal calls
         calls += 1
         first_started.set()
         await release_first.wait()
+        injected.extend(await kwargs["before_round"](0))
+        return "merged gateway reply"
 
-    monkeypatch.setattr(gateway_api, "_send_to_agent_background", fake_background)
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_provider)
 
     async with async_session() as first_db:
         first_response = await gateway_api.send_message(
@@ -738,28 +726,23 @@ async def test_concurrent_native_gateway_turns_respect_project_capacity(
     await asyncio.wait_for(first_started.wait(), timeout=1)
 
     async with async_session() as second_db:
-        with pytest.raises(HTTPException) as second_exc:
-            await gateway_api.send_message(
-                GatewaySendMessageRequest(agent_id=target_id, content="second turn"),
-                x_api_key=api_key,
-                x_idempotency_key=None,
-                db=second_db,
-            )
-    assert second_exc.value.status_code == 503
-    assert second_exc.value.detail["retryable"] is True
+        second_response = await gateway_api.send_message(
+            GatewaySendMessageRequest(agent_id=target_id, content="second turn"),
+            x_api_key=api_key, x_idempotency_key=None, db=second_db,
+        )
+    assert second_response["status"] == "accepted"
     assert calls == 1
 
     snapshot = await capacity.snapshot()
-    assert snapshot.categories[WorkloadKind.PROJECT.value].active == 1
-    assert snapshot.categories[WorkloadKind.PROJECT.value].high_watermark == 1
-    assert snapshot.categories[WorkloadKind.PROJECT.value].rejected_total == 1
+    assert snapshot.categories[WorkloadKind.BACKGROUND.value].active == 1
+    assert snapshot.categories[WorkloadKind.BACKGROUND.value].high_watermark == 1
+    assert snapshot.categories[WorkloadKind.BACKGROUND.value].rejected_total == 0
     assert snapshot.tenants[str(tenant_id)].active == 1
 
     release_first.set()
-    for _ in range(20):
-        snapshot = await capacity.snapshot()
-        if snapshot.global_capacity.active == 0:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*gateway_api._background_tasks), timeout=2)
+    snapshot = await capacity.snapshot()
     assert snapshot.global_capacity.active == 0
-    assert snapshot.categories[WorkloadKind.PROJECT.value].completed_total == 1
+    assert snapshot.categories[WorkloadKind.BACKGROUND.value].completed_total == 1
+    assert calls == 1 and len(injected) == 1
+    assert "second turn" in injected[0]["content"]

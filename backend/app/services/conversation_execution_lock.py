@@ -11,7 +11,7 @@ from functools import wraps
 from inspect import signature
 from typing import Any, ParamSpec, TypeVar
 
-from app.services.redis_lease_lock import redis_lease_lock
+from app.services.redis_lease_lock import RedisLeaseError, redis_lease_lock
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -93,10 +93,17 @@ def serialize_conversation_execution(
         durable_agent_id = bound.arguments.get(
             "turn_anchor_agent_id"
         ) or bound.arguments.get("agent_id")
-        async with conversation_execution_lock(
-            agent_id=durable_agent_id,
-            session_id=bound.arguments.get("session_id"),
-        ):
-            return await func(*args, **kwargs)
+        try:
+            async with conversation_execution_lock(
+                agent_id=durable_agent_id,
+                session_id=bound.arguments.get("session_id"),
+            ):
+                return await func(*args, **kwargs)
+        except RedisLeaseError as exc:
+            if bound.arguments.get("turn_anchor_id"):
+                from app.services.turn_interruption import TurnInterrupted
+
+                raise TurnInterrupted(str(exc)) from exc
+            raise
 
     return _wrapped

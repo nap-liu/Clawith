@@ -1,12 +1,14 @@
 """Mechanical continuation of startup turn-recovery tests."""
 
 import pytest
+from app.services import turn_recovery_dispatch, turn_recovery_scanner
 
 from tests.test_turn_recovery import (
     ChatMessage,
     ChatSession,
     _dispose_engine_between_tests,  # noqa: F401 - pytest autouse fixture
     _make_agent_with_model,
+    _make_durable_anchor,
     _make_user_anchor,
     async_session,
     asyncio,
@@ -25,10 +27,10 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
 
     from app.services import turn_recovery
 
-    anchor = SimpleNamespace(id=uuid.uuid4())
+    anchor = SimpleNamespace(id=uuid.uuid4(), conversation_id=str(uuid.uuid4()), role="user")
     recovery_started = asyncio.Event()
 
-    async def fake_load(_db):
+    async def fake_load(_db, **_kwargs):
         return [anchor]
 
     async def fake_resume(_anchor):
@@ -36,19 +38,20 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
         await asyncio.Event().wait()
         return True
 
-    monkeypatch.setattr(turn_recovery, "_load_recoverable_anchors", fake_load)
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fake_resume)
+    monkeypatch.setattr(turn_recovery_scanner, "_load_recoverable_anchors", fake_load)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fake_resume)
 
     scanner = asyncio.create_task(turn_recovery.startup_turn_resume_once(limit=1))
     await asyncio.wait_for(recovery_started.wait(), timeout=1)
     scanner.cancel()
     with pytest.raises(asyncio.CancelledError):
         await scanner
+    await turn_recovery_dispatch.cancel_recovery_dispatch()
 
     async def resumed_after_shutdown(_anchor):
         return True
 
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", resumed_after_shutdown)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", resumed_after_shutdown)
     retry_stats = await asyncio.wait_for(
         turn_recovery.startup_turn_resume_once(limit=1),
         timeout=1,
@@ -58,20 +61,30 @@ async def test_scanner_shutdown_cancels_children_and_releases_global_lock(monkey
 
 
 async def test_concurrent_startup_scanners_resume_one_durable_turn_once(monkeypatch):
-    """The global batch lock and durable assistant boundary prevent duplicate recovery."""
+    """Repeated discovery still executes and publishes one durable reply."""
     from app.services import turn_recovery
 
     agent_id, user_id = await _make_agent_with_model()
-    conversation_id = f"dual_scanner_{uuid.uuid4().hex}"
-    anchor_id = await _make_user_anchor(
-        agent_id,
-        user_id,
-        conv=conversation_id,
-        content="recover exactly once",
-    )
+    anchor = await _make_durable_anchor(agent_id, user_id)
+    conversation_id, anchor_id = anchor.conversation_id, anchor.id
     deliveries: list[uuid.UUID] = []
+    terminal_events: list[uuid.UUID] = []
+    provider_calls = 0
+    from app.services import conversation_turn_lifecycle
+
+    original_publish = conversation_turn_lifecycle.publish_conversation_turn_event
+
+    async def observe_terminal(**kwargs):
+        payload = kwargs.get("payload") or {}
+        if kwargs.get("agent_id") == agent_id and payload.get("type") == "done":
+            terminal_events.append(uuid.UUID(str(payload["message_id"])))
+        return await original_publish(**kwargs)
+
+    monkeypatch.setattr(conversation_turn_lifecycle, "publish_conversation_turn_event", observe_terminal)
 
     async def fake_llm(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
         await asyncio.sleep(0)
         return "one recovered reply"
 
@@ -91,9 +104,12 @@ async def test_concurrent_startup_scanners_resume_one_durable_turn_once(monkeypa
         turn_recovery.startup_turn_resume_once(limit=10),
     )
 
-    assert sorted((first.scanned, second.scanned)) == [0, 1]
+    assert 1 <= first.scanned + second.scanned <= 2
+    assert first.failed + second.failed == 0
     assert first.resumed + second.resumed == 1
-    assert len(deliveries) == 1
+    assert provider_calls == 1
+    assert len(terminal_events) == 1
+    assert deliveries == []  # The published Web event already acknowledged delivery.
     async with async_session() as db:
         assistant_rows = (
             await db.execute(
@@ -300,7 +316,7 @@ async def test_startup_scan_skips_archived_channel_session(monkeypatch):
     async def fail_if_resumed(_anchor):
         raise AssertionError("archived sessions must not be resumed after restart")
 
-    monkeypatch.setattr(turn_recovery, "resume_startup_anchor", fail_if_resumed)
+    monkeypatch.setattr(turn_recovery_dispatch, "resume_startup_anchor", fail_if_resumed)
 
     stats = await turn_recovery.startup_turn_resume_once(limit=10)
 
@@ -311,6 +327,7 @@ async def test_startup_scan_skips_archived_channel_session(monkeypatch):
 async def test_startup_scan_recovers_any_channel_tail_without_adapter(monkeypatch):
     """Startup recovery must resume every channel's unfinished turn tail."""
     from app.services import turn_recovery
+    from app.services.conversation_turn_lifecycle import transition_conversation_turn
 
     agent_id, user_id = await _make_agent_with_model()
     async with async_session() as db:
@@ -324,8 +341,7 @@ async def test_startup_scan_recovers_any_channel_tail_without_adapter(monkeypatc
         db.add(session)
         await db.flush()
         conv = str(session.id)
-        db.add(
-            ChatMessage(
+        anchor = ChatMessage(
                 agent_id=agent_id,
                 user_id=user_id,
                 conversation_id=conv,
@@ -333,6 +349,11 @@ async def test_startup_scan_recovers_any_channel_tail_without_adapter(monkeypatc
                 content="feishu should recover too",
                 created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
             )
+        db.add(anchor)
+        await db.flush()
+        await transition_conversation_turn(
+            db, agent_id=agent_id, conversation_id=conv,
+            turn_anchor_id=anchor.id, status="running",
         )
         await db.commit()
 

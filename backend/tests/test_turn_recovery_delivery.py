@@ -3,34 +3,34 @@
 import pytest
 
 from tests.test_turn_recovery import (
-    UTC,
-    Agent,
+    UTC as UTC,
+    Agent as Agent,
     ChannelConfig,
     ChatMessage,
     ChatSession,
-    IdentityProvider,
-    OrgMember,
-    SimpleNamespace,
-    User,
-    _dispose_engine_between_tests,
+    IdentityProvider as IdentityProvider,
+    OrgMember as OrgMember,
+    SimpleNamespace as SimpleNamespace,
+    User as User,
+    _dispose_engine_between_tests,  # noqa: F401 - pytest autouse fixture
     _make_agent_with_model,
-    _make_user_anchor,
+    _make_user_anchor as _make_user_anchor,
     asyncio,
     async_session,
     datetime,
-    delete,
-    engine,
+    delete as delete,
+    engine as engine,
     json,
     select,
-    text,
+    text as text,
     timedelta,
     timezone,
     uuid,
 )
 
 pytestmark = pytest.mark.asyncio
-async def test_new_waits_for_locked_recovery_delivery(monkeypatch):
-    """The route generation cannot change between final validation and send."""
+async def test_new_can_archive_during_delivery_and_prevents_redelivery(monkeypatch):
+    """Network waits release the DB; an archived route cannot be delivered again."""
     from app.services import channel_commands, turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
@@ -65,8 +65,10 @@ async def test_new_waits_for_locked_recovery_delivery(monkeypatch):
     delivery_entered = asyncio.Event()
     allow_delivery = asyncio.Event()
     delivery_finished = asyncio.Event()
+    delivery_calls = []
 
     async def fake_deliver(**_kwargs):
+        delivery_calls.append(_kwargs)
         delivery_entered.set()
         await allow_delivery.wait()
         delivery_finished.set()
@@ -102,18 +104,24 @@ async def test_new_waits_for_locked_recovery_delivery(monkeypatch):
             return result
 
     archive_task = asyncio.create_task(archive_session())
-    await asyncio.sleep(0.05)
-    assert archive_task.done() is False
+    result = await asyncio.wait_for(archive_task, timeout=2)
+    assert result["action"] == "new_session"
+    assert delivery_finished.is_set() is False
 
     allow_delivery.set()
     assert await asyncio.wait_for(delivery_task, timeout=2) is True
     assert delivery_finished.is_set()
-    result = await asyncio.wait_for(archive_task, timeout=2)
-    assert result["action"] == "new_session"
 
     async with async_session() as db:
         session = await db.get(ChatSession, uuid.UUID(conv))
     assert "__archived_" in session.external_conv_id
+    assert await turn_recovery._deliver_recovered_reply(
+        anchor,
+        expected_origin=expected_origin,
+        reply="serialized reply",
+        execution_agent_id=agent_id,
+    ) is False
+    assert len(delivery_calls) == 1
 
 
 async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeypatch):
@@ -616,3 +624,124 @@ async def test_resume_turn_never_reexecutes_ambiguous_external_send(monkeypatch)
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
     assert "Recovery blocked automatic replay" in payloads[1]["result"]
+
+
+@pytest.mark.parametrize("channel", ["dingtalk", "web"])
+async def test_pending_terminal_delivery_survives_next_turn_without_model_replay(monkeypatch, channel):
+    from app.services.chat_history import ingest_incoming_chat_message, persist_assistant_reply_row
+    from app.services.im_delivery import IMDeliveryResult, IMDeliveryPart, attach_delivery_to_meta
+    from app.services.turn_recovery_scanner import _load_recoverable_anchors
+    from app.services.turn_recovery_startup import resume_startup_anchor
+    from app.services import turn_runtime, turn_recovery
+
+    agent_id, user_id = await _make_agent_with_model()
+    async with async_session() as db:
+        session = ChatSession(agent_id=agent_id, user_id=user_id, title="Delivery recovery",
+                              source_channel=channel, external_conv_id="dingtalk_group_original" if channel == "dingtalk" else None)
+        db.add(session)
+        await db.flush()
+        original = await ingest_incoming_chat_message(
+            db, session=session, agent_id=agent_id, user_id=user_id,
+            content="original input", source_channel=channel,
+        )
+        await db.commit()
+        final_id = await persist_assistant_reply_row(
+            db, agent_id=agent_id, user_id=user_id, conversation_id=str(session.id),
+            content="committed reply", turn_anchor_id=original.message.id,
+            message_meta=attach_delivery_to_meta({}, IMDeliveryResult.pending(channel)),
+        )
+        await db.commit()
+        following = await ingest_incoming_chat_message(
+            db, session=session, agent_id=agent_id, user_id=user_id,
+            content="next input", source_channel=channel,
+        )
+        await db.commit()
+        candidates = await _load_recoverable_anchors(db, include_legacy=False)
+        final = next(row for row in candidates if row.id == final_id)
+        following_id = following.message.id
+        session_id = session.id
+
+    sends = []
+    async def provider_send(*, runtime, message, **_kwargs):
+        sends.append((runtime.external_conv_id, message))
+        return IMDeliveryResult.sent("dingtalk", IMDeliveryPart("dingtalk_openapi", "remote-1"))
+
+    async def forbidden_model(*_args, **_kwargs):
+        raise AssertionError("a committed reply must never re-enter the model")
+
+    async def publish_web(_agent, _session, payload):
+        sends.append(("web", payload["content"]))
+
+    from app.api.websocket import manager
+    monkeypatch.setattr(manager, "send_to_session", publish_web)
+    monkeypatch.setattr(turn_runtime, "deliver_message_with_receipt", provider_send)
+    monkeypatch.setattr(turn_recovery, "_call_agent_llm", forbidden_model)
+    assert await resume_startup_anchor(final)
+    assert not await resume_startup_anchor(final)
+    assert sends == [("dingtalk_group_original" if channel == "dingtalk" else "web", "committed reply")]
+    async with async_session() as db:
+        stored = await db.get(ChatMessage, final_id)
+        assert stored.message_meta["delivery"]["status"] == "sent"
+        session = await db.get(ChatSession, session_id)
+        assert session.im_config["conversation_turn"]["turn_anchor_id"] == str(following_id)
+        assert session.im_config["conversation_turn"]["status"] == "running"
+
+
+async def test_background_web_terminal_receipt_remains_owned_by_trigger(monkeypatch):
+    from app.api.websocket import manager
+    from app.services import background_turns, turn_recovery
+    from app.services.chat_history import ingest_incoming_chat_message, persist_assistant_reply_row
+    from app.services.turn_recovery_scanner import _load_recoverable_anchors
+    from app.services.turn_recovery_startup import resume_startup_anchor
+
+    agent_id, user_id = await _make_agent_with_model()
+    async with async_session() as db:
+        session = ChatSession(agent_id=agent_id, user_id=user_id, title="Background Web",
+                              source_channel="web")
+        db.add(session)
+        await db.flush()
+        admitted = await ingest_incoming_chat_message(
+            db, session=session, agent_id=agent_id, user_id=user_id,
+            content="on_message event", source_channel="web",
+        )
+        anchor = admitted.message
+        await background_turns.initialize_background_turn(
+            db, session=session, anchor=anchor, kind="trigger", reference_id=uuid.uuid4(),
+            completion={"origin": True, "triggers": [{"type": "on_message", "config": {}}]},
+        )
+        await db.commit()
+        reply_id = await persist_assistant_reply_row(
+            db, agent_id=agent_id, user_id=user_id, conversation_id=str(session.id),
+            content="background reply", turn_anchor_id=anchor.id,
+        )
+        reply = await db.get(ChatMessage, reply_id)
+        await background_turns._finalize(db, anchor, reply)
+        await db.commit()
+        assert reply.message_meta["delivery"]["status"] == "pending"
+        assert not anchor.message_meta["background_execution"]["delivered"]
+        anchor_id = anchor.id
+
+    events = []
+    async def publish(_agent, _session, payload):
+        events.append(payload)
+
+    async def forbidden_model(*_args, **_kwargs):
+        raise AssertionError("terminal background delivery must not rerun the model")
+
+    monkeypatch.setattr(manager, "send_to_session", publish)
+    monkeypatch.setattr(turn_recovery, "_call_agent_llm", forbidden_model)
+    async with async_session() as db:
+        candidates = await _load_recoverable_anchors(db, include_legacy=False)
+        candidate = next(row for row in candidates if row.id == anchor_id)
+    assert await resume_startup_anchor(candidate)
+    assert len(events) == 1
+    assert events[0]["message_id"] == str(reply_id)
+    async with async_session() as db:
+        current = await db.get(ChatMessage, anchor_id)
+        reply = await db.get(ChatMessage, reply_id)
+        assert current.message_meta["background_execution"]["delivered"] is True
+        assert reply.message_meta["delivery"]["status"] == "sent"
+        candidates = await _load_recoverable_anchors(db, include_legacy=False)
+        assert not any(row.id in {anchor_id, reply_id} for row in candidates)
+    assert await resume_startup_anchor(current)
+    assert len(events) == 1

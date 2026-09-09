@@ -1,6 +1,5 @@
 """Background work follows its last user mutation and freezes active-run snapshots."""
 
-import asyncio
 import uuid
 
 import pytest
@@ -13,7 +12,7 @@ from app.api.agents import get_agent_permission_members
 from app.api.schedules import ScheduleUpdate, trigger_schedule, update_schedule
 from app.api.tasks import update_task
 from app.api.triggers import TriggerUpdate, list_agent_triggers, update_trigger
-from app.database import async_session, engine
+from app.database import async_session
 from app.models.agent import Agent, AgentPermission
 from app.models.schedule import AgentSchedule
 from app.models.audit import AuditLog, ChatMessage
@@ -22,9 +21,12 @@ from app.models.task import Task, TaskLog
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
-from app.models.user import Identity, User
+from app.models.user import User
 from app.schemas.schemas import TaskUpdate
-from execution_identity_support import _dispose_engine_between_cases, _user
+from execution_identity_support import (
+    _dispose_engine_between_cases as _dispose_engine_between_cases,
+    _user,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -326,7 +328,7 @@ async def test_manual_schedule_run_aligns_execution_user_to_current_user(monkeyp
             creator_id=creator.id,
             name=f"Schedule Run Agent {suffix}",
             access_mode="company",
-            status="idle",
+            status="running",
         )
         db.add(agent)
         await db.flush()
@@ -343,16 +345,17 @@ async def test_manual_schedule_run_aligns_execution_user_to_current_user(monkeyp
 
     captured: dict[str, object] = {}
 
-    async def _capture(*args):
-        captured["args"] = args
+    async def _capture(_entrypoint, anchor_id):
+        async with async_session() as db:
+            anchor = await db.get(ChatMessage, anchor_id)
+            captured["execution_user_id"] = anchor.user_id
 
-    monkeypatch.setattr("app.services.scheduler._execute_schedule", _capture)
+    monkeypatch.setattr("app.services.agent_execution.bridge.dispatch_background", _capture)
     async with async_session() as db:
         operator = await db.get(User, operator.id)
         result = await trigger_schedule(agent.id, schedule.id, operator, db)
         assert result["status"] == "triggered"
-        await asyncio.sleep(0)
-        assert captured["args"][3] == operator.id
+        assert captured["execution_user_id"] == operator.id
         assert (await db.get(AgentSchedule, schedule.id)).execution_user_id == operator.id
 
 

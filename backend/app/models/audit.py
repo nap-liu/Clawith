@@ -97,6 +97,18 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index(
+            "ix_chat_messages_terminal_pending", "created_at", "id",
+            postgresql_where=text(
+                "role = 'assistant' AND message_meta->'delivery'->>'status' = 'pending' "
+                "AND message_meta->>'turn_status' IN ('completed','failed','cancelled')"
+            ),
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_chat_messages_background_unfinished",
+            "created_at", "id",
+            postgresql_where=text("message_meta->'background_execution'->>'delivered' = 'false'"),
+        ).ddl_if(dialect="postgresql"),
+        Index(
             "ix_chat_messages_subagent_dispatch_pending",
             "created_at", "id",
             postgresql_where=text("(message_meta->>'subagent_dispatch_state') = 'pending'"),

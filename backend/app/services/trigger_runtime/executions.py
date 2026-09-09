@@ -23,8 +23,10 @@ async def mark_trigger_executions_completed(execution_ids: list[uuid.UUID]) -> N
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)).with_for_update())
         for execution in result.scalars().all():
+            if execution.status in {"completed", "failed", "cancelled"}:
+                continue
             execution.status = "completed"
             execution.finished_at = datetime.now(timezone.utc)
             execution.lease_owner = None
@@ -37,8 +39,10 @@ async def mark_trigger_executions_failed(execution_ids: list[uuid.UUID], error_t
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)).with_for_update())
         for execution in result.scalars().all():
+            if execution.status in {"completed", "failed", "cancelled"}:
+                continue
             execution.status = "failed"
             execution.finished_at = datetime.now(timezone.utc)
             execution.lease_owner = None
@@ -57,8 +61,10 @@ async def requeue_trigger_executions(execution_ids: list[uuid.UUID], error_text:
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)))
+        result = await db.execute(select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids)).with_for_update())
         for execution in result.scalars().all():
+            if execution.status in {"completed", "failed", "cancelled"}:
+                continue
             execution.status = "pending"
             execution.finished_at = None
             execution.lease_owner = None
@@ -91,14 +97,10 @@ async def _claim_pending_trigger_executions_for_scope(
                         or_(
                             TriggerExecution.source == "manual",
                             AgentTrigger.is_enabled.is_(True),
-                            # A retryable on_message execution may have disabled
-                            # its one-shot base trigger on the first claim.  The
-                            # same execution must still be reclaimable to finish
-                            # deterministic origin delivery.
-                            and_(
-                                TriggerExecution.source == "on_message",
-                                TriggerExecution.started_at.isnot(None),
-                            ),
+                            # The first claim can disable a once/max-fire trigger.
+                            # Continue that admitted execution despite the flag;
+                            # it does not authorize a new scheduled occurrence.
+                            TriggerExecution.started_at.isnot(None),
                         ),
                     ),
                     and_(

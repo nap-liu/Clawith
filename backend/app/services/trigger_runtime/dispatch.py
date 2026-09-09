@@ -122,7 +122,9 @@ async def enqueue_due_trigger(
                 if unfinished is not None:
                     return
 
-            active_since = now.isoformat()
+            # Retain the durable batch identity when inspecting a stale lock.
+            # A cancelled legacy batch must not become a new occurrence.
+            active_since = fresh_cfg.get("_webhook_active_since") or now.isoformat()
             locked_cfg = {
                 **fresh_cfg,
                 "_webhook_active": True,

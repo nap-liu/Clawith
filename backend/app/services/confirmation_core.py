@@ -490,6 +490,12 @@ async def _reenter_loop(
     )
 
     async def _work() -> str:
+        background_anchor = None
+        a2a_anchor = None
+        a2a_origin = None
+        continuation_agent_id = agent_id
+        continuation_user_id = resolving_user_id
+        call_options = {}
         if turn_anchor_id is not None:
             async with async_session() as lifecycle_check_db:
                 from app.models.audit import ChatMessage
@@ -548,27 +554,76 @@ async def _reenter_loop(
                         turn_anchor_id,
                     )
                     return ""
+                if anchor_meta.get("background_execution") or anchor_meta.get("source_channel") == "agent":
+                    from app.services.background_turns import background_call_options
+                    from app.services.turn_recovery_identity import _validated_execution_agent_id
+
+                    background_anchor = anchor if anchor_meta.get("background_execution") else None
+                    continuation_agent_id = await _validated_execution_agent_id(db, anchor)
+                    if continuation_agent_id is None:
+                        raise PermissionError("Confirmation execution identity changed")
+                    continuation_user_id = anchor.user_id
+                    call_options = {
+                        **background_call_options(anchor),
+                        "storage_agent_id": anchor.agent_id,
+                    }
+                    if background_anchor is None:
+                        from app.services.turn_recovery import _load_recovery_origin
+
+                        a2a_anchor = anchor
+                        a2a_origin = await _load_recovery_origin(db, anchor)
+                        if a2a_origin is None:
+                            return ""
             agent_obj = (
-                await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+                await db.execute(select(AgentModel).where(AgentModel.id == continuation_agent_id))
             ).scalar_one_or_none()
+            if agent_obj is not None and agent_obj.scope == "project":
+                from app.services.agent_runtime_workspace import resolve_agent_runtime_workspace
+                from app.services.project_runtime_boundary import project_agent_runtime_allows
+
+                if not await project_agent_runtime_allows(db, agent_obj):
+                    return ""
+                runtime_session = await db.get(ChatSession, uuid.UUID(str(conversation_id)))
+                call_options["runtime_workspace"] = resolve_agent_runtime_workspace(
+                    agent_id=agent_obj.id, agent_scope=agent_obj.scope,
+                    agent_project_id=agent_obj.project_id, tenant_id=agent_obj.tenant_id,
+                    session_project_id=runtime_session.project_id if runtime_session else None,
+                    session_config=runtime_session.im_config if runtime_session else None,
+                )
             ctx_size = (agent_obj.context_window_size if agent_obj else None) or DEFAULT_CONTEXT_WINDOW_SIZE
             history = await load_history_for_llm(
                 db, agent_id=agent_id, conversation_id=conversation_id, ctx_size=ctx_size
             )
             reply = await _call_agent_llm(
                 db,
-                agent_id,
+                continuation_agent_id,
                 "",
                 session_id=conversation_id,
-                user_id=resolving_user_id,
+                user_id=continuation_user_id,
                 history=history,
                 recovery_hint=None,
                 continue_turn=True,
                 turn_anchor_id=turn_anchor_id,
+                **call_options,
             )
         # An empty reply means the agent suspended AGAIN (chained confirmation) and the new
         # suspend already persisted/delivered everything — nothing to add here.
         if reply and reply.strip():
+            if background_anchor is not None:
+                from app.services.background_turns import complete_background_turn
+
+                await complete_background_turn(
+                    background_anchor, reply=reply, execution_agent_id=continuation_agent_id,
+                )
+                return reply
+            if a2a_anchor is not None:
+                from app.services.turn_recovery import _persist_and_deliver_recovered_reply
+
+                await _persist_and_deliver_recovered_reply(
+                    a2a_anchor, expected_origin=a2a_origin, reply=reply,
+                    execution_agent_id=continuation_agent_id,
+                )
+                return reply
             from app.services.im_delivery import (
                 IMDeliveryResult,
                 attach_delivery_to_meta,
@@ -622,25 +677,22 @@ async def _reenter_loop(
         session = await db.get(ChatSession, uuid.UUID(str(conversation_id)))
         if session is not None and session.agent_id != agent_id:
             raise RuntimeError("Confirmation session changed owner")
-        if session is not None and session.source_channel == "subagent":
-            # Project group members, direct A2A targets, work-item Runs and
-            # restored member generations all execute as durable SubagentRuns.
-            # Resume through that worker so restart recovery, project lifecycle
-            # and parent delivery remain on the canonical path.
-            from app.services.subagent_runtime import (
-                resume_subagent_after_confirmation,
-            )
-
-            await resume_subagent_after_confirmation(
-                session.id,
-                resolved_tool_payload=resolved_tool_payload,
-                child_turn_anchor_id=turn_anchor_id,
-            )
-            return
+        subagent_id = session.id if session is not None and session.source_channel == "subagent" else None
         # Legacy confirmation rows can outlive a deleted/missing ChatSession.
         # Preserve their UUID lock identity; durable sessions use the same
         # canonical external-session key as ordinary channel messages.
         lock_key = chat_session_lock_key(session) if session is not None else str(conversation_id)
+
+    if subagent_id is not None:
+        # Keep the canonical worker and release the read transaction before it runs.
+        from app.services.subagent_runtime import resume_subagent_after_confirmation
+
+        await resume_subagent_after_confirmation(
+            subagent_id,
+            resolved_tool_payload=resolved_tool_payload,
+            child_turn_anchor_id=turn_anchor_id,
+        )
+        return
 
     await run_channel_message(
         lock_key,

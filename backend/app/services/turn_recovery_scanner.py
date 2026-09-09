@@ -1,4 +1,4 @@
-"""Recoverable turn discovery for startup recovery."""
+"""Discover unfinished execution and delivery through durable turn state."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, text
 
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
@@ -22,16 +22,11 @@ from app.services.conversation_turn_lifecycle import (
     conversation_turn_snapshot_for_session,
 )
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
-from app.services.turn_recovery import (
-    _load_recovery_origin,
-    _metadata_int,
-    _recovery_max_age_hours,
-    _tool_payload,
-)
 
 
-async def _load_recoverable_anchors(db) -> list[ChatMessage]:
-    """Snapshot every recoverable turn with activity inside the safety window.
+
+async def _load_recoverable_anchors(db, *, include_legacy: bool = True) -> list[ChatMessage]:
+    """Snapshot durable unfinished work without an execution age cutoff.
 
     A durable session owner is authoritative even when newer user messages are
     queued behind it. The recent message-tail scan remains as a compatibility
@@ -41,6 +36,9 @@ async def _load_recoverable_anchors(db) -> list[ChatMessage]:
     for every eligible turn; the existing workload-capacity layer remains the
     only execution admission boundary.
     """
+    # The public recovery facade re-exports this scanner; import lazily.
+    from app.services.turn_recovery import _load_recovery_origin, _metadata_int, _recovery_max_age_hours
+
     cutoff = datetime.now(UTC) - timedelta(hours=_recovery_max_age_hours())
     latest = (
         select(
@@ -58,13 +56,13 @@ async def _load_recoverable_anchors(db) -> list[ChatMessage]:
         )
         .subquery()
     )
-    result = await db.execute(
-        select(ChatMessage)
-        .join(latest, ChatMessage.id == latest.c.id)
-        .where(latest.c.rn == 1)
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-    )
-    latest_rows = list(result.scalars().all())
+    latest_rows = []
+    if include_legacy:
+        result = await db.execute(
+            select(ChatMessage).join(latest, ChatMessage.id == latest.c.id)
+            .where(latest.c.rn == 1).order_by(ChatMessage.created_at, ChatMessage.id)
+        )
+        latest_rows = list(result.scalars().all())
 
     recent_session_ids: set[uuid.UUID] = set()
     for row in latest_rows:
@@ -73,15 +71,12 @@ async def _load_recoverable_anchors(db) -> list[ChatMessage]:
         except (TypeError, ValueError):
             continue
 
-    sessions: list[ChatSession] = []
-    if recent_session_ids:
-        sessions = list(
-            (
-                await db.execute(
-                    select(ChatSession).where(ChatSession.id.in_(recent_session_ids))
-                )
-            ).scalars()
-        )
+    # Durable unfinished ownership has no age cutoff. The recent tail is only
+    # a fallback for old messages without a lifecycle pointer.
+    sessions = list((await db.execute(select(ChatSession).where(or_(
+        ChatSession.id.in_(recent_session_ids),
+        text("im_config->'conversation_turn'->>'status' IN ('running', 'suspended')"),
+    )))).scalars())
 
     authoritative_sessions: dict[
         tuple[uuid.UUID, str],
@@ -165,10 +160,30 @@ async def _load_recoverable_anchors(db) -> list[ChatMessage]:
             continue
         anchors.append(anchor)
         selected_anchor_ids.add(anchor.id)
+    # A reply can be committed before a legacy finalizer or outbound receipt.
+    # Such tails must be reconciled even though their turn is already terminal.
+    unfinished_completion = list((await db.execute(select(ChatMessage).where(
+        text("message_meta->'background_execution'->>'delivered' = 'false'"),
+    ))).scalars())
+    for anchor in unfinished_completion:
+        if anchor.id not in selected_anchor_ids:
+            anchors.append(anchor)
+            selected_anchor_ids.add(anchor.id)
+    pending_replies = list((await db.execute(select(ChatMessage).where(
+        text("role = 'assistant' AND message_meta->'delivery'->>'status' = 'pending' "
+             "AND message_meta->>'turn_status' IN ('completed','failed','cancelled')"),
+        ChatMessage.message_meta["delivery"]["origin"].is_not(None),
+    ))).scalars())
+    for reply in pending_replies:
+        if reply.id not in selected_anchor_ids:
+            anchors.append(reply)
+            selected_anchor_ids.add(reply.id)
     return sorted(anchors, key=lambda row: (row.created_at, str(row.id)))
 
 
 async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
+    from app.services.turn_recovery import _tool_payload
+
     try:
         session = await db.get(ChatSession, uuid.UUID(str(row.conversation_id)))
     except (TypeError, ValueError):
@@ -253,6 +268,8 @@ async def _find_turn_anchor_for_latest(db, latest_row: ChatMessage) -> ChatMessa
 
 
 async def _tail_has_pending_confirmation(db, anchor: ChatMessage, *, ctx_size: int) -> bool:
+    from app.services.turn_recovery import _tool_payload
+
     rows = await load_recoverable_messages_for_turn(
         db,
         agent_id=anchor.agent_id,

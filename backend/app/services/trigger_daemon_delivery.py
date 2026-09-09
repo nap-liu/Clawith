@@ -181,7 +181,10 @@ async def _finalize_invocation_executions(
             .scalars()
             .all()
         )
+        completed_trigger_ids = set()
         for execution in executions:
+            if execution.status in {"completed", "failed", "cancelled"}:
+                continue
             if valid_conversation_id is not None:
                 execution.conversation_id = valid_conversation_id
             if invocation_error is None:
@@ -198,9 +201,11 @@ async def _finalize_invocation_executions(
                 execution.last_error = invocation_error
             execution.lease_owner = None
             execution.lease_expires_at = None
+            if execution.status in {"completed", "failed"}:
+                completed_trigger_ids.add(execution.trigger_id)
 
         for runtime_trigger in triggers:
-            if runtime_trigger.type != "webhook":
+            if runtime_trigger.type != "webhook" or runtime_trigger.id not in completed_trigger_ids:
                 continue
             stored_trigger = (
                 await db.execute(select(AgentTrigger).where(AgentTrigger.id == runtime_trigger.id).with_for_update())
@@ -244,9 +249,11 @@ class RetryableOnMessageError(RuntimeError):
 def _is_retryable_invocation_error(error: Exception) -> bool:
     """Return whether a durable trigger execution should return to pending."""
 
+    from app.services.conversation_turn_lifecycle import ConversationTurnConflict
+
     return isinstance(
         error,
-        (RetryableOnMessageError, WorkloadOverloadedError, RedisLeaseError),
+        (RetryableOnMessageError, WorkloadOverloadedError, RedisLeaseError, ConversationTurnConflict),
     )
 
 
@@ -332,23 +339,14 @@ async def _resume_origin_session_for_on_message(
     """
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
-    from app.services.channel_dispatch import (
-        ChannelReactions,
-        chat_session_lock_key,
-        run_channel_message,
-    )
-    from app.services.channel_llm import _call_agent_llm
-    from app.services.chat_history import (
-        load_recoverable_history_for_turn,
-        persist_assistant_reply_row,
-    )
+    from app.services.background_turns import initialize_background_turn, run_background_turn
+    from app.services.trigger_turn_completion import trigger_completion_snapshot
 
     cfg = trigger.config if isinstance(trigger.config, dict) else {}
     execution_id = uuid.UUID(str(cfg["_execution_id"]))
     origin_id = uuid.UUID(str(cfg["_origin_session_id"]))
     matched_id = uuid.UUID(str(cfg["_matched_message_id"]))
     anchor_id = uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"anchor:{execution_id}")
-    final_id = uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"final:{execution_id}")
 
     async def _work() -> str:
         async with async_session() as db:
@@ -402,17 +400,6 @@ async def _resume_origin_session_for_on_message(
             # Validate the immutable origin envelope before every retry.  A
             # persisted final from an older session generation must never be
             # delivered after /new rotates the external conversation id.
-            existing_final = await db.get(ChatMessage, final_id)
-            if existing_final is not None:
-                from app.services.llm.failure_outcome import (
-                    MODEL_RESPONSE_IDLE_TIMEOUT_CODE,
-                    model_response_idle_timeout_failure,
-                )
-
-                if (existing_final.message_meta or {}).get("error_code") == MODEL_RESPONSE_IDLE_TIMEOUT_CODE:
-                    return model_response_idle_timeout_failure()
-                return existing_final.content
-
             owner_user_id = origin.user_id
             configured_user = cfg.get("_execution_user_id") or cfg.get("_origin_user_id")
             if configured_user:
@@ -424,8 +411,6 @@ async def _resume_origin_session_for_on_message(
             agent = await db.get(Agent, agent_id)
             if agent is None:
                 raise RuntimeError("on_message agent no longer exists")
-            from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-
             history_agent_id = origin.agent_id if origin.source_channel == "agent" else agent_id
             trigger_context = (
                 cfg.get("_trigger_context")
@@ -471,182 +456,31 @@ async def _resume_origin_session_for_on_message(
                 )
                 db.add(anchor)
                 origin.last_message_at = datetime.now(timezone.utc)
-                await db.commit()
-
-            history = await load_recoverable_history_for_turn(
-                db,
-                agent_id=history_agent_id,
-                conversation_id=str(origin.id),
-                turn_anchor_id=anchor_id,
-                ctx_size=agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE,
-                is_group=bool(origin.is_group),
-            )
-            reply = await _call_agent_llm(
-                db,
-                agent_id,
-                "",
-                session_id=str(origin.id),
-                user_id=owner_user_id,
-                history=history,
-                is_group=bool(origin.is_group),
-                recovery_hint=None,
-                continue_turn=True,
-                recovery_mode=True,
-                turn_anchor_id=anchor_id,
-                storage_agent_id=history_agent_id,
-                model_override_id=trigger.model_id,
-                temperature_override=trigger.temperature,
-                reasoning_effort_override=trigger.reasoning_effort,
-                include_soul=trigger.soul,
-                include_memory=trigger.memory,
-            )
-            if reply and reply.strip():
-                final_meta = {
-                    "kind": "on_message_final",
-                    "trigger_execution_id": str(execution_id),
-                    "matched_message_id": str(matched_id),
-                }
-                from app.services.im_delivery import (
-                    IMDeliveryResult,
-                    attach_delivery_to_meta,
-                )
-
-                final_meta = attach_delivery_to_meta(
-                    final_meta,
-                    IMDeliveryResult.pending(str(origin.source_channel or "web")),
-                )
-                origin_agent_participant = None
-                if origin.source_channel == "agent":
-                    from app.models.participant import Participant
-
-                    origin_agent_participant = (
-                        await db.execute(
-                            select(Participant).where(
-                                Participant.type == "agent",
-                                Participant.ref_id == agent_id,
-                            )
-                        )
-                    ).scalar_one_or_none()
-                    final_meta.update(
-                        {
-                            "direction": "inbound",
-                            "source_channel": "agent",
-                            "actor_ref": str(
-                                origin_agent_participant.id if origin_agent_participant is not None else agent_id
-                            ),
-                        }
-                    )
-                await persist_assistant_reply_row(
+                await db.flush()
+                anchor.sender_user_id = None
+                await initialize_background_turn(
                     db,
-                    agent_id=history_agent_id,
-                    user_id=owner_user_id,
-                    conversation_id=str(origin.id),
-                    content=reply,
-                    message_id=final_id,
-                    message_meta=final_meta,
-                    turn_anchor_id=anchor_id,
+                    session=origin,
+                    anchor=anchor,
+                    kind="trigger",
+                    reference_id=str(execution_id),
+                    settings={
+                        "execution_agent_id": str(agent_id),
+                        "model_override_id": str(trigger.model_id) if trigger.model_id else None,
+                        "temperature_override": trigger.temperature,
+                        "reasoning_effort_override": trigger.reasoning_effort,
+                        "include_soul": trigger.soul,
+                        "include_memory": trigger.memory,
+                    },
+                    completion={
+                        "execution_ids": [str(execution_id)],
+                        "triggers": trigger_completion_snapshot([trigger]),
+                        "origin": True,
+                    },
                 )
-                if origin.source_channel == "agent":
-                    final_row = await db.get(ChatMessage, final_id)
-                    if final_row is not None:
-                        if origin_agent_participant is not None:
-                            final_row.participant_id = origin_agent_participant.id
-                        from app.services.trigger_runtime.evaluator import (
-                            match_incoming_chat_message,
-                        )
+                await db.commit()
+        return await run_background_turn(anchor_id)
 
-                        await match_incoming_chat_message(db, final_row, origin)
-                origin_row = await db.get(ChatSession, origin.id)
-                if origin_row is not None:
-                    origin_row.last_message_at = datetime.now(timezone.utc)
-            await db.commit()
-            from app.services.conversation_turn_lifecycle import publish_committed_turn_terminal
-
-            await publish_committed_turn_terminal(
-                agent_id=history_agent_id,
-                conversation_id=str(origin.id),
-                turn_anchor_id=anchor_id,
-                message_id=final_id,
-                content=reply,
-            )
-            return reply
-
-    async def _work_and_deliver() -> str:
-        """Keep turn creation and origin transport ordering in one session lock."""
-        reply = await _work()
-        if not reply or not reply.strip():
-            return reply
-
-        async with async_session() as db:
-            final_row = await db.get(ChatMessage, final_id)
-            final_meta = (
-                final_row.message_meta if final_row is not None and isinstance(final_row.message_meta, dict) else {}
-            )
-            if final_meta.get("origin_delivery_status") == "delivered":
-                return reply
-
-        from app.services.turn_runtime import (
-            deliver_recovered_reply_to_origin,
-            load_turn_runtime,
-        )
-
-        runtime = await load_turn_runtime(
-            agent_id=agent_id,
-            conversation_id=str(origin_id),
-        )
-        if (
-            runtime.source_channel != str(cfg.get("_origin_source_channel") or "")
-            or (
-                "_origin_external_conv_id" in cfg
-                and runtime.external_conv_id != cfg.get("_origin_external_conv_id")
-            )
-        ):
-            raise RetryableOnMessageError("on_message origin generation changed")
-        delivered = await deliver_recovered_reply_to_origin(
-            agent_id=agent_id,
-            conversation_id=str(origin_id),
-            reply=reply,
-            origin_actor_ref=str(cfg.get("_origin_actor_ref") or "") or None,
-            origin_actor_ref_type=str(cfg.get("_origin_actor_ref_type") or "") or None,
-            require_transport=True,
-            expected_source_channel=str(cfg.get("_origin_source_channel") or "") or None,
-            expected_external_conv_id=cfg.get("_origin_external_conv_id"),
-            validate_external_conv_id="_origin_external_conv_id" in cfg,
-            message_id=final_id,
-        )
-        if not delivered:
-            raise RetryableOnMessageError("on_message origin delivery failed")
-        try:
-            async with async_session() as db:
-                final_row = await db.get(ChatMessage, final_id)
-                if final_row is not None:
-                    final_meta = final_row.message_meta if isinstance(final_row.message_meta, dict) else {}
-                    final_row.message_meta = {
-                        **final_meta,
-                        "origin_delivery_status": "delivered",
-                        "origin_delivered_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    await db.commit()
-        except Exception as exc:
-            raise RetryableOnMessageError(
-                "on_message delivery succeeded but its durable receipt was not recorded"
-            ) from exc
-        return reply
-
-    async with async_session() as db:
-        origin_session = await db.get(ChatSession, origin_id)
-        if origin_session is None:
-            raise RuntimeError("on_message origin session no longer exists")
-        lock_key = chat_session_lock_key(origin_session)
-
-    return await run_channel_message(
-        lock_key,
-        is_command=False,
-        reactions=ChannelReactions(),
-        work=_work_and_deliver,
-        distributed=True,
-        workload_kind=WorkloadKind.SCHEDULED,
-        tenant_id=tenant_id or cfg.get("_execution_user_id") or agent_id,
-    )
+    return await _work()
 
 __all__ = [name for name in globals() if not name.startswith("__")]

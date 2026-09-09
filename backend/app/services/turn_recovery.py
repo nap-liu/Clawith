@@ -365,7 +365,7 @@ async def _deliver_recovered_reply(
     execution_agent_id: uuid.UUID,
     message_id: uuid.UUID | str | None = None,
 ) -> bool:
-    """Validate the turn generation and deliver while its rows stay locked."""
+    """Validate the turn generation, then deliver outside the read transaction."""
     async with async_session() as db:
         current_origin = await _load_recovery_origin(
             db,
@@ -392,6 +392,16 @@ async def _deliver_recovered_reply(
             # this origin check; it must not be routed through an IM adapter.
             return True
 
+        from app.services.turn_delivery_recovery import LOCAL_CHANNELS
+
+        if expected_origin.source_channel in LOCAL_CHANNELS and message_id:
+            row = await db.get(ChatMessage, uuid.UUID(str(message_id)))
+            if (row is not None and row.conversation_id == anchor.conversation_id
+                    and row.agent_id == anchor.agent_id
+                    and (row.message_meta or {}).get("delivery", {}).get("status") == "sent"):
+                # The terminal event already acknowledged this history reply.
+                return True
+
         delivery_kwargs = {
             "agent_id": execution_agent_id,
             "conversation_id": anchor.conversation_id,
@@ -406,8 +416,7 @@ async def _deliver_recovered_reply(
                     "validate_external_conv_id": True,
                 }
             )
-        delivered = await deliver_recovered_reply_to_origin(**delivery_kwargs)
-    return delivered
+    return await deliver_recovered_reply_to_origin(**delivery_kwargs)
 
 
 async def _start_recovered_reactions(anchor: ChatMessage) -> ChannelReactions:
@@ -451,11 +460,20 @@ async def _persist_and_deliver_recovered_reply(
     expected_origin: _RecoveryOrigin,
     execution_agent_id: uuid.UUID,
     reply: str,
+    resume_promoted_turn: bool = True,
 ) -> bool:
     """Commit the recovered terminal result, then deliver and promote."""
 
     if not await _recovery_origin_matches(anchor, expected_origin):
         raise _RecoveryFenceLost("recovery owner or route changed")
+
+    from app.services.background_turns import background_execution, complete_background_turn
+
+    if background_execution(anchor):
+        return await complete_background_turn(
+            anchor, reply=reply, execution_agent_id=execution_agent_id,
+            resume_promoted_turn=resume_promoted_turn,
+        )
 
     from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
 
@@ -551,96 +569,19 @@ from app.services.turn_recovery_scanner import (
 )
 
 
-async def _resume_one(
-    anchor: ChatMessage,
-) -> RecoveryStats:
-    """Resume one independently cancellable anchor."""
-    result = RecoveryStats()
-    try:
-        # A recovered turn owns its cancellation lifecycle. Running it in a
-        # child task lets one stopped turn remain isolated while an actual
-        # shutdown still cancels the whole startup recovery set.
-        did_resume = await asyncio.create_task(resume_startup_anchor(anchor))
-    except asyncio.CancelledError:
-        recovery_task = asyncio.current_task()
-        if recovery_task is not None and recovery_task.cancelling():
-            raise
-        result.skipped = 1
-        logger.info(
-            "[turn_recovery] recovery cancelled for anchor={}",
-            anchor.id,
-        )
-    except Exception as exc:  # noqa: BLE001 - one failed turn must not cancel its batch
-        result.failed = 1
-        logger.exception(f"[turn_recovery] failed to resume anchor={anchor.id}: {exc}")
-    else:
-        if did_resume:
-            result.resumed = 1
-        else:
-            result.skipped = 1
-    return result
+from app.services.turn_recovery_dispatch import (  # noqa: E402 - scanner imports core helpers
+    _resume_one as _resume_one,
+    startup_turn_resume_once as startup_turn_resume_once,
+)
 
 
-async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
-    """Resume startup-recoverable turn anchors once.
+async def resume_turn(anchor: ChatMessage, *, resume_promoted_turn: bool = True) -> bool:
+    """Execute or resume one durable turn through the shared channel path."""
+    from app.services.background_turns import background_execution, reconcile_background_turn
 
-    All app instances may pass through this gate. A renewable Redis lease keeps
-    one replica responsible for the complete recovery set without reserving a
-    PostgreSQL connection while model turns execute. ``limit`` is retained only
-    for bounded cleanup of already-terminal provider feedback; it never limits
-    eligible turns. Callers may run this synchronously or as a detached startup
-    background task.
-    """
-    stats = RecoveryStats()
-    try:
-        async with RedisLeaseLock(
-            STARTUP_RECOVERY_LEASE_RESOURCE,
-            namespace="turn-recovery",
-        ):
-            # Reaction callback closures cannot survive process restart. Consume
-            # their durable provider markers independently from LLM resumption,
-            # including sessions whose terminal assistant row was already saved.
-            from app.services.turn_inbox import (
-                cleanup_stale_channel_receipt_anchors,
-            )
-
-            try:
-                await cleanup_stale_channel_receipt_anchors(limit=limit)
-            except Exception:  # noqa: BLE001 - reaction cleanup cannot block recovery
-                logger.opt(exception=True).warning(
-                    "[turn_recovery] startup durable reaction cleanup failed"
-                )
-            # Scanning is a short read transaction. Close it before admission,
-            # model execution, tool execution, or inter-turn waits.
-            async with async_session() as db:
-                anchors = await _load_recoverable_anchors(db)
-            stats.scanned = len(anchors)
-            if anchors:
-                logger.info(
-                    "[turn_recovery] resuming all eligible anchors in parallel: {}",
-                    len(anchors),
-                )
-                tasks: list[asyncio.Task[RecoveryStats]] = []
-                async with asyncio.TaskGroup() as task_group:
-                    for anchor in anchors:
-                        tasks.append(
-                            task_group.create_task(
-                                _resume_one(anchor),
-                                name=f"turn_recovery:{anchor.id}",
-                            )
-                        )
-                for task in tasks:
-                    result = task.result()
-                    stats.resumed += result.resumed
-                    stats.skipped += result.skipped
-                    stats.failed += result.failed
-    except RedisLeaseBusyError:
-        logger.info("[turn_recovery] another replica owns startup recovery")
-    return stats
-
-
-async def resume_turn(anchor: ChatMessage) -> bool:
-    """Resume one inferred incomplete user turn via the normal channel LLM path."""
+    reconciled = await reconcile_background_turn(anchor, resume_promoted_turn=resume_promoted_turn)
+    if reconciled is not None:
+        return reconciled
 
     if not await _ensure_recovery_owner(anchor):
         return False
@@ -655,12 +596,31 @@ async def resume_turn(anchor: ChatMessage) -> bool:
         if execution_agent_id is None:
             return False
         agent = (await db.execute(select(Agent).where(Agent.id == execution_agent_id))).scalar_one_or_none()
+        # OpenClaw executes externally and is explicitly outside native recovery.
         if agent is None or getattr(agent, "agent_type", None) == "openclaw":
             return False
         tenant_id = agent.tenant_id
         ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
+        execution = background_execution(anchor)
+        workload_kind = WorkloadKind.SCHEDULED if execution.get("kind") in {"trigger", "schedule"} else WorkloadKind.BACKGROUND
+        runtime_workspace = None
+        if getattr(agent, "scope", None) == "project":
+            from app.services.agent_runtime_workspace import resolve_agent_runtime_workspace
 
-    async with get_workload_capacity().slot(WorkloadKind.BACKGROUND, tenant_id):
+            session = await db.get(ChatSession, uuid.UUID(anchor.conversation_id))
+            runtime_workspace = resolve_agent_runtime_workspace(
+                agent_id=agent.id, agent_scope=agent.scope, agent_project_id=agent.project_id,
+                tenant_id=agent.tenant_id, session_project_id=session.project_id,
+                session_config=session.im_config,
+            )
+
+    async with get_workload_capacity().slot(workload_kind, tenant_id):
+        if getattr(agent, "scope", None) == "project":
+            from app.services.project_runtime_boundary import project_agent_runtime_allows
+
+            async with async_session() as db:
+                if not await project_agent_runtime_allows(db, agent):
+                    return False
         if not await _recovery_origin_matches(anchor, expected_origin):
             return False
 
@@ -726,6 +686,9 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                     # continuation point.
                     return False
 
+        from app.services.background_turns import background_call_options
+
+        call_options = {"turn_type": "recovery", **background_call_options(anchor)}
         reactions = await _start_recovered_reactions(anchor)
         try:
             async with async_session() as db:
@@ -741,7 +704,8 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                     recovery_mode=True,
                     turn_anchor_id=anchor.id,
                     storage_agent_id=anchor.agent_id,
-                    turn_type="recovery",
+                    runtime_workspace=runtime_workspace,
+                    **call_options,
                     on_tool_call=reactions.on_tool_call,
                     on_thinking=reactions.on_thinking,
                     on_chunk=reactions.on_chunk,
@@ -760,6 +724,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                     expected_origin=expected_origin,
                     execution_agent_id=execution_agent_id,
                     reply=reply,
+                    resume_promoted_turn=resume_promoted_turn,
                 )
                 if reply and reply.strip()
                 else False
@@ -771,6 +736,6 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             await _finish_recovered_reactions(reactions, exc)
             raise
         await _finish_recovered_reactions(reactions, reply or "")
-        if result:
+        if result and resume_promoted_turn:
             await _kick_recovered_promoted_turn(anchor)
         return result

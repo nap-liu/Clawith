@@ -37,6 +37,7 @@ async def call_llm_with_failover(
     turn_type: str | None = None,
     context_recovery=None,
     prepared_tools: list[dict] | None = None,
+    prepared_turn_context: tuple[str, str] | None = None,
     before_round=None,
     before_tool_execution=None,
     include_soul: bool = True,
@@ -206,7 +207,7 @@ async def call_llm_with_failover(
     # Freeze one context snapshot for the whole logical turn.  Runtime
     # failover is a provider retry, not a new Agent turn, so both models must
     # see the same memory, clock, trigger and relationship state.
-    prepared_turn_context = await _build_turn_context(
+    prepared_turn_context = prepared_turn_context or await _build_turn_context(
         agent_id=agent_id,
         agent_name=agent_name,
         role_description=role_description,

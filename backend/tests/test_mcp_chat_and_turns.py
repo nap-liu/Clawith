@@ -681,3 +681,28 @@ async def test_chat_with_agent_cross_agent_session_id_mismatch(monkeypatch):
     )
     assert "不一致" in result
     assert called["n"] == 0, "LLM must not run when session_id's agent != requested agent"
+
+
+async def test_mcp_execution_loss_retains_committed_turn_for_recovery():
+    from app.mcp_server.tools import chat_with_agent
+    from app.services.turn_interruption import TurnInterrupted
+    from app.services.llm.failure_outcome import render_message
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    token = await _issue_pat_for(user)
+    agent = await _seed_agent(user.id, tenant_id=tenant.id, name="RecoverableMCP")
+    with patch("app.services.channel_llm._call_agent_llm", side_effect=TurnInterrupted()):
+        result = await chat_with_agent(_ctx(token), message="persist before execute", agent=str(agent.id))
+    assert result == render_message("turn.recovering")
+    async with async_session() as db:
+        anchor = await db.scalar(select(ChatMessage).where(
+            ChatMessage.agent_id == agent.id, ChatMessage.role == "user",
+        ))
+        assert anchor.message_meta["turn_status"] == "running"
+        session = await db.get(ChatSession, uuid.UUID(anchor.conversation_id))
+        assert session.im_config["conversation_turn"]["turn_anchor_id"] == str(anchor.id)
+        assert not (await db.scalars(select(ChatMessage).where(
+            ChatMessage.conversation_id == anchor.conversation_id,
+            ChatMessage.role == "assistant",
+        ))).all()

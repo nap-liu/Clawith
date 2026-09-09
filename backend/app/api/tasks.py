@@ -137,20 +137,22 @@ async def create_task(
         ),
         remind_schedule=data.remind_schedule,
     )
-    db.add(task)
-    await db.flush()
-
-    task_out = await _enrich_task_out(task, db)
-
-    # Commit so the background executor can see the task in its own session
-    await db.commit()
-
-    # Fire background execution for todo tasks
+    anchor_id = None
     if data.type == "todo":
-        import asyncio
-        from app.services.task_executor import execute_task
-        asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
+        from app.services.task_executor import prepare_created_task_turn
 
+        anchor = await prepare_created_task_turn(db, task)
+        if anchor is not None:
+            anchor_id = anchor.id
+    else:
+        db.add(task)
+        await db.flush()
+    task_out = await _enrich_task_out(task, db)
+    await db.commit()
+    if anchor_id is not None:
+        from app.services.agent_execution.bridge import dispatch_background
+
+        await dispatch_background("app.services.background_turns:run_background_turn", anchor_id)
     return task_out
 
 

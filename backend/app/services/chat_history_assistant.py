@@ -388,6 +388,9 @@ async def persist_assistant_reply_row(
                 "conversation_turn_lifecycle"
             ) is True:
                 raise
+    from app.services.turn_delivery_recovery import prepare_terminal_delivery
+
+    await prepare_terminal_delivery(db, msg)
     await db.flush()
     return msg.id
 

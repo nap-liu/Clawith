@@ -315,7 +315,7 @@ async def _call_llm_execute_tool_round(
             from app.services import confirmation_service
 
             await confirmation_service.suspend_for_confirmation(
-                agent_id=state.agent_id,
+                agent_id=state.turn_anchor_agent_id or state.agent_id,
                 conversation_id=state.session_id,
                 chat_session_id=None,
                 source_channel="web",

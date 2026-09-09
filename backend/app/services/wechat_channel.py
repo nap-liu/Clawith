@@ -27,7 +27,6 @@ from app.services.channel_dispatch import (
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
-from app.services.im_markdown_media import project_agent_images_for_im
 
 
 WECHAT_ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -362,10 +361,6 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 )
                 return ""
 
-            token = str((config.extra_config or {}).get("bot_token") or "").strip()
-            base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
-            route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
-
             _thinking_chunks: list[str] = []
             _thinking_sender = BufferedIMThinkingSender.for_runtime(
                 enabled=resolve_im_thinking_enabled(agent_obj, sess),
@@ -398,13 +393,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             # stamped after the tool loop, ordered after the turn's tool calls).
             from app.services.chat_history import persist_assistant_reply
             from app.database import async_session as _areply_session
-            from app.services.im_delivery import (
-                IMDeliveryPart,
-                IMDeliveryResult,
-                append_delivery_part,
-                attach_delivery_to_meta,
-                register_delivery,
-            )
+            from app.services.im_delivery import IMDeliveryResult, attach_delivery_to_meta
 
             assistant_message_id = await persist_assistant_reply(
                 _areply_session, agent_id=agent_id, user_id=platform_user_id,
@@ -414,47 +403,14 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 turn_anchor_id=ingested.message.id,
                 required=True,
             )
-            delivery_reply_text = await project_agent_images_for_im(agent_id, reply_text)
-            async def _record_wechat_part(response: dict) -> None:
-                part = IMDeliveryPart(
-                    transport="wechat_ilink",
-                    provider_message_id=str(response.get("client_id") or "") or None,
-                    conversation_ref=from_user_id,
-                    artifact_role="chunk",
-                    recallable=False,
-                )
-                if not await append_delivery_part(assistant_message_id, part):
-                    raise RuntimeError("delivery_part_persistence_failed")
+            from app.services.im_delivery import deliver_persisted_message
+            from app.services.turn_runtime import TurnRuntime
 
-            try:
-                responses = await send_wechat_text_message(
-                    token=token,
-                    base_url=base_url,
-                    to_user_id=from_user_id,
-                    context_token=context_token,
-                    text=delivery_reply_text,
-                    route_tag=route_tag,
-                    on_result=_record_wechat_part,
-                )
-                delivery_result = IMDeliveryResult.sent(
-                    "wechat",
-                    *(
-                        IMDeliveryPart(
-                            transport="wechat_ilink",
-                            provider_message_id=str(response.get("client_id") or "") or None,
-                            conversation_ref=from_user_id,
-                            artifact_role="chunk",
-                            recallable=False,
-                        )
-                        for response in responses
-                    ),
-                )
-            except Exception as exc:
-                delivery_result = IMDeliveryResult.from_exception("wechat", exc)
-                raise
-            finally:
-                if assistant_message_id is not None:
-                    await register_delivery(assistant_message_id, delivery_result)
+            await deliver_persisted_message(
+                message_id=assistant_message_id, agent_id=agent_id,
+                runtime=TurnRuntime(True, "wechat", session_conv_id, sess.external_conv_id, False),
+                message=reply_text,
+            )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 

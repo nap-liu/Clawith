@@ -10,6 +10,7 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.user import User
+from app.models.trigger_execution import TriggerExecution
 
 
 def _metadata_execution_agent_id(anchor: ChatMessage) -> uuid.UUID:
@@ -24,7 +25,7 @@ async def _validated_execution_agent_id(
     db,
     anchor: ChatMessage,
 ) -> uuid.UUID | None:
-    """Resolve an execution Agent only from a validated Subagent edge."""
+    """Resolve execution identity through the persisted A2A or Subagent edge."""
     candidate = _metadata_execution_agent_id(anchor)
     if candidate == anchor.agent_id:
         return candidate
@@ -47,6 +48,28 @@ async def _validated_execution_agent_id(
             if session is not None
             else set()
         )
+        # A subscription event is system-owned, not a fabricated peer message.
+        # Its durable TriggerExecution supplies the same authenticated edge that
+        # ordinary A2A obtains from sender_agent_id.
+        background = meta.get("background_execution") or {}
+        if background.get("kind") == "trigger" and meta.get("kind") == "on_message_event":
+            try:
+                execution_id = uuid.UUID(str(background.get("reference_id")))
+            except (TypeError, ValueError):
+                return None
+            execution = await db.get(TriggerExecution, execution_id)
+            payload = (execution.payload or {}) if execution is not None else {}
+            valid_sender_edge = bool(
+                execution is not None
+                and execution.agent_id == candidate
+                and execution.conversation_id == session_id
+                and execution.execution_user_id == anchor.user_id
+                and str(execution.id) == str(meta.get("trigger_execution_id"))
+                and str(execution.trigger_id) == str(meta.get("trigger_id"))
+                and str(payload.get("_origin_session_id")) == str(session_id)
+            )
+        else:
+            valid_sender_edge = anchor.sender_agent_id in participants and anchor.sender_agent_id != candidate
         if (
             session is None
             or session.source_channel != "agent"
@@ -55,8 +78,7 @@ async def _validated_execution_agent_id(
             or execution_user is None
             or session.agent_id != anchor.agent_id
             or candidate not in participants
-            or anchor.sender_agent_id not in participants
-            or anchor.sender_agent_id == candidate
+            or not valid_sender_edge
             or storage_agent.tenant_id != execution_agent.tenant_id
             or execution_user.tenant_id != execution_agent.tenant_id
         ):

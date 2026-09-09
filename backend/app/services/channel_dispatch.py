@@ -25,6 +25,7 @@ from uuid import UUID
 from loguru import logger
 
 from app.services.active_turns import active_turn_boundary
+from app.services.turn_interruption import TurnInterrupted
 from app.services.redis_lease_lock import redis_lease_lock
 from app.services.workload_capacity import (
     WorkloadKind,
@@ -428,6 +429,10 @@ async def run_channel_message(
                         await _safe(reactions.on_consume)
                         try:
                             reply = await work()
+                        except TurnInterrupted as exc:
+                            await _safe(reactions.on_error, exc)
+                            logger.info("[Channel] Durable turn interrupted; recovery will resume {}", lock_key)
+                            return ""
                         except BaseException as exc:
                             await _safe(reactions.on_error, exc)
                             raise

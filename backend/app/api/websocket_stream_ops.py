@@ -631,6 +631,9 @@ async def create_task_record_impl(api, self, task_title: str, assistant_response
     if not task_title:
         return assistant_response
     try:
+        from app.services.agent_execution.bridge import dispatch_background
+        from app.services.task_executor import prepare_created_task_turn
+
         async with api.async_session() as db:
             task = api.Task(
                 agent_id=self.agent_id,
@@ -640,12 +643,11 @@ async def create_task_record_impl(api, self, task_title: str, assistant_response
                 status="pending",
                 priority="medium",
             )
-            db.add(task)
+            anchor = await prepare_created_task_turn(db, task)
             await db.commit()
-            await db.refresh(task)
             api.logger.info(f"[WS] Task created: {task.id}")
-            task_id = task.id
-        api.asyncio.create_task(api.execute_task(task_id, self.agent_id, self.user_id))
+        if anchor is not None:
+            await dispatch_background("app.services.background_turns:run_background_turn", anchor.id)
         assistant_response += f"\n\n📋 Task synced to task board: [{task_title}]"
     except Exception as te:
         api.logger.error(f"[WS] Task creation failed: {te}")
@@ -723,6 +725,9 @@ async def save_assistant_reply_impl(
             ),
         )
         db.add(assistant_msg)
+        from app.services.turn_delivery_recovery import prepare_terminal_delivery
+
+        await prepare_terminal_delivery(db, assistant_msg)
         if turn_anchor_id is not None:
             await api.transition_conversation_turn(
                 db,
