@@ -252,6 +252,41 @@ async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
     assert len(replies) == 1
 
 
+async def test_local_confirmation_completion_acknowledges_reply_once(monkeypatch, caplog):
+    """The terminal event's sent receipt completes H5 confirmation delivery."""
+    from app.api.websocket import manager
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="miniprogram")
+    conv = str(session.id)
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+    events = []
+
+    async def capture_event(_agent_id, _conversation_id, payload):
+        events.append(payload)
+
+    monkeypatch.setattr(manager, "send_to_session", capture_event)
+    monkeypatch.setattr(
+        "app.services.channel_llm._call_agent_llm", AsyncMock(return_value="Confirmed action completed"),
+    )
+    await cs._reenter_loop(agent_id, conv, user_id, turn_anchor_id=anchor_id)
+
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+        replies = list(await db.scalars(select(ChatMessage).where(
+            ChatMessage.conversation_id == conv, ChatMessage.role == "assistant",
+        )))
+    assert anchor.message_meta["turn_status"] == "completed"
+    assert len(replies) == 1
+    assert replies[0].message_meta["turn_status"] == "completed"
+    assert replies[0].message_meta["delivery"]["status"] == "sent"
+    terminals = [event for event in events if event.get("event_kind") == "turn_terminal"]
+    assert len(terminals) == 1
+    assert terminals[0]["message_id"] == str(replies[0].id)
+    assert not any("origin delivery failed" in record.message for record in caplog.records)
+
+
 async def test_reenter_loop_skips_cancelled_confirmation_turn(monkeypatch):
     """A /stop in the pending-to-reenter window prevents continuation."""
     from app.services import confirmation_service as cs

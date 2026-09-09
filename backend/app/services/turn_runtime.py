@@ -169,6 +169,23 @@ async def deliver_reply_to_origin(
                 )
                 return True
             from app.services.im_delivery import deliver_persisted_message
+            from app.services.turn_delivery_recovery import LOCAL_CHANNELS
+
+            if runtime.source_channel in LOCAL_CHANNELS:
+                from app.models.audit import ChatMessage
+
+                async with async_session() as db:
+                    meta = await db.scalar(select(ChatMessage.message_meta).where(
+                        ChatMessage.id == uuid.UUID(str(message_id)),
+                        ChatMessage.agent_id == agent_id,
+                        ChatMessage.conversation_id == str(conversation_id),
+                        ChatMessage.role == "assistant",
+                    ))
+                delivery = meta.get("delivery") if isinstance(meta, dict) else None
+                if (isinstance(delivery, dict) and delivery.get("status") == "sent"
+                        and delivery.get("channel") == runtime.source_channel):
+                    # The shared terminal publisher already acknowledged this reply.
+                    return True
 
             result = await deliver_persisted_message(
                 message_id=message_id,
