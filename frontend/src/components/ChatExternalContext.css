@@ -10,9 +10,21 @@
 }
 
 .chat-external-context > summary {
-    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
     cursor: pointer;
-    overflow-wrap: anywhere;
+    list-style: none;
+}
+
+.chat-external-context > summary::-webkit-details-marker {
+    display: none;
+}
+
+.chat-external-context > summary > svg,
+.chat-external-context > summary > span:first-of-type {
+    flex-shrink: 0;
 }
 
 .chat-external-context > summary:focus-visible {
@@ -21,14 +33,31 @@
 }
 
 .chat-external-context__source {
-    margin-inline-start: 8px;
-    color: var(--text-tertiary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-.chat-external-context > pre {
-    margin: 0;
-    padding: 12px;
+.chat-external-context__chevron {
+    margin-inline-start: auto;
+}
+
+.chat-external-context[open] .chat-external-context__chevron {
+    transform: rotate(90deg);
+}
+
+.chat-external-context__body {
     border-top: 1px solid var(--border-subtle);
+    padding: 10px;
+}
+
+.chat-external-context__body > p {
+    margin: 0 0 8px;
+}
+
+.chat-external-context__body > pre {
+    margin: 0;
     max-height: 360px;
     overflow: auto;
     white-space: pre-wrap;

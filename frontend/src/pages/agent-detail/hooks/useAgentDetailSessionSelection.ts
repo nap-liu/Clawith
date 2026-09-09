@@ -7,6 +7,7 @@ import {
 } from '../../../features/conversation/historyPagination';
 import {
     latestHistoryWindowOverlaps,
+    mapHistoryMessage,
     normalizeChatTimelineMessages,
     reconcileLatestHistoryWindow,
 } from '../../../features/conversation/core/chatTimeline';
@@ -232,28 +233,9 @@ export function useAgentDetailSessionSelection({
         try {
             const tkn = localStorage.getItem('token');
             const parseHistoryRows = (rows: any[]) => rows.map((m: any) => parseChatMsgRef.current({
-                msg: {
-                    role: m.role,
-                    content: m.content || '',
-                    ...(Object.prototype.hasOwnProperty.call(m, 'display_content') && { display_content: m.display_content || '' }),
-                    ...(Object.prototype.hasOwnProperty.call(m, 'attachments') && { attachments: m.attachments || [] }),
-                    ...(m.quoted_message && { quoted_message: m.quoted_message }),
-                    ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
-                    ...(m.toolCallId && { toolCallId: m.toolCallId }),
-                    ...(typeof m.toolCallIdExplicit === 'boolean' && { _toolCallIdExplicit: m.toolCallIdExplicit }),
-                    ...((m.turnAnchorId || m.message_meta?.turn_anchor_id) && { turnAnchorId: m.turnAnchorId || m.message_meta?.turn_anchor_id }),
-                    ...((m.turnGeneration ?? m.message_meta?.turn_generation) != null && { turnGeneration: m.turnGeneration ?? m.message_meta?.turn_generation }),
-                    ...((m.producerScope || m.producer_scope || m.message_meta?.producer_scope) && { producerScope: m.producerScope || m.producer_scope || m.message_meta?.producer_scope }),
-                    ...(m.thinking && { thinking: m.thinking }),
-                    ...(m.created_at && { timestamp: m.created_at }),
-                    ...(m.id && { id: m.id }),
-                    ...(m.sender_name && { sender_name: m.sender_name }),
-                    ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
-                    ...(m.sender_agent_id && { sender_agent_id: m.sender_agent_id }),
-                    ...(m.sender_avatar_url && { sender_avatar_url: m.sender_avatar_url }),
-                },
+                msg: mapHistoryMessage(m) ?? m,
                 id,
-                activeSession,
+                activeSession: sess,
             }));
             const currentLoadedMessages = writable ? chatMessagesSnapshotRef.current : historyMsgsSnapshotRef.current;
             let collectedRows: any[] = [];

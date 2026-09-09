@@ -342,3 +342,10 @@ reconciliation. Context-bearing retries compare question, attachments and JSON
 before side effects on all duplicate paths, including session-lock and unique-key
 races. Ordinary messages without context retain their existing semantics.
 The opt-in browser lifecycle and SDK contract are owned by `openapi.md`.
+
+WebChat and H5 render these snapshots through the same reference-data disclosure.
+Web history selection, pagination, recovery and live events use the shared message
+projection; transport-specific field allowlists must not drop `external_context`.
+The product label is “Reference data” (参考资料), with the source name and the
+original snapshot available on expansion. It describes data attached at send
+time, not a live view of the host page.
