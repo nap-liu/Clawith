@@ -83,4 +83,3 @@ async def _require_agent_server_access(
         # into this project's isolated Digital Employee snapshot.
         raise HTTPException(status_code=404, detail="MCP server not found")
     return agent
-
