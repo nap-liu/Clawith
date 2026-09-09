@@ -125,5 +125,13 @@ async def resolve_media_model(state, effective_config: dict) -> dict:
                 or purpose not in (model.purposes or [])):
             raise MediaAIError("modelUnavailable")
         resolved = model_connection(model)
+        if state.tool_name == "read_media" and config.get("fallback_model_id"):
+            try:
+                fallback = await db.get(LLMModel, uuid.UUID(str(config["fallback_model_id"])))
+            except (ValueError, TypeError):
+                fallback = None
+            if (fallback is not None and fallback.id != model.id and fallback.tenant_id == agent.tenant_id
+                    and fallback.enabled and purpose in (fallback.purposes or [])):
+                resolved["fallback_connection"] = model_connection(fallback)
         await db.commit()
     return resolved

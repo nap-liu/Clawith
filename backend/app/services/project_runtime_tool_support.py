@@ -277,33 +277,13 @@ async def execute_project_workspace_tool(
             )
         finally:
             materialized.cleanup()
-    if tool_name == "read_image":
-        image_paths = arguments.get("image_paths") or []
-        if not isinstance(image_paths, list):
-            raise ValueError("image_paths must be an array")
-        local_paths: list[str] = []
-        for image_path in image_paths:
-            value = str(image_path or "").strip()
-            if not value.lower().startswith(("http://", "https://", "data:")):
-                local_paths.append(value)
-        from app.services.tools.read_image import (
-            get_effective_read_image_max_bytes,
-            handle_read_image,
+    if tool_name == "read_media":
+        from app.services.read_media_compat import read_project_media
+
+        return await read_project_media(
+            project, arguments, agent_id=agent_id, execution_user_id=execution_user_id,
+            session_id=session_id, tool_call_id=tool_call_id, turn_anchor_id=turn_anchor_id,
         )
-        max_image_bytes = await get_effective_read_image_max_bytes(agent_id)
-        materialized = await materialize_project_read_workspace(
-            project,
-            local_paths,
-            max_bytes=max_image_bytes,
-        )
-        try:
-            return await handle_read_image(
-                agent_id,
-                arguments,
-                workspace_root=materialized.root,
-            )
-        finally:
-            materialized.cleanup()
 
     if tool_name == "list_files":
         return await list_project_workspace(project, str(arguments.get("path") or ""))

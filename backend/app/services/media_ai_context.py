@@ -8,8 +8,9 @@ from app.database import async_session
 from app.models.audit import ChatMessage
 from app.services.chat_history_loading import load_messages_for_session
 from app.services.llm.compactor import maybe_compact
-from app.services.media_ai_io import load_media
+from app.services.media_ai_io import load_media, load_understanding_media
 from app.services.media_ai_model import media_context_model
+from app.services.read_media_compat import media_input_workspace
 
 
 def media_content(prompt: str, media: list) -> list[dict]:
@@ -87,7 +88,8 @@ async def prepare_media_context(agent, child, anchor, request: dict) -> tuple[di
             old_args = previous_request.get("arguments") or {}
             sources = old_args.get("files") or []
             if request["tool"] == "read_media":
-                media = await load_media(agent.id, sources)
+                with media_input_workspace(agent.id, previous_request):
+                    media, _ = await load_understanding_media(agent.id, sources, loader=load_media)
                 history.append({"role": "user", "content": media_content(row.content, media)})
             else:
                 history.append({"role": "user", "content": row.content})

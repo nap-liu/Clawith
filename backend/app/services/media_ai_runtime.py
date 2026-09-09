@@ -19,10 +19,11 @@ from app.services.agent_runtime_workspace import bind_agent_runtime_workspace, r
 from app.services.agent_tools_config_runtime import _get_tool_config
 from app.services.chat_attachments import attachment_from_workspace_path
 from app.services.media_ai_context import prepare_media_context
-from app.services.media_ai_io import MediaAIError, load_media
+from app.services.media_ai_io import MediaAIError, load_media, load_understanding_media
 from app.services.media_ai_jobs import accept_result, create_intent, find_generation_row, finish_generation
 from app.services.media_ai_provider import connection, generation_payload, request, understand, understand_response
 from app.services.media_ai_tools import error_result
+from app.services.read_media_compat import media_input_workspace
 from app.services.llm.failure_outcome import render_message
 from app.services.media_url_source import MediaUrlError
 from app.services.turn_tool_settings import restore_turn_tool_settings
@@ -118,17 +119,27 @@ async def execute_media_turn(run_id, anchor, *, recovering=False) -> bool:
                         raise MediaAIError("analysisInterrupted")
                     if media_request["tool"] == "read_media":
                         args, history = await prepare_media_context(agent, child, anchor, media_request)
-                        media = await load_media(agent.id, args.get("files", []))
+                        with media_input_workspace(agent.id, media_request):
+                            media, input_errors = await load_understanding_media(
+                                agent.id, args.get("files", []), loader=load_media,
+                            )
                         await _assert_subagent_running(run_id)
                         await _checkpoint_input(run_id, anchor.id, {"media_read_started": True})
                         if config.get("model_id"):
                             response = await understand_response(config, args["prompt"], media, history=history)
                             text, usage = response.content, response.usage or {}
+                            actual_model = response.model or config["understanding_model"]
                             responses_snapshot = response.responses_snapshot
                         else:
                             text, usage = await understand(config, args["prompt"], media, history=history)
+                            actual_model = config["understanding_model"]
+                        if input_errors:
+                            text += "\n\n" + render_message("mediaAI.partialInputs") + "\n" + "\n".join(
+                                f"{item['index']}: {item['code']}" for item in input_errors
+                            )
                         result = {"status": "completed", "text": text, "usage": usage,
-                                  "model": config["understanding_model"]}
+                                  "input_errors": input_errors,
+                                  "model": actual_model}
                     else:
                         result, args = await _generate_turn(agent, child, run, anchor, media_request, config)
                     context = {

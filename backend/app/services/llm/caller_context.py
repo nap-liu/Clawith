@@ -468,7 +468,8 @@ async def _process_tool_call(
             await _emit_round_done_events([record], on_tool_call)
         return error_msg
 
-    if tool_name not in allowed_tool_names:
+    permission_name = "read_media" if tool_name == "read_image" else tool_name
+    if permission_name not in allowed_tool_names:
         result = _tool_not_enabled_message(tool_name)
         logger.warning(f"[LLM] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
         done_evt = {

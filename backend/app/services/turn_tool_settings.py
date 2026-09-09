@@ -66,6 +66,9 @@ async def _load_settings(agent_id, channel_context):
         agent = await db.get(Agent, agent_id)
         if agent is None:
             raise ValueError("Scene agent is unavailable")
+        from app.services.read_media_compat import project_legacy_image_settings
+
+        settings = await project_legacy_image_settings(db, agent.tenant_id, settings)
         tools = (await db.scalars(select(Tool).where(
             or_(Tool.id.in_([item["tool_id"] for item in settings]), Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)),
             tool_visibility_clause(agent.tenant_id, select(AgentTool.tool_id).where(AgentTool.agent_id == agent_id)),
@@ -92,6 +95,7 @@ async def _load_settings(agent_id, channel_context):
             if item["enabled"] or tool_is_required(tool.name):
                 assignments.append(item)
                 enabled_names.add(tool.name)
+        await db.commit()
         server_ids = {tool.mcp_server_id for tool in tools if tool.mcp_server_id}
         overrides = (await db.scalars(select(MCPServerOverride).where(
             MCPServerOverride.mcp_server_id.in_(server_ids),

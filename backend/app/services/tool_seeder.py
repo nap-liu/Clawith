@@ -25,6 +25,7 @@ from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES, USER_PROJEC
 _settings = get_settings()
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
+    "read_media",
     "update_self_settings",
     "run_subagent",
     "send_message_to_subagent",
@@ -32,7 +33,6 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "send_message_to_parent",
     "execute_code",
     "execute_code_aio",
-    "read_image",
     "read_webpage",
     "duckduckgo_search",
     "jina_search",
@@ -308,6 +308,10 @@ async def seed_builtin_tools():
                     updated_fields.append("parameters_schema")
                 if updated_fields:
                     logger.info(f"[ToolSeeder] Updated {', '.join(updated_fields)}: {t['name']}")
+
+        from app.services.read_media_compat import migrate_read_image
+
+        await migrate_read_image(db)
 
         # Auto-assign new default tools to standard Agents only. Project Agents
         # have an explicit project-local allowlist and must not inherit future

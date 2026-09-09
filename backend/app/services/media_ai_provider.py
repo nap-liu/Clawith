@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from urllib.parse import quote, urlsplit
 
+import httpx
+
 from app.services import media_ai_bailian as bailian, media_ai_openai as standard
 from app.services.llm.client import LLMError, LLMMessage, LLMResponse, create_llm_client
 from app.services.llm.client_registry import resolve_api_protocol
@@ -98,29 +100,61 @@ async def understand_response(config: dict, prompt: str, media: list[MediaInput]
             content.append({"type": kind, kind: {"url": item.data_url}})
     messages = [LLMMessage(**message) for message in (history or [])]
     messages.append(LLMMessage(role="user", content=content))
+    return await _understanding_attempt(config, media, messages)
+
+
+async def _understanding_attempt(config, media, messages, *, attempts=None):
+    from app.services.llm.provider_retry import _is_provider_recovery_error, _is_provider_throttle_error
+
+    attempts = list(attempts or [])
     protocol, base_url = _understanding_transport(config, messages)
     client = create_llm_client(
         provider=config["provider"], api_key=config["api_key"], model=config["model"],
-        base_url=base_url, timeout=config.get("request_timeout") or 180,
-        api_protocol=protocol,
+        base_url=base_url, timeout=config.get("request_timeout") or 180, api_protocol=protocol,
     )
+    emitted = False
+
+    async def observed(*values):
+        nonlocal emitted
+        emitted = emitted or any(values)
+
+    fallback = None
     try:
-        extra = {}
-        if config.get("provider") in {"qwen", "bailian", "dashscope"}:
-            extra["modalities"] = ["text"]
+        extra = {"modalities": ["text"]} if config.get("provider") in {"qwen", "bailian", "dashscope"} else {}
         response = await client.stream(
             messages=messages, max_tokens=config.get("max_output_tokens"),
-            temperature=config.get("temperature"), reasoning_effort=config.get("reasoning_effort"), **extra,
+            temperature=config.get("temperature"), reasoning_effort=config.get("reasoning_effort"),
+            on_chunk=observed, on_thinking=observed, on_tool_delta=observed, **extra,
         )
         if response.finish_reason in {"length", "max_tokens"}:
             raise MediaAIError("analysisTooLong")
         if response.finish_reason not in {None, "stop", "end_turn"} or not response.content:
             raise MediaAIError("providerFailed")
+        response.model = response.model or config["model"]
+        if attempts:
+            response.usage = {**(response.usage or {}), "provider_attempts": [
+                *attempts, {"model_id": config.get("model_id"), "status": "completed"},
+            ]}
         return response
     except LLMError as exc:
-        raise MediaAIError("providerFailed") from exc
+        attempts.append({"model_id": config.get("model_id"), "status": "failed",
+                         "http_status": exc.status_code, "provider_code": exc.error_code})
+        if (not emitted and not attempts[:-1] and exc.status_code is not None
+                and (_is_provider_throttle_error(exc) or _is_provider_recovery_error(exc))):
+            fallback = config.get("fallback_connection")
+        if fallback is None:
+            error = MediaAIError("providerFailed", provider_code=exc.error_code or "")
+            error.attempts = attempts
+            raise error from exc
+    except (httpx.HTTPError, MediaAIError) as exc:
+        error = exc if isinstance(exc, MediaAIError) else MediaAIError("connectionFailed")
+        error.attempts = [*attempts, {"model_id": config.get("model_id"), "status": "failed",
+                                    "code": error.code}]
+        raise error from exc
     finally:
         await client.close()
+    _validate_inputs(fallback, media)
+    return await _understanding_attempt(fallback, media, messages, attempts=attempts)
 
 
 def _validate_inputs(config: dict, media: list[MediaInput]) -> None:

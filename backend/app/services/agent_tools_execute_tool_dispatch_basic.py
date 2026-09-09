@@ -162,6 +162,8 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
     ws = state.ws
 
     if tool_name in MEDIA_AI_NAMES:
+        if state.project_workspace == "agent":
+            state.arguments = {key: value for key, value in arguments.items() if key != "workspace"}
         return await execute_media_tool(state)
     elif tool_name == "list_files":
         result = await _storage_list_dir(agent_id, arguments.get("path", ""), tenant_id=_agent_tenant_id)
@@ -231,10 +233,6 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
             base_dir=ws,
             session_id=session_id,
         )
-    elif tool_name == "read_image":
-        from app.services.tools.read_image import handle_read_image
-
-        return await handle_read_image(agent_id, arguments)
     elif tool_name == "list_sessions":
         from app.services.tools.session_introspection import handle_list_sessions
 

@@ -474,40 +474,6 @@ AGENT_TOOL_RUNTIME = [
     {
         "type": "function",
         "function": {
-            "name": "read_image",
-            "description": (
-                "Read an image: transcribe all visible text (preserving headers, bullets, tables). "
-                "If the image is not text-dominant (charts, scenes, photos), briefly describe what is seen. "
-                "Useful for: image-only PPTX slides, screenshots, scanned documents, reading chart data. "
-                "Inputs: workspace relative path, http(s):// URL, or data:image/*;base64,… "
-                "(exactly which modes are available is controlled by the admin). "
-                "Output is a plain-text string with per-image blocks separated by '--- Image N: <ref> ---'; "
-                "some blocks may be ❌ error lines — inspect each and decide whether to retry or skip. "
-                "Do NOT call this tool on text you just generated yourself."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 6,
-                        "description": (
-                            "要识别的图片列表。每项可以是 (1) workspace 相对路径；(2) http(s):// URL "
-                            "(仅当管理员启用 URL 模式时)；(3) data:image/<fmt>;base64,<payload> "
-                            "(仅当管理员启用 base64 模式时)。支持 jpeg/png/webp/gif。未启用的输入模式会直接报错。"
-                            "单次最多 6 张，超过请分多次调用。"
-                        ),
-                    }
-                },
-                "required": ["image_paths"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "execute_code",
             "description": "Execute code (Python, Bash, or Node.js) in a local sandboxed subprocess within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory, so you can access skills/, workspace/, memory/ etc. directly. Security restrictions apply: no system-level operations, 30-second default timeout.",
             "parameters": {

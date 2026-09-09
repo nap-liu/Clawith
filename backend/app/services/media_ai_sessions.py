@@ -51,9 +51,10 @@ async def enqueue_media(state, config: dict, *, notify_parent: bool = True) -> d
         return task_receipt(existing)
     request = {
         "tool": state.tool_name, "arguments": args,
-        "config": {key: value for key, value in config.items() if key not in {"api_key", "runtime_model"}},
+        "config": {key: value for key, value in config.items() if key not in {"api_key", "runtime_model", "fallback_connection"}},
         "origin_session_id": state.session_id, "origin_call_id": state.tool_call_id,
         "workspace": current_agent_runtime_workspace(state.agent_id).as_session_config(),
+        "input_workspace": getattr(state, "media_input_workspace", "agent"),
         "connection_ref": encrypt_data(json.dumps(config), get_settings().SECRET_KEY),
     }
     async with async_session() as db:

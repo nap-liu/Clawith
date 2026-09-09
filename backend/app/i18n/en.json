@@ -67,6 +67,7 @@
   "mcpAccess.invalidConfig": "Invalid credential configuration.",
   "mcpAccess.noDiscoveredTools": "No tools were discovered. The installation was not saved. Check the package, arguments and credentials.",
   "mcpAccess.existingInstallation": "An identical installation already exists. Its connection was preserved. Complete any pending authorization for that installation or test its connection.",
+  "mediaAI.partialInputs": "Some inputs could not be read (input number: reason):",
   "mediaAI.generationCompleted": "Media generated.",
   "mediaAI.toolDisabled": "Enable this media tool for the digital employee before using it.",
   "mediaAI.invalidArguments": "Provide valid media files and a request.",

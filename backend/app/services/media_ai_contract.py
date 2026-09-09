@@ -1,4 +1,4 @@
-"""Two opt-in media tools backed by the enterprise model pool."""
+"""Unified media tools backed by the enterprise model pool."""
 
 MEDIA_AI_NAMES = frozenset({"read_media", "generate_media"})
 MEDIA_AI_CONFIG_KEY = "media_ai"
@@ -29,7 +29,7 @@ _FILES = {
             "role": {"type": "string", "enum": ["first_frame", "last_frame", "reference_image", "reference_video", "reference_audio"]},
         }, "required": ["source"], "additionalProperties": False},
     ]},
-    "description": "AgentDir paths or third-party HTTP(S) URLs. Optional kind avoids probing opaque URLs; role selects a generation reference role.",
+    "description": "AgentDir paths, third-party HTTP(S) URLs or base64 media data URLs. Optional kind avoids probing opaque URLs; role selects a generation reference role.",
 }
 _SESSION = {"type": "string", "format": "uuid", "description": "Continue a media session returned by an earlier call. Omit to start one."}
 _MODEL = {"type": "string", "format": "uuid", "description": "Optional enterprise model ID. Omit to use the media session selection or configured company model."}
@@ -68,7 +68,7 @@ GENERATE_MEDIA_SCHEMA = {
 MEDIA_AI_SEEDS = [
     {
         "name": "read_media", "display_name": "Read Media",
-        "description": "Read images, audio or video asynchronously, including video sound when supported by the selected enterprise model. Returns task_id and session_id immediately; completion arrives automatically. Supply session_id for follow-up questions. Do not poll or resubmit while pending. Uses the company model pool.",
+        "description": "Read one or multiple images, audio or videos together asynchronously, including video sound when supported by the selected enterprise model. Returns task_id and session_id immediately; completion arrives automatically. Supply session_id for follow-up questions. Do not poll or resubmit while pending. Uses the company model pool.",
         "parameters_schema": READ_MEDIA_SCHEMA,
     },
     {
@@ -78,7 +78,7 @@ MEDIA_AI_SEEDS = [
     },
 ]
 MEDIA_AI_SEEDS = [
-    {**seed, "category": "media", "icon": "🎬", "is_default": False,
+    {**seed, "category": "media", "icon": "🎬", "is_default": seed["name"] == "read_media",
      "config": {}, "config_schema": {"fields": [
          field for field in MEDIA_AI_CONFIG_SCHEMA["fields"]
          if (field["key"] == "understanding_model_id") == (seed["name"] == "read_media")

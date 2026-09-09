@@ -80,7 +80,7 @@ PROJECT_STANDARD_FILE_TOOL_NAMES = frozenset(
         "delete_file",
     }
 )
-PROJECT_STRUCTURED_READ_TOOL_NAMES = frozenset({"read_document", "read_image"})
+PROJECT_STRUCTURED_READ_TOOL_NAMES = frozenset({"read_document", "read_media"})
 PROJECT_SANDBOX_TOOL_NAMES = frozenset({"execute_code"})
 PROJECT_WORKSPACE_ROUTED_TOOL_NAMES = (
     PROJECT_STANDARD_FILE_TOOL_NAMES

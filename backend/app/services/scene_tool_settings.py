@@ -57,6 +57,9 @@ async def prepare_scene_settings(db, agent_id, payload, previous=None):
         payload["mcp_server_overrides"] = []
         return
     agent = await db.get(Agent, agent_id)
+    from app.services.read_media_compat import project_legacy_image_settings
+
+    payload["tools"] = await project_legacy_image_settings(db, agent.tenant_id, payload["tools"])
     assignments = {
         str(row.tool_id): row for row in
         (await db.scalars(select(AgentTool).where(AgentTool.agent_id == agent_id))).all()

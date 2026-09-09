@@ -106,6 +106,9 @@ async def execute_tool_preflight(
         .replace("\ufeff", "")
         .strip()
     )
+    from app.services.read_media_compat import normalize_read_image_call
+
+    tool_name, arguments = normalize_read_image_call(tool_name, arguments)
     scope = current_tool_settings(agent_id)
     from app.services.project_runtime_tool_catalog import PROJECT_RUNTIME_TOOL_NAMES
 

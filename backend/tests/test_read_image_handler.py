@@ -1,248 +1,194 @@
-"""Tests for tools/read_image/handler.py — orchestration."""
+"""Legacy image installations migrate onto the observable media tool contract."""
 
+import json
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
-from app.services.tools.read_image import handle_read_image
+from app.database import async_session
+from app.models.llm import LLMModel
+from app.models.tool import AgentTool, Tool
+from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
+from app.services.read_media_compat import migrate_read_image
+from app.services.tool_config import get_tenant_tool_config, set_tenant_tool_config
+from app.services.tool_seeder import seed_builtin_tools
+from app.services.turn_tool_settings import scene_tool_settings_scope
+import test_media_ai_runtime as runtime_tests
 
+context = runtime_tests.context
 
-@pytest.fixture
-def agent_id() -> uuid.UUID:
-    return uuid.UUID("00000000-0000-0000-0000-000000000001")
-
-
-@pytest.fixture
-def jpeg_bytes() -> bytes:
-    """A real, Pillow-decodable 8x8 JPEG."""
-    from io import BytesIO
-    from PIL import Image
-    img = Image.new("RGB", (8, 8), color=(128, 128, 200))
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=80)
-    return buf.getvalue()
+pytestmark = pytest.mark.asyncio
 
 
-def _mock_llm_model(model_id: str, supports_vision: bool = True):
-    m = MagicMock()
-    m.id = uuid.UUID(model_id) if isinstance(model_id, str) else model_id
-    m.model = "qwen3.6-plus"
-    m.supports_vision = supports_vision
-    m.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    m.api_key = "sk-fake"
-    return m
+async def legacy(state):
+    async with async_session() as db:
+        old = await db.scalar(select(Tool).where(Tool.name == "read_image"))
+        if old is None:
+            old = Tool(name="read_image", display_name="Legacy image", type="builtin", source="builtin",
+                       enabled=True, is_default=True, config={})
+            db.add(old)
+        else:
+            old.source, old.enabled = "builtin", True
+        model = LLMModel(tenant_id=state.tenant_id, provider="openai", model="vision-test", label="Vision",
+                         api_key_encrypted="test", base_url="http://provider.test/v1", purposes=["conversation"],
+                         supports_vision=True, input_modalities=["text", "image"], enabled=True)
+        db.add(model)
+        await db.flush()
+        db.add(AgentTool(agent_id=state.agent_id, tool_id=old.id, enabled=True, config={"model_id": str(model.id)}))
+        await set_tenant_tool_config(db, state.tenant_id, "read_image", {"model_id": str(model.id)})
+        await set_tenant_tool_config(db, state.tenant_id, "read_media", {})
+        await db.commit()
+        return old.id, model.id
 
 
-@pytest.mark.asyncio
-async def test_config_missing_model_id_short_circuits(agent_id, tmp_path):
-    config = {"model_id": None, "input_modes": {"workspace_path": {"enabled": True}}, "max_images_per_call": 6, "max_image_bytes_per_file": 5_000_000, "vision_max_output_tokens": 4096}
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=None)),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-    ):
-        result = await handle_read_image(agent_id, {"image_paths": ["img.jpg"]})
-
-    assert result.startswith("❌")
-    assert "视觉模型" in result or "model" in result.lower()
-
-
-@pytest.mark.asyncio
-async def test_success_single_workspace_image(agent_id, tmp_path, jpeg_bytes):
-    (tmp_path / "img.jpg").write_bytes(jpeg_bytes)
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config["model_id"] = "00000000-0000-0000-0000-000000000010"
-
-    async def fake_call_llm(*args, **kwargs):
-        return "--- VISION MODEL OUTPUT ---\nHello world."
-
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=_mock_llm_model("00000000-0000-0000-0000-000000000010"))),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-        patch("app.services.llm.caller.call_llm", AsyncMock(side_effect=fake_call_llm)),
-    ):
-        result = await handle_read_image(agent_id, {"image_paths": ["img.jpg"]})
-
-    assert "--- Image 1: img.jpg ---" in result
-    assert "Hello world" in result
+async def test_seed_merges_assignments_and_projects_old_scene_without_rewriting(context):
+    old_id, model_id = await legacy(context)
+    await seed_builtin_tools()
+    await seed_builtin_tools()
+    async with async_session() as db:
+        old = await db.get(Tool, old_id)
+        assert old.source == "legacy" and not old.enabled and not old.is_default
+        new = await db.scalar(select(Tool).where(Tool.name == "read_media"))
+        assigned = list(await db.scalars(select(AgentTool).where(
+            AgentTool.agent_id == context.agent_id, AgentTool.tool_id.in_([old_id, new.id]))))
+        assert len(assigned) == 1 and assigned[0].tool_id == new.id and assigned[0].enabled
+        assert assigned[0].config["understanding_model_id"] == str(model_id)
+        assert "media_understanding" in (await db.get(LLMModel, model_id)).purposes
+        assert (await get_tenant_tool_config(db, context.tenant_id, "read_media"))["understanding_model_id"] == str(model_id)
+    tools = await get_agent_tools_for_llm(context.agent_id)
+    names = [item["function"]["name"] for item in tools]
+    assert names.count("read_media") == 1 and "read_image" not in names
+    schema = next(item["function"]["parameters"] for item in tools if item["function"]["name"] == "read_media")
+    assert "maxItems" not in schema["properties"]["files"]
+    scene = {"scene_tools": [{"tool_id": str(old_id), "enabled": True, "config": {"model_id": str(model_id)}}]}
+    original = json.dumps(scene)
+    async with scene_tool_settings_scope(context.agent_id, scene) as scope:
+        assert "read_media" in scope.enabled_names and "read_image" not in scope.enabled_names
+        assert scope.configs["read_media"]["understanding_model_id"] == str(model_id)
+        assert "read_media" in {item["function"]["name"] for item in await get_agent_tools_for_llm(context.agent_id)}
+    assert json.dumps(scene) == original
 
 
-@pytest.mark.asyncio
-async def test_partial_failure_inline_error_block(agent_id, tmp_path, jpeg_bytes):
-    (tmp_path / "ok.jpg").write_bytes(jpeg_bytes)
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config["model_id"] = "00000000-0000-0000-0000-000000000010"
-
-    async def fake_call_llm(*args, **kwargs):
-        return "Transcription of ok.jpg only."
-
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=_mock_llm_model("00000000-0000-0000-0000-000000000010"))),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-        patch("app.services.llm.caller.call_llm", AsyncMock(side_effect=fake_call_llm)),
-    ):
-        result = await handle_read_image(agent_id, {"image_paths": ["ok.jpg", "missing.jpg"]})
-
-    assert "--- Image 1: ok.jpg ---" in result
-    assert "--- Image 2: missing.jpg ---" in result
-    assert "❌" in result
-    assert "不存在" in result or "not" in result.lower()
+async def test_explicit_new_disable_wins_and_old_call_uses_same_permission(context):
+    old_id, _ = await legacy(context)
+    async with async_session() as db:
+        new = await db.scalar(select(Tool).where(Tool.name == "read_media"))
+        db.add(AgentTool(agent_id=context.agent_id, tool_id=new.id, enabled=False, config={}))
+        await migrate_read_image(db)
+        await db.commit()
+    result = json.loads(await execute_tool("read_image", {"image_paths": ["image.png"]},
+        context.agent_id, context.user_id, session_id=context.session_id,
+        tool_call_id=context.tool_call_id, turn_anchor_id=context.turn_anchor_id, skip_autonomy=True))
+    assert result["code"] == "toolDisabled"
+    async with async_session() as db:
+        assert await db.scalar(select(AgentTool).where(AgentTool.agent_id == context.agent_id, AgentTool.tool_id == old_id)) is None
 
 
-@pytest.mark.asyncio
-async def test_upstream_llm_failure_short_circuits(agent_id, tmp_path, jpeg_bytes):
-    (tmp_path / "img.jpg").write_bytes(jpeg_bytes)
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config["model_id"] = "00000000-0000-0000-0000-000000000010"
-
-    async def blow_up(*args, **kwargs):
-        raise RuntimeError("upstream 503")
-
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=_mock_llm_model("00000000-0000-0000-0000-000000000010"))),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-        patch("app.services.llm.caller.call_llm", AsyncMock(side_effect=blow_up)),
-    ):
-        result = await handle_read_image(agent_id, {"image_paths": ["img.jpg"]})
-
-    assert result.startswith("❌")
-    assert "upstream" in result.lower() or "503" in result
+async def test_legacy_batch_call_is_one_durable_async_media_input(context):
+    await legacy(context)
+    await seed_builtin_tools()
+    paths = [f"https://media.example/image-{index}.png" for index in range(8)]
+    result = json.loads(await execute_tool("read_image", {"image_paths": paths},
+        context.agent_id, context.user_id, session_id=context.session_id,
+        tool_call_id=context.tool_call_id, turn_anchor_id=context.turn_anchor_id, skip_autonomy=True))
+    assert result["status"] == "queued"
+    from app.models.audit import ChatMessage
+    async with async_session() as db:
+        row = await db.get(ChatMessage, uuid.UUID(result["task_id"]))
+        request = row.message_meta["media_request"]
+        assert request["tool"] == "read_media"
+        assert [item["source"] for item in request["arguments"]["files"]] == paths
+        assert "Transcribe" in request["arguments"]["prompt"]
+        assert "api_key" not in request["config"] and "fallback_connection" not in request["config"]
 
 
-@pytest.mark.asyncio
-async def test_configured_fallback_model_is_forwarded_for_vision_failover(
-    agent_id, tmp_path, jpeg_bytes
-):
-    (tmp_path / "img.jpg").write_bytes(jpeg_bytes)
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
+async def test_project_shared_media_uses_existing_exact_file_ticket(context):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlsplit
 
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config["model_id"] = "00000000-0000-0000-0000-000000000010"
-    config["fallback_model_id"] = "00000000-0000-0000-0000-000000000011"
-    primary = _mock_llm_model(config["model_id"])
-    fallback = _mock_llm_model(config["fallback_model_id"])
-    llm = AsyncMock(
-        side_effect=["[LLM Error] HTTP 503: unavailable", "fallback vision result"]
-    )
+    from app.config import get_settings
+    from app.services.agent_file_urls import verify_agent_file_ticket
+    from app.services.agent_runtime_workspace import AgentRuntimeWorkspace, bind_agent_runtime_workspace
+    from app.services.read_media_compat import read_project_media
+    from app.services.storage import get_storage_backend
+    from app.models.audit import ChatMessage
+    from test_media_ai_provider import PNG
 
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch(
-            "app.services.tools.read_image.handler._load_vision_model",
-            AsyncMock(side_effect=[primary, fallback]),
-        ),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-        patch("app.services.llm.caller.call_llm", llm),
-    ):
-        result = await handle_read_image(agent_id, {"image_paths": ["img.jpg"]})
-
-    assert "fallback vision result" in result
-    assert llm.await_count == 2
-    assert llm.await_args_list[0].kwargs["model"] is primary
-    assert llm.await_args_list[1].kwargs["model"] is fallback
-    assert all(call.kwargs["skip_tools"] is True for call in llm.await_args_list)
-
-
-@pytest.mark.asyncio
-async def test_multi_success_combined_block_not_duplicated(agent_id, tmp_path, jpeg_bytes):
-    """With 3 successful images, the LLM response must appear ONCE under a combined
-    header, not duplicated under each image block."""
-    for i in range(1, 4):
-        (tmp_path / f"s{i}.jpg").write_bytes(jpeg_bytes)
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config["model_id"] = "00000000-0000-0000-0000-000000000010"
-
-    unique_marker = "UNIQUE_VISION_PAYLOAD_MARKER_42"
-
-    async def fake_call_llm(*args, **kwargs):
-        return f"Transcription text including {unique_marker}."
-
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=_mock_llm_model("00000000-0000-0000-0000-000000000010"))),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-        patch("app.services.llm.caller.call_llm", AsyncMock(side_effect=fake_call_llm)),
-    ):
-        result = await handle_read_image(
-            agent_id, {"image_paths": ["s1.jpg", "s2.jpg", "s3.jpg"]}
-        )
-
-    assert "--- Images 1, 2, 3:" in result
-    assert "s1.jpg" in result and "s2.jpg" in result and "s3.jpg" in result
-    assert result.count(unique_marker) == 1
+    await legacy(context)
+    await seed_builtin_tools()
+    project_id = uuid.uuid4()
+    prefix = f"projects/{context.tenant_id}/{project_id}/repo"
+    repo = Path(get_settings().STORAGE_LOCAL_ROOT) / prefix
+    workspace = AgentRuntimeWorkspace(context.agent_id, repo / ".agents" / str(context.agent_id),
+        prefix + f"/.agents/{context.agent_id}", project_id=project_id, project_repo_root=repo)
+    storage = get_storage_backend()
+    await storage.write_bytes(prefix + "/assets/image.png", PNG)
+    with bind_agent_runtime_workspace(workspace):
+        receipt = json.loads(await read_project_media(SimpleNamespace(id=project_id),
+            {"files": ["assets/image.png"], "prompt": "Read shared image", "workspace": "project"},
+            agent_id=context.agent_id, execution_user_id=context.user_id, session_id=context.session_id,
+            tool_call_id=context.tool_call_id, turn_anchor_id=context.turn_anchor_id))
+    assert receipt["status"] == "queued"
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, uuid.UUID(receipt["task_id"]))
+    request = anchor.message_meta["media_request"]
+    assert request["arguments"]["files"][0]["source"] == "assets/image.png"
+    assert request["input_workspace"] == "project"
+    from app.services.read_media_compat import media_input_workspace
+    from app.services.media_ai_io import load_media
+    with bind_agent_runtime_workspace(workspace), media_input_workspace(context.agent_id, request):
+        media = await load_media(context.agent_id, request["arguments"]["files"])
+    params = parse_qs(urlsplit(media[0].url).query)
+    payload = verify_agent_file_ticket(context.agent_id, "assets/image.png", params["im_ticket"][0])
+    assert payload["storage_key"] == prefix + "/assets/image.png"
+    assert await storage.read_bytes(payload["storage_key"]) == PNG
+    assert anchor.message_meta["media_request"]["workspace"] == workspace.as_session_config()
 
 
-@pytest.mark.asyncio
-async def test_tightening_override_rejects_agent_loosen(agent_id, tmp_path, jpeg_bytes):
-    """Agent tries max_images=10 vs tool=6; request with 8 images must short-circuit."""
-    for i in range(8):
-        (tmp_path / f"img{i}.jpg").write_bytes(jpeg_bytes)
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
-    tool_cfg = copy.deepcopy(DEFAULT_CONFIG)
-    tool_cfg["max_images_per_call"] = 6
-    tool_cfg["model_id"] = "00000000-0000-0000-0000-000000000010"
-    agent_cfg = {"max_images_per_call": 10}
-
-    paths = [f"img{i}.jpg" for i in range(8)]
-
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(tool_cfg, agent_cfg))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=_mock_llm_model("00000000-0000-0000-0000-000000000010"))),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-    ):
-        result = await handle_read_image(agent_id, {"image_paths": paths})
-
-    assert result.startswith("❌")
-    assert "6" in result  # cites the effective (tool) limit, not the agent's 10
+async def test_old_disabled_assignment_survives_default_backfill(context):
+    old_id, _ = await legacy(context)
+    async with async_session() as db:
+        old_assignment = await db.scalar(select(AgentTool).where(
+            AgentTool.agent_id == context.agent_id, AgentTool.tool_id == old_id))
+        old_assignment.enabled = False
+        new = await db.scalar(select(Tool).where(Tool.name == "read_media"))
+        new.is_default = False  # Exercise the actual rollout, including backfill.
+        await db.commit()
+    await seed_builtin_tools()
+    async with async_session() as db:
+        new = await db.scalar(select(Tool).where(Tool.name == "read_media"))
+        assignment = await db.scalar(select(AgentTool).where(
+            AgentTool.agent_id == context.agent_id, AgentTool.tool_id == new.id))
+        assert new.is_default is True and assignment.enabled is False
+        generation = await db.scalar(select(Tool).where(Tool.name == "generate_media"))
+        assert generation.is_default is False
+    assert "read_media" not in {item["function"]["name"] for item in await get_agent_tools_for_llm(context.agent_id)}
 
 
-@pytest.mark.asyncio
-async def test_all_inputs_fail_no_llm_call(agent_id, tmp_path):
-    """If every image fails at category-B load time, the LLM must not be
-    called — we return inline errors only, no zero-image API request."""
-    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
-    import copy
-    config = copy.deepcopy(DEFAULT_CONFIG)
-    config["model_id"] = "00000000-0000-0000-0000-000000000010"
+async def test_shared_loop_accepts_historical_name_under_canonical_permission(context):
+    from app.services.active_turns import active_turn_boundary
+    from app.services.llm import call_llm
+    from execution_provider_fixture import provider
 
-    llm_mock = AsyncMock()  # Should never be called
-
-    with (
-        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
-        patch("app.services.tools.read_image.handler._load_vision_model", AsyncMock(return_value=_mock_llm_model("00000000-0000-0000-0000-000000000010"))),
-        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
-        patch("app.services.llm.caller.call_llm", llm_mock),
-    ):
-        # Two nonexistent files — both become category-B LoadErrors
-        result = await handle_read_image(agent_id, {"image_paths": ["m1.jpg", "m2.jpg"]})
-
-    llm_mock.assert_not_called()
-    assert "--- Image 1: m1.jpg ---" in result
-    assert "--- Image 2: m2.jpg ---" in result
-    assert result.count("❌") >= 2  # both failures rendered inline
-
-
-@pytest.mark.asyncio
-async def test_recursion_defense_rejects_agent_id_none(tmp_path):
-    """If the handler is ever reached with agent_id=None (which would happen
-    if a vision model somehow tried to call read_image via the tool loop
-    with agent_id=None inherited from handle_read_image's own call_llm
-    invocation), we reject immediately. This is the defense against
-    vision-model-triggered recursion."""
-    result = await handle_read_image(None, {"image_paths": ["img.jpg"]})
-    assert result.startswith("❌")
-    assert "递归" in result or "recursion" in result.lower()
+    _, model_id = await legacy(context)
+    await seed_builtin_tools()
+    call = {"id": "legacy-read", "type": "function", "function": {
+        "name": "read_image", "arguments": json.dumps({"image_paths": ["first.png", "second.png"]})}}
+    async with provider([{"tool_calls": [call]}, {"content": "Task accepted"}]) as (url, requests):
+        async with async_session() as db:
+            model = await db.get(LLMModel, model_id)
+            model.base_url = url
+            model.api_protocol = "openai_compatible"
+            await db.commit()
+        async with active_turn_boundary():
+            reply = await call_llm(model, [{"role": "user", "content": "Read the old image request"}],
+                "Media tester", "Assistant", agent_id=context.agent_id, user_id=context.user_id,
+                session_id=context.session_id, turn_anchor_id=context.turn_anchor_id,
+                prepared_turn_context=("Assistant", ""))
+        assert reply == "Task accepted" and len(requests) == 2
+        names = {item["function"]["name"] for item in requests[0]["tools"]}
+        assert "read_media" in names and "read_image" not in names
+        result = json.loads(next(item["content"] for item in requests[1]["messages"] if item["role"] == "tool"))
+        assert result["status"] == "queued"

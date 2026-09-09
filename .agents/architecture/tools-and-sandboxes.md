@@ -25,9 +25,8 @@ trail. Seed values must respect the actual database column lengths.
 
 Do not hard-code one tool's name in unrelated tool descriptions, because disabled tools can leak back into model context through prose.
 
-Builtin tools must inherit company configuration through the current Agent's
-tenant; `read_image` resolves that shared base before applying its existing
-tightening-only Agent overrides, rather than bypassing the company layer.
+Builtin tools inherit company configuration through the current Agent's tenant;
+Agent overrides never bypass tenant model ownership and enablement checks.
 
 Builtin runtime-override fields must stay synchronized between database seeds
 and in-code fallback schemas. `run_subagent` and trigger-management tools accept
@@ -44,7 +43,8 @@ provider adapters may retain the internal `temperature` name.
 
 ## Media understanding and generation
 
-`read_media` and `generate_media` are independently opt-in builtin tools.
+`read_media` inherits the former image reader's default installation policy;
+`generate_media` remains opt-in. Explicit disabled assignments remain disabled.
 Both reference the existing enterprise `LLMModel` pool. Four default model IDs
 in `tool_config:media_ai` are managed by the enterprise model UI; Agent/scene
 tool settings may override those references. Explicit call `model_id` wins,
@@ -74,8 +74,33 @@ materialized into a matching tenant model on admission; disabled matches stay
 disabled. The legacy transport reader remains for previously accepted tasks.
 Enterprise media tests submit to the same child worker using an authorized existing
 Agent workspace. The existing non-waking Subagent mode avoids an extra parent LLM
-call; HTTP still returns a task receipt immediately. Existing image tools and
-their assignments retain their original behavior and permissions.
+call; HTTP still returns a task receipt immediately. Existing image generation
+tools retain their original behavior and permissions.
+
+`read_media` also replaces the former synchronous `read_image` vision/OCR tool.
+Its `files` array supports batches and joint image/audio/video understanding in
+one provider request, subject to the selected provider's actual capabilities.
+Base64 media data URLs remain supported without lossy compression. Missing or
+unreadable batch members are reported individually while valid members are
+understood together; an entirely unreadable batch fails explicitly.
+
+Startup moves old Agent assignments and tenant model references into `read_media`,
+preserving disabled states and preferring existing explicit media assignments.
+Old vision models gain the understanding purpose only within their owning tenant;
+invalid/foreign/disabled references do not silently select a different model.
+The old Tool UUID row remains a disabled legacy record, outside the normal catalog.
+Immutable scenes are not rewritten: their old UUID/config is projected onto the
+new tool at read time. Old `read_image(image_paths)` calls normalize before the
+ordinary permission check and enqueue the same asynchronous media task with the
+original OCR/transcription intent. No independent image understanding loop remains.
+
+Legacy backup model configuration uses the same shared provider clients. Only an
+explicit retryable HTTP refusal before any text, reasoning or tool output permits
+one backup attempt in the current worker execution. Connections are frozen and
+encrypted on admission; network uncertainty, partial output and restart recovery
+never resubmit understanding. Result usage records attempts and the actual model.
+Project shared-root media uses the existing authorized workspace route and exact
+file signing; asynchronous inputs never depend on a temporary materialization.
 
 Both entrypoints immediately return a `media_task` receipt (`task_id`, `session_id`,
 `status`). They enqueue an input in an ordinary child Session with `executor=media`.

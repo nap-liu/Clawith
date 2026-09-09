@@ -34,6 +34,7 @@ def error_result(error: MediaAIError) -> str:
         "status": "failed", "code": error.code,
         "message": render_message(f"mediaAI.{error.code}"),
         **({"provider_code": error.provider_code} if error.provider_code else {}),
+        **({"attempts": error.attempts} if getattr(error, "attempts", None) else {}),
     }, ensure_ascii=False)
 
 

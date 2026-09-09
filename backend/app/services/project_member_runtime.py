@@ -35,7 +35,7 @@ PROJECT_AGENT_DEFAULT_TOOL_NAMES = frozenset(
         "move_file",
         "read_document",
         "read_file",
-        "read_image",
+        "read_media",
         "search_files",
         "send_media",
         "upsert_focus_item",

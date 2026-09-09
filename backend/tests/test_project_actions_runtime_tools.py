@@ -27,7 +27,7 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
         "search_files",
         "write_file",
     }
-    structured_read_names = {"read_document", "read_image"}
+    structured_read_names = {"read_document", "read_media"}
     sandbox_names = {"execute_code", "execute_code_e2b", "execute_code_aio"}
     project_sandbox_names = {"execute_code"}
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import mimetypes
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
@@ -96,7 +97,9 @@ def normalize_sources(files: list) -> list[dict]:
     for value in files:
         item = dict(value) if isinstance(value, dict) else {"source": value}
         source = item["source"]
-        if source.startswith(("https://", "http://")):
+        if source.startswith("data:"):
+            _data_media(source)
+        elif source.startswith(("https://", "http://")):
             parsed = urlsplit(source)
             if not parsed.hostname or parsed.username or parsed.password:
                 raise MediaAIError("unsafeUrl")
@@ -114,6 +117,10 @@ async def load_media(agent_id, files: list) -> list[MediaInput]:
     for item in normalize_sources(files):
         source = item["source"]
         hint = item.get("kind")
+        if source.startswith("data:"):
+            mime, data = _data_media(source)
+            result.append(MediaInput(source, mime, data=data, role=item.get("role", "")))
+            continue
         if source.startswith(("https://", "http://")):
             await _managed_request_target(source)
             if hint:
@@ -148,3 +155,35 @@ async def load_media(agent_id, files: list) -> list[MediaInput]:
             raise MediaAIError("invalidMedia")
         result.append(MediaInput(source, mime, url=url, role=item.get("role", "")))
     return result
+
+
+def _data_media(source: str) -> tuple[str, bytes]:
+    try:
+        header, encoded = source.split(",", 1)
+        if not header.endswith(";base64"):
+            raise ValueError("base64 encoding required")
+        data = base64.b64decode(encoded, validate=True)
+        declared = header[5:-7]
+        mime = media_mime(data)
+        if declared != mime:
+            raise ValueError("media MIME mismatch")
+        return mime, data
+    except (ValueError, binascii.Error) as exc:
+        raise MediaAIError("invalidMedia") from exc
+
+
+async def load_understanding_media(agent_id, files: list, *, loader=load_media):
+    """Keep readable members of a batch and report every failed input explicitly."""
+    from app.services.media_url_source import MediaUrlError
+
+    media, failures = [], []
+    for index, item in enumerate(files):
+        try:
+            media.extend(await loader(agent_id, [item]))
+        except (MediaAIError, MediaUrlError, httpx.HTTPError, OSError) as exc:
+            source = item.get("source", "") if isinstance(item, dict) else item
+            failures.append({"index": index + 1, "source": source,
+                             "code": exc.code if isinstance(exc, MediaAIError) else "fileUnavailable"})
+    if files and not media:
+        raise MediaAIError(failures[0]["code"])
+    return media, failures

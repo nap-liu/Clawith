@@ -241,7 +241,7 @@ async def test_project_structured_readers_and_isolated_sandbox_share_the_project
         bind_agent_runtime_workspace,
         project_agent_runtime_workspace,
     )
-    from app.services.tools import read_image as read_image_tool
+    from app.services import read_media_compat
 
     env = project_api
     project = await _create_project(env, name="Structured project workspace")
@@ -317,16 +317,16 @@ async def test_project_structured_readers_and_isolated_sandbox_share_the_project
     document_result = await run("read_document", {"path": "docs/brief.docx"})
     assert "Project document content" in document_result
 
-    async def fake_read_image(agent_id, arguments, *, workspace_root=None):
-        assert agent_id == env.worker_id
-        assert workspace_root is not None
-        assert (workspace_root / "assets" / "diagram.png").read_bytes() == b"project-image-marker"
-        assert not (workspace_root / ".agents").exists()
-        assert not (workspace_root / ".git").exists()
-        return "project image read"
+    async def fake_read_media(project, arguments, **kwargs):
+        assert kwargs["agent_id"] == env.worker_id
+        assert str(project.id) == str(project_id)
+        assert arguments["files"] == ["assets/diagram.png"]
+        assert arguments["prompt"] == "Describe project diagram"
+        return "project media queued"
 
-    monkeypatch.setattr(read_image_tool, "handle_read_image", fake_read_image)
-    assert await run("read_image", {"image_paths": ["assets/diagram.png"]}) == "project image read"
+    monkeypatch.setattr(read_media_compat, "read_project_media", fake_read_media)
+    assert await run("read_media", {"files": ["assets/diagram.png"],
+                                    "prompt": "Describe project diagram"}) == "project media queued"
 
     async def fake_execute_code(_agent_id, _ws, _arguments, **kwargs):
         sandbox_root = kwargs["work_dir_override"]
