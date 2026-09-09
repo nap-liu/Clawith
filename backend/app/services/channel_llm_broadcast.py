@@ -71,5 +71,3 @@ async def broadcast_channel_user_message(
     # One-release compatibility for older Web clients.
     payload["user_id"] = str(user_id) if user_id is not None else None
     await _broadcast_to_web_session(agent_id, session_id, payload)
-
-

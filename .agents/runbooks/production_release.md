@@ -2,7 +2,27 @@
 
 This is the canonical executable release workflow for the digital employee
 platform. A release is incomplete unless every applicable section has evidence,
-an owner, an authority checkpoint, and a tested rollback anchor.
+an owner, an authority checkpoint, and a tested remediation path.
+
+### Explicit forward-only release policy
+
+If the user prohibits rollback, that instruction overrides rollback requirements
+below for the authorized release. Record `REMEDIATION_POLICY=forward-only` and a
+hotfix owner. Do not prepare an executable rollback entry point or require an
+old binary to adopt new unfinished work. Keep prior-image identity as comparison
+evidence and still prove online migrations work while the outgoing image serves.
+
+After cutover, remediate with a minimal fix based on the released SHA, affected
+Docker validation, and backend/frontend immutable images built from the same
+new hotfix SHA. Verify
+and pre-pull the new digests before the same four-role replacement command.
+Preserve durable inputs, tool results and delivery state for the shared recovery
+owner; do not downgrade schema, restore old snapshots over new writes, revert
+application images, or patch files inside production containers. Existing
+incident thresholds start forward-fix handling instead of rollback. Prepare the
+build/cache path, evidence capture and affected-check commands before release;
+do not invent a speculative hotfix or weaken validation to claim readiness.
+Production action authorization remains separate from preparation.
 
 Production hosts, credentials, private endpoints, registry authentication,
 domains, and absolute data paths live in the approved operations inventory.

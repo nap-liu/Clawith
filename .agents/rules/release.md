@@ -4,6 +4,11 @@ Read `.agents/runbooks/production_release.md` in full for every release,
 production cutover, or rollback plan. These invariants are not a substitute for
 the runbook.
 
+- When the user explicitly requires forward-only remediation, record that
+  release policy and follow the runbook's forward-only path. Do not execute a
+  binary rollback, schema downgrade or snapshot restore to undo that release.
+  Prepare a tested immutable-image hotfix path instead of a rollback gate.
+
 - An explicit request to "prepare everything before release" authorizes the
   reviewed release-candidate commit, authoritative-branch push, immutable
   backend/frontend image and cache build, registry push, and digest capture.
