@@ -19,6 +19,7 @@ from app.services.conversation_turn_lifecycle import transition_conversation_tur
 from app.services.gateway_message_queue import enqueue_user_gateway_message
 from app.services.llm.failure_outcome import render_message
 from app.services.openapi_applications import digest, fail, now
+from app.services.openapi_scenes import require_available_scene, select_session_scene
 from app.services.quota_guard import (
     AgentExpired, QuotaExceeded, check_agent_expired, check_conversation_quota,
 )
@@ -35,10 +36,12 @@ def _path(employee_id, session_id=None):
     return f"{path}?session_id={session_id}" if session_id else path
 
 
-async def prepare_interaction(db, application, user, employee_id, instance_ref, interaction: dict):
+async def prepare_interaction(db, application, user, employee_id, instance_ref, interaction: dict, scene_key=None):
     """Prepare once; retries neither extend expiry nor start execution."""
     request_id = interaction["request_id"]
     payload = {"message": interaction["message"], "context": interaction.get("context")}
+    if scene_key is not None:
+        payload["scene_key"] = scene_key
     fingerprint = digest(json.dumps(
         {"employee_id": str(employee_id), "instance_ref": instance_ref, **payload},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
@@ -113,6 +116,9 @@ async def activate_launcher(db, application, user, launcher: dict) -> tuple[str,
     if agent.tenant_id != application.tenant_id or user.tenant_id != application.tenant_id:
         fail("access_denied", 403)
     instance_ref = launcher.get("instance_ref")
+    scene_key = launcher.get("scene_key")
+    if scene_key is not None:
+        await require_available_scene(db, employee_id, scene_key)
     interaction_id = launcher.get("interaction_id")
     record = None
     if interaction_id:
@@ -134,7 +140,7 @@ async def activate_launcher(db, application, user, launcher: dict) -> tuple[str,
             if session is None or session.user_id != user.id or session.agent_id != employee_id:
                 fail("interaction_unavailable", 410)
             return _path(employee_id, session.id), None
-    if record is None and instance_ref is None:
+    if record is None and instance_ref is None and scene_key is None:
         return _path(employee_id), None
     external_conv_id = None
     current_session = None
@@ -151,11 +157,13 @@ async def activate_launcher(db, application, user, launcher: dict) -> tuple[str,
             ChatSession.external_conv_id == external_conv_id,
         ).with_for_update())
         if current_session is not None and record is None:
+            select_session_scene(current_session, scene_key)
             return _path(employee_id, current_session.id), None
     if record is None:
         session = await _new_session(
             db, user, employee_id, render_message("openapi.sessionTitle"), external_conv_id,
         )
+        select_session_scene(session, scene_key)
         return _path(employee_id, session.id), None
     try:
         await check_conversation_quota(user.id)
@@ -171,6 +179,7 @@ async def activate_launcher(db, application, user, launcher: dict) -> tuple[str,
         current_session.external_conv_id = None
         await db.flush()
     session = await _new_session(db, user, employee_id, message, external_conv_id)
+    select_session_scene(session, scene_key)
     content = message
     metadata = {
         "display_content": message,

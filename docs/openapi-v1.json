@@ -3,7 +3,7 @@
   "info": {
     "title": "Clawith system OpenAPI",
     "version": "1",
-    "description": "Generated from FastAPI. Context interactions and instance sessions are implemented. Check capabilities on the target environment for availability."
+    "description": "Generated from FastAPI. Context interactions, instance sessions and explicit scene selection are implemented. Check capabilities on the target environment for availability."
   },
   "paths": {
     "/api/openapi/v1/auth/token": {
@@ -178,13 +178,74 @@
         ]
       }
     },
+    "/api/openapi/v1/digital-employees/{employee_id}/scenes/search": {
+      "post": {
+        "tags": [
+          "OpenAPI v1"
+        ],
+        "summary": "Employee Scenes",
+        "description": "List this employee's enabled published scenes using the public H5 manifest.",
+        "operationId": "employee_scenes_api_openapi_v1_digital_employees__employee_id__scenes_search_post",
+        "security": [
+          {
+            "SystemOAuth2": [
+              "employees:read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "employee_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Employee Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmployeeUserInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmployeeScenesOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/openapi/v1/digital-employees/{employee_id}/access": {
       "post": {
         "tags": [
           "OpenAPI v1"
         ],
         "summary": "Employee",
-        "description": "With only user, returns the existing employee information and access URL. Adding instance_ref, interaction or embed_origin also requires auth:login and returns a temporary login URL. An interaction prepares a first question and optional JSON context without executing it. Opening the login URL activates one new conversation and one first question; identical request_id retries reuse that interaction. instance_ref alone resumes its current conversation.",
+        "description": "With only user, returns the existing employee information and access URL. Adding instance_ref, interaction, embed_origin or scene_key also requires auth:login and returns a temporary login URL. An interaction prepares a first question and optional JSON context without executing it. Opening the login URL activates one new conversation and one first question; identical request_id retries reuse that interaction. instance_ref alone resumes its current conversation. scene_key selects an enabled published scene when the login URL is opened.",
         "operationId": "employee_api_openapi_v1_digital_employees__employee_id__access_post",
         "security": [
           {
@@ -228,6 +289,9 @@
           },
           "400": {
             "description": "invalid_interaction: invalid optional launch fields or an empty question/request ID."
+          },
+          "404": {
+            "description": "scene_unavailable: the selected scene is not available for activation."
           },
           "409": {
             "description": "interaction_conflict: request_id was already used with different business content."
@@ -325,6 +389,9 @@
           },
           "400": {
             "description": "invalid_interaction: the launch reference is invalid."
+          },
+          "404": {
+            "description": "scene_unavailable: the selected scene is no longer available."
           },
           "410": {
             "description": "interaction_expired or interaction_unavailable: the prepared interaction is no longer available."
@@ -574,6 +641,28 @@
               }
             ],
             "title": "Request Id"
+          },
+          "scene_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scene Key"
+          },
+          "scene_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scene Revision"
           }
         },
         "type": "object",
@@ -623,6 +712,17 @@
               }
             ],
             "title": "Embed Origin"
+          },
+          "scene_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scene Key"
           }
         },
         "additionalProperties": false,
@@ -657,6 +757,116 @@
         "title": "ContextInteractionInput"
       },
       "JsonValue": {},
+      "EmployeeScenesOut": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EmployeeSceneOut"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "total"
+        ],
+        "title": "EmployeeScenesOut"
+      },
+      "EmployeeSceneOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "scene_key": {
+            "type": "string",
+            "title": "Scene Key"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision"
+          },
+          "welcome_message": {
+            "type": "string",
+            "title": "Welcome Message"
+          },
+          "quick_actions": {
+            "items": {
+              "additionalProperties": {
+                "$ref": "#/components/schemas/JsonValue"
+              },
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Quick Actions"
+          },
+          "system_prompts": {
+            "items": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "type": "array",
+            "title": "System Prompts"
+          },
+          "has_unpublished_changes": {
+            "type": "boolean",
+            "title": "Has Unpublished Changes"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "scene_key",
+          "name",
+          "enabled",
+          "revision",
+          "welcome_message",
+          "quick_actions",
+          "system_prompts",
+          "has_unpublished_changes",
+          "updated_at"
+        ],
+        "title": "EmployeeSceneOut"
+      },
+      "EmployeeUserInput": {
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/DelegatedUser"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "user"
+        ],
+        "title": "EmployeeUserInput"
+      },
       "EmployeePageOut": {
         "properties": {
           "items": {
@@ -807,10 +1017,31 @@
             "const": true,
             "title": "Instance Ref",
             "default": true
+          },
+          "scenes": {
+            "$ref": "#/components/schemas/SceneCapability"
           }
         },
         "type": "object",
         "title": "H5LauncherCapability"
+      },
+      "SceneCapability": {
+        "properties": {
+          "list": {
+            "type": "boolean",
+            "const": true,
+            "title": "List",
+            "default": true
+          },
+          "activate": {
+            "type": "boolean",
+            "const": true,
+            "title": "Activate",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "SceneCapability"
       },
       "InteractionCapability": {
         "properties": {

@@ -95,7 +95,8 @@ platform-administrator login through trusted phone assertions.
 |---|---|---|
 | GET `/capabilities` | Bearer token | Version, granted scopes and delegation availability |
 | POST `/digital-employees/search` | `user`, optional `search`, `page`, `page_size` | `items`, `total`, `page`, `page_size`, `has_more` |
-| POST `/digital-employees/{id}/access` | `user`, optional `instance_ref`, `interaction`, `embed_origin` | Employee display item; extended requests also return a temporary `login_url` |
+| POST `/digital-employees/{id}/access` | `user`, optional `instance_ref`, `interaction`, `embed_origin`, `scene_key` | Employee display item; extended requests also return a temporary `login_url` |
+| POST `/digital-employees/{id}/scenes/search` | `user` | Currently available published scene manifests for that employee |
 | POST `/auth/links` | `user`, `redirect_uri`, optional `embed_origin` | `login_url`, `expires_in` |
 | POST `/auth/link-exchange` | One-use `code` | Normal platform login response and bound `redirect_uri` |
 
@@ -172,8 +173,8 @@ parallel authentication, session, renderer or synchronization mechanism.
 ## Optional context interaction for H5 access
 
 The H5 access extension must stay simple, normalized and compatible. Extend
-`POST /digital-employees/{id}/access` with optional `instance_ref`, `interaction`
-and `embed_origin`. Requests without these additions retain the existing employee
+`POST /digital-employees/{id}/access` with optional `instance_ref`, `interaction`,
+`embed_origin` and `scene_key`. Requests without these additions retain the existing employee
 response and ordinary H5 behavior. Extended access returns the existing employee
 fields plus `login_url`, `expires_in` and, for an interaction, `request_id`.
 It reuses `employees:read`, `auth:login`, trusted delegation and generic login
@@ -225,3 +226,29 @@ interaction access even when no cleanup traffic has occurred.
 The external integration contract and runnable requests are maintained in
 [`docs/openapi-integration.md`](../../docs/openapi-integration.md); the generated
 [`docs/openapi-v1.json`](../../docs/openapi-v1.json) describes the system routes.
+
+## Explicit scene selection over OpenAPI
+
+Scene discovery uses delegated employee access and `employees:read`. Return only
+enabled published scenes while the employee's existing scene capability is
+enabled. Reuse the browser manifest projection; drafts, server prompts, automatic
+targets and tool/MCP credentials are never part of discovery.
+
+Optional `scene_key` on employee access selects a scene when its login link is
+opened, using the existing `auth:login` scope and launch flow. Validate availability
+at issuance and activation. The response identifies the scene's current published
+revision; actual turns snapshot the revision resolved at activation.
+
+Persist selection in ordinary `ChatSession.im_config.scene_key`, clearing the
+scene-disabled preference and preserving other preferences. With an instance,
+plain activation selects its current session; without one, create an independent
+session. For a new interaction, select the scene before ingest so the first
+question and subsequent H5 turns use the existing scene owners. Omitting the key
+preserves existing behavior. No new table, scope or model executor is required.
+
+An explicit scene key participates in interaction content identity. Reopening an
+activated request never resends or overwrites subsequent session scene choices.
+Active-turn revision snapshots remain immutable when session preferences change.
+Unavailable explicit scenes return `scene_unavailable` rather than silently
+falling back. OpenClaw retains its existing H5 scene presentation and gateway
+protocol; Native prompt/tool scene execution is not added to remote gateways.

@@ -35,7 +35,7 @@ class OpenAPIRoute(APIRoute):
                 code, status = "invalid_request", 422
                 if self.path.endswith("/{employee_id}/access") and any(
                     len(error["loc"]) > 1
-                    and error["loc"][1] in {"instance_ref", "interaction", "embed_origin"}
+                    and error["loc"][1] in {"instance_ref", "interaction", "embed_origin", "scene_key"}
                     for error in exc.errors()
                 ):
                     code, status = "invalid_interaction", 400

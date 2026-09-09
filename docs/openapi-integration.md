@@ -71,7 +71,8 @@ ID 和密钥做表单编码，再构造 Basic 值。
   "trust_user_identity": true,
   "h5_launcher": {
     "interaction": {"supported": true, "version": 1},
-    "instance_ref": true
+    "instance_ref": true,
+    "scenes": {"list": true, "activate": true}
   }
 }
 ```
@@ -144,6 +145,7 @@ ID 和密钥做表单编码，再构造 Basic 值。
 | --- | --- | --- |
 | `user` | object，必填 | 上述委托用户 |
 | `instance_ref` | 非空 string，可选 | 业务侧稳定的会话实例引用，不能只有空白；由调用方自行命名，平台不解析其业务结构 |
+| `scene_key` | string，可选 | 从有效场景列表取得的标识；打开登录链接时激活 |
 | `interaction` | object，可选 | 本次首次提问；省略时不自动提问 |
 | `interaction.request_id` | 非空 string，必填 | 本次业务动作的幂等键，不能只有空白；推荐 UUID，重试保持原值 |
 | `interaction.message` | 非空 string，必填 | 用户问题；不能只有空白 |
@@ -253,7 +255,82 @@ ID 和密钥做表单编码，再构造 Basic 值。
 同时更新 `asserted_at`。重签不会延长交互的 10 分钟期限。
 重复请求的关联和过期记录至少保留 24 小时；请为新动作始终生成新 ID。
 
-## 6. 既有普通入口与通用登录
+## 6. 获取有效场景与激活
+
+### 获取员工有效场景
+
+`POST /api/openapi/v1/digital-employees/{employee_id}/scenes/search`
+
+需要 `employees:read` 和可信用户委托，请求体只需 `user`：
+
+```json
+{
+  "user": {"subject": "business-user-42", "phone": "+8613800000000", "asserted_at": 1788919200}
+}
+```
+
+返回 `items` 和 `total`。每项沿用平台公开场景 manifest，主要字段如下：
+
+| 字段 | 含义 |
+| --- | --- |
+| `scene_key` | 激活时传入的场景标识，例如 `business-analysis` |
+| `name` | 已发布场景名称 |
+| `enabled` | 有效列表中为 true |
+| `revision` | 当前已发布版本号 |
+| `welcome_message` | 场景欢迎语 |
+| `quick_actions` | 允许用户看到的快捷操作 |
+
+只返回已发布且启用的场景，不返回草稿、停用场景。员工未启用场景能力时返回
+`{"items":[],"total":0}`。系统提示词、工具及 MCP 凭据不对外提供。
+该接口不提供场景创建、编辑和发布权限。
+
+### 使用 access 激活场景
+
+在第 5 节 access 请求增加顶层 `scene_key`：
+
+```json
+{
+  "user": {"subject": "business-user-42", "phone": "+8613800000000", "asserted_at": 1788919200},
+  "instance_ref": "dashboard:12:assistant:456",
+  "scene_key": "business-analysis"
+}
+```
+
+返回原员工字段、`login_url`、`expires_in`，并追加 `scene_key` 和 `scene_revision`。
+浏览器直接打开 `login_url` 后激活场景；签发本身不改变会话，也不调用模型。
+需要 `employees:read` 和 `auth:login`，不新增专用 scope。
+
+需要按场景自动提问时，在同一请求中加入原有 `interaction`：
+
+```json
+{
+  "user": {"subject": "business-user-42", "phone": "+8613800000000", "asserted_at": 1788919200},
+  "instance_ref": "dashboard:12:assistant:456",
+  "scene_key": "business-analysis",
+  "interaction": {
+    "request_id": "b77954cf-0630-4a85-9a55-b887254d36d2",
+    "message": "分析当前营业额变化。",
+    "context": {"revenue": 128000, "yoy": -0.12}
+  }
+}
+```
+
+平台先选择场景，再提交首问。原生员工的系统提示、工具配置、菜单和后续 H5 对话
+复用既有场景机制。OpenClaw 保持现有 H5 场景展示与网关协议，本轮不将原生场景
+提示词和工具配置转换为远端网关协议。
+
+- 有 `instance_ref`、无 `interaction`：在该实例当前会话激活场景；首次打开创建会话。
+- 无 `instance_ref`、有 `scene_key`：打开独立会话，避免改变原 H5 主会话。
+- 带新 `interaction`：创建新会话并按指定场景提交首问，沿用原有幂等规则。
+- 同 `request_id` 改 `scene_key`：409 `interaction_conflict`；重复打开已激活交互不覆盖之后的场景选择。
+- 省略 `scene_key`：保持原有会话、自动场景和默认场景规则。
+
+`scene_revision` 是签发时的当前已发布版本。打开时重查可用性，使用当时有效的已发布版本；
+首问记录实际版本，后续切换场景不会改写已开始的那一轮。
+场景下架、未发布或员工关闭场景能力时返回 404 `scene_unavailable`，不静默回退。
+标识沿用平台既有格式，直接使用列表返回的 `scene_key` 即可。
+
+## 7. 既有普通入口与通用登录
 
 不需要实例隔离或首问的既有接入可以继续：查询或 access 取得 `access_url`，然后调用
 `POST /api/openapi/v1/auth/links`（需要 `auth:login`）。
@@ -270,7 +347,7 @@ ID 和密钥做表单编码，再构造 Basic 值。
 `/auth/links` 不接受 interaction；新能力统一使用员工 access 接口。
 `POST /api/openapi/v1/auth/link-exchange` 由平台登录页内部调用，对接方无需自行兑换。
 
-## 7. 来源与地址
+## 8. 来源与地址
 
 系统 API 通过客户端凭据和 Bearer 授权，不要求调用方域名与平台域名相同。
 企业配置的嵌入白名单留空时允许任意有效嵌入来源；填写后按显式配置校验 `embed_origin`。
@@ -281,7 +358,7 @@ ID 和密钥做表单编码，再构造 Basic 值。
 如果返回了错误的公开地址，应修正平台公开地址配置。iframe 是否可用也取决于业务站点的
 嵌入策略与浏览器行为；这些不会改变系统 API 的 Bearer 认证方式。
 
-## 8. 错误与重试
+## 9. 错误与重试
 
 业务错误沿用以下结构；按 `detail.code` 分支，不依赖提示文案。
 
@@ -291,7 +368,7 @@ ID 和密钥做表单编码，再构造 Basic 值。
 
 | HTTP | code | 处理 |
 | --- | --- | --- |
-| 400 | `invalid_interaction` | 修正新字段格式、空 request_id 或空问题 |
+| 400 | `invalid_interaction` | 修正新字段格式、无效 scene_key、空 request_id 或空问题 |
 | 400 | `invalid_user_assertion` | 用当前 Unix 秒时间戳更新用户断言 |
 | 401 | `invalid_token` / `invalid_login_code` | 更新系统 token，或由业务后端重签登录链接 |
 | 401 | `application_disabled` | 检查应用、企业启用状态及凭据是否因配置变更失效 |
@@ -301,6 +378,7 @@ ID 和密钥做表单编码，再构造 Basic 值。
 | 403 | `embed_origin_denied` | 检查企业显式配置的嵌入来源 |
 | 403 | `quota_exceeded` | 按已有平台额度处理 |
 | 404 或 403 | `employee_unavailable` | 检查员工可用状态；保留原员工访问检查的错误语义 |
+| 404 | `scene_unavailable` | 重新获取有效场景，确认场景已发布且启用 |
 | 409 | `identity_conflict` | 核对用户映射，不用换手机号绕过已有绑定 |
 | 409 | `interaction_conflict` | 同动作保持原内容；明确新动作才使用新 ID |
 | 410 | `interaction_expired` / `interaction_unavailable` | 原交互已不可用，需要用户发起新动作 |
@@ -315,7 +393,7 @@ OAuth 端点与 Bearer scope 错误使用标准 `{"error":"…"}` 结构及相�
 本轮没有新增 `context_too_large` 或 8000 字符／128 KiB／200 行硬限制；
 平台已有请求容量、模型上下文容量和权限仍适用，不承诺无限输入。
 
-## 9. 可执行请求示例
+## 10. 可执行请求示例
 
 以下示例在业务后端环境运行，需 curl 和 jq。预先设置 `BASE_URL`、`CLIENT_ID`、
 `CLIENT_SECRET`、`EMPLOYEE_ID`、`USER_SUBJECT`、`USER_PHONE`、`INSTANCE_REF`、
@@ -347,7 +425,7 @@ jq -n --arg subject "$USER_SUBJECT" --arg phone "$USER_PHONE" \
 将成功响应中的 `login_url` 返回给当前用户的浏览器打开，不将它写入普通业务日志。
 对接完成后验证三件事：首次打开只有一条首问、重签重开不会重复、不同实例恢复各自会话。
 
-## 10. 其他接口与范围
+## 11. 其他接口与范围
 
 - `POST /api/openapi/v1/auth/revoke`：Basic 客户端认证，表单字段 `token`，可选
   `token_type_hint`；成功返回 200，未知或已撤销 token 同样返回 200。

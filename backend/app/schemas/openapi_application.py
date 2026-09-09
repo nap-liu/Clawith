@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
+from app.schemas.scene import validate_scene_key
+
 SCOPES = {"employees:read", "auth:login"}
 
 
@@ -98,6 +100,12 @@ class EmployeeAccessInput(EmployeeUserInput):
     instance_ref: str | None = Field(default=None, min_length=1)
     interaction: ContextInteractionInput | None = None
     embed_origin: str | None = None
+    scene_key: str | None = None
+
+    @field_validator("scene_key")
+    @classmethod
+    def scene_key_valid(cls, value):
+        return validate_scene_key(value) if value is not None else None
 
     @field_validator("instance_ref")
     @classmethod
@@ -138,6 +146,26 @@ class EmployeeAccessOut(EmployeeOut):
     login_url: str | None = None
     expires_in: int | None = None
     request_id: str | None = None
+    scene_key: str | None = None
+    scene_revision: int | None = None
+
+
+class EmployeeSceneOut(BaseModel):
+    id: UUID
+    scene_key: str
+    name: str
+    enabled: bool
+    revision: int
+    welcome_message: str
+    quick_actions: list[dict[str, JsonValue]]
+    system_prompts: list[JsonValue]
+    has_unpublished_changes: bool
+    updated_at: datetime | None
+
+
+class EmployeeScenesOut(BaseModel):
+    items: list[EmployeeSceneOut]
+    total: int
 
 
 class OAuthTokenOut(BaseModel):
@@ -157,9 +185,15 @@ class InteractionCapability(BaseModel):
     version: Literal[1] = 1
 
 
+class SceneCapability(BaseModel):
+    list: Literal[True] = True
+    activate: Literal[True] = True
+
+
 class H5LauncherCapability(BaseModel):
     interaction: InteractionCapability = Field(default_factory=InteractionCapability)
     instance_ref: Literal[True] = True
+    scenes: SceneCapability = Field(default_factory=SceneCapability)
 
 
 class CapabilitiesOut(BaseModel):
