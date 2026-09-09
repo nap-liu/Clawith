@@ -5345,5 +5345,38 @@
     "invalidSecret": "Invalid credential configuration. Enter it again.",
     "toolDisabled": "This tool is not enabled in the current scene.",
     "soul": "Load Soul"
+  },
+  "mcpConfig": {
+    "environment": "Environment variables",
+    "name": "Name",
+    "value": "Value",
+    "addEnvironment": "Add environment variable",
+    "saveFailed": "Could not save. Try again.",
+    "resetFailed": "Could not restore defaults. Try again.",
+    "loading": "Loading…",
+    "preview": "Configuration preview",
+    "address": "Service address",
+    "credential": "Access credential",
+    "set": "Configured",
+    "unset": "Not configured",
+    "instructions": "Instructions",
+    "instructionsHint": "Add instructions for this Digital Employee.",
+    "reset": "Restore defaults",
+    "saving": "Saving…",
+    "save": "Save",
+    "testing": "Testing…",
+    "testConnection": "Test connection",
+    "refreshing": "Refreshing…",
+    "refreshTools": "Refresh tools",
+    "running": "Running…",
+    "success": "Passed",
+    "failed": "Failed",
+    "delete": "Delete",
+    "add": "Add",
+    "result": {
+      "connection": "Connection",
+      "refresh": "Tools",
+      "dry-run": "Configuration"
+    }
   }
 }

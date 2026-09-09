@@ -109,6 +109,7 @@ class MCPServerOut(BaseModel):
     """Response — credential field IS NEVER plaintext."""
 
     id: uuid.UUID
+    is_shared: bool = True
     tenant_id: uuid.UUID | None
     name: str
     display_name: str

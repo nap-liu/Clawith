@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import React, { useState } from 'react';
 import { IconCheck, IconAlertTriangle } from '@tabler/icons-react';
 import { mcpServersApi, mcpOverridesApi } from '../../services/mcpServers';
@@ -20,6 +21,7 @@ type Result =
   | { kind: 'dry-run'; body: DryRunResponse; ok: boolean };
 
 export default function TestTab({ server, agentId, onRefreshed }: Props) {
+  const { t } = useTranslation();
   const [running, setRunning] = useState<'connection' | 'refresh' | 'dry-run' | null>(null);
   const [result, setResult] = useState<Result | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -29,7 +31,7 @@ export default function TestTab({ server, agentId, onRefreshed }: Props) {
     setErr(null);
     setResult(null);
     try {
-      const body = await mcpServersApi.testConnection(server.id);
+      const body = await mcpServersApi.testConnection(server.id, agentId);
       setResult({ kind: 'connection', body, ok: !!body?.success });
     } catch (e: any) {
       setErr(e?.message ?? String(e));
@@ -84,9 +86,9 @@ export default function TestTab({ server, agentId, onRefreshed }: Props) {
             cursor: running ? 'not-allowed' : 'pointer',
           }}
         >
-          {running === 'connection' ? '测试中…' : 'Test Connection'}
+          {running === 'connection' ? t('mcpConfig.testing') : t('mcpConfig.testConnection')}
         </button>
-        <button
+        {(!agentId || server.is_shared === false) && <button
           onClick={refreshTools}
           disabled={running !== null}
           style={{
@@ -96,8 +98,8 @@ export default function TestTab({ server, agentId, onRefreshed }: Props) {
             cursor: running ? 'not-allowed' : 'pointer',
           }}
         >
-          {running === 'refresh' ? '刷新中…' : '刷新工具'}
-        </button>
+          {running === 'refresh' ? t('mcpConfig.refreshing') : t('mcpConfig.refreshTools')}
+        </button>}
         <button
           onClick={dryRun}
           disabled={running !== null}
@@ -108,7 +110,7 @@ export default function TestTab({ server, agentId, onRefreshed }: Props) {
             cursor: running ? 'not-allowed' : 'pointer',
           }}
         >
-          {running === 'dry-run' ? '运行中…' : 'Dry Run（仅解析占位符）'}
+          {running === 'dry-run' ? t('mcpConfig.running') : t('mcpConfig.preview')}
         </button>
       </div>
       {err && <div style={{ color: '#ef4444', fontSize: 12 }}>{err}</div>}
@@ -122,7 +124,7 @@ export default function TestTab({ server, agentId, onRefreshed }: Props) {
             color: result.ok ? '#10b981' : '#ef4444',
           }}>
             {result.ok ? <IconCheck size={14} /> : <IconAlertTriangle size={14} />}
-            <span>{result.kind}: {result.ok ? 'OK' : 'FAILED'}</span>
+            <span>{t(`mcpConfig.result.${result.kind}`)}: {result.ok ? t('mcpConfig.success') : t('mcpConfig.failed')}</span>
           </div>
           <pre style={{
             whiteSpace: 'pre-wrap', margin: 0,

@@ -9,14 +9,17 @@ from __future__ import annotations
 import json
 import uuid
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer
 from app.models.tool import AgentTool, Tool
+from app.services.mcp_access import removable_mcp_server_ids, visible_mcp_installations
+from app.services.mcp_catalog_policy import shared_catalog
+from app.services.turn_tool_settings import effective_assignment
+from app.services.mcp_refresh_snapshot import MCPRefreshChanged, MCPRefreshUnavailable
 from app.services.mcp_refresh_service import (
-    ensure_agent_mcp_server_isolated,
     refresh_mcp_server_tools,
 )
 
@@ -24,61 +27,30 @@ from app.services.mcp_refresh_service import (
 async def list_installed_mcp_servers(agent_id: uuid.UUID) -> str:
     """List concise server-level MCP inventory with exact lifecycle IDs."""
     async with async_session() as db:
-        rows = (
-            await db.execute(
-                select(
-                    MCPServer.id.label("mcp_server_id"),
-                    MCPServer.display_name,
-                    MCPServer.transport,
-                    func.count(AgentTool.id).label("tool_count"),
-                    func.count(AgentTool.id)
-                    .filter(AgentTool.enabled.is_(True))
-                    .label("enabled_tool_count"),
-                    func.count(AgentTool.id)
-                    .filter(
-                        AgentTool.source == "user_installed",
-                        AgentTool.installed_by_agent_id == agent_id,
-                    )
-                    .label("removable_count"),
-                )
-                .select_from(AgentTool)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .join(MCPServer, MCPServer.id == Tool.mcp_server_id)
-                .where(
-                    AgentTool.agent_id == agent_id,
-                    Tool.type == "mcp",
-                )
-                .group_by(
-                    MCPServer.id,
-                    MCPServer.display_name,
-                    MCPServer.transport,
-                )
-                .order_by(MCPServer.display_name, MCPServer.id)
+        pairs = [(tool, assignment) for tool, assignment in
+                 await visible_mcp_installations(db, agent_id) if assignment is not None]
+        server_ids = {tool.mcp_server_id for tool, _ in pairs if tool.mcp_server_id}
+        removable_ids = await removable_mcp_server_ids(db, agent_id, server_ids)
+        server_rows = (await db.scalars(
+            select(MCPServer).where(MCPServer.id.in_(server_ids))
+            .order_by(MCPServer.display_name, MCPServer.id)
+        )).all()
+        groups = {server.id: {
+            "mcp_server_id": str(server.id), "display_name": server.display_name,
+            "transport": server.transport, "tool_count": 0,
+            "enabled_tool_count": 0, "removable": server.id in removable_ids,
+        } for server in server_rows}
+        legacy_tool_count = 0
+        for tool, assignment in pairs:
+            if tool.mcp_server_id is None:
+                legacy_tool_count += 1
+                continue
+            item = groups[tool.mcp_server_id]
+            item["tool_count"] += 1
+            item["enabled_tool_count"] += int(
+                effective_assignment(agent_id, tool, assignment) is not None
             )
-        ).all()
-
-        servers = [
-            {
-                "mcp_server_id": str(row.mcp_server_id),
-                "display_name": row.display_name,
-                "transport": row.transport,
-                "tool_count": row.tool_count,
-                "enabled_tool_count": row.enabled_tool_count,
-                "removable": row.removable_count > 0,
-            }
-            for row in rows
-        ]
-
-        legacy_tool_count = await db.scalar(
-            select(func.count(AgentTool.id))
-            .select_from(AgentTool)
-            .join(Tool, Tool.id == AgentTool.tool_id)
-            .where(
-                AgentTool.agent_id == agent_id,
-                Tool.type == "mcp",
-                Tool.mcp_server_id.is_(None),
-            )
-        )
+        servers = list(groups.values())
 
         result: dict = {"mcp_servers": servers}
         if legacy_tool_count:
@@ -101,7 +73,7 @@ async def refresh_mcp_server(
     async with async_session() as db:
         agent = (
             await db.execute(
-                select(Agent).where(Agent.id == agent_id).with_for_update()
+                select(Agent).where(Agent.id == agent_id)
             )
         ).scalar_one_or_none()
         if agent is None:
@@ -125,12 +97,6 @@ async def refresh_mcp_server(
 
         effective_server_id = server_id
         try:
-            server = await ensure_agent_mcp_server_isolated(
-                db,
-                server,
-                agent_id,
-            )
-            effective_server_id = server.id
             result = await refresh_mcp_server_tools(
                 db,
                 effective_server_id,
@@ -139,7 +105,11 @@ async def refresh_mcp_server(
                 session_id=session_id,
                 assign_to_agent=True,
             )
+            effective_server_id = result.server_id or server_id
             await db.commit()
+        except (MCPRefreshUnavailable, MCPRefreshChanged) as exc:
+            await db.rollback()
+            return json.dumps({"ok": False, "error": "mcp_refresh_unavailable", "detail": str(exc)}, ensure_ascii=False)
         except PermissionError as exc:
             detail = str(exc)
             await db.rollback()
@@ -179,11 +149,9 @@ async def refresh_mcp_server(
 async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
     """Detach only the current Agent's own installation from one exact server."""
     async with async_session() as db:
-        # Serialize lifecycle writes for one Agent without adding a new schema
-        # or ownership model. Other Agents remain fully concurrent.
-        await db.execute(
-            select(Agent.id).where(Agent.id == agent_id).with_for_update()
-        )
+        from app.services.mcp_catalog_locks import lock_mcp_catalogs
+
+        await lock_mcp_catalogs(db, [server_id], agent_id=agent_id)
         server = (
             await db.execute(select(MCPServer).where(MCPServer.id == server_id))
         ).scalar_one_or_none()
@@ -197,6 +165,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                 ensure_ascii=False,
             )
 
+        is_shared = await shared_catalog(db, server)
         pairs = (
             await db.execute(
                 select(AgentTool, Tool)
@@ -241,7 +210,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                     tool is not None
                     and tool.type == "mcp"
                     and tool.source == "agent"
-                    and server.created_by_user_id is None
+                    and not is_shared
                 ):
                     await db.delete(tool)
                     deleted_orphan_tools += 1
@@ -257,7 +226,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
         ).scalar_one_or_none()
         if (
             remaining_server_assignments is None
-            and server.created_by_user_id is None
+            and not is_shared
         ):
             stale_agent_tools = (
                 await db.execute(
@@ -279,7 +248,7 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                 .limit(1)
             )
         ).scalar_one_or_none()
-        server_deleted = remaining_server_tools is None
+        server_deleted = remaining_server_tools is None and not is_shared
         if server_deleted:
             await db.delete(server)
 

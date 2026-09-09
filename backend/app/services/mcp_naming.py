@@ -23,14 +23,14 @@ def server_internal_name(display_name: str, server_id: uuid.UUID) -> str:
 
 
 def tool_function_name(server: MCPServer, remote_name: str) -> str:
-    """Return a valid, globally unique function name within varchar(100)."""
+    """Return a valid, globally unique function name within the 64-character provider limit."""
     remote = _slug(remote_name, fallback="tool")
     # Existing servers may still have tenant-local names. The immutable id
     # isolates tenants; the raw-name digest also separates names that slugify
     # to the same value (for example, "search.docs" and "search_docs").
     value = f"mcp_{_slug(server.name)}_{server.id.hex[:8]}_{remote}"
     digest = hashlib.sha1(f"{server.id}:{remote_name}".encode()).hexdigest()[:10]
-    return f"{value[:89]}_{digest}"
+    return f"{value[:53]}_{digest}"
 
 
 def model_group_label(value: str | None) -> str:

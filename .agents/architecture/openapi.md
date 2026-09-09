@@ -156,6 +156,8 @@ OpenAPI models register through `app.models.registry`. The shared bootstrap and
 Alembic boundary owns schema creation; neither application lifespan nor a second
 entrypoint import list creates these tables. The integration merge revision joins
 the OpenAPI migration and bootstrap-index repair without rewriting either parent.
+The subsequent OpenAPI/MCP merge revision joins interaction persistence with the
+company Agent tool lookup index; deployments keep one current migration head.
 
 OpenAPI opts into the shared identity owner's exact mainland phone lookup:
 domestic 11-digit, `+86`, `86` and `0086` forms resolve to the same existing

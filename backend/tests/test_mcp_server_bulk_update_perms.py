@@ -80,12 +80,12 @@ async def _put(client: AsyncClient, server_name: str, token: str, url: str = "ht
     return resp.status_code
 
 
-async def test_owner_can_update():
+async def test_creator_member_cannot_update_shared_catalog():
     owner_id, owner_token = await _mk_user("member")
     _, name = await _mk_server_and_tool(owner_id)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        assert await _put(client, name, owner_token) == 200
+        assert await _put(client, name, owner_token) == 403
 
 
 async def test_non_owner_member_forbidden():
@@ -124,4 +124,4 @@ async def test_cross_tenant_org_admin_forbidden():
     _, foreign = await _mk_user("org_admin", tenant_id=other_tid)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        assert await _put(client, name, foreign) == 403
+        assert await _put(client, name, foreign) == 404

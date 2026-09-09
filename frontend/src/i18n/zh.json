@@ -5396,5 +5396,38 @@
     "invalidSecret": "凭据配置无效，请重新填写。",
     "toolDisabled": "当前场景未启用此工具。",
     "soul": "加载 Soul"
+  },
+  "mcpConfig": {
+    "environment": "环境变量",
+    "name": "名称",
+    "value": "值",
+    "addEnvironment": "添加环境变量",
+    "saveFailed": "保存失败，请稍后重试。",
+    "resetFailed": "恢复失败，请稍后重试。",
+    "loading": "加载中…",
+    "preview": "配置预览",
+    "address": "服务地址",
+    "credential": "访问凭证",
+    "set": "已设置",
+    "unset": "未设置",
+    "instructions": "执行说明",
+    "instructionsHint": "补充当前数字员工使用此服务时的说明。",
+    "reset": "恢复默认配置",
+    "saving": "保存中…",
+    "save": "保存",
+    "testing": "测试中…",
+    "testConnection": "测试连接",
+    "refreshing": "刷新中…",
+    "refreshTools": "刷新工具",
+    "running": "运行中…",
+    "success": "通过",
+    "failed": "失败",
+    "delete": "删除",
+    "add": "添加",
+    "result": {
+      "connection": "连接",
+      "refresh": "工具",
+      "dry-run": "配置"
+    }
   }
 }

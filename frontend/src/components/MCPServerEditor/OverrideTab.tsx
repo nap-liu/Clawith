@@ -1,3 +1,5 @@
+import { useTranslation } from 'react-i18next';
+import KeyValueEditor from './KeyValueEditor';
 import React, { useEffect, useState } from 'react';
 import { mcpOverridesApi } from '../../services/mcpServers';
 import type {
@@ -43,7 +45,10 @@ export default function OverrideTab({
   draftOverride,
   onDraftOverrideChange,
 }: Props) {
+  const { t } = useTranslation();
+  const [env, setEnv] = useState<Record<string, string>>({});
   const isDraftMode = Boolean(onDraftOverrideChange);
+  const shared = server.is_shared !== false;
   const [draft, setDraft] = useState<OverrideDraft>(emptyDraft());
   const [savedCredentialState, setSavedCredentialState] = useState<'set' | 'unset'>('unset');
   const [loaded, setLoaded] = useState(false);
@@ -52,6 +57,7 @@ export default function OverrideTab({
 
   useEffect(() => {
     if (isDraftMode) {
+      setEnv(draftOverride?.env_template ?? {});
       setDraft({
         system_prompt_block: draftOverride?.system_prompt_block ?? '',
         headers_template: draftOverride?.headers_template ?? {},
@@ -69,6 +75,7 @@ export default function OverrideTab({
         const groups = await mcpOverridesApi.list(server.id, agentId);
         if (cancelled) return;
         const existing = groups.agent.find((o) => o.scope_id === agentId);
+        setEnv(existing?.env_template ?? {});
         if (existing) {
           setDraft({
             system_prompt_block: existing.system_prompt_block ?? '',
@@ -77,7 +84,8 @@ export default function OverrideTab({
           });
           setSavedCredentialState(existing.credential_state);
         } else {
-          setDraft(emptyDraft());
+          setEnv({});
+        setDraft(emptyDraft());
           setSavedCredentialState('unset');
         }
       } catch (e: any) {
@@ -93,7 +101,7 @@ export default function OverrideTab({
     serverId: server.id,
     agentId,
     draftOverrides: draftToDraftOverrides(
-      draft,
+      shared ? { ...draft, system_prompt_block: '' } : draft,
       isDraftMode ? draftOverride?.credential_template : null,
     ),
   });
@@ -103,7 +111,8 @@ export default function OverrideTab({
     setErr(null);
     try {
       if (onDraftOverrideChange) {
-        const payload = draftToPayload(draft);
+        const payload = { ...draftToPayload(draft), env_template: env };
+        if (shared) delete payload.system_prompt_block;
         const credentialTemplate = draft.credential_input || draftOverride?.credential_template;
         onDraftOverrideChange({
           ...payload,
@@ -115,7 +124,9 @@ export default function OverrideTab({
         onSaved();
         return;
       }
-      const saved = await mcpOverridesApi.putAgent(server.id, agentId, draftToPayload(draft));
+      const payload = { ...draftToPayload(draft), env_template: env };
+      if (shared) delete payload.system_prompt_block;
+      const saved = await mcpOverridesApi.putAgent(server.id, agentId, payload);
       // After save, clear the password input so we don't re-submit the same
       // credential on the next save click, and surface the server's freshest state.
       setDraft({
@@ -123,10 +134,11 @@ export default function OverrideTab({
         headers_template: saved.headers_template ?? {},
         credential_input: '',
       });
+      setEnv(saved.env_template ?? {});
       setSavedCredentialState(saved.credential_state);
       onSaved();
     } catch {
-      setErr('保存失败，请稍后重试。');
+      setErr(t('mcpConfig.saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -138,23 +150,25 @@ export default function OverrideTab({
     try {
       if (onDraftOverrideChange) {
         onDraftOverrideChange(null);
+        setEnv({});
         setDraft(emptyDraft());
         setSavedCredentialState('unset');
         onSaved();
         return;
       }
       await mcpOverridesApi.deleteAgent(server.id, agentId);
+      setEnv({});
       setDraft(emptyDraft());
       setSavedCredentialState('unset');
       onSaved();
     } catch {
-      setErr('恢复失败，请稍后重试。');
+      setErr(t('mcpConfig.resetFailed'));
     } finally {
       setSaving(false);
     }
   };
 
-  if (!loaded) return <div style={{ color: 'var(--text-secondary)' }}>加载中…</div>;
+  if (!loaded) return <div style={{ color: 'var(--text-secondary)' }}>{t('mcpConfig.loading')}</div>;
 
   return (
     <div>
@@ -162,17 +176,17 @@ export default function OverrideTab({
         padding: 10, background: 'var(--bg-tertiary)', borderRadius: 6,
         marginBottom: 14, fontSize: 11, color: 'var(--text-tertiary)',
       }}>
-        <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>配置预览</div>
-        <div>服务地址：<code style={{ color: 'var(--text-secondary)' }}>{preview?.resolved_url ?? '…'}</code></div>
+        <div style={{ color: 'var(--text-secondary)', marginBottom: 4 }}>{t('mcpConfig.preview')}</div>
+        <div>{t('mcpConfig.address')}: <code style={{ color: 'var(--text-secondary)' }}>{preview?.resolved_url ?? '…'}</code></div>
         {preview?.resolved_headers && Object.entries(preview.resolved_headers).map(([k, v]) => (
           <div key={k}><code>{k}: {v}</code></div>
         ))}
         {preview?.resolved_credential_state && (
-          <div style={{ marginTop: 2 }}>访问凭证：<code>{preview.resolved_credential_state === 'set' ? '已设置' : '未设置'}</code></div>
+          <div style={{ marginTop: 2 }}>{t('mcpConfig.credential')}: <code>{preview.resolved_credential_state === 'set' ? t('mcpConfig.set') : t('mcpConfig.unset')}</code></div>
         )}
         {preview?.resolved_prompt && (
           <div style={{ marginTop: 4, whiteSpace: 'pre-wrap' }}>
-            执行说明：<code style={{ color: 'var(--text-secondary)' }}>{preview.resolved_prompt}</code>
+            {t('mcpConfig.instructions')}: <code style={{ color: 'var(--text-secondary)' }}>{preview.resolved_prompt}</code>
           </div>
         )}
       </div>
@@ -181,8 +195,16 @@ export default function OverrideTab({
         draft={draft}
         onChange={setDraft}
         savedCredentialState={savedCredentialState}
-        placeholdersHint="可按需补充当前数字员工使用此服务时的说明。"
+        hide={{ prompt: shared }}
+        placeholdersHint={t('mcpConfig.instructionsHint')}
       />
+
+      {server.transport === 'stdio' && <KeyValueEditor
+        value={env} onChange={setEnv} label={t('mcpConfig.environment')}
+        keyPlaceholder={t('mcpConfig.name')} valuePlaceholder={t('mcpConfig.value')}
+        addLabel={t('mcpConfig.addEnvironment')}
+        isSecretKey={(key) => /TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL/i.test(key)}
+      />}
 
       {err && <div style={{ color: '#ef4444', fontSize: 12, marginTop: 10 }}>{err}</div>}
       <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 14 }}>
@@ -197,7 +219,7 @@ export default function OverrideTab({
             cursor: saving ? 'not-allowed' : 'pointer',
           }}
         >
-          恢复默认配置
+          {t('mcpConfig.reset')}
         </button>
         <button
           onClick={save}
@@ -209,7 +231,7 @@ export default function OverrideTab({
             cursor: saving ? 'not-allowed' : 'pointer',
           }}
         >
-          {saving ? '保存中…' : '保存'}
+          {saving ? t('mcpConfig.saving') : t('mcpConfig.save')}
         </button>
       </div>
     </div>

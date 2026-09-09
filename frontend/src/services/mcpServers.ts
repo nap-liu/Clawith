@@ -37,8 +37,8 @@ export const mcpServersApi = {
     }),
   delete: (id: string) =>
     fetchJson<void>(`/admin/mcp-servers/${id}`, { method: 'DELETE' }),
-  testConnection: (id: string) =>
-    fetchJson<TestConnectionResult>(`/admin/mcp-servers/${id}/test-connection`, {
+  testConnection: (id: string, agentId?: string) =>
+    fetchJson<TestConnectionResult>(`/admin/mcp-servers/${id}/test-connection${agentId ? `?agent_id=${encodeURIComponent(agentId)}` : ''}`, {
       method: 'POST',
     }),
   refreshTools: (id: string, agentId?: string) => {

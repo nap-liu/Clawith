@@ -4,16 +4,22 @@ import uuid
 
 from app.config import get_settings
 from sqlalchemy import select
+from app.models.agent import Agent
 from app.models.tool import Tool, AgentTool
+from app.services.tool_enablement import tool_visibility_clause
+from app.services.mcp_catalog_policy import shared_catalog, safe_shared_override
 from app.services.turn_tool_settings import current_tool_settings, effective_mcp_override
 
 
 def _enabled_tools_query(agent_id):
+    tenant = select(Agent.tenant_id).where(Agent.id == agent_id).scalar_subquery()
+    installed = select(AgentTool.tool_id).where(AgentTool.agent_id == agent_id).correlate(None)
+    query = select(Tool).where(Tool.enabled.is_(True), tool_visibility_clause(tenant, installed))
     scope = current_tool_settings(agent_id)
     if scope is not None:
-        return select(Tool).where(Tool.id.in_([item["tool_id"] for item in scope.assignments]), Tool.enabled.is_(True))
-    return select(Tool).join(AgentTool, AgentTool.tool_id == Tool.id).where(
-        AgentTool.agent_id == agent_id, AgentTool.enabled.is_(True), Tool.enabled.is_(True),
+        return query.where(Tool.id.in_([item["tool_id"] for item in scope.assignments]))
+    return query.join(AgentTool, AgentTool.tool_id == Tool.id).where(
+        AgentTool.agent_id == agent_id, AgentTool.enabled.is_(True),
     )
 
 
@@ -167,6 +173,9 @@ async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
         for srv in servers:
             t_ovr = ovr_index.get((srv.id, "tenant", tenant_id)) if tenant_id else None
             a_ovr = effective_mcp_override(agent_id, srv.id, ovr_index.get((srv.id, "agent", agent_id)))
+            if await shared_catalog(db, srv):
+                t_ovr = safe_shared_override(t_ovr)
+                a_ovr = safe_shared_override(a_ovr)
             parts = [
                 (srv.system_prompt_block or "").strip(),
                 (t_ovr.system_prompt_block or "").strip() if t_ovr else "",

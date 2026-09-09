@@ -166,7 +166,7 @@ async def lookup_overrides(
         # credentials are never read from that scope: an eligible execution
         # references the source Agent override below, and all others inherit
         # only server/tenant configuration.
-        if project_uses_private_tool:
+        if project_agent is not None and project_agent.scope == "project":
             a_ovr = None
         source_has_private_tool = False
         if (
@@ -203,7 +203,14 @@ async def lookup_overrides(
             ).scalar_one_or_none()
     from app.services.turn_tool_settings import effective_mcp_override
 
-    return t_ovr, effective_mcp_override(agent_id, server_id, a_ovr)
+    from app.services.mcp_catalog_policy import shared_catalog, safe_shared_override
+
+    a_ovr = effective_mcp_override(agent_id, server_id, a_ovr)
+    server = await db.get(MCPServer, server_id)
+    if server is not None and await shared_catalog(db, server):
+        t_ovr = safe_shared_override(t_ovr)
+        a_ovr = safe_shared_override(a_ovr)
+    return t_ovr, a_ovr
 
 
 async def lookup_project_source_tool_config(
@@ -368,6 +375,8 @@ async def persist_stdio_discovered_tools(
     db,
     srv,
     tools: list[dict],
+    *,
+    source: str = "admin",
 ) -> int:
     """Upsert Tool rows for tools discovered from a stdio MCP server.
 
@@ -384,6 +393,12 @@ async def persist_stdio_discovered_tools(
     from app.models.tool import Tool
     from sqlalchemy import select
 
+    from app.services.mcp_catalog_policy import shared_catalog
+
+    # Discovery cannot change the origin of an existing catalog.
+    has_tools = await db.scalar(select(Tool.id).where(Tool.mcp_server_id == srv.id).limit(1))
+    if srv.created_by_user_id is not None or has_tools is not None:
+        source = "admin" if await shared_catalog(db, srv) else "agent"
     upserted = 0
     for t in tools:
         raw_name: str = t.get("name") or ""
@@ -392,7 +407,9 @@ async def persist_stdio_discovered_tools(
         if not raw_name:
             continue
 
-        tool_name = f"mcp_{srv.name}_{raw_name}"
+        from app.services.mcp_naming import tool_function_name
+
+        tool_name = tool_function_name(srv, raw_name)
         display_name = raw_name.replace("_", " ").title()
 
         existing = (await db.execute(
@@ -412,7 +429,7 @@ async def persist_stdio_discovered_tools(
                 display_name=display_name,
                 description=description,
                 type="mcp",
-                source="admin",
+                source=source,
                 tenant_id=srv.tenant_id,
                 mcp_server_id=srv.id,
                 mcp_server_name=srv.name,
@@ -449,27 +466,30 @@ async def upsert_mcp_server_from_tools(
     - Returns the row's id.
     - On name collision (uniq violation), suffixes -2/-3 etc. (matches P0a migration).
     """
+    if owner_agent_id is not None:
+        from app.services.mcp_private_installations import private_server
+
+        server = await private_server(db, owner_agent_id, tenant_id, server_name, {
+            "transport": "http", "base_url_template": server_url,
+            "headers_template": headers_template or {}, "credential_template": api_key,
+        })
+        return server.id
     tenant_clause = (
         MCPServer.tenant_id == tenant_id
         if tenant_id is not None
         else MCPServer.tenant_id.is_(None)
     )
-    private_name = (
-        agent_private_server_name(server_name, server_url, owner_agent_id)
-        if owner_agent_id is not None
-        else None
-    )
-    lookup = select(MCPServer).where(
-        MCPServer.base_url_template == server_url,
-        tenant_clause,
-    )
-    if private_name is not None:
-        # The display name may change between imports; ownership identity does
-        # not. Match the stable Agent + URL suffix before using the current
-        # display-derived name for a newly created row.
-        private_suffix = private_name[private_name.rfind("-a"):]
-        lookup = lookup.where(MCPServer.name.endswith(private_suffix))
-    existing = (await db.execute(lookup)).scalar_one_or_none()
+    from app.services.mcp_catalog_policy import shared_catalog
+
+    candidates = (await db.scalars(select(MCPServer).where(
+        MCPServer.base_url_template == server_url, tenant_clause,
+    ))).all()
+    shared = [candidate for candidate in candidates if await shared_catalog(db, candidate)]
+    if len(shared) > 1:
+        from app.services.llm.failure_outcome import render_message
+
+        raise ValueError(render_message("mcpAccess.exactServerRequired"))
+    existing = shared[0] if shared else None
 
     if existing is not None:
         if system_prompt_block is not None:
@@ -483,7 +503,7 @@ async def upsert_mcp_server_from_tools(
 
     # Create new — derive unique name (seed the fallback from the URL so
     # ASCII-free names don't all collapse to the same base; see docstring).
-    base = private_name or _slugify_server_name(server_name, url_seed=server_url)
+    base = _slugify_server_name(server_name, url_seed=server_url)
     name = base
     suffix = 2
     while True:
@@ -515,49 +535,15 @@ async def upsert_mcp_server_from_tools(
 
 
 async def get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg: dict):
-    """Create-or-reuse an agent-private stdio MCPServer from a parsed stdio cfg.
+    """Create or reuse the current Agent's exact stdio configuration."""
+    from app.services.mcp_private_installations import private_server
 
-    Name = "{pkgslug}-a{agent8}" so two agents installing the same package get
-    distinct servers (distinct creds, no Tool.name collision). Idempotent on name.
-    cfg keys: command(str), args(list), env(dict).
-    """
-    from app.models.mcp_server import MCPServer
-    from sqlalchemy import select
-
-    # Derive a package slug from the most descriptive arg (last non-flag) or command.
     args = cfg.get("args") or []
-    pkg = next((a for a in reversed(args) if not str(a).startswith("-")), cfg.get("command", "mcp"))
-    pkg_slug = re.sub(r"[^a-z0-9]+", "-", str(pkg).lower()).strip("-")[:40] or "mcp"
-    agent8 = str(agent_id).replace("-", "")[:8]
-    name = f"{pkg_slug}-a{agent8}"
+    from pathlib import PurePath
 
-    existing = (await db.execute(
-        select(MCPServer).where(
-            MCPServer.name == name,
-            (MCPServer.tenant_id == tenant_id) if tenant_id is not None
-            else MCPServer.tenant_id.is_(None),
-        )
-    )).scalar_one_or_none()
-    if existing is not None:
-        # Refresh command/args/env in case the agent changed creds/args.
-        existing.command_template = cfg.get("command")
-        existing.args_template = cfg.get("args") or []
-        existing.env_template = cfg.get("env") or {}
-        await db.flush()
-        return existing
-
-    srv = MCPServer(
-        name=name,
-        display_name=pkg_slug,
-        tenant_id=tenant_id,
-        transport="stdio",
-        command_template=cfg.get("command"),
-        args_template=cfg.get("args") or [],
-        env_template=cfg.get("env") or {},
-        base_url_template="",
-        headers_template={},
-        created_by_user_id=None,
-    )
-    db.add(srv)
-    await db.flush()
-    return srv
+    label = PurePath(cfg.get("command") or "mcp").name
+    return await private_server(db, agent_id, tenant_id, label, {
+        "transport": "stdio", "base_url_template": "", "headers_template": {},
+        "command_template": cfg.get("command"), "args_template": args,
+        "env_template": cfg.get("env") or {},
+    })

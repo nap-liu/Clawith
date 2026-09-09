@@ -8,7 +8,8 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.core.security import decrypt_data, encrypt_data
 from app.models.agent import Agent
-from app.models.mcp_server import MCPServerOverride
+from app.models.mcp_server import MCPServer, MCPServerOverride
+from app.services.mcp_catalog_policy import validate_agent_override, validate_shared_tool_config
 from app.models.tool import AgentTool, Tool
 from app.schemas.scene import SceneSaveRequest, SceneToolSaveRequest
 from app.services.tool_config import get_sensitive_keys
@@ -71,6 +72,7 @@ async def prepare_scene_settings(db, agent_id, payload, previous=None):
         tool = catalog.get(tool_id)
         if tool is None or (item["enabled"] and not tool.enabled and not tool_is_required(tool.name)):
             raise HTTPException(422, detail="sceneRuntime.toolUnavailable")
+        await validate_shared_tool_config(db, tool, item.get("config", {}))
         item["enabled"] = tool_is_required(tool.name) or item["enabled"]
         assignment = assignments.get(tool_id)
         prior = prior_tools.get(tool_id, {}).get("config", assignment.config if assignment else {}) or {}
@@ -86,6 +88,8 @@ async def prepare_scene_settings(db, agent_id, payload, previous=None):
         server_id = str(item["server_id"])
         if server_id not in server_ids:
             raise HTTPException(422, detail="sceneRuntime.serverUnavailable")
+        server = await db.get(MCPServer, item["server_id"])
+        await validate_agent_override(db, server, {key: value for key, value in item.items() if key != "server_id"})
         original = await db.scalar(select(MCPServerOverride).where(
             MCPServerOverride.mcp_server_id == server_id,
             MCPServerOverride.scope_type == "agent", MCPServerOverride.scope_id == agent_id,

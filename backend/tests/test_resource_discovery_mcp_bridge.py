@@ -179,9 +179,10 @@ async def test_smithery_import_links_existing_model_and_returns_exact_server_id(
     async with async_session() as db:
         servers = (
             await db.execute(
-                select(MCPServer).where(
-                    MCPServer.base_url_template == "https://vendor-example.run.tools"
-                )
+                select(MCPServer).join(Tool, Tool.mcp_server_id == MCPServer.id).join(AgentTool).where(
+                    MCPServer.base_url_template == "https://vendor-example.run.tools",
+                    AgentTool.agent_id == agent_id,
+                ).distinct()
             )
         ).scalars().all()
         assert len(servers) == 1

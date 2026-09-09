@@ -28,11 +28,15 @@ from app.api.tools_shared import (
     tool_is_required,
 )
 from app.core.okr_feature import is_retired_okr_tool
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
+from app.models.agent import Agent
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.services.mcp_naming import load_mcp_display_names
+from app.services.llm.failure_outcome import render_message
+from app.services.mcp_catalog_policy import can_remove_private_tool, validate_shared_tool_config
 
 
 @router.get("/agents/{agent_id}")
@@ -356,11 +360,23 @@ async def delete_agent_tool(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin: remove an agent-tool assignment. Also deletes the tool record if no other agents use it."""
+    """An Agent manager can remove a binding and its orphaned MCP tool."""
     at_r = await db.execute(select(AgentTool).where(AgentTool.id == agent_tool_id))
     at = at_r.scalar_one_or_none()
     if not at:
         raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    _agent, access_level = await check_agent_access(db, current_user, at.agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail=render_message("mcpAccess.manageRequired"))
+    from app.services.mcp_catalog_locks import lock_tool_catalog
+
+    await db.execute(select(Agent.id).where(Agent.id == at.agent_id).with_for_update())
+    at = await db.scalar(select(AgentTool).where(
+        AgentTool.id == agent_tool_id,
+    ).execution_options(populate_existing=True))
+    if at is None:
+        raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    await lock_tool_catalog(db, at.tool_id)
     tool_id = at.tool_id
     await db.delete(at)
     await db.flush()
@@ -369,7 +385,7 @@ async def delete_agent_tool(
     if not remaining_r.scalar_one_or_none():
         tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
         tool = tool_r.scalar_one_or_none()
-        if tool and tool.type == "mcp":
+        if tool and await can_remove_private_tool(db, tool):
             await db.delete(tool)
     await db.commit()
     return {"ok": True}
@@ -417,7 +433,9 @@ async def get_agent_tool_config(
 
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     assignments = await _load_agent_tool_assignments(db, agent_id)
-    tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
+    tool_r = await db.execute(select(Tool).where(
+        Tool.id == tool_id, _agent_visible_tool_clause(agent.tenant_id, assignments),
+    ))
     tool = tool_r.scalar_one_or_none()
     if tool and is_retired_okr_tool(tool.name):
         tool = None
@@ -478,7 +496,10 @@ async def update_agent_tool_config(
             )
 
     # Encrypt sensitive fields using the tool's config_schema for field type awareness
-    tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id))
+    assigned_ids = select(AgentTool.tool_id).where(AgentTool.agent_id == agent_id)
+    from app.services.tool_enablement import tool_visibility_clause
+
+    tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id, tool_visibility_clause(agent.tenant_id, assigned_ids)))
     tool_for_schema = tool_r2.scalar_one_or_none()
     if tool_for_schema and is_retired_okr_tool(tool_for_schema.name):
         tool_for_schema = None
@@ -487,6 +508,7 @@ async def update_agent_tool_config(
         tool_for_schema, agent.tenant_id, assignments
     ):
         raise HTTPException(status_code=404, detail="Tool not found")
+    await validate_shared_tool_config(db, tool_for_schema, data.config)
     encrypted_config = _encrypt_sensitive_fields(data.config, tool_for_schema.config_schema if tool_for_schema else None)
 
     at_r = await db.execute(

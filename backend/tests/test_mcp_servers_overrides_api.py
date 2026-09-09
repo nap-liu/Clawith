@@ -119,26 +119,26 @@ async def test_put_tenant_override_creates_then_updates(client):
     r = await client.put(
         f"/api/admin/mcp-servers/{srv.id}/overrides/tenant/{t_id}",
         json={
-            "system_prompt_block": "TENANT-BLOCK",
+            "headers_template": {"X-Team": "one"},
             "env_template": {"ACCESS_TOKEN": "override-secret", "MODE": "safe"},
         },
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert r.status_code == 200
-    assert r.json()["system_prompt_block"] == "TENANT-BLOCK"
+    assert r.json()["headers_template"] == {"X-Team": "one"}
     assert r.json()["env_template"] == {"ACCESS_TOKEN": "***", "MODE": "safe"}
 
     # PUT (update — same scope_id) is idempotent upsert
     r2 = await client.put(
         f"/api/admin/mcp-servers/{srv.id}/overrides/tenant/{t_id}",
         json={
-            "system_prompt_block": "TENANT-BLOCK-V2",
+            "headers_template": {"X-Team": "two"},
             "env_template": {"ACCESS_TOKEN": "***", "MODE": "safe"},
         },
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert r2.status_code == 200
-    assert r2.json()["system_prompt_block"] == "TENANT-BLOCK-V2"
+    assert r2.json()["headers_template"] == {"X-Team": "two"}
     assert r2.json()["id"] == r.json()["id"]  # same row, not a new one
     async with async_session() as db:
         stored = await db.get(MCPServerOverride, uuid.UUID(r.json()["id"]))
@@ -174,7 +174,7 @@ async def test_put_agent_override_requires_agent_creator_or_platform_admin(clien
     _, other_token = await _make_user("member")
     r = await client.put(
         f"/api/admin/mcp-servers/{srv.id}/overrides/agent/{agent_id}",
-        json={"system_prompt_block": "AG"},
+        json={"credential_template": "agent-key"},
         headers={"Authorization": f"Bearer {other_token}"},
     )
     assert r.status_code == 403
@@ -183,11 +183,11 @@ async def test_put_agent_override_requires_agent_creator_or_platform_admin(clien
     creator_token = create_access_token(str(creator.id), "member")
     r2 = await client.put(
         f"/api/admin/mcp-servers/{srv.id}/overrides/agent/{agent_id}",
-        json={"system_prompt_block": "AG"},
+        json={"credential_template": "agent-key"},
         headers={"Authorization": f"Bearer {creator_token}"},
     )
     assert r2.status_code == 200
-    assert r2.json()["system_prompt_block"] == "AG"
+    assert r2.json()["credential_state"] == "set"
 
 
 async def test_get_overrides_agent_creator_can_read_own_agent_scope(client):

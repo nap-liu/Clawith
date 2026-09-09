@@ -111,7 +111,15 @@ async def execute_tool_preflight(
 
     # Project protocol tools have their own validated member/role scope below.
     if scope is not None and tool_name not in scope.enabled_names and not tool_is_required(tool_name) and tool_name not in PROJECT_RUNTIME_TOOL_NAMES:
-        return render_message("sceneRuntime.toolDisabled")
+        from app.services.mcp_access import resolve_mcp_execution
+
+        async with async_session() as access_db:
+            candidates = await resolve_mcp_execution(access_db, agent_id, tool_name)
+        if len(candidates) > 1:
+            return render_message("mcpAccess.ambiguous")
+        if not candidates or candidates[0][0].name not in scope.enabled_names:
+            return render_message("sceneRuntime.toolDisabled")
+        tool_name = candidates[0][0].name
     # Normalize only the legacy Agent-UUID sentinel at the shared tool boundary.
     # A genuine ``None`` remains anonymous/autonomous; durable background entry
     # points resolve a missing resource execution user to its creator earlier.

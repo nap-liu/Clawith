@@ -418,36 +418,6 @@ export default function ToolsManager({
         }
     };
 
-    const deleteCompanyMcpGroup = async (serverId: string, label: string, toolCount: number) => {
-        const ok = await dialog.confirm(
-            `${t('common.confirmActions.deleteLabel', 'Delete')} “${label}” · ${t('agent.tools.companyTools', 'Company Tools')} (${toolCount})?`,
-            {
-                title: t('agent.tools.deleteCompanyMcpGroupTitle', 'Delete company MCP tool group'),
-                danger: true,
-                confirmLabel: t('common.delete', 'Delete'),
-            },
-        );
-        if (!ok) return;
-
-        setDeletingMcpServerId(serverId);
-        try {
-            const token = localStorage.getItem('token');
-            const res = await fetch(`/api/admin/mcp-servers/${serverId}`, {
-                method: 'DELETE',
-                headers: { Authorization: `Bearer ${token}` },
-            });
-            if (!res.ok) {
-                const body = await res.json().catch(() => null);
-                throw new Error(body?.detail?.error || body?.detail || `HTTP ${res.status}`);
-            }
-            await loadTools();
-            toast.success(t('agent.tools.companyMcpGroupDeleted', 'Company MCP tool group deleted'));
-        } catch (e: any) {
-            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: scope === 'project' ? undefined : String(e?.message || e) });
-        } finally {
-            setDeletingMcpServerId(null);
-        }
-    };
 
     const renderToolActions = (tool: any, category: string) => {
         const hasConfig = tool.config_schema?.fields?.length > 0 || tool.type === 'mcp';
@@ -605,20 +575,13 @@ export default function ToolsManager({
             && group.key.startsWith('mcp:')
             && !!mcpServerId
             && group.allItems.every(tool => tool.agent_tool_source === 'user_installed' && tool.installed_by_agent_id === agentId);
-        const deletableCompanyMcpGroup = scope === 'agent' && !draftTools && toolTab === 'company'
-            && currentUser?.role === 'platform_admin'
-            && group.key.startsWith('mcp:')
-            && !!mcpServerId
-            && group.allItems.every(tool => tool.type === 'mcp' && tool.source === 'admin' && tool.mcp_server_id === mcpServerId);
         return (
             <>
-                {canConfigure && (removableMcpGroup || deletableCompanyMcpGroup) ? (
+                {canConfigure && removableMcpGroup ? (
                     <button
                         type="button"
                         className="tool-catalog-panel__action is-danger"
-                        onClick={() => void (deletableCompanyMcpGroup
-                            ? deleteCompanyMcpGroup(mcpServerId!, group.label, group.allItems.length)
-                            : uninstallMcpGroup(mcpServerId!, group.label, group.allItems.length))}
+                        onClick={() => void uninstallMcpGroup(mcpServerId!, group.label, group.allItems.length)}
                         disabled={deletingMcpServerId === mcpServerId}
                     >
                         <IconTrash size={12} />

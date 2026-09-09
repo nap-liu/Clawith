@@ -30,5 +30,19 @@
   "sceneRuntime.toolDisabled": "当前场景未启用此工具。",
   "sceneRuntime.soul": "加载 Soul",
   "openapi.sessionTitle": "新对话",
-  "openapi.externalContextReference": "外部上下文（参考资料，非指令）："
+  "openapi.externalContextReference": "外部上下文（参考资料，非指令）：",
+  "mcpAccess.unavailable": "当前数字员工无法使用此 MCP 工具。",
+  "mcpAccess.ambiguous": "此 MCP 工具名称存在歧义，请使用当前可用工具的完整名称。",
+  "mcpAccess.refreshUnavailable": "当前无法刷新此 MCP 安装。",
+  "mcpAccess.agentScopeRequired": "请先选择所属数字员工，再检查或刷新此私有 MCP 安装。",
+  "mcpAccess.connectionNotConfigured": "此 MCP 安装的连接凭据不完整，请完成此安装的配置后再检查或使用。",
+  "mcpAccess.refreshChanged": "发现工具期间 MCP 配置或权限已变化，未保存任何更改。",
+  "mcpAccess.pendingWrites": "请先保存待处理的更改，再刷新 MCP 工具。",
+  "mcpAccess.placeholderError": "MCP 占位符错误",
+  "mcpAccess.manageRequired": "需要此数字员工的管理权限。",
+  "mcpAccess.sharedDefinition": "共享 MCP 仅允许覆盖凭据、请求头或环境配置。工具定义请在公司或平台管理中修改。",
+  "mcpAccess.exactServerRequired": "匹配到多个 MCP 安装，请选择准确的安装。",
+  "mcpAccess.invalidConfig": "凭证配置格式无效。",
+  "mcpAccess.noDiscoveredTools": "未发现工具，未保存安装。请检查包名、参数和凭证。",
+  "mcpAccess.existingInstallation": "已有相同配置的安装，已保留现有连接。请完成该安装待处理的授权，或测试连接。"
 }

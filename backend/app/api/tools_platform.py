@@ -3,7 +3,7 @@
 import uuid
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.tools_models import BulkToolUpdateItem, MCPServerUpdate, ToolCreate, ToolUpdate
@@ -30,6 +30,7 @@ from app.models.mcp_server import MCPServer
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.services.user_output import sanitize_user_visible_text
+from app.services.llm.failure_outcome import render_message
 
 
 @router.get("")
@@ -49,7 +50,7 @@ async def list_tools(
     target_tenant_id = _resolve_target_tenant_id(current_user, tenant_id)
     if target_tenant_id:
         from sqlalchemy import or_ as _or
-        query = query.where(_or(Tool.tenant_id == None, Tool.tenant_id == target_tenant_id))
+        query = query.where(_or(Tool.tenant_id.is_(None), Tool.tenant_id == target_tenant_id))
     result = await db.execute(query)
     response = []
     for t, mcp_server_display_name in result.all():
@@ -144,6 +145,7 @@ async def update_tools_bulk(
     tool_ids = [uuid.UUID(u.tool_id) for u in updates]
     result = await db.execute(
         select(Tool).where(Tool.id.in_(tool_ids), _feature_visible_tool_clause())
+        .order_by(Tool.id).with_for_update()
     )
     tools_map = {str(t.id): t for t in result.scalars().all()}
 
@@ -207,28 +209,35 @@ async def update_mcp_server(
         assert_can_create_server_in_tenant,
         assert_can_patch_server,
     )
-    srv_q = await db.execute(
-        select(MCPServer).where(MCPServer.name == data.server_name).limit(1)
-    )
-    srv = srv_q.scalar_one_or_none()
+    if data.server_id is not None:
+        srv = await db.get(MCPServer, data.server_id)
+        if srv is None:
+            raise HTTPException(404, detail="MCP server not found")
+    else:
+        candidates = (await db.scalars(select(MCPServer).where(
+            or_(MCPServer.name == data.server_name, MCPServer.display_name == data.server_name),
+            MCPServer.tenant_id == target_tenant_id,
+        ))).all()
+        if len(candidates) > 1:
+            raise HTTPException(409, detail=render_message("mcpAccess.exactServerRequired"))
+        srv = candidates[0] if candidates else None
     if srv is not None:
         await assert_can_patch_server(current_user, srv, db)
+        if srv.tenant_id != target_tenant_id:
+            raise HTTPException(403, detail=render_message("mcpAccess.unavailable"))
     else:
         assert_can_create_server_in_tenant(current_user, target_tenant_id)
 
-    # Load all tools from this server under the target tenant
-    result = await db.execute(
-        select(Tool).where(
-            Tool.mcp_server_name == data.server_name,
-            Tool.tenant_id == target_tenant_id,
-        )
-    )
-    tools = result.scalars().all()
+    from app.services.mcp_catalog_locks import lock_mcp_catalogs
+
+    await lock_mcp_catalogs(db, [srv.id] if srv else [])
+    tools = (await db.scalars(select(Tool).where(
+        Tool.mcp_server_id == srv.id if srv else Tool.mcp_server_id.is_(None),
+        Tool.tenant_id == target_tenant_id,
+        *([] if srv else [Tool.mcp_server_name == data.server_name]),
+    ))).all()
     if not tools:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No tools found for server '{data.server_name}'",
-        )
+        raise HTTPException(404, detail=render_message("mcpAccess.unavailable"))
 
     # NEW: validate prompt placeholders BEFORE writing anything
     if data.system_prompt_block is not None:
@@ -254,18 +263,23 @@ async def update_mcp_server(
             tool.config = _encrypt_sensitive_fields(current_config, tool.config_schema)
         # If api_key is None (not provided), preserve the existing encrypted key
 
-    # NEW: bridge to mcp_servers table
-    from app.services.mcp_server_service import upsert_mcp_server_from_tools
-    mcp_server_id = await upsert_mcp_server_from_tools(
-        db,
-        tenant_id=target_tenant_id,
-        server_url=data.server_url,
-        server_name=data.server_name,
-        system_prompt_block=data.system_prompt_block,
-        headers_template=data.headers_template,
-        api_key=data.api_key,
-        created_by_user_id=current_user.id,
-    )
+    if srv is None:
+        from app.services.mcp_naming import server_internal_name
+
+        identifier = uuid.uuid4()
+        srv = MCPServer(id=identifier, name=server_internal_name(data.server_name, identifier),
+                        display_name=data.server_name, tenant_id=target_tenant_id,
+                        base_url_template=data.server_url, created_by_user_id=current_user.id)
+        db.add(srv)
+    srv.base_url_template = data.server_url
+    if data.system_prompt_block is not None:
+        srv.system_prompt_block = data.system_prompt_block
+    if data.headers_template is not None:
+        srv.headers_template = data.headers_template
+    if data.api_key is not None:
+        srv.credential_template = data.api_key
+    await db.flush()
+    mcp_server_id = srv.id
     # Link tools rows to the upserted mcp_servers row
     for tool in tools:
         if tool.mcp_server_id != mcp_server_id:
@@ -337,6 +351,9 @@ async def delete_tool(
     else:
         _require_tenant_tool_admin(current_user, tool.tenant_id)
 
+    from app.services.mcp_catalog_locks import lock_tool_catalog
+
+    await lock_tool_catalog(db, tool_id)
     await db.execute(delete(AgentTool).where(AgentTool.tool_id == tool_id))
     await db.delete(tool)
     await db.commit()

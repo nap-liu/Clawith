@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import PlaceholderField from './PlaceholderField';
+import { useTranslation } from 'react-i18next';
 
 interface Props {
   /** Current key-value mapping. */
@@ -56,12 +56,13 @@ export default function KeyValueEditor({
   value,
   onChange,
   label,
-  keyPlaceholder = 'Key',
-  valuePlaceholder = 'Value (支持 ${...} 占位符)',
-  addLabel = '+ 添加',
+  keyPlaceholder,
+  valuePlaceholder,
+  addLabel,
   isSecretKey,
   helperHint,
 }: Props) {
+  const { t } = useTranslation();
   // Maintain a stable-ordered array so React can reconcile rows without
   // clobbering focus mid-typing (same approach as OverrideFieldsEditor).
   const [pairs, setPairs] = useState<Pair[]>(() => recordToPairs(value));
@@ -111,7 +112,7 @@ export default function KeyValueEditor({
           <div key={idx} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'flex-start' }}>
             <input
               value={p.key}
-              placeholder={keyPlaceholder}
+              placeholder={keyPlaceholder ?? t('mcpConfig.name')}
               onChange={(e) => updatePair(idx, e.target.value, p.value)}
               style={{ ...inputStyle, flex: '0 0 35%' }}
             />
@@ -121,7 +122,7 @@ export default function KeyValueEditor({
               <input
                 type="password"
                 value={p.value}
-                placeholder={valuePlaceholder}
+                placeholder={valuePlaceholder ?? t('mcpConfig.value')}
                 onChange={(e) => updatePair(idx, p.key, e.target.value)}
                 autoComplete="new-password"
                 style={{ ...inputStyle, flex: 1 }}
@@ -129,7 +130,7 @@ export default function KeyValueEditor({
             ) : (
               <input
                 value={p.value}
-                placeholder={valuePlaceholder}
+                placeholder={valuePlaceholder ?? t('mcpConfig.value')}
                 onChange={(e) => updatePair(idx, p.key, e.target.value)}
                 style={{ ...inputStyle, flex: 1 }}
               />
@@ -145,7 +146,7 @@ export default function KeyValueEditor({
                 cursor: 'pointer', flexShrink: 0,
               }}
             >
-              删除
+              {t('mcpConfig.delete')}
             </button>
           </div>
         );
@@ -161,7 +162,7 @@ export default function KeyValueEditor({
           color: 'var(--text-secondary)',
         }}
       >
-        {addLabel}
+        {addLabel ?? t('mcpConfig.add')}
       </button>
 
       {helperHint && (

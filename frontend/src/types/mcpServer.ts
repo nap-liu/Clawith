@@ -1,4 +1,5 @@
 export interface MCPServer {
+  is_shared?: boolean;
   id: string;
   tenant_id: string | null;
   name: string;
@@ -79,6 +80,7 @@ export interface MCPToolRefreshResult {
 }
 
 export interface MCPServerOverride {
+  env_template?: Record<string, string> | null;
   id: string;
   mcp_server_id: string;
   scope_type: 'tenant' | 'agent';
