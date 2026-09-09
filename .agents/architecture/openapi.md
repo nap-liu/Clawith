@@ -83,11 +83,12 @@ silently switching an existing subject to another person. Ambiguous or conflicti
 matches fail closed. Existing global, membership and tenant active-state checks
 remain authoritative.
 
-Tenant-managed clients cannot delegate platform administrators, whether that
-authority comes from the tenant role or the global Identity flag. Both identity
-resolution and login-code exchange enforce this boundary, including when a user
-is promoted after a link was issued. Enterprise self-service must not mint a
-platform-administrator login through trusted phone assertions.
+Platform administrators follow the same delegation and temporary-login flow as
+other existing users, including administrators identified by the global Identity
+flag. Resolution and code exchange still require an active membership in the
+application's tenant. The ordinary login owner preserves the user's current
+identity and permissions; OpenAPI does not reject or downgrade administrative
+roles, create memberships, or bypass application tenant checks.
 
 ## Business API contract
 

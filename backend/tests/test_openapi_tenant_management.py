@@ -1,4 +1,4 @@
-"""Tenant self-service must not grant cross-tenant or platform authority."""
+"""Tenant-scoped management and ordinary delegated login for existing users."""
 import time
 import uuid
 from urllib.parse import parse_qs, urlsplit
@@ -16,7 +16,7 @@ from app.models.user import Identity, User
 
 
 @pytest.mark.asyncio
-async def test_company_management_is_scoped_and_cannot_delegate_platform_authority():
+async def test_company_management_is_scoped_and_supports_platform_admin_login():
     async with async_session() as db:
         tenants = [Tenant(name=f"Company {n}", slug=f"openapi-admin-{uuid.uuid4().hex}") for n in range(2)]
         db.add_all(tenants)
@@ -81,7 +81,24 @@ async def test_company_management_is_scoped_and_cannot_delegate_platform_authori
                 "user": {"subject": str(users[index].id), "phone": identities[index].phone, "asserted_at": int(time.time())},
                 "redirect_uri": "/explore",
             })
-            assert response.status_code == 403
+            assert response.status_code == 200
+            code = parse_qs(urlsplit(response.json()["login_url"]).query)["code"][0]
+            exchanged = await client.post(business + "/auth/link-exchange", json={"code": code})
+            assert exchanged.status_code == 200
+            assert exchanged.json()["user"]["id"] == str(users[index].id)
+            me = await client.get("/api/auth/me", headers={
+                "Authorization": "Bearer " + exchanged.json()["access_token"],
+            })
+            assert me.status_code == 200 and me.json()["id"] == str(users[index].id)
+        other_token = await client.post(business + "/auth/token",
+            auth=httpx.BasicAuth(other["client_id"], other["client_secret"]),
+            data={"grant_type": "client_credentials"})
+        assert other_token.status_code == 200
+        foreign_login = await client.post(business + "/auth/links", headers={
+            "Authorization": "Bearer " + other_token.json()["access_token"],
+        }, json={"user": {"subject": str(users[3].id), "phone": identities[3].phone,
+                          "asserted_at": int(time.time())}, "redirect_uri": "/explore"})
+        assert foreign_login.status_code == 403
         response = await client.post(business + "/auth/links", headers=bearer, json={
             "user": {"subject": str(users[2].id), "phone": identities[2].phone, "asserted_at": int(time.time())},
             "redirect_uri": "/explore",
@@ -92,7 +109,9 @@ async def test_company_management_is_scoped_and_cannot_delegate_platform_authori
             identity = await db.get(Identity, identities[2].id)
             identity.is_platform_admin = True
             await db.commit()
-        assert (await client.post(business + "/auth/link-exchange", json={"code": code})).status_code == 401
+        exchanged = await client.post(business + "/auth/link-exchange", json={"code": code})
+        assert exchanged.status_code == 200
+        assert exchanged.json()["user"]["id"] == str(users[2].id)
         rotated = await client.post(own_path + "/rotate-secret", headers=headers[0])
         assert rotated.status_code == 200 and rotated.json()["client_secret"] != own["client_secret"]
         assert (await client.get(business + "/capabilities", headers=bearer)).status_code == 401

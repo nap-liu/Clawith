@@ -10,8 +10,6 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.permissions import is_platform_admin_user
-
 from app.models.audit import AuditLog
 from app.models.openapi_application import OpenAPIApplication, OpenAPICredential, OpenAPIUserBinding
 from app.models.tenant import Tenant
@@ -121,8 +119,6 @@ async def delegated_user(db: AsyncSession, app: OpenAPIApplication, claim: Deleg
     if len(users) != 1:
         fail("user_unavailable")
     user = users[0]
-    if is_platform_admin_user(user):
-        fail("identity_delegation_denied")
     if binding and binding.user_id != user.id:
         fail("identity_conflict", 409)
     try:
@@ -138,7 +134,7 @@ async def delegated_user(db: AsyncSession, app: OpenAPIApplication, claim: Deleg
 async def login_user(db: AsyncSession, app: OpenAPIApplication, value: OpenAPICredential):
     user = (await db.execute(select(User).where(User.id == value.user_id)
                             .options(selectinload(User.identity)))).scalar_one_or_none()
-    if not user or user.tenant_id != app.tenant_id or is_platform_admin_user(user):
+    if not user or user.tenant_id != app.tenant_id:
         fail("user_unavailable", 401)
     try:
         return await require_active_authentication_principal(db, user, status_code=401)

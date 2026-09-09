@@ -92,7 +92,7 @@ async def test_oauth_and_generic_login_contract():
         assert response.status_code == 401 and response.headers["www-authenticate"] == "Bearer"
         response = await client.post(base + "/digital-employees/search", headers=bearer,
                                      json={"user": {**claim, "phone": identities[0].phone}})
-        assert response.status_code == 403
+        assert response.status_code == 409
         response = await client.post(base + "/digital-employees/search", headers=bearer,
                                      json={"user": {**claim, "asserted_at": int(time.time()) - 90}})
         assert response.status_code == 400
