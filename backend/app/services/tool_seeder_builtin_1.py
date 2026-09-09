@@ -130,7 +130,10 @@ BUILTIN_TOOLS_PART_1 = [
         "parameters_schema": {
             "type": "object",
             "additionalProperties": False,
-            "properties": {"subagent_id": {"type": "string", "format": "uuid"}},
+            "properties": {
+                "subagent_id": {"type": "string", "format": "uuid", "description": "Child session identifier."},
+                "task_id": {"type": "string", "format": "uuid", "description": "Optional media task identifier. Stops only that turn; other queued media turns remain available."},
+            },
             "required": ["subagent_id"],
         },
         "config": {},

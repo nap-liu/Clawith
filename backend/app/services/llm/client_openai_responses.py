@@ -1,4 +1,7 @@
 from app.services.llm.client_shared import *  # noqa: F401,F403
+from copy import deepcopy
+
+from app.services.llm.responses_stream import stream_response
 
 class OpenAIResponsesClient(LLMClient):
     """Client for OpenAI Responses API (`/v1/responses`)."""
@@ -75,6 +78,33 @@ class OpenAIResponsesClient(LLMClient):
         input_items: list[dict[str, Any]] = []
 
         for msg in messages:
+            snapshot = msg.responses_snapshot
+            if (
+                msg.role == "assistant"
+                and isinstance(snapshot, dict)
+                and snapshot.get("protocol") == "openai_responses"
+                and snapshot.get("endpoint") == self._normalize_base_url()
+                and snapshot.get("model") == self.model
+                and isinstance(snapshot.get("output"), list) and snapshot["output"]
+            ):
+                native_items = deepcopy(snapshot["output"])
+                canonical_calls = {call.get("id"): call for call in msg.tool_calls or []}
+                for item in native_items:
+                    call = canonical_calls.get(item.get("call_id"))
+                    if item.get("type") == "function_call" and call:
+                        # The shared loop can repair malformed JSON arguments.
+                        # Keep that repair while retaining native ids and phase.
+                        args = (call.get("function") or {}).get("arguments")
+                        try:
+                            json.loads(item.get("arguments", "{}"))
+                        except (ValueError, TypeError):
+                            if args is None:
+                                continue
+                            item["arguments"] = (
+                                json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else args
+                            )
+                input_items.extend(native_items)
+                continue
             # Handle system messages with dynamic_content
             if msg.role == "system" and msg.content is not None:
                 content = msg.content
@@ -186,6 +216,7 @@ class OpenAIResponsesClient(LLMClient):
                 "name": fn.get("name", ""),
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {"type": "object"}),
+                "strict": fn.get("strict", False),
             })
         return converted or None
 
@@ -206,6 +237,8 @@ class OpenAIResponsesClient(LLMClient):
             "model": self.model,
             "input": self._messages_to_input(messages),
             "stream": stream,
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
         }
         if temperature is not None:
             payload["temperature"] = temperature
@@ -244,6 +277,8 @@ class OpenAIResponsesClient(LLMClient):
                     c_type = c.get("type")
                     if c_type in {"output_text", "text"}:
                         content_parts.append(c.get("text", ""))
+                    elif c_type == "refusal":
+                        content_parts.append(c.get("refusal", ""))
                     elif c_type == "reasoning":
                         reasoning_parts.append(c.get("summary", "") or c.get("text", ""))
             elif item_type == "function_call":
@@ -258,6 +293,11 @@ class OpenAIResponsesClient(LLMClient):
                         "arguments": str(args or "{}"),
                     },
                 })
+            elif item_type == "reasoning":
+                reasoning_parts.extend(
+                    part.get("text", "") for part in item.get("summary", [])
+                    if isinstance(part, dict)
+                )
 
         # Some Responses payloads include a pre-aggregated output_text field.
         # Use it as a fallback when output blocks are empty.
@@ -274,6 +314,13 @@ class OpenAIResponsesClient(LLMClient):
             finish_reason=finish_reason,
             usage=usage if isinstance(usage, dict) else None,
             model=data.get("model"),
+            responses_snapshot={
+                "protocol": "openai_responses",
+                "endpoint": self._normalize_base_url(),
+                "model": self.model,
+                "response_id": data.get("id"),
+                "output": deepcopy(data.get("output") or []),
+            },
         )
 
     def _extract_api_error(self, data: dict[str, Any]) -> str | None:
@@ -296,7 +343,7 @@ class OpenAIResponsesClient(LLMClient):
             return str(err)
 
         status = str(data.get("status") or "").lower()
-        if status in {"failed", "incomplete", "cancelled"}:
+        if status and status != "completed":
             last_error = data.get("last_error")
             incomplete = data.get("incomplete_details")
             rid = data.get("id")
@@ -366,22 +413,14 @@ class OpenAIResponsesClient(LLMClient):
         on_thinking: ThinkingCallback | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Streaming completion.
-
-        Minimal implementation: fallback to non-streaming and forward final text.
-        """
-        response = await self.complete(
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs,
+        """Deliver SSE deltas immediately and return only a completed response."""
+        payload = self._build_payload(
+            messages, tools, temperature, max_tokens, stream=True, **kwargs,
         )
-        if on_chunk and response.content:
-            await on_chunk(response.content)
-        if on_thinking and response.reasoning_content:
-            await on_thinking(response.reasoning_content)
-        return response
+        return await stream_response(
+            self, payload, on_chunk=on_chunk,
+            on_tool_delta=on_tool_delta, on_thinking=on_thinking,
+        )
 
     async def close(self) -> None:
         """Close the HTTP client."""

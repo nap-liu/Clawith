@@ -81,3 +81,41 @@ the context builder presents one normalized memory contract.
 This product-level Agent memory is distinct from coding-agent instructions for
 this repository. Repository engineering knowledge lives in `AGENTS.md`,
 `.agents/`, code, and tests—not in any developer's personal assistant memory.
+
+## Media session context
+
+Media understanding projects completed input/result pairs into native multimodal
+messages, ordered by task anchor rather than result arrival timestamps. It uses
+`maybe_compact` and the normal compaction-aware history loader, not a parallel
+summary store. The immutable model projection comes from the accepted enterprise
+model snapshot, including its real ID, protocol and context/output settings.
+Legacy accepted tasks retain their original encrypted connection projection.
+Provider-reported prompt usage triggers the shared budget logic;
+media summary calls use the shared streaming client because Omni requires it.
+Pending jobs are excluded from the compaction projection; current and recent turns
+remain protected. Summaries retain source references and full archival history;
+local media references are signed again for each provider request.
+
+Generation continuation inherits compatible output artifacts and parameters.
+The parent Agent supplies the complete current image/video instruction, carrying
+forward any desired language constraints from its ordinary conversation context.
+TTS always receives the exact current spoken text. A generation prompt never
+contains an ever-growing concatenation of prior chat messages. Explicit `files: []`
+clears inherited references. Artifact version management is deferred.
+
+## Responses protocol state
+
+Responses output Items are preserved on existing assistant/tool message metadata
+as `responses_snapshot`, including the protocol, endpoint and selected model binding.
+Only that same binding replays native Items; a changed model or endpoint uses the
+ordinary content projection. Opaque reasoning state is replayed without decoding
+or exposing it as user-visible text. Message phase and function call identities
+remain intact across ordinary tool rounds, confirmations and recovery.
+
+Completed plain rounds checkpoint a pending snapshot on their exact turn anchor.
+The existing terminal writer consumes it in the same transaction as the final
+assistant row. Pending snapshots are never historical completed output. Historical
+compaction continues through `ChatCompaction`; retained complete turns reload their
+native Items, while archived turns do not reappear through provider-side state.
+The platform remains the conversation authority; no provider conversation store
+or parallel context lifecycle is introduced.

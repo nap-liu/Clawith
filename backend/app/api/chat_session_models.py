@@ -37,6 +37,8 @@ class SessionRuntimeOut(BaseModel):
     model: Optional[str] = None
     soul: bool = True
     memory: bool = True
+    executor: str = "agent"
+    task_id: Optional[str] = None
 
 class SessionDetailOut(SessionOut):
     view_scope: Literal["mine", "all"]

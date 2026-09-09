@@ -1,3 +1,8 @@
+export type ModelPurpose = "conversation" | "media_understanding" | "image_generation" | "audio_generation" | "video_generation" | "speech_recognition";
+export type InputModality = "text" | "image" | "audio" | "video";
+export const MODEL_PURPOSES: ModelPurpose[] = ["conversation", "media_understanding", "image_generation", "audio_generation", "video_generation", "speech_recognition"];
+export const INPUT_MODALITIES: InputModality[] = ["text", "image", "audio", "video"];
+
 export interface LlmModelListItem {
     id: string;
     provider?: string;
@@ -5,6 +10,10 @@ export interface LlmModelListItem {
     label?: string;
     enabled?: boolean;
     supports_vision?: boolean;
+    api_protocol?: string | null;
+    effective_api_protocol?: string;
+    purposes?: ModelPurpose[];
+    input_modalities?: InputModality[];
 }
 
 const modelNameCollator = new Intl.Collator(['zh-CN', 'en'], {
@@ -42,4 +51,8 @@ export function sortLlmModels<T extends LlmModelListItem>(models: readonly T[]):
             return byModel || byId || left.index - right.index;
         })
         .map(({ model }) => model);
+}
+
+export function supportsModelPurpose(model: LlmModelListItem, purpose: ModelPurpose = "conversation"): boolean {
+    return (model.purposes ?? ["conversation"]).includes(purpose);
 }

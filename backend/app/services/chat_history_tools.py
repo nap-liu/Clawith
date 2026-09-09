@@ -105,11 +105,10 @@ async def persist_tool_call_row(
         role="tool_call",
         content=content,
         conversation_id=conversation_id,
-        message_meta=(
-            {"turn_anchor_id": str(turn_anchor_id)}
-            if turn_anchor_id is not None
-            else {}
-        ),
+        message_meta={
+            **({"turn_anchor_id": str(turn_anchor_id)} if turn_anchor_id is not None else {}),
+            **({"responses_snapshot": evt["responses_snapshot"]} if evt.get("responses_snapshot") else {}),
+        },
     )
     db.add(row)
     await db.flush()
@@ -166,6 +165,7 @@ async def close_running_tool_calls_for_stop(
                 "result": "[Generation stopped]",
                 "reasoning_content": payload.get("reasoning_content"),
                 "assistant_content": payload.get("assistant_content"),
+                "responses_snapshot": (row.message_meta or {}).get("responses_snapshot"),
                 "recovery_prefix_messages": payload.get("recovery_prefix_messages") or [],
                 "round_id": payload.get("round_id"),
                 "round_tool_index": payload.get("round_tool_index"),
@@ -260,6 +260,7 @@ def _pending_confirmation_payload(
     recovery_prefix_messages: list[dict[str, str]] | None = None,
     reasoning_content: str | None = None,
     round_id: str | None = None,
+    call_id: str | None = None,
 ) -> str:
     payload = {
         "name": name,
@@ -271,6 +272,7 @@ def _pending_confirmation_payload(
         "reasoning_content": reasoning_content,
         "round_id": round_id,
         "round_tool_index": 0,
+        "call_id": call_id,
     }
     return json.dumps(payload, ensure_ascii=False, default=str)
 
@@ -289,6 +291,8 @@ async def persist_pending_confirmation_row(
     recovery_prefix_messages: list[dict[str, str]] | None = None,
     reasoning_content: str | None = None,
     round_id: str | None = None,
+    responses_snapshot: dict | None = None,
+    call_id: str | None = None,
 ) -> uuid.UUID:
     content = _pending_confirmation_payload(
         name=name,
@@ -298,6 +302,7 @@ async def persist_pending_confirmation_row(
         recovery_prefix_messages=recovery_prefix_messages,
         reasoning_content=reasoning_content,
         round_id=round_id,
+        call_id=call_id,
     )
     row = ChatMessage(
         agent_id=agent_id,
@@ -315,6 +320,7 @@ async def persist_pending_confirmation_row(
                 else {}
             ),
             **({"intended_user_id": str(user_id)} if user_id is not None else {}),
+            **({"responses_snapshot": responses_snapshot} if responses_snapshot else {}),
         },
         created_at=created_at,
     )
@@ -336,6 +342,8 @@ async def persist_pending_confirmation(
     recovery_prefix_messages: list[dict[str, str]] | None = None,
     reasoning_content: str | None = None,
     round_id: str | None = None,
+    responses_snapshot: dict | None = None,
+    call_id: str | None = None,
 ) -> uuid.UUID:
     """Persist a SUSPENDED confirmation tool_call and return its row id.
 
@@ -359,6 +367,8 @@ async def persist_pending_confirmation(
             recovery_prefix_messages=recovery_prefix_messages,
             reasoning_content=reasoning_content,
             round_id=round_id,
+            responses_snapshot=responses_snapshot,
+            call_id=call_id,
         )
         await db.commit()
         return row_id

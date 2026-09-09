@@ -12,6 +12,7 @@ from app.core.permissions import is_platform_admin_user
 from app.mcp_server import mcp
 from app.mcp_server._common import authed_write, resolve_manageable_agent
 from app.models.llm import LLMModel
+from app.services.model_capabilities import purpose_clause
 from app.services.agent_provisioning import AgentProvisionInput, provision_agent
 from app.services.agent_settings_update import apply_agent_settings_patch, public_setting_name
 from app.services.quota_guard import QuotaExceeded
@@ -37,6 +38,7 @@ async def _resolve_model_id(db, tenant_id, ref):
         return None
     base = select(LLMModel).where(
         LLMModel.enabled == True,  # noqa: E712
+                purpose_clause(),
         or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None)),
     )
     try:

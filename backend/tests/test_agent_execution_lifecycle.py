@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.database import async_session, engine
 from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.task import Task
 from app.services.active_turns import list_active_turns, reserve_active_turn_stop
 from tests.execution_process_fixtures import admit_nested, create_todo
@@ -63,8 +64,12 @@ async def test_stop_waits_for_child_commit_and_cancels_all_durable_anchors():
 
     root = asyncio.create_task(admit_nested(aid, uid, str(sid), anchor,
                                            nested_sid, nested_anchor, callback))
+    ready = asyncio.create_task(before_commit.wait())
     try:
-        await asyncio.wait_for(before_commit.wait(), 30)
+        await asyncio.wait({root, ready}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+        if root.done():
+            await root
+        assert before_commit.is_set()
         records = await list_active_turns(owner_user_id=uid)
         assert len(records) == 1
         reservation = asyncio.create_task(reserve_active_turn_stop(records[0].turn_id, owner_user_id=uid))
@@ -82,6 +87,8 @@ async def test_stop_waits_for_child_commit_and_cancels_all_durable_anchors():
             assert len(rows) == 2
             assert all(row.message_meta["turn_status"] == "cancelled" for row in rows)
     finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)
         release_commit.set()
         if not root.done():
             root.cancel()
@@ -108,7 +115,15 @@ async def test_legacy_default_identity_and_session_keep_cancellable_root():
             records = await list_active_turns(owner_user_id=uid)
             assert len(records) == 1
             assert records[0].task is root
-            assert records[0].session_id.startswith("background:")
+            async with async_session() as db:
+                session = await db.get(ChatSession, uuid.UUID(records[0].session_id))
+                assert session.source_channel == "trigger"
+                assert session.external_conv_id.startswith("background:")
+                anchor = await db.scalar(select(ChatMessage).where(
+                    ChatMessage.conversation_id == records[0].session_id,
+                    ChatMessage.role == "user"))
+                assert anchor.user_id == uid
+                assert anchor.message_meta["background_execution"]["settings"]["execution_user_id"] == str(uid)
             await cancel_active_turn(records[0].turn_id, owner_user_id=uid)
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(root, 5)

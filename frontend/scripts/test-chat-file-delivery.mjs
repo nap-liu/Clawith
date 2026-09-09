@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { loadTypeScriptModule } from './load-typescript-module.mjs';
 
-const { parseFileDeliveryToolResult } = loadTypeScriptModule(
+const { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } = loadTypeScriptModule(
     fileURLToPath(new URL('../src/utils/chatFileDelivery.ts', import.meta.url)),
 );
 
@@ -96,5 +96,28 @@ assert.equal(parseFileDeliveryToolResult('send_channel_message', '{"type":"platf
 assert.equal(parseFileDeliveryToolResult('send_channel_file', '{"type":"platform_file_delivery","path":"/etc/passwd"}'), null);
 assert.equal(parseFileDeliveryToolResult('send_channel_file', '{"type":"platform_file_delivery","path":"../secret.txt"}'), null);
 assert.equal(parseFileDeliveryToolResult('send_channel_file', '{"type":"platform_file_delivery","path":"https://evil.example/a.pdf"}'), null);
+
+for (const mediaKind of ['audio', 'video']) {
+    const result = {
+        type: 'media_generation',
+        status: 'completed',
+        delivery: {
+            type: 'platform_media_delivery', status: 'sent', media_kind: mediaKind,
+            path: `workspace/media/result.${mediaKind === 'audio' ? 'wav' : 'mp4'}`,
+            message_id: 'original-receipt', allow_download: true,
+        },
+    };
+    for (const payload of [result, JSON.stringify(result)]) {
+        const delivery = parseFileDeliveryToolResult('generate_media', payload, {}, 'generation-call');
+        assert.equal(delivery.mediaKind, mediaKind);
+        assert.equal(delivery.messageId, 'original-receipt');
+        assert.equal(delivery.path, result.delivery.path);
+        assert.equal(delivery.allowDownload, true);
+    }
+    result.delivery.status = 'unknown';
+    result.delivery.code = 'MEDIA_DELIVERY_STATE_UNKNOWN';
+    assert.equal(parseFileDeliveryToolResult('generate_media', result), null);
+    assert.equal(parseMediaDeliveryErrorResult('generate_media', result).status, 'unknown');
+}
 
 console.log('chat file delivery tests passed');

@@ -126,6 +126,18 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
 
     # If the caller didn't pick a model, fall back to the tenant's default.
     effective_primary_model_id = data.primary_model_id or tenant_default_model_id
+    from app.models.llm import LLMModel
+    from app.services.model_capabilities import supports_purpose
+
+    for model_id in (effective_primary_model_id, data.fallback_model_id):
+        if model_id is None:
+            continue
+        selected_model = await db.get(LLMModel, model_id)
+        if (selected_model is None or selected_model.tenant_id not in {tenant_id, None}
+                or not selected_model.enabled or not supports_purpose(selected_model)):
+            from app.services.llm.failure_outcome import render_message
+
+            raise ValueError(render_message("modelPool.conversationRequired"))
     expires_at = datetime.now(tz.utc) + timedelta(hours=ttl_hours) if ttl_hours and ttl_hours > 0 else None
 
     agent = Agent(

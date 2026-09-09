@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
+import re  # noqa: F401 - re-exported to provider adapters via __all__
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
@@ -76,6 +76,7 @@ class LLMMessage:
     reasoning_content: str | None = None
     reasoning_signature: str | None = None
     dynamic_content: str | None = None
+    responses_snapshot: dict[str, Any] | None = None
 
     def to_openai_format(self) -> dict:
         """Convert to OpenAI format."""
@@ -210,6 +211,7 @@ class LLMResponse:
     finish_reason: str | None = None
     usage: dict[str, Any] | None = None
     model: str | None = None
+    responses_snapshot: dict[str, Any] | None = None
 
 
 @dataclass

@@ -1,4 +1,4 @@
-"""Alibaba Cloud Fun-ASR protocol helpers and tenant credential resolution."""
+"""Enterprise speech model resolution and native Fun-ASR protocol helpers."""
 
 from __future__ import annotations
 
@@ -7,20 +7,18 @@ import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import websockets
 
 from app.config import get_settings
-from app.core.security import decrypt_data
-from app.models.speech_recognition_config import SpeechRecognitionConfig
+from app.services.llm.client_registry import get_provider_spec
+from app.services.llm.utils import get_model_api_key
+from app.services.llm.failure_outcome import render_message
+from app.services.speech_model_selection import SpeechCredentialUnavailable, resolve_speech_model
 
 settings = get_settings()
-
-
-class SpeechCredentialUnavailable(RuntimeError):
-    """Raised when a tenant has no DashScope-compatible credential."""
 
 
 @dataclass(frozen=True)
@@ -28,6 +26,9 @@ class SpeechCredentials:
     api_key: str
     provider: str
     model: str
+    base_url: str = ""
+    transport: str = "dashscope"
+    timeout: float = 120
 
 
 @dataclass(frozen=True)
@@ -38,34 +39,38 @@ class SpeechResult:
     duration_seconds: int | None = None
 
 
-async def resolve_speech_credentials(db: AsyncSession, tenant_id: uuid.UUID | None) -> SpeechCredentials:
-    """Resolve the tenant's independent speech-service config; never inspect llm_models."""
-    if tenant_id is None:
-        raise SpeechCredentialUnavailable("当前用户不属于任何租户")
-
-    config = (
-        await db.execute(
-            select(SpeechRecognitionConfig).where(SpeechRecognitionConfig.tenant_id == tenant_id)
-        )
-    ).scalar_one_or_none()
-    if config is None:
-        raise SpeechCredentialUnavailable("当前租户尚未配置语音识别凭证，请联系管理员")
-    if not config.enabled or config.provider != "aliyun_dashscope" or config.model != "fun-asr-realtime":
-        raise SpeechCredentialUnavailable("当前租户配置的语音识别凭证不可用，请联系管理员")
-    try:
-        api_key = decrypt_data(config.api_key_encrypted, settings.SECRET_KEY).strip()
-    except ValueError:
-        api_key = config.api_key_encrypted.strip()
+async def resolve_speech_credentials(db: AsyncSession, tenant_id: uuid.UUID | None, model_id=None) -> SpeechCredentials:
+    """Snapshot an enabled, tenant-owned enterprise model before provider I/O."""
+    model = await resolve_speech_model(db, tenant_id, model_id)
+    api_key = get_model_api_key(model).strip()
     if not api_key:
-        raise SpeechCredentialUnavailable("当前租户的语音识别 API Key 为空")
-    return SpeechCredentials(api_key=api_key, provider=config.provider, model=config.model)
+        raise SpeechCredentialUnavailable(render_message("speech.emptyKey"))
+    spec = get_provider_spec(model.provider)
+    endpoint = model.base_url or (spec.default_base_url if spec else "") or ""
+    native = model.provider in {"qwen", "aliyun_dashscope"} and model.model.startswith("fun-asr")
+    if native and not endpoint.startswith(("ws://", "wss://")):
+        parsed = urlsplit(endpoint)
+        if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+            raise SpeechCredentialUnavailable(render_message("speech.invalidEndpoint"))
+        path = "/api-ws/v1/inference" if parsed.path.rstrip("/") in {"", "/compatible-mode/v1"} else parsed.path
+        endpoint = urlunsplit(("wss" if parsed.scheme == "https" else "ws", parsed.netloc, path, parsed.query, ""))
+    if not endpoint or (not native and not endpoint.startswith(("https://", "http://"))):
+        raise SpeechCredentialUnavailable(render_message("speech.invalidEndpoint"))
+    return SpeechCredentials(api_key=api_key, provider=model.provider, model=model.model,
+                             base_url=endpoint, transport="dashscope" if native else "openai",
+                             timeout=float(model.request_timeout or 120))
 
 
 async def verify_speech_credentials(credentials: SpeechCredentials) -> None:
-    """Perform a short authenticated Fun-ASR task without exposing the key."""
+    """Probe the selected speech transport without exposing its key."""
+    if credentials.transport == "openai":
+        from app.services.speech_transports import transcribe_pcm
+
+        await transcribe_pcm(credentials, b"\0" * 3200)
+        return
     task_id = str(uuid.uuid4())
     async with websockets.connect(
-        settings.ASR_WEBSOCKET_URL,
+        credentials.base_url or settings.ASR_WEBSOCKET_URL,
         additional_headers={"Authorization": f"Bearer {credentials.api_key}"},
         open_timeout=10,
         close_timeout=5,
@@ -74,7 +79,8 @@ async def verify_speech_credentials(credentials: SpeechCredentials) -> None:
         started = json.loads(await asyncio.wait_for(upstream.recv(), timeout=10))
         if started.get("header", {}).get("event") != "task-started":
             header = started.get("header", {})
-            raise RuntimeError(header.get("error_message") or "阿里云语音识别任务启动失败")
+            raise RuntimeError(header.get("error_message") or render_message("speech.startFailed"))
+        await upstream.send(json.dumps(build_finish_task(task_id)))
 
 
 def build_run_task(task_id: str, *, model: str = "fun-asr-realtime") -> dict[str, Any]:

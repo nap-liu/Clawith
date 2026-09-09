@@ -1,6 +1,13 @@
 from app.services.llm.compactor_shared import *  # noqa: F401,F403
 from app.services.llm.compactor_summary import _objective_evidence_items
 
+def _media_reference_context(meta: dict) -> str:
+    request = meta.get("media_request") or {}
+    context = meta.get("media_context") or {}
+    sources = list((request.get("arguments") or {}).get("files") or context.get("sources") or [])
+    sources.extend({"source": item["path"], "kind": item.get("kind")} for item in context.get("files", []))
+    return "\nMedia references: " + json.dumps(sources, ensure_ascii=False) if sources else ""
+
 def _elide_materialized_output_bodies(content: str) -> str:
     """Drop only bodies whose complete source already has a durable path."""
     if not isinstance(content, str):
@@ -115,6 +122,7 @@ def serialize_span_for_summary(
             )
         elif elide_durable_only and durable_tool_output:
             body = _elide_materialized_output_bodies(body)
+        body += _media_reference_context(meta)
         chunks.append(f"### [{r.role}] @ {r.created_at.isoformat()}\n{body}")
     return "\n\n".join(chunks)
 
@@ -192,6 +200,7 @@ def objective_evidence_items_from_rows(
             meta.get("source_channel"),
         )
         body = render_attachment_context(body, attachments)
+        body += _media_reference_context(meta)
         sender_user_id = getattr(row, "sender_user_id", None) or getattr(row, "user_id", None)
         if wrap_user_names and sender_user_id is not None:
             body = wrap_with_sender(

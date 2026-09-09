@@ -666,7 +666,9 @@ async def _load_active_rows(
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
         .execution_options(populate_existing=True)
     )
-    return order_messages_for_context([
+    from app.services.llm.queued_media_history import executed_media_rows
+
+    return executed_media_rows(order_messages_for_context([
         row
         for row in result.scalars().all()
         if not (
@@ -676,7 +678,7 @@ async def _load_active_rows(
                 or row.message_meta.get("turn_inbox_state") in {"pending", "processing", "cancelled"}
             )
         )
-    ])
+    ]))
 
 
 async def _load_compaction_state(

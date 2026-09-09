@@ -205,3 +205,51 @@ legacy application roles start, run the candidate image's idempotent
 `python -m app.scripts.rollback_reasoning_controls apply` helper and verify
 `status` reports zero reasoning fields.  A later candidate startup restores the
 current schemas through the normal builtin seeder.
+
+
+## Unified company model pool
+
+`LLMModel` is the company-owned connection and capability record for both
+conversation and media models. `api_protocol` selects the wire protocol
+independently of `provider`; null preserves the registry behavior for existing
+records, including the `openai-response` alias. Explicit protocol selection is
+carried through runtime snapshots, caller retries, compaction, heartbeat and
+connection tests. New OpenAI and Qwen records prefer Responses; Hunyuan and
+Volcengine already use that registry default. Administrators retain explicit
+Chat selection for models whose Responses endpoint cannot complete a tool turn.
+Provider errors do not silently replay a partially executed turn through Chat.
+
+`purposes` identifies conversation, media understanding, image generation,
+audio generation, video generation or speech recognition. `input_modalities` identifies text,
+image, audio and video inputs; migration preserves legacy `supports_vision`.
+Conversation pickers and backend provisioning/runtime selection exclude models
+without the conversation purpose. Generation-only models cannot become the
+company conversation default.
+
+The five media default model IDs reuse tenant `tool_config:media_ai` storage,
+managed in the company model pool. Tool settings can override by purpose and
+otherwise inherit those defaults. Media model tests select an existing Digital
+Employee workspace and execute through the shared asynchronous media runtime;
+results use the existing session viewer and task card, without another queue.
+
+Speech input resolves `speech_model_id` from the same company defaults and reads
+the selected enterprise model's connection. Legacy speech-service records are
+migrated once into model records; clearing a selection or disabling a model must
+not reactivate the legacy configuration. The browser's PCM/stop event contract
+is preserved: the DashScope adapter provides live partial transcripts, while the
+standard audio-transcriptions adapter returns the final transcript after stop.
+Speech input does not introduce a second model pool or task scheduler.
+
+The model list shares adaptive Grid tracks across rows, including conditional
+actions. Default selections for conversation and all media purposes live in the
+default-model drawer; rows show a default badge and a labelled enable switch.
+Model editing uses the shared settings drawer and form primitives;
+imagination and reasoning controls share one responsive two-column field grid. Imagination
+uses `DivergenceSlider`; reasoning uses `ReasoningEffortSelect` with Auto retaining
+its inheritance semantics. Editing a different provider/model/endpoint must not
+apply the old model's capability choices. All labels use shared i18n resources.
+
+The provider registry includes Tencent Hunyuan and Volcengine Ark. Their current
+default endpoints support Responses; administrators can select Chat Completions
+and a different endpoint for compatible or legacy models. Provider registration
+does not imply that every model supports every media or reasoning capability.

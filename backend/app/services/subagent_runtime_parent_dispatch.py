@@ -25,6 +25,11 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
             await _finish_parent_event_dispatch(child_message_id, SUBAGENT_DISPATCH_DISCARDED)
             return True
 
+    if parent.source_channel == SUBAGENT_CHANNEL:
+        from app.services.subagent_runtime_child_events import dispatch_child_parent_event
+
+        return await dispatch_child_parent_event(child_message_id)
+
     if parent.source_channel == "agent" and parent.project_id is not None and child.project_id == parent.project_id:
         return await _materialize_project_a2a_turn(
             event=event,
@@ -186,6 +191,7 @@ async def _pending_parent_event_groups(
                     SubagentRun.execution_user_id,
                     child_session.agent_id,
                     parent_session.project_id,
+                    parent_session.source_channel,
                 )
                 .join(
                     SubagentRun,
@@ -201,9 +207,9 @@ async def _pending_parent_event_groups(
     batches: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], list[uuid.UUID]] = {}
     special: list[uuid.UUID] = []
     grouped_ids: set[uuid.UUID] = set()
-    for message_id, parent_id, execution_user_id, execution_agent_id, project_id in rows:
+    for message_id, parent_id, execution_user_id, execution_agent_id, project_id, source_channel in rows:
         grouped_ids.add(message_id)
-        if project_id is not None:
+        if project_id is not None or source_channel == SUBAGENT_CHANNEL:
             special.append(message_id)
             continue
         key = (parent_id, execution_user_id, execution_agent_id)

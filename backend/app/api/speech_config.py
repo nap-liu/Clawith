@@ -1,141 +1,63 @@
-"""Independent tenant configuration API for speech-recognition services."""
+"""Compatibility read/test endpoints backed exclusively by the enterprise pool."""
 
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
-from app.core.security import decrypt_data, encrypt_data, get_current_admin
+from app.api.enterprise_routes_model_defaults import _tenant
+from app.core.security import get_current_admin
 from app.database import get_db
-from app.models.speech_recognition_config import SpeechRecognitionConfig
-from app.models.tenant import Tenant
 from app.models.user import User
+from app.services.llm.failure_outcome import render_message
+from app.services.llm.utils import get_model_api_key
+from app.services.speech_model_selection import SpeechCredentialUnavailable, resolve_speech_model
 from app.services.speech_recognition import resolve_speech_credentials, verify_speech_credentials
 
 router = APIRouter(prefix="/api/speech-config", tags=["speech-config"])
-settings = get_settings()
-
-SUPPORTED_PROVIDER = "aliyun_dashscope"
-SUPPORTED_MODEL = "fun-asr-realtime"
-
-
-class SpeechConfigUpdate(BaseModel):
-    provider: str = SUPPORTED_PROVIDER
-    model: str = SUPPORTED_MODEL
-    api_key: str | None = None
-    enabled: bool = True
-
-
-def _target_tenant_id(tenant_id: str | None, current_user: User) -> uuid.UUID:
-    try:
-        target = uuid.UUID(tenant_id) if tenant_id else current_user.tenant_id
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID") from exc
-    if target is None:
-        raise HTTPException(status_code=400, detail="Tenant is required")
-    is_platform_admin = current_user.role == "platform_admin" or bool(
-        getattr(getattr(current_user, "identity", None), "is_platform_admin", False)
-    )
-    if not is_platform_admin and current_user.tenant_id != target:
-        raise HTTPException(status_code=403, detail="Cannot configure another tenant")
-    return target
-
-
-def _masked_key(config: SpeechRecognitionConfig) -> str:
-    try:
-        key = decrypt_data(config.api_key_encrypted, settings.SECRET_KEY)
-    except ValueError:
-        key = config.api_key_encrypted
-    return f"****{key[-4:]}" if len(key) > 4 else "****"
-
-
-def _config_response(config: SpeechRecognitionConfig | None) -> dict:
-    if config is None:
-        return {
-            "configured": False,
-            "provider": SUPPORTED_PROVIDER,
-            "model": SUPPORTED_MODEL,
-            "api_key_masked": "",
-            "enabled": False,
-        }
-    return {
-        "configured": True,
-        "provider": config.provider,
-        "model": config.model,
-        "api_key_masked": _masked_key(config),
-        "enabled": config.enabled,
-    }
-
-
-async def _ensure_tenant_exists(db: AsyncSession, tenant_id: uuid.UUID) -> None:
-    if await db.scalar(select(Tenant.id).where(Tenant.id == tenant_id)) is None:
-        raise HTTPException(status_code=404, detail="Tenant not found")
 
 
 @router.get("")
 async def get_speech_config(
-    tenant_id: str | None = None,
+    tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    target = _target_tenant_id(tenant_id, current_user)
-    await _ensure_tenant_exists(db, target)
-    config = (
-        await db.execute(select(SpeechRecognitionConfig).where(SpeechRecognitionConfig.tenant_id == target))
-    ).scalar_one_or_none()
-    return _config_response(config)
+    target = _tenant(current_user, tenant_id)
+    try:
+        model = await resolve_speech_model(db, target, require_enabled=False)
+    except SpeechCredentialUnavailable:
+        await db.commit()
+        return {"configured": False, "provider": "", "model": "", "model_id": None,
+                "api_key_masked": "", "enabled": False}
+    key = get_model_api_key(model)
+    result = {"configured": True, "provider": model.provider, "model": model.model,
+              "model_id": str(model.id), "enabled": model.enabled,
+              "api_key_masked": f"****{key[-4:]}" if len(key) > 4 else "****"}
+    await db.commit()
+    return result
 
 
 @router.put("")
-async def update_speech_config(
-    data: SpeechConfigUpdate,
-    tenant_id: str | None = None,
-    current_user: User = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    target = _target_tenant_id(tenant_id, current_user)
-    if data.provider != SUPPORTED_PROVIDER or data.model != SUPPORTED_MODEL:
-        raise HTTPException(status_code=400, detail="当前仅支持阿里云百炼 fun-asr-realtime")
-    await _ensure_tenant_exists(db, target)
-
-    config = (
-        await db.execute(select(SpeechRecognitionConfig).where(SpeechRecognitionConfig.tenant_id == target))
-    ).scalar_one_or_none()
-    api_key = (data.api_key or "").strip()
-    if config is None:
-        if not api_key:
-            raise HTTPException(status_code=400, detail="首次配置必须填写语音识别 API Key")
-        config = SpeechRecognitionConfig(
-            tenant_id=target,
-            provider=data.provider,
-            model=data.model,
-            api_key_encrypted=encrypt_data(api_key, settings.SECRET_KEY),
-            enabled=data.enabled,
-        )
-        db.add(config)
-    else:
-        config.provider = data.provider
-        config.model = data.model
-        config.enabled = data.enabled
-        if api_key and not api_key.startswith("****"):
-            config.api_key_encrypted = encrypt_data(api_key, settings.SECRET_KEY)
-    await db.flush()
-    return _config_response(config)
+async def update_speech_config(current_user: User = Depends(get_current_admin)):
+    del current_user
+    raise HTTPException(410, detail=render_message("speech.configureInModelPool"))
 
 
 @router.post("/test")
 async def test_speech_config(
-    tenant_id: str | None = None,
+    tenant_id: uuid.UUID | None = None,
+    model_id: uuid.UUID | None = None,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    target = _target_tenant_id(tenant_id, current_user)
+    target = _tenant(current_user, tenant_id)
     try:
-        credentials = await resolve_speech_credentials(db, target)
+        credentials = await resolve_speech_credentials(db, target, model_id)
+        await db.commit()
         await verify_speech_credentials(credentials)
+    except SpeechCredentialUnavailable as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"语音识别连接测试失败：{str(exc)[:240]}") from exc
+        raise HTTPException(400, detail=render_message("speech.testFailed")) from exc
     return {"success": True}

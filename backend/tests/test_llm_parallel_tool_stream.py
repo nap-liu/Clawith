@@ -13,7 +13,7 @@ from app.services.llm.caller import (
     _sanitize_tool_calls_for_context,
     _stream_with_throttle_retry,
 )
-from app.services.llm.client import LLMError
+from app.services.llm.client import LLMError, LLMMessage
 from app.services.llm.client_gemini import GeminiClient
 from app.services.llm.client_openai_compatible import OpenAICompatibleClient
 
@@ -32,6 +32,41 @@ def _client_for_sse(body: str) -> OpenAICompatibleClient:
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, text=body))
     )
     return client
+
+
+@pytest.mark.asyncio
+async def test_streamed_function_round_replays_required_type_to_strict_chat_provider():
+    requests = []
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) == 1:
+            return httpx.Response(200, text=_sse({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "read-1", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"report.txt"}'},
+            }]}, "finish_reason": "tool_calls"}]}))
+        call = next(message for message in payload["messages"] if message.get("tool_calls"))["tool_calls"][0]
+        assert call["type"] == "function"
+        assert call["id"] == "read-1"
+        assert payload["messages"][-1]["tool_call_id"] == "read-1"
+        return httpx.Response(200, text=_sse({"choices": [{
+            "delta": {"content": "Read successfully."}, "finish_reason": "stop",
+        }]}))
+
+    client = OpenAICompatibleClient("test", base_url="https://provider.invalid/v1", model="test-model")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = await client.stream([LLMMessage("user", "Read the report")])
+        final = await client.stream([
+            LLMMessage("user", "Read the report"),
+            LLMMessage("assistant", tool_calls=response.tool_calls),
+            LLMMessage("tool", "Report text", tool_call_id="read-1"),
+        ])
+        assert final.content == "Read successfully."
+        assert len(requests) == 2
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

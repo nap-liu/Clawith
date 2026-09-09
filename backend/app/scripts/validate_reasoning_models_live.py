@@ -24,6 +24,7 @@ class LiveModel:
     model: str
     base_url: str | None
     api_key: str
+    api_protocol: str | None = None
     label: str | None = None
     max_output_tokens: int | None = None
 
@@ -31,6 +32,7 @@ class LiveModel:
     def from_dict(cls, raw: dict[str, Any]) -> LiveModel:
         return cls(
             provider=str(raw.get("provider") or "custom"),
+            api_protocol=raw.get("api_protocol"),
             model=str(raw["model"]),
             base_url=str(raw["base_url"]) if raw.get("base_url") else None,
             api_key=str(raw["api_key"]),
@@ -96,6 +98,7 @@ async def _run_attempt(
         model.model,
         model.base_url,
         timeout=min(timeout_seconds, 120.0),
+        api_protocol=model.api_protocol,
     )
     started = time.monotonic()
     first_event_ms: int | None = None

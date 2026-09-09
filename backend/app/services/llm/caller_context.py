@@ -425,6 +425,7 @@ async def _process_tool_call(
     round_id: str | None = None,
     round_tool_index: int | None = None,
     assistant_content: str | None = None,
+    responses_snapshot: dict | None = None,
     recovery_prefix_messages: list[dict[str, str]] | None = None,
     durable_agent_id=None,
 ) -> str:
@@ -447,6 +448,7 @@ async def _process_tool_call(
             "result": error_msg,
             "reasoning_content": full_reasoning_content,
             "assistant_content": assistant_content,
+            "responses_snapshot": responses_snapshot,
             "recovery_prefix_messages": recovery_prefix_messages or [],
         }
         persisted = await _persist_tool_call_events_strict(
@@ -479,6 +481,7 @@ async def _process_tool_call(
             "result": result,
             "reasoning_content": full_reasoning_content,
             "assistant_content": assistant_content,
+            "responses_snapshot": responses_snapshot,
             "recovery_prefix_messages": recovery_prefix_messages or [],
         }
         persisted = await _persist_tool_call_events_strict(
@@ -518,6 +521,7 @@ async def _process_tool_call(
             "round_tool_index": round_tool_index,
             "reasoning_content": full_reasoning_content,
             "assistant_content": assistant_content,
+            "responses_snapshot": responses_snapshot,
             "recovery_prefix_messages": recovery_prefix_messages or [],
         }
         persisted_running = await _persist_tool_call_events_strict(
@@ -540,7 +544,7 @@ async def _process_tool_call(
 
     if running_evt is not None and on_tool_call:
         try:
-            await on_tool_call(running_evt)
+            await on_tool_call({k: v for k, v in running_evt.items() if k != "responses_snapshot"})
         except Exception:
             pass
 
@@ -605,6 +609,7 @@ async def _process_tool_call(
         "result": llm_view,
         "reasoning_content": full_reasoning_content,
         "assistant_content": assistant_content,
+        "responses_snapshot": responses_snapshot,
         "recovery_prefix_messages": recovery_prefix_messages or [],
     }
     done_row_id = _durable_tool_result_row_id(tool_name, str(llm_view), session_id)

@@ -354,9 +354,7 @@ export function useH5AgentChatPresentation(
             quotedPreviewImages,
         } = partitionChatQuotedContent(quotedMessage, allAttachments, allPreviewImages);
         const previewedImageNames = new Set(previewImages.map((image) => image.filename).filter(Boolean));
-        const mediaAttachments = msg.role === 'user'
-            ? attachments.filter((attachment) => attachment.kind === 'audio' || attachment.kind === 'video')
-            : [];
+        const mediaAttachments = attachments.filter((attachment) => attachment.kind === 'audio' || attachment.kind === 'video');
         const quotedMediaAttachments = quotedAttachments.filter((attachment) => attachment.kind === 'audio' || attachment.kind === 'video');
         const fileChips: Array<{
             name: string;

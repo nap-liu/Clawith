@@ -14,7 +14,7 @@ from tests.test_turn_inbox_receipt_anchor import (
     ChannelConfig,
     ChatMessage,
     ChatSession,
-    _dispose_engine_between_tests,
+    _dispose_engine_between_tests,  # noqa: F401 - shared autouse fixture
     _seed_running_im_turn,
     async_session,
     bind_durable_channel_receipt_anchor,
@@ -250,7 +250,7 @@ async def test_failed_terminal_cleanup_survives_next_turn_binding(monkeypatch):
 async def test_one_startup_drains_ten_successful_terminal_receipt_anchors(
     monkeypatch,
 ):
-    from app.services import dingtalk_reaction, turn_recovery
+    from app.services import dingtalk_reaction, turn_recovery, turn_recovery_scanner
 
     agent_id, user_id, session_id, root_id, _generation = await _seed_running_im_turn()
     message_ids = [root_id]
@@ -337,7 +337,7 @@ async def test_one_startup_drains_ten_successful_terminal_receipt_anchors(
         async def __aexit__(self, *_args):
             return False
 
-    async def no_recoverable_anchors(_db):
+    async def no_recoverable_anchors(_db, **_kwargs):
         return []
 
     monkeypatch.setattr(
@@ -347,7 +347,7 @@ async def test_one_startup_drains_ten_successful_terminal_receipt_anchors(
     )
     monkeypatch.setattr(turn_recovery, "RedisLeaseLock", NoopRecoveryLease)
     monkeypatch.setattr(
-        turn_recovery,
+        turn_recovery_scanner,
         "_load_recoverable_anchors",
         no_recoverable_anchors,
     )

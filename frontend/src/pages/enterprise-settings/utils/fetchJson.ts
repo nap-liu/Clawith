@@ -13,7 +13,7 @@ export async function fetchJson<T>(url: string, options?: RequestInit): Promise<
         const msg = Array.isArray(detail)
             ? detail.map((e: any) => e.msg || JSON.stringify(e)).join('; ')
             : (typeof detail === 'string' ? detail : 'Error');
-        throw new Error(msg);
+        throw Object.assign(new Error(msg), { status: res.status, detail });
     }
     if (res.status === 204) return undefined as T;
     return res.json();

@@ -23,6 +23,7 @@ export type SubagentRunCardData = {
     fork?: boolean;
     soul?: boolean;
     memory?: boolean;
+    taskId?: string;
 };
 
 type Translate = (key: string, options?: any) => string;
@@ -54,9 +55,10 @@ export function parseSubagentRunCardData(message: any, payload: Record<string, a
         sessionId: result.session_id ? String(result.session_id) : (result.subagent_id ? String(result.subagent_id) : undefined),
         executionAgentId: result.execution_agent_id ? String(result.execution_agent_id) : undefined,
         status,
+        taskId: result.type === 'media_task' ? String(result.task_id || '') : undefined,
         name: result.name || args.name ? String(result.name || args.name) : undefined,
         mode: result.mode || args.mode ? String(result.mode || args.mode) : undefined,
-        task: args.task ? String(args.task) : undefined,
+        task: args.task || args.prompt ? String(args.task || args.prompt) : undefined,
         model: args.model ? String(args.model) : undefined,
         fork: args.fork === true,
         soul: (result.soul ?? args.soul) !== false,
@@ -106,7 +108,7 @@ export default function SubagentRunCard({
 
         const refresh = async () => {
             try {
-                const detail = await chatSessionApi.get(agentId, data.sessionId!);
+                const detail = await chatSessionApi.get(agentId, data.sessionId!, data.taskId);
                 if (cancelled) return;
                 const runtime = detail?.runtime;
                 const next = {
@@ -116,8 +118,8 @@ export default function SubagentRunCard({
                     name: String(detail?.title || data.name || ''),
                     mode: runtime?.mode || data.mode,
                     model: runtime?.model || data.model,
-                    soul: runtime?.soul ?? data.soul,
-                    memory: runtime?.memory ?? data.memory,
+                    soul: data.taskId ? true : (runtime?.soul ?? data.soul),
+                    memory: data.taskId ? true : (runtime?.memory ?? data.memory),
                 };
                 setLiveData(next);
                 if (['queued', 'pending', 'running', 'processing'].includes(next.status)) {
@@ -135,7 +137,7 @@ export default function SubagentRunCard({
             cancelled = true;
             if (timer !== undefined) window.clearTimeout(timer);
         };
-    }, [agentId, data.executionAgentId, data.mode, data.model, data.name, data.sessionId, data.status, data.task, data.fork, data.soul, data.memory]);
+    }, [agentId, data.executionAgentId, data.mode, data.model, data.name, data.sessionId, data.status, data.task, data.taskId, data.fork, data.soul, data.memory]);
 
     const status = statusMeta(liveData.status);
     const StatusIcon = status.icon;

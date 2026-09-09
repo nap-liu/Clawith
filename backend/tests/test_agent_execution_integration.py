@@ -16,6 +16,7 @@ from app.models.tool import AgentTool, Tool
 from app.services.active_turns import active_turn_boundary
 from app.services.conversation_turn_lifecycle import transition_conversation_turn
 from app.services.llm.runtime_model import RuntimeLLMModel
+from app.services.tool_seeder import seed_builtin_tools
 from test_im_scene_command_integration import _seed_scene_runtime
 from execution_provider_fixture import provider
 
@@ -29,6 +30,7 @@ async def isolated_engine(monkeypatch):
 
 
 async def seed(base_url, channel="web"):
+    await seed_builtin_tools()
     aid, uid = await _seed_scene_runtime()
     async with async_session() as db:
         agent = await db.get(Agent, aid)

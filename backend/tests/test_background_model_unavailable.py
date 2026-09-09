@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import uuid
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
+import app.models.registry  # noqa: F401 - real durable turn foreign-key graph
+
 from app.database import async_session, engine
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
 from app.models.llm import LLMModel
 from app.models.task import Task, TaskLog
 from app.models.tenant import Tenant
@@ -22,12 +24,6 @@ async def _isolate_engine():
     await engine.dispose()
     yield
     await engine.dispose()
-
-
-class _UnlimitedCapacity:
-    @asynccontextmanager
-    async def slot(self, *_args):
-        yield
 
 
 async def _seed_runtime() -> tuple[User, Agent, LLMModel]:
@@ -100,10 +96,6 @@ async def test_task_with_unavailable_model_returns_to_pending(monkeypatch):
         AsyncMock(),
     )
     monkeypatch.setattr(
-        "app.services.task_executor.get_workload_capacity",
-        lambda: _UnlimitedCapacity(),
-    )
-    monkeypatch.setattr(
         "app.services.agent_context.build_agent_context",
         AsyncMock(return_value=("static", "dynamic")),
     )
@@ -117,18 +109,20 @@ async def test_task_with_unavailable_model_returns_to_pending(monkeypatch):
                 select(TaskLog).where(TaskLog.task_id == task_id).order_by(TaskLog.created_at)
             )
         ).scalars().all()
+        terminal = await db.scalar(select(ChatMessage).where(
+            ChatMessage.agent_id == agent.id, ChatMessage.role == "assistant",
+            ChatMessage.message_meta["turn_status"].as_string() == "failed",
+        ))
     assert persisted.status == "pending"
-    assert any("请更新运行配置后重试" in log.content for log in logs)
+    assert logs and terminal is not None
+    assert terminal.message_meta["error_code"] == "model_unavailable"
+    assert terminal.content in logs[-1].content
 
 
 async def test_schedule_with_unavailable_model_is_failed(monkeypatch):
     from app.services.scheduler import ScheduleExecutionOutcome, _execute_schedule
 
     user, agent, model = await _seed_runtime()
-    monkeypatch.setattr(
-        "app.services.scheduler.get_workload_capacity",
-        lambda: _UnlimitedCapacity(),
-    )
     monkeypatch.setattr(
         "app.services.agent_context.build_agent_context",
         AsyncMock(return_value=("static", "dynamic")),

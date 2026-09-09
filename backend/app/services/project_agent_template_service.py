@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
 from app.models.llm import LLMModel
+from app.services.model_capabilities import purpose_clause
 from app.models.mcp_server import MCPServer
 from app.models.participant import Participant
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
@@ -172,6 +173,7 @@ async def instantiate_project_agents_from_template(
                         LLMModel.id.in_(requested_model_ids),
                         or_(LLMModel.tenant_id == project.tenant_id, LLMModel.tenant_id.is_(None)),
                         LLMModel.enabled.is_(True),
+                        purpose_clause(),
                     )
                 )
             ).scalars()

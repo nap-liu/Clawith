@@ -42,6 +42,72 @@ permissions, credentials, approval/autonomy policy, lifecycle state, Soul, or
 Core Memory. Public tool fields call temperature “imagination”; database and
 provider adapters may retain the internal `temperature` name.
 
+## Media understanding and generation
+
+`read_media` and `generate_media` are independently opt-in builtin tools.
+Both reference the existing enterprise `LLMModel` pool. Four default model IDs
+in `tool_config:media_ai` are managed by the enterprise model UI; Agent/scene
+tool settings may override those references. Explicit call `model_id` wins,
+otherwise a same-purpose media session retains its selection, then the resolved
+tool default applies. Admission validates tenant, enabled state and purpose,
+and freezes the real model ID, resolved protocol and encrypted runtime settings.
+The next input reads that selected model's current settings; queued inputs retain
+their accepted snapshot. Model names are free configuration, not an allowlist.
+
+`api_protocol` selects the shared understanding/dialogue transport independently
+of the provider. NULL preserves the provider registry's existing default; changing
+a provider to Responses requires configuring and validating that endpoint.
+For actual Bailian endpoints, audio/video in the current input or retained history
+selects Chat before sending because Bailian Responses currently accepts neither.
+Text/image requests retain Responses. This capability routing never retries a
+failed submission and does not change other providers' configured protocols.
+Understanding preserves original supported image/audio/video inputs, without
+silently discarding audio or sampling locally. Generation uses a small transport
+facade: compatible services share standard image/audio/video endpoints; Qwen uses
+its native generation adapter. A Responses setting does not imply every generation
+operation uses `/responses`. Unsupported native operations fail explicitly.
+
+Startup converts mutable legacy tenant and Agent connections to enterprise model
+references and clears old global media defaults. Published scene revisions and
+accepted task snapshots are not rewritten. A published legacy connection is
+materialized into a matching tenant model on admission; disabled matches stay
+disabled. The legacy transport reader remains for previously accepted tasks.
+Enterprise media tests submit to the same child worker using an authorized existing
+Agent workspace. The existing non-waking Subagent mode avoids an extra parent LLM
+call; HTTP still returns a task receipt immediately. Existing image tools and
+their assignments retain their original behavior and permissions.
+
+Both entrypoints immediately return a `media_task` receipt (`task_id`, `session_id`,
+`status`). They enqueue an input in an ordinary child Session with `executor=media`.
+The shared SubagentRun lease/worker executes the provider adapter directly, without
+an Agent planning round, Soul, memory search or a separate job queue. Each input is
+one task and publishes its own completion, even when later inputs are queued.
+Omitting `session_id` starts a one-shot job; supplying it continues the same media
+conversation, with a fresh task ID and the same authorization boundary.
+
+Admission stores effective configuration and the accepted scene revision on the
+input anchor; connection credentials are encrypted. Generation intent, encrypted
+provider task/result references and saved files live on that input's tool-call row
+in `message_meta.media_job`. Recovery queries the original provider task; an
+unconfirmed submission is never resubmitted. Interrupted understanding without a
+stored result ends explicitly instead of silently paying for another invocation.
+Outer-tool recovery restores the original enqueue receipt. Retryable provider
+reads retain the same task and checkpoints honor the shared turn/lease fence.
+
+AgentDir paths use existing storage signing, with an exact-file ticket fallback
+for local storage. Third-party HTTP(S) URLs retain their original query parameters.
+A supplied media kind avoids probing an opaque URL; otherwise bounded probing
+determines its type. There is no platform input size/count cap or compulsory
+Base64 conversion; the selected model and reachable storage determine supported
+sizes. Existing URL access security rules still apply. Files use the execution
+Agent's workspace, which may differ from the A2A history owner. Audio/video delivery
+reuses the original parent's receipt and player. Task cards reuse the existing
+subagent UI and query per-task status so later turns cannot rewrite earlier
+outcomes. The shared frontend parser unwraps `media_generation.delivery`.
+A2A returns the generated workspace file with a separate unsupported media-player
+delivery status, following the existing channel capability; file generation still
+succeeds and the file remains available for the normal A2A file exchange.
+
 ## CLI execution models
 
 The platform supports two intentionally distinct command models:

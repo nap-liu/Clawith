@@ -381,6 +381,8 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
             }
         ],
     }
+    if (getattr(msg, "message_meta", None) or {}).get("responses_snapshot"):
+        asst["responses_snapshot"] = msg.message_meta["responses_snapshot"]
     if payload["reasoning_content"]:
         asst["reasoning_content"] = payload["reasoning_content"]
 
@@ -439,6 +441,9 @@ def expand_tool_call_round(messages: list[Any]) -> list[dict[str, Any]]:
         assistant["reasoning_content"] = source_payload["reasoning_content"]
 
     for message, payload in parsed:
+        snapshot = (getattr(message, "message_meta", None) or {}).get("responses_snapshot")
+        if snapshot and "responses_snapshot" not in assistant:
+            assistant["responses_snapshot"] = snapshot
         args = payload.get("args") if payload.get("args") is not None else {}
         assistant["tool_calls"].append(
             {
@@ -523,6 +528,8 @@ def build_llm_message_from_row(
             )
 
     entry: dict[str, Any] = {"role": message.role, "content": content}
+    if message.role == "assistant" and not recalled and meta.get("responses_snapshot"):
+        entry["responses_snapshot"] = meta["responses_snapshot"]
     if attachments or has_attachment_protocol:
         entry["attachments"] = attachments
     if include_thinking and not recalled and getattr(message, "thinking", None):

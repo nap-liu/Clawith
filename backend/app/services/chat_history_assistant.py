@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.llm.responses_history import transfer_response_snapshot
+
 from app.services.chat_history_tools import *  # noqa: F401,F403
 
 THINKING_MAX_CHARS = 64_000
@@ -141,6 +143,7 @@ async def persist_intermediate_assistant_reply(
     content: str,
     turn_anchor_id: uuid.UUID,
     thinking: str | None = None,
+    responses_snapshot: dict | None = None,
     visible_joiner_before: str = "",
     max_output_resume_prompt: str | None = None,
     created_at: datetime | None = None,
@@ -180,6 +183,7 @@ async def persist_intermediate_assistant_reply(
                 else None
             ),
             message_meta={
+                **({"responses_snapshot": responses_snapshot} if responses_snapshot else {}),
                 "artifact_role": INTERMEDIATE_ASSISTANT_ARTIFACT_ROLE,
                 "turn_anchor_id": str(turn_anchor_id),
                 "turn_status": "running",
@@ -304,6 +308,9 @@ async def persist_assistant_reply_row(
             turn_anchor_id=turn_anchor_id,
         )
     final_meta = dict(message_meta or {})
+    transfer_response_snapshot(
+        turn_anchor, final_meta, completed=turn_terminal_status == "completed",
+    )
     if failure_code:
         final_meta.update(failure_meta)
     final_meta.setdefault("attachments", [])

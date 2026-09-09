@@ -13,7 +13,7 @@ from app.models.agent import Agent
 from app.models.audit import AuditLog, ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.schedule import AgentSchedule
-from app.models.task import Task, TaskLog
+from app.models.task import Task
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
@@ -68,7 +68,7 @@ async def test_manual_run_uses_one_actor_aligned_path_for_all_resource_types(mon
             creator_id=creator.id,
             name=f"Manual Run Agent {suffix}",
             access_mode="company",
-            status="idle",
+            status="running",
         )
         db.add(agent)
         await db.flush()
@@ -106,20 +106,15 @@ async def test_manual_run_uses_one_actor_aligned_path_for_all_resource_types(mon
 
     calls = []
 
-    async def _capture_task(*args):
-        calls.append(args)
+    async def _complete_accepted_turn(anchor_id):
+        from app.services.background_turns import complete_background_turn
 
-    async def _capture_schedule(*args):
-        from app.services.scheduler import ScheduleExecutionOutcome
+        async with async_session() as db:
+            anchor = await db.get(ChatMessage, anchor_id)
+        await complete_background_turn(anchor, reply="Completed", execution_agent_id=agent.id)
+        calls.append((anchor_id, anchor.user_id))
 
-        calls.append(args)
-        return ScheduleExecutionOutcome.SUCCEEDED
-
-    monkeypatch.setattr("app.services.task_executor.execute_task", _capture_task)
-    monkeypatch.setattr(
-        "app.services.scheduler._execute_schedule",
-        _capture_schedule,
-    )
+    monkeypatch.setattr("app.services.background_turns.run_background_turn", _complete_accepted_turn)
 
     async with async_session() as db:
         await run_background_resource(
@@ -146,7 +141,9 @@ async def test_manual_run_uses_one_actor_aligned_path_for_all_resource_types(mon
             resource=str(trigger.id),
         )
 
-    await asyncio.sleep(0.05)
+    async with asyncio.timeout(3):
+        while len(calls) < 2:
+            await asyncio.sleep(0.01)
     assert len(calls) == 2
     assert calls[0][-1] == actor.id
     assert calls[1][-1] == actor.id
@@ -232,7 +229,7 @@ async def test_manual_schedule_overload_does_not_record_success(monkeypatch):
 
 
 async def test_task_capacity_overload_returns_task_to_retryable_state(monkeypatch):
-    """Capacity pressure must not leave a task doing or mark it failed/done."""
+    """Capacity pressure retains the admitted run, and recovery completes it once."""
 
     from contextlib import asynccontextmanager
 
@@ -282,7 +279,7 @@ async def test_task_capacity_overload_returns_task_to_retryable_state(monkeypatc
         await db.commit()
 
     monkeypatch.setattr(
-        "app.services.task_executor.get_workload_capacity",
+        "app.services.turn_recovery.get_workload_capacity",
         lambda: _OverloadedCapacity(),
     )
     await reset_active_turns_for_testing()
@@ -294,15 +291,33 @@ async def test_task_capacity_overload_returns_task_to_retryable_state(monkeypatc
     async with async_session() as db:
         stored = await db.get(Task, task.id)
         assert stored is not None
-        assert stored.status == "pending"
+        assert stored.status == "doing"
         assert stored.completed_at is None
-        logs = (
-            (await db.execute(select(TaskLog).where(TaskLog.task_id == task.id).order_by(TaskLog.created_at)))
-            .scalars()
-            .all()
-        )
-        assert any("可重新执行" in log.content for log in logs)
-        assert not any("执行出错" in log.content for log in logs)
+        anchor = await db.scalar(select(ChatMessage).where(
+            ChatMessage.agent_id == agent.id, ChatMessage.role == "user",
+            ChatMessage.message_meta["background_execution"]["kind"].as_string() == "task",
+        ))
+        assert anchor.message_meta["turn_status"] == "running"
+        anchor_id = anchor.id
+
+    from unittest.mock import AsyncMock
+    from app.services.background_turns import run_background_turn
+
+    class AvailableCapacity:
+        @asynccontextmanager
+        async def slot(self, *_args):
+            yield
+
+    model_call = AsyncMock(return_value="Recovered task completed")
+    monkeypatch.setattr("app.services.turn_recovery.get_workload_capacity", AvailableCapacity)
+    monkeypatch.setattr("app.services.turn_recovery._call_agent_llm", model_call)
+    await run_background_turn(anchor_id)
+    await run_background_turn(anchor_id)
+    assert model_call.await_count == 1
+    async with async_session() as db:
+        stored = await db.get(Task, task.id)
+        assert stored.status == "done"
+        assert stored.completed_at is not None
 
 
 async def test_manual_run_rejects_running_or_ambiguous_tasks(monkeypatch):
@@ -443,7 +458,7 @@ async def test_agent_tool_manual_run_requires_a_real_human_turn(
     async def _capture(*args):
         calls.append(args)
 
-    monkeypatch.setattr("app.services.task_executor.execute_task", _capture)
+    monkeypatch.setattr("app.services.background_turns.run_background_turn", _capture)
     accepted = await handle_run_background_resource(
         agent.id,
         actor.id,
@@ -500,10 +515,10 @@ async def test_task_executor_atomically_skips_duplicate_runs(monkeypatch):
     release = asyncio.Event()
     calls = 0
 
-    async def _context(*_args):
+    async def _context(*_args, **_kwargs):
         return "static", "dynamic"
 
-    async def _llm(**_kwargs):
+    async def _llm(_anchor_id):
         nonlocal calls
         calls += 1
         entered.set()
@@ -513,14 +528,14 @@ async def test_task_executor_atomically_skips_duplicate_runs(monkeypatch):
     async def _activity(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr("app.services.agent_context.build_agent_context", _context)
-    monkeypatch.setattr("app.services.llm.call_agent_llm_with_tools", _llm)
+    monkeypatch.setattr("app.services.task_executor.build_agent_context", _context)
+    monkeypatch.setattr("app.services.background_turns.run_background_turn", _llm)
     monkeypatch.setattr("app.services.activity_logger.log_activity", _activity)
 
     await reset_active_turns_for_testing()
     worker = asyncio.create_task(execute_task(task.id, agent.id, actor.id))
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=3)
         await asyncio.wait_for(execute_task(task.id, agent.id, actor.id), timeout=1)
         assert calls == 1
     finally:

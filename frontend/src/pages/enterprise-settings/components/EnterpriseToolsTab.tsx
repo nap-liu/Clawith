@@ -1,11 +1,11 @@
 import { CliToolsSection } from '../../../components/cli-tools/CliToolsSection';
 import LlmModelSelect from '../../../components/LlmModelSelect';
+import SearchInput from '../../../components/ui/SearchInput';
 import MCPServerEditor from '../../../components/MCPServerEditor';
 import { effectiveEditorRole } from '../../../components/MCPServerEditor/role';
 import { getLocalizedToolPresentation } from '../../../utils/toolPresentation';
 import {
     IconChevronDown,
-    IconSearch,
     IconSettings,
 } from '@tabler/icons-react';
 import fetchJson from '../api';
@@ -239,26 +239,11 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                 if (allTools.length === 0) {
                                     return <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-tertiary)' }}>{t('enterprise.tools.emptyState')}</div>;
                                 }
-                                if (filteredTools.length === 0) {
-                                    return (
-                                        <>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '16px' }}>
-                                                <div style={{ position: 'relative', flex: '1 1 260px', minWidth: '220px' }}>
-                                                    <IconSearch size={15} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-                                                    <input value={toolSearch} onChange={(e) => setToolSearch(e.target.value)} placeholder={t('agent.tools.searchTools', 'Search tools...')} style={{ width: '100%', boxSizing: 'border-box', border: '1px solid var(--border-subtle)', borderRadius: '8px', background: 'var(--bg-primary)', color: 'var(--text-primary)', padding: '8px 10px 8px 32px', fontSize: '13px', outline: 'none' }} />
-                                                </div>
-                                            </div>
-                                            <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-tertiary)' }}>{hasFilters ? t('agent.tools.noMatchingTools', 'No matching tools') : t('enterprise.tools.emptyState')}</div>
-                                        </>
-                                    );
-                                }
-
                                 return (
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                             <div style={{ position: 'relative', flex: '1 1 260px', minWidth: '220px' }}>
-                                                <IconSearch size={15} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-                                                <input value={toolSearch} onChange={(e) => setToolSearch(e.target.value)} placeholder={t('agent.tools.searchTools', 'Search tools...')} style={{ width: '100%', boxSizing: 'border-box', border: '1px solid var(--border-subtle)', borderRadius: '8px', background: 'var(--bg-primary)', color: 'var(--text-primary)', padding: '8px 10px 8px 32px', fontSize: '13px', outline: 'none' }} />
+                                                <SearchInput value={toolSearch} onChange={(e) => setToolSearch(e.target.value)} placeholder={t('agent.tools.searchTools')} aria-label={t('agent.tools.searchTools')} />
                                             </div>
                                             {(['all', 'enabled', 'disabled', 'default', 'configured'] as const).map(filter => (
                                                 <button key={filter} type="button" onClick={() => setToolStatusFilter(filter)} style={{ border: '1px solid var(--border-subtle)', borderRadius: '999px', background: toolStatusFilter === filter ? 'var(--text-primary)' : 'var(--bg-primary)', color: toolStatusFilter === filter ? 'var(--bg-primary)' : 'var(--text-secondary)', padding: '6px 10px', fontSize: '11px', cursor: 'pointer' }}>
@@ -277,6 +262,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                             </button>
                                         </div>
 
+                                        {filteredTools.length === 0 && <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-tertiary)' }}>{hasFilters ? t('agent.tools.noMatchingTools') : t('enterprise.tools.emptyState')}</div>}
                                         {Object.entries(grouped)
                                             .sort(([a, aTools], [b, bTools]) => {
                                                 const aMeta = getToolGroupMeta(a, allGrouped[a] || aTools as any[]);
@@ -397,7 +383,7 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                 const missingRequiredModel = visibleFields.some((field: any) => field.type === 'llm_model_picker' && field.required && !(editingConfig[field.key] ?? field.default));
                                 const renderField = (field: any) => (
                                     <div key={field.key}>
-                                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{field.label}</label>
+                                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{t(field.label)}</label>
                                         {field.type === 'checkbox' ? (
                                             <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer' }}>
                                                 <input
@@ -423,6 +409,8 @@ export default function EnterpriseToolsTab({ model }: { model: any }) {
                                                 value={editingConfig[field.key] ?? field.default ?? ''}
                                                 onChange={value => setEditingConfig((p: Record<string, any>) => ({ ...p, [field.key]: value }))}
                                                 tenantId={selectedTenantId}
+                                                purpose={field.purpose}
+                                                placeholder={field.purpose ? t("enterprise.llm.inheritMediaDefault") : undefined}
                                                 supportsVision={field.filter?.supports_vision === true}
                                                 required={field.required}
                                             />

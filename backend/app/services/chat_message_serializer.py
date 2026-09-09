@@ -57,6 +57,12 @@ def serialize_chat_message_for_client(
         "attachments": attachments,
         "created_at": created_at.isoformat() if created_at else None,
     }
+    if isinstance(meta, dict):
+        media_result = meta.get("media_result")
+        if role == "assistant" and isinstance(media_result, dict) and media_result.get("task_id"):
+            entry["mediaTaskId"] = str(media_result["task_id"])
+        elif role == "tool_call" and meta.get("media_job") and meta.get("turn_anchor_id"):
+            entry["mediaTaskId"] = str(meta["turn_anchor_id"])
     if role == "user" and isinstance(meta, dict):
         if meta.get("client_message_id"):
             entry["client_message_id"] = str(meta["client_message_id"])

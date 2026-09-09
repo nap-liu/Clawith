@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.services.turn_tool_settings import current_tool_settings
+from app.services.media_ai_contract import MEDIA_AI_NAMES
 
 
 # ─── Tool Config Cache ──────────────────────────────────────────
@@ -86,7 +87,8 @@ def invalidate_tool_config_cache(agent_id: Optional[uuid.UUID], tool_name: str |
     agent_key = str(agent_id) if agent_id else None
     for cache_key in list(_tool_config_cache):
         agent_matches = agent_id is None or cache_key[0] == agent_key
-        if agent_matches and (tool_name is None or cache_key[1] == tool_name):
+        shared_media = tool_name in MEDIA_AI_NAMES and cache_key[1] in MEDIA_AI_NAMES
+        if agent_matches and (tool_name is None or cache_key[1] == tool_name or shared_media):
             _tool_config_cache.pop(cache_key, None)
 
 
@@ -107,7 +109,7 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     # Check cache first
     cached = _get_cached_tool_config(agent_id, tool_name)
     if cached is not None:
-        logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}: {cached}")
+        logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}")
         return cached
 
     from app.models.tool import Tool, AgentTool

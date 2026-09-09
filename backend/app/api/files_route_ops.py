@@ -24,6 +24,8 @@ from app.services.authentication_state import require_active_authentication_prin
 from app.services.chat_attachments import sniff_image_mime_bytes
 from app.services.focus_service import is_focus_file_path
 from app.services.im_markdown_media import verify_im_image_ticket
+from app.services.agent_file_urls import verify_agent_file_ticket
+from app.services.llm.failure_outcome import render_message
 from app.services.storage import ensure_local_path, guess_content_type
 from app.services.workspace_collaboration import (
     acquire_edit_lock,
@@ -282,6 +284,24 @@ async def download_file_impl(
 
     storage = api.get_storage_backend()
     if im_ticket:
+        media_ticket = verify_agent_file_ticket(agent_id, path, im_ticket)
+        if media_ticket is not None:
+            key = media_ticket["storage_key"]
+            if not await storage.is_file(key):
+                raise HTTPException(status_code=404, detail=render_message("mediaAI.fileUnavailable"))
+            local_path = await storage.local_path_for(key)
+            headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+            if local_path is not None:
+                return FileResponse(str(local_path), media_type=media_ticket["mime_type"], headers=headers)
+            from fastapi.responses import StreamingResponse
+
+            entry = await storage.stat(key)
+
+            async def chunks():
+                for offset in range(0, entry.size, 1024 * 1024):
+                    yield await storage.read_range(key, offset, min(entry.size - 1, offset + 1024 * 1024 - 1))
+
+            return StreamingResponse(chunks(), media_type=media_ticket["mime_type"], headers=headers)
         image_ticket = verify_im_image_ticket(agent_id, path, im_ticket)
         if image_ticket is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")

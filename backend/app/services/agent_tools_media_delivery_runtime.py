@@ -125,6 +125,7 @@ async def _send_media_to_session_under_lifecycle_lock(
         size_bytes=file_path.stat().st_size,
     )
     persisted_args = dict(tool_args or {"media_type": media_kind, "file_path": workspace_path})
+    delivery_tool_name = "generate_media" if "output_type" in persisted_args else "send_media"
     display_title = normalize_media_display_title(persisted_args.get("title"))
     if not operation_key:
         return json.dumps(
@@ -385,7 +386,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                     continue
                 if (
                     isinstance(candidate_payload, dict)
-                    and str(candidate_payload.get("name") or "") == "send_media"
+                    and str(candidate_payload.get("name") or "") == delivery_tool_name
                     and str(candidate_payload.get("call_id") or "") == intent_id
                 ):
                     receipt = candidate
@@ -418,7 +419,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                 role="tool_call",
                 content=json.dumps(
                     {
-                        "name": "send_media",
+                        "name": delivery_tool_name,
                         "call_id": intent_id,
                         "args": persisted_args,
                         "status": "running",
@@ -605,7 +606,6 @@ async def _send_media_to_session_under_lifecycle_lock(
                     )
                     caption_db.add(caption_row)
                     await caption_db.flush()
-                caption_message_id = caption_row.id
                 await caption_db.commit()
             try:
                 caption_delivery_result = await deliver_message_with_receipt(
@@ -713,10 +713,10 @@ async def _send_media_to_session_under_lifecycle_lock(
         final_receipt.content = json.dumps(
             {
                 **final_tool_payload,
-                "name": "send_media",
+                "name": delivery_tool_name,
                 "call_id": intent_id,
                 "args": persisted_args,
-                "status": "done",
+                "status": "running" if delivery_tool_name == "generate_media" and str(origin_session_id) == str(target_session_id) else "done",
                 "result": json.dumps(result_payload, ensure_ascii=False),
                 "reasoning_content": final_tool_payload.get("reasoning_content"),
             },
@@ -761,7 +761,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                 "type": "tool_call",
                 "id": str(final_receipt.id),
                 "message_id": str(final_receipt.id),
-                "name": "send_media",
+                "name": delivery_tool_name,
                 "call_id": intent_id,
                 "args": persisted_args,
                 "status": "done",

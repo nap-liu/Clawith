@@ -181,6 +181,8 @@ export function ToolConfigModal({
                                             <LlmModelSelect
                                                 value={configData[field.key] ?? field.default ?? ''}
                                                 onChange={value => setConfigData(p => ({ ...p, [field.key]: value }))}
+                                                purpose={field.purpose}
+                                                placeholder={field.purpose ? t("enterprise.llm.inheritMediaDefault") : undefined}
                                                 supportsVision={field.filter?.supports_vision === true}
                                                 disabled={isReadOnly}
                                                 required={field.required}
@@ -288,7 +290,9 @@ export function ToolConfigModal({
                                                         <LlmModelSelect
                                                             value={configData[field.key] ?? field.default ?? ''}
                                                             onChange={value => setConfigData(p => ({ ...p, [field.key]: value }))}
-                                                            supportsVision={field.filter?.supports_vision === true}
+                                                            purpose={field.purpose}
+                                                placeholder={field.purpose ? t("enterprise.llm.inheritMediaDefault") : undefined}
+                                                supportsVision={field.filter?.supports_vision === true}
                                                             disabled={isReadOnly}
                                                             required={field.required}
                                                         />

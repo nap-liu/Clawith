@@ -83,6 +83,15 @@ async def execute_claimed_subagent(
                 await _requeue_capacity_blocked_subagent(run_id, anchor_id)
                 current_anchor_id = None
                 return
+            from app.services.media_ai_runtime import execute_media_turn, is_media_session
+
+            if await is_media_session(run_id):
+                terminal = await execute_media_turn(run_id, anchor, recovering=recovering)
+                await active_turn_capacity.aclose()
+                active_turn_capacity = None
+                if terminal:
+                    return
+                continue
             async with async_session() as db:
                 run = await db.get(SubagentRun, run_id)
                 child = await db.get(ChatSession, run_id)

@@ -83,7 +83,7 @@ async def admit_nested(agent_id, user_id, session_id, turn_anchor_id,
     from app.services.conversation_turn_lifecycle import transition_conversation_turn
 
     async with async_session() as db:
-        db.add(ChatSession(id=new_session_id, agent_id=agent_id, user_id=user_id, source_channel="agent"))
+        db.add(ChatSession(id=new_session_id, agent_id=agent_id, user_id=user_id, source_channel="web"))
         db.add(ChatMessage(id=new_anchor_id, agent_id=agent_id, user_id=user_id,
                            conversation_id=str(new_session_id), role="user", content="Nested request"))
         await db.flush()

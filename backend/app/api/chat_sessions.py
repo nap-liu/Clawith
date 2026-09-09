@@ -137,9 +137,10 @@ async def _build_session_detail_out(
     db: AsyncSession,
     session: ChatSession,
     view_scope: Literal["mine", "all"],
+    task_id: uuid.UUID | None = None,
 ) -> SessionDetailOut:
     return await _chat_session_access._build_session_detail_out(
-        db, session, view_scope
+        db, session, view_scope, task_id=task_id
     )
 
 
@@ -532,12 +533,13 @@ async def list_sessions(
 async def get_session(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
+    task_id: uuid.UUID | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get one accessible session so a URL can restore it without scanning a paged list."""
     _, session, view_scope = await _load_accessible_session(db, current_user, agent_id, session_id)
-    return await _build_session_detail_out(db, session, view_scope)
+    return await _build_session_detail_out(db, session, view_scope, task_id=task_id)
 
 
 @router.get("/{agent_id}/sessions/{session_id}/execution")

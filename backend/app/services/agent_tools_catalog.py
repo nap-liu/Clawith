@@ -4,8 +4,10 @@ from app.services.agent_tools_catalog_core import AGENT_TOOL_CORE
 from app.services.agent_tools_catalog_feishu import AGENT_TOOL_FEISHU
 from app.services.agent_tools_catalog_integrations import AGENT_TOOL_INTEGRATIONS
 from app.services.agent_tools_catalog_runtime import AGENT_TOOL_RUNTIME
+from app.services.media_ai_contract import MEDIA_AI_FUNCTIONS
 
 AGENT_TOOLS = [
+    *MEDIA_AI_FUNCTIONS,
     *AGENT_TOOL_CORE,
     *AGENT_TOOL_RUNTIME,
     *AGENT_TOOL_FEISHU,

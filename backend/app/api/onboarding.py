@@ -13,6 +13,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent, AgentPermission, AgentTemplate
 from app.models.llm import LLMModel
+from app.services.model_capabilities import purpose_clause
 from app.models.onboarding import UserTenantOnboarding
 from app.models.participant import Participant
 from app.models.tenant import Tenant
@@ -102,6 +103,7 @@ async def _tenant_default_model_id(db: AsyncSession, tenant_id: uuid.UUID | None
         select(LLMModel.id).where(
             LLMModel.tenant_id == tenant_id,
             LLMModel.enabled == True,  # noqa: E712
+                purpose_clause(),
         ).order_by(LLMModel.created_at.asc())
     )
     return model_result.scalar_one_or_none()

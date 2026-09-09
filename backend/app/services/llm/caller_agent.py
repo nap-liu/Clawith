@@ -101,6 +101,10 @@ async def call_agent_llm_with_tools(
 
     if await is_retired_okr_agent(db, agent):
         return make_llm_failure(code="model_turn_failed", message_key="errors.modelTurnFailed")
+    if execution_user_id is None:
+        from app.services.active_turns import resolve_execution_owner
+
+        execution_user_id = await resolve_execution_owner(agent_id, agent_id)
     anchor = await create_background_turn(
         db, agent=agent, kind="background", reference_id=uuid.uuid4(),
         user_prompt=user_prompt, execution_user_id=execution_user_id,

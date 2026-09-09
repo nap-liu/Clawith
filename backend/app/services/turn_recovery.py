@@ -296,6 +296,7 @@ async def prepare_recoverable_turn_history(
         ctx_size=ctx_size,
         expected_origin=expected_origin,
         execution_agent_id=execution_agent_id,
+        release_db_before_execution=True,
     )
     await _normalize_completed_tool_rounds_for_recovery(
         anchor,
@@ -463,7 +464,6 @@ async def _persist_and_deliver_recovered_reply(
     resume_promoted_turn: bool = True,
 ) -> bool:
     """Commit the recovered terminal result, then deliver and promote."""
-
     if not await _recovery_origin_matches(anchor, expected_origin):
         raise _RecoveryFenceLost("recovery owner or route changed")
 

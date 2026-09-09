@@ -12,6 +12,7 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.llm import LLMModel
 from app.models.tenant import Tenant
+from app.services.model_capabilities import supports_purpose, purpose_clause
 from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.llm.reasoning import validate_reasoning_effort
 
@@ -104,6 +105,7 @@ async def list_enabled_tenant_models(
         select(LLMModel).where(
             LLMModel.tenant_id == tenant_id,
             LLMModel.enabled.is_(True),
+            purpose_clause(),
         )
     )
     return sorted(
@@ -123,7 +125,7 @@ async def resolve_tenant_model_by_name(
     if not normalized:
         return ModelNameResolution(MODEL_STATUS_NOT_FOUND)
 
-    result = await db.execute(select(LLMModel).where(LLMModel.tenant_id == tenant_id))
+    result = await db.execute(select(LLMModel).where(LLMModel.tenant_id == tenant_id, purpose_clause()))
     matches = [
         model
         for model in result.scalars().all()
@@ -152,7 +154,7 @@ async def resolve_tenant_model_reference(
         (
             await db.execute(
                 select(LLMModel).where(
-                    or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None))
+                    or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None)), purpose_clause()
                 )
             )
         )
@@ -198,7 +200,7 @@ async def resolve_runtime_models(
         if model_id is None:
             return None
         model = (await db.execute(select(LLMModel).where(LLMModel.id == model_id))).scalar_one_or_none()
-        return model if model is not None and model.enabled else None
+        return model if model is not None and model.enabled and supports_purpose(model) else None
 
     primary_orm = await _load_enabled(agent.primary_model_id)
     fallback_orm = await _load_enabled(agent.fallback_model_id)
@@ -232,6 +234,8 @@ async def resolve_runtime_models(
     override = (await db.execute(select(LLMModel).where(LLMModel.id == requested_id))).scalar_one_or_none()
     agent_tenant_id = getattr(agent, "tenant_id", None)
     if override is None or agent_tenant_id is None or override.tenant_id not in {agent_tenant_id, None}:
+        return RuntimeModelResolution(primary, fallback, MODEL_OVERRIDE_UNAVAILABLE)
+    if not supports_purpose(override):
         return RuntimeModelResolution(primary, fallback, MODEL_OVERRIDE_UNAVAILABLE)
     if not override.enabled:
         return RuntimeModelResolution(primary, fallback, MODEL_OVERRIDE_DISABLED)
@@ -345,6 +349,7 @@ async def resolve_project_member_runtime_models(
                 select(LLMModel).where(
                     or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None)),
                     LLMModel.enabled.is_(True),
+                    purpose_clause(),
                 )
             )
         )

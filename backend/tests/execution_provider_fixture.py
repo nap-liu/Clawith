@@ -21,7 +21,21 @@ async def provider(responses):
             gate = response.pop("_wait_for", None)
             if gate is not None:
                 await gate.wait()
-            if request.get("stream"):
+            if "_responses_output" in response:
+                assert header.startswith(b"POST /v1/responses ")
+                output = response["_responses_output"]
+                events = [
+                    {"type": "response.output_text.delta", "delta": part["text"]}
+                    for item in output if item.get("type") == "message"
+                    for part in item.get("content", []) if part.get("type") == "output_text"
+                ]
+                events.append({"type": "response.completed", "response": {
+                    "id": f"response-{len(requests)}", "status": "completed", "model": request["model"],
+                    "output": output, "usage": {"input_tokens": 100, "output_tokens": 10},
+                }})
+                body = "".join("data: " + json.dumps(event) + "\n\n" for event in events).encode()
+                content_type = "text/event-stream"
+            elif request.get("stream"):
                 delta = dict(response)
                 if "tool_calls" in delta:
                     delta["tool_calls"] = [{"index": index, **call} for index, call in enumerate(delta["tool_calls"])]

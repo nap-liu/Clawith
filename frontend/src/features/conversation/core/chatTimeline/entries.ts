@@ -1,4 +1,5 @@
 import { getChatToolRenderType } from "../../../../components/ChatToolCallRenderer";
+import { parseFileDeliveryToolResult } from "../../../../utils/chatFileDelivery";
 import { normalizeChatTimelineMessages } from "./history";
 import { isConfirmationToolCall, normalizeToolResult, parseStoredToolPayload } from "./tooling";
 import type {
@@ -153,7 +154,8 @@ export function buildConversationEntries(
 
   for (let i = 0; i < messages.length; i += 1) {
     const msg = messages[i];
-    const renderType = getChatToolRenderType(msg);
+    const renderType = mediaResultHasCompletionAttachment(messages, i)
+      ? null : getChatToolRenderType(msg);
     if (renderType) {
       flushGroup();
       grouped.push({
@@ -216,6 +218,21 @@ export function buildConversationEntries(
 
   flushGroup();
   return grouped;
+}
+
+function mediaResultHasCompletionAttachment(messages: ConversationMessage[], index: number): boolean {
+  const tool = messages[index];
+  if (tool.toolName !== "generate_media" || !tool.mediaTaskId) return false;
+  const delivery = parseFileDeliveryToolResult(tool.toolName, tool.toolResult, tool.toolArgs);
+  if (!delivery?.path) return false;
+  for (let next = index + 1; next < messages.length; next += 1) {
+    const message = messages[next];
+    if (message.role === "assistant" && message.mediaTaskId === tool.mediaTaskId
+      && message.attachments?.some(file => file.path === delivery.path)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function messageAnchor(msg: ConversationMessage) {

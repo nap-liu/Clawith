@@ -9,6 +9,7 @@ from app.mcp_server import mcp
 from app.mcp_server._common import _tenant_tool_clause
 from app.mcp_server.auth import resolve_pat_context
 from app.models.llm import LLMModel
+from app.services.model_capabilities import purpose_clause
 from app.models.tool import Tool
 
 _UNAUTH = "❌ 未鉴权：请在 MCP 客户端配置 Authorization: Bearer <clw_...> 令牌。"
@@ -43,6 +44,7 @@ async def list_models_impl(ctx) -> str:
         rows = (await db.execute(
             select(LLMModel).where(
                 LLMModel.enabled == True,  # noqa: E712
+                purpose_clause(),
                 or_(LLMModel.tenant_id == pc.tenant_id, LLMModel.tenant_id.is_(None)),
             )
         )).scalars().all()

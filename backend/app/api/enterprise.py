@@ -1,6 +1,9 @@
 """Enterprise management API routes: LLM pool, identity, org, and invitations."""
 
 from app.api.enterprise_api_shared import *  # noqa: F401,F403
+from app.api.enterprise_routes_models import *  # noqa: F401,F403
+from app.api.enterprise_routes_model_defaults import *  # noqa: F401,F403
+from app.api.enterprise_routes_media_test import *  # noqa: F401,F403
 from app.api.enterprise_routes_core import *  # noqa: F401,F403
 from app.api.enterprise_routes_identity import *  # noqa: F401,F403
 from app.api.enterprise_routes_identity_conflicts import *  # noqa: F401,F403

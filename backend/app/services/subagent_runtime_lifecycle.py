@@ -25,6 +25,7 @@ async def create_subagent(
     project_run_id: uuid.UUID | None = None,
     input_metadata: dict | None = None,
     allow_parent_continuation: bool = False,
+    executor: str = "agent",
 ) -> tuple[SubagentRun, bool]:
     """Create one child Session and lifecycle row, idempotent per parent tool call."""
     task_text = str(task or "").strip()
@@ -47,7 +48,9 @@ async def create_subagent(
         parent = await db.get(ChatSession, parent_id, with_for_update=True)
         if agent is None or parent is None or not await _agent_participates(db, parent, agent_id):
             raise SubagentError("当前 Agent 无权从这个 Session 创建 Subagent。")
-        if parent.source_channel == SUBAGENT_CHANNEL:
+        if executor not in {"agent", "media"}:
+            raise SubagentError("Invalid executor")
+        if parent.source_channel == SUBAGENT_CHANNEL and executor == "agent":
             raise SubagentError("Subagent 不能继续创建 Subagent。")
 
         project = None
@@ -113,7 +116,7 @@ async def create_subagent(
             normalized_reasoning_effort = validate_reasoning_effort(reasoning_effort)
         except ValueError as exc:
             raise SubagentError(str(exc)) from exc
-        model_id, canonical_model = await _resolve_model_override(db, agent, model)
+        model_id, canonical_model = (None, None) if executor == "media" else await _resolve_model_override(db, agent, model)
         now = datetime.now(UTC)
         child_id = uuid.uuid4()
         child_user_id = (
@@ -175,7 +178,8 @@ async def create_subagent(
                 ).as_session_config()
 
         task_metadata = dict(input_metadata or {})
-        await snapshot_project_scene(db, agent_id, parent, task_metadata)
+        if executor != "media":
+            await snapshot_project_scene(db, agent_id, parent, task_metadata)
         child = ChatSession(
             id=child_id,
             agent_id=agent_id,
@@ -186,6 +190,7 @@ async def create_subagent(
             is_primary=False,
             is_group=False,
             im_config={
+                "executor": executor,
                 "project_id": str(parent.project_id) if parent.project_id else None,
                 "project_group_session_id": str(parent.id) if parent.project_id else None,
                 "project_member_id": str(project_member.id) if project_member else None,
@@ -300,6 +305,7 @@ async def append_subagent_message(
     project_run_id: uuid.UUID | None = None,
     input_metadata: dict | None = None,
     allow_parent_continuation: bool = False,
+    executor: str = "agent",
 ) -> str:
     content = str(message or "").strip()
     if not content:
@@ -335,6 +341,8 @@ async def append_subagent_message(
         child = await db.get(ChatSession, child_id)
         if child is None or child.agent_id != agent_id:
             raise SubagentError("当前 Agent 无权操作这个 Subagent。")
+        if dict(child.im_config or {}).get("executor", "agent") != executor:
+            raise SubagentError("Session executor does not match this operation")
         try:
             agent = await _validate_execution_identity(db, run, child)
         except RuntimeError as exc:
@@ -406,7 +414,8 @@ async def append_subagent_message(
                         supplied_metadata.get("project_read_only_conversation")
                     ),
                 }
-        await snapshot_project_scene(db, agent.id, parent, supplied_metadata)
+        if executor != "media":
+            await snapshot_project_scene(db, agent.id, parent, supplied_metadata)
         supplied_attachments = list(supplied_metadata.pop("attachments", []) or [])
         causality = await _subagent_input_causality(db, parent=parent)
         input_row = ChatMessage(
@@ -558,6 +567,7 @@ async def stop_subagent(
     parent_session_id: str,
     subagent_id: str,
     execution_user_id: uuid.UUID,
+    task_id: str | None = None,
 ) -> str:
     try:
         parent_id = uuid.UUID(str(parent_session_id))
@@ -574,6 +584,12 @@ async def stop_subagent(
         child = await db.get(ChatSession, child_id)
         if child is None or child.agent_id != agent_id:
             raise SubagentError("当前 Agent 无权操作这个 Subagent。")
+        if task_id and dict(child.im_config or {}).get("executor") == "media":
+            from app.services.media_ai_sessions import cancel_pending_media_task
+
+            task_status = await cancel_pending_media_task(db, child, task_id)
+            if task_status is not None:
+                return task_status
         if run.status in TERMINAL_STATUSES:
             return run.status
         await db.rollback()
@@ -584,5 +600,6 @@ async def stop_subagent(
         agent_id=agent_id,
         session_id=child_id,
         reason=f"Subagent stop requested by user {execution_user_id}",
+        expected_anchor_id=uuid.UUID(task_id) if task_id else None,
     )
     return RUN_CANCELLED

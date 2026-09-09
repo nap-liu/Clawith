@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
 from app.models.llm import LLMModel
+from app.services.model_capabilities import purpose_clause
 from app.models.mcp_server import MCPServer
 from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 from app.models.tool import AgentTool, Tool
@@ -391,6 +392,7 @@ async def merge_project_member_runtime_config(
                         LLMModel.id.in_(requested_ids),
                         or_(LLMModel.tenant_id == project.tenant_id, LLMModel.tenant_id.is_(None)),
                         LLMModel.enabled.is_(True),
+                        purpose_clause(),
                     )
                 )
             ).scalars()

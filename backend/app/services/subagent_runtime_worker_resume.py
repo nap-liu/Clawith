@@ -90,6 +90,8 @@ async def _finish_subagent_turn(
     failure_code: str | None = None,
     thinking: str | None = None,
     reply_quality: dict | None = None,
+    attachments: list[dict] | None = None,
+    result_meta: dict | None = None,
 ) -> bool:
     """Persist the reply and lifecycle transition behind the same Run lock."""
     from app.services.active_turns import wait_for_current_turn_stop_resolution
@@ -138,13 +140,14 @@ async def _finish_subagent_turn(
         # failed provider/tool round may finish its already-dispatched inputs,
         # but it cannot strand later pending messages behind a terminal Run.
         terminal = not pending_exists
+        notify_turn = terminal or dict(child.im_config or {}).get("executor") == "media"
         kind = (
             SUBAGENT_FAILURE
-            if failed and terminal
+            if failed and notify_turn
             else "subagent_turn_failure"
             if failed
             else SUBAGENT_COMPLETION
-            if terminal
+            if notify_turn
             else "subagent_turn_result"
         )
         content = (reply or "").strip() or (
@@ -338,15 +341,16 @@ async def _finish_subagent_turn(
             content=content,
             thinking=thinking,
             message_meta={
+                **(result_meta or {}),
                 "kind": kind,
                 **({"error_code": failure_code} if failure_code else {}),
-                "subagent_wake": terminal and run.mode == "async",
+                "subagent_wake": notify_turn and run.mode == "async",
                 **(
                     {"subagent_dispatch_state": SUBAGENT_DISPATCH_PENDING}
-                    if terminal and run.mode == "async"
+                    if notify_turn and run.mode == "async"
                     else {}
                 ),
-                "attachments": [],
+                "attachments": attachments or [],
                 "project_run_ids": [str(value) for value in sorted(project_run_ids, key=str)],
                 **({"reply_quality": reply_quality} if reply_quality else {}),
             },
@@ -367,7 +371,7 @@ async def _finish_subagent_turn(
         else:
             run.lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)
         await db.commit()
-        if terminal and run.mode == "async":
+        if notify_turn and run.mode == "async":
             if run.project_id is not None:
                 _signal_project_dispatch_work()
             else:

@@ -242,6 +242,7 @@ async def execute_tool_preflight(
                     parent_session_id=session_id,
                     subagent_id=arguments.get("subagent_id"),
                     execution_user_id=user_id,
+                    task_id=arguments.get("task_id"),
                 )
                 return json.dumps({"status": status}, ensure_ascii=False)
             await send_subagent_message_to_parent(

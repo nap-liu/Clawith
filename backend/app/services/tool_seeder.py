@@ -15,7 +15,10 @@ from app.services.mcp_catalog_locks import lock_mcp_catalogs
 from app.services.mcp_catalog_policy import can_remove_private_tool
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
-from app.services.tool_config import meaningful_config, tenant_tool_config_key
+from app.services.media_ai_contract import MEDIA_AI_SEEDS
+from app.services.media_model_migration import migrate_legacy_media_configs
+from app.services.speech_model_selection import migrate_legacy_speech_configs
+from app.services.tool_config import get_sensitive_keys, meaningful_config, tenant_tool_config_key
 from app.services.tool_enablement import tool_is_required
 from app.services.user_project_tools import USER_PROJECT_TOOL_NAMES, USER_PROJECT_TOOL_SEEDS
 
@@ -130,6 +133,7 @@ from app.services.tool_seeder_builtin_5 import BUILTIN_TOOLS_PART_5
 from app.services.tool_seeder_builtin_6 import BUILTIN_TOOLS_PART_6
 
 BUILTIN_TOOLS = [
+    *MEDIA_AI_SEEDS,
     *BUILTIN_TOOLS_PART_1,
     *BUILTIN_TOOLS_PART_2,
     *BUILTIN_TOOLS_PART_3,
@@ -379,7 +383,7 @@ async def seed_builtin_tools():
                 # Remove sensitive fields from global config instead of wiping it
                 clean_config = {}
                 schema_fields = (tool.config_schema or {}).get("fields", [])
-                sensitive_keys = {f["key"] for f in schema_fields if f.get("type") == "password"}
+                sensitive_keys = get_sensitive_keys({"fields": schema_fields})
                 for k, v in (tool.config or {}).items():
                     if k not in sensitive_keys:
                         clean_config[k] = v
@@ -390,6 +394,14 @@ async def seed_builtin_tools():
                     f"to tenant_settings for tenant {first_tenant.id}"
                 )
 
+        # Media model names and transport defaults now belong to enterprise
+        # models. Keeping old seed values would override selected model records.
+        for media_tool in (await db.scalars(select(Tool).where(
+            Tool.name.in_([seed["name"] for seed in MEDIA_AI_SEEDS]), Tool.source == "builtin",
+        ))).all():
+            media_tool.config = {}
+        await migrate_legacy_media_configs(db)
+        await migrate_legacy_speech_configs(db)
         await db.commit()
         logger.info("[ToolSeeder] Builtin tools seeded")
 

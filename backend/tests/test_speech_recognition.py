@@ -1,15 +1,7 @@
-import uuid
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
-
-import pytest
-
 from app.services.speech_recognition import (
-    SpeechCredentialUnavailable,
     build_finish_task,
     build_run_task,
     parse_result_event,
-    resolve_speech_credentials,
 )
 
 
@@ -68,32 +60,3 @@ def test_parse_result_event_ignores_heartbeat_and_other_events():
         )
         is None
     )
-
-
-@pytest.mark.asyncio
-async def test_resolve_speech_credentials_uses_only_independent_speech_config(monkeypatch):
-    config = SimpleNamespace(
-        enabled=True,
-        provider="aliyun_dashscope",
-        model="fun-asr-realtime",
-        api_key_encrypted="encrypted-speech-key",
-    )
-    result = SimpleNamespace(scalar_one_or_none=lambda: config)
-    db = SimpleNamespace(execute=AsyncMock(return_value=result))
-    monkeypatch.setattr("app.services.speech_recognition.decrypt_data", lambda *_args: "speech-key")
-
-    credentials = await resolve_speech_credentials(db, uuid.uuid4())
-
-    assert credentials.api_key == "speech-key"
-    assert credentials.provider == "aliyun_dashscope"
-    assert credentials.model == "fun-asr-realtime"
-    assert db.execute.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_resolve_speech_credentials_requires_explicit_config():
-    result = SimpleNamespace(scalar_one_or_none=lambda: None)
-    db = SimpleNamespace(execute=AsyncMock(return_value=result))
-
-    with pytest.raises(SpeechCredentialUnavailable, match="尚未配置"):
-        await resolve_speech_credentials(db, uuid.uuid4())

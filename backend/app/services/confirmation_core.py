@@ -22,6 +22,8 @@ async def suspend_for_confirmation(
     assistant_content: str | None = None,
     recovery_prefix_messages: list[dict[str, str]] | None = None,
     reasoning_content: str | None = None,
+    responses_snapshot: dict | None = None,
+    call_id: str | None = None,
     round_id: str | None = None,
 ) -> uuid.UUID:
     """Suspend the turn on a request_confirmation tool_call and return the row id.
@@ -128,6 +130,8 @@ async def suspend_for_confirmation(
             assistant_content=assistant_content,
             recovery_prefix_messages=recovery_prefix_messages,
             reasoning_content=reasoning_content,
+            responses_snapshot=responses_snapshot,
+            call_id=call_id,
             round_id=round_id,
             created_at=(
                 created_at + timedelta(microseconds=1)

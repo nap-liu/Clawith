@@ -70,6 +70,8 @@ from app.services.agent_tools import (
 from app.services.agent_tools_a2a_delivery import _send_file_to_agent
 from app.services.agent_tools_a2a_messaging import _send_message_to_agent
 from app.services.agent_tools_execute_tool_preflight import ExecuteToolDispatchContext
+from app.services.media_ai_contract import MEDIA_AI_NAMES
+from app.services.media_ai_tools import execute_media_tool
 from app.services.agent_tools_temp_workspace_exec import _CODE_EXEC_TOOL_NAMES, _execute_workspace_mutation, _run_with_temp_workspace
 
 _ROOT_TOOL_SYMBOLS = (
@@ -159,7 +161,9 @@ async def execute_tool_dispatch_basic(state: ExecuteToolDispatchContext) -> str 
     _agent_tenant_id = state.agent_tenant_id
     ws = state.ws
 
-    if tool_name == "list_files":
+    if tool_name in MEDIA_AI_NAMES:
+        return await execute_media_tool(state)
+    elif tool_name == "list_files":
         result = await _storage_list_dir(agent_id, arguments.get("path", ""), tenant_id=_agent_tenant_id)
     elif tool_name == "update_self_settings":
         from app.services.agent_self_settings_tool import handle_update_self_settings

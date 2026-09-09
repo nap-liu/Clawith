@@ -493,7 +493,9 @@ class OpenAICompatibleClient(LLMClient):
                                     error_type="protocol_error",
                                 )
                             while len(tool_calls_data) <= idx:
-                                tool_calls_data.append({"id": "", "function": {"name": "", "arguments": ""}})
+                                tool_calls_data.append({
+                                    "id": "", "type": "function", "function": {"name": "", "arguments": ""},
+                                })
                             tc = tool_calls_data[idx]
                             incoming_id = tool_call_delta.get("id")
                             if incoming_id and tc["id"] and incoming_id != tc["id"]:

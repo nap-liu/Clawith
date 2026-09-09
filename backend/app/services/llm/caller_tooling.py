@@ -458,7 +458,7 @@ async def _emit_round_done_events(
         return
     for record in done_records:
         try:
-            await on_tool_call(record.event)
+            await on_tool_call({k: v for k, v in record.event.items() if k != "responses_snapshot"})
         except Exception:
             pass
 

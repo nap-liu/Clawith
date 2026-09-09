@@ -23,7 +23,7 @@ export type ChatMediaDeliveryError = {
     mediaKind?: 'audio' | 'video';
 };
 
-const FILE_DELIVERY_TOOLS = new Set(['send_channel_file', 'send_media', 'send_audio', 'send_video']);
+const FILE_DELIVERY_TOOLS = new Set(['send_channel_file', 'send_media', 'send_audio', 'send_video', 'generate_media']);
 const FILE_DELIVERY_TYPE = 'platform_file_delivery';
 const MEDIA_DELIVERY_TYPE = 'platform_media_delivery';
 
@@ -156,12 +156,17 @@ function parseStructuredResult(toolResult: any) {
     }
 }
 
+function unwrapMediaGeneration(toolResult: any) {
+    const parsed = parseStructuredResult(toolResult);
+    return parsed?.type === 'media_generation' ? parseStructuredResult(parsed.delivery) : parsed;
+}
+
 export function parseMediaDeliveryErrorResult(
     toolName: string | undefined,
     toolResult: any,
 ): ChatMediaDeliveryError | null {
-    if (!['send_media', 'send_audio', 'send_video'].includes((toolName || '').toLowerCase())) return null;
-    const payload = parseStructuredResult(toolResult);
+    if (!['send_media', 'send_audio', 'send_video', 'generate_media'].includes((toolName || '').toLowerCase())) return null;
+    const payload = unwrapMediaGeneration(toolResult);
     if (!payload || !['media_delivery_result', MEDIA_DELIVERY_TYPE].includes(payload.type)) return null;
     const rawStatus = firstString(payload.status).toLowerCase();
     if (!['failed', 'unsupported', 'unknown'].includes(rawStatus)) return null;
@@ -206,7 +211,7 @@ export function parseFileDeliveryToolResult(
     toolCallId?: string,
 ): ChatFileDelivery | null {
     if (!FILE_DELIVERY_TOOLS.has((toolName || '').toLowerCase())) return null;
-    const structured = parseStructuredResult(toolResult);
+    const structured = unwrapMediaGeneration(toolResult);
     if (structured) {
         if (![FILE_DELIVERY_TYPE, MEDIA_DELIVERY_TYPE].includes(structured.type)) return null;
         if (

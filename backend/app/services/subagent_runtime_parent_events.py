@@ -384,7 +384,11 @@ async def _materialize_parent_event_batch(
                 "execution_agent_id": str(child.agent_id),
                 "subagent_id": str(child.id),
                 "child_message_id": str(event.id),
-                "attachments": list(event_meta.get("attachments") or []),
+                "attachments": (
+                    [] if (event_meta.get("media_result", {}).get("delivery") or {}).get("status") in {"sent", "already_sent"}
+                    else list(event_meta.get("attachments") or [])
+                ),
+                **({"media_result": event_meta["media_result"]} if event_meta.get("media_result") else {}),
                 **(
                     {"turn_status": "running", "subagent_event_batch": True}
                     if is_new_root

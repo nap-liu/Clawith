@@ -218,6 +218,7 @@ async def _assemble_api_messages_for_call_llm(
                 content=msg.get("content"),
                 tool_calls=msg.get("tool_calls"),
                 tool_call_id=msg.get("tool_call_id"),
+                responses_snapshot=msg.get("responses_snapshot"),
             )
         )
     assembled = _convert_messages_for_vision(assembled, supports_vision)
@@ -239,6 +240,7 @@ async def _call_llm_prepare_client_and_messages(
     try:
         client = create_llm_client(
             provider=state.model.provider,
+            api_protocol=getattr(state.model, "api_protocol", None),
             api_key=get_model_api_key(state.model),
             model=state.model.model,
             base_url=state.model.base_url,
@@ -337,6 +339,7 @@ async def _call_llm_persist_intermediate_segment(
     visible_joiner_before: str,
     max_output_resume_prompt: str | None = None,
     thinking: str | None = None,
+    responses_snapshot: dict | None = None,
     created_at=None,
 ) -> bool:
     if not (content or "").strip():
@@ -352,6 +355,7 @@ async def _call_llm_persist_intermediate_segment(
         conversation_id=state.session_id,
         content=content,
         thinking=thinking,
+        responses_snapshot=responses_snapshot,
         turn_anchor_id=state.turn_anchor_id,
         visible_joiner_before=visible_joiner_before,
         max_output_resume_prompt=max_output_resume_prompt,

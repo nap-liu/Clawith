@@ -6,6 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.services.llm.reasoning import ReasoningEffort
+from app.services.model_capabilities import APIProtocol, InputModality, ModelPurpose
 
 
 # ─── Auth ───────────────────────────────────────────────
@@ -507,7 +508,12 @@ class TaskLogOut(BaseModel):
 
 # ─── LLM ────────────────────────────────────────────────
 
+
+
 class LLMModelCreate(BaseModel):
+    api_protocol: APIProtocol | None = None
+    purposes: list[ModelPurpose] = Field(default_factory=lambda: ["conversation"], min_length=1)
+    input_modalities: list[InputModality] | None = Field(default=None, min_length=1)
     provider: str
     model: str
     api_key: str
@@ -525,6 +531,9 @@ class LLMModelCreate(BaseModel):
     keep_recent_turns: int = Field(3, ge=3, le=50)
 
 class LLMModelUpdate(BaseModel):
+    api_protocol: APIProtocol | None = None
+    purposes: list[ModelPurpose] | None = Field(None, min_length=1)
+    input_modalities: list[InputModality] | None = Field(None, min_length=1)
     provider: str | None = None
     model: str | None = None
     api_key: str | None = None
@@ -548,6 +557,10 @@ class LLMModelClone(BaseModel):
 
 
 class LLMModelOut(BaseModel):
+    api_protocol: APIProtocol | None = None
+    effective_api_protocol: str = "openai_compatible"
+    purposes: list[ModelPurpose] = Field(default_factory=lambda: ["conversation"])
+    input_modalities: list[InputModality] = Field(default_factory=lambda: ["text"])
     id: uuid.UUID
     provider: str
     model: str

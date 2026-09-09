@@ -13,6 +13,7 @@ from sqlalchemy import func, or_, select
 
 from app.models.agent import Agent
 from app.models.llm import LLMModel
+from app.services.model_capabilities import purpose_clause
 from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.services.llm.reasoning import ReasoningEffort
@@ -169,6 +170,7 @@ class AgentSettingsUpdateResult:
 async def _resolve_model_id(db, tenant_id: uuid.UUID | None, ref: str) -> uuid.UUID:
     base = select(LLMModel).where(
         LLMModel.enabled.is_(True),
+        purpose_clause(),
         or_(LLMModel.tenant_id == tenant_id, LLMModel.tenant_id.is_(None)),
     )
     try:

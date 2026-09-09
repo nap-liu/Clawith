@@ -53,6 +53,7 @@ async def _call_llm_resume_truncated_response(
             visible_joiner_before=(round_visible_joiner if recovery_count_this_round == 1 else ""),
             max_output_resume_prompt=RESUME_PROMPT,
             thinking=response.reasoning_content,
+            responses_snapshot=getattr(response, "responses_snapshot", None),
         )
         accumulated_partials.append(partial_text)
         if not partial_persisted:
@@ -68,6 +69,7 @@ async def _call_llm_resume_truncated_response(
             LLMMessage(
                 role="assistant",
                 content=partial_text,
+                responses_snapshot=getattr(response, "responses_snapshot", None),
             )
         )
         state.api_messages.append(
@@ -179,6 +181,7 @@ async def _call_llm_handle_plain_text_round(
             late_segment,
             visible_joiner_before=("" if _has_accumulated_partials else _visible_joiner),
             thinking=_thinking,
+            responses_snapshot=getattr(response, "responses_snapshot", None),
             created_at=created_at,
         )
 
@@ -208,6 +211,7 @@ async def _call_llm_handle_plain_text_round(
                 role="assistant",
                 content=response.content or None,
                 reasoning_content=response.reasoning_content,
+                responses_snapshot=getattr(response, "responses_snapshot", None),
             )
         )
         prepared_injected = await prepare_messages_for_model(
@@ -258,6 +262,12 @@ async def _call_llm_handle_plain_text_round(
 
     if state.agent_id and state.unsaved_usage.total_tokens > 0:
         await record_token_usage(state.agent_id, state.unsaved_usage)
+    from app.services.llm.responses_history import checkpoint_response
+
+    await checkpoint_response(
+        async_session, agent_id=state.anchor_agent_id, conversation_id=state.session_id,
+        anchor_id=state.turn_anchor_id, response=response,
+    )
     await state.client_guard.close()
     _call_llm_log_turn_timing(state, "reply", round_i + 1)
     return _CallLlmPlainTextResult(
@@ -331,6 +341,8 @@ async def _call_llm_execute_tool_round(
                 assistant_content=response.content or None,
                 recovery_prefix_messages=recovery_prefix_messages,
                 reasoning_content=response.reasoning_content,
+                responses_snapshot=getattr(response, "responses_snapshot", None),
+                call_id=conf_call.call_id,
                 round_id=(
                     f"{state.turn_anchor_id or state.session_id}:{state.turn_execution_id}:round:{round_i + 1}"
                     if state.turn_anchor_id or state.session_id
@@ -352,6 +364,7 @@ async def _call_llm_execute_tool_round(
                 content=response.content or None,
                 tool_calls=sanitized_tool_calls,
                 reasoning_content=response.reasoning_content,
+                responses_snapshot=getattr(response, "responses_snapshot", None),
             )
         )
         state.api_messages.append(
@@ -388,6 +401,7 @@ async def _call_llm_execute_tool_round(
             content=response.content or None,
             tool_calls=sanitized_tool_calls,
             reasoning_content=response.reasoning_content,
+            responses_snapshot=getattr(response, "responses_snapshot", None),
         )
     )
 
@@ -411,6 +425,7 @@ async def _call_llm_execute_tool_round(
                 "round_tool_index": tool_index,
                 "reasoning_content": full_reasoning_content,
                 "assistant_content": (response.content or None) if tool_index == 0 else None,
+                "responses_snapshot": getattr(response, "responses_snapshot", None) if tool_index == 0 else None,
                 "recovery_prefix_messages": (recovery_prefix_messages if tool_index == 0 else []),
             }
         )
@@ -440,7 +455,7 @@ async def _call_llm_execute_tool_round(
             event["_durable_message_id"] = str(durable_message_id)
         if state.on_tool_call is not None:
             try:
-                await state.on_tool_call(event)
+                await state.on_tool_call({k: v for k, v in event.items() if k != "responses_snapshot"})
             except Exception:
                 pass
 
@@ -466,6 +481,7 @@ async def _call_llm_execute_tool_round(
                 round_id=durable_round_id,
                 round_tool_index=tool_index,
                 assistant_content=(response.content or None) if tool_index == 0 else None,
+                responses_snapshot=getattr(response, "responses_snapshot", None) if tool_index == 0 else None,
                 recovery_prefix_messages=(recovery_prefix_messages if tool_index == 0 else None),
                 durable_agent_id=state.anchor_agent_id,
             )

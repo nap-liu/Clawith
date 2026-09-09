@@ -10,7 +10,6 @@ import { useAuthStore } from '../stores';
 import OrgTab from './enterprise-settings/tabs/OrgTab';
 import SkillsTab from './enterprise-settings/tabs/SkillsTab';
 import LlmTab from './enterprise-settings/tabs/LlmTab';
-import SpeechRecognitionTab from './enterprise-settings/tabs/SpeechRecognitionTab';
 import OpenAPIApplications from './enterprise-settings/tabs/openapi/OpenAPIApplications';
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
 import { A2AAsyncToggle, CompanyLogoEditor, CompanyNameEditor, CompanyTimezoneEditor } from './enterprise-settings/components/CompanyInfoEditors';
@@ -43,16 +42,23 @@ export default function EnterpriseSettings() {
     const qc = useQueryClient();
     const currentUser = useAuthStore((s) => s.user);
     const isPlatformAdmin = currentUser?.role === 'platform_admin' || currentUser?.is_platform_admin === true;
-    type TabKey = 'llm' | 'speech' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'openapi';
-    const VALID_TABS: TabKey[] = ['info', 'llm', 'speech', 'tools', 'skills', 'openapi', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    type TabKey = 'llm' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'openapi';
+    const VALID_TABS: TabKey[] = ['info', 'llm', 'tools', 'skills', 'openapi', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
     const getTabFromHash = (): TabKey => {
-        const hash = window.location.hash.replace('#', '') as TabKey;
-        return VALID_TABS.includes(hash) ? hash : 'info';
+        const hash = window.location.hash.replace('#', '');
+        if (hash === 'speech') return 'llm';
+        return VALID_TABS.includes(hash as TabKey) ? hash as TabKey : 'info';
     };
     const [activeTab, setActiveTab] = useState<TabKey>(getTabFromHash);
     // Sync hash ↔ activeTab: hashchange navigation (back/forward) updates state
     useEffect(() => {
-        const handler = () => setActiveTab(getTabFromHash());
+        const handler = () => {
+            if (window.location.hash === '#speech') {
+                window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#llm`);
+            }
+            setActiveTab(getTabFromHash());
+        };
+        handler();
         window.addEventListener('hashchange', handler);
         return () => window.removeEventListener('hashchange', handler);
     }, []);
@@ -366,9 +372,6 @@ export default function EnterpriseSettings() {
 
                 {/* ── LLM Model Pool ── */}
                 {activeTab === 'llm' && <LlmTab selectedTenantId={selectedTenantId} />}
-
-                {/* ── Speech Recognition Service ── */}
-                {activeTab === 'speech' && <SpeechRecognitionTab selectedTenantId={selectedTenantId} />}
 
                 {activeTab === 'openapi' && <OpenAPIApplications
                     key={selectedTenantId || currentUser?.tenant_id}

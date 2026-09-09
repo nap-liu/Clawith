@@ -35,13 +35,22 @@ class RuntimeLLMModel:
     keep_recent_turns: int
     compact_summary_max_tokens: int
     reasoning_effort: str | None = None
+    compact_stream: bool = False
+    api_protocol: str | None = None
+    purposes: tuple[str, ...] = ("conversation",)
+    input_modalities: tuple[str, ...] = ("text",)
 
     @classmethod
     def from_orm(cls, model: LLMModel) -> "RuntimeLLMModel":
+        from app.services.model_capabilities import model_modalities, model_purposes
+
         return cls(
             id=model.id,
             tenant_id=model.tenant_id,
             provider=model.provider,
+            api_protocol=getattr(model, "api_protocol", None) if isinstance(getattr(model, "api_protocol", None), str) else None,
+            purposes=tuple(model_purposes(model)),
+            input_modalities=tuple(model_modalities(model)),
             model=model.model,
             api_key_encrypted=model.api_key_encrypted,
             base_url=model.base_url,

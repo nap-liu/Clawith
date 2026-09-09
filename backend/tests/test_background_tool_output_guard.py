@@ -1,428 +1,114 @@
-"""Background tool loops must keep oversized tool output out of LLM context."""
+"""Durable background entry shares measured usage, tool shaping and confirmations."""
 
-from __future__ import annotations
-
-import uuid
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+import json
 
 import pytest
+from sqlalchemy import select
 
-from app.config import get_settings
+from app.database import async_session
+from app.models.activity_log import DailyTokenUsage
+from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
+from app.models.llm import LLMModel
+from app.services.active_turns import active_turn_boundary
+from app.services.agent_runtime_workspace import standard_agent_runtime_workspace
 from app.services.llm.caller import call_agent_llm_with_tools
-from app.services.llm.client import LLMResponse
 from app.services.llm.tool_output_store import PERSISTED_OPEN
+from execution_provider_fixture import provider
+from test_agent_execution_integration import isolated_engine, seed  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
 
 
-class _Result:
-    def __init__(self, value):
-        self.value = value
-
-    def scalar_one_or_none(self):
-        return self.value
+def tool(name, arguments, call_id="tool-1"):
+    return {"id": call_id, "type": "function", "function": {
+        "name": name, "arguments": json.dumps(arguments)}}
 
 
-def _model_row(
-    model_id: uuid.UUID,
-    *,
-    provider: str = "qwen",
-    model: str = "qwen-test",
-    context_window: int = 1_000_000,
-    max_output_tokens: int = 1_000,
-) -> SimpleNamespace:
-    """Return the persisted-model shape consumed by the shared resolver."""
-
-    return SimpleNamespace(
-        id=model_id,
-        tenant_id=None,
-        provider=provider,
-        model=model,
-        api_key_encrypted="",
-        base_url=None,
-        label=model,
-        max_tokens_per_day=None,
-        enabled=True,
-        supports_vision=False,
-        temperature=0.2,
-        request_timeout=30,
-        max_output_tokens=max_output_tokens,
-        context_window=context_window,
-        context_usage_ratio=0.7,
-        compact_trigger_ratio=0.8,
-        keep_recent_turns=3,
-        compact_summary_max_tokens=1_000,
-    )
-
-
-async def test_background_context_uses_provider_usage_not_local_text_size(
-    monkeypatch,
-):
-    agent_id = uuid.uuid4()
-    primary_id = uuid.uuid4()
-    fallback_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        name="background-agent",
-        creator_id=uuid.uuid4(),
-        primary_model_id=primary_id,
-        fallback_model_id=fallback_id,
-    )
-
-    def _small_model(model_id):
-        return _model_row(
-            model_id,
-            provider="custom",
-            model="tiny-context",
-            max_output_tokens=100,
-            context_window=1_000,
-        )
-
-    query_results = [
-        _Result(agent),
-        _Result(_small_model(primary_id)),
-        _Result(_small_model(fallback_id)),
-    ]
-
-    async def _execute(*_args, **_kwargs):
-        return query_results.pop(0)
-
-    class _ProviderMeasuredClient:
-        def __init__(self):
-            self.calls = 0
-
-        async def complete(self, **_kwargs):
-            self.calls += 1
-            return LLMResponse(
-                content="provider accepted",
-                usage={
-                    "prompt_tokens": 321,
-                    "completion_tokens": 5,
-                    "total_tokens": 326,
-                },
-            )
-
-        async def close(self):
-            return None
-
-    terminate = AsyncMock(return_value="must not persist")
-    record_usage = AsyncMock(return_value=None)
-    client = _ProviderMeasuredClient()
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.terminate_session_context",
-        terminate,
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.create_llm_client",
-        lambda **_kwargs: client,
-    )
-    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "key")
-    monkeypatch.setattr(
-        "app.services.llm.caller.get_agent_tools_for_llm",
-        AsyncMock(return_value=[]),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.record_token_usage",
-        record_usage,
-    )
-
-    db = SimpleNamespace(execute=_execute, commit=AsyncMock())
-    reply = await call_agent_llm_with_tools(
-        db,
-        agent_id,
-        "system",
-        "数" * 1_000,
-        session_id=str(uuid.uuid4()),
-    )
-
-    assert reply == "provider accepted"
-    assert client.calls == 1
-    db.commit.assert_awaited_once()
-    terminate.assert_not_awaited()
-    recorded = record_usage.await_args.args[1]
-    assert recorded.context_input_tokens == 321
-    assert recorded.output_tokens == 5
-
-
-async def test_large_read_file_result_is_materialized_before_second_model_round(
-    monkeypatch,
-    tmp_path,
-):
-    agent_id = uuid.uuid4()
-    model_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        name="background-agent",
-        creator_id=uuid.uuid4(),
-        primary_model_id=model_id,
-        fallback_model_id=None,
-    )
-    model = _model_row(model_id)
-
-    responses = [
-        LLMResponse(
-            content="reading",
-            tool_calls=[
-                {
-                    "id": "read-1",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": '{"path":"large.json"}',
-                    },
-                }
-            ],
-            usage={"prompt_tokens": 10, "completion_tokens": 5},
-        ),
-        LLMResponse(
-            content="done",
-            usage={"prompt_tokens": 20, "completion_tokens": 5},
-        ),
-    ]
-
-    class _Client:
-        def __init__(self):
-            self.requests = []
-
-        async def complete(self, *, messages, **_kwargs):
-            self.requests.append(list(messages))
-            return responses.pop(0)
-
-        async def close(self):
-            return None
-
-    client = _Client()
-    query_results = [_Result(agent), _Result(model)]
-
-    async def _execute(*_args, **_kwargs):
-        return query_results.pop(0)
-
-    db = SimpleNamespace(execute=_execute, commit=AsyncMock())
-    monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.create_llm_client",
-        lambda **_kwargs: client,
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.get_model_api_key",
-        lambda _model: "test-key",
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.get_agent_tools_for_llm",
-        AsyncMock(
-            return_value=[
-                {
-                    "type": "function",
-                    "function": {"name": "read_file", "description": "read"},
-                }
-            ]
-        ),
-    )
-    huge = "x" * 200_000
-    monkeypatch.setattr(
-        "app.services.llm.caller.execute_tool",
-        AsyncMock(return_value=huge),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.record_token_usage",
-        AsyncMock(return_value=None),
-    )
-
-    try:
+async def background(aid, uid, sid, prompt="Process the report"):
+    async with active_turn_boundary(), async_session() as db:
         result = await call_agent_llm_with_tools(
-            db,
-            agent_id,
-            "system",
-            "process the file",
-            max_rounds=2,
-            session_id=str(uuid.uuid4()),
+            db, aid, "Assistant", prompt, session_id=str(sid), execution_user_id=uid,
+            max_rounds=3,
         )
-    finally:
-        get_settings.cache_clear()
-
-    assert result == "done"
-    db.commit.assert_awaited_once()
-    tool_message = next(msg for msg in client.requests[1] if msg.role == "tool")
-    assert PERSISTED_OPEN in tool_message.content
-    assert len(tool_message.content) < len(huge)
-    assert huge not in tool_message.content
+        assert not db.in_transaction()
+    return result
 
 
-async def test_background_tool_round_content_becomes_confirmation_intro(monkeypatch):
-    agent_id = uuid.uuid4()
-    model_id = uuid.uuid4()
-    execution_user_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        name="background-agent",
-        creator_id=execution_user_id,
-        primary_model_id=model_id,
-        fallback_model_id=None,
-    )
-    model = _model_row(model_id)
-    responses = [
-        LLMResponse(
-            content="background answer",
-            tool_calls=[
-                {
-                    "id": "lookup-1",
-                    "type": "function",
-                    "function": {"name": "knowledge_search", "arguments": "{}"},
-                }
-            ],
-        ),
-        LLMResponse(
-            content="",
-            tool_calls=[
-                {
-                    "id": "confirm-1",
-                    "type": "function",
-                    "function": {
-                        "name": "request_confirmation",
-                        "arguments": (
-                            '{"title":"Confirm","summary":"Continue?","buttons":[{"text":"Yes","value":"yes"}]}'
-                        ),
-                    },
-                }
-            ],
-        ),
-    ]
-
-    class _Client:
-        async def complete(self, **_kwargs):
-            return responses.pop(0)
-
-        async def close(self):
-            return None
-
-    query_results = [_Result(agent), _Result(model)]
-
-    async def _execute_query(*_args, **_kwargs):
-        return query_results.pop(0)
-
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: _Client())
-    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "test-key")
-    monkeypatch.setattr(
-        "app.services.llm.caller.get_agent_tools_for_llm",
-        AsyncMock(
-            return_value=[
-                {"type": "function", "function": {"name": "knowledge_search", "description": "search"}},
-                {"type": "function", "function": {"name": "request_confirmation", "description": "confirm"}},
-            ]
-        ),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.execute_tool",
-        AsyncMock(return_value="matched"),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.record_token_usage",
-        AsyncMock(return_value=None),
-    )
-    suspend = AsyncMock(return_value="confirmation-row")
-    monkeypatch.setattr(
-        "app.services.confirmation_service.suspend_for_confirmation",
-        suspend,
-    )
-
-    db = SimpleNamespace(execute=_execute_query, commit=AsyncMock())
-    reply = await call_agent_llm_with_tools(
-        db,
-        agent_id,
-        "system",
-        "prompt",
-        session_id=str(uuid.uuid4()),
-    )
-
-    assert reply == ""
-    db.commit.assert_awaited_once()
-    assert suspend.await_args.kwargs["intro_text"] == "background answer"
+async def rows(aid):
+    async with async_session() as db:
+        return list(await db.scalars(select(ChatMessage).where(
+            ChatMessage.agent_id == aid).order_by(ChatMessage.created_at)))
 
 
-async def test_background_confirmation_round_id_is_unique_per_execution(monkeypatch):
-    agent_id = uuid.uuid4()
-    model_id = uuid.uuid4()
-    execution_user_id = uuid.uuid4()
-    session_id = str(uuid.uuid4())
-    agent = SimpleNamespace(
-        id=agent_id,
-        name="background-agent",
-        creator_id=execution_user_id,
-        primary_model_id=model_id,
-        fallback_model_id=None,
-    )
-    model = _model_row(model_id)
+async def test_background_context_uses_provider_usage_not_local_text_size():
+    async with provider([{"content": "provider accepted"}]) as (url, requests):
+        aid, uid, sid, _, snapshot = await seed(url, "trigger")
+        async with async_session() as db:
+            model = await db.get(LLMModel, snapshot.id)
+            model.context_window = 1000
+            model.max_output_tokens = 100
+            await db.commit()
+        assert await background(aid, uid, sid, "数" * 1000) == "provider accepted"
+        assert len(requests) == 1
+        assert "数" * 1000 in str(requests[0]["messages"])
+        async with async_session() as db:
+            usage = await db.scalar(select(DailyTokenUsage).where(DailyTokenUsage.agent_id == aid))
+            assert (usage.input_tokens, usage.output_tokens, usage.tokens_used) == (100, 10, 110)
+            assert usage.estimated_tokens == 0
+            sessions = list(await db.scalars(select(ChatSession).where(ChatSession.agent_id == aid)))
+            assert all(session.context_terminated_reason is None for session in sessions)
 
-    class _Client:
-        async def complete(self, **_kwargs):
-            return LLMResponse(
-                content="confirm this run",
-                tool_calls=[
-                    {
-                        "id": str(uuid.uuid4()),
-                        "type": "function",
-                        "function": {
-                            "name": "request_confirmation",
-                            "arguments": '{"title":"Confirm","summary":"Continue?"}',
-                        },
-                    }
-                ],
-            )
 
-        async def close(self):
-            return None
+async def test_large_read_file_result_is_materialized_before_second_model_round():
+    read = tool("read_file", {"path": "workspace/report.txt"})
+    async with provider([{"content": "Reading", "tool_calls": [read]},
+                         {"content": "done"}]) as (url, requests):
+        aid, uid, sid, _, _ = await seed(url, "trigger")
+        workspace = standard_agent_runtime_workspace(aid)
+        huge = "x" * 200000
+        workspace.local_path("workspace/report.txt").write_text(huge)
+        assert await background(aid, uid, sid) == "done"
+        assert len(requests) == 2
+        tool_message = next(msg for msg in requests[1]["messages"] if msg["role"] == "tool")
+        view = tool_message["content"]
+        assert PERSISTED_OPEN in view and len(view) < len(huge) and huge not in view
+        saved = view.split("Full output saved to:", 1)[1].split()[0]
+        assert huge in workspace.local_path(saved).read_text()
+        stored = [json.loads(row.content) for row in await rows(aid) if row.role == "tool_call"]
+        assert any(row.get("result") == view for row in stored)
 
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: _Client())
-    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "test-key")
-    monkeypatch.setattr(
-        "app.services.llm.caller.get_agent_tools_for_llm",
-        AsyncMock(
-            return_value=[
-                {"type": "function", "function": {"name": "request_confirmation", "description": "confirm"}}
-            ]
-        ),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.caller.record_token_usage",
-        AsyncMock(return_value=None),
-    )
-    suspend = AsyncMock(return_value="confirmation-row")
-    monkeypatch.setattr("app.services.confirmation_service.suspend_for_confirmation", suspend)
 
-    for _ in range(2):
-        query_results = [_Result(agent), _Result(model)]
+async def test_background_tool_round_content_becomes_confirmation_intro():
+    read = tool("read_file", {"path": "workspace/report.txt"}, "read-1")
+    confirm = tool("request_confirmation", {"title": "Confirm", "summary": "Continue?"}, "confirm-1")
+    async with provider([{"content": "background answer", "tool_calls": [read]},
+                         {"tool_calls": [confirm]}]) as (url, requests):
+        aid, uid, sid, _, _ = await seed(url, "trigger")
+        assert await background(aid, uid, sid) == ""
+        assert len(requests) == 2
+        stored = await rows(aid)
+        pending = [row for row in stored if row.role == "tool_call"
+                   and json.loads(row.content).get("name") == "request_confirmation"]
+        assert len(pending) == 1
+        assert json.loads(pending[0].content)["status"] == "pending"
+        assert any(row.role == "assistant" and row.content == "background answer" for row in stored)
+        async with async_session() as db:
+            anchor = await db.get(ChatMessage, pending[0].message_meta["turn_anchor_id"])
+            assert anchor.message_meta["turn_status"] == "suspended"
 
-        async def _execute_query(*_args, **_kwargs):
-            return query_results.pop(0)
 
-        db = SimpleNamespace(execute=_execute_query, commit=AsyncMock())
-        assert await call_agent_llm_with_tools(
-            db,
-            agent_id,
-            "system",
-            "prompt",
-            session_id=session_id,
-        ) == ""
-
-    round_ids = [call.kwargs["round_id"] for call in suspend.await_args_list]
-    assert len(round_ids) == 2
-    assert round_ids[0] != round_ids[1]
-    assert all(round_id.startswith(f"{session_id}:background:") for round_id in round_ids)
+async def test_background_confirmation_round_id_is_unique_per_execution():
+    confirm = tool("request_confirmation", {"title": "Confirm", "summary": "Continue?"})
+    async with provider([{"content": "confirm this run", "tool_calls": [confirm]}]) as (url, requests):
+        aid, uid, sid, _, _ = await seed(url, "trigger")
+        for _ in range(2):
+            assert await background(aid, uid, sid) == ""
+        assert len(requests) == 2
+        pending = [row for row in await rows(aid) if row.role == "tool_call"
+                   and json.loads(row.content).get("name") == "request_confirmation"]
+        assert len(pending) == 2
+        assert len({json.loads(row.content)["round_id"] for row in pending}) == 2
+        assert len({row.message_meta["turn_anchor_id"] for row in pending}) == 2
+        assert len({row.conversation_id for row in pending}) == 2
+        assert all(json.loads(row.content)["status"] == "pending" for row in pending)

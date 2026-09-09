@@ -289,6 +289,13 @@ primaries nor return a unique-constraint failure.
 
 ## Sessions and identities
 
+Responses uses the existing shared LLM/tool loop with a true SSE adapter. Text and
+tool-argument increments may update the UI while streaming, but only a successful
+terminal response authorizes execution of returned tool calls. Failed, incomplete,
+cancelled and interrupted responses do not silently become successful tool rounds.
+Original output Items are attached to the existing message audit chain and replayed
+under their matching endpoint/model binding; see `context-and-memory.md`.
+
 - P2P: the counterpart is stable for the session, so identity is session-scoped.
 - Group: senders vary per message, so identity is message-scoped.
 - While an IM turn runs, all senders addressing that employee share its FIFO
@@ -427,3 +434,21 @@ projection; transport-specific field allowlists must not drop `external_context`
 The product label is “Reference data” (参考资料), with the source name and the
 original snapshot available on expansion. It describes data attached at send
 time, not a live view of the host page.
+
+## Media execution in child sessions
+
+The media executor reuses Session/input anchor/Turn/SubagentRun, leases, capacity,
+recovery and parent events. `task_id` is the individual input anchor; `session_id`
+is the reusable child session. Inputs remain separate FIFO jobs instead of being
+merged into a live Agent round. Each completed input publishes its own result and
+attachments; native media delivery targets the original parent conversation.
+A parent that is itself a subagent receives completion through its existing inbox
+and leased worker, preserving scene/causal metadata rather than starting an
+ordinary Web/IM turn alongside that worker.
+
+`stop_subagent` accepts an optional media task ID. Cancelling a queued job affects
+that input; stopping a running media job fences its lease and lets later queued
+inputs run. Stopping a parent turn cancels causally owned nested media inputs too.
+The session detail API accepts `task_id` for historical per-task status; ownership
+checks remain identical to ordinary child-session access. The shared task card
+uses that status, so an older task does not change when a session continues.

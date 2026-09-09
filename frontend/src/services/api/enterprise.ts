@@ -4,13 +4,18 @@ export const enterpriseApi = {
   llmModels: () => {
     const tid = localStorage.getItem("current_tenant_id");
     return request<any[]>(
-      `/enterprise/llm-models${tid ? `?tenant_id=${tid}` : ""}`,
+      `/enterprise/llm-models?purpose=conversation${tid ? `&tenant_id=${tid}` : ""}`,
     );
   },
 
-  llmModelsForTenant: (tenantId: string) =>
+  llmModelsByPurpose: (purpose: string) => {
+    const tid = localStorage.getItem("current_tenant_id");
+    return request<any[]>(`/enterprise/llm-models?purpose=${purpose}${tid ? `&tenant_id=${tid}` : ""}`);
+  },
+
+  llmModelsForTenant: (tenantId: string, purpose = "conversation") =>
     request<any[]>(
-      `/enterprise/llm-models?tenant_id=${encodeURIComponent(tenantId)}`,
+      `/enterprise/llm-models?tenant_id=${encodeURIComponent(tenantId)}&purpose=${purpose}`,
     ),
 
   setDefaultModel: (modelId: string) =>

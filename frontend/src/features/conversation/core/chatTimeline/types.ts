@@ -23,6 +23,7 @@ export type ConversationMessage = {
   toolStatus?: ConversationToolStatus;
   toolResult?: string;
   toolThinking?: string;
+  mediaTaskId?: string;
   fileName?: string;
   imageUrl?: string;
   previewImages?: ChatPreviewImage[];

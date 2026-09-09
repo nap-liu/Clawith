@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 
 from app.database import async_session
 from app.models.audit import ChatMessage
@@ -133,14 +133,27 @@ async def stop_session_turn_tree(
                 root_snapshot = conversation_turn_snapshot_for_session(root)
 
         if root_run is not None:
-            child_ids = [root_id]
-            input_filter = ChatMessage.conversation_id == str(root_id)
+            child_ids = [root_id, *(await db.scalars(select(SubagentRun.id).where(
+                SubagentRun.parent_session_id == root_id,
+            ))).all()]
+            input_filter = or_(ChatMessage.conversation_id == str(root_id), and_(
+                ChatMessage.message_meta["causal_parent_session_id"].as_string() == str(root_id),
+                ChatMessage.message_meta["causal_parent_anchor_id"].as_string() == str(root_snapshot.anchor_id),
+            ))
+            if dict(root.im_config or {}).get("executor") == "media":
+                media_anchor_id = root_snapshot.anchor_id or await db.scalar(
+                    select(ChatMessage.id).where(
+                        ChatMessage.conversation_id == str(root_id),
+                        ChatMessage.message_meta["subagent_input_state"].as_string() == INPUT_PENDING,
+                    ).order_by(ChatMessage.created_at, ChatMessage.id).limit(1)
+                )
+                input_filter = and_(input_filter, ChatMessage.id == media_anchor_id)
         elif root_snapshot.anchor_id is not None:
             child_ids = list(
                 (
                     await db.execute(
-                        select(SubagentRun.id).where(
-                            SubagentRun.parent_session_id == root_id
+                        select(SubagentRun.id).join(ChatSession, ChatSession.id == SubagentRun.id).where(
+                            ChatSession.agent_id == agent_id
                         )
                     )
                 ).scalars()
@@ -179,7 +192,9 @@ async def stop_session_turn_tree(
         if root_run is not None:
             run_ids.add(root_id)
         if root_run is not None:
-            runs = [root_run]
+            runs = [root_run, *(await db.scalars(select(SubagentRun).where(
+                SubagentRun.id.in_(run_ids - {root_id}),
+            ).order_by(SubagentRun.id).with_for_update())).all()]
         else:
             runs = (
                 list(
@@ -248,7 +263,7 @@ async def stop_session_turn_tree(
                 continue
             child_snapshot = conversation_turn_snapshot_for_session(child)
             owned_input_ids = {row.id for row in inputs_by_run.get(run.id, [])}
-            if run.id != root_id and child_snapshot.anchor_id not in owned_input_ids:
+            if run.id != root_id and child_snapshot.anchor_id is not None and child_snapshot.anchor_id not in owned_input_ids:
                 continue
             if child.id != root.id:
                 target_sessions.append(child)
@@ -296,6 +311,7 @@ async def stop_session_turn_tree(
             row.message_meta = {
                 **dict(row.message_meta or {}),
                 "subagent_input_state": INPUT_CANCELLED,
+                **({"turn_status": "cancelled"} if (row.message_meta or {}).get("media_request") else {}),
             }
 
         if root_snapshot.anchor_id is not None:
@@ -394,10 +410,23 @@ async def stop_session_turn_tree(
             event_kind="turn_terminal",
         )
 
+    # Media turns are independent jobs: a direct STOP preserves later inputs.
+    if root_run is not None and dict(root.im_config or {}).get("executor") == "media":
+        async with async_session() as next_db:
+            stopped_run = await next_db.get(SubagentRun, root_id, with_for_update=True)
+            pending = await next_db.scalar(select(ChatMessage.id).where(
+                ChatMessage.conversation_id == str(root_id),
+                ChatMessage.message_meta["subagent_input_state"].as_string() == INPUT_PENDING,
+            ).limit(1))
+            if stopped_run and stopped_run.status == RUN_CANCELLED and pending:
+                stopped_run.status = "queued"
+                await next_db.commit()
+
     # Web may interrupt its LLM task immediately after this operation returns.
-    # Persist all anchors owned here before that interruption. Notify remote
-    # owners first: finalizing a local owner may cancel this caller itself.
+    # Persist all anchors and queued media successors before that interruption.
+    # Notify remote owners first: finalizing a local owner may cancel this caller.
     await stop_local_registered_turns(turn_anchors, reason=reason)
+
     return TurnTreeStopResult(
         session_ids=tuple(sorted(stopped_session_ids, key=str)),
         cancelled_turns=tuple(cancelled_turns),

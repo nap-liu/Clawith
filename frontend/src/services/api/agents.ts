@@ -212,9 +212,9 @@ export const chatSessionApi = {
     });
   },
 
-  get: (agentId: string, sessionId: string) =>
+  get: (agentId: string, sessionId: string, taskId?: string) =>
     request<Record<string, any> & { view_scope: "mine" | "all" }>(
-      `/agents/${agentId}/sessions/${sessionId}`,
+      `/agents/${agentId}/sessions/${sessionId}${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ''}`,
     ),
 
   execution: (agentId: string, sessionId: string) =>

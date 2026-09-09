@@ -87,6 +87,7 @@ async def _summarize_via_llm(
     api_key = get_model_api_key(model)
     client = create_llm_client(
         provider=model.provider,
+        api_protocol=getattr(model, "api_protocol", None),
         base_url=model.base_url,
         api_key=api_key,
         model=model.model,
@@ -95,6 +96,11 @@ async def _summarize_via_llm(
     )
 
     try:
+        if getattr(model, "compact_stream", False):
+            response = await client.stream(
+                messages, max_tokens=model.compact_summary_max_tokens, temperature=0.2,
+            )
+            return response.content or "", response.usage
         response = await client.complete(
             messages,
             max_tokens=get_max_tokens(

@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.core.security import decrypt_data, encrypt_data
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
+from app.services.media_ai_contract import MEDIA_AI_CONFIG_KEY, MEDIA_AI_NAMES
 
 
 SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret"}
@@ -25,6 +26,8 @@ TENANT_TOOL_CONFIG_PREFIX = "tool_config:"
 
 
 def tenant_tool_config_key(tool_name: str) -> str:
+    if tool_name in MEDIA_AI_NAMES:
+        tool_name = MEDIA_AI_CONFIG_KEY
     return f"{TENANT_TOOL_CONFIG_PREFIX}{tool_name}"
 
 

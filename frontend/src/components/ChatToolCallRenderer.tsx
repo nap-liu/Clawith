@@ -46,9 +46,10 @@ function toolName(context: ToolCallRenderContext): string {
 const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
     {
         type: 'run-subagent',
-        resolve: (context) => toolName(context) === 'run_subagent'
-            ? parseSubagentRunCardData(context.message, context.payload)
-            : null,
+        resolve: (context) => {
+            const data = parseSubagentRunCardData(context.message, context.payload);
+            return toolName(context) === 'run_subagent' || data.taskId ? data : null;
+        },
         render: ({ agentId, mode, t, onOpenSubagentSession }, _context, data) => (
             <SubagentRunCard
                 agentId={agentId}
@@ -60,7 +61,7 @@ const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
         ),
         identity: (_context, data) => {
             const run = data as SubagentRunCardData;
-            return [run.sessionId || '', run.status, run.name || '', run.task || '', run.mode || '', run.model || '', String(run.fork), String(run.soul), String(run.memory)].join('\u0000');
+            return [run.sessionId || '', run.taskId || '', run.status, run.name || '', run.task || '', run.mode || '', run.model || '', String(run.fork), String(run.soul), String(run.memory)].join('\u0000');
         },
     },
     {

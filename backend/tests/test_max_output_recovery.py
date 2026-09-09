@@ -36,6 +36,16 @@ from app.services.llm.caller import (
     call_llm,
 )
 from app.services.llm.client import LLMError, LLMMessage, LLMResponse
+from app.database import engine
+
+
+@pytest.fixture(autouse=True)
+async def isolated_engine():
+    # Plain completions also clear recovered Responses checkpoints in the DB.
+    # Each pytest event loop must release the connections it created.
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 def _stop_response(content: str) -> LLMResponse:

@@ -17,6 +17,26 @@ export function runH5ChatTimelinePart4(ctx) {
     } = ctx;
 
 {
+    const tool = mapHistoryMessage({
+        id: 'generated-tool', role: 'tool_call', toolName: 'generate_media',
+        toolStatus: 'done', mediaTaskId: 'media-turn',
+        toolResult: JSON.stringify({ type: 'media_generation', delivery: {
+            type: 'platform_media_delivery', status: 'sent', media_kind: 'audio',
+            path: 'workspace/output.wav', filename: 'output.wav',
+        } }),
+    });
+    const completion = { id: 'completion', role: 'assistant', content: 'Generated.', mediaTaskId: 'media-turn',
+        attachments: [{ kind: 'audio', path: 'workspace/output.wav', display_name: 'output.wav' }] };
+    const entries = buildH5ConversationEntries([tool, completion]);
+    assert.deepEqual(entries.map(entry => entry.type), ['analysis_group', 'message']);
+    assert.equal(entries[1].msg.attachments.length, 1);
+    assert.equal(buildH5ConversationEntries([tool])[0].type, 'special_render');
+    assert.equal(buildH5ConversationEntries([{ ...tool, mediaTaskId: undefined }, completion])[0].type, 'special_render');
+    assert.equal(buildH5ConversationEntries([tool, { ...completion, mediaTaskId: 'other-task' }])[0].type, 'special_render');
+    assert.equal(buildH5ConversationEntries([tool, { id: 'next', role: 'user', content: 'Queued follow-up' }, completion])[0].type, 'analysis_group');
+}
+
+{
     const messageId = 'initial-assistant:session-1';
     let messages = applyAssistantStreamMessage([], {
         type: 'done',

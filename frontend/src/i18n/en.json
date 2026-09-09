@@ -1528,15 +1528,15 @@
       "showAll": "Show all",
       "groupCount": "{{selected}} / {{total}}",
       "mcpToolCount": "{{count}} tools",
-    "groups": {
-      "mcp": {
-        "company": "Shared MCP",
-        "digital_employee": "Current Digital Employee MCP"
-      },
-      "skill": {
-        "market": "Marketplace Skills",
-        "digital_employee": "Current Digital Employee Skills"
-      }
+      "groups": {
+        "mcp": {
+          "company": "Shared MCP",
+          "digital_employee": "Current Digital Employee MCP"
+        },
+        "skill": {
+          "market": "Marketplace Skills",
+          "digital_employee": "Current Digital Employee Skills"
+        }
       },
       "toolsAria": "Project tools",
       "skillsAria": "Project Skills",
@@ -1650,21 +1650,35 @@
         "archived": "Project archived",
         "shared": "Project shared",
         "unshared": "Project unshared",
-        "settings": { "updated": "Project settings updated" },
-        "file": { "committed": "Project file saved" },
-        "plan": { "updated": "Project plan updated" },
-        "status": { "updated": "Project status updated" },
-        "management": {
-          "action": { "completed": "Project work updated" }
+        "settings": {
+          "updated": "Project settings updated"
         },
-        "trace": { "repaired": "Project relations updated" },
+        "file": {
+          "committed": "Project file saved"
+        },
+        "plan": {
+          "updated": "Project plan updated"
+        },
+        "status": {
+          "updated": "Project status updated"
+        },
+        "management": {
+          "action": {
+            "completed": "Project work updated"
+          }
+        },
+        "trace": {
+          "repaired": "Project relations updated"
+        },
         "template": {
           "restored": "Template content restored",
           "published": "Template published",
           "updated": "Template updated"
         },
         "agent": {
-          "message": { "sent": "Project Digital Employee message sent" }
+          "message": {
+            "sent": "Project Digital Employee message sent"
+          }
         },
         "kickoff": {
           "confirmed": "Project plan confirmed and started",
@@ -1679,7 +1693,9 @@
           "created": "Member settings created",
           "updated": "Member settings updated"
         },
-        "tools": { "updated": "Member tools updated" },
+        "tools": {
+          "updated": "Member tools updated"
+        },
         "departed": "Project member departed",
         "restored": "Project member restored"
       },
@@ -1724,21 +1740,33 @@
         "cancelled": "Member collaboration cancelled",
         "delivery_failed": "Member collaboration message failed"
       },
-      "group": { "message": { "created": "Project group message created" } },
+      "group": {
+        "message": {
+          "created": "Project group message created"
+        }
+      },
       "git": {
-        "commit": { "created": "Project version created" },
+        "commit": {
+          "created": "Project version created"
+        },
         "milestone": {
           "prepared": "Delivery milestone prepared",
           "created": "Delivery milestone created"
         },
-        "branch": { "created": "Project branch created" },
-        "restore_commit": { "created": "Recovery version created" },
+        "branch": {
+          "created": "Project branch created"
+        },
+        "restore_commit": {
+          "created": "Recovery version created"
+        },
         "restored": "Project version restored",
         "remote": {
           "configured": "Remote repository configured",
           "deleted": "Remote repository removed"
         },
-        "repository": { "cloned": "Remote repository imported" }
+        "repository": {
+          "cloned": "Remote repository imported"
+        }
       }
     },
     "details": {
@@ -1757,10 +1785,16 @@
         "file": {
           "committed": "The project file was saved as a new version."
         },
-        "plan": { "updated": "The project plan was updated." },
-        "status": { "updated": "The project status was updated." },
+        "plan": {
+          "updated": "The project plan was updated."
+        },
+        "status": {
+          "updated": "The project status was updated."
+        },
         "management": {
-          "action": { "completed": "Project work was reviewed or updated." }
+          "action": {
+            "completed": "Project work was reviewed or updated."
+          }
         },
         "trace": {
           "repaired": "Relations between project executions, conversations, and results were updated."
@@ -1788,7 +1822,9 @@
           "created": "The project member settings were created.",
           "updated": "The project member settings were updated."
         },
-        "tools": { "updated": "The member tool settings were updated." },
+        "tools": {
+          "updated": "The member tool settings were updated."
+        },
         "departed": "The member left the project; their history remains visible and read-only.",
         "restored": "The member rejoined; future work uses the current configuration."
       },
@@ -1846,7 +1882,9 @@
           "prepared": "The delivery milestone is being prepared.",
           "created": "The delivery milestone was created."
         },
-        "branch": { "created": "The project branch was created." },
+        "branch": {
+          "created": "The project branch was created."
+        },
         "restore_commit": {
           "created": "A recovery version was created and existing history was preserved."
         },
@@ -3178,6 +3216,14 @@
       "subagent": "Delegate tasks, review progress, and provide additional guidance"
     },
     "toolTranslations": {
+      "read_media": {
+        "name": "Read Media",
+        "description": "Analyze images, audio and video asynchronously. Ask follow-up questions and receive results automatically."
+      },
+      "generate_media": {
+        "name": "Generate Media",
+        "description": "Generate images, speech and video asynchronously. Continue editing and receive saved results automatically."
+      },
       "user_project_search": {
         "name": "Search projects",
         "description": "Find projects by name, goal, status, or scope."
@@ -3735,7 +3781,7 @@
       "testSuccess": "OK ({{latency}}ms)",
       "testFailed": "Test failed: {{error}}\n\nLatency: {{latency}}ms",
       "testError": "Test error: {{message}}",
-      "editModel": "Edit Model",
+      "editModel": "Edit model",
       "vision": "Vision",
       "temperature": "Imagination",
       "temperaturePlaceholder": "e.g. 0.7 or 1.0 (Leave empty for default)",
@@ -3747,7 +3793,61 @@
       "setAsDefaultTitle": "Set as default for new agents",
       "testErrorShort": "Test error",
       "testFailedShort": "Test failed",
-      "testTitle": "Connectivity test"
+      "testTitle": "Connectivity test",
+      "protocol": "API protocol",
+      "purposesLabel": "Model purposes",
+      "modalitiesLabel": "Input types",
+      "keepApiKey": "Leave blank to keep the existing key",
+      "selectedCount": "{{count}} selected",
+      "mediaDefaults": "Default models",
+      "noDefault": "Not set",
+      "inheritMediaDefault": "Use company default",
+      "deleteConfirm": "Delete model “{{name}}”?",
+      "forceDeleteConfirm": "Model deletion failed. Clear references and force delete?",
+      "mediaTest": "Model test",
+      "testAgent": "Test workspace",
+      "selectTestAgent": "Select a Digital Employee",
+      "testPrompt": "Test instruction",
+      "testFiles": "Reference files",
+      "testFilesHint": "One media URL or AgentDir path per line",
+      "startMediaTest": "Start test",
+      "purposes": {
+        "conversation": "Conversation",
+        "media_understanding": "Media understanding",
+        "image_generation": "Image generation",
+        "audio_generation": "Audio generation",
+        "video_generation": "Video generation",
+        "speech_recognition": "Speech recognition"
+      },
+      "modalities": {
+        "text": "Text",
+        "image": "Image",
+        "audio": "Audio",
+        "video": "Video"
+      },
+      "protocols": {
+        "inherit": "Provider default",
+        "openai_responses": "OpenAI Responses",
+        "openai_compatible": "OpenAI Chat Completions",
+        "anthropic": "Anthropic Messages",
+        "gemini": "Gemini"
+      },
+      "poolTitle": "Model pool",
+      "connectionSettings": "Connection",
+      "capabilitySettings": "Capabilities",
+      "responseSettings": "Response settings",
+      "requestSettings": "Request settings",
+      "providerDefault": "Use provider default",
+      "imaginationLow": "Stable",
+      "imaginationMiddle": "Balanced",
+      "imaginationHigh": "Imaginative",
+      "testSettings": "Test input",
+      "testResult": "Test result",
+      "providers": {
+        "hunyuan": "Tencent Hunyuan",
+        "volcengine": "Volcengine Ark"
+      },
+      "connectionPassed": "Connection successful"
     },
     "tools": {
       "title": "Global Tool Management",
@@ -4787,7 +4887,13 @@
     "saveFailed": "Save failed",
     "saved": "Saved",
     "unknownError": "Unknown error",
-    "switchLanguage": "Switch language"
+    "switchLanguage": "Switch language",
+    "select": "Select",
+    "unavailableConfiguredModel": "The configured model is unavailable",
+    "unavailableSuffix": "(unavailable)",
+    "modelLoadFailed": "Failed to load models",
+    "selectVisionModel": "Select a vision model",
+    "selectModel": "Select a model"
   },
   "openclaw": {
     "created": "OpenClaw Agent Created",
@@ -5383,5 +5489,21 @@
       "refresh": "Tools",
       "dry-run": "Configuration"
     }
+  },
+  "mediaAI": {
+    "apiKey": "Bailian API Key (company configuration shared by both media tools)",
+    "base_url": "Bailian service URL",
+    "understanding_model": "Media understanding model (Omni)",
+    "image_model": "Image model (Qwen Image API)",
+    "audio_model": "Speech model (Qwen TTS API)",
+    "video_model": "Video model (Wan 3.0 API)",
+    "context_window": "Understanding model context window",
+    "context_usage_ratio": "Context usage ratio",
+    "max_output_tokens": "Maximum understanding output tokens",
+    "understanding_model_id": "Understanding model",
+    "image_model_id": "Image model",
+    "audio_model_id": "Audio model",
+    "video_model_id": "Video model",
+    "speech_model_id": "Speech recognition model"
   }
 }

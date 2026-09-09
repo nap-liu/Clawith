@@ -1523,15 +1523,15 @@
       "showAll": "查看全部",
       "groupCount": "{{selected}} / {{total}}",
       "mcpToolCount": "{{count}} 项工具",
-    "groups": {
-      "mcp": {
-        "company": "共享 MCP",
-        "digital_employee": "当前数字员工的 MCP"
-      },
-      "skill": {
-        "market": "市场 Skill",
-        "digital_employee": "当前数字员工的 Skill"
-      }
+      "groups": {
+        "mcp": {
+          "company": "共享 MCP",
+          "digital_employee": "当前数字员工的 MCP"
+        },
+        "skill": {
+          "market": "市场 Skill",
+          "digital_employee": "当前数字员工的 Skill"
+        }
       },
       "toolsAria": "项目工具",
       "skillsAria": "项目技能",
@@ -1645,29 +1645,52 @@
         "archived": "归档项目",
         "shared": "共享项目",
         "unshared": "取消共享",
-        "settings": { "updated": "更新项目设置" },
-        "file": { "committed": "保存工作区文件" },
-        "plan": { "updated": "更新项目计划" },
-        "status": { "updated": "更新项目状态" },
-        "management": {
-          "action": { "completed": "项目工作已更新" }
+        "settings": {
+          "updated": "更新项目设置"
         },
-        "trace": { "repaired": "更新项目关联信息" },
+        "file": {
+          "committed": "保存工作区文件"
+        },
+        "plan": {
+          "updated": "更新项目计划"
+        },
+        "status": {
+          "updated": "更新项目状态"
+        },
+        "management": {
+          "action": {
+            "completed": "项目工作已更新"
+          }
+        },
+        "trace": {
+          "repaired": "更新项目关联信息"
+        },
         "template": {
           "restored": "模板内容已恢复",
           "published": "模板已发布",
           "updated": "模板已更新"
         },
-        "agent": { "message": { "sent": "发送项目数字员工消息" } },
+        "agent": {
+          "message": {
+            "sent": "发送项目数字员工消息"
+          }
+        },
         "kickoff": {
           "confirmed": "确认项目方案并启动",
           "failed": "项目启动失败"
         },
-        "agent_reply_batch": { "dispatched": "数字员工回复已汇总" }
+        "agent_reply_batch": {
+          "dispatched": "数字员工回复已汇总"
+        }
       },
       "member": {
-        "snapshot": { "created": "创建成员设置", "updated": "更新成员设置" },
-        "tools": { "updated": "成员工具已更新" },
+        "snapshot": {
+          "created": "创建成员设置",
+          "updated": "更新成员设置"
+        },
+        "tools": {
+          "updated": "成员工具已更新"
+        },
         "departed": "成员退出项目",
         "restored": "恢复项目成员"
       },
@@ -1692,7 +1715,10 @@
           "rolled_back": "技能整理已撤销"
         }
       },
-      "work_item": { "created": "创建任务", "updated": "更新任务" },
+      "work_item": {
+        "created": "创建任务",
+        "updated": "更新任务"
+      },
       "run": {
         "queued": "执行等待处理",
         "running": "执行已开始",
@@ -1709,18 +1735,33 @@
         "cancelled": "成员协作已取消",
         "delivery_failed": "成员协作消息送达失败"
       },
-      "group": { "message": { "created": "创建项目群消息" } },
+      "group": {
+        "message": {
+          "created": "创建项目群消息"
+        }
+      },
       "git": {
-        "commit": { "created": "创建项目版本" },
+        "commit": {
+          "created": "创建项目版本"
+        },
         "milestone": {
           "prepared": "准备交付里程碑",
           "created": "创建交付里程碑"
         },
-        "branch": { "created": "创建项目分支" },
-        "restore_commit": { "created": "创建恢复版本" },
+        "branch": {
+          "created": "创建项目分支"
+        },
+        "restore_commit": {
+          "created": "创建恢复版本"
+        },
         "restored": "恢复项目版本",
-        "remote": { "configured": "配置远程仓库", "deleted": "删除远程仓库" },
-        "repository": { "cloned": "远程仓库已导入" }
+        "remote": {
+          "configured": "配置远程仓库",
+          "deleted": "删除远程仓库"
+        },
+        "repository": {
+          "cloned": "远程仓库已导入"
+        }
       }
     },
     "details": {
@@ -1733,20 +1774,36 @@
         "archived": "项目已归档，历史记录继续保留。",
         "shared": "项目可见范围已更新为指定成员共享。",
         "unshared": "项目共享授权已撤销。",
-        "settings": { "updated": "项目设置已更新。" },
-        "file": { "committed": "工作区文件已保存。" },
-        "plan": { "updated": "项目计划已更新。" },
-        "status": { "updated": "项目状态已更新。" },
-        "management": {
-          "action": { "completed": "项目工作已更新。" }
+        "settings": {
+          "updated": "项目设置已更新。"
         },
-        "trace": { "repaired": "项目执行、会话与成果的关联信息已更新。" },
+        "file": {
+          "committed": "工作区文件已保存。"
+        },
+        "plan": {
+          "updated": "项目计划已更新。"
+        },
+        "status": {
+          "updated": "项目状态已更新。"
+        },
+        "management": {
+          "action": {
+            "completed": "项目工作已更新。"
+          }
+        },
+        "trace": {
+          "repaired": "项目执行、会话与成果的关联信息已更新。"
+        },
         "template": {
           "restored": "模板内容已恢复。",
           "published": "模板已发布。",
           "updated": "模板内容已更新。"
         },
-        "agent": { "message": { "sent": "项目数字员工消息已发送。" } },
+        "agent": {
+          "message": {
+            "sent": "项目数字员工消息已发送。"
+          }
+        },
         "kickoff": {
           "confirmed": "方案已确认，项目已开始执行。",
           "failed": "项目启动未完成，请稍后重试。"
@@ -1760,7 +1817,9 @@
           "created": "项目成员设置已创建。",
           "updated": "项目成员设置已更新。"
         },
-        "tools": { "updated": "成员工具设置已更新。" },
+        "tools": {
+          "updated": "成员工具设置已更新。"
+        },
         "departed": "成员已退出项目，历史记录保持只读可见。",
         "restored": "成员已恢复参与项目，后续执行将使用当前配置。"
       },
@@ -1811,12 +1870,16 @@
         }
       },
       "git": {
-        "commit": { "created": "项目变更已记录为新版本。" },
+        "commit": {
+          "created": "项目变更已记录为新版本。"
+        },
         "milestone": {
           "prepared": "交付里程碑正在创建。",
           "created": "交付里程碑已创建。"
         },
-        "branch": { "created": "项目分支已创建。" },
+        "branch": {
+          "created": "项目分支已创建。"
+        },
         "restore_commit": {
           "created": "已创建恢复版本，原版本历史保持不变。"
         },
@@ -1825,7 +1888,9 @@
           "configured": "远程仓库已配置。",
           "deleted": "远程仓库已删除。"
         },
-        "repository": { "cloned": "远程仓库已导入。" }
+        "repository": {
+          "cloned": "远程仓库已导入。"
+        }
       }
     }
   },
@@ -3773,7 +3838,61 @@
       "setAsDefaultTitle": "设为新数字员工默认模型",
       "testErrorShort": "连通性测试出错",
       "testFailedShort": "连通性测试失败",
-      "testTitle": "连通性测试"
+      "testTitle": "连通性测试",
+      "protocol": "API 协议",
+      "purposesLabel": "模型用途",
+      "modalitiesLabel": "输入类型",
+      "keepApiKey": "留空保留现有密钥",
+      "selectedCount": "已选 {{count}} 项",
+      "mediaDefaults": "默认模型",
+      "noDefault": "未设置",
+      "inheritMediaDefault": "使用企业默认模型",
+      "deleteConfirm": "删除模型“{{name}}”？",
+      "forceDeleteConfirm": "模型删除失败。是否清空引用并强制删除？",
+      "mediaTest": "模型测试",
+      "testAgent": "测试工作空间",
+      "selectTestAgent": "选择数字员工",
+      "testPrompt": "测试指令",
+      "testFiles": "参考素材",
+      "testFilesHint": "每行一个素材 URL 或 AgentDir 路径",
+      "startMediaTest": "开始测试",
+      "purposes": {
+        "conversation": "对话",
+        "media_understanding": "媒体理解",
+        "image_generation": "图像生成",
+        "audio_generation": "音频生成",
+        "video_generation": "视频生成",
+        "speech_recognition": "语音识别"
+      },
+      "modalities": {
+        "text": "文本",
+        "image": "图像",
+        "audio": "音频",
+        "video": "视频"
+      },
+      "protocols": {
+        "inherit": "跟随服务商默认",
+        "openai_responses": "OpenAI Responses",
+        "openai_compatible": "OpenAI Chat Completions",
+        "anthropic": "Anthropic Messages",
+        "gemini": "Gemini"
+      },
+      "poolTitle": "模型池",
+      "connectionSettings": "连接配置",
+      "capabilitySettings": "模型能力",
+      "responseSettings": "回答设置",
+      "requestSettings": "请求设置",
+      "providerDefault": "使用服务商默认值",
+      "imaginationLow": "稳定",
+      "imaginationMiddle": "均衡",
+      "imaginationHigh": "丰富",
+      "testSettings": "测试内容",
+      "testResult": "测试结果",
+      "providers": {
+        "hunyuan": "腾讯混元",
+        "volcengine": "字节火山"
+      },
+      "connectionPassed": "连接正常"
     },
     "tools": {
       "title": "全局工具管理",
@@ -4777,7 +4896,13 @@
     "saveFailed": "保存失败",
     "saved": "已保存",
     "unknownError": "未知错误",
-    "switchLanguage": "切换语言"
+    "switchLanguage": "切换语言",
+    "select": "请选择",
+    "unavailableConfiguredModel": "当前配置的模型不可用",
+    "unavailableSuffix": "（不可用）",
+    "modelLoadFailed": "模型加载失败",
+    "selectVisionModel": "请选择视觉模型",
+    "selectModel": "请选择模型"
   },
   "admin": {
     "title": "公司管理",
@@ -5434,5 +5559,21 @@
       "refresh": "工具",
       "dry-run": "配置"
     }
+  },
+  "mediaAI": {
+    "apiKey": "百炼 API Key（企业配置由两个媒体工具共用）",
+    "base_url": "百炼服务地址",
+    "understanding_model": "媒体理解模型（Omni）",
+    "image_model": "图片模型（千问图像接口）",
+    "audio_model": "配音模型（千问 TTS 接口）",
+    "video_model": "视频模型（万相 3.0 接口）",
+    "context_window": "理解模型上下文容量",
+    "context_usage_ratio": "上下文使用比例",
+    "max_output_tokens": "理解结果最大输出 Token 数",
+    "understanding_model_id": "理解模型",
+    "image_model_id": "图像模型",
+    "audio_model_id": "音频模型",
+    "video_model_id": "视频模型",
+    "speech_model_id": "语音识别模型"
   }
 }

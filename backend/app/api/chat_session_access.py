@@ -20,6 +20,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
+from app.services.llm.failure_outcome import render_message
 
 
 async def _load_accessible_session(
@@ -128,6 +129,7 @@ async def _build_session_detail_out(
     db: AsyncSession,
     session: ChatSession,
     view_scope: Literal["mine", "all"],
+    task_id: uuid.UUID | None = None,
 ) -> SessionDetailOut:
     count_result = await db.execute(
         select(func.count(ChatMessage.id)).where(ChatMessage.conversation_id == str(session.id))
@@ -175,7 +177,16 @@ async def _build_session_detail_out(
                 model=run.model,
                 soul=run.soul,
                 memory=run.memory,
+                executor=dict(session.im_config or {}).get("executor", "agent"),
             )
+            if task_id is not None and runtime.executor == "media":
+                task = await db.get(ChatMessage, task_id)
+                if task is None or task.conversation_id != str(session.id) or not (task.message_meta or {}).get("media_request"):
+                    raise HTTPException(status_code=404, detail=render_message("mediaAI.contextRequired"))
+                from app.services.media_ai_sessions import task_receipt
+
+                runtime.status = task_receipt(task)["status"]
+                runtime.task_id = str(task_id)
 
     return SessionDetailOut(
         id=str(session.id),

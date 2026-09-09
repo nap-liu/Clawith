@@ -63,6 +63,9 @@ async def clone_tenant_llm_model(
     cloned = LLMModel(
         tenant_id=tenant_id,
         provider=source.provider,
+        api_protocol=source.api_protocol,
+        purposes=list(source.purposes or ["conversation"]),
+        input_modalities=list(source.input_modalities or (["text", "image"] if source.supports_vision else ["text"])),
         model=normalized_model,
         # Copy the encrypted-at-rest value verbatim.  The clone path never
         # decrypts the credential and no response schema exposes this column.

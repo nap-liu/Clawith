@@ -148,6 +148,8 @@
     "manage_scene": {"name": "管理场景配置", "description": "读取、保存和发布带版本控制的欢迎语、系统提示和快捷操作场景。"},
     "set_execution_user": {"name": "调整后台任务执行人", "description": "设置指定后台任务后续执行所使用的用户权限；已经开始或排队的执行不受影响。"},
     "run_background_resource": {"name": "执行后台任务", "description": "主动执行指定的任务、触发器或计划任务，用于测试执行稳定性。"},
+    "read_media": {"name": "读取媒体", "description": "异步分析图片、音频和视频，支持连续追问，完成后自动通知。"},
+    "generate_media": {"name": "媒体生成", "description": "异步生成图片、配音和视频，支持继续修改，自动保存并回传成果。"},
     "generate_image_custom": {"name": "自定义接口生成图片", "description": "通过自定义 OpenAI 兼容或网关接口生成图片。"},
     "generate_image_google": {"name": "Google 生成图片", "description": "通过 Google Gemini Image 或 Vertex AI 生成图片。"},
     "generate_image_openai": {"name": "OpenAI 生成图片", "description": "通过 OpenAI DALL·E 系列模型生成图片。"},

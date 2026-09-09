@@ -1,4 +1,7 @@
-from app.services.llm.client_shared import *  # noqa: F401,F403
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from app.services.llm.client_shared import LLMClient, LLMMessage, ChunkCallback, ThinkingCallback
 from app.services.llm.client_anthropic import AnthropicClient
 from app.services.llm.client_gemini import GeminiClient
 from app.services.llm.client_openai_compatible import OpenAICompatibleClient
@@ -79,6 +82,18 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
             "qwen3.5-plus": 32768,
             "qwen3.6-plus": 32768,
         },
+    ),
+    "hunyuan": ProviderSpec(
+        provider="hunyuan",
+        display_name="Tencent Hunyuan",
+        protocol="openai_responses",
+        default_base_url="https://tokenhub.tencentcloudmaas.com/v1",
+    ),
+    "volcengine": ProviderSpec(
+        provider="volcengine",
+        display_name="Volcengine Ark",
+        protocol="openai_responses",
+        default_base_url="https://ark.cn-beijing.volces.com/api/v3",
     ),
     "minimax": ProviderSpec(
         provider="minimax",
@@ -165,6 +180,15 @@ def get_provider_spec(provider: str) -> ProviderSpec | None:
     return PROVIDER_REGISTRY.get(normalize_provider(provider))
 
 
+def resolve_api_protocol(provider: str, api_protocol: str | None = None) -> str:
+    if api_protocol is not None:
+        if api_protocol not in {"openai_compatible", "openai_responses", "anthropic", "gemini"}:
+            raise ValueError("Unsupported API protocol")
+        return api_protocol
+    spec = get_provider_spec(provider)
+    return spec.protocol if spec else "openai_compatible"
+
+
 def get_provider_manifest() -> list[dict[str, Any]]:
     """List supported providers and capabilities for UI/config discovery."""
     out: list[dict[str, Any]] = []
@@ -173,6 +197,7 @@ def get_provider_manifest() -> list[dict[str, Any]]:
             "provider": spec.provider,
             "display_name": spec.display_name,
             "protocol": spec.protocol,
+            "preferred_protocol": "openai_responses" if spec.provider in {"openai", "openai-response", "qwen"} else spec.protocol,
             "default_base_url": spec.default_base_url,
             "supports_tool_choice": spec.supports_tool_choice,
             "default_max_tokens": spec.default_max_tokens,
@@ -261,6 +286,7 @@ def create_llm_client(
     timeout: float = 120.0,
     *,
     provider_managed_timeout: bool = False,
+    api_protocol: str | None = None,
 ) -> LLMClient:
     """Create an LLM client for the given provider.
 
@@ -281,12 +307,13 @@ def create_llm_client(
     """
     normalized_provider = normalize_provider(provider)
     spec = get_provider_spec(normalized_provider)
+    protocol = resolve_api_protocol(normalized_provider, api_protocol)
 
     # Get base URL
     final_base_url = get_provider_base_url(normalized_provider, base_url)
 
     # Create appropriate client
-    if spec and spec.protocol == "anthropic":
+    if protocol == "anthropic":
         return AnthropicClient(
             api_key=api_key,
             base_url=final_base_url,
@@ -294,22 +321,22 @@ def create_llm_client(
             timeout=timeout,
             provider_managed_timeout=provider_managed_timeout,
         )
-    elif spec and spec.protocol == "openai_responses":
+    elif protocol == "openai_responses":
         return OpenAIResponsesClient(
             api_key=api_key,
             base_url=final_base_url,
             model=model,
             timeout=timeout,
-            supports_tool_choice=spec.supports_tool_choice,
+            supports_tool_choice=spec.supports_tool_choice if spec else True,
             provider_managed_timeout=provider_managed_timeout,
         )
-    elif spec and spec.protocol == "gemini":
+    elif protocol == "gemini":
         return GeminiClient(
             api_key=api_key,
             base_url=final_base_url,
             model=model,
             timeout=timeout,
-            supports_tool_choice=spec.supports_tool_choice,
+            supports_tool_choice=spec.supports_tool_choice if spec else True,
             provider_managed_timeout=provider_managed_timeout,
         )
     elif normalized_provider in PROVIDER_CLIENTS:
@@ -353,12 +380,13 @@ async def chat_complete(
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
     timeout: float = 120.0,
+    api_protocol: str | None = None,
 ) -> dict:
     """High-level function for non-streaming chat completion.
 
     Returns response in OpenAI-compatible format for backward compatibility.
     """
-    client = create_llm_client(provider, api_key, model, base_url, timeout)
+    client = create_llm_client(provider, api_key, model, base_url, timeout, api_protocol=api_protocol)
 
     try:
         llm_messages = [LLMMessage(**m) for m in messages]
@@ -399,12 +427,13 @@ async def chat_stream(
     timeout: float = 120.0,
     on_chunk: ChunkCallback | None = None,
     on_thinking: ThinkingCallback | None = None,
+    api_protocol: str | None = None,
 ) -> dict:
     """High-level function for streaming chat completion.
 
     Returns aggregated response in OpenAI-compatible format.
     """
-    client = create_llm_client(provider, api_key, model, base_url, timeout)
+    client = create_llm_client(provider, api_key, model, base_url, timeout, api_protocol=api_protocol)
 
     try:
         llm_messages = [LLMMessage(**m) for m in messages]
@@ -439,6 +468,7 @@ __all__ = (
     'PROVIDER_REGISTRY',
     'normalize_provider',
     'get_provider_spec',
+    'resolve_api_protocol',
     'get_provider_manifest',
     'PROVIDER_CLIENTS',
     'PROVIDER_URLS',

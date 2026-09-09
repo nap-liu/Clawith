@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 
 from app.database import async_session, engine
 from app.models.activity_log import AgentActivityLog
@@ -113,6 +113,11 @@ async def test_committed_task_is_discovered_and_concurrent_resume_finalizes_once
         assert requests == []
         dispatched = await own_dispatched(anchor.id)
         await wait_for_requests(requests)
+        async with async_session() as db:
+            assert await db.scalar(text(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                "AND state = 'idle in transaction' AND pid <> pg_backend_pid()"
+            )) == 0
         duplicate = asyncio.create_task(background_turns.run_background_turn(anchor.id))
         gate.set()
         async with asyncio.timeout(20):

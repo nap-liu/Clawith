@@ -16,6 +16,10 @@ from app.services.chat_history import (
     rewrite_tool_call_done_results,
 )
 from app.services.llm.tool_output_store import finalize_tool_output
+from app.services.media_ai_jobs import recover_generation
+from app.services.media_ai_sessions import recover_media_submission
+from app.services.media_ai_io import MediaAIError
+from app.services.media_ai_tools import error_result
 from app.services.turn_recovery import (
     RECOVERY_TOOL_MATERIALIZE_TIMEOUT_SECONDS,
     _RecoveryOrigin,
@@ -63,6 +67,19 @@ async def _complete_unfinished_tool_calls(
             "did not execute it again. Inspect the target state before choosing "
             "a safe next action."
         )
+        submitted_media = await recover_media_submission(_row) if name in {"generate_media", "read_media"} else None
+        if submitted_media is not None:
+            result_text = submitted_media
+        elif name == "generate_media":
+            try:
+                result_text = await recover_generation(
+                    _row, execution_agent_id=execution_agent_id,
+                    guard=lambda: _recovery_origin_matches(anchor, expected_origin),
+                ) or result_text
+            except MediaAIError as exc:
+                result_text = error_result(exc)
+        if not await _recovery_origin_matches(anchor, expected_origin):
+            return completed
         llm_view = await finalize_tool_output(
             result_text,
             tool_name=name,
@@ -84,6 +101,7 @@ async def _complete_unfinished_tool_calls(
                     "result": llm_view,
                     "reasoning_content": payload.get("reasoning_content"),
                     "assistant_content": payload.get("assistant_content"),
+                    "responses_snapshot": (_row.message_meta or {}).get("responses_snapshot"),
                     "recovery_prefix_messages": payload.get("recovery_prefix_messages") or [],
                     "round_id": payload.get("round_id"),
                     "round_tool_index": payload.get("round_tool_index"),
