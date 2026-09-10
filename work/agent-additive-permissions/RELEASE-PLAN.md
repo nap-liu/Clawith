@@ -6,9 +6,9 @@
 
 ## 范围与候选身份
 
-- 公司主线：`yybpc/company/main`；已核实基线
-  `0cc8c01c1eb39a8c17f67f6333dbf701369aa677`。
-- 候选：`feat/agent-additive-permissions` 的未提交改动及新增文件；尚无最终 RELEASE_SHA。
+- 公司主线：`yybpc/company/main`；已合入
+  `e7abac770197f493e0efbd8975164f766041918f`，原实现基线为 `0cc8c01c`。
+- 候选：`feat/agent-additive-permissions` 本地提交与主线合并；尚未冻结发布 RELEASE_SHA。
   发布准备时重新 fetch 主线，若移动则集成、复审受影响差异并重新验证。
 - 当前产品版本：backend/frontend 均为 `1.10.3`，不升语义版本；
   最终 RELEASE_ID 为 `v1.10.3-<RELEASE_SHA7>`。
@@ -16,6 +16,9 @@
   backend、worker、connector 使用同一 backend digest，frontend 来自同一 SHA。
 - Plaza 已废弃，按用户要求不处理；无依赖、AIO、Redis、workspace 或对象存储格式变更，
   不更改数据库内置工具 schema。MCP 配置工具沿现有 FastMCP 定义更新。
+- 权限迁移接在 `model_extra_headers` 之后，保持唯一 head。若实际生产尚未包含
+  本次合入的模型能力/请求头主线提交，最终发布差异也须包含其影响及验证，
+  不得将整次发布仍描述为仅权限改动。
 
 ## 已有证据与发布前补齐项
 

@@ -20,6 +20,13 @@
     font-weight: 600;
 }
 
+.model-pool__filters {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
 .model-pool__list {
     display: grid;
     grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) repeat(4, max-content);
@@ -83,6 +90,7 @@
 }
 
 @container (max-width: 480px) {
+    .model-pool__filters { grid-template-columns: minmax(0, 1fr); }
     .model-pool__header { align-items: flex-start; flex-direction: column; }
     .model-pool__list { grid-template-columns: minmax(0, 1fr); }
     .model-pool__row > .model-pool__actions {

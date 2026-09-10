@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from app.services.llm.caller_context import *  # noqa: F401,F403
 from app.services.llm.caller_shared import *  # noqa: F401,F403
 from app.services.llm.caller_tooling import *  # noqa: F401,F403
+from app.services.model_headers import resolve_model_headers
 
 
 @dataclass
@@ -246,6 +247,7 @@ async def _call_llm_prepare_client_and_messages(
             base_url=state.model.base_url,
             timeout=_get_model_timeout(state.model),
             provider_managed_timeout=True,
+            extra_headers=resolve_model_headers(state.model),
         )
         state.client_guard = LLMClientCloseGuard(client)
     except Exception as e:

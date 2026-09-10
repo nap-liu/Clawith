@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,6 +38,7 @@ class LLMModel(Base):
     input_modalities: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=lambda: ["text"], server_default='["text"]')
     model: Mapped[str] = mapped_column(String(100), nullable=False)  # claude-opus-4-6, gpt-4o, etc.
     api_key_encrypted: Mapped[str] = mapped_column(String(1024), nullable=False)
+    extra_headers_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     base_url: Mapped[str | None] = mapped_column(String(500))
     label: Mapped[str] = mapped_column(String(200), nullable=False)  # Display name
     max_tokens_per_day: Mapped[int | None] = mapped_column(Integer)

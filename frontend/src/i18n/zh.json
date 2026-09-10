@@ -3878,10 +3878,19 @@
         "gemini": "Gemini"
       },
       "poolTitle": "模型池",
+      "servicePlatform": "服务平台",
+      "allPlatforms": "全部服务平台",
+      "searchModels": "搜索模型名称或服务平台",
+      "noMatchingModels": "未找到匹配的模型",
       "connectionSettings": "连接配置",
       "capabilitySettings": "模型能力",
       "responseSettings": "回答设置",
       "requestSettings": "请求设置",
+      "extraHeaders": "额外请求头",
+      "headerName": "请求头名称",
+      "headerValue": "请求头值",
+      "addHeader": "添加请求头",
+      "extraHeadersHint": "随模型请求发送。删除全部条目可清空额外请求头。",
       "providerDefault": "使用服务商默认值",
       "imaginationLow": "稳定",
       "imaginationMiddle": "均衡",
@@ -3889,6 +3898,8 @@
       "testSettings": "测试内容",
       "testResult": "测试结果",
       "providers": {
+        "tokenhub": "腾讯 TokenHub",
+        "bailian": "阿里云百炼",
         "hunyuan": "腾讯混元",
         "volcengine": "字节火山"
       },

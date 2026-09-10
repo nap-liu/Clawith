@@ -1,4 +1,10 @@
 from app.services.llm.client_shared import *  # noqa: F401,F403
+from app.services.llm.provider_parameters import (
+    merge_request_headers,
+    supports_default_tool_choice,
+    validate_chat_parameters,
+)
+from app.services.llm.reasoning import is_bailian_endpoint, openai_chat_reasoning_options
 
 class OpenAICompatibleClient(LLMClient):
     """Client for OpenAI-compatible APIs (OpenAI, DeepSeek, Qwen, etc.)."""
@@ -15,6 +21,7 @@ class OpenAICompatibleClient(LLMClient):
         supports_cache_control: bool = False,
         provider_managed_timeout: bool = False,
         provider: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(
             api_key,
@@ -22,6 +29,7 @@ class OpenAICompatibleClient(LLMClient):
             model,
             timeout,
             provider_managed_timeout,
+            extra_headers,
         )
         self.supports_tool_choice = supports_tool_choice
         self.supports_cache_control = supports_cache_control
@@ -37,15 +45,16 @@ class OpenAICompatibleClient(LLMClient):
                     provider_managed_timeout=self.provider_managed_timeout,
                 ),
                 follow_redirects=True,
+                event_hooks=self._request_event_hooks(),
                 proxy=None,
             )
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
-        return {
+        return merge_request_headers({
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-        }
+        }, self.extra_headers)
 
     def _normalize_base_url(self) -> str:
         """Normalize base URL by stripping trailing /chat/completions."""
@@ -63,7 +72,7 @@ class OpenAICompatibleClient(LLMClient):
         protocol. Other OpenAI-compatible providers (OpenAI, DeepSeek
         direct, etc.) keep the plain string-content shape.
         """
-        return "dashscope" in (self.base_url or "").lower()
+        return is_bailian_endpoint(self.base_url)
 
     def _apply_dashscope_cache_markers(self, messages_payload: list[dict]) -> None:
         """Annotate the cache breakpoints chosen by ``select_cache_breakpoints``.
@@ -119,8 +128,6 @@ class OpenAICompatibleClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build request payload."""
-        from app.services.llm.reasoning import openai_chat_reasoning_options
-
         reasoning_effort = kwargs.pop("reasoning_effort", None)
         messages_payload = self._messages_to_openai_payload(messages)
         if self._is_dashscope_channel():
@@ -151,7 +158,9 @@ class OpenAICompatibleClient(LLMClient):
 
         if tools:
             payload["tools"] = tools
-            if self.supports_tool_choice:
+            if self.supports_tool_choice and supports_default_tool_choice(
+                model=self.model, base_url=self.base_url,
+            ):
                 payload["tool_choice"] = "auto"
                 payload["parallel_tool_calls"] = True
 
@@ -167,6 +176,7 @@ class OpenAICompatibleClient(LLMClient):
 
         # Add any additional kwargs
         payload.update(kwargs)
+        validate_chat_parameters(payload, base_url=self.base_url)
 
         return payload
 
@@ -419,6 +429,7 @@ class OpenAICompatibleClient(LLMClient):
         return LLMResponse(
             content=msg.get("content", ""),
             tool_calls=msg.get("tool_calls", []),
+            reasoning_content=msg.get("reasoning_content"),
             finish_reason=choice.get("finish_reason"),
             usage=data.get("usage"),
             model=data.get("model"),

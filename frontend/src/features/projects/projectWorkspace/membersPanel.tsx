@@ -10,7 +10,7 @@ import {
 } from "@tabler/icons-react";
 
 import { enterpriseApi } from "../../../services/api";
-import { sortLlmModels } from "../../../utils/llmModels";
+import { getLlmModelLabel, sortLlmModels } from "../../../utils/llmModels";
 import { projectsApi } from "../../../services/projects";
 import type {
   ProjectCapabilityOption,
@@ -243,7 +243,7 @@ export function MembersPanel({
     { value: "", label: t("projectSnapshot.followSourceAgent") },
     ...sortLlmModels(memberModels).map((model) => ({
       value: model.id,
-      label: model.label || `${model.provider} · ${model.model}`,
+      label: getLlmModelLabel(model, t),
     })),
   ];
   const updateConfigField = (key: string, value: unknown) =>

@@ -61,6 +61,7 @@ async def _summarize_via_llm(
     LLM client directly.
     """
     from app.services.llm import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
+    from app.services.model_headers import resolve_model_headers
 
     def _messages(candidate_span: str) -> list[LLMMessage]:
         user_payload = []
@@ -93,6 +94,7 @@ async def _summarize_via_llm(
         model=model.model,
         timeout=float(getattr(model, "request_timeout", None) or 120.0),
         provider_managed_timeout=True,
+        extra_headers=resolve_model_headers(model),
     )
 
     try:

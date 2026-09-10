@@ -121,6 +121,12 @@ The initial normalization table is:
 | Kimi K3 | always-on effort | native low/high/max; platform maps minimal/low -> low, medium/high -> high, xhigh/max -> max |
 | MiMo | toggle | `none` disables; every enabled level enables thinking |
 | MiniMax M1/M2.5 | fixed | explicit values are rejected; M1 is retained only as a retired/unavailable legacy configuration |
+| Bailian MiniMax/MiniMax-M3 | adaptive toggle | `none` disables; enabled levels use adaptive thinking; sampling parameters are fixed |
+| Bailian stepfun/step-3.7-flash | toggle and effort | `none` disables; minimal/low -> low; medium -> medium; high/xhigh/max -> high |
+| TokenHub Hy3 | native effort | `none` disables; minimal/low -> low; medium -> medium; high/xhigh/max -> high |
+| TokenHub DeepSeek V4 Flash | native effort | `none` disables; minimal/low -> low; medium/high -> high; xhigh/max -> max |
+| TokenHub GLM 5.3 | always-on effort | enabled levels collapse to low/high/max |
+| TokenHub Kimi K3 | always-on effort | all enabled levels map to max |
 | DeepSeek R1 / QwQ Plus | fixed | provider ignores effort controls; explicit values are rejected |
 | DeepSeek V3 / Qwen Max | unsupported | no controllable reasoning surface is exposed |
 
@@ -262,3 +268,36 @@ The provider registry includes Tencent Hunyuan and Volcengine Ark. Their current
 default endpoints support Responses; administrators can select Chat Completions
 and a different endpoint for compatible or legacy models. Provider registration
 does not imply that every model supports every media or reasoning capability.
+
+Serving-platform labels are a read-only projection (`service_platform`) of the
+configured endpoint and provider. Known TokenHub, Bailian and Ark hosts identify
+the serving platform independently of model branding; unknown services retain
+the configured provider. This does not rewrite legacy provider values, protocols,
+credentials or default references. The model pool and all model pickers share
+localized model-name/platform presentation, sorting by model name then platform.
+TokenHub has its own registry entry with a Responses default; individual model
+capabilities still determine the actual transport and accepted parameters.
+
+TokenHub reasoning mappings follow its [Responses contract](https://cloud.tencent.com/document/product/1823/135873)
+and model-specific [GLM](https://cloud.tencent.com/document/product/1823/132061),
+[Kimi](https://cloud.tencent.com/document/product/1823/132232) and
+[DeepSeek](https://cloud.tencent.com/document/product/1823/132248) contracts.
+Bailian direct-provider IDs use their own [MiniMax](https://help.aliyun.com/zh/model-studio/minimax-api-by-minimax)
+and [Step](https://help.aliyun.com/zh/model-studio/stepfun) parameter contracts.
+In particular, do not copy Bailian Kimi effort values into TokenHub Kimi K3.
+
+Enterprise models expose optional `extra_headers` through the existing model
+form and connection test. Values are encrypted at rest; only model administrators
+receive decrypted configuration, and ordinary model selectors receive an empty
+map. Omitted updates preserve the configuration, `null` inherits endpoint
+defaults, and `{}` explicitly clears optional headers. Clones and accepted media
+jobs retain their encrypted configuration snapshot. Custom headers never belong
+in public task metadata or third-party artifact downloads; cross-origin LLM
+redirects strip configured headers.
+
+The Bailian endpoint preset is `X-DashScope-Wait-Timeout: 120`, following its
+[official request-header contract](https://help.aliyun.com/zh/model-studio/rate-limiting-best-practices).
+Administrators can change or remove it like any other header. All LLM protocols,
+compaction, media adapters and speech transports consume the shared configuration.
+This is provider request metadata only: it adds no platform queuing, retry,
+overall timeout or model-switch policy, and preserves existing transport timers.

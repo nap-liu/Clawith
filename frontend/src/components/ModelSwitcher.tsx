@@ -4,9 +4,9 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { IconChevronDown, IconCheck } from '@tabler/icons-react';
 import { enterpriseApi } from '../services/api';
-import { sortLlmModels } from '../utils/llmModels';
+import { getLlmModelLabel, sortLlmModels, type LlmModelListItem } from '../utils/llmModels';
 
-interface Model {
+interface Model extends LlmModelListItem {
     id: string;
     provider: string;
     model: string;
@@ -110,7 +110,7 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
 
     if (enabled.length === 0) return null;
 
-    const labelFor = (m: Model) => m.label || `${m.provider} · ${m.model}`;
+    const labelFor = (m: Model) => getLlmModelLabel(m, t);
 
     return (
         <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>

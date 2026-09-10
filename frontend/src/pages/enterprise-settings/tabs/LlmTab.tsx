@@ -7,9 +7,10 @@ import { useToast } from '../../../components/Toast/ToastProvider';
 import ToggleSwitch from '../../../components/ToggleSwitch';
 import SelectDropdown from '../../../components/SelectDropdown';
 import Button from '../../../components/ui/Button';
+import TextInput from '../../../components/ui/TextInput';
 import { SettingsDrawer, SettingsField, SettingsSection } from '../../../components/ui/SettingsForm';
 import { useAuthStore } from '../../../stores';
-import { getLlmModelLabel, sortLlmModels, supportsModelPurpose, type ModelPurpose } from '../../../utils/llmModels';
+import { getLlmModelLabel, getLlmModelName, getLlmModelPlatform, getLlmModelPlatformLabel, sortLlmModels, supportsModelPurpose, type ModelPurpose } from '../../../utils/llmModels';
 import { fetchJson } from '../utils/fetchJson';
 import LlmModelForm, { type PoolModel, type ProviderSpec } from './LlmModelForm';
 import LlmMediaTest from './LlmMediaTest';
@@ -24,7 +25,7 @@ const MEDIA_DEFAULTS: [string, ModelPurpose][] = [
 ];
 
 export default function LlmTab({ selectedTenantId }: { selectedTenantId: string }) {
-    const { t, i18n } = useTranslation();
+    const { t } = useTranslation();
     const dialog = useDialog();
     const toast = useToast();
     const qc = useQueryClient();
@@ -32,12 +33,16 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
     const [editing, setEditing] = useState<PoolModel | 'new' | null>(null);
     const [testing, setTesting] = useState<PoolModel | null>(null);
     const [showDefaults, setShowDefaults] = useState(false);
+    const [search, setSearch] = useState('');
+    const [platform, setPlatform] = useState('');
     const tenantId = selectedTenantId || currentUser?.tenant_id || '';
     const suffix = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : '';
     useEffect(() => {
         setEditing(null);
         setTesting(null);
         setShowDefaults(false);
+        setSearch('');
+        setPlatform('');
     }, [tenantId]);
     const modelQuery = useQuery({
         queryKey: ['enterprise-model-pool', tenantId],
@@ -45,6 +50,10 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
         enabled: Boolean(tenantId),
     });
     const models = sortLlmModels(modelQuery.data || []);
+    const platforms = [...new Map(models.map(model => [getLlmModelPlatform(model), model])).values()];
+    const query = search.trim().toLocaleLowerCase();
+    const visibleModels = models.filter(model => (!platform || getLlmModelPlatform(model) === platform)
+        && (!query || [getLlmModelLabel(model, t), model.model].join(' ').toLocaleLowerCase().includes(query)));
     const { data: providers = [] } = useQuery({
         queryKey: ['llm-provider-specs'],
         queryFn: () => fetchJson<ProviderSpec[]>('/enterprise/llm-providers'),
@@ -91,7 +100,7 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
         onSuccess: invalidate, onError: reportError,
     });
     const remove = async (model: PoolModel) => {
-        if (!await dialog.confirm(t('enterprise.llm.deleteConfirm', { name: getLlmModelLabel(model) }), {
+        if (!await dialog.confirm(t('enterprise.llm.deleteConfirm', { name: getLlmModelLabel(model, t) }), {
             title: t('common.dialog.deleteModel'), danger: true,
         })) return;
         try {
@@ -113,10 +122,6 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
             }
         }
     };
-    const providerLabel = (provider: string) => {
-        const key = `enterprise.llm.providers.${provider}`;
-        return i18n.exists(key) ? t(key) : providers.find(p => p.provider === provider)?.display_name || provider;
-    };
     const defaultOptions = (field: string, purpose: ModelPurpose) => {
         const eligible = models.filter(model => model.enabled !== false && supportsModelPurpose(model, purpose));
         const selected = field === 'conversation' ? tenant?.default_model_id : defaults[field];
@@ -124,7 +129,7 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
             ...(field === 'conversation' ? [] : [{ value: '', label: t('enterprise.llm.noDefault') }]),
             ...(selected && !eligible.some(model => model.id === selected)
                 ? [{ value: selected, label: t('common.unavailableConfiguredModel') }] : []),
-            ...eligible.map(model => ({ value: model.id, label: getLlmModelLabel(model) })),
+            ...eligible.map(model => ({ value: model.id, label: getLlmModelLabel(model, t) })),
         ];
     };
     return <section className="model-pool">
@@ -140,18 +145,28 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
                 </Button>
             </div>
         </header>
+        <div className="model-pool__filters">
+            <TextInput type="search" value={search} onChange={event => setSearch(event.target.value)}
+                placeholder={t('enterprise.llm.searchModels')} aria-label={t('enterprise.llm.searchModels')} />
+            <SelectDropdown value={platform} onChange={setPlatform} style={{ width: '100%' }}
+                ariaLabel={t('enterprise.llm.servicePlatform')} options={[
+                    { value: '', label: t('enterprise.llm.allPlatforms') },
+                    ...platforms.map(model => ({ value: getLlmModelPlatform(model), label: getLlmModelPlatformLabel(model, t) })),
+                ]} />
+        </div>
         {modelQuery.isPending ? <p className="model-pool__status" role="status">{t('common.loading')}</p>
             : modelQuery.isError ? <p className="model-pool__error" role="alert">{t('common.modelLoadFailed')}
                 <Button variant="ghost" onClick={() => void modelQuery.refetch()}>{t('common.retry')}</Button>
             </p> : <div className="model-pool__list">
-                {models.map(model => <article className="model-pool__row" key={model.id}>
+                {visibleModels.map(model => <article className="model-pool__row" key={model.id}>
                     <div className="model-pool__identity">
                         <div className="model-pool__name">
-                            <h3>{getLlmModelLabel(model)}</h3>
+                            <h3>{getLlmModelName(model)}</h3>
+                            <span className="badge">{getLlmModelPlatformLabel(model, t)}</span>
                             {(tenant?.default_model_id === model.id || MEDIA_DEFAULTS.some(([field]) => defaults[field] === model.id)) &&
                                 <span className="badge">{t('enterprise.llm.defaultBadge')}</span>}
                         </div>
-                        <p>{providerLabel(model.provider)} · {model.model}</p>
+                        <p>{model.model}</p>
                         {(supportsModelPurpose(model) || supportsModelPurpose(model, 'media_understanding')) &&
                             <p>{t(`enterprise.llm.protocols.${model.effective_api_protocol || 'openai_compatible'}`)}</p>}
                     </div>
@@ -172,7 +187,8 @@ export default function LlmTab({ selectedTenantId }: { selectedTenantId: string 
                         <Button variant="ghost" className="model-pool__delete" onClick={() => void remove(model)}>{t('common.delete')}</Button>
                     </div>
                 </article>)}
-                {!models.length && <p className="model-pool__status">{t('enterprise.llm.noModels')}</p>}
+                {!visibleModels.length && <p className="model-pool__status">{t(models.length
+                    ? 'enterprise.llm.noMatchingModels' : 'enterprise.llm.noModels')}</p>}
             </div>}
         {editing && <LlmModelForm key={`${tenantId}-${editing === 'new' ? 'new' : editing.id}`}
             model={editing === 'new' ? undefined : editing} providers={providers}

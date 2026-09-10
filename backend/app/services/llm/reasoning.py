@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
@@ -60,6 +61,22 @@ def _name(value: str | None) -> str:
     return str(value or "").strip().lower().replace("_", "-")
 
 
+def is_bailian_endpoint(base_url: str | None) -> bool:
+    """Recognize both shared and workspace-scoped Alibaba model endpoints."""
+    host = (urlsplit(str(base_url or "")).hostname or "").lower()
+    return host in {
+        "dashscope.aliyuncs.com",
+        "dashscope-intl.aliyuncs.com",
+        "dashscope-us.aliyuncs.com",
+    } or host.endswith(".maas.aliyuncs.com")
+
+
+def is_tokenhub_endpoint(base_url: str | None) -> bool:
+    return (urlsplit(str(base_url or "")).hostname or "").lower() in {
+        "tokenhub.tencentmaas.com", "tokenhub-intl.tencentmaas.com",
+    }
+
+
 def _budget_cap(model: str) -> int:
     if "qwen3.5" in model or "qwen3-5" in model or "qwen3.6" in model or "qwen3-6" in model:
         return 81_920
@@ -91,7 +108,24 @@ def resolve_reasoning_capability(
     provider_name = _name(provider)
     model_name = _name(model)
     endpoint = _name(base_url)
-    dashscope = "dashscope" in endpoint
+    dashscope = is_bailian_endpoint(base_url)
+
+    if is_tokenhub_endpoint(base_url):
+        if model_name == "hy3":
+            return ReasoningCapability(
+                "native_effort", REASONING_EFFORTS,
+                effort_map=(("minimal", "low"),
+                            ("xhigh", "high"), ("max", "high")),
+            )
+        if model_name == "deepseek-v4-flash":
+            return _collapsed_low_high_max()
+        if model_name == "glm-5.3":
+            return _collapsed_low_high_max(always_on=True)
+        if model_name == "kimi-k3":
+            return ReasoningCapability(
+                "always_on_effort", ENABLED_REASONING_EFFORTS,
+                effort_map=tuple((effort, "max") for effort in ENABLED_REASONING_EFFORTS),
+            )
 
     # Legacy dedicated-reasoning models accept effort-shaped fields but ignore
     # them in live provider responses. Treat them as fixed so the UI never
@@ -102,6 +136,14 @@ def resolve_reasoning_capability(
         return ReasoningCapability("unsupported", ())
 
     if dashscope:
+        if model_name == "minimax/minimax-m3":
+            return ReasoningCapability("adaptive_toggle", REASONING_EFFORTS)
+        if model_name == "stepfun/step-3.7-flash":
+            return ReasoningCapability(
+                "toggle_effort",
+                REASONING_EFFORTS,
+                effort_map=(("minimal", "low"), ("xhigh", "high"), ("max", "high")),
+            )
         if "qwen3.8" in model_name or "qwen3-8" in model_name:
             thinking_only = "2.4t" in model_name
             efforts = ENABLED_REASONING_EFFORTS if thinking_only else REASONING_EFFORTS
@@ -211,6 +253,15 @@ def openai_chat_reasoning_options(
         return {}
     capability = resolve_reasoning_capability(provider=provider, model=model, base_url=base_url)
     _assert_supported(capability, normalized, model)
+    if is_tokenhub_endpoint(base_url) and _name(model) == "hy3" and normalized == "none":
+        return {"reasoning_effort": "no_think"}
+    if is_tokenhub_endpoint(base_url) and _name(model) == "deepseek-v4-flash":
+        if normalized == "none":
+            return {"thinking": {"type": "disabled"}}
+        return {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": capability.mapped_effort(normalized),
+        }
     if capability.profile in {"budget", "always_on_budget"}:
         if normalized == "none":
             return {"enable_thinking": False}
@@ -227,10 +278,16 @@ def openai_chat_reasoning_options(
         }
     if capability.profile == "toggle":
         return {"enable_thinking": normalized != "none"}
-    if normalized == "none" and "dashscope" in _name(base_url):
+    if capability.profile == "adaptive_toggle":
+        return {"thinking": {"type": "disabled" if normalized == "none" else "adaptive"}}
+    if capability.profile == "toggle_effort":
+        if normalized == "none":
+            return {"enable_thinking": False}
+        return {"enable_thinking": True, "reasoning_effort": capability.mapped_effort(normalized)}
+    if normalized == "none" and is_bailian_endpoint(base_url):
         return {"enable_thinking": False}
     options = {"reasoning_effort": capability.mapped_effort(normalized)}
-    if "dashscope" in _name(base_url) and "qwen" in _name(model):
+    if is_bailian_endpoint(base_url) and "qwen" in _name(model):
         options["enable_thinking"] = True
     return options
 

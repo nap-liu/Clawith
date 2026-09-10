@@ -1,5 +1,6 @@
 from app.services.llm.client_shared import *  # noqa: F401,F403
 from app.services.llm.client_openai_compatible import OpenAICompatibleClient
+from app.services.llm.provider_parameters import merge_request_headers
 
 class GeminiClient(LLMClient):
     """Client for Gemini native API (`generateContent` / `streamGenerateContent`)."""
@@ -14,6 +15,7 @@ class GeminiClient(LLMClient):
         timeout: float = 120.0,
         supports_tool_choice: bool = True,
         provider_managed_timeout: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(
             api_key,
@@ -21,6 +23,7 @@ class GeminiClient(LLMClient):
             model,
             timeout,
             provider_managed_timeout,
+            extra_headers,
         )
         self.supports_tool_choice = supports_tool_choice
         self._client: httpx.AsyncClient | None = None
@@ -35,6 +38,7 @@ class GeminiClient(LLMClient):
                     provider_managed_timeout=self.provider_managed_timeout,
                 ),
                 follow_redirects=True,
+                event_hooks=self._request_event_hooks(),
                 proxy=None,
             )
         return self._client
@@ -50,6 +54,7 @@ class GeminiClient(LLMClient):
                 supports_tool_choice=self.supports_tool_choice,
                 supports_cache_control=False,
                 provider_managed_timeout=self.provider_managed_timeout,
+                extra_headers=dict(self.extra_headers),
             )
         return self._openai_fallback_client
 
@@ -59,10 +64,10 @@ class GeminiClient(LLMClient):
         return url.endswith("/openai") or "/openai/" in url
 
     def _get_headers(self) -> dict[str, str]:
-        return {
+        return merge_request_headers({
             "Content-Type": "application/json",
             "x-goog-api-key": self.api_key,
-        }
+        }, self.extra_headers)
 
     def _normalize_base_url(self) -> str:
         """Normalize base URL for Gemini native endpoints."""

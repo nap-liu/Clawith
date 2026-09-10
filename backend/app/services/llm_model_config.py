@@ -70,6 +70,7 @@ async def clone_tenant_llm_model(
         # Copy the encrypted-at-rest value verbatim.  The clone path never
         # decrypts the credential and no response schema exposes this column.
         api_key_encrypted=source.api_key_encrypted,
+        extra_headers_encrypted=source.extra_headers_encrypted,
         base_url=source.base_url,
         label=normalized_label,
         max_tokens_per_day=source.max_tokens_per_day,

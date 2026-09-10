@@ -8,7 +8,7 @@ import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
 import AgentPermissionsEditor, { permissionGrants, type AgentPermissionsValue } from '../components/AgentPermissionsEditor';
 import { buildAgentSetupCopyText, buildAgentSetupInstruction } from './agentCreateInstructions';
-import { sortLlmModels } from '../utils/llmModels';
+import { getLlmModelLabel, sortLlmModels } from '../utils/llmModels';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -476,7 +476,7 @@ export default function AgentCreate() {
                                             <input type="radio" name="model" checked={form.primary_model_id === m.id}
                                                 onChange={() => { setForm({ ...form, primary_model_id: m.id }); clearFieldError('primary_model_id'); }} />
                                             <div>
-                                                <div style={{ fontWeight: 500, fontSize: '13px' }}>{m.label}</div>
+                                                <div style={{ fontWeight: 500, fontSize: '13px' }}>{getLlmModelLabel(m, t)}</div>
                                             </div>
                                         </label>
                                     ))}
@@ -613,7 +613,7 @@ export default function AgentCreate() {
             {/* Summary sidebar */}
             {selectedModel && (
                 <div style={{ marginTop: '16px', padding: '12px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', maxWidth: '640px', marginBottom: '80px' }}>
-                    <strong>{form.name || t('wizard.summary.unnamed')}</strong> · {t('wizard.summary.model')}: {selectedModel.label}
+                    <strong>{form.name || t('wizard.summary.unnamed')}</strong> · {t('wizard.summary.model')}: {getLlmModelLabel(selectedModel, t)}
                     {form.max_tokens_per_day && ` · ${t('wizard.summary.dailyLimit')}: ${Number(form.max_tokens_per_day).toLocaleString()}`}
                 </div>
             )}

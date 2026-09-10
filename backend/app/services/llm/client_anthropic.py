@@ -1,4 +1,5 @@
 from app.services.llm.client_shared import *  # noqa: F401,F403
+from app.services.llm.provider_parameters import merge_request_headers
 
 class AnthropicClient(LLMClient):
     """Client for Anthropic's native Messages API.
@@ -16,6 +17,7 @@ class AnthropicClient(LLMClient):
         model: str | None = None,
         timeout: float = 120.0,
         provider_managed_timeout: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(
             api_key,
@@ -23,6 +25,7 @@ class AnthropicClient(LLMClient):
             model,
             timeout,
             provider_managed_timeout,
+            extra_headers,
         )
         self._client: httpx.AsyncClient | None = None
 
@@ -35,17 +38,18 @@ class AnthropicClient(LLMClient):
                     provider_managed_timeout=self.provider_managed_timeout,
                 ),
                 follow_redirects=True,
+                event_hooks=self._request_event_hooks(),
                 proxy=None,
             )
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
-        return {
+        return merge_request_headers({
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
             "anthropic-version": self.API_VERSION,
             "anthropic-beta": "prompt-caching-2024-07-31",
-        }
+        }, self.extra_headers)
 
     def _normalize_base_url(self) -> str:
         """Normalize base URL by stripping trailing API paths."""

@@ -4,7 +4,7 @@ from alembic import context, op
 from sqlalchemy import text
 
 revision = "additive_agent_permissions"
-down_revision = "merge_media_model_runtime"
+down_revision = "model_extra_headers"
 branch_labels = None
 depends_on = None
 

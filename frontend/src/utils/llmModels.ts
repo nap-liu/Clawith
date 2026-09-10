@@ -6,6 +6,7 @@ export const INPUT_MODALITIES: InputModality[] = ["text", "image", "audio", "vid
 export interface LlmModelListItem {
     id: string;
     provider?: string;
+    service_platform?: string;
     model?: string;
     label?: string;
     enabled?: boolean;
@@ -21,10 +22,25 @@ const modelNameCollator = new Intl.Collator(['zh-CN', 'en'], {
     sensitivity: 'base',
 });
 
-export function getLlmModelLabel(model: LlmModelListItem): string {
+type ModelLabelTranslate = (key: string, options: { defaultValue: string }) => string;
+
+export function getLlmModelName(model: LlmModelListItem): string {
     return model.label?.trim()
-        || [model.provider, model.model].filter(Boolean).join(' · ')
+        || model.model
         || model.id;
+}
+
+export function getLlmModelPlatform(model: LlmModelListItem): string {
+    return model.service_platform || model.provider || '';
+}
+
+export function getLlmModelPlatformLabel(model: LlmModelListItem, t: ModelLabelTranslate): string {
+    const platform = getLlmModelPlatform(model);
+    return platform ? t(`enterprise.llm.providers.${platform}`, { defaultValue: platform }) : '';
+}
+
+export function getLlmModelLabel(model: LlmModelListItem, t: ModelLabelTranslate): string {
+    return [getLlmModelName(model), getLlmModelPlatformLabel(model, t)].filter(Boolean).join(' · ');
 }
 
 export function sortLlmModels<T extends LlmModelListItem>(models: readonly T[]): T[] {
@@ -32,14 +48,14 @@ export function sortLlmModels<T extends LlmModelListItem>(models: readonly T[]):
         .map((model, index) => ({ model, index }))
         .sort((left, right) => {
             const byName = modelNameCollator.compare(
-                getLlmModelLabel(left.model),
-                getLlmModelLabel(right.model),
+                getLlmModelName(left.model),
+                getLlmModelName(right.model),
             );
             if (byName !== 0) return byName;
 
             const byProvider = modelNameCollator.compare(
-                left.model.provider || '',
-                right.model.provider || '',
+                getLlmModelPlatform(left.model),
+                getLlmModelPlatform(right.model),
             );
             if (byProvider !== 0) return byProvider;
 

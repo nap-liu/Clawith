@@ -83,6 +83,12 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
             "qwen3.6-plus": 32768,
         },
     ),
+    "tokenhub": ProviderSpec(
+        provider="tokenhub",
+        display_name="Tencent TokenHub",
+        protocol="openai_responses",
+        default_base_url="https://tokenhub.tencentmaas.com/v1",
+    ),
     "hunyuan": ProviderSpec(
         provider="hunyuan",
         display_name="Tencent Hunyuan",
@@ -191,6 +197,8 @@ def resolve_api_protocol(provider: str, api_protocol: str | None = None) -> str:
 
 def get_provider_manifest() -> list[dict[str, Any]]:
     """List supported providers and capabilities for UI/config discovery."""
+    from app.services.model_headers import default_model_headers
+
     out: list[dict[str, Any]] = []
     for spec in PROVIDER_REGISTRY.values():
         out.append({
@@ -199,6 +207,7 @@ def get_provider_manifest() -> list[dict[str, Any]]:
             "protocol": spec.protocol,
             "preferred_protocol": "openai_responses" if spec.provider in {"openai", "openai-response", "qwen"} else spec.protocol,
             "default_base_url": spec.default_base_url,
+            "default_extra_headers": default_model_headers(spec.provider, spec.default_base_url),
             "supports_tool_choice": spec.supports_tool_choice,
             "default_max_tokens": spec.default_max_tokens,
             "model_max_tokens": spec.model_max_tokens,
@@ -287,6 +296,7 @@ def create_llm_client(
     *,
     provider_managed_timeout: bool = False,
     api_protocol: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> LLMClient:
     """Create an LLM client for the given provider.
 
@@ -298,6 +308,8 @@ def create_llm_client(
         timeout: Connection and auxiliary-call timeout in seconds
         provider_managed_timeout: Deprecated compatibility flag. Provider
             response reads are always unbounded.
+        extra_headers: Configured HTTP headers. None inherits provider defaults;
+            an empty dictionary explicitly clears those optional defaults.
 
     Returns:
         An instance of the appropriate LLMClient subclass
@@ -311,10 +323,15 @@ def create_llm_client(
 
     # Get base URL
     final_base_url = get_provider_base_url(normalized_provider, base_url)
+    if extra_headers is None:
+        from app.services.model_headers import default_model_headers
+
+        extra_headers = default_model_headers(normalized_provider, final_base_url)
 
     # Create appropriate client
     if protocol == "anthropic":
         return AnthropicClient(
+            extra_headers=extra_headers,
             api_key=api_key,
             base_url=final_base_url,
             model=model,
@@ -323,6 +340,7 @@ def create_llm_client(
         )
     elif protocol == "openai_responses":
         return OpenAIResponsesClient(
+            extra_headers=extra_headers,
             api_key=api_key,
             base_url=final_base_url,
             model=model,
@@ -332,6 +350,7 @@ def create_llm_client(
         )
     elif protocol == "gemini":
         return GeminiClient(
+            extra_headers=extra_headers,
             api_key=api_key,
             base_url=final_base_url,
             model=model,
@@ -342,6 +361,7 @@ def create_llm_client(
     elif normalized_provider in PROVIDER_CLIENTS:
         supports_tool_choice = normalized_provider in TOOL_CHOICE_PROVIDERS
         return OpenAICompatibleClient(
+            extra_headers=extra_headers,
             api_key=api_key,
             base_url=final_base_url,
             model=model,
@@ -354,6 +374,7 @@ def create_llm_client(
     else:
         # Default to OpenAI-compatible for unknown providers
         return OpenAICompatibleClient(
+            extra_headers=extra_headers,
             api_key=api_key,
             base_url=final_base_url or PROVIDER_URLS["openai"],
             model=model,
@@ -381,12 +402,16 @@ async def chat_complete(
     max_tokens: int | None = None,
     timeout: float = 120.0,
     api_protocol: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict:
     """High-level function for non-streaming chat completion.
 
     Returns response in OpenAI-compatible format for backward compatibility.
     """
-    client = create_llm_client(provider, api_key, model, base_url, timeout, api_protocol=api_protocol)
+    client = create_llm_client(
+        provider, api_key, model, base_url, timeout,
+        api_protocol=api_protocol, extra_headers=extra_headers,
+    )
 
     try:
         llm_messages = [LLMMessage(**m) for m in messages]
@@ -428,12 +453,16 @@ async def chat_stream(
     on_chunk: ChunkCallback | None = None,
     on_thinking: ThinkingCallback | None = None,
     api_protocol: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict:
     """High-level function for streaming chat completion.
 
     Returns aggregated response in OpenAI-compatible format.
     """
-    client = create_llm_client(provider, api_key, model, base_url, timeout, api_protocol=api_protocol)
+    client = create_llm_client(
+        provider, api_key, model, base_url, timeout,
+        api_protocol=api_protocol, extra_headers=extra_headers,
+    )
 
     try:
         llm_messages = [LLMMessage(**m) for m in messages]

@@ -10,6 +10,7 @@ import { SettingsDrawer, SettingsField, SettingsSection } from '../../../compone
 import { agentApi } from '../../../services/api';
 import { fetchJson } from '../utils/fetchJson';
 import type { PoolModel } from './LlmModelForm';
+import { getLlmModelLabel } from '../../../utils/llmModels';
 
 export default function LlmMediaTest({ model, tenantId, onClose }: {
     model: PoolModel;
@@ -64,7 +65,7 @@ export default function LlmMediaTest({ model, tenantId, onClose }: {
             setSubmitting(false);
         }
     };
-    return <SettingsDrawer title={t('enterprise.llm.mediaTest')} description={model.label || model.model}
+    return <SettingsDrawer title={t('enterprise.llm.mediaTest')} description={getLlmModelLabel(model, t)}
         busy={submitting} onClose={onClose} footer={<>
             <Button variant="secondary" disabled={submitting} onClick={onClose}>{t('common.close')}</Button>
             <Button variant="primary" type="submit" form={formId} disabled={submitting || invalid}>

@@ -8,7 +8,7 @@ import { translateTemplate } from '../i18n/templateTranslations';
 import { useDialog } from './Dialog/DialogProvider';
 import SelectDropdown from './SelectDropdown';
 import AgentPermissionsEditor, { permissionGrants, type AgentPermissionsValue } from './AgentPermissionsEditor';
-import { sortLlmModels } from '../utils/llmModels';
+import { getLlmModelLabel, sortLlmModels, type LlmModelListItem } from '../utils/llmModels';
 
 interface Template {
     id: string;
@@ -18,7 +18,7 @@ interface Template {
     category?: string;
 }
 
-interface Model {
+interface Model extends LlmModelListItem {
     id: string;
     provider: string;
     model: string;
@@ -155,7 +155,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
 
     if (!open || !template) return null;
 
-    const labelFor = (m: Model) => m.label || `${m.provider} · ${m.model}`;
+    const labelFor = (m: Model) => getLlmModelLabel(m, t);
     const busy = hire.isPending;
 
     return (

@@ -54,6 +54,7 @@ async def create_subagent(
             raise SubagentError("Subagent 不能继续创建 Subagent。")
 
         project = None
+        execution_origin = None
         if parent.project_id is not None:
             from app.models.project import Project
             from app.services.project_service import resolve_project_execution_user
@@ -67,12 +68,14 @@ async def create_subagent(
                 raise SubagentError("项目执行用户不可用。") from exc
             resolved_user_id = resolved_user.id
         else:
-            from app.services.execution_identity import resolve_execution_user_id
+            from app.services.subagent_execution_identity import resolve_subagent_execution_user
 
-            resolved_user_id = await resolve_execution_user_id(
+            resolved_user_id, execution_origin = await resolve_subagent_execution_user(
                 db,
                 agent,
                 execution_user_id,
+                parent=parent,
+                anchor_id=turn_anchor_id,
             )
 
         async def _load_authorized_existing() -> SubagentRun | None:
@@ -190,6 +193,7 @@ async def create_subagent(
             is_primary=False,
             is_group=False,
             im_config={
+                "execution_origin": execution_origin,
                 "executor": executor,
                 "project_id": str(parent.project_id) if parent.project_id else None,
                 "project_group_session_id": str(parent.id) if parent.project_id else None,

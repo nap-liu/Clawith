@@ -12,6 +12,7 @@ import websockets
 
 from app.config import get_settings
 from app.services.llm.failure_outcome import render_message
+from app.services.llm.provider_parameters import merge_request_headers
 from app.services.speech_recognition import build_run_task, build_finish_task, parse_result_event
 
 settings = get_settings()
@@ -25,7 +26,9 @@ async def stream_dashscope(websocket, credentials):
 
     async with websockets.connect(
         credentials.base_url or settings.ASR_WEBSOCKET_URL,
-        additional_headers={"Authorization": f"Bearer {credentials.api_key}"},
+        additional_headers=merge_request_headers(
+            {"Authorization": f"Bearer {credentials.api_key}"}, dict(credentials.extra_headers),
+        ),
         open_timeout=10,
         close_timeout=5,
         ping_interval=20,
@@ -117,7 +120,9 @@ async def transcribe_pcm(credentials, pcm: bytes) -> str:
         endpoint += "/audio/transcriptions"
     async with httpx.AsyncClient(timeout=credentials.timeout) as client:
         response = await client.post(
-            endpoint, headers={"Authorization": f"Bearer {credentials.api_key}"},
+            endpoint, headers=merge_request_headers(
+                {"Authorization": f"Bearer {credentials.api_key}"}, dict(credentials.extra_headers),
+            ),
             data={"model": credentials.model},
             files={"file": ("recording.wav", audio.getvalue(), "audio/wav")},
         )

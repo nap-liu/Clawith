@@ -8,13 +8,10 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.services.media_ai_contract import MEDIA_AI_DEFAULTS
+from app.services.media_ai_bailian_generation import IMAGE_PATH, MULTIMODAL_PATH, VIDEO_PATH, image_payload
+from app.services.media_ai_bailian_video import video_payload
+from app.services.media_ai_headers import provider_headers
 from app.services.media_ai_io import MediaAIError, MediaInput, media_content
-
-MULTIMODAL_PATH = "/api/v1/services/aigc/multimodal-generation/generation"
-VIDEO_PATH = "/api/v1/services/aigc/video-generation/video-synthesis"
-IMAGE_SIZES = {"1:1": "1024*1024", "16:9": "1536*864", "9:16": "864*1536",
-               "4:3": "1152*864", "3:4": "864*1152"}
-
 
 def connection(config: dict) -> dict:
     resolved = {**MEDIA_AI_DEFAULTS, **{k: v for k, v in config.items() if v is not None and v != ""}}
@@ -59,9 +56,9 @@ def _check_response(response: httpx.Response) -> dict:
 
 
 async def request(config: dict, path: str, payload: dict | None = None, *, asynchronous=False) -> dict:
-    headers = {"Authorization": f"Bearer {config['api_key']}"}
-    if asynchronous:
-        headers["X-DashScope-Async"] = "enable"
+    headers = provider_headers(config)
+    if asynchronous or (payload is not None and path == IMAGE_PATH):
+        headers["x-dashscope-async"] = "enable"
     async with httpx.AsyncClient(timeout=180, follow_redirects=False) as client:
         response = await client.request(
             "POST" if payload is not None else "GET", config["base_url"] + path,
@@ -86,7 +83,7 @@ async def understand(config: dict, prompt: str, media: list[MediaInput], *, hist
     async with httpx.AsyncClient(timeout=180) as client:
         async with client.stream(
             "POST", config["base_url"] + "/compatible-mode/v1/chat/completions",
-            json=payload, headers={"Authorization": f"Bearer {config['api_key']}"},
+            json=payload, headers=provider_headers(config),
         ) as response:
             if not response.is_success:
                 await response.aread()
@@ -118,6 +115,7 @@ async def understand(config: dict, prompt: str, media: list[MediaInput], *, hist
 
 def generation_payload(config: dict, args: dict, media: list[MediaInput]) -> tuple[str, dict]:
     kind = args["output_type"]
+    options = dict(args.get("parameters") or {})
     if kind == "image" and any(item.kind != "image" for item in media):
         raise MediaAIError("referenceImagesOnly")
     if kind == "audio":
@@ -125,35 +123,14 @@ def generation_payload(config: dict, args: dict, media: list[MediaInput]) -> tup
             raise MediaAIError("unsupportedOptions")
         return MULTIMODAL_PATH, {
             "model": config["audio_model"],
-            "input": {"text": args["prompt"], "voice": args.get("voice", "Cherry"), "language_type": "Auto"},
+            "input": {"language_type": "Auto", **options, "text": args["prompt"],
+                      "voice": args.get("voice", options.get("voice", "Cherry"))},
         }
     if "voice" in args or (kind == "image" and "duration" in args):
         raise MediaAIError("unsupportedOptions")
     if kind == "image":
-        size = args.get("size") or IMAGE_SIZES.get(args.get("ratio", "1:1"))
-        if not size:
-            raise MediaAIError("unsupportedOptions")
-        return MULTIMODAL_PATH, {
-            "model": config["image_model"],
-            "input": {"messages": [{"role": "user", "content": [
-                *[{"image": item.data_url} for item in media], {"text": args["prompt"]},
-            ]}]},
-            "parameters": {"n": 1, "size": size},
-        }
-    references = []
-    for item in media:
-        role = item.role or ("first_frame" if len(media) == 1 and item.kind == "image" else f"reference_{item.kind}")
-        expected = "image" if role in {"first_frame", "last_frame"} else role.removeprefix("reference_")
-        if expected != item.kind:
-            raise MediaAIError("inputCombination")
-        references.append({"type": role, "url": item.data_url})
-    return VIDEO_PATH, {
-        "model": config["video_model"],
-        "input": {"prompt": args["prompt"], **({"media": references} if media else {})},
-        "parameters": {"resolution": args.get("resolution", "720P"), "ratio": args.get("ratio", "adaptive" if media else "16:9"),
-                       "duration": args.get("duration", 5)},
-    }
-
+        return image_payload(config["image_model"], args, media)
+    return VIDEO_PATH, video_payload(config["video_model"], args, media)
 
 def result_url(result: dict, kind: str) -> str:
     output = result.get("output") or {}

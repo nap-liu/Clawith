@@ -3833,10 +3833,19 @@
         "gemini": "Gemini"
       },
       "poolTitle": "Model pool",
+      "servicePlatform": "Service platform",
+      "allPlatforms": "All service platforms",
+      "searchModels": "Search model name or service platform",
+      "noMatchingModels": "No matching models",
       "connectionSettings": "Connection",
       "capabilitySettings": "Capabilities",
       "responseSettings": "Response settings",
       "requestSettings": "Request settings",
+      "extraHeaders": "Extra headers",
+      "headerName": "Header name",
+      "headerValue": "Header value",
+      "addHeader": "Add header",
+      "extraHeadersHint": "Sent with model requests. Remove all entries to clear extra headers.",
       "providerDefault": "Use provider default",
       "imaginationLow": "Stable",
       "imaginationMiddle": "Balanced",
@@ -3844,6 +3853,8 @@
       "testSettings": "Test input",
       "testResult": "Test result",
       "providers": {
+        "tokenhub": "Tencent TokenHub",
+        "bailian": "Alibaba Cloud Bailian",
         "hunyuan": "Tencent Hunyuan",
         "volcengine": "Volcengine Ark"
       },

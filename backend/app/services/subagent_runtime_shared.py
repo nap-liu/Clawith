@@ -557,9 +557,12 @@ async def _validate_execution_identity(
         ):
             raise RuntimeError("Project member is no longer active")
     else:
-        from app.services.execution_identity import resolve_execution_user_id
+        from app.services.subagent_execution_identity import resolve_subagent_execution_user
 
-        await resolve_execution_user_id(db, agent, run.execution_user_id)
+        await resolve_subagent_execution_user(
+            db, agent, run.execution_user_id,
+            origin=dict(child.im_config or {}).get("execution_origin"),
+        )
     return agent
 
 

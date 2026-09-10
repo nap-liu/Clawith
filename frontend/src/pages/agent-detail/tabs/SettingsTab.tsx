@@ -91,7 +91,7 @@ export default function SettingsTab(props: Props) {
             llmModels.filter((model: any) => model.enabled || model.id === currentId),
         ).map((model: any) => ({
             value: model.id as string,
-            label: getLlmModelLabel(model),
+            label: getLlmModelLabel(model, t),
         })),
     ];
     const readOnly = !canManage;

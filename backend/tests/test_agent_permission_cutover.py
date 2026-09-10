@@ -13,6 +13,8 @@ from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from tests.test_bootstrap_db import empty_database, execute, run_bootstrap  # noqa: F401
 
+PARENT_REVISION = "model_extra_headers"
+
 
 def alembic(url, *arguments, success=True):
     return run_bootstrap(
@@ -46,7 +48,7 @@ def test_offline_conversion_refuses_online_upgrade_and_never_restores_old_roster
     # Fresh bootstrap remains automatic; an empty schema has no ACL decisions
     # and can be taken to the parent to construct the previous representation.
     run_bootstrap(url)
-    alembic(url, "downgrade", "merge_media_model_runtime")
+    alembic(url, "downgrade", PARENT_REVISION)
     tenant_id, owner_id, user_id, replacement_id = (uuid.uuid4() for _ in range(4))
     execute(url, Tenant.__table__.insert().values(id=tenant_id, name="ACL migration", slug="acl-migration"))
     for uid in (owner_id, user_id, replacement_id):
@@ -92,7 +94,7 @@ def test_offline_conversion_refuses_online_upgrade_and_never_restores_old_roster
         agent_id=agent_ids[1], scope_type="user", scope_id=replacement_id, access_level="manage",
     ))
     latest = snapshot(url)
-    refused = alembic(url, "downgrade", "merge_media_model_runtime", success=False)
+    refused = alembic(url, "downgrade", PARENT_REVISION, success=False)
     assert "cannot be downgraded safely" in refused.stderr
     assert snapshot(url) == latest
     assert asyncio.run(access_levels(url, user_id, [agent_ids[1]])) == [None]
@@ -102,7 +104,7 @@ def test_offline_conversion_refuses_online_upgrade_and_never_restores_old_roster
 async def test_cutover_fails_boundedly_while_an_old_writer_holds_the_agent_table(empty_database):  # noqa: F811
     url = empty_database
     await asyncio.to_thread(run_bootstrap, url)
-    await asyncio.to_thread(alembic, url, "downgrade", "merge_media_model_runtime")
+    await asyncio.to_thread(alembic, url, "downgrade", PARENT_REVISION)
     engine = create_async_engine(url)
     try:
         async with engine.begin() as connection:
@@ -113,6 +115,6 @@ async def test_cutover_fails_boundedly_while_an_old_writer_holds_the_agent_table
             )
             assert "lock timeout" in refused.stderr
             revision = await asyncio.to_thread(execute, url, "SELECT version_num FROM alembic_version")
-            assert revision == [("merge_media_model_runtime",)]
+            assert revision == [(PARENT_REVISION,)]
     finally:
         await engine.dispose()

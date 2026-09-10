@@ -124,3 +124,38 @@ requested scope and confirmed canonical documentation matches the implementation
 The [maintenance release plan](RELEASE-PLAN.md) records the remaining authorization,
 actual-production-state, immutable-image and backup/restore rehearsal gates.
 Normal online release remains NO-GO.
+
+## Company main integration
+
+The permission implementation was saved as local commit `81fe5e13`, then
+`yybpc/company/main` at `e7abac770197f493e0efbd8975164f766041918f` was merged
+into this feature branch. One import conflict in PostHireSettingsModal was
+resolved by retaining the shared permission editor and the new model-label
+helpers together. Creation/model headers and both i18n additions merged intact.
+Whitespace in the newly tracked editor CSS was cleaned before the first commit.
+
+The unpublished ACL migration now follows `model_extra_headers`, keeping one
+head: `additive_agent_permissions`. Its cutover tests use that current main
+parent. A fresh task-owned PostgreSQL database, `test_agent_permissions_merged`,
+was used instead of changing the earlier candidate's stamped database.
+
+Docker validation after integration: **37 tests passed**, covering cutover,
+additive permissions, Agent route creation/provisioning, MCP, model header API
+configuration and serving-platform labels:
+
+```sh
+python -m pytest -p no:cacheprovider -q \
+  tests/test_agent_permission_cutover.py tests/test_agent_additive_permissions.py \
+  tests/test_agent_create_route.py tests/test_agent_provisioning.py \
+  tests/test_mcp_config_tools.py tests/test_model_headers_config.py \
+  tests/test_model_platform.py
+```
+
+Frontend `npm run build` passed all prebuild checks, TypeScript and Vite.
+The single Alembic head, focused Ruff and staged diff checks passed; all source
+files delivered from the original baseline remain within 800 lines (maximum 777).
+No provider calls, full-suite or new browser run was needed for this import and
+migration-order integration. The previous browser results concern the prior
+candidate, and the retained long-running local API is not claimed as the merged
+candidate's validation environment. No push, production inspection or deployment
+was performed; unrelated original-checkout work remains untouched.

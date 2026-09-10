@@ -14,7 +14,25 @@ from app.services.read_media_compat import media_input_workspace
 
 
 
-async def prepare_media_context(agent, child, anchor, request: dict) -> tuple[dict, list[dict]]:
+def _native_override(parameters: dict, key: str) -> bool:
+    """Current native controls outrank inherited normalized defaults."""
+    aliases = {
+        "duration": {"duration", "seconds"},
+        "ratio": {"ratio", "aspect_ratio", "size"},
+        "size": {"size", "ratio", "aspect_ratio"},
+        "resolution": {"resolution", "mode", "size"},
+        "voice": {"voice", "voice_id", "timbre_weights"},
+    }
+    if aliases[key].intersection(parameters):
+        return True
+    settings = parameters.get("settings")
+    if isinstance(settings, dict) and aliases[key].intersection(settings):
+        return True
+    voice = parameters.get("voice_setting")
+    return key == "voice" and isinstance(voice, dict) and "voice_id" in voice
+
+
+async def prepare_media_context(agent, child, anchor, request: dict, *, prepare_inputs=None) -> tuple[dict, list[dict]]:
     args = dict(request["arguments"])
     async with async_session() as db:
         all_inputs = (await db.scalars(select(ChatMessage).where(
@@ -45,9 +63,14 @@ async def prepare_media_context(agent, child, anchor, request: dict) -> tuple[di
             if source not in args["_context_sources"]:
                 args["_context_sources"].append(source)
     if request["tool"] == "generate_media":
+        supplied_parameters = dict(args.get("parameters") or {})
+        if ("parameters" not in args and previous_context.get("output_type") == args["output_type"]
+                and previous_context.get("model_id") == request.get("config", {}).get("model_id")):
+            args["parameters"] = dict(previous_context.get("native_parameters") or {})
         parameter_keys = {"image": ("ratio", "size"), "video": ("ratio", "resolution", "duration"), "audio": ("voice",)}
         for key in parameter_keys[args["output_type"]]:
-            if key not in args and key in previous_context.get("parameters", {}):
+            if (key not in args and not _native_override(supplied_parameters, key)
+                    and key in previous_context.get("parameters", {})):
                 args[key] = previous_context["parameters"][key]
         if "files" not in args:
             kind = args["output_type"]
@@ -59,6 +82,8 @@ async def prepare_media_context(agent, child, anchor, request: dict) -> tuple[di
     elif "files" not in args:
         args["files"] = []
     if request["tool"] == "read_media":
+        if prepare_inputs is not None:
+            await prepare_inputs(args, previous_context)
         model = await media_context_model(agent, request)
         usage = (prior_result.message_meta or {}).get("media_result", {}).get("usage", {}) if prior_result else {}
         await maybe_compact(

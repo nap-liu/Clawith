@@ -52,6 +52,9 @@ from the previous effective company level. This avoids activating stale hidden
 grants. Private grants are removed because the prior evaluator honored only
 built-in authority there. Custom company rows are removed; custom user and
 department grants remain.
+Its parent is the company main migration `model_extra_headers`; the migration
+graph has one head. Re-parenting this unpublished candidate requires a new
+isolated validation database rather than reusing an earlier candidate's stamp.
 
 This is a one-time **offline writer cutover**, not a backward-compatible online
 migration. The default online production workflow is NO-GO. Before touching an

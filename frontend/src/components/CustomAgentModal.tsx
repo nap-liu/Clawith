@@ -316,7 +316,7 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                                                 value={modelId}
                                                 options={sortedEnabledModels.map((model) => ({
                                                     value: model.id,
-                                                    label: `${getLlmModelLabel(model)}${myTenant?.default_model_id === model.id ? ` · ${t('customAgentModal.defaultModel')}` : ''}`,
+                                                    label: `${getLlmModelLabel(model, t)}${myTenant?.default_model_id === model.id ? ` · ${t('customAgentModal.defaultModel')}` : ''}`,
                                                 }))}
                                                 onChange={setModelId}
                                                 ariaLabel={t('customAgentModal.model')}

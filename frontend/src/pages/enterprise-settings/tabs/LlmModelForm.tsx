@@ -4,6 +4,7 @@ import SelectDropdown from '../../../components/SelectDropdown';
 import MultiSelectDropdown from '../../../components/ui/MultiSelectDropdown';
 import Button from '../../../components/ui/Button';
 import TextInput from '../../../components/ui/TextInput';
+import KeyValueEditor from '../../../components/ui/KeyValueEditor';
 import { SettingsDrawer, SettingsField, SettingsSection } from '../../../components/ui/SettingsForm';
 import DivergenceSlider from '../../../components/DivergenceSlider';
 import ReasoningEffortSelect, { type ReasoningEffortValue } from '../../../components/ReasoningEffortSelect';
@@ -15,6 +16,7 @@ export interface PoolModel extends LlmModelListItem {
     model: string;
     label: string;
     base_url?: string;
+    extra_headers?: Record<string, string> | null;
     max_output_tokens?: number;
     request_timeout?: number;
     temperature?: number;
@@ -30,6 +32,7 @@ export interface ProviderSpec {
     protocol: string;
     preferred_protocol?: string;
     default_base_url?: string | null;
+    default_extra_headers?: Record<string, string>;
     default_max_tokens: number;
 }
 
@@ -52,6 +55,7 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
         label: model?.label || '',
         api_key: '',
         base_url: model?.base_url || (model ? '' : defaultSpec?.default_base_url || ''),
+        extra_headers: model ? model.extra_headers || {} : defaultSpec?.default_extra_headers || {},
         max_output_tokens: String(model?.max_output_tokens ?? defaultSpec?.default_max_tokens ?? 4096),
         request_timeout: String(model?.request_timeout ?? ''),
         temperature: model?.temperature ?? null as number | null,
@@ -61,6 +65,7 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
         keep_recent_turns: String(model?.keep_recent_turns ?? 3),
     });
     const [testing, setTesting] = useState(false);
+    const [headersChange, setHeadersChange] = useState<'unchanged' | 'provider' | 'edited'>('unchanged');
     const [testResult, setTestResult] = useState('');
     const [error, setError] = useState('');
     const busy = saving || testing;
@@ -76,6 +81,11 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
         || !form.purposes.length || !form.input_modalities.length;
     const payload = () => ({
         ...form,
+        extra_headers: headersChange === 'edited'
+            ? form.extra_headers
+            : headersChange === 'provider'
+                ? (Object.keys(form.extra_headers).length ? form.extra_headers : null)
+                : !model && Object.keys(form.extra_headers).length ? form.extra_headers : undefined,
         api_protocol: form.api_protocol || null,
         max_output_tokens: form.max_output_tokens ? Number(form.max_output_tokens) : null,
         request_timeout: form.request_timeout ? Number(form.request_timeout) : null,
@@ -155,7 +165,9 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
                             ...(providers.some(p => p.provider === form.provider) ? [] : [{ value: form.provider, label: form.provider }]),
                         ]} onChange={provider => {
                             const spec = providers.find(p => p.provider === provider);
+                            setHeadersChange('provider');
                             update({ provider, base_url: spec?.default_base_url || '',
+                                extra_headers: spec?.default_extra_headers || {},
                                 api_protocol: spec?.preferred_protocol || spec?.protocol || 'openai_compatible' });
                         }} ariaLabel={t('enterprise.llm.provider')} />
                 </SettingsField>
@@ -197,6 +209,17 @@ export default function LlmModelForm({ model, providers, onSave, onCancel, savin
             </SettingsSection>}
             <SettingsSection title={t('enterprise.llm.requestSettings')}>
                 {input('request_timeout', 'enterprise.llm.requestTimeout', 'number', t('enterprise.llm.requestTimeoutDesc'))}
+                <KeyValueEditor value={form.extra_headers} disabled={busy}
+                    label={t('enterprise.llm.extraHeaders')}
+                    keyPlaceholder={t('enterprise.llm.headerName')}
+                    valuePlaceholder={t('enterprise.llm.headerValue')}
+                    addLabel={t('enterprise.llm.addHeader')}
+                    helperHint={t('enterprise.llm.extraHeadersHint')}
+                    isSecretKey={key => /authorization|api[-_]?key|token|secret|cookie/i.test(key)}
+                    onChange={extra_headers => {
+                        setHeadersChange('edited');
+                        update({ extra_headers });
+                    }} />
             </SettingsSection>
         </form>
     </SettingsDrawer>;

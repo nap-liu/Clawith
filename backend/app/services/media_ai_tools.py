@@ -46,6 +46,8 @@ async def execute_media_tool(state) -> str:
         validate(state.arguments, schema, format_checker=FormatChecker())
         if not state.arguments["prompt"].strip():
             raise MediaAIError("invalidArguments")
+        if state.tool_name == "read_media" and not state.arguments.get("session_id") and not state.arguments.get("files"):
+            raise MediaAIError("inputCombination")
         existing = await find_submitted_task(state.session_id, state.tool_call_id)
         if existing is not None:
             return json.dumps(task_receipt(existing), ensure_ascii=False)
