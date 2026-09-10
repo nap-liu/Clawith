@@ -272,6 +272,7 @@ async def create_agent(
         permission_scope_type=data.permission_scope_type,
         permission_scope_ids=data.permission_scope_ids,
         permission_access_level=data.permission_access_level,
+        permission_grants=data.permission_grants,
         autonomy_policy=data.autonomy_policy,
         max_tokens_per_day=data.max_tokens_per_day,
         max_tokens_per_month=data.max_tokens_per_month,

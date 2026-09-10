@@ -60,7 +60,7 @@
 }
 
 .select-dropdown__menu {
-    z-index: 10001;
+    z-index: 10060;
     box-sizing: border-box;
     width: var(--radix-select-trigger-width);
     max-height: min(240px, var(--radix-select-content-available-height));

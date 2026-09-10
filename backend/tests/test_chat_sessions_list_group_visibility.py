@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import select, update
 
 from app.database import async_session, engine
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentPermission
 from app.models.audit import ChatMessage  # noqa: F401
 from app.models.chat_session import ChatSession
 from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
@@ -77,6 +77,8 @@ async def _seed_agent(
             company_access_level=company_access_level,
         )
         db.add(agent)
+        await db.flush()
+        db.add(AgentPermission(agent_id=agent.id, scope_type="company", access_level=company_access_level))
         await db.commit()
         await db.refresh(agent)
         return agent.id

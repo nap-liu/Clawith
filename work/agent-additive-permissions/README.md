@@ -1,0 +1,126 @@
+# Agent additive permissions iteration
+
+- Baseline: yybpc/company/main, `0cc8c01c1eb39a8c17f67f6333dbf701369aa677`.
+- Branch: `feat/agent-additive-permissions`.
+- Task worktree, relative to the original repository: `.worktrees/agent-additive-permissions`.
+- Scope: normalized company/department/user grants; shared REST creation/settings
+  and MCP writer; shared frontend editor; safe legacy normalization.
+- Original checkout and unrelated worktrees were preserved. No production
+  inspection, provider messaging, push, tag or deployment was performed.
+
+## Validation
+
+All application validation ran in Docker, with the exact task backend mounted
+at `/app` and isolated PostgreSQL databases. No host Python or virtualenv was used.
+
+- 60 affected tests passed: additive ACL (3), visibility, creation, provisioning,
+  MCP configuration, contact relationships, group-session access and visibility.
+- After the final test-only import/format cleanup, the affected MCP/contact
+  subset passed again (34 tests).
+- The original baseline MCP configuration suite passed (21 tests). Old test
+  expectations for dormant grants and copied creator rows were updated to the
+  accepted additive semantics. Contact tests now use PostgreSQL rather than
+  SQLite; their mocked tool adapter runs in-process to share the fixture
+  transaction, independently of execution-process integration tests.
+- Focused Ruff checks passed. TypeScript checking and Vite production build
+  passed; Vite retained its existing large-chunk advisory.
+- `git diff --check` passed. Every changed/new hand-written source is at most
+  800 physical lines; the largest is the existing schema module at 772 lines.
+
+The initial migration was exercised against an isolated database bootstrapped by the actual
+baseline checkout. Company/custom/private Agents had deliberately hidden grants.
+Upgrade preserved other-user effective levels as use/manage/none respectively,
+archived all three old rosters and retained only the two effective optional rows.
+Its original unchanged-state downgrade was subsequently rejected by independent
+audit and replaced by the stricter maintenance conversion described below.
+
+Playwright used the isolated frontend nginx proxy on container port 3008, backed
+by the task API and PostgreSQL. It verified:
+
+- Company off/on preserves a named manager.
+- Department management saves alongside company use and personal management.
+- Creation uses the same directory picker and persists company use + manager.
+- Nested custom-creation dialogs keep both the company select and department
+  picker above their parent and fully interactive.
+
+The browser account hit its default Agent quota on the first create attempt;
+only that disposable test account's quota was raised, and the full flow passed.
+Screenshots: `permissions-complete.png`, `permissions-create.png`, and
+`permissions-modal.png`. Temporary browser authorization was removed after QA.
+
+## Retained local resources and limits
+
+Task-owned containers: `agent-permissions-test-pg`, `agent-permissions-test-api`,
+`agent-permissions-test-web`; network: `agent-permissions-test`. The isolated
+frontend is mapped to loopback port 3012, leaving the shared host port 3008 stack
+untouched. Task dependency volumes are `agent-permissions-node-modules` and
+`agent-permissions-browser-modules`. These resources and this dirty task worktree
+are retained for the next authorized iteration; owner: this task.
+
+Full-suite testing, production migration/cutover and production/provider smoke
+tests were not performed. Migration requires a separately approved offline
+writer cutover; old permission writers must remain stopped from before conversion
+until the candidate alone starts. Legacy columns remain display compatibility
+projections for the supported capability. Deprecated Plaza is out of scope.
+
+## Independent audit fixes
+
+See `AUDIT.md` for the initial findings and independent follow-up review.
+Settings now derive editable state from complete grants, retaining explicit
+administrator levels and inactive departments. Directory metadata does not
+decide which grants exist.
+
+The conversion rejects normal online Alembic/bootstrap execution on an existing
+parent database. It requires `-x agent_permissions_cutover=offline`, an explicit
+operator assertion of a separately approved and verified maintenance state.
+It bounds lock waits to 5 seconds and statements to 60 seconds. Nonempty-database
+downgrade always refuses; archived rosters are never automatically restored over
+new decisions. Fresh empty-database bootstrap remains automatic.
+
+Five focused PostgreSQL tests passed: the three existing additive ACL tests plus
+two real Alembic cutover tests. These verify default online/bootstrap rejection
+without changes, effective company/custom/private access after approved isolated
+conversion, repeat bootstrap, rejection after a legacy roster replacement without
+new-writer audit, and bounded failure while an old writer holds a conflicting lock.
+The test harness creates and drops its own disposable PostgreSQL databases.
+
+Exact affected test command inside the backend Docker image, with the final
+backend checkout mounted read-only at /app and an isolated DATABASE_URL:
+
+```sh
+python -m pytest -p no:cacheprovider -q \
+  tests/test_agent_permission_cutover.py tests/test_agent_additive_permissions.py
+ruff check --no-cache app/services/agent_permissions.py \
+  app/schemas/agent_permissions.py \
+  alembic/versions/20260910_additive_agent_permissions.py \
+  tests/test_agent_permission_cutover.py
+```
+
+Docker frontend `npm run build` passed its complete prebuild checks, TypeScript,
+and Vite build. The pre-existing large-chunk advisory remains.
+Initial harness attempts with the pytest executable missing the app import path
+and Ruff's cache on a read-only mount failed before checks; the exact commands
+above corrected the invocation and passed.
+
+The final Docker Playwright run passed through nginx on container port 3008.
+It verified company toggles and picker saves preserve every original grant,
+including administrator **use** and inactive-department **manage**, and creation
+persists the same normalized shape. Follow-up PostgreSQL evaluation verified
+the demoted administrator keeps explicit use and the reactivated department
+regains manage after other matching grants are removed. Screenshots were
+visually inspected.
+
+The first picker attempts used an incomplete directory fixture (no active member
+count) and then an exact button name that omitted the rendered member count.
+Adding real disposable memberships/counts and matching the department button's
+name prefix corrected the harness. A follow-up access assertion initially
+forgot that the active Operations management grant also covered the administrator;
+removing that independent matching grant confirmed the expected personal-use
+fallback. These were fixture/assertion corrections; no product behavior was
+weakened to make checks pass. Temporary browser authorization was removed.
+
+Independent follow-up review found no remaining blocking code issue within the
+requested scope and confirmed canonical documentation matches the implementation.
+The [maintenance release plan](RELEASE-PLAN.md) records the remaining authorization,
+actual-production-state, immutable-image and backup/restore rehearsal gates.
+Normal online release remains NO-GO.

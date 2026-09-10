@@ -28,8 +28,7 @@ async def ensure_access_granted_platform_relationships(
 
     Returns True when new relationship rows were added.
     """
-    access_mode = getattr(agent, "access_mode", None) or "company"
-    if access_mode not in ("private", "custom") or not agent.tenant_id:
+    if getattr(agent, "company_grant_level", None) is not None or not agent.tenant_id:
         return False
 
     # Department grants stay dynamic and are intentionally not materialized as

@@ -282,7 +282,7 @@ async def search_contacts_for_agent(
             agent_query = select(Agent).where(
                 Agent.tenant_id == source_agent.tenant_id,
                 Agent.is_deleted.is_(False),
-                Agent.access_mode == "company",
+                Agent.company_grant_level.is_not(None),
             )
             current_user_id = source_agent.creator_id
         pattern = f"%{search_text}%"

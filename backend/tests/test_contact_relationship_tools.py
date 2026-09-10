@@ -1,18 +1,14 @@
 import uuid
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import delete, select
 
-from app.database import Base
+from app.database import async_session, engine
 from app.models.agent import Agent, AgentPermission
 from app.models.identity import IdentityProvider
 from app.models.org import (
     AgentAgentRelationship,
     AgentRelationship,
-    DirectoryAccountGroup,
-    DirectoryGroupEdge,
-    OrgDepartment,
     OrgMember,
     RelationshipSuppression,
 )
@@ -27,29 +23,23 @@ from app.services.contact_relationships import (
 
 
 @pytest.fixture
-async def contact_session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    tables = [
-        Identity.__table__,
-        Tenant.__table__,
-        User.__table__,
-        Agent.__table__,
-        AgentPermission.__table__,
-        IdentityProvider.__table__,
-        OrgDepartment.__table__,
-        OrgMember.__table__,
-        DirectoryGroupEdge.__table__,
-        DirectoryAccountGroup.__table__,
-        AgentRelationship.__table__,
-        AgentAgentRelationship.__table__,
-        RelationshipSuppression.__table__,
-    ]
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
-    Session = async_sessionmaker(engine, expire_on_commit=False)
-    async with Session() as session:
-        yield session
+async def contact_session(monkeypatch):
+    # These tool-adapter tests share a transaction and monkeypatched providers.
+    # Process isolation has separate integration coverage.
+    monkeypatch.setenv("AGENT_EXECUTION_ISOLATION", "0")
     await engine.dispose()
+    async with async_session() as session:
+        yield session
+        await session.rollback()
+    await engine.dispose()
+
+
+async def _restrict_agent(session, agent):
+    await session.execute(delete(AgentPermission).where(
+        AgentPermission.agent_id == agent.id, AgentPermission.scope_type == "company",
+    ))
+    await session.flush()
+    await session.refresh(agent, ["company_grant_level"])
 
 
 async def _seed_contact_graph(session):
@@ -57,6 +47,8 @@ async def _seed_contact_graph(session):
     other_tenant_id = uuid.uuid4()
     creator_id = uuid.uuid4()
     member_user_id = uuid.uuid4()
+    target_creator_id = uuid.uuid4()
+    other_creator_id = uuid.uuid4()
     provider_id = uuid.uuid4()
     web_provider_id = uuid.uuid4()
 
@@ -65,6 +57,8 @@ async def _seed_contact_graph(session):
             Tenant(id=tenant_id, name="Acme", slug=f"acme-{uuid.uuid4().hex[:8]}"),
             Tenant(id=other_tenant_id, name="Other", slug=f"other-{uuid.uuid4().hex[:8]}"),
             Identity(id=uuid.uuid4(), username=f"creator-{uuid.uuid4().hex[:8]}"),
+            User(id=target_creator_id, tenant_id=tenant_id, display_name="Target creator"),
+            User(id=other_creator_id, tenant_id=other_tenant_id, display_name="Other creator"),
             User(
                 id=creator_id,
                 identity_id=None,
@@ -99,7 +93,7 @@ async def _seed_contact_graph(session):
     target = Agent(
         id=uuid.uuid4(),
         tenant_id=tenant_id,
-        creator_id=uuid.uuid4(),
+        creator_id=target_creator_id,
         name="Research Agent",
         role_description="Research helper",
         access_mode="company",
@@ -109,7 +103,7 @@ async def _seed_contact_graph(session):
     other_tenant_agent = Agent(
         id=uuid.uuid4(),
         tenant_id=other_tenant_id,
-        creator_id=uuid.uuid4(),
+        creator_id=other_creator_id,
         name="Other Tenant Agent",
         access_mode="company",
         status="running",
@@ -146,6 +140,11 @@ async def _seed_contact_graph(session):
     )
     session.add_all([source, target, other_tenant_agent, dingtalk_member, platform_member, other_tenant_member])
     await session.flush()
+    for agent in (source, target, other_tenant_agent):
+        session.add(AgentPermission(agent_id=agent.id, scope_type="company", access_level="use"))
+    await session.flush()
+    for agent in (source, target, other_tenant_agent):
+        await session.refresh(agent, ["company_grant_level"])
     return {
         "tenant_id": tenant_id,
         "creator_id": creator_id,
@@ -211,7 +210,7 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
 @pytest.mark.asyncio
 async def test_search_contacts_includes_human_not_rostered_on_custom_agent(contact_session):
     ctx = await _seed_contact_graph(contact_session)
-    ctx["source"].access_mode = "custom"
+    await _restrict_agent(contact_session, ctx["source"])
     contact_session.add(
         AgentPermission(
             agent_id=ctx["source"].id,
@@ -275,7 +274,7 @@ async def test_add_contact_creates_human_relationship_idempotently(contact_sessi
 @pytest.mark.asyncio
 async def test_add_contact_allows_human_not_rostered_on_custom_agent(contact_session):
     ctx = await _seed_contact_graph(contact_session)
-    ctx["source"].access_mode = "custom"
+    await _restrict_agent(contact_session, ctx["source"])
     contact_session.add(
         AgentPermission(
             agent_id=ctx["source"].id,
@@ -375,7 +374,7 @@ async def test_add_contact_rejects_user_who_cannot_manage_source_agent(contact_s
 @pytest.mark.asyncio
 async def test_execute_tool_direct_uses_approval_resolver_for_contact_relationship(contact_session, monkeypatch):
     ctx = await _seed_contact_graph(contact_session)
-    ctx["target"].access_mode = "custom"
+    await _restrict_agent(contact_session, ctx["target"])
     contact_session.add(
         AgentPermission(
             agent_id=ctx["target"].id,

@@ -11,9 +11,7 @@ from app.database import async_session
 from app.mcp_server import mcp
 from app.mcp_server._common import authed_write, resolve_manageable_agent, resolve_tenant_tool
 from app.mcp_server.tools_config_access import (
-    _ensure_access_required_managers,
     _parse_access_ids,
-    _upsert_access_permission,
     get_agent_access_impl,
     grant_agent_access_impl,
     revoke_agent_access_impl,
@@ -429,10 +427,10 @@ async def set_agent_access_mode(  # noqa: D401
 ) -> str:
     """Switch only an agent's access mode (write scope + manage + confirm).
 
-    access_mode: company | private | custom. Existing user and department grants
-    are preserved, never replaced; they are effective only while mode is custom.
+    access_mode: company | private | custom. Company/custom preserve additive
+    user and department grants. Private explicitly clears optional grants.
     company_access_level is optional and only valid for company mode; omitting it
-    preserves the previously configured company level."""
+    preserves the current company grant, defaulting to use when company access is off."""
     return await set_agent_access_mode_impl(
         ctx,
         agent=agent,
@@ -453,7 +451,7 @@ async def grant_agent_access(  # noqa: D401,B006
 ) -> str:
     """Incrementally add or update custom access grants (write + manage + confirm).
 
-    Requires custom mode. user_ids and department_ids must be platform UUIDs from
+    Works with company access on or off. Subject IDs must be platform UUIDs from
     the same tenant. Department grants always include descendants. Existing grants
     not named in this call are preserved. The request is validated atomically."""
     return await grant_agent_access_impl(
@@ -476,8 +474,8 @@ async def revoke_agent_access(  # noqa: D401,B006
 ) -> str:
     """Incrementally remove exact custom grants (write scope + manage + confirm).
 
-    Only the listed UUID grants are removed. Creator and active company-admin
-    grants are protected. Other grants and relationship records stay unchanged."""
+    Only the listed UUID grants are removed. Built-in creator/admin authority
+    and other grants remain effective. Relationship records stay unchanged."""
     return await revoke_agent_access_impl(
         ctx,
         agent=agent,

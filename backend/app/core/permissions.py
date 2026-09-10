@@ -30,15 +30,14 @@ def build_visible_agents_query(
 ):
     """Build a query for agents visible to the current user.
 
-    Role-based visibility (refined v1.9.3 access_mode model):
+    Role-based visibility with additive Agent grants:
 
     - ``platform_admin``: cross-tenant operator. Sees every agent in the
       target tenant unconditionally, including other users' ``private``
       and ``custom`` agents. This is required for ops/audit duties.
     - ``org_admin``: company governance role. Sees every standard agent in
       their tenant, including other users' ``private`` agents.
-    - Regular users: own creations + ``company`` agents + agents
-      explicitly added to a ``custom`` roster they're on.
+    - Regular users: own creations plus matching company, user or department grants.
     """
     # Project-owned Agents live inside their project and must never leak into
     # the global Agent directory, Plaza, relationship picker, or MCP roster.
@@ -95,16 +94,16 @@ def build_visible_agents_query(
         Agent.tenant_id == target_tenant_id,
         or_(
             Agent.creator_id == user.id,
-            Agent.access_mode == "company",
-            and_(Agent.access_mode == "custom", Agent.id.in_(explicit_user_ids)),
-            and_(Agent.access_mode == "custom", Agent.id.in_(department_agent_ids)),
+            Agent.company_grant_level.is_not(None),
+            Agent.id.in_(explicit_user_ids),
+            Agent.id.in_(department_agent_ids),
         ),
     )
 
 
 def is_company_visible_agent(agent: Agent) -> bool:
     """Return whether an agent participates in company-public surfaces."""
-    return (getattr(agent, "access_mode", None) or "company") == "company"
+    return getattr(agent, "company_grant_level", None) is not None
 
 
 def _is_admin(user: User) -> bool:
@@ -273,37 +272,30 @@ async def get_agent_access_level_for_user_id(
     if agent.creator_id == user.id:
         return "manage"
 
-    access_mode = getattr(agent, "access_mode", None) or "company"
-    # Administrators govern every standard Agent in the tenant, including
-    # private Agents. Project Agents remain behind project membership APIs.
-    if is_platform_admin_user(user):
+    return await resolve_agent_grant_level(db, user, agent)
+
+
+async def resolve_agent_grant_level(db, user, agent) -> str | None:
+    """Shared, additive evaluator after the caller's tenant/identity gate."""
+    if agent.creator_id == user.id or is_platform_admin_user(user):
         return "manage"
     if user.role == "org_admin" and getattr(agent, "scope", "standard") == "standard":
         return "manage"
-
-    perms_result = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent.id))
-    permissions = perms_result.scalars().all()
-
-    if access_mode == "company":
-        company_level = getattr(agent, "company_access_level", None) or next(
-            (perm.access_level for perm in permissions if perm.scope_type == "company"),
-            "use",
-        )
-        return company_level or "use"
-
-    if access_mode == "custom":
-        levels = [
-            perm.access_level or "use" for perm in permissions if perm.scope_type == "user" and perm.scope_id == user.id
-        ]
-        department_level = await _get_department_permission_level(db, user.id, agent)
-        if department_level:
-            levels.append(department_level)
-        if "manage" in levels:
-            return "manage"
-        if levels:
-            return "use"
-
-    return None
+    levels = list(await db.scalars(select(AgentPermission.access_level).where(
+        AgentPermission.agent_id == agent.id,
+        or_(
+            AgentPermission.scope_type == "company",
+            and_(AgentPermission.scope_type == "user", AgentPermission.scope_id == user.id),
+        ),
+    )))
+    if "manage" in levels:
+        return "manage"
+    department_level = await _get_department_permission_level(db, user.id, agent)
+    if department_level:
+        levels.append(department_level)
+    if "manage" in levels:
+        return "manage"
+    return "use" if "use" in levels else None
 
 
 async def user_can_manage_agent_id(
@@ -374,58 +366,46 @@ def build_agent_accessible_user_ids_query(
     include_department_members: bool = True,
 ):
     """Build a tenant-safe SQL query for users who can access ``agent``."""
-    access_mode = getattr(agent, "access_mode", None) or "company"
     base_conditions = [
         User.tenant_id == agent.tenant_id,
-        User.is_active == True,  # noqa: E712
+        User.is_active.is_(True),
         or_(Identity.id.is_(None), Identity.is_active.is_(True)),
     ]
-    base_query = select(User.id).outerjoin(Identity, Identity.id == User.identity_id)
-    if access_mode == "company":
-        return base_query.where(*base_conditions)
-
-    if access_mode == "custom":
-        explicit_user_ids = select(AgentPermission.scope_id).where(
-            AgentPermission.agent_id == agent.id,
-            AgentPermission.scope_type == "user",
-            AgentPermission.scope_id.isnot(None),
+    company_grant = select(AgentPermission.id).where(
+        AgentPermission.agent_id == agent.id, AgentPermission.scope_type == "company",
+    ).exists()
+    explicit_user_ids = select(AgentPermission.scope_id).where(
+        AgentPermission.agent_id == agent.id, AgentPermission.scope_type == "user",
+    )
+    conditions = [
+        company_grant,
+        User.id == agent.creator_id,
+        User.id.in_(explicit_user_ids),
+        User.role == "platform_admin",
+        Identity.is_platform_admin.is_(True),
+    ]
+    if getattr(agent, "scope", "standard") == "standard":
+        conditions.append(User.role == "org_admin")
+    if include_department_members and agent.tenant_id:
+        grants = agent_permission_department_subtree_cte(
+            tenant_id=agent.tenant_id, agent_id=agent.id,
+            name="accessible_user_department_grants",
         )
-        access_conditions = [
-            User.id == agent.creator_id,
-            User.id.in_(explicit_user_ids),
-            User.role.in_(["platform_admin", "org_admin"]),
-        ]
-        if include_department_members and agent.tenant_id:
-            department_grants = agent_permission_department_subtree_cte(
-                tenant_id=agent.tenant_id,
-                agent_id=agent.id,
-                name="accessible_user_department_grants",
-            )
-            department_user_ids = (
-                select(OrgMember.user_id)
-                .select_from(department_grants)
-                .join(
-                    OrgMember,
-                    and_(
-                        OrgMember.tenant_id == agent.tenant_id,
-                        OrgMember.status == "active",
-                        member_in_directory_group(
-                            OrgMember,
-                            group_id=department_grants.c.department_id,
-                            provider_id=department_grants.c.provider_id,
-                        ),
-                    ),
-                )
-                .where(
-                    department_grants.c.agent_id == agent.id,
-                    OrgMember.user_id.is_not(None),
-                )
-                .distinct()
-            )
-            access_conditions.append(User.id.in_(department_user_ids))
-        return base_query.where(*base_conditions, or_(*access_conditions))
-
-    return base_query.where(*base_conditions, User.id == agent.creator_id)
+        department_users = select(OrgMember.user_id).select_from(grants).join(
+            OrgMember,
+            and_(
+                OrgMember.tenant_id == agent.tenant_id,
+                OrgMember.status == "active",
+                member_in_directory_group(
+                    OrgMember, group_id=grants.c.department_id,
+                    provider_id=grants.c.provider_id,
+                ),
+            ),
+        ).where(OrgMember.user_id.is_not(None))
+        conditions.append(User.id.in_(department_users))
+    return select(User.id).outerjoin(Identity, Identity.id == User.identity_id).where(
+        *base_conditions, or_(*conditions),
+    )
 
 
 async def get_agent_accessible_user_ids(
@@ -520,8 +500,7 @@ async def evaluate_agent_relationship_status(
             "access_status_reason": "relationship_creator_no_longer_has_access_to_both_agents",
         }
 
-    target_mode = getattr(target, "access_mode", None) or "company"
-    if target_mode == "company":
+    if is_company_visible_agent(target):
         return {
             "access_allowed": True,
             "access_status": "active",
@@ -637,37 +616,9 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
     if agent.creator_id == user.id:
         return agent, "manage"
 
-    access_mode = getattr(agent, "access_mode", None) or "company"
-
-    # Org admins govern every standard Agent in their tenant. Project Agents
-    # stay behind project membership and project-specific APIs.
-    if user.role == "org_admin" and getattr(agent, "scope", "standard") == "standard":
-        return agent, "manage"
-
-    perms = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent_id))
-    permissions = perms.scalars().all()
-
-    if access_mode == "company":
-        company_level = getattr(agent, "company_access_level", None)
-        if not company_level:
-            company_level = next(
-                (perm.access_level for perm in permissions if perm.scope_type == "company"),
-                "use",
-            )
-        return agent, company_level or "use"
-
-    if access_mode == "custom":
-        levels = [
-            perm.access_level or "use" for perm in permissions if perm.scope_type == "user" and perm.scope_id == user.id
-        ]
-        department_level = await _get_department_permission_level(db, user.id, agent)
-        if department_level:
-            levels.append(department_level)
-        if "manage" in levels:
-            return agent, "manage"
-        if levels:
-            return agent, "use"
-
+    level = await resolve_agent_grant_level(db, user, agent)
+    if level:
+        return agent, level
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")
 
 

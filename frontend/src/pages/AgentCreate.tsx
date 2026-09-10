@@ -2,12 +2,11 @@ import { useState, useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { IconEye, IconSettings, IconTools } from '@tabler/icons-react';
+import { IconTools } from '@tabler/icons-react';
 import { agentApi, channelApi, enterpriseApi, skillApi, tenantApi } from '../services/api';
 import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
-import UserMultiSelect from '../components/UserMultiSelect';
-import { useAuthStore } from '../stores';
+import AgentPermissionsEditor, { permissionGrants, type AgentPermissionsValue } from '../components/AgentPermissionsEditor';
 import { buildAgentSetupCopyText, buildAgentSetupInstruction } from './agentCreateInstructions';
 import { sortLlmModels } from '../utils/llmModels';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
@@ -31,16 +30,8 @@ export default function AgentCreate() {
     // Current company (tenant) selection from layout sidebar
     const [currentTenant] = useState<string | null>(() => localStorage.getItem('current_tenant_id'));
 
-    // Current user for permission defaults
-    const { user: currentUser } = useAuthStore();
-
-    // Selected user IDs for "specific users" permission mode
-    const [permissionSelectedUserIds, setPermissionSelectedUserIds] = useState<string[]>([]);
-
-    // Fetch org members for user selection
-    const { data: members = [] } = useQuery({
-        queryKey: ['org-members'],
-        queryFn: enterpriseApi.listMembers,
+    const [permissions, setPermissions] = useState<AgentPermissionsValue>({
+        company: 'use', users: [], departments: [],
     });
 
     const [form, setForm] = useState({
@@ -50,8 +41,6 @@ export default function AgentCreate() {
         boundaries: '',
         primary_model_id: '' as string,
         fallback_model_id: '' as string,
-        permission_scope_type: 'company',
-        permission_access_level: 'use',
         max_tokens_per_day: '',
         max_tokens_per_month: '',
         skill_ids: [] as string[],
@@ -98,22 +87,6 @@ export default function AgentCreate() {
             }
         }
     }, [globalSkills]);
-
-    // Pre-select self when user enters "specific users" mode for the first time
-    useEffect(() => {
-        const uid = currentUser?.id;
-        if (uid && permissionSelectedUserIds.length === 0 && !permissionSelectedUserIds.includes(uid)) {
-            setPermissionSelectedUserIds([uid]);
-        }
-    }, [currentUser]);
-
-    // Reset selected users when leaving 'specific' scope. Search query is
-    // owned by the unmounted UserMultiSelect, so it auto-resets.
-    useEffect(() => {
-        if (form.permission_scope_type !== 'specific') {
-            setPermissionSelectedUserIds([]);
-        }
-    }, [form.permission_scope_type]);
 
     const createMutation = useMutation({
         mutationFn: async (data: any) => {
@@ -254,14 +227,10 @@ export default function AgentCreate() {
             boundaries: agentType === 'native' ? form.boundaries : undefined,
             primary_model_id: agentType === 'native' ? (form.primary_model_id || undefined) : undefined,
             fallback_model_id: agentType === 'native' ? (form.fallback_model_id || undefined) : undefined,
-            permission_scope_type: form.permission_scope_type === 'specific' ? 'user' : form.permission_scope_type,
-            permission_scope_ids: form.permission_scope_type === 'specific'
-                ? (permissionSelectedUserIds.length > 0 ? permissionSelectedUserIds : (currentUser?.id ? [currentUser.id] : []))
-                : [],
+            permission_grants: permissionGrants(permissions),
             max_tokens_per_day: form.max_tokens_per_day ? Number(form.max_tokens_per_day) : undefined,
             max_tokens_per_month: form.max_tokens_per_month ? Number(form.max_tokens_per_month) : undefined,
             skill_ids: agentType === 'native' ? form.skill_ids : [],
-            permission_access_level: form.permission_access_level,
             tenant_id: currentTenant || undefined,
         });
     };
@@ -424,28 +393,8 @@ export default function AgentCreate() {
                     {/* Permissions */}
                     <div className="form-group" style={{ marginTop: '8px' }}>
                         <label className="form-label">{t('wizard.step4.title')}</label>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                            {[
-                                { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
-                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
-                                { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
-                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Start private, then choose platform users in Settings') },
-                            ].map((scope) => (
-                                <label key={scope.value} style={{
-                                    flex: 1, display: 'flex', alignItems: 'center', gap: '10px', padding: '12px',
-                                    background: form.permission_scope_type === scope.value ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                    border: `1px solid ${form.permission_scope_type === scope.value ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                                    borderRadius: '8px', cursor: 'pointer',
-                                }}>
-                                    <input type="radio" name="scope" checked={form.permission_scope_type === scope.value}
-                                        onChange={() => setForm({ ...form, permission_scope_type: scope.value })} />
-                                    <div>
-                                        <div style={{ fontWeight: 500, fontSize: '13px' }}>{scope.label}</div>
-                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{scope.desc}</div>
-                                    </div>
-                                </label>
-                            ))}
-                        </div>
+                        <AgentPermissionsEditor value={permissions}
+                            onChange={async next => { setPermissions(next); }} />
                     </div>
 
                     {/* Actions */}
@@ -635,68 +584,8 @@ export default function AgentCreate() {
                 {step === 3 && (
                     <div>
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step4.title')}</h3>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
-                            {[
-                                { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
-                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
-                                { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
-                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Start private, then choose platform users in Settings') },
-                            ].map((scope) => (
-                                <label key={scope.value} style={{
-                                    display: 'flex', alignItems: 'center', gap: '12px', padding: '14px',
-                                    background: form.permission_scope_type === scope.value ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                    border: `1px solid ${form.permission_scope_type === scope.value ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                                    borderRadius: '8px', cursor: 'pointer',
-                                }}>
-                                    <input type="radio" name="scope" checked={form.permission_scope_type === scope.value}
-                                        onChange={() => setForm({ ...form, permission_scope_type: scope.value })} />
-
-                                    <div>
-                                        <div style={{ fontWeight: 500, fontSize: '13px' }}>{scope.label}</div>
-                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{scope.desc}</div>
-                                    </div>
-                                </label>
-                            ))}
-                        </div>
-
-                        {/* Specific users — multi-select via shared UserMultiSelect */}
-                        {form.permission_scope_type === 'specific' && (
-                            <UserMultiSelect
-                                style={{ marginBottom: '20px' }}
-                                members={members as any[]}
-                                selectedIds={permissionSelectedUserIds}
-                                onSelectionChange={setPermissionSelectedUserIds}
-                            />
-                        )}
-
-                        {/* Access Level — only for company scope */}
-                        {form.permission_scope_type === 'company' && (
-                            <div>
-                                <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, marginBottom: '10px' }}>
-                                    {t('wizard.step4.accessLevel', 'Default Access Level')}
-                                </label>
-                                <div style={{ display: 'flex', gap: '8px' }}>
-                                    {[
-                                        { value: 'use', icon: <IconEye size={14} stroke={1.8} />, label: t('wizard.step4.useLevel', 'Use'), desc: t('wizard.step4.useDesc', 'Can use Task, Chat, Tools, Skills, Workspace') },
-                                        { value: 'manage', icon: <IconSettings size={14} stroke={1.8} />, label: t('wizard.step4.manageLevel', 'Manage'), desc: t('wizard.step4.manageDesc', 'Full access including Settings, Mind, Relationships') },
-                                    ].map((lvl) => (
-                                        <label key={lvl.value} style={{
-                                            flex: 1, display: 'flex', alignItems: 'flex-start', gap: '10px', padding: '12px',
-                                            background: form.permission_access_level === lvl.value ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                            border: `1px solid ${form.permission_access_level === lvl.value ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                                            borderRadius: '8px', cursor: 'pointer',
-                                        }}>
-                                            <input type="radio" name="access_level" checked={form.permission_access_level === lvl.value}
-                                                onChange={() => setForm({ ...form, permission_access_level: lvl.value })} style={{ marginTop: '2px' }} />
-                                            <div>
-                                                <div style={{ fontWeight: 500, fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>{lvl.icon} {lvl.label}</div>
-                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{lvl.desc}</div>
-                                            </div>
-                                        </label>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
+                        <AgentPermissionsEditor value={permissions}
+                            onChange={async next => { setPermissions(next); }} />
                     </div>
                 )}
 

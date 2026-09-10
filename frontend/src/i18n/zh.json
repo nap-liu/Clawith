@@ -5575,5 +5575,22 @@
     "audio_model_id": "音频模型",
     "video_model_id": "视频模型",
     "speech_model_id": "语音识别模型"
-  }
+  },
+  "agentPermissions": {
+    "title": "访问权限",
+    "company": "公司开放",
+    "companyDescription": "设置本租户所有成员的基础权限。",
+    "off": "关闭",
+    "use": "使用",
+    "manage": "管理",
+    "additional": "部门与人员授权",
+    "count": "已指定 {{departments}} 个部门、{{users}} 名成员",
+    "choose": "选择部门或成员",
+    "descendants": "含下级",
+    "additiveHint": "多项授权同时生效时取最高权限，管理权限包含使用权限。",
+    "builtin": "创建者及管理员保留内置管理权限。",
+    "onlyMe": "仅创建者使用",
+    "saving": "保存中…",
+    "saveError": "权限保存失败，请刷新后重试。"
+}
 }

@@ -5505,5 +5505,22 @@
     "audio_model_id": "Audio model",
     "video_model_id": "Video model",
     "speech_model_id": "Speech recognition model"
-  }
+  },
+  "agentPermissions": {
+    "title": "Access permissions",
+    "company": "Company access",
+    "companyDescription": "Set the base permission for all members of this tenant.",
+    "off": "Off",
+    "use": "Use",
+    "manage": "Manage",
+    "additional": "Departments and people",
+    "count": "{{departments}} departments and {{users}} people selected",
+    "choose": "Choose departments or people",
+    "descendants": "Includes descendants",
+    "additiveHint": "Matching grants combine at the highest level. Manage includes use.",
+    "builtin": "The creator and administrators retain built-in management access.",
+    "onlyMe": "Creator only",
+    "saving": "Saving…",
+    "saveError": "Could not save permissions. Refresh and try again."
+}
 }

@@ -20,6 +20,7 @@ facts from the current repository and authorized local Docker environment.
 
 | Task surface | Required architecture document | Additional rule/workflow |
 |---|---|---|
+| Agent visibility, use/manage grants, access settings, permission migration | `.agents/architecture/agent-permissions.md`, `.agents/architecture/identity-directory-and-channel-bindings.md` | — |
 | sessions, turns, WebSocket, A2A, triggers, history, recovery, active-turn control | `.agents/architecture/conversations-and-turns.md` | — |
 | IM channels, delivery, files/media, confirmation lifecycle, recall | `.agents/architecture/conversations-and-turns.md` | — |
 | identity, SSO, SCIM, organization directories, user normalization, channel-user binding | `.agents/architecture/identity-directory-and-channel-bindings.md` | — |

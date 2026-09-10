@@ -122,7 +122,7 @@ async def hook_new_agent(db: AsyncSession, new_agent_id: uuid.UUID, tenant_id: u
     agent = agent_res.scalar_one_or_none()
     if not agent or getattr(agent, "is_system", False):
         return
-    if (getattr(agent, "access_mode", None) or "company") != "company":
+    if getattr(agent, "company_grant_level", None) is None:
         return  # Do not bind private/custom agents into tenant-wide OKR relationships
         
     okr_agent = await _get_okr_agent(db, tenant_id)

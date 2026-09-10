@@ -13,7 +13,9 @@ from app.models.mcp_server import MCPServer  # noqa: F401  (resolve Tool.mcp_ser
 
 @pytest.fixture(autouse=True)
 async def _isolate():
-    await engine.dispose(); yield; await engine.dispose()
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 def _ctx(token):
@@ -24,16 +26,23 @@ def _ctx(token):
 async def _seed_tenant():
     async with async_session() as db:
         t = Tenant(name="T", slug=f"t-{uuid.uuid4().hex[:10]}")
-        db.add(t); await db.commit(); await db.refresh(t); return t
+        db.add(t)
+        await db.commit()
+        await db.refresh(t)
+        return t
 
 
 async def _seed_user(tenant_id=None):
     async with async_session() as db:
         s = uuid.uuid4().hex[:12]
         ident = Identity(username=f"u_{s}", email=f"{s}@t.local", password_hash="x")
-        db.add(ident); await db.flush()
+        db.add(ident)
+        await db.flush()
         u = User(identity_id=ident.id, display_name="U", role="member", is_active=True, tenant_id=tenant_id)
-        db.add(u); await db.commit(); await db.refresh(u); return u
+        db.add(u)
+        await db.commit()
+        await db.refresh(u)
+        return u
 
 
 async def _pat(user, scope="write"):
@@ -44,14 +53,19 @@ async def _pat(user, scope="write"):
 
 
 async def _seed_agent(creator, name="Agent", access_mode="company"):
-    from app.models.agent import Agent
+    from app.models.agent import Agent, AgentPermission
     from app.models.participant import Participant
     async with async_session() as db:
         a = Agent(name=name, creator_id=creator.id, tenant_id=creator.tenant_id,
                   agent_type="native", access_mode=access_mode, status="idle")
-        db.add(a); await db.flush()
+        db.add(a)
+        await db.flush()
+        if access_mode == "company":
+            db.add(AgentPermission(agent_id=a.id, scope_type="company", access_level="use"))
         db.add(Participant(type="agent", ref_id=a.id, display_name=a.name))
-        await db.commit(); await db.refresh(a); return a
+        await db.commit()
+        await db.refresh(a)
+        return a
 
 
 async def _seed_builtin_tool(name=None):
@@ -60,14 +74,19 @@ async def _seed_builtin_tool(name=None):
     async with async_session() as db:
         t = Tool(name=name, display_name=name, description="", category="custom",
                  source="builtin", enabled=True, is_default=False)
-        db.add(t); await db.commit(); await db.refresh(t); return t
+        db.add(t)
+        await db.commit()
+        await db.refresh(t)
+        return t
 
 
 async def test_set_agent_tools_enables():
     from app.mcp_server.tools_config import set_agent_tools_impl
     from app.models.tool import AgentTool
-    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    tool = await _seed_builtin_tool()
     token = await _pat(user)
     out = await set_agent_tools_impl(_ctx(token), agent=str(agent.id), enable=[tool.name])
     assert "✅" in out
@@ -79,7 +98,8 @@ async def test_set_agent_tools_enables():
 
 async def test_set_agent_tools_requires_write():
     from app.mcp_server.tools_config import set_agent_tools_impl
-    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
     agent = await _seed_agent(user)
     token = await _pat(user, scope="read")
     out = await set_agent_tools_impl(_ctx(token), agent=str(agent.id), enable=["x"])
@@ -89,8 +109,10 @@ async def test_set_agent_tools_requires_write():
 async def test_set_agent_trigger_creates_cron():
     from app.mcp_server.tools_config import set_agent_trigger_impl
     from app.models.trigger import AgentTrigger
-    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user); token = await _pat(user)
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user)
     out = await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="daily",
                                        type="cron", config={"expr": "0 9 * * *"}, reason="morning brief")
     assert "❌" not in out, out
@@ -103,8 +125,10 @@ async def test_set_agent_trigger_creates_cron():
 async def test_delete_agent_trigger_removes():
     from app.mcp_server.tools_config import set_agent_trigger_impl, delete_agent_trigger_impl
     from app.models.trigger import AgentTrigger
-    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user); token = await _pat(user)
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user)
     await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="todelete",
                                  type="cron", config={"expr": "0 9 * * *"}, reason="r")
     out = await delete_agent_trigger_impl(_ctx(token), agent=str(agent.id), trigger="todelete")
@@ -285,7 +309,7 @@ async def test_set_agent_access_mode_preserves_existing_grants():
         department_id = department.id
     token = await _pat(user, scope="write")
     out = await set_agent_access_mode_impl(
-        _ctx(token), agent=str(agent.id), access_mode="private", confirm=True
+        _ctx(token), agent=str(agent.id), access_mode="custom", confirm=True
     )
     assert "✅" in out
     async with async_session() as db:
@@ -295,8 +319,8 @@ async def test_set_agent_access_mode_preserves_existing_grants():
                 select(AgentPermission).where(AgentPermission.agent_id == agent.id)
             )
         ).scalars().all()
-    assert a.access_mode == "private"
-    assert a.company_access_level == "manage"
+    assert a.access_mode == "custom"
+    assert a.company_grant_level is None
     assert any(p.scope_type == "user" and p.scope_id == colleague.id for p in grants)
     assert any(p.scope_type == "department" and p.scope_id == department_id for p in grants)
 
@@ -316,7 +340,9 @@ async def test_set_agent_access_mode_company_level_change_is_explicit():
         access_mode="company",
         company_access_level="manage",
     )
-    assert "company_access_level: use → manage" in preview
+    assert "manage" in preview
+    async with async_session() as db:
+        assert (await db.get(Agent, agent.id)).company_grant_level == "use"
     out = await set_agent_access_mode_impl(
         _ctx(token),
         agent=str(agent.id),
@@ -324,7 +350,7 @@ async def test_set_agent_access_mode_company_level_change_is_explicit():
         company_access_level="manage",
         confirm=True,
     )
-    assert "company_access_level: use → manage" in out
+    assert "✅" in out
     async with async_session() as db:
         stored = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
     assert stored.company_access_level == "manage"
@@ -370,7 +396,7 @@ async def test_grant_agent_access_is_incremental_and_atomic():
         department_ids=[str(department_id)],
         confirm=True,
     )
-    assert "未执行任何修改" in rejected
+    assert "❌" in rejected
     async with async_session() as db:
         rejected_rows = (
             await db.execute(
@@ -469,27 +495,28 @@ async def test_grant_agent_access_is_concurrency_safe_for_same_department():
             )
         ).scalar_one()
     assert grant_count == 1
-    assert owner_grant_count == 1
+    assert owner_grant_count == 0
+    from app.core.permissions import get_agent_access_level_for_user_id
+    async with async_session() as db:
+        assert await get_agent_access_level_for_user_id(db, owner.id, agent) == "manage"
 
 
 async def test_company_access_upsert_is_concurrency_safe_with_null_scope_id():
-    from app.mcp_server.tools_config import _upsert_access_permission
+    from app.mcp_server.tools_config import set_agent_access_mode_impl
     from app.models.agent import AgentPermission
 
     tenant = await _seed_tenant()
     owner = await _seed_user(tenant_id=tenant.id)
     agent = await _seed_agent(owner, access_mode="company")
 
+    token = await _pat(owner, scope="write")
+
     async def upsert_company_grant():
-        async with async_session() as db:
-            await _upsert_access_permission(
-                db,
-                agent_id=agent.id,
-                scope_type="company",
-                scope_id=None,
-                access_level="use",
-            )
-            await db.commit()
+        result = await set_agent_access_mode_impl(
+            _ctx(token), agent=str(agent.id), access_mode="company",
+            company_access_level="use", confirm=True,
+        )
+        assert "✅" in result
 
     await asyncio.gather(*(upsert_company_grant() for _ in range(8)))
 
@@ -528,7 +555,10 @@ async def test_revoke_agent_access_removes_only_named_grants_and_protects_owner(
     protected = await revoke_agent_access_impl(
         _ctx(token), agent=str(agent.id), user_ids=[str(owner.id)], confirm=True
     )
-    assert "不能撤销" in protected
+    assert "✅" in protected
+    from app.core.permissions import get_agent_access_level_for_user_id
+    async with async_session() as db:
+        assert await get_agent_access_level_for_user_id(db, owner.id, agent) == "manage"
     out = await revoke_agent_access_impl(
         _ctx(token), agent=str(agent.id), user_ids=[str(user_a.id)], confirm=True
     )
@@ -544,7 +574,7 @@ async def test_revoke_agent_access_removes_only_named_grants_and_protects_owner(
                 )
             ).scalars().all()
         )
-    assert owner.id in remaining_ids
+    assert owner.id not in remaining_ids
     assert user_a.id not in remaining_ids
     assert user_b.id in remaining_ids
 
@@ -713,8 +743,10 @@ async def test_update_agent_trigger_disables():
 async def test_set_agent_tool_config_sets_config():
     from app.mcp_server.tools_config import set_agent_tool_config_impl
     from app.models.tool import AgentTool
-    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    tool = await _seed_builtin_tool()
     token = await _pat(user)
     out = await set_agent_tool_config_impl(_ctx(token), agent=str(agent.id), tool=tool.name, config={"foo": "bar"})
     assert "✅" in out
@@ -726,8 +758,10 @@ async def test_set_agent_tool_config_sets_config():
 
 async def test_set_agent_tool_config_allow_network_admin_only():
     from app.mcp_server.tools_config import set_agent_tool_config_impl
-    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)  # role member
-    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)  # role member
+    agent = await _seed_agent(user)
+    tool = await _seed_builtin_tool()
     token = await _pat(user)
     out = await set_agent_tool_config_impl(_ctx(token), agent=str(agent.id), tool=tool.name, config={"allow_network": True})
     assert "管理员" in out  # admin-only denial
