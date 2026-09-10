@@ -1,19 +1,31 @@
-# Agent 叠加权限维护发布计划
+# Agent 叠加权限与子会话即时详情维护发布计划
 
 代码及限定独立复审通过，可进入发布准备。**当前没有生产 GO：维护窗口、生产检查、
 备份/恢复决策、最终 SHA 和镜像均待授权或准备。默认在线迁移不可用。**
-本计划依据当前 release rules 和完整 production release runbook；不授权执行下列操作。
+本计划依据当前 release rules 和完整 production release runbook。
+用户已授权发布前准备：候选提交、公司主线推送、同 SHA 双镜像及 cache 构建/推送、
+digest 记录。生产只读检查、维护停写、备份、迁移、切换和真实外部 smoke 尚未授权。
 
 ## 范围与候选身份
 
-- 公司主线：`yybpc/company/main`；已合入
+- 公司主线：remote 为 `yybpc`、branch 为 `company/main`。
+  本轮已执行 `git fetch yybpc company/main`，确认远端为
   `5129490b5db442edaa5c6f746226f003458326ed`，原实现基线为 `0cc8c01c`。
-- 候选：`feat/agent-additive-permissions` 本地提交与主线合并；尚未冻结发布 RELEASE_SHA。
+- 当前代码候选：`feat/agent-additive-permissions`，
+  `1a0517fa995754f05f8e04ceacdd0327ed8d6a95`，已包含上述远端主线。
+  功能审查范围为 `5129490b..1a0517fa`；生产发布范围必须改用
+  `CURRENT_RELEASE_SHA..RELEASE_SHA`，不能假设生产已等于主线。
+  本计划是该代码候选的发布输入，尚未冻结最终 RELEASE_SHA。
   发布准备时重新 fetch 主线，若移动则集成、复审受影响差异并重新验证。
 - 当前产品版本：backend/frontend 均为 `1.10.3`，不升语义版本；
-  最终 RELEASE_ID 为 `v1.10.3-<RELEASE_SHA7>`。
+  当前代码候选对应 `v1.10.3-1a0517f`；
+  最终 RELEASE_ID 为 `v1.10.3-<RELEASE_SHA7>`，源码若变化必须重定身份和产物。
 - 包含授权读写、创建/设置/MCP、共用权限编辑器及一次 PostgreSQL 数据归一化。
   backend、worker、connector 使用同一 backend digest，frontend 来自同一 SHA。
+- 包含同步 subagent 创建后即可打开只读详情：会话引用通过已有 running 工具事件
+  持久化和推送，PC/H5 共用卡片；失败、停止、历史分页与恢复保留引用。
+  同步等待不变；恢复按调用 ID 合并运行更新，只补写一个最终结果。
+  这部分没有新增表、接口、工具入参 schema 或新执行队列。
 - Plaza 已废弃，按用户要求不处理；权限功能无依赖、AIO、Redis、workspace 或对象存储
   格式变更。MCP 配置工具沿现有 FastMCP 定义更新。
 - 合入主线已包含 `list_models` 内置工具及媒体工具参数/schema 更新。若生产尚未包含
@@ -29,10 +41,39 @@
 实际浏览器保存/创建及数据库结果、Ruff、差异和 800 行检查见 README 与 AUDIT。
 独立 subagent 确认 P1/P2 修复和 canonical 文档一致，未执行生产检查。
 
+子会话优化在 `1a0517fa` 的证据：
+
+- 第一轮 19 项检查通过，覆盖子会话进度、共享 caller、工具历史和 WebSocket 持久化。
+- 根据独立审计修复停止时丢引用、恢复重复写 done 两项边界后，38 项相关检查通过，
+  包含 4 项子会话进度用例与现有恢复用例。两轮有重叠，不累计宣称 57 项。
+- Docker 内完整前端 prebuild、TypeScript 和 Vite 构建通过；保留既有大 chunk 提示。
+- Docker Playwright 经隔离 nginx 的 3008 端口连接真实 API/PostgreSQL，
+  PC/H5 都可在 queued 阶段打开只读详情，刷新后入口仍可用；跨租户详情返回 403。
+  长同步等待由可控阻塞执行器验证，未调用真实付费模型。
+- 独立 `subagent_plan_audit` 初审、改动复审及最终复核通过；
+  最终源码差异与 800 行检查通过。临时容器和浏览器凭据已清理。
+- 恢复检查首次因测试 Redis 缺失出现 12 失败/26 通过，补齐隔离 Redis 后
+  原范围 38 项全通过；另一次文件路径写错导致未收集测试，不作为通过证据。
+
+上述后端检查的实际命令（均在测试镜像内，精确 backend 挂载到 /app，
+使用隔离 PostgreSQL；恢复组另配置可用的隔离 REDIS_URL）：
+
+```sh
+python -m pytest -q -p no:cacheprovider \
+  tests/test_subagent_session_progress.py tests/test_llm_caller_integration.py \
+  tests/test_tool_call_history.py tests/test_websocket_tool_call_persistence.py
+python -m pytest -q -p no:cacheprovider --tb=short \
+  tests/test_subagent_session_progress.py tests/test_turn_recovery.py \
+  tests/test_turn_recovery_continuation.py tests/test_turn_recovery_scanner.py
+```
+
 最终 clean SHA 上复核差异、文案、800 行及受主线集成影响的测试，不默认跑全套。
 生产父版本/schema-derived 隔离副本、实际数据量下的转换耗时、备份恢复、维护编排、
 真实旧镜像/候选启动及四角色恢复演练尚未验证，是 GO 前必需项。
 拒绝 downgrade 的测试不等价于成功的备份恢复演练。
+未做子会话创建提交与创建通知提交之间的强杀故障注入。这是两个短事务；
+其间进程退出可能尚未公布引用，不宣称原子提交或任意时刻都无损恢复。
+发布时优先排空同步子任务，不把运行中详情可见等同于旧版本恢复兼容。
 
 下列事实仅在获准的发布会话内由运维清单和实际部署确定，不从历史记录填入：
 
@@ -45,15 +86,24 @@
 | COMPOSE_PROJECT、当前/候选/恢复 compose、存储清单 | 从实际生产拓扑解析并安全保存 |
 | BACKUP_ID、校验和、恢复演练及恢复授权边界 | 数据负责人确认 |
 
+以上责任人和实际 Compose project 当前未指定，不能填入猜测的姓名或线上配置。
+负责人、窗口、中断上限和演练证据齐备后才能给生产 GO。
+
 ## 发布准备：维护窗口之前完成
 
-授权范围分别确认：源码提交/主线推送、镜像构建/推送、生产只读检查、维护停写、
-备份、迁移、配置/切换、专用测试身份 smoke、数据恢复。Git tag/hosted Release 不在本计划执行范围。
+源码提交/主线推送及镜像/cache 构建推送已经获得本次准备授权。
+生产只读检查、维护停写、备份、迁移、配置/切换、专用测试身份 smoke、数据恢复
+仍为独立授权边界。Git tag/hosted Release 不在本次执行范围。
 
 按 runbook 4.1 验证当前可信 linux/amd64 backend digest 的依赖复用条件：
 pyproject 相等且与镜像内校验和一致、Python 版本一致、依赖安装和运行库合同未变。
 满足后使用该 digest 作为 CLAWITH_DEPS_IMAGE；不满足则明确转依赖刷新，不能强行复用。
 现有运行镜像未知，因此当前仅确定采用该判定流程。
+候选相对已核实的公司主线没有修改 backend Dockerfile/pyproject 或前端依赖清单；
+这不替代与实际 CURRENT_RELEASE_SHA 和可信镜像的依赖复用检查。
+本次准备不检查生产，因此不宣称已有可信生产 dependency carrier。
+构建明确选择 Dockerfile 的 deps-build 路径（不传 CLAWITH_DEPS_IMAGE），
+记录解析后的依赖清单；不选择未验证的生产 cache 输入，仅写新 SHA 专用 registry cache。
 
 在获准的干净构建目录写入完整 backend/COMMIT；以下变量必须先由发布记录解析。
 稳定 build args 和 digest-pinned base 按候选 Dockerfile、runbook 4 完整核对。
@@ -98,6 +148,13 @@ docker buildx imagetools inspect "$FRONTEND_REPO:$RELEASE_ID"
 备份使用同一个一致性快照，记录 BACKUP_ID，并执行 pg_restore --list 和文件校验。
 完整恢复只在隔离目标演练；任何生产恢复必须按已经审核的数据负责人决策执行。
 
+维护前在隔离环境完成：实际生产父 revision/数据副本 → 候选 offline 迁移 →
+候选四角色启动及权限验收；另将转换前备份恢复到独立目标并启动旧 digest 四角色。
+旧 ACL evaluator 不兼容迁移后的授权语义，因此本次不能以“旧镜像可启动”
+代替权限兼容性证据；不得让旧 writer 连接已转换的正式数据。
+若实际 revision 已包含本迁移，则核对现有授权状态，不重新转换；由实际版本差异
+重新评估是否仍需维护窗口，而不是重复执行已有维护步骤。
+
 ## 已批准维护窗口内的唯一转换路径
 
 1. 启用已演练的维护入口策略，阻止新增工作；完成最终排空和保护对象记录。
@@ -136,6 +193,17 @@ docker compose -p "$COMPOSE_PROJECT" -f "$CANDIDATE_COMPOSE" \
 管理员角色降级后的显式授权、失活部门重新启用、REST/MCP/创建/设置一致性。
 无新增测试身份或外部 smoke 消息的隐含授权。
 
+子会话验收使用专用会话和已授权模型，观察以下结果：
+
+1. 同步子任务提交创建后，父卡片在完成前即可打开 queued/running 详情；
+   父工具仍等待结果，不提前完成。
+2. PC/H5 刷新或断线重连后引用保持，详情为只读，内容及状态继续更新。
+3. 完成、失败、停止仍保留同一会话入口；无重复卡片、子会话或恢复结果。
+4. 非授权用户和跨租户访问拒绝。
+
+真实模型长任务与停机恢复先在隔离环境演练。生产 smoke 的外部调用与消息
+仍只在已批准的专用身份/会话内执行；不强杀生产进程来验证故障窗口。
+
 权限扩大/跨租户访问、数据损失、错误镜像、启动不健康、重复外发立即停止验收并进入
 补救；锁超时或迁移错误立即 NO-GO。延迟/5xx 的数值阈值须由生产基线和发布负责人
 在 GO 前确定；不能留到现场决定。近距离观察至少 30 分钟，保留 24 小时跟踪。
@@ -151,6 +219,9 @@ docker compose -p "$COMPOSE_PROJECT" -f "$PREVIOUS_COMPOSE" \
 - **转换已成功**：不执行 Alembic downgrade、不直接切回旧镜像。优先从最终发布 SHA
   制作最小兼容修复，完成相关 Docker 验证和同 SHA 双镜像构建、提前拉取，再四角色切换。
   热修复负责人及构建/cache 路径须提前就绪；不提前伪造热修复产物。
+- 本次工具历史允许同一调用多条 running 更新。补救镜像必须保留按调用 ID
+  归一化的恢复逻辑，不能只凭数据库 schema 可读就让不具备该能力的旧 worker
+  接管未结束工具记录；详情 UI 的降级不能牺牲持久化恢复正确性。
 - 如需恢复转换前数据库，必须重新停写，在已批准并演练的完整恢复方案下恢复一致状态，
   明确新写入损失。完成后方可使用上面的旧四角色启动命令。未授权、未演练时不能当作可用回退。
 
@@ -162,6 +233,8 @@ docker compose -p "$COMPOSE_PROJECT" -f "$PREVIOUS_COMPOSE" \
 
 验收及近距离观察完成后，由收尾负责人按 worktree_cleanup workflow 处理本任务
 `.worktrees/agent-additive-permissions` 与届时实际创建的发布/验证 checkout。
-当前候选未提交且本地验证环境仍引用它，必须保留；共享 3008 环境和其它未完成工作
+当前代码候选及发布计划随本轮准备提交；最终 SHA/digest 和构建日志在仓库外归档，
+不将生产库存或私有镜像地址提交到 Git。本地权限验证环境仍引用
+该 worktree，在完成正式产物与证据归档前必须保留。共享 3008 环境和其它未完成工作
 受保护。任务自有容器、依赖卷和证据由实际引用决定去留，不清理共享资源。
 报告移除/保留项及原因，完成记录后才关闭发布。
