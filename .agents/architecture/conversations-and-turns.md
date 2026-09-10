@@ -453,6 +453,8 @@ recovery and parent events. `task_id` is the individual input anchor; `session_i
 is the reusable child session. Inputs remain separate FIFO jobs instead of being
 merged into a live Agent round. Each completed input publishes its own result and
 attachments; native media delivery targets the original parent conversation.
+Media sessions retain their original parent-notification mode across follow-up
+turns, including enterprise model tests created with `notify_parent=False`.
 A parent that is itself a subagent receives completion through its existing inbox
 and leased worker, preserving scene/causal metadata rather than starting an
 ordinary Web/IM turn alongside that worker.

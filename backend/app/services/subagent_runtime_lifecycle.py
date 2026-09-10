@@ -478,7 +478,8 @@ async def append_subagent_message(
         child.last_message_at = now
         if run.status in {RUN_COMPLETED, RUN_FAILED, RUN_WAITING, RUN_CANCELLED}:
             run.status = RUN_QUEUED
-            run.mode = "async"
+            if executor != "media":
+                run.mode = "async"
             run.lease_owner = None
             run.lease_expires_at = None
         await db.commit()
