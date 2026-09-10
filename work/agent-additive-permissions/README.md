@@ -159,3 +159,27 @@ migration-order integration. The previous browser results concern the prior
 candidate, and the retained long-running local API is not claimed as the merged
 candidate's validation environment. No push, production inspection or deployment
 was performed; unrelated original-checkout work remains untouched.
+
+## Second company main integration
+
+Merged four subsequent company-main commits through
+`a6904c9615b6e04aabe9b329c3ea65a378f6ed4f` into the permission branch without
+conflicts. They preserve media follow-up notification policy and refine model
+brand/platform display labels. The permission behavior and migration graph did
+not change.
+
+Docker verification passed **17 tests**:
+`test_media_notification_mode.py`, `test_subagent_group_origin.py`, and
+`test_agent_additive_permissions.py`, using the isolated merged PostgreSQL
+database and a temporary task-owned Redis. Frontend full prebuild, TypeScript
+and Vite build passed; the existing chunk-size advisory remains. Staged diff
+checks and every incoming source file's 800-line gate passed (largest incoming
+source: 610 lines).
+
+Two initial runs each had 2 media-test failures and 15 passes because Redis was
+unavailable for workspace leases. The first selected local Redis image lacked
+its server executable and exited; a verified working Redis image returned PONG,
+and all 17 tests then passed without changing product code or assertions.
+The temporary `agent-permissions-merge-redis` container and its anonymous volume
+were removed after verification. No shared stack, browser/provider workflow or
+production environment was changed, and no push or deployment was performed.

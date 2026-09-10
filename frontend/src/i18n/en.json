@@ -3852,6 +3852,12 @@
       "imaginationHigh": "Imaginative",
       "testSettings": "Test input",
       "testResult": "Test result",
+      "platformLabels": {
+        "tokenhub": "Hunyuan",
+        "bailian": "Bailian",
+        "hunyuan": "Hunyuan",
+        "volcengine": "Volcengine"
+      },
       "providers": {
         "tokenhub": "Tencent TokenHub",
         "bailian": "Alibaba Cloud Bailian",

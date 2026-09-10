@@ -8,7 +8,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "happyhorse-1.0-video-edit",
-      "label": "happyhorse-1.0-video-edit",
+      "label": "HappyHorse 1.0 视频编辑",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -29,7 +29,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "happyhorse-1.1-i2v",
-      "label": "happyhorse-1.1-i2v",
+      "label": "HappyHorse 1.1 图生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -49,7 +49,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "happyhorse-1.1-r2v",
-      "label": "happyhorse-1.1-r2v",
+      "label": "HappyHorse 1.1 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -69,7 +69,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "happyhorse-1.1-t2v",
-      "label": "happyhorse-1.1-t2v",
+      "label": "HappyHorse 1.1 文生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -110,7 +110,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi-k2.6",
-      "label": "kimi-k2.6",
+      "label": "Kimi K2.6",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -132,7 +132,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi-k2.7-code",
-      "label": "kimi-k2.7-code",
+      "label": "Kimi K2.7 Code",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -154,7 +154,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi-k3",
-      "label": "kimi-k3",
+      "label": "Kimi K3",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -175,7 +175,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.6",
-      "label": "kimi/kimi-k2.6",
+      "label": "Kimi K2.6（直供）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -197,7 +197,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.7-code",
-      "label": "kimi/kimi-k2.7-code",
+      "label": "Kimi K2.7 Code（直供）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -219,7 +219,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.7-code-highspeed",
-      "label": "kimi/kimi-k2.7-code-highspeed",
+      "label": "Kimi K2.7 Code Highspeed",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -241,7 +241,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k3",
-      "label": "kimi/kimi-k3",
+      "label": "Kimi K3（直供）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -263,7 +263,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kling/kling-v3-image-generation",
-      "label": "kling/kling-v3-image-generation",
+      "label": "可灵 V3 图像",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -283,7 +283,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kling/kling-v3-omni-image-generation",
-      "label": "kling/kling-v3-omni-image-generation",
+      "label": "可灵 V3 全模态 图像",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -303,7 +303,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kling/kling-v3-omni-video-generation",
-      "label": "kling/kling-v3-omni-video-generation",
+      "label": "可灵 V3 全模态 视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -324,7 +324,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kling/kling-v3-turbo-video-generation",
-      "label": "kling/kling-v3-turbo-video-generation",
+      "label": "可灵 V3 Turbo 视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -344,7 +344,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kling/kling-v3-video-generation",
-      "label": "kling/kling-v3-video-generation",
+      "label": "可灵 V3 视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -364,7 +364,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "MiniMax/MiniMax-H3",
-      "label": "MiniMax/MiniMax-H3",
+      "label": "海螺 H3",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -408,7 +408,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-c1-it2v",
-      "label": "pixverse/pixverse-c1-it2v",
+      "label": "爱诗 C1 图生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -428,7 +428,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-c1-kf2v",
-      "label": "pixverse/pixverse-c1-kf2v",
+      "label": "爱诗 C1 首尾帧视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -448,7 +448,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-c1-r2v",
-      "label": "pixverse/pixverse-c1-r2v",
+      "label": "爱诗 C1 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -468,7 +468,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-c1-t2v",
-      "label": "pixverse/pixverse-c1-t2v",
+      "label": "爱诗 C1 文生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -487,7 +487,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-v6-it2v",
-      "label": "pixverse/pixverse-v6-it2v",
+      "label": "爱诗 V6 图生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -507,7 +507,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-v6-kf2v",
-      "label": "pixverse/pixverse-v6-kf2v",
+      "label": "爱诗 V6 首尾帧视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -527,7 +527,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-v6-r2v",
-      "label": "pixverse/pixverse-v6-r2v",
+      "label": "爱诗 V6 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -547,7 +547,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-v6-r2v-omni",
-      "label": "pixverse/pixverse-v6-r2v-omni",
+      "label": "爱诗 V6 全模态 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -568,7 +568,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "pixverse/pixverse-v6-t2v",
-      "label": "pixverse/pixverse-v6-t2v",
+      "label": "爱诗 V6 文生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -587,7 +587,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qvq-max",
-      "label": "qvq-max",
+      "label": "千问 QVQ Max",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -607,7 +607,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qvq-plus",
-      "label": "qvq-plus",
+      "label": "千问 QVQ Plus",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -627,7 +627,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-2.0",
-      "label": "qwen-image-2.0",
+      "label": "千问 图像 2.0",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -647,7 +647,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-2.0-pro",
-      "label": "qwen-image-2.0-pro",
+      "label": "千问 图像 2.0 Pro",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -667,7 +667,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-3.0",
-      "label": "qwen-image-3.0",
+      "label": "千问 图像 3.0",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -687,7 +687,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-3.0-pro",
-      "label": "qwen-image-3.0-pro",
+      "label": "千问 图像 3.0 Pro",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -707,7 +707,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-edit-max",
-      "label": "qwen-image-edit-max",
+      "label": "千问 图像编辑 Max",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -727,7 +727,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-edit-plus",
-      "label": "qwen-image-edit-plus",
+      "label": "千问 图像编辑 Plus",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -747,7 +747,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-max",
-      "label": "qwen-image-max",
+      "label": "千问 图像 Max",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -766,7 +766,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-image-plus",
-      "label": "qwen-image-plus",
+      "label": "千问 图像 Plus",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -785,7 +785,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-omni-turbo",
-      "label": "qwen-omni-turbo",
+      "label": "千问 全模态 Turbo",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -807,7 +807,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-vl-max",
-      "label": "qwen-vl-max",
+      "label": "千问 视觉 Max",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -827,7 +827,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-vl-ocr",
-      "label": "qwen-vl-ocr",
+      "label": "千问 视觉文字识别",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -847,7 +847,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-vl-ocr-latest",
-      "label": "qwen-vl-ocr-latest",
+      "label": "千问 视觉文字识别 Latest",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -867,7 +867,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen-vl-plus",
-      "label": "qwen-vl-plus",
+      "label": "千问 视觉 Plus",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -887,7 +887,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3-omni-flash",
-      "label": "qwen3-omni-flash",
+      "label": "千问 3 全模态 Flash",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -910,7 +910,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3-vl-flash",
-      "label": "qwen3-vl-flash",
+      "label": "千问 3 视觉 Flash",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -932,7 +932,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3-vl-plus",
-      "label": "qwen3-vl-plus",
+      "label": "千问 3 视觉 Plus",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -954,7 +954,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-122b-a10b",
-      "label": "qwen3.5-122b-a10b",
+      "label": "千问 3.5 122B A10B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -976,7 +976,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-27b",
-      "label": "qwen3.5-27b",
+      "label": "千问 3.5 27B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -998,7 +998,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-35b-a3b",
-      "label": "qwen3.5-35b-a3b",
+      "label": "千问 3.5 35B A3B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1020,7 +1020,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-397b-a17b",
-      "label": "qwen3.5-397b-a17b",
+      "label": "千问 3.5 397B A17B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1042,7 +1042,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-flash",
-      "label": "qwen3.5-flash",
+      "label": "千问 3.5 Flash",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1064,7 +1064,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-ocr",
-      "label": "qwen3.5-ocr",
+      "label": "千问 3.5 文字识别",
       "api_protocol": "openai_responses",
       "purposes": [
         "media_understanding"
@@ -1084,7 +1084,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-omni-flash",
-      "label": "qwen3.5-omni-flash",
+      "label": "千问 3.5 全模态 Flash",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -1106,7 +1106,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-omni-plus",
-      "label": "qwen3.5-omni-plus",
+      "label": "千问 3.5 全模态 Plus",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -1129,7 +1129,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.5-plus",
-      "label": "Qwen3.5 Plus",
+      "label": "千问 3.5 Plus",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1151,7 +1151,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.6-27b",
-      "label": "qwen3.6-27b",
+      "label": "千问 3.6 27B",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -1173,7 +1173,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.6-35b-a3b",
-      "label": "qwen3.6-35b-a3b",
+      "label": "千问 3.6 35B A3B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1195,7 +1195,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.6-flash",
-      "label": "qwen3.6-flash",
+      "label": "千问 3.6 Flash",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1217,7 +1217,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.6-plus",
-      "label": "qwen3.6-plus",
+      "label": "千问 3.6 Plus",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1239,7 +1239,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.7-flash",
-      "label": "qwen3.7-flash",
+      "label": "千问 3.7 Flash",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1261,7 +1261,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.7-max",
-      "label": "qwen3.7-max",
+      "label": "千问 3.7 Max",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation"
@@ -1280,7 +1280,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.7-max-2026-06-08",
-      "label": "qwen3.7-max-2026-06-08",
+      "label": "千问 3.7 Max 2026-06-08",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1302,7 +1302,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.7-plus",
-      "label": "qwen3.7-plus",
+      "label": "千问 3.7 Plus",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1324,7 +1324,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.8-2.4t-a95b",
-      "label": "qwen3.8-2.4t-a95b",
+      "label": "千问 3.8 2.4T A95B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1345,7 +1345,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.8-27b",
-      "label": "qwen3.8-27b",
+      "label": "千问 3.8 27B",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1367,7 +1367,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.8-flash",
-      "label": "qwen3.8-flash",
+      "label": "千问 3.8 Flash",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1389,7 +1389,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "qwen3.8-max",
-      "label": "Qwen3.8 Max",
+      "label": "千问 3.8 Max",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -1411,7 +1411,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "stepfun/step-3.7-flash",
-      "label": "Step 3.7 Flash",
+      "label": "阶跃星辰 3.7 Flash",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -1433,7 +1433,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/vidu-image-lite_reference2image",
-      "label": "vidu/vidu-image-lite_reference2image",
+      "label": "生数 图像 Lite 参考生图",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1453,7 +1453,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/vidu-image-pro_reference2image",
-      "label": "vidu/vidu-image-pro_reference2image",
+      "label": "生数 图像 Pro 参考生图",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1473,7 +1473,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/vidu-image_reference2image",
-      "label": "vidu/vidu-image_reference2image",
+      "label": "生数 图像 参考生图",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1493,7 +1493,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-ad_reference2video",
-      "label": "vidu/viduq3-ad_reference2video",
+      "label": "生数 Q3 AD 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1513,7 +1513,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-drama_reference2video",
-      "label": "vidu/viduq3-drama_reference2video",
+      "label": "生数 Q3 Drama 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1533,7 +1533,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-fast_reference2image",
-      "label": "vidu/viduq3-fast_reference2image",
+      "label": "生数 Q3 Fast 参考生图",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1553,7 +1553,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-mix_reference2video",
-      "label": "vidu/viduq3-mix_reference2video",
+      "label": "生数 Q3 Mix 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1573,7 +1573,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-pro-fast_img2video",
-      "label": "vidu/viduq3-pro-fast_img2video",
+      "label": "生数 Q3 专业 Fast 图生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1593,7 +1593,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-pro_img2video",
-      "label": "vidu/viduq3-pro_img2video",
+      "label": "生数 Q3 Pro 图生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1613,7 +1613,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-pro_start-end2video",
-      "label": "vidu/viduq3-pro_start-end2video",
+      "label": "生数 Q3 Pro 首尾帧视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1633,7 +1633,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-pro_text2video",
-      "label": "vidu/viduq3-pro_text2video",
+      "label": "生数 Q3 Pro 文生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1652,7 +1652,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-turbo_img2video",
-      "label": "vidu/viduq3-turbo_img2video",
+      "label": "生数 Q3 Turbo 图生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1672,7 +1672,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-turbo_reference2video",
-      "label": "vidu/viduq3-turbo_reference2video",
+      "label": "生数 Q3 Turbo 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1692,7 +1692,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-turbo_start-end2video",
-      "label": "vidu/viduq3-turbo_start-end2video",
+      "label": "生数 Q3 Turbo 首尾帧视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1712,7 +1712,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3-turbo_text2video",
-      "label": "vidu/viduq3-turbo_text2video",
+      "label": "生数 Q3 Turbo 文生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1731,7 +1731,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "vidu/viduq3_reference2video",
-      "label": "vidu/viduq3_reference2video",
+      "label": "生数 Q3 参考生视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1751,7 +1751,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "wan2.7-image",
-      "label": "wan2.7-image",
+      "label": "通义万相 2.7 图像",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1771,7 +1771,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "wan2.7-image-pro",
-      "label": "wan2.7-image-pro",
+      "label": "通义万相 2.7 图像 Pro",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1791,7 +1791,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "wan3.0-video",
-      "label": "wan3.0-video",
+      "label": "通义万相 3.0 视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1813,7 +1813,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "wan3.0-video-prime",
-      "label": "wan3.0-video-prime",
+      "label": "通义万相 3.0 视频 Prime",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -1835,7 +1835,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "xiaomi/mimo-v2.5-pro",
-      "label": "xiaomi/mimo-v2.5-pro",
+      "label": "小米 MiMo V2.5 Pro",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation"
@@ -1854,7 +1854,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "z-image-turbo",
-      "label": "z-image-turbo",
+      "label": "通义 Z-Image Turbo 图像",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1873,7 +1873,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "ZHIPU/GLM-5.3-Flash",
-      "label": "GLM 5.3 Flash",
+      "label": "智谱 GLM 5.3 Flash",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -1914,7 +1914,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "glm-5.3",
-      "label": "GLM 5.3",
+      "label": "智谱 GLM 5.3",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation"
@@ -1933,7 +1933,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "hy-image-v3",
-      "label": "HY Image 3.0",
+      "label": "混元图像 3.0",
       "api_protocol": "openai_compatible",
       "purposes": [
         "image_generation"
@@ -1953,7 +1953,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "hy-vision-2.0-instruct",
-      "label": "HY Vision 2.0 Instruct",
+      "label": "混元视觉 2.0",
       "api_protocol": "openai_compatible",
       "purposes": [
         "media_understanding"
@@ -1973,7 +1973,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "hy3",
-      "label": "Hy3",
+      "label": "混元 3",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation"
@@ -2014,7 +2014,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "kling-video-v3",
-      "label": "Kling Video V3",
+      "label": "可灵 V3 视频",
       "api_protocol": "openai_compatible",
       "purposes": [
         "video_generation"
@@ -2034,7 +2034,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "minimax-speech-2.8-turbo",
-      "label": "MiniMax Speech 2.8 Turbo",
+      "label": "MiniMax 语音 2.8 Turbo",
       "api_protocol": "openai_compatible",
       "purposes": [
         "audio_generation"

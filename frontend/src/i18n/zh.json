@@ -3897,6 +3897,12 @@
       "imaginationHigh": "丰富",
       "testSettings": "测试内容",
       "testResult": "测试结果",
+      "platformLabels": {
+        "tokenhub": "混元",
+        "bailian": "百炼",
+        "hunyuan": "混元",
+        "volcengine": "火山"
+      },
       "providers": {
         "tokenhub": "腾讯 TokenHub",
         "bailian": "阿里云百炼",

@@ -7,7 +7,7 @@
 ## 范围与候选身份
 
 - 公司主线：`yybpc/company/main`；已合入
-  `e7abac770197f493e0efbd8975164f766041918f`，原实现基线为 `0cc8c01c`。
+  `a6904c9615b6e04aabe9b329c3ea65a378f6ed4f`，原实现基线为 `0cc8c01c`。
 - 候选：`feat/agent-additive-permissions` 本地提交与主线合并；尚未冻结发布 RELEASE_SHA。
   发布准备时重新 fetch 主线，若移动则集成、复审受影响差异并重新验证。
 - 当前产品版本：backend/frontend 均为 `1.10.3`，不升语义版本；

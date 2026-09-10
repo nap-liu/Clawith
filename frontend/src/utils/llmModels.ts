@@ -36,7 +36,9 @@ export function getLlmModelPlatform(model: LlmModelListItem): string {
 
 export function getLlmModelPlatformLabel(model: LlmModelListItem, t: ModelLabelTranslate): string {
     const platform = getLlmModelPlatform(model);
-    return platform ? t(`enterprise.llm.providers.${platform}`, { defaultValue: platform }) : '';
+    if (!platform) return '';
+    const providerLabel = t(`enterprise.llm.providers.${platform}`, { defaultValue: platform });
+    return t(`enterprise.llm.platformLabels.${platform}`, { defaultValue: providerLabel });
 }
 
 export function getLlmModelLabel(model: LlmModelListItem, t: ModelLabelTranslate): string {
