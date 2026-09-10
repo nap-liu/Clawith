@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -239,7 +239,7 @@ export default function OrgMemberAccessPicker({
         }
     }, [directoryUrl, membersOnly, mergeDepartments]);
 
-    useEffect(() => {
+    useLayoutEffect(() => {
         if (!open) {
             wasOpenRef.current = false;
             return;
@@ -316,7 +316,7 @@ export default function OrgMemberAccessPicker({
                 `${directoryUrl}/members?${params}`,
             );
         },
-        enabled: open && (membersOnly || singleSelect || !!debouncedMemberSearch || !!selectedDepartmentId),
+        enabled: open,
         staleTime: 15_000,
     });
 
