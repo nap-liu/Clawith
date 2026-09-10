@@ -10,6 +10,7 @@ from app.services.chat_attachments import (
 )
 from app.services.chat_history import parse_tool_call_for_display
 from app.services.quoted_message import normalize_quoted_message
+from app.services.media_request_attachments import media_request_attachments
 
 
 def serialize_chat_message_for_client(
@@ -36,6 +37,8 @@ def serialize_chat_message_for_client(
             meta,
             resolved_source,
         )
+        if not attachments and isinstance(meta, dict) and meta.get("media_request"):
+            attachments = media_request_attachments(meta)
     else:
         display_content = "该消息已撤回" if recall_status == "recalled" else raw_content
         delivery_status = meta.get("delivery_status") if isinstance(meta, dict) else None

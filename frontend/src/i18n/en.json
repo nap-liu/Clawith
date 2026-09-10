@@ -3216,13 +3216,17 @@
       "subagent": "Delegate tasks, review progress, and provide additional guidance"
     },
     "toolTranslations": {
+      "list_models": {
+        "name": "List models",
+        "description": "Find available models by name, purpose, input type or provider, and view capabilities and defaults."
+      },
       "read_media": {
         "name": "Read Media",
-        "description": "Analyze images, audio and video asynchronously. Ask follow-up questions and receive results automatically."
+        "description": "Analyze one or more images, audio files or videos, with follow-up questions and optional models and parameters."
       },
       "generate_media": {
         "name": "Generate Media",
-        "description": "Generate images, speech and video asynchronously. Continue editing and receive saved results automatically."
+        "description": "Generate or edit images and videos, or synthesize speech, with continued edits and optional models and parameters."
       },
       "user_project_search": {
         "name": "Search projects",

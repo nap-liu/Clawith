@@ -183,3 +183,26 @@ and all 17 tests then passed without changing product code or assertions.
 The temporary `agent-permissions-merge-redis` container and its anonymous volume
 were removed after verification. No shared stack, browser/provider workflow or
 production environment was changed, and no push or deployment was performed.
+
+## Third company main integration
+
+Merged company main `5129490b5db442edaa5c6f746226f003458326ed` without
+conflicts. Incoming changes add model discovery and media parameter controls,
+project request inputs into shared attachments, and extend playback reference
+checks. No migration or permission-writer change was needed.
+
+Docker verification passed **53 tests** across
+`test_media_understanding_parameters.py`, `test_media_viewer_catalog.py`,
+`test_media_playback.py`, `test_chat_attachments.py`, and
+`test_agent_additive_permissions.py`, against the isolated merged PostgreSQL
+database and temporary task Redis. This includes seeded model discovery,
+tenant filtering, transport parameters, media paths and additive Agent access.
+Frontend full prebuild, TypeScript and Vite build passed with the existing
+chunk-size advisory. Staged diff checks and incoming source line counts passed;
+the largest incoming source is 723 lines.
+
+Temporary Redis and its anonymous volume were removed after verification.
+No full-suite, new browser/provider or production validation was performed for
+this conflict-free integration. The release plan now notes that the incoming
+builtin tool/schema changes must be included if absent from actual production.
+No push or deployment was performed.

@@ -543,6 +543,7 @@ export default function SessionViewerDrawer({
     document.body.style.overflow = "hidden";
     window.requestAnimationFrame(() => closeButtonRef.current?.focus());
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (document.querySelector('.chat-image-lightbox')) return;
       if (event.key === "Escape") {
         onClose();
         return;

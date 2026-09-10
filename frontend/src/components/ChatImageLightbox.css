@@ -1,4 +1,5 @@
 .chat-image-lightbox {
+    --yarl__portal_zindex: 13000;
     --yarl__color_backdrop: rgba(4, 8, 14, 0.92);
     --yarl__slide_captions_container_background: rgba(0, 0, 0, 0.48);
 }

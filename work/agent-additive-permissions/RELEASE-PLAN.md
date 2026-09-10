@@ -7,15 +7,18 @@
 ## 范围与候选身份
 
 - 公司主线：`yybpc/company/main`；已合入
-  `a6904c9615b6e04aabe9b329c3ea65a378f6ed4f`，原实现基线为 `0cc8c01c`。
+  `5129490b5db442edaa5c6f746226f003458326ed`，原实现基线为 `0cc8c01c`。
 - 候选：`feat/agent-additive-permissions` 本地提交与主线合并；尚未冻结发布 RELEASE_SHA。
   发布准备时重新 fetch 主线，若移动则集成、复审受影响差异并重新验证。
 - 当前产品版本：backend/frontend 均为 `1.10.3`，不升语义版本；
   最终 RELEASE_ID 为 `v1.10.3-<RELEASE_SHA7>`。
 - 包含授权读写、创建/设置/MCP、共用权限编辑器及一次 PostgreSQL 数据归一化。
   backend、worker、connector 使用同一 backend digest，frontend 来自同一 SHA。
-- Plaza 已废弃，按用户要求不处理；无依赖、AIO、Redis、workspace 或对象存储格式变更，
-  不更改数据库内置工具 schema。MCP 配置工具沿现有 FastMCP 定义更新。
+- Plaza 已废弃，按用户要求不处理；权限功能无依赖、AIO、Redis、workspace 或对象存储
+  格式变更。MCP 配置工具沿现有 FastMCP 定义更新。
+- 合入主线已包含 `list_models` 内置工具及媒体工具参数/schema 更新。若生产尚未包含
+  `5129490b`，须将这些 seed、附件预览与旧镜像工具兼容性纳入最终发布差异和演练，
+  不能沿用“内置工具 schema 未变”的假设。
 - 权限迁移接在 `model_extra_headers` 之后，保持唯一 head。若实际生产尚未包含
   本次合入的模型能力/请求头主线提交，最终发布差异也须包含其影响及验证，
   不得将整次发布仍描述为仅权限改动。

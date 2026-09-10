@@ -50,6 +50,10 @@ export type ChatPreviewImage = {
     path?: string;
 };
 
+export function externalChatAttachmentUrl(path: string): string | undefined {
+    return /^(https?:\/\/|data:(image|audio|video)\/)/i.test(path) ? path : undefined;
+}
+
 export type ChatAttachmentPayload = {
     contentForLLM: string;
     userMsg: string;
@@ -304,7 +308,7 @@ export function normalizeChatAttachmentFields({
     const previewImages = normalized.attachments
         .filter((attachment) => attachment.kind === 'image')
         .map((attachment) => buildPreviewImage(
-            buildDownloadUrl(attachment.path, true),
+            externalChatAttachmentUrl(attachment.path) || buildDownloadUrl(attachment.path, true),
             attachment.display_name,
             undefined,
             attachment.path,

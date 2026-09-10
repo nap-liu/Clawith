@@ -13,6 +13,7 @@ from app.services.agent_tools_config_runtime import _get_tool_config
 from app.services.llm.failure_outcome import render_message
 from app.services.media_ai_contract import GENERATE_MEDIA_SCHEMA, READ_MEDIA_SCHEMA
 from app.services.media_ai_io import MediaAIError
+from app.services.media_ai_parameters import understanding_parameters
 from app.services.media_ai_sessions import enqueue_media, find_submitted_task, task_receipt
 from app.services.media_model_selection import resolve_media_model
 from app.services.turn_tool_settings import current_tool_settings
@@ -44,6 +45,8 @@ async def execute_media_tool(state) -> str:
             raise MediaAIError("toolDisabled")
         schema = READ_MEDIA_SCHEMA if state.tool_name == "read_media" else GENERATE_MEDIA_SCHEMA
         validate(state.arguments, schema, format_checker=FormatChecker())
+        if state.tool_name == "read_media":
+            understanding_parameters({}, state.arguments.get("parameters"))
         if not state.arguments["prompt"].strip():
             raise MediaAIError("invalidArguments")
         if state.tool_name == "read_media" and not state.arguments.get("session_id") and not state.arguments.get("files"):

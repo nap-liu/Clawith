@@ -2,7 +2,7 @@ import { IconAlertTriangle, IconDownload, IconPlayerPlayFilled, IconRefresh } fr
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { fileApi } from '../services/api';
-import type { ChatMessageAttachment } from '../utils/chatAttachments';
+import { externalChatAttachmentUrl, type ChatMessageAttachment } from '../utils/chatAttachments';
 import { formatFileSize } from '../utils/formatFileSize';
 import ChatAttachmentIcon from './ChatAttachmentIcon';
 import './ChatMediaCard.css';
@@ -31,7 +31,7 @@ export default function ChatMediaCard({
     agentId,
     messageId,
     attachment,
-    externalUrl,
+    externalUrl = externalChatAttachmentUrl(attachment.path),
     mode = 'pc',
     onDownload,
     onUnavailable,

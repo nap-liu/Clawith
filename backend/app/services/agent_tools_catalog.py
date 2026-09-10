@@ -5,9 +5,11 @@ from app.services.agent_tools_catalog_feishu import AGENT_TOOL_FEISHU
 from app.services.agent_tools_catalog_integrations import AGENT_TOOL_INTEGRATIONS
 from app.services.agent_tools_catalog_runtime import AGENT_TOOL_RUNTIME
 from app.services.media_ai_contract import MEDIA_AI_FUNCTIONS
+from app.services.model_catalog_tool import MODEL_CATALOG_FUNCTION
 
 AGENT_TOOLS = [
     *MEDIA_AI_FUNCTIONS,
+    MODEL_CATALOG_FUNCTION,
     *AGENT_TOOL_CORE,
     *AGENT_TOOL_RUNTIME,
     *AGENT_TOOL_FEISHU,

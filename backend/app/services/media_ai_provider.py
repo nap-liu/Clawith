@@ -12,6 +12,7 @@ from app.services.llm.client import LLMError, LLMMessage, LLMResponse, create_ll
 from app.services.llm.client_registry import resolve_api_protocol
 from app.services.media_ai_io import MediaAIError, MediaInput, media_content
 from app.services.media_ai_headers import extra_headers
+from app.services.media_ai_parameters import understanding_parameters
 from app.services.model_platform import model_service_platform
 
 
@@ -110,16 +111,16 @@ def _understanding_transport(config: dict, messages: list[LLMMessage]) -> tuple[
     return protocol, base_url
 
 
-async def understand_response(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None) -> LLMResponse:
+async def understand_response(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None, parameters: dict | None = None) -> LLMResponse:
     if not media and not history:
         raise MediaAIError("inputCombination")
     content = media_content(prompt, media)
     messages = [LLMMessage(**message) for message in (history or [])]
     messages.append(LLMMessage(role="user", content=content))
-    return await _understanding_attempt(config, media, messages)
+    return await _understanding_attempt(config, media, messages, parameters=parameters)
 
 
-async def _understanding_attempt(config, media, messages, *, attempts=None):
+async def _understanding_attempt(config, media, messages, *, attempts=None, parameters=None):
     from app.services.llm.provider_retry import _is_provider_recovery_error, _is_provider_throttle_error
 
     attempts = list(attempts or [])
@@ -138,10 +139,10 @@ async def _understanding_attempt(config, media, messages, *, attempts=None):
     fallback = None
     try:
         extra = {"modalities": ["text"]} if config.get("provider") in {"qwen", "bailian", "dashscope"} else {}
+        options = {**extra, **understanding_parameters(config, parameters)}
         response = await client.stream(
-            messages=messages, max_tokens=config.get("max_output_tokens"),
-            temperature=config.get("temperature"), reasoning_effort=config.get("reasoning_effort"),
-            on_chunk=observed, on_thinking=observed, on_tool_delta=observed, **extra,
+            messages=messages,
+            on_chunk=observed, on_thinking=observed, on_tool_delta=observed, **options,
         )
         if response.finish_reason in {"length", "max_tokens"}:
             raise MediaAIError("analysisTooLong")
@@ -170,11 +171,11 @@ async def _understanding_attempt(config, media, messages, *, attempts=None):
         raise error from exc
     finally:
         await client.close()
-    return await _understanding_attempt(fallback, media, messages, attempts=attempts)
+    return await _understanding_attempt(fallback, media, messages, attempts=attempts, parameters=parameters)
 
 
-async def understand(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None) -> tuple[str, dict]:
+async def understand(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None, parameters: dict | None = None) -> tuple[str, dict]:
     if not config.get("model_id"):
-        return await bailian.understand(config, prompt, media, history=history)
-    response = await understand_response(config, prompt, media, history=history)
+        return await bailian.understand(config, prompt, media, history=history, parameters=parameters)
+    response = await understand_response(config, prompt, media, history=history, parameters=parameters)
     return response.content, response.usage or {}

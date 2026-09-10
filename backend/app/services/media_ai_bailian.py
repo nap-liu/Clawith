@@ -12,6 +12,7 @@ from app.services.media_ai_bailian_generation import IMAGE_PATH, MULTIMODAL_PATH
 from app.services.media_ai_bailian_video import video_payload
 from app.services.media_ai_headers import provider_headers
 from app.services.media_ai_io import MediaAIError, MediaInput, media_content
+from app.services.media_ai_parameters import understanding_parameters
 
 def connection(config: dict) -> dict:
     resolved = {**MEDIA_AI_DEFAULTS, **{k: v for k, v in config.items() if v is not None and v != ""}}
@@ -67,7 +68,7 @@ async def request(config: dict, path: str, payload: dict | None = None, *, async
         return _check_response(response)
 
 
-async def understand(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None) -> tuple[str, dict]:
+async def understand(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None, parameters: dict | None = None) -> tuple[str, dict]:
     if not media and not history:
         raise MediaAIError("inputCombination")
     content = media_content(prompt, media)
@@ -77,6 +78,7 @@ async def understand(config: dict, prompt: str, media: list[MediaInput], *, hist
         "modalities": ["text"], "stream": True,
         "stream_options": {"include_usage": True}, "max_tokens": config.get("max_output_tokens", 4096),
     }
+    payload.update({key: value for key, value in understanding_parameters(config, parameters).items() if value is not None})
     chunks = []
     usage = {}
     finished = False

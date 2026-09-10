@@ -16,6 +16,7 @@ from app.services.mcp_catalog_policy import can_remove_private_tool
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
 from app.services.media_ai_contract import MEDIA_AI_SEEDS
+from app.services.model_catalog_tool import MODEL_CATALOG_SEED
 from app.services.media_model_migration import migrate_legacy_media_configs
 from app.services.speech_model_selection import migrate_legacy_speech_configs
 from app.services.tool_config import get_sensitive_keys, meaningful_config, tenant_tool_config_key
@@ -134,6 +135,7 @@ from app.services.tool_seeder_builtin_6 import BUILTIN_TOOLS_PART_6
 
 BUILTIN_TOOLS = [
     *MEDIA_AI_SEEDS,
+    MODEL_CATALOG_SEED,
     *BUILTIN_TOOLS_PART_1,
     *BUILTIN_TOOLS_PART_2,
     *BUILTIN_TOOLS_PART_3,

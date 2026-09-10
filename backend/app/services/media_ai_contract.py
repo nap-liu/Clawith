@@ -29,18 +29,20 @@ _FILES = {
             "role": {"type": "string", "enum": ["first_frame", "last_frame", "reference_image", "reference_video", "reference_audio"]},
         }, "required": ["source"], "additionalProperties": False},
     ]},
-    "description": "AgentDir paths, third-party HTTP(S) URLs or base64 media data URLs. Optional kind avoids probing opaque URLs; role selects a generation reference role.",
+    "description": "File paths, HTTP(S) URLs or media data URLs. Use kind to specify the media type and role to specify how a reference is used.",
 }
 _SESSION = {"type": "string", "format": "uuid", "description": "Continue a media session returned by an earlier call. Omit to start one."}
-_MODEL = {"type": "string", "format": "uuid", "description": "Optional enterprise model ID. Omit to use the media session selection or configured company model."}
+_MODEL = {"type": "string", "format": "uuid", "description": "Model ID from list_models. Omit to use the default."}
+_PARAMETERS = {"type": "object", "description": "Optional model parameters, such as temperature, reasoning_effort, max_output_tokens or seed. Omitted values use defaults."}
 READ_MEDIA_SCHEMA = {
     "type": "object",
     "properties": {
         "files": {**_FILES, "minItems": 1},
         "session_id": _SESSION,
-        "model_id": {**_MODEL, "description": "Optional enterprise model ID. An explicit model is used as selected. Omit to prefer a session/company model matching the media types. Provider support determines whether an input is accepted."},
+        "model_id": _MODEL,
         "prompt": {"type": "string", "minLength": 1,
                    "description": "Question or analysis request about the supplied media."},
+        "parameters": _PARAMETERS,
     },
     "required": ["prompt"], "additionalProperties": False,
 }
@@ -61,7 +63,7 @@ GENERATE_MEDIA_SCHEMA = {
                    "description": "Optional provider voice for speech. Omit to use the selected model's default."},
         "resolution": {"type": "string", "description": "Provider video resolution, for example 480P or 720P."},
         "size": {"type": "string", "description": "Provider image dimensions, for example 1024*1024."},
-        "parameters": {"type": "object", "description": "Optional generation parameters supported by the selected model, such as seed or voice settings. Model, prompt and reference files use the fields above."},
+        "parameters": _PARAMETERS,
     },
     "required": ["prompt", "output_type"], "additionalProperties": False,
 }
@@ -69,12 +71,12 @@ GENERATE_MEDIA_SCHEMA = {
 MEDIA_AI_SEEDS = [
     {
         "name": "read_media", "display_name": "Read Media",
-        "description": "Read one or multiple images, audio or videos together asynchronously, including video sound when supported by the selected enterprise model. Returns task_id and session_id immediately; completion arrives automatically. Supply session_id for follow-up questions. Do not poll or resubmit while pending. Uses the company model pool.",
+        "description": "Analyze one or more images, audio files or videos. Supports follow-up questions, model selection and optional parameters. Results arrive automatically when complete.",
         "parameters_schema": READ_MEDIA_SCHEMA,
     },
     {
         "name": "generate_media", "display_name": "Generate Media",
-        "description": "Generate/edit images, synthesize speech, or generate/edit/extend video asynchronously using the selected enterprise model's capabilities. Returns task_id and session_id immediately; results arrive automatically. Supply session_id to continue with prior references. For audio, prompt is the complete text to speak. Do not poll or resubmit while pending. Uses the company model pool.",
+        "description": "Generate or edit images and videos, or synthesize speech. Supports continued edits, model selection and optional parameters. Results arrive automatically when complete.",
         "parameters_schema": GENERATE_MEDIA_SCHEMA,
     },
 ]
