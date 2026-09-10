@@ -317,7 +317,7 @@ BUILTIN_TOOLS_PART_1 = [
                         "properties": {
                             "id": {"type": "string", "minLength": 1, "maxLength": 120},
                             "name": {"type": "string", "minLength": 1, "maxLength": 80},
-                            "content": {"type": "string", "minLength": 1, "maxLength": 12000},
+                            "content": {"type": "string", "minLength": 1, "maxLength": 24000},
                             "enabled": {
                                 "type": "boolean",
                                 "default": True,

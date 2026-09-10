@@ -70,6 +70,13 @@ Display/log sanitization must not poison the durable result later replayed to
 the model. Exact file paths and stage-specific storage/parser errors remain
 visible; do not collapse them into a false “not found” or canned success.
 
+## Scene prompt blocks
+
+Each scene system-prompt block accepts up to 24,000 characters through the
+settings editor, scene API, and seeded `manage_scene` tool schema. Enabled
+blocks are loaded in order without per-block truncation; model context budgets
+still apply. Raising the input limit does not restore previously truncated text.
+
 ## Agent memory loading
 
 Core memory is loaded without an arbitrary fixed-character truncation. Daily
