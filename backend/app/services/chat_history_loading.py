@@ -311,6 +311,7 @@ def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
         "args": args,
         "status": data.get("status"),
         "result": data.get("result"),
+        "session_ref": data.get("session_ref"),
         "reasoning_content": data.get("reasoning_content"),
         "assistant_content": data.get("assistant_content"),
         "recovery_prefix_messages": data.get("recovery_prefix_messages"),

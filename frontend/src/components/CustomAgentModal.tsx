@@ -16,10 +16,10 @@ import { agentApi, authApi, enterpriseApi, tenantApi } from '../services/api';
 import { useDialog } from './Dialog/DialogProvider';
 import LinearCopyButton from './LinearCopyButton';
 import SelectDropdown from './SelectDropdown';
+import AgentPermissionsEditor, { permissionGrants, type AgentPermissionsValue } from './AgentPermissionsEditor';
 import { getLlmModelLabel, sortLlmModels } from '../utils/llmModels';
 
 type Mode = 'native' | 'openclaw';
-type Visibility = 'company' | 'only_me' | 'custom';
 
 interface Model {
     id: string;
@@ -51,7 +51,7 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
     const [mode, setMode] = useState<Mode>(initialMode);
     const [name, setName] = useState('');
     const [roleDescription, setRoleDescription] = useState('');
-    const [visibility, setVisibility] = useState<Visibility>('only_me');
+    const [permissions, setPermissions] = useState<AgentPermissionsValue>({ company: 'off', users: [], departments: [] });
     const [modelId, setModelId] = useState('');
     const [createdExternal, setCreatedExternal] = useState<CreatedAgent | null>(null);
 
@@ -111,7 +111,7 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             setMode(initialMode);
             setName('');
             setRoleDescription('');
-            setVisibility('only_me');
+            setPermissions({ company: 'off', users: [], departments: [] });
             setModelId('');
             setCreatedExternal(null);
         }
@@ -145,9 +145,7 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                 name: trimmedName,
                 agent_type: mode,
                 role_description: roleDescription.trim() || undefined,
-                permission_scope_type: visibility === 'company' ? 'company' : visibility === 'custom' ? 'custom' : 'user',
-                permission_scope_ids: [],
-                permission_access_level: 'use',
+                permission_grants: permissionGrants(permissions),
                 tenant_id: currentTenant || undefined,
                 skill_ids: [],
             };
@@ -300,26 +298,8 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                                     <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
                                         {t('customAgentModal.visibility')}
                                     </div>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                        <RadioRow
-                                            selected={visibility === 'company'}
-                                            onClick={() => !busy && setVisibility('company')}
-                                            title={t('customAgentModal.visibilityCompany')}
-                                            hint={t('customAgentModal.visibilityCompanyHint')}
-                                        />
-                                        <RadioRow
-                                            selected={visibility === 'only_me'}
-                                            onClick={() => !busy && setVisibility('only_me')}
-                                            title={t('customAgentModal.visibilityOnlyMe')}
-                                            hint={t('customAgentModal.visibilityOnlyMeHint')}
-                                        />
-                                        <RadioRow
-                                            selected={visibility === 'custom'}
-                                            onClick={() => !busy && setVisibility('custom')}
-                                            title={t('customAgentModal.visibilityCustom')}
-                                            hint={t('customAgentModal.visibilityCustomHint')}
-                                        />
-                                    </div>
+                                    <AgentPermissionsEditor value={permissions} disabled={busy}
+                                        onChange={async next => { setPermissions(next); }} />
                                 </section>
 
                                 {mode === 'native' && (
@@ -489,45 +469,6 @@ function ModeButton({ active, icon, label, onClick }: { active: boolean; icon: R
         >
             {icon}
             {label}
-        </button>
-    );
-}
-
-function RadioRow({ selected, onClick, title, hint }: { selected: boolean; onClick: () => void; title: string; hint: string }) {
-    return (
-        <button
-            type="button"
-            onClick={onClick}
-            style={{
-                display: 'flex',
-                alignItems: 'flex-start',
-                gap: '10px',
-                padding: '10px 12px',
-                textAlign: 'left',
-                border: `1px solid ${selected ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
-                borderRadius: '8px',
-                background: selected ? 'var(--accent-subtle, rgba(99,102,241,0.08))' : 'transparent',
-                cursor: 'pointer',
-                width: '100%',
-            }}
-        >
-            <span style={{
-                marginTop: '2px',
-                width: '14px',
-                height: '14px',
-                borderRadius: '50%',
-                border: `2px solid ${selected ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-            }}>
-                {selected && <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'var(--accent-primary)' }} />}
-            </span>
-            <span style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                <span style={{ fontSize: '13px', color: 'var(--text-primary)' }}>{title}</span>
-                <span style={{ fontSize: '11.5px', color: 'var(--text-tertiary)' }}>{hint}</span>
-            </span>
         </button>
     );
 }

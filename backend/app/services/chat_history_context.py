@@ -29,6 +29,8 @@ def parse_tool_call_for_display(content: str) -> dict[str, Any]:
     }
     if payload["call_id"]:
         display["toolCallId"] = str(payload["call_id"])
+    if payload.get("session_ref"):
+        display["toolSessionRef"] = payload["session_ref"]
     return display
 
 

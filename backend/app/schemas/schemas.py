@@ -5,6 +5,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.schemas.agent_permissions import AgentGrant
 from app.services.llm.reasoning import ReasoningEffort
 from app.services.model_capabilities import APIProtocol, InputModality, ModelPurpose
 from app.schemas.model_headers import ExtraHeaders
@@ -258,6 +259,7 @@ class AgentCreate(BaseModel):
     # Permissions
     permission_scope_type: str = "company"  # company | user | custom
     permission_scope_ids: list[uuid.UUID] = []
+    permission_grants: list[AgentGrant] | None = None
     permission_access_level: str = "use"  # use | manage
     # Target tenant (admin-only override; otherwise ignored)
     tenant_id: uuid.UUID | None = None

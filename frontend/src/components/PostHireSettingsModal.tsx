@@ -7,6 +7,7 @@ import { agentApi, authApi, enterpriseApi, tenantApi } from '../services/api';
 import { translateTemplate } from '../i18n/templateTranslations';
 import { useDialog } from './Dialog/DialogProvider';
 import SelectDropdown from './SelectDropdown';
+import AgentPermissionsEditor, { permissionGrants, type AgentPermissionsValue } from './AgentPermissionsEditor';
 import { getLlmModelLabel, sortLlmModels, type LlmModelListItem } from '../utils/llmModels';
 
 interface Template {
@@ -35,7 +36,6 @@ interface Props {
     onDone?: () => void;
 }
 
-type Visibility = 'company' | 'only_me' | 'custom';
 
 export default function PostHireSettingsModal({ template, open, onClose, onDone }: Props) {
     const { t, i18n } = useTranslation();
@@ -44,7 +44,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
     const dialog = useDialog();
     const isChinese = i18n.language.startsWith('zh');
 
-    const [visibility, setVisibility] = useState<Visibility>('company');
+    const [permissions, setPermissions] = useState<AgentPermissionsValue>({ company: 'use', users: [], departments: [] });
     const [modelId, setModelId] = useState<string>('');
 
     const { data: myTenant } = useQuery({
@@ -99,7 +99,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
     // Reset local form whenever the modal closes so the next open is clean.
     useEffect(() => {
         if (!open) {
-            setVisibility('company');
+            setPermissions({ company: 'use', users: [], departments: [] });
             setModelId('');
         }
     }, [open]);
@@ -134,14 +134,8 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                 role_description: localized.description,
                 template_id: template.id,
                 primary_model_id: modelId || undefined,
-                permission_access_level: 'manage',
+                permission_grants: permissionGrants(permissions),
             };
-            payload.permission_scope_type = visibility === 'company'
-                ? 'company'
-                : visibility === 'custom'
-                    ? 'custom'
-                    : 'user';
-            payload.permission_scope_ids = [];
             return agentApi.create(payload).then((agent: any) => ({ agent, navigateAfter }));
         },
         onSuccess: ({ agent, navigateAfter }) => {
@@ -175,7 +169,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
         >
             <div style={{
                 background: 'var(--bg-primary)', borderRadius: '12px',
-                width: '480px', maxWidth: '92vw',
+                width: '480px', maxWidth: '92vw', maxHeight: '86vh',
                 border: '1px solid var(--border-subtle)',
                 boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
                 display: 'flex', flexDirection: 'column', overflow: 'hidden',
@@ -194,32 +188,14 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                     </button>
                 </div>
 
-                <div style={{ padding: '8px 26px 8px', display: 'flex', flexDirection: 'column', gap: '18px' }}>
+                <div style={{ padding: '8px 26px 8px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '18px' }}>
                     {/* Visibility */}
                     <section>
                         <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
                             {t('postHire.visibility')}
                         </div>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                            <RadioRow
-                                selected={visibility === 'company'}
-                                onClick={() => !busy && setVisibility('company')}
-                                title={t('postHire.visibilityCompanyTitle')}
-                                hint={t('postHire.visibilityCompanyHint')}
-                            />
-                            <RadioRow
-                                selected={visibility === 'only_me'}
-                                onClick={() => !busy && setVisibility('only_me')}
-                                title={t('postHire.visibilityOnlyMeTitle')}
-                                hint={t('postHire.visibilityOnlyMeHint')}
-                            />
-                            <RadioRow
-                                selected={visibility === 'custom'}
-                                onClick={() => !busy && setVisibility('custom')}
-                                title={t('postHire.visibilityCustomTitle')}
-                                hint={t('postHire.visibilityCustomHint')}
-                            />
-                        </div>
+                        <AgentPermissionsEditor value={permissions} disabled={busy}
+                            onChange={async next => { setPermissions(next); }} />
                     </section>
 
                     {/* Model */}
@@ -327,34 +303,5 @@ function NoModelsNotice({
                 ) : null}
             </div>
         </div>
-    );
-}
-
-function RadioRow({ selected, onClick, title, hint }: { selected: boolean; onClick: () => void; title: string; hint: string }) {
-    return (
-        <button
-            type="button"
-            onClick={onClick}
-            style={{
-                display: 'flex', alignItems: 'flex-start', gap: '10px',
-                padding: '10px 12px', textAlign: 'left',
-                border: `1px solid ${selected ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
-                borderRadius: '8px', background: selected ? 'var(--accent-subtle, rgba(99,102,241,0.08))' : 'transparent',
-                cursor: 'pointer', width: '100%',
-            }}
-        >
-            <span style={{
-                marginTop: '2px', width: '14px', height: '14px', borderRadius: '50%',
-                border: `2px solid ${selected ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
-                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                flexShrink: 0,
-            }}>
-                {selected && <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'var(--accent-primary)' }} />}
-            </span>
-            <span style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                <span style={{ fontSize: '13px', color: 'var(--text-primary)' }}>{title}</span>
-                <span style={{ fontSize: '11.5px', color: 'var(--text-tertiary)' }}>{hint}</span>
-            </span>
-        </button>
     );
 }

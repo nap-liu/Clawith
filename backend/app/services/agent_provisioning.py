@@ -23,7 +23,10 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import and_, or_, select
 
-from app.models.agent import Agent, AgentPermission
+from app.models.agent import Agent
+from app.services.llm.failure_outcome import render_message
+from app.schemas.agent_permissions import AgentGrant
+from app.services.agent_permissions import update_agent_grants
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 
 
@@ -43,6 +46,7 @@ class AgentProvisionInput:
     permission_scope_type: str = "company"     # company | user | custom
     permission_scope_ids: list = field(default_factory=list)
     permission_access_level: str = "use"
+    permission_grants: list | None = None
     autonomy_policy: dict | None = None
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
@@ -135,7 +139,6 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
         selected_model = await db.get(LLMModel, model_id)
         if (selected_model is None or selected_model.tenant_id not in {tenant_id, None}
                 or not selected_model.enabled or not supports_purpose(selected_model)):
-            from app.services.llm.failure_outcome import render_message
 
             raise ValueError(render_message("modelPool.conversationRequired"))
     expires_at = datetime.now(tz.utc) + timedelta(hours=ttl_hours) if ttl_hours and ttl_hours > 0 else None
@@ -177,29 +180,21 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
     ))
     await db.flush()
 
-    # Set permissions
-    access_level = data.permission_access_level if data.permission_access_level in ("use", "manage") else "use"
-    if data.permission_scope_type not in ("company", "user", "custom"):
-        raise ValueError("Unsupported permission_scope_type")
-    if data.permission_scope_type == "company":
-        agent.access_mode = "company"
-        agent.company_access_level = access_level
-        db.add(AgentPermission(agent_id=agent.id, scope_type="company", access_level=access_level))
-    elif data.permission_scope_type == "user":
-        agent.access_mode = "private"
-        agent.company_access_level = access_level
-        if data.permission_scope_ids:
-            for scope_id in data.permission_scope_ids:
-                db.add(AgentPermission(agent_id=agent.id, scope_type="user", scope_id=scope_id, access_level=access_level))
-        else:
-            # "仅自己" — insert creator as the only permitted user
-            db.add(AgentPermission(agent_id=agent.id, scope_type="user", scope_id=creator.id, access_level="manage"))
-    elif data.permission_scope_type == "custom":
-        agent.access_mode = "custom"
-        agent.company_access_level = access_level
-        db.add(AgentPermission(agent_id=agent.id, scope_type="user", scope_id=creator.id, access_level="manage"))
-
-    await db.flush()
+    # Every entry point writes the same normalized grants.
+    grants = data.permission_grants
+    if grants is None:
+        if data.permission_scope_type not in ("company", "user", "private", "custom"):
+            raise ValueError(render_message("agentPermissions.invalidScope"))
+        if data.permission_access_level not in ("use", "manage"):
+            raise ValueError(render_message("agentPermissions.invalidLevel"))
+        grants = []
+        if data.permission_scope_type == "company":
+            grants.append(AgentGrant(scope_type="company", access_level=data.permission_access_level))
+        elif data.permission_scope_type == "custom":
+            grants.extend(AgentGrant(
+                scope_type="user", scope_id=sid, access_level=data.permission_access_level,
+            ) for sid in data.permission_scope_ids)
+    await update_agent_grants(db, agent, actor_id=creator.id, data={"grants": grants})
     await ensure_access_granted_platform_relationships(db, agent, created_by_user_id=creator.id)
 
     # Seed explicit AgentTool rows from the platform default set so this agent's

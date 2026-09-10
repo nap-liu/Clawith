@@ -187,7 +187,7 @@ async def search_human_relationship_candidates(
     if not _can_manage_relationships(current_user, access_level):
         raise HTTPException(status_code=403, detail="Only org admins or managers can modify relationships")
 
-    access_mode = getattr(agent, "access_mode", None) or "company"
+    company_visible = getattr(agent, "company_grant_level", None) is not None
     directory = await permission_directory_members(
         db,
         tenant_id=agent.tenant_id,
@@ -203,7 +203,7 @@ async def search_human_relationship_candidates(
         platform_access_level = await get_agent_access_level_for_user_id(
             db, user_id, agent
         )
-        if access_mode != "company" and platform_access_level is None:
+        if not company_visible and platform_access_level is None:
             continue
         sources = item.get("directory_sources") or []
         preferred = next(

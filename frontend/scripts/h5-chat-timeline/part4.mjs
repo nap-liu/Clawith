@@ -14,7 +14,41 @@ export function runH5ChatTimelinePart4(ctx) {
         getH5ScrollAnchor,
         mergeHistoryMessages,
         reconcileLatestHistoryWindow,
+        parseSubagentRunCardData,
     } = ctx;
+
+{
+    const reference = { session_id: 'child-session', execution_agent_id: 'execution-agent' };
+    const running = toolCallMessageFromEvent({
+        name: 'run_subagent', call_id: 'child-call', status: 'running',
+        args: { task: 'Inspect evidence' }, session_ref: reference,
+    });
+    const card = parseSubagentRunCardData(running, {});
+    assert.equal(card.sessionId, reference.session_id);
+    assert.equal(card.status, 'running');
+    let messages = upsertToolCallMessage([], running);
+    messages = upsertToolCallMessage(messages, toolCallMessageFromEvent({
+        name: 'run_subagent', call_id: 'child-call', status: 'done',
+        result: '[Generation stopped]',
+    }));
+    messages = upsertToolCallMessage(messages, running);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].toolStatus, 'done');
+    assert.equal(parseSubagentRunCardData(messages[0], {}).sessionId, reference.session_id);
+    const reloaded = mapHistoryMessage({
+        id: 'durable-final', role: 'tool_call', toolName: 'run_subagent',
+        toolCallId: 'child-call', toolStatus: 'done', toolSessionRef: reference,
+        toolResult: '[Generation stopped]',
+    });
+    assert.equal(parseSubagentRunCardData(reloaded, {}).sessionId, reference.session_id);
+    const legacy = mapHistoryMessage({
+        id: 'legacy-final', role: 'tool_call', content: JSON.stringify({
+            name: 'run_subagent', status: 'done',
+            result: JSON.stringify({ session_id: 'legacy-child', status: 'completed' }),
+        }),
+    });
+    assert.equal(parseSubagentRunCardData(legacy, {}).sessionId, 'legacy-child');
+}
 
 {
     const tool = mapHistoryMessage({

@@ -555,6 +555,7 @@ async def execute_tool(
     skip_autonomy: bool = False,
     tools_for_llm: list[dict] | None = None,
     approved_by_human: bool = False,
+    on_progress=None,
 ) -> str:
     from app.services.agent_tools_execute_tool_dispatch_basic import execute_tool_dispatch_basic
     from app.services.agent_tools_execute_tool_dispatch_extended import execute_tool_dispatch_extended
@@ -573,6 +574,7 @@ async def execute_tool(
         skip_autonomy=skip_autonomy,
         tools_for_llm=tools_for_llm,
         approved_by_human=approved_by_human,
+        on_progress=on_progress,
     )
     if isinstance(preflight, str):
         return preflight

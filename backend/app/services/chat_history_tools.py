@@ -90,6 +90,7 @@ async def persist_tool_call_row(
             "args": evt.get("args"),
             "status": status,
             "result": evt.get("result") or "",
+            **({"session_ref": evt["session_ref"]} if evt.get("session_ref") else {}),
             "reasoning_content": evt.get("reasoning_content"),
             "assistant_content": evt.get("assistant_content"),
             "recovery_prefix_messages": evt.get("recovery_prefix_messages") or [],
@@ -147,6 +148,9 @@ async def close_running_tool_calls_for_stop(
             continue
         call_id = str(payload.get("call_id") or row.id)
         if payload.get("status") == "running":
+            previous = open_calls.get(call_id)
+            if previous and not payload.get("session_ref"):
+                payload["session_ref"] = previous[1].get("session_ref")
             open_calls[call_id] = (row, payload)
         elif payload.get("status") == "done":
             open_calls.pop(call_id, None)
@@ -163,6 +167,7 @@ async def close_running_tool_calls_for_stop(
                 "args": payload.get("args"),
                 "status": "done",
                 "result": "[Generation stopped]",
+                "session_ref": payload.get("session_ref"),
                 "reasoning_content": payload.get("reasoning_content"),
                 "assistant_content": payload.get("assistant_content"),
                 "responses_snapshot": (row.message_meta or {}).get("responses_snapshot"),

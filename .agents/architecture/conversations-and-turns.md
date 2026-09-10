@@ -219,6 +219,17 @@ delivery of provider reasoning or hidden chain-of-thought.
 
 ### Asynchronous Subagent events on parent turns
 
+A child session becomes viewable as soon as creation commits, including during
+a synchronous parent tool wait. The shared tool caller persists and broadcasts
+one additional `running` marker with a stable `session_ref` under the same tool
+call ID. It retains the round/recovery context and obeys the current turn fence.
+The reference is display metadata, separate from the final model-facing result;
+history/live projections and stopped results retain it. Existing session access,
+read-only details and status subscriptions apply. Synchronous execution still
+waits for completion, and retry admission reuses the original child session.
+Recovery folds running updates by tool call ID and retains the reference in its
+single interrupted result; its existing automatic-replay policy is unchanged.
+
 Ordinary Web, IM, trigger, and non-project A2A parent Sessions use one durable Subagent-event drain rather than one wake turn per child event. A child `ChatMessage` with `subagent_wake=true` remains the notification source, and its parent projection is idempotent through `external_event_key=subagent-parent:<child_message_id>`.
 
 - If the parent is idle, the dispatcher groups a bounded set of events by parent Session and execution identity. The first projection is the root anchor, later projections carry `subagent_turn_anchor_id`, and the batch calls `resume_turn()` once.

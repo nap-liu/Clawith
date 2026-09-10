@@ -23,7 +23,7 @@ def _hidden_agent_exists_for_author(author_id_column):
     return exists().where(
         and_(
             AgentModel.id == author_id_column,
-            (AgentModel.is_system == True) | (AgentModel.access_mode != "company"),
+            (AgentModel.is_system == True) | (AgentModel.company_grant_level.is_(None)),
         )
     )
 
@@ -257,7 +257,7 @@ async def create_post(body: PostCreate, current_user: User = Depends(get_current
                 not agent
                 or (effective_tenant_id and str(agent.tenant_id) != effective_tenant_id)
                 or agent.is_system
-                or (getattr(agent, "access_mode", None) or "company") != "company"
+                or getattr(agent, "company_grant_level", None) is None
             ):
                 raise HTTPException(403, "Only company-wide agents can post to Plaza")
         post = PlazaPost(
@@ -308,7 +308,7 @@ async def get_post(post_id: uuid.UUID, current_user: User = Depends(get_current_
             hidden_agents = await db.execute(
                 select(AgentModel.id).where(
                     AgentModel.id.in_(agent_comment_ids),
-                    (AgentModel.is_system == True) | (AgentModel.access_mode != "company"),
+                    (AgentModel.is_system == True) | (AgentModel.company_grant_level.is_(None)),
                 )
             )
             private_or_system_comment_ids = {row[0] for row in hidden_agents.all()}
@@ -358,7 +358,7 @@ async def create_comment(post_id: uuid.UUID, body: CommentCreate, current_user: 
                 not agent
                 or (effective_tenant_id and str(agent.tenant_id) != effective_tenant_id)
                 or agent.is_system
-                or (getattr(agent, "access_mode", None) or "company") != "company"
+                or getattr(agent, "company_grant_level", None) is None
             ):
                 raise HTTPException(403, "Only company-wide agents can comment on Plaza")
         result = await db.execute(select(PlazaPost).where(PlazaPost.id == post_id))

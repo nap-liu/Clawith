@@ -19,7 +19,9 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSON, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, column_property
+
+from sqlalchemy import select
 
 from app.database import Base
 
@@ -172,6 +174,7 @@ class Agent(Base):
     # - company: all platform users in the tenant can access; all tenant agents can interact.
     # - private: only the creator can use/manage; hidden from Plaza.
     # - custom: explicit user access rows; agent-to-agent access is configured via Relationships.
+    # Compatibility display projections; grants are the authorization source.
     access_mode: Mapped[str] = mapped_column(String(20), default="company", nullable=False)
     company_access_level: Mapped[str] = mapped_column(String(20), default="use", nullable=False)
 
@@ -264,6 +267,14 @@ class AgentPermission(Base):
     access_level: Mapped[str] = mapped_column(String(20), default="use", nullable=False)
 
     agent: Mapped["Agent"] = relationship(back_populates="permissions")
+
+
+Agent.company_grant_level = column_property(
+    select(AgentPermission.access_level)
+    .where(AgentPermission.agent_id == Agent.id, AgentPermission.scope_type == "company")
+    .correlate_except(AgentPermission)
+    .scalar_subquery()
+)
 
 
 class AgentTemplate(Base):

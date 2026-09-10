@@ -51,6 +51,11 @@ transaction or lock.
 
 ## Frontend
 
+Agent company, department and personal access grants combine at their highest
+level. `agent_permissions` is authoritative; legacy mode fields are compatibility
+projections. Creation, settings and MCP writes share one grant service. See
+`.agents/architecture/agent-permissions.md` for semantics and migration boundaries.
+
 The React/TypeScript frontend renders durable sessions and live events. Authorization to view, write, or monitor a session is decided by backend policy. Read-only monitoring may receive live events but must remain server-enforced read-only.
 
 Project creation may copy any selectable, visible native Agent in the tenant;

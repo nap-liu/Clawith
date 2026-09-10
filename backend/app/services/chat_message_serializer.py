@@ -135,7 +135,10 @@ def merge_tool_call_update_for_client(
 ) -> dict[str, Any]:
     """Project one append-only tool update without moving its timeline slot."""
 
+    created_at = previous.get("created_at") or current.get("created_at")
     if previous.get("toolStatus") == "done" and current.get("toolStatus") == "running":
-        return previous
-    current["created_at"] = previous.get("created_at") or current.get("created_at")
+        previous, current = current, previous
+    if previous.get("toolSessionRef") and not current.get("toolSessionRef"):
+        current["toolSessionRef"] = previous["toolSessionRef"]
+    current["created_at"] = created_at
     return current

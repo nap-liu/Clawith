@@ -42,6 +42,7 @@ function parseObject(value: unknown): Record<string, any> {
 export function parseSubagentRunCardData(message: any, payload: Record<string, any>): SubagentRunCardData {
     const args = parseObject(message?.toolArgs ?? payload.args);
     const result = parseObject(message?.toolResult ?? payload.result);
+    const reference = parseObject(message?.toolSessionRef ?? payload.session_ref);
     const toolStatus = String(message?.toolStatus || payload.status || '').toLowerCase();
     const fallbackStatus = result.subagent_id || result.session_id
         ? 'completed'
@@ -51,9 +52,11 @@ export function parseSubagentRunCardData(message: any, payload: Record<string, a
         || fallbackStatus,
     ).toLowerCase();
     return {
-        subagentId: result.subagent_id ? String(result.subagent_id) : undefined,
-        sessionId: result.session_id ? String(result.session_id) : (result.subagent_id ? String(result.subagent_id) : undefined),
-        executionAgentId: result.execution_agent_id ? String(result.execution_agent_id) : undefined,
+        subagentId: result.subagent_id || reference.session_id ? String(result.subagent_id || reference.session_id) : undefined,
+        sessionId: reference.session_id || result.session_id || result.subagent_id
+            ? String(reference.session_id || result.session_id || result.subagent_id) : undefined,
+        executionAgentId: reference.execution_agent_id || result.execution_agent_id
+            ? String(reference.execution_agent_id || result.execution_agent_id) : undefined,
         status,
         taskId: result.type === 'media_task' ? String(result.task_id || '') : undefined,
         name: result.name || args.name ? String(result.name || args.name) : undefined,

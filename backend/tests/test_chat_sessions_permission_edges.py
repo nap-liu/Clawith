@@ -18,7 +18,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.models.user import Identity, User  # noqa: F401
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentPermission
 from app.models.tenant import Tenant  # noqa: F401
 from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
 from app.models.participant import Participant  # noqa: F401
@@ -80,6 +80,8 @@ async def _seed_agent(creator_user_id, tenant_id: uuid.UUID) -> uuid.UUID:
             tenant_id=tenant_id,
         )
         db.add(agent)
+        await db.flush()
+        db.add(AgentPermission(agent_id=agent.id, scope_type="company", access_level="use"))
         await db.commit()
         await db.refresh(agent)
         return agent.id

@@ -121,5 +121,25 @@
     "userUnavailable": "用户不存在或已停用",
     "configureInModelPool": "请在企业模型池配置语音识别模型",
     "testFailed": "语音识别连接测试失败，请检查模型配置"
-  }
+  },
+  "agentPermissions.invalidUser": "成员不存在、已停用或不属于当前租户。",
+  "agentPermissions.invalidDepartment": "部门不存在、已停用或不属于当前租户。",
+  "agentPermissions.activeOperator": "需要有效且已启用的操作账号。",
+  "agentPermissions.managerRequired": "只有管理者可以修改权限。",
+  "agentPermissions.invalidSubject": "公司授权不填写对象 ID；部门和人员授权必须填写对象 ID。",
+  "agentPermissions.grantList": "授权必须为列表。",
+  "agentPermissions.oneContract": "请使用授权列表或旧版范围字段，不可同时提交。",
+  "agentPermissions.updateRequired": "请提供权限修改内容。",
+  "agentPermissions.invalidScope": "不支持的访问范围。",
+  "agentPermissions.invalidLevel": "权限只能为 use 或 manage。",
+  "agentPermissions.companyLevelOnly": "只有公司开放时可以设置公司权限。",
+  "agentPermissions.emptySubjects": "请至少选择一个成员或部门。",
+  "agentPermissions.privateSummary": "清空公司、部门和人员授权；创建者及管理员保留内置权限",
+  "agentPermissions.scopeSummary": "修改公司开放权限；部门和人员授权继续叠加生效",
+  "agentPermissions.scopePreview": "将「{name}」设置为 {mode}（{level}）：{summary}",
+  "agentPermissions.scopeSaved": "✅ 已更新「{name}」权限：{summary}。",
+  "agentPermissions.grantPreview": "向「{name}」授予 {users} 名成员、{departments} 个部门（含下级）{level} 权限；与其他授权叠加生效",
+  "agentPermissions.grantsSaved": "✅ 已更新「{name}」的 {count} 条授权。",
+  "agentPermissions.revokePreview": "从「{name}」撤销 {count} 条指定授权；其他来源及内置权限继续生效",
+  "agentPermissions.revoked": "✅ 已从「{name}」撤销 {count} 条指定授权；剩余权限按其他来源计算。"
 }

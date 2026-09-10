@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { agentApi } from '../services/api';
 import LinearCopyButton from '../components/LinearCopyButton';
+import AccessPermissionsPanel from './agent-detail/components/AccessPermissionsPanel';
 function fetchAuth<T>(url: string, options?: RequestInit): Promise<T> {
     const token = localStorage.getItem('token');
     return fetch(`/api${url}`, {
@@ -77,40 +78,7 @@ export default function OpenClawSettings({ agent, agentId, canManage }: OpenClaw
         enabled: !!agentId,
     });
 
-    const handleScopeChange = async (newScope: string) => {
-        if (!canManage || !isOwner) return;
-        try {
-            await fetchAuth(`/agents/${agentId}/permissions`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ scope_type: newScope, scope_ids: [], access_level: permData?.access_level || 'use' }),
-            });
-            queryClient.invalidateQueries({ queryKey: ['agent-permissions', agentId] });
-            queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
-        } catch (e) {
-            console.error('Failed to update permissions', e);
-        }
-    };
-
-    const handleAccessLevelChange = async (newLevel: string) => {
-        if (!canManage || !isOwner) return;
-        try {
-            await fetchAuth(`/agents/${agentId}/permissions`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ scope_type: permData?.scope_type || 'company', scope_ids: permData?.scope_ids || [], access_level: newLevel }),
-            });
-            queryClient.invalidateQueries({ queryKey: ['agent-permissions', agentId] });
-            queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
-        } catch (e) {
-            console.error('Failed to update access level', e);
-        }
-    };
-
-    const isOwner = permData?.is_owner ?? false;
-    const canEditPermissions = canManage && isOwner;
-    const currentScope = permData?.scope_type === 'user' ? 'private' : (permData?.scope_type || 'company');
-    const currentAccessLevel = permData?.access_level || 'use';
+    const canEditPermissions = canManage && (permData?.is_owner ?? false);
 
     return (
         <div>
@@ -233,109 +201,8 @@ export default function OpenClawSettings({ agent, agentId, canManage }: OpenClaw
             </div>
 
             {/* ── Permissions ── */}
-            <div className="card" style={{ marginBottom: '12px' }}>
-                <h4 style={{ marginBottom: '12px' }}>
-                    {t('agent.settings.perm.title', 'Access Permissions')}
-                </h4>
-                <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '16px' }}>
-                    {t('agent.settings.perm.description', 'Control who can see and interact with this agent. Only the creator or admin can change this.')}
-                </p>
-
-                {/* Scope Selection */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
-                    {(['company', 'private', 'custom'] as const).map((scope) => (
-                        <label
-                            key={scope}
-                            style={{
-                                display: 'flex', alignItems: 'center', gap: '10px',
-                                padding: '12px 14px', borderRadius: '8px',
-                                cursor: canEditPermissions ? 'pointer' : 'default',
-                                border: currentScope === scope
-                                    ? '1px solid var(--accent-primary)'
-                                    : '1px solid var(--border-subtle)',
-                                background: currentScope === scope
-                                    ? 'rgba(99,102,241,0.06)'
-                                    : 'transparent',
-                                opacity: canEditPermissions ? 1 : 0.7,
-                                transition: 'all 0.15s',
-                            }}
-                        >
-                            <input
-                                type="radio"
-                                name="perm_scope_oc"
-                                checked={currentScope === scope}
-                                disabled={!canEditPermissions}
-                                onChange={() => handleScopeChange(scope)}
-                                style={{ accentColor: 'var(--accent-primary)' }}
-                            />
-                            <div>
-                                <div style={{ fontWeight: 500, fontSize: '13px' }}>
-                                    {scope === 'company'
-                                        ? t('agent.settings.perm.companyWide', 'Company-wide')
-                                        : scope === 'private'
-                                            ? t('agent.settings.perm.onlyMe', 'Only Me')
-                                            : t('agent.settings.perm.custom', 'Custom')}
-                                </div>
-                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
-                                    {scope === 'company' && t('agent.settings.perm.companyWideDesc', 'All users in the organization can use this agent')}
-                                    {scope === 'private' && t('agent.settings.perm.onlyMeDesc', 'Only the creator can use this agent')}
-                                    {scope === 'custom' && t('agent.settings.perm.customDesc', 'Start private, then choose platform users in Settings')}
-                                </div>
-                            </div>
-                        </label>
-                    ))}
-                </div>
-
-                {/* Access Level for company scope */}
-                {currentScope === 'company' && canEditPermissions && (
-                    <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
-                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '8px' }}>
-                            {t('agent.settings.perm.defaultAccess', 'Default Access Level')}
-                        </label>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                            {[
-                                { val: 'use', label: t('agent.settings.perm.useAccess', 'Use'), desc: t('agent.settings.perm.useAccessDesc', 'Task, Chat, Tools, Skills, Workspace') },
-                                { val: 'manage', label: t('agent.settings.perm.manageAccess', 'Manage'), desc: t('agent.settings.perm.manageAccessDesc', 'Full access including Settings, Mind, Relationships') },
-                            ].map(opt => (
-                                <label key={opt.val}
-                                    style={{
-                                        flex: 1, padding: '10px 12px', borderRadius: '8px',
-                                        cursor: 'pointer',
-                                        border: currentAccessLevel === opt.val
-                                            ? '1px solid var(--accent-primary)'
-                                            : '1px solid var(--border-subtle)',
-                                        background: currentAccessLevel === opt.val
-                                            ? 'rgba(99,102,241,0.06)'
-                                            : 'transparent',
-                                        transition: 'all 0.15s',
-                                    }}
-                                >
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                        <input type="radio" name="access_level_oc" checked={currentAccessLevel === opt.val}
-                                            onChange={() => handleAccessLevelChange(opt.val)}
-                                            style={{ accentColor: 'var(--accent-primary)' }} />
-                                        <span style={{ fontWeight: 500, fontSize: '13px' }}>{opt.label}</span>
-                                    </div>
-                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px', marginLeft: '20px' }}>{opt.desc}</div>
-                                </label>
-                            ))}
-                        </div>
-                    </div>
-                )}
-
-                {currentScope !== 'company' && permData?.scope_names?.length > 0 && (
-                    <div style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                        <span style={{ fontWeight: 500 }}>{t('agent.settings.perm.currentAccess', 'Current access')}:</span>{' '}
-                        {permData.scope_names.map((s: any) => s.name).join(', ')}
-                    </div>
-                )}
-
-                {!isOwner && (
-                    <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)', fontStyle: 'italic' }}>
-                        {t('agent.settings.perm.readOnly', 'Only the creator or admin can change permissions')}
-                    </div>
-                )}
-            </div>
+            <AccessPermissionsPanel agentId={agentId} permData={permData}
+                canManage={canManage} queryClient={queryClient} />
 
             {/* ── Danger Zone: Delete Agent ── */}
             {canEditPermissions && (

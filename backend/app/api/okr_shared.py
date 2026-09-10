@@ -80,7 +80,7 @@ async def _sync_okr_agent_relationships(db, tenant_id: uuid.UUID, okr_agent_id: 
             Agent.id != okr_agent_id,
             Agent.is_system == False,  # noqa: E712
             Agent.status.notin_(["stopped", "error"]),
-            Agent.access_mode == "company",
+            Agent.company_grant_level.is_not(None),
         )
     )
     agent_ids = [agent_id for (agent_id,) in agent_result.fetchall()]

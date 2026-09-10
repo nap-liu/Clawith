@@ -99,6 +99,7 @@ async def _complete_unfinished_tool_calls(
                     "args": args,
                     "status": "done",
                     "result": llm_view,
+                    "session_ref": payload.get("session_ref"),
                     "reasoning_content": payload.get("reasoning_content"),
                     "assistant_content": payload.get("assistant_content"),
                     "responses_snapshot": (_row.message_meta or {}).get("responses_snapshot"),

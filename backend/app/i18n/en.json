@@ -121,5 +121,25 @@
     "userUnavailable": "The user does not exist or is disabled",
     "configureInModelPool": "Configure speech recognition in the company model pool",
     "testFailed": "Speech connection test failed. Check the model configuration"
-  }
+  },
+  "agentPermissions.invalidUser": "The member is missing, inactive, or outside this tenant.",
+  "agentPermissions.invalidDepartment": "The department is missing, inactive, or outside this tenant.",
+  "agentPermissions.activeOperator": "An active operator is required.",
+  "agentPermissions.managerRequired": "Only managers can change permissions.",
+  "agentPermissions.invalidSubject": "Company grants have no subject ID; department and user grants require one.",
+  "agentPermissions.grantList": "Grants must be a list.",
+  "agentPermissions.oneContract": "Use grants or legacy scope fields, not both.",
+  "agentPermissions.updateRequired": "A permission update is required.",
+  "agentPermissions.invalidScope": "Unsupported access scope.",
+  "agentPermissions.invalidLevel": "Access level must be use or manage.",
+  "agentPermissions.companyLevelOnly": "A company level can only be set with company access.",
+  "agentPermissions.emptySubjects": "Select at least one member or department.",
+  "agentPermissions.privateSummary": "Clear company, department and user grants; retain built-in creator and administrator access",
+  "agentPermissions.scopeSummary": "Change company access; department and user grants remain additive",
+  "agentPermissions.scopePreview": "Set {name} to {mode} ({level}): {summary}",
+  "agentPermissions.scopeSaved": "✅ Updated permissions for {name}: {summary}.",
+  "agentPermissions.grantPreview": "Grant {level} to {users} people and {departments} departments including descendants for {name}; combine with existing grants",
+  "agentPermissions.grantsSaved": "✅ Updated {count} grants for {name}.",
+  "agentPermissions.revokePreview": "Revoke {count} grants for {name}; other grants and built-in permissions remain effective",
+  "agentPermissions.revoked": "✅ Revoked {count} grants for {name}; remaining permissions come from other sources."
 }

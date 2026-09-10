@@ -2,6 +2,42 @@
 
 from app.api.agent_api_shared import *  # noqa: F401,F403
 from app.services.provider_identity_policy import mask_identity_claim
+from app.schemas.agent_permissions import AgentGrant, AgentPermissionUpdate
+from app.services.agent_permissions import grant_projection, update_agent_grants
+
+
+@router.get("/permissions/directory/departments")
+async def creation_permission_departments(
+    parent_id: uuid.UUID | None = None,
+    search: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant context is required")
+    return await permission_directory_departments(
+        db, tenant_id=current_user.tenant_id, current_user_id=current_user.id,
+        parent_id=parent_id, search=search, limit=limit,
+    )
+
+
+@router.get("/permissions/directory/members")
+async def creation_permission_members(
+    department_id: uuid.UUID | None = None,
+    include_descendants: bool = False,
+    search: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant context is required")
+    return await permission_directory_members(
+        db, tenant_id=current_user.tenant_id, department_id=department_id,
+        include_descendants=include_descendants, search=search, page=page, page_size=page_size,
+    )
 
 
 @router.get("/{agent_id}/permissions")
@@ -16,30 +52,12 @@ async def get_agent_permissions(
     perms = result.scalars().all()
     can_manage = access_level == "manage"
     is_owner = is_agent_creator(current_user, agent)
-    access_mode = getattr(agent, "access_mode", None) or "company"
-
-    if not perms:
-        return {
-            "scope_type": access_mode,
-            "scope_ids": [],
-            "user_access": [],
-            "department_access": [],
-            "access_level": "manage" if is_owner else "use",
-            "effective_access_level": access_level,
-            "can_manage": can_manage,
-            "is_owner": is_owner,
-            "creator_id": str(agent.creator_id) if agent.creator_id else None,
-        }
-
+    grants = [AgentGrant.model_validate(perm) for perm in perms]
+    access_mode, company_level = grant_projection(grants, agent.creator_id)
     scope_type = access_mode
     scope_ids = [str(p.scope_id) for p in perms if p.scope_type == "user" and p.scope_id]
-    department_perms = [
-        p for p in perms if p.scope_type == "department" and p.scope_id
-    ]
-    perm_access_level = getattr(agent, "company_access_level", None) or next(
-        (p.access_level for p in perms if p.scope_type == "company"),
-        "use",
-    )
+    department_perms = [p for p in perms if p.scope_type == "department" and p.scope_id]
+    perm_access_level = company_level or "use"
 
     # Resolve names for display
     scope_names = []
@@ -52,7 +70,6 @@ async def get_agent_permissions(
             .where(
                 OrgDepartment.id.in_([p.scope_id for p in department_perms]),
                 OrgDepartment.tenant_id == agent.tenant_id,
-                OrgDepartment.status == "active",
             )
             .order_by(OrgDepartment.path.asc())
         )
@@ -77,10 +94,9 @@ async def get_agent_permissions(
                     }
                 )
     display_user_ids = {uuid.UUID(sid) for sid in scope_ids}
-    if access_mode == "custom":
-        if agent.creator_id:
-            display_user_ids.add(agent.creator_id)
-        display_user_ids.update(admin.id for admin in await _get_active_admin_users(db, agent.tenant_id))
+    if agent.creator_id:
+        display_user_ids.add(agent.creator_id)
+    display_user_ids.update(admin.id for admin in await _get_active_admin_users(db, agent.tenant_id))
 
     if display_user_ids:
         users_result = await db.execute(
@@ -131,7 +147,7 @@ async def get_agent_permissions(
             member = members_by_user_id.get(sid)
             is_creator = agent.creator_id == u.id
             is_admin = u.role in ("platform_admin", "org_admin")
-            is_required = access_mode == "custom" and (is_creator or is_admin)
+            is_required = is_creator or is_admin
             item = {
                 "id": sid,
                 "name": u.display_name or u.username,
@@ -156,6 +172,8 @@ async def get_agent_permissions(
             user_access.append(item)
 
     return {
+        "grants": [g.model_dump(mode="json") for g in grants],
+        "company_access_level": company_level,
         "scope_type": scope_type,
         "scope_ids": scope_ids,
         "scope_names": scope_names,
@@ -172,7 +190,7 @@ async def get_agent_permissions(
 @router.put("/{agent_id}/permissions")
 async def update_agent_permissions(
     agent_id: uuid.UUID,
-    data: dict,
+    data: AgentPermissionUpdate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -181,148 +199,10 @@ async def update_agent_permissions(
     if access_level != "manage":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
 
-    scope_type = data.get("scope_type", "company")
-    scope_ids = data.get("scope_ids", [])
-    user_access = data.get("user_access", [])
-    department_access = data.get("department_access", [])
-    access_level = data.get("access_level", "use")
-    if access_level not in ("use", "manage"):
-        access_level = "use"
-    if scope_type not in ("company", "user", "private", "custom"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scope_type")
-    if scope_type == "user":
-        scope_type = "private"
-
-    valid_user_ids: set[uuid.UUID] = set()
-    if scope_type == "custom":
-        try:
-            requested_user_ids = {
-                uuid.UUID(str(item.get("id") or item.get("user_id")))
-                for item in user_access
-                if item.get("id") or item.get("user_id")
-            }
-            requested_user_ids.update(uuid.UUID(str(scope_id)) for scope_id in scope_ids)
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid user id",
-            ) from exc
-        if requested_user_ids:
-            users_result = await db.execute(
-                select(User.id).where(
-                    User.id.in_(requested_user_ids),
-                    User.tenant_id == agent.tenant_id,
-                    User.is_active == True,  # noqa: E712
-                )
-            )
-            valid_user_ids = set(users_result.scalars().all())
-            if valid_user_ids != requested_user_ids:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="User not found in this organization",
-                )
-
-    valid_departments: dict[uuid.UUID, OrgDepartment] = {}
-    if scope_type == "custom" and department_access:
-        try:
-            requested_department_ids = {
-                uuid.UUID(str(item.get("id") or item.get("department_id")))
-                for item in department_access
-                if item.get("id") or item.get("department_id")
-            }
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid department id",
-            ) from exc
-        departments_result = await db.execute(
-            select(OrgDepartment).where(
-                OrgDepartment.id.in_(requested_department_ids),
-                OrgDepartment.tenant_id == agent.tenant_id,
-                OrgDepartment.status == "active",
-            )
-        )
-        valid_departments = {
-            department.id: department
-            for department in departments_result.scalars().all()
-        }
-        if set(valid_departments) != requested_department_ids:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Department not found in this organization",
-            )
-
-    # Delete existing permissions
-    from sqlalchemy import delete as sql_delete
-    await db.execute(sql_delete(AgentPermission).where(AgentPermission.agent_id == agent_id))
-
-    # Insert new permissions
-    if scope_type == "company":
-        agent.access_mode = "company"
-        agent.company_access_level = access_level
-        db.add(AgentPermission(agent_id=agent_id, scope_type="company", access_level=access_level))
-    elif scope_type == "private":
-        agent.access_mode = "private"
-        agent.company_access_level = access_level
-        # "Only me" means private to the agent creator, even when an org admin
-        # is managing a company-visible agent created by someone else.
-        db.add(AgentPermission(agent_id=agent_id, scope_type="user", scope_id=agent.creator_id or current_user.id, access_level="manage"))
-    elif scope_type == "custom":
-        agent.access_mode = "custom"
-        agent.company_access_level = access_level
-        seen_user_ids: set[uuid.UUID] = set()
-        creator_id = agent.creator_id or current_user.id
-        required_manager_ids = {creator_id}
-        required_manager_ids.update(admin.id for admin in await _get_active_admin_users(db, agent.tenant_id))
-        for item in user_access:
-            sid = item.get("id") or item.get("user_id")
-            if not sid:
-                continue
-            uid = uuid.UUID(str(sid))
-            if uid in seen_user_ids:
-                continue
-            lvl = item.get("access_level", "use")
-            if lvl not in ("use", "manage"):
-                lvl = "use"
-            if uid in required_manager_ids:
-                lvl = "manage"
-            seen_user_ids.add(uid)
-            db.add(AgentPermission(agent_id=agent_id, scope_type="user", scope_id=uid, access_level=lvl))
-        for sid in scope_ids:
-            uid = uuid.UUID(str(sid))
-            if uid not in seen_user_ids:
-                seen_user_ids.add(uid)
-                db.add(AgentPermission(
-                    agent_id=agent_id,
-                    scope_type="user",
-                    scope_id=uid,
-                    access_level="manage" if uid in required_manager_ids else access_level,
-                ))
-        seen_department_ids: set[uuid.UUID] = set()
-        for item in department_access:
-            sid = item.get("id") or item.get("department_id")
-            if not sid:
-                continue
-            department_id = uuid.UUID(str(sid))
-            if department_id in seen_department_ids or department_id not in valid_departments:
-                continue
-            level = item.get("access_level", "use")
-            if level not in ("use", "manage"):
-                level = "use"
-            seen_department_ids.add(department_id)
-            db.add(
-                AgentPermission(
-                    agent_id=agent_id,
-                    scope_type="department",
-                    scope_id=department_id,
-                    access_level=level,
-                )
-            )
-        for uid in required_manager_ids:
-            if uid not in seen_user_ids:
-                db.add(AgentPermission(agent_id=agent_id, scope_type="user", scope_id=uid, access_level="manage"))
-
-    await db.flush()
+    try:
+        await update_agent_grants(db, agent, actor_id=current_user.id, data=data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     relationships_changed = await ensure_access_granted_platform_relationships(
         db,
         agent,

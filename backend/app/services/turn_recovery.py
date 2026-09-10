@@ -84,7 +84,7 @@ def _unfinished_tool_call_rows(
         return []
 
     done_keys: set[str] = set()
-    candidates: list[tuple[ChatMessage, dict, str]] = []
+    candidates: dict[str, tuple[ChatMessage, dict, str]] = {}
     for row in rows[anchor_idx + 1 :]:
         if getattr(row, "role", None) != "tool_call":
             continue
@@ -104,8 +104,11 @@ def _unfinished_tool_call_rows(
             continue
         if payload.get("name") == REQUEST_CONFIRMATION_TOOL_NAME:
             continue
-        candidates.append((row, payload, key))
-    unfinished = [(row, payload, key) for row, payload, key in candidates if key not in done_keys]
+        previous = candidates.get(key)
+        if previous and not payload.get("session_ref"):
+            payload["session_ref"] = previous[1].get("session_ref")
+        candidates[key] = (row, payload, key)
+    unfinished = [item for key, item in candidates.items() if key not in done_keys]
     # Transaction-level ``now()`` gives all rows prewritten for one planned
     # round the same timestamp. The provider-issued index is authoritative
     # within that round; UUID ordering is random.
