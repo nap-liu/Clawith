@@ -175,7 +175,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.6",
-      "label": "Kimi K2.6（kimi/）",
+      "label": "Kimi K2.6（直供）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -197,7 +197,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.7-code",
-      "label": "Kimi K2.7 Code（kimi/）",
+      "label": "Kimi K2.7 Code（直供）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -241,7 +241,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k3",
-      "label": "Kimi K3（kimi/）",
+      "label": "Kimi K3（直供）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -1895,7 +1895,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "deepseek-v4-flash",
-      "label": "deepseek V4 Flash",
+      "label": "DeepSeek V4 Flash",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation"
