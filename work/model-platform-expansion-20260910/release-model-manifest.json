@@ -88,7 +88,7 @@
       "provider": "moonshot",
       "service_platform": "bailian",
       "model": "kimi-k2.5",
-      "label": "月之暗面 K2.5",
+      "label": "Kimi K2.5",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -110,7 +110,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi-k2.6",
-      "label": "月之暗面 K2.6",
+      "label": "Kimi K2.6",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -132,7 +132,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi-k2.7-code",
-      "label": "月之暗面 K2.7 Code",
+      "label": "Kimi K2.7 Code",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -154,7 +154,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi-k3",
-      "label": "月之暗面 K3",
+      "label": "Kimi K3",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -175,7 +175,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.6",
-      "label": "月之暗面 K2.6（kimi/）",
+      "label": "Kimi K2.6（kimi/）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -197,7 +197,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.7-code",
-      "label": "月之暗面 K2.7 Code（kimi/）",
+      "label": "Kimi K2.7 Code（kimi/）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -219,7 +219,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k2.7-code-highspeed",
-      "label": "月之暗面 K2.7 Code Highspeed",
+      "label": "Kimi K2.7 Code Highspeed",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -241,7 +241,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "kimi/kimi-k3",
-      "label": "月之暗面 K3（kimi/）",
+      "label": "Kimi K3（kimi/）",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -386,7 +386,7 @@
       "provider": "qwen",
       "service_platform": "bailian",
       "model": "MiniMax/MiniMax-M3",
-      "label": "稀宇 M3",
+      "label": "MiniMax M3",
       "api_protocol": "openai_compatible",
       "purposes": [
         "conversation",
@@ -1895,7 +1895,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "deepseek-v4-flash",
-      "label": "深度求索 V4 Flash",
+      "label": "deepseek V4 Flash",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation"
@@ -1992,7 +1992,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "kimi-k3",
-      "label": "月之暗面 K3",
+      "label": "Kimi K3",
       "api_protocol": "openai_responses",
       "purposes": [
         "conversation",
@@ -2034,7 +2034,7 @@
       "provider": "tokenhub",
       "service_platform": "tokenhub",
       "model": "minimax-speech-2.8-turbo",
-      "label": "稀宇 语音 2.8 Turbo",
+      "label": "MiniMax 语音 2.8 Turbo",
       "api_protocol": "openai_compatible",
       "purposes": [
         "audio_generation"
