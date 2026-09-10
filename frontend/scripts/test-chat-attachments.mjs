@@ -7,6 +7,7 @@ const {
     buildChatAttachmentPayload,
     collectMarkdownImages,
     extractChatImageDataMarkers,
+    externalChatAttachmentUrl,
     getChatAttachmentIconKind,
     getChatQuotedMessageTypeLabel,
     isPreviewableImageName,
@@ -19,6 +20,18 @@ const {
 } = loadTypeScriptModule(
     fileURLToPath(new URL('../src/utils/chatAttachments.ts', import.meta.url)),
 );
+
+{
+    const url = 'https://media.example/image.png?signature=original&expires=123';
+    assert.equal(externalChatAttachmentUrl(url), url);
+    assert.equal(externalChatAttachmentUrl('workspace/image.png'), undefined);
+    assert.equal(externalChatAttachmentUrl('javascript:alert(1)'), undefined);
+    const result = normalizeChatAttachmentFields({
+        raw: { display_content: 'Read image', attachments: [{ display_name: 'image.png', path: url, kind: 'image' }] },
+        buildDownloadUrl: () => { throw new Error('External media must not use authenticated workspace downloads'); },
+    });
+    assert.equal(result.previewImages[0].src, url);
+}
 
 {
     const quotedMessage = normalizeChatQuotedMessage({

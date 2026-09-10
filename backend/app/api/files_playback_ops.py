@@ -32,6 +32,7 @@ from app.services.media_playback import (
     verify_signature,
 )
 from app.services.storage_runtime.base import StorageEntry
+from app.services.media_request_attachments import media_request_attachments
 
 
 def playback_headers_impl() -> dict[str, str]:
@@ -49,6 +50,10 @@ def storage_entry_version_token_impl(entry: StorageEntry) -> str:
 
 def message_references_media_path_impl(message: ChatMessage, path: str) -> bool:
     meta = message.message_meta if isinstance(message.message_meta, dict) else {}
+    if getattr(message, "role", None) == "user" and any(
+        item["path"] == path for item in media_request_attachments(meta)
+    ):
+        return True
     if "attachments" in meta:
         attachments = meta.get("attachments")
         return isinstance(attachments, list) and any(

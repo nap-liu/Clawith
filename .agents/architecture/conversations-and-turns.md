@@ -465,3 +465,11 @@ inputs run. Stopping a parent turn cancels causally owned nested media inputs to
 The session detail API accepts `task_id` for historical per-task status; ownership
 checks remain identical to ordinary child-session access. The shared task card
 uses that status, so an older task does not change when a session continues.
+
+Client serialization projects media-request input references into the existing
+attachment contract, including historical tasks, without exposing their encrypted
+connection snapshot. The shared playback authorizer recognizes these exact
+references while preserving Session and Agent access checks. Original third-party
+URLs are rendered directly without platform credentials; local files retain the
+standard download/playback routes. Session viewers reuse the shared image/media
+components, and nested image previews render above the viewer and own Escape/focus.

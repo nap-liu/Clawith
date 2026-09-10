@@ -238,6 +238,19 @@ otherwise inherit those defaults. Media model tests select an existing Digital
 Employee workspace and execute through the shared asynchronous media runtime;
 results use the existing session viewer and task card, without another queue.
 
+The builtin `list_models` exposes enabled models from the executing Agent's
+tenant, with optional name, purpose, input-modality and serving-provider filters
+and offset pagination. It returns IDs, capability labels and configured inference
+defaults, never connection credentials or headers. Existing explicit tool
+enablement and scene scope apply. It does not probe providers or promise capacity.
+Both `read_media` and `generate_media` accept an optional enterprise `model_id`
+and `parameters` object. Understanding parameters survive durable task admission
+and are applied over model defaults through the shared Chat/Responses adapters;
+`max_output_tokens` maps to the selected protocol, and explicit native reasoning
+controls take precedence over the inherited normalized effort. Connection,
+content and streaming lifecycle remain owned by their existing tool/runtime
+fields. No provider-specific inference-parameter allowlist is introduced.
+
 Legacy inline media connections and image-tool purposes migrate once. Internal
 tenant migration receipts bind old references to model IDs, so administrator
 changes govern every new admission and deletion returns `modelUnavailable`.

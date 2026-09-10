@@ -1,4 +1,5 @@
 import type { Agent, ExploreAgentPage, Task } from "../../types";
+import { externalChatAttachmentUrl } from "../../utils/chatAttachments";
 import { API_BASE, request, uploadFile, uploadFileWithProgress } from "./core";
 
 export const agentApi = {
@@ -421,6 +422,8 @@ export const fileApi = {
     path: string,
     options?: { inline?: boolean },
   ) => {
+    const externalUrl = externalChatAttachmentUrl(path);
+    if (externalUrl) return externalUrl;
     const token = localStorage.getItem("token");
     const params = new URLSearchParams({ path, token: token || "" });
     if (options?.inline) params.set("inline", "1");

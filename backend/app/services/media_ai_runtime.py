@@ -153,13 +153,14 @@ async def execute_media_turn(run_id, anchor, *, recovering=False) -> bool:
                         await select_inputs(input_modalities)
                         await _assert_subagent_running(run_id)
                         await _checkpoint_input(run_id, anchor.id, {"media_read_started": True})
+                        options = {"parameters": args["parameters"]} if "parameters" in args else {}
                         if config.get("model_id"):
-                            response = await understand_response(config, args["prompt"], media, history=history)
+                            response = await understand_response(config, args["prompt"], media, history=history, **options)
                             text, usage = response.content, response.usage or {}
                             actual_model = response.model or config["understanding_model"]
                             responses_snapshot = response.responses_snapshot
                         else:
-                            text, usage = await understand(config, args["prompt"], media, history=history)
+                            text, usage = await understand(config, args["prompt"], media, history=history, **options)
                             actual_model = config["understanding_model"]
                         if input_errors:
                             text += "\n\n" + render_message("mediaAI.partialInputs") + "\n" + "\n".join(
