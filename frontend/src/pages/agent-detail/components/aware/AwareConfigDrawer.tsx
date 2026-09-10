@@ -186,7 +186,7 @@ export default function AwareConfigDrawer({
     const modelOptions = [
         { value: '', label: t('agent.aware.workspace.config.inheritModel') },
         ...sortLlmModels(models.filter((model) => model.enabled || model.id === draft.modelId))
-            .map((model) => ({ value: String(model.id), label: getLlmModelLabel(model) })),
+            .map((model) => ({ value: String(model.id), label: getLlmModelLabel(model, t) })),
     ];
     const selectedModel = models.find((model) => String(model.id) === String(draft.modelId || inheritedModelId));
     const currentTargetValue = draft.targetUserId ? `user:${draft.targetUserId}` : draft.targetAgentId ? `agent:${draft.targetAgentId}` : '';

@@ -46,7 +46,7 @@ export default function BackgroundRuntimeControls({ resource, models, disabled, 
     const modelOptions = [
         { value: '', label: isZh ? '继承数字员工模型' : 'Inherit Digital Employee model' },
         ...sortLlmModels(models.filter((model) => model.enabled || model.id === modelId))
-            .map((model) => ({ value: model.id, label: getLlmModelLabel(model) })),
+            .map((model) => ({ value: model.id, label: getLlmModelLabel(model, t) })),
     ];
 
     return (

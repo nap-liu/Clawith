@@ -148,3 +148,55 @@ async def test_task_status_is_exposed_through_real_session_http_route(context, p
         assert response.status_code == 200, response.text
         assert response.json()["runtime"]["task_id"] == receipt["task_id"]
         assert response.json()["runtime"]["status"] == "completed"
+
+
+@pytest.mark.parametrize("followup_options", [None, {}, {"seed": 29}])
+async def test_generation_continuation_preserves_or_replaces_native_parameters(context, providers, followup_options):
+    from app.services.media_ai_tools import execute_media_tool
+
+    original = {"seed": 17, "watermark": False}
+    context.arguments = {"output_type": "image", "prompt": "A blue circle", "parameters": original}
+    first = json.loads(await execute_media_tool(context))
+    context.tool_call_id = f"call_{uuid.uuid4().hex}"
+    context.arguments = {"output_type": "image", "prompt": "Make it red", "session_id": first["session_id"]}
+    if followup_options is not None:
+        context.arguments["parameters"] = followup_options
+    second = json.loads(await execute_media_tool(context))
+    results = await run_task(first)
+    expected = original if followup_options is None else followup_options
+    assert len(results) == 2
+    assert providers[0]["parameters"] == {"n": 1, "size": "1024*1024", **original}
+    assert providers[1]["parameters"] == {"n": 1, "size": "1024*1024", **expected}
+    assert "image" in providers[1]["input"]["messages"][0]["content"][0]
+    assert results[1].message_meta["media_result"]["task_id"] == second["task_id"]
+    assert results[1].message_meta["media_context"]["native_parameters"] == expected
+
+
+async def test_media_header_secret_is_frozen_only_in_encrypted_connection(context, providers, monkeypatch):
+    from app.services import media_ai_tools
+
+    resolve = media_ai_tools.resolve_media_model
+    generate = media_ai_runtime.request
+    configured = {"X-Provider-Key": "private-routing-value"}
+    observed = []
+
+    async def resolve_with_headers(*args, **kwargs):
+        return {**await resolve(*args, **kwargs), "extra_headers": dict(configured)}
+
+    async def capture(config, *args, **kwargs):
+        observed.append(config["extra_headers"])
+        return await generate(config, *args, **kwargs)
+
+    monkeypatch.setattr(media_ai_tools, "resolve_media_model", resolve_with_headers)
+    monkeypatch.setattr(media_ai_runtime, "request", capture)
+    receipt = await submit(context)
+    configured["X-Provider-Key"] = "changed-after-admission"
+    results = await run_task(receipt)
+    assert results[0].message_meta["media_result"]["status"] == "completed"
+    assert observed == [{"X-Provider-Key": "private-routing-value"}]
+    async with async_session() as db:
+        rows = (await db.scalars(select(ChatMessage).where(
+            ChatMessage.conversation_id == receipt["session_id"],
+        ))).all()
+        for row in rows:
+            assert "private-routing-value" not in json.dumps(row.message_meta or {})

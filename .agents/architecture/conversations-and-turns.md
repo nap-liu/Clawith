@@ -437,6 +437,17 @@ time, not a live view of the host page.
 
 ## Media execution in child sessions
 
+Children created by an admitted human IM turn retain that exact sender's
+tenant identity and the server-validated origin Session/input anchor. This
+session-scoped authority applies to both ordinary subagents and media children;
+it grants no general access to a private Agent. Admission verifies the current
+running anchor, and execution/recovery revalidates the real human origin and
+active User/Identity. A P2P origin must also belong to that exact sender;
+group origins retain per-message attribution. Nested media work inherits the
+same origin. Web, other users' P2P sessions, synthetic inputs, other tenants,
+and unattended tasks retain their existing
+Agent-access rules; caller-supplied metadata cannot grant origin authority.
+
 The media executor reuses Session/input anchor/Turn/SubagentRun, leases, capacity,
 recovery and parent events. `task_id` is the individual input anchor; `session_id`
 is the reusable child session. Inputs remain separate FIFO jobs instead of being

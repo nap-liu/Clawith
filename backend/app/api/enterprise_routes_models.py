@@ -11,6 +11,9 @@ from app.api.enterprise_api_shared import (
 from app.services.llm.failure_outcome import render_message
 from pydantic import Field
 from app.services.llm.client_registry import resolve_api_protocol
+from app.services.model_platform import model_service_platform
+from app.services.model_headers import encrypt_model_headers, resolve_model_headers
+from app.schemas.model_headers import ExtraHeaders
 from app.services.model_capabilities import APIProtocol, ModelPurpose, model_modalities, model_purposes, supports_purpose
 
 @router.get("/llm-providers")
@@ -22,6 +25,7 @@ async def list_llm_providers(
 
 
 class LLMTestRequest(BaseModel):
+    extra_headers: ExtraHeaders | None = None
     api_protocol: APIProtocol | None = None
     provider: str
     model: str
@@ -32,10 +36,13 @@ class LLMTestRequest(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=1)
 
 
-def _llm_model_out(model: LLMModel) -> LLMModelOut:
+def _llm_model_out(model: LLMModel, *, reveal_headers: bool = False) -> LLMModelOut:
     from app.services.llm.reasoning import capability_metadata
 
     out = LLMModelOut.model_validate(model)
+    if reveal_headers:
+        out.extra_headers = resolve_model_headers(model)
+    out.service_platform = model_service_platform(model.provider, model.base_url)
     out.effective_api_protocol = resolve_api_protocol(model.provider, model.api_protocol)
     out.purposes = model_purposes(model)
     out.input_modalities = model_modalities(model)
@@ -82,6 +89,7 @@ async def test_llm_model(
     protocol = data.api_protocol
     output_limit = data.max_output_tokens
     reasoning_effort = data.reasoning_effort
+    extra_headers = data.extra_headers
     if data.model_id:
         async with async_session() as session:
             stored = await session.get(LLMModel, uuid.UUID(data.model_id))
@@ -93,6 +101,9 @@ async def test_llm_model(
                     output_limit = stored.max_output_tokens
                 if "reasoning_effort" not in data.model_fields_set:
                     reasoning_effort = stored.reasoning_effort
+                if ("extra_headers" not in data.model_fields_set
+                        and stored.extra_headers_encrypted is not None):
+                    extra_headers = resolve_model_headers(stored)
     start = time.time()
     try:
         client = create_llm_client(
@@ -101,6 +112,7 @@ async def test_llm_model(
             api_key=api_key,
             base_url=data.base_url or None,
             api_protocol=protocol,
+            extra_headers=extra_headers,
         )
         # Simple test: ask model to say "ok"
         try:
@@ -148,7 +160,9 @@ async def list_llm_models(
     result = await db.execute(query)
     models = []
     for m in result.scalars().all():
-        out = _llm_model_out(m)
+        out = _llm_model_out(m, reveal_headers=(
+            _is_platform_admin_user(current_user) or current_user.role == "org_admin"
+        ))
         # Mask API key: show last 4 chars
         key = get_model_api_key(m)
         out.api_key_masked = f"****{key[-4:]}" if len(key) > 4 else "****"
@@ -174,6 +188,7 @@ async def add_llm_model(
         input_modalities=list(dict.fromkeys(data.input_modalities or (["text", "image"] if data.supports_vision else ["text"]))),
         model=data.model,
         api_key_encrypted=encrypt_data(data.api_key, settings.SECRET_KEY),
+        extra_headers_encrypted=encrypt_model_headers(data.extra_headers),
         base_url=data.base_url,
         label=data.label,
         temperature=data.temperature,
@@ -202,7 +217,7 @@ async def add_llm_model(
         if tenant and tenant.default_model_id is None:
             tenant.default_model_id = model.id
 
-    return _llm_model_out(model)
+    return _llm_model_out(model, reveal_headers=True)
 
 
 @router.post("/llm-models/{source_model_id}/clone", response_model=LLMModelOut)
@@ -237,7 +252,7 @@ async def clone_llm_model(
         )
     except LLMModelConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _llm_model_out(cloned)
+    return _llm_model_out(cloned, reveal_headers=True)
 
 
 @router.post("/llm-models/{model_id}/set-default", status_code=status.HTTP_204_NO_CONTENT)
@@ -356,6 +371,8 @@ async def update_llm_model(
     try:
         if "api_protocol" in data.model_fields_set:
             model.api_protocol = data.api_protocol
+        if "extra_headers" in data.model_fields_set:
+            model.extra_headers_encrypted = encrypt_model_headers(data.extra_headers)
         if data.purposes is not None:
             if "conversation" not in data.purposes:
                 from app.models.tenant import Tenant
@@ -408,7 +425,7 @@ async def update_llm_model(
 
         await db.commit()
         await db.refresh(model)
-        return _llm_model_out(model)
+        return _llm_model_out(model, reveal_headers=True)
     except SQLAlchemyError:
         await db.rollback()
         raise HTTPException(status_code=500, detail="Failed to update model")

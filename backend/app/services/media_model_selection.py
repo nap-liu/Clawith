@@ -21,9 +21,11 @@ from app.services.llm.client_registry import get_provider_spec, resolve_api_prot
 from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.llm.utils import get_model_api_key
 from app.services.media_ai_io import MediaAIError
+from app.services.media_model_inputs import matching_understanding_model, source_modalities
 from app.services.tool_config import get_tenant_tool_config
 from app.services.model_capabilities import MEDIA_MODEL_DEFAULTS, model_modalities, model_purposes
 from app.services.turn_tool_settings import current_tool_settings
+from app.services.model_headers import encrypt_model_headers, resolve_model_headers
 
 
 def media_model_slot(tool: str, args: dict) -> tuple[str, str]:
@@ -48,6 +50,11 @@ async def _previous_selection(db, state) -> dict:
         ChatMessage.message_meta["media_request"].is_not(None),
     ).order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc()))).all()
     slot, _ = media_model_slot(state.tool_name, state.arguments)
+    required = set()
+    for row in rows:
+        meta = row.message_meta or {}
+        required.update(source_modalities((meta.get("media_request") or {}).get("arguments", {}).get("files", [])))
+        required.update((meta.get("media_context") or {}).get("input_modalities", []))
     for row in rows:
         previous = (row.message_meta or {}).get("media_request") or {}
         previous_args = previous.get("arguments") or {}
@@ -55,7 +62,7 @@ async def _previous_selection(db, state) -> dict:
             continue
         if media_model_slot(previous["tool"], previous_args)[0] != slot:
             continue
-        return previous
+        return {**previous, "required_input_modalities": sorted(required)}
     return {}
 
 
@@ -71,10 +78,13 @@ def model_connection(model: LLMModel) -> dict:
         raise MediaAIError("invalidEndpoint")
     snapshot["api_protocol"] = protocol
     snapshot["base_url"] = base_url
+    headers = resolve_model_headers(runtime)
+    snapshot["extra_headers_encrypted"] = encrypt_model_headers(headers)
     return {
         "model_id": str(runtime.id), "provider": runtime.provider,
         "api_protocol": protocol, "model": runtime.model, "base_url": base_url,
         "api_key": get_model_api_key(runtime),
+        "extra_headers": headers,
         "runtime_model": snapshot,
         "input_modalities": model_modalities(model),
         "purposes": model_purposes(model),
@@ -98,6 +108,8 @@ async def resolve_media_model(state, effective_config: dict) -> dict:
         if agent is None or agent.tenant_id is None:
             raise MediaAIError("contextRequired")
         previous = await _previous_selection(db, state)
+        required = source_modalities(state.arguments.get("files", []))
+        required.update(previous.get("required_input_modalities", []))
         model_id = state.arguments.get("model_id")
         if not model_id:
             model_id = (previous.get("config") or {}).get("model_id")
@@ -132,16 +144,22 @@ async def resolve_media_model(state, effective_config: dict) -> dict:
                     db, agent.tenant_id, defaults, reference="company", required_slot=slot,
                 )
             model_id = defaults.get(slot)
-        if not model_id:
+        if not model_id and state.tool_name != "read_media":
             raise MediaAIError("notConfigured")
         try:
-            model = await db.get(LLMModel, uuid.UUID(str(model_id)))
+            model = await db.get(LLMModel, uuid.UUID(str(model_id))) if model_id else None
         except (TypeError, ValueError) as exc:
             raise MediaAIError("modelUnavailable") from exc
-        if (model is None or model.tenant_id != agent.tenant_id or not model.enabled
+        if model_id and (model is None or model.tenant_id != agent.tenant_id or not model.enabled
                 or purpose not in (model.purposes or [])):
             raise MediaAIError("modelUnavailable")
+        if state.tool_name == "read_media":
+            model = await matching_understanding_model(
+                db, agent.tenant_id, model, required, explicit=bool(state.arguments.get("model_id")),
+            )
         resolved = model_connection(model)
+        if state.tool_name == "read_media":
+            resolved["retained_input_modalities"] = previous.get("required_input_modalities", [])
         if state.tool_name == "read_media" and config.get("fallback_model_id"):
             try:
                 fallback = await db.get(LLMModel, uuid.UUID(str(config["fallback_model_id"])))

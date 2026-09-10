@@ -2,6 +2,7 @@ from app.services.llm.client_shared import *  # noqa: F401,F403
 from copy import deepcopy
 
 from app.services.llm.responses_stream import stream_response
+from app.services.llm.provider_parameters import merge_request_headers
 
 class OpenAIResponsesClient(LLMClient):
     """Client for OpenAI Responses API (`/v1/responses`)."""
@@ -16,6 +17,7 @@ class OpenAIResponsesClient(LLMClient):
         timeout: float = 120.0,
         supports_tool_choice: bool = True,
         provider_managed_timeout: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(
             api_key,
@@ -23,6 +25,7 @@ class OpenAIResponsesClient(LLMClient):
             model,
             timeout,
             provider_managed_timeout,
+            extra_headers,
         )
         self.supports_tool_choice = supports_tool_choice
         self._client: httpx.AsyncClient | None = None
@@ -36,15 +39,16 @@ class OpenAIResponsesClient(LLMClient):
                     provider_managed_timeout=self.provider_managed_timeout,
                 ),
                 follow_redirects=True,
+                event_hooks=self._request_event_hooks(),
                 proxy=None,
             )
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
-        return {
+        return merge_request_headers({
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-        }
+        }, self.extra_headers)
 
     def _normalize_base_url(self) -> str:
         """Normalize base URL by stripping trailing /responses endpoint."""

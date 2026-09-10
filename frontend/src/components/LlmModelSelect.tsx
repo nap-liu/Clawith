@@ -68,7 +68,7 @@ export default function LlmModelSelect({
                 || (supportsVision && model.supports_vision !== true);
             return {
                 value: model.id,
-                label: `${getLlmModelLabel(model)}${
+                label: `${getLlmModelLabel(model, t)}${
                     unavailable ? ` ${t('common.unavailableSuffix', '（不可用）')}` : ''
                 }`,
             };

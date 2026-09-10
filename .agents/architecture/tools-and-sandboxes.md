@@ -59,12 +59,14 @@ of the provider. NULL preserves the provider registry's existing default; changi
 a provider to Responses requires configuring and validating that endpoint.
 For actual Bailian endpoints, audio/video in the current input or retained history
 selects Chat before sending because Bailian Responses currently accepts neither.
+TokenHub Kimi K3 video inputs also select Chat before submission because its
+Responses compatibility mode does not accept video, including retained history.
 Text/image requests retain Responses. This capability routing never retries a
 failed submission and does not change other providers' configured protocols.
 Understanding preserves original supported image/audio/video inputs, without
 silently discarding audio or sampling locally. Generation uses a small transport
-facade: compatible services share standard image/audio/video endpoints; Qwen uses
-its native generation adapter. A Responses setting does not imply every generation
+facade: compatible services share standard image/audio/video endpoints; Qwen and
+the supported TokenHub generation models use their native adapters. A Responses setting does not imply every generation
 operation uses `/responses`. Unsupported native operations fail explicitly.
 
 Startup converts mutable legacy tenant and Agent connections to enterprise model
@@ -141,6 +143,47 @@ unconfirmed submission is never resubmitted. Interrupted understanding without a
 stored result ends explicitly instead of silently paying for another invocation.
 Outer-tool recovery restores the original enqueue receipt. Retryable provider
 reads retain the same task and checkpoints honor the shared turn/lease fence.
+
+Media understanding uses input modality metadata as an automatic-selection hint,
+not an input restriction. Admission uses declared kinds, data MIME and filename
+hints without downloading opaque URLs. A matching session/company selection stays
+preferred; otherwise an enabled understanding model in the same enterprise is
+selected in model-name order. If no metadata match exists, keep the preferred
+model (or another available enterprise model); the provider decides actual input
+support. Explicit `model_id` stays as selected, subject to the existing enterprise,
+enablement and purpose checks. The worker uses loaded media types before compaction
+and persists any automatically updated model in the encrypted request snapshot.
+Retained media types inform follow-up selection. Capability labels do not block
+primary or configured fallback requests. Arbitrary URLs and AgentDir signing keep
+their existing loader behavior; selection adds no queue or provider call.
+
+Generation accepts optional provider-native `parameters`; explicit normalized
+arguments win when both specify the same setting. On continuation, explicit
+current native controls (including provider aliases and nested settings) take
+precedence over inherited normalized defaults. Bailian image/video options
+map to its native `parameters`, while speech options map to its native `input`.
+Documented native input controls (for example negative prompts and Kling multi-shot
+controls) are placed under `input` by the family adapter. Image/video family adapters
+translate normalized dimensions and reference roles to each provider contract;
+Kling and Vidu images use the asynchronous image endpoint and the existing task
+poller. Qwen/Wan multimodal images retain their synchronous provider transport
+inside the same asynchronous platform job. HappyHorse video editing preserves
+the source duration. Kling image series and Wan sequential/interleaved multi-image
+modes fail before submission under the same one-artifact contract.
+Completed contexts retain these options for follow-ups using the same model and
+output kind. Omitting `parameters` inherits them; providing an object replaces
+them, and `{}` clears them. These snapshots reuse message metadata and add no
+queue or database table. The current generation result saves one artifact per
+task, so `n` values other than 1 fail before any provider submission rather than
+paying for outputs which would be discarded.
+Standard speech generation preserves `response_format` (MP3 by default), and
+saved file MIME/extension come from the returned container. Raw PCM has no
+container metadata for the shared file/player contract and is rejected before
+submission; it is never silently replaced with MP3 or converted to WAV.
+TokenHub MiniMax speech likewise rejects its raw `pcm` and `pcmu_raw` formats
+before submission; container-based output formats retain their provider values.
+Its `subtitle_enable=true` option also fails before submission because the
+current result does not deliver an auxiliary subtitle file.
 
 AgentDir paths use existing storage signing, with an exact-file ticket fallback
 for local storage. Third-party HTTP(S) URLs retain their original query parameters.

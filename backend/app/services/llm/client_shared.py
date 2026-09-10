@@ -13,9 +13,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from types import MappingProxyType
 
 import httpx
 from loguru import logger
+from app.services.llm.provider_parameters import request_headers_event_hooks
 
 # ============================================================================
 # Data Models
@@ -249,12 +251,17 @@ class LLMClient(ABC):
         model: str | None = None,
         timeout: float = 120.0,
         provider_managed_timeout: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
         self.provider_managed_timeout = provider_managed_timeout
+        self.extra_headers = MappingProxyType(dict(extra_headers or {}))
+
+    def _request_event_hooks(self) -> dict[str, list]:
+        return request_headers_event_hooks(self.base_url, self.extra_headers)
 
     @abstractmethod
     async def complete(

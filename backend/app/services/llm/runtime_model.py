@@ -39,6 +39,7 @@ class RuntimeLLMModel:
     api_protocol: str | None = None
     purposes: tuple[str, ...] = ("conversation",)
     input_modalities: tuple[str, ...] = ("text",)
+    extra_headers_encrypted: str | None = None
 
     @classmethod
     def from_orm(cls, model: LLMModel) -> "RuntimeLLMModel":
@@ -53,6 +54,11 @@ class RuntimeLLMModel:
             input_modalities=tuple(model_modalities(model)),
             model=model.model,
             api_key_encrypted=model.api_key_encrypted,
+            extra_headers_encrypted=(
+                model.extra_headers_encrypted
+                if isinstance(getattr(model, "extra_headers_encrypted", None), str)
+                else None
+            ),
             base_url=model.base_url,
             label=model.label,
             max_tokens_per_day=model.max_tokens_per_day,

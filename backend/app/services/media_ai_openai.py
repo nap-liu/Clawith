@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from app.services.media_ai_bailian import _check_response
+from app.services.media_ai_headers import provider_headers
 from app.services.media_ai_io import MAX_RESULT_BYTES, MediaAIError, MediaInput, download_media
 
 
@@ -19,10 +20,14 @@ def generation_payload(config: dict, args: dict, media: list[MediaInput]) -> tup
     if kind == "audio":
         if media or any(key in args for key in ("ratio", "duration", "size", "resolution")):
             raise MediaAIError("unsupportedOptions")
+        # Raw PCM has no container metadata for the shared file/player contract.
+        # Fail before paying for a result which cannot be stored as requested.
+        if options.get("response_format") == "pcm":
+            raise MediaAIError("unsupportedOptions")
         return "/audio/speech", {
             **options, "model": config["model"], "input": args["prompt"],
             "voice": args.get("voice", options.get("voice", "alloy")),
-            "response_format": "mp3",
+            "response_format": options.get("response_format", "mp3"),
         }
     if "voice" in args or (kind == "image" and any(key in args for key in ("duration", "resolution"))):
         raise MediaAIError("unsupportedOptions")
@@ -73,7 +78,7 @@ def _normalize_video(data: dict) -> dict:
 
 
 async def request(config: dict, path: str, payload: dict | None = None) -> dict:
-    headers = {"Authorization": f"Bearer {config['api_key']}"}
+    headers = provider_headers(config)
     async with httpx.AsyncClient(timeout=config.get("request_timeout") or 180, follow_redirects=False) as client:
         response = await client.request(
             "POST" if payload is not None else "GET", config["base_url"].rstrip("/") + path,
@@ -120,7 +125,7 @@ async def download_result(config: dict, reference: str) -> bytes:
         raise MediaAIError("invalidArguments")
     async with httpx.AsyncClient(timeout=config.get("request_timeout") or 180, follow_redirects=False) as client:
         async with client.stream("GET", config["base_url"].rstrip("/") + path,
-                                 headers={"Authorization": f"Bearer {config['api_key']}"}) as response:
+                                 headers=provider_headers(config)) as response:
             response.raise_for_status()
             chunks = []
             size = 0

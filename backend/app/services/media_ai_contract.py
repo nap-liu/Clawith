@@ -38,7 +38,7 @@ READ_MEDIA_SCHEMA = {
     "properties": {
         "files": {**_FILES, "minItems": 1},
         "session_id": _SESSION,
-        "model_id": _MODEL,
+        "model_id": {**_MODEL, "description": "Optional enterprise model ID. An explicit model is used as selected. Omit to prefer a session/company model matching the media types. Provider support determines whether an input is accepted."},
         "prompt": {"type": "string", "minLength": 1,
                    "description": "Question or analysis request about the supplied media."},
     },
@@ -61,6 +61,7 @@ GENERATE_MEDIA_SCHEMA = {
                    "description": "Optional provider voice for speech. Omit to use the selected model's default."},
         "resolution": {"type": "string", "description": "Provider video resolution, for example 480P or 720P."},
         "size": {"type": "string", "description": "Provider image dimensions, for example 1024*1024."},
+        "parameters": {"type": "object", "description": "Optional generation parameters supported by the selected model, such as seed or voice settings. Model, prompt and reference files use the fields above."},
     },
     "required": ["prompt", "output_type"], "additionalProperties": False,
 }

@@ -17,6 +17,8 @@ from app.services.llm.client_registry import get_provider_spec
 from app.services.llm.utils import get_model_api_key
 from app.services.llm.failure_outcome import render_message
 from app.services.speech_model_selection import SpeechCredentialUnavailable, resolve_speech_model
+from app.services.model_headers import resolve_model_headers
+from app.services.llm.provider_parameters import merge_request_headers
 
 settings = get_settings()
 
@@ -29,6 +31,7 @@ class SpeechCredentials:
     base_url: str = ""
     transport: str = "dashscope"
     timeout: float = 120
+    extra_headers: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,7 @@ async def resolve_speech_credentials(db: AsyncSession, tenant_id: uuid.UUID | No
         raise SpeechCredentialUnavailable(render_message("speech.invalidEndpoint"))
     return SpeechCredentials(api_key=api_key, provider=model.provider, model=model.model,
                              base_url=endpoint, transport="dashscope" if native else "openai",
+                             extra_headers=tuple(resolve_model_headers(model).items()),
                              timeout=float(model.request_timeout or 120))
 
 
@@ -71,7 +75,9 @@ async def verify_speech_credentials(credentials: SpeechCredentials) -> None:
     task_id = str(uuid.uuid4())
     async with websockets.connect(
         credentials.base_url or settings.ASR_WEBSOCKET_URL,
-        additional_headers={"Authorization": f"Bearer {credentials.api_key}"},
+        additional_headers=merge_request_headers(
+            {"Authorization": f"Bearer {credentials.api_key}"}, dict(credentials.extra_headers),
+        ),
         open_timeout=10,
         close_timeout=5,
     ) as upstream:

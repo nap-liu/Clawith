@@ -7,6 +7,7 @@ from dataclasses import replace
 from app.config import get_settings
 from app.core.security import decrypt_data, encrypt_data
 from app.services.llm.runtime_model import RuntimeLLMModel
+from app.services.model_headers import encrypt_model_headers
 
 
 async def media_context_model(agent, request: dict) -> RuntimeLLMModel:
@@ -21,6 +22,7 @@ async def media_context_model(agent, request: dict) -> RuntimeLLMModel:
         id=uuid.uuid5(uuid.NAMESPACE_URL, config["base_url"] + "/" + config["understanding_model"]),
         tenant_id=agent.tenant_id, provider="openai", model=config["understanding_model"],
         api_key_encrypted=encrypt_data(snapshot["api_key"], get_settings().SECRET_KEY),
+        extra_headers_encrypted=encrypt_model_headers(snapshot.get("extra_headers")),
         base_url=config["base_url"] + "/compatible-mode/v1", label=config["understanding_model"],
         max_tokens_per_day=None, enabled=True, supports_vision=True, temperature=None,
         request_timeout=180, max_output_tokens=int(config["max_output_tokens"]),

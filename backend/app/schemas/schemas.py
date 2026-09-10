@@ -7,6 +7,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 
 from app.services.llm.reasoning import ReasoningEffort
 from app.services.model_capabilities import APIProtocol, InputModality, ModelPurpose
+from app.schemas.model_headers import ExtraHeaders
 
 
 # ─── Auth ───────────────────────────────────────────────
@@ -511,6 +512,7 @@ class TaskLogOut(BaseModel):
 
 
 class LLMModelCreate(BaseModel):
+    extra_headers: ExtraHeaders | None = None
     api_protocol: APIProtocol | None = None
     purposes: list[ModelPurpose] = Field(default_factory=lambda: ["conversation"], min_length=1)
     input_modalities: list[InputModality] | None = Field(default=None, min_length=1)
@@ -531,6 +533,7 @@ class LLMModelCreate(BaseModel):
     keep_recent_turns: int = Field(3, ge=3, le=50)
 
 class LLMModelUpdate(BaseModel):
+    extra_headers: ExtraHeaders | None = None
     api_protocol: APIProtocol | None = None
     purposes: list[ModelPurpose] | None = Field(None, min_length=1)
     input_modalities: list[InputModality] | None = Field(None, min_length=1)
@@ -557,6 +560,8 @@ class LLMModelClone(BaseModel):
 
 
 class LLMModelOut(BaseModel):
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    service_platform: str | None = None
     api_protocol: APIProtocol | None = None
     effective_api_protocol: str = "openai_compatible"
     purposes: list[ModelPurpose] = Field(default_factory=lambda: ["conversation"])

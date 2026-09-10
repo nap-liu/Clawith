@@ -7,9 +7,12 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from app.services import media_ai_bailian as bailian, media_ai_openai as standard
+from app.services import media_ai_tokenhub as tokenhub
 from app.services.llm.client import LLMError, LLMMessage, LLMResponse, create_llm_client
 from app.services.llm.client_registry import resolve_api_protocol
 from app.services.media_ai_io import MediaAIError, MediaInput, media_content
+from app.services.media_ai_headers import extra_headers
+from app.services.model_platform import model_service_platform
 
 
 def connection(config: dict) -> dict:
@@ -40,18 +43,26 @@ def _bailian_config(config: dict) -> dict:
 
 
 def generation_payload(config: dict, args: dict, media: list[MediaInput]) -> tuple[str, dict]:
-    _validate_inputs(config, media)
+    if (args.get("parameters") or {}).get("n", 1) != 1:
+        # The shared result stores one artifact; do not pay for dropped outputs.
+        raise MediaAIError("unsupportedOptions")
+    if tokenhub.supports(config):
+        return tokenhub.generation_payload(config, args, media)
     adapter = bailian if _native(config) else standard
     return adapter.generation_payload(config, args, media)
 
 
 async def request(config: dict, path: str, payload: dict | None = None, *, asynchronous=False) -> dict:
+    if tokenhub.supports(config):
+        return await tokenhub.request(config, path, payload)
     if _native(config):
         return await bailian.request(_bailian_config(config), path, payload, asynchronous=asynchronous)
     return await standard.request(config, path, payload)
 
 
 async def poll_generation(config: dict, task_id: str) -> dict:
+    if tokenhub.supports(config):
+        return await tokenhub.poll_generation(config, task_id)
     path = "/api/v1/tasks/" if _native(config) else "/videos/"
     return await request(config, path + quote(str(task_id), safe=""))
 
@@ -84,13 +95,24 @@ def _understanding_transport(config: dict, messages: list[LLMMessage]) -> tuple[
     )
     if protocol == "openai_responses" and bailian_endpoint and audio_video:
         return "openai_compatible", base_url.rstrip("/").removesuffix("/responses")
+    # TokenHub's Responses compatibility mode does not accept video inputs.
+    # Kimi K3 supports video through Chat; select before submitting, including
+    # video references retained in follow-up history.
+    # https://cloud.tencent.com/document/product/1823/130079
+    tokenhub_endpoint = model_service_platform("", base_url) == "tokenhub"
+    video = any(
+        part.get("type") in {"video_url", "input_video"}
+        for message in messages if isinstance(message.content, list)
+        for part in message.content if isinstance(part, dict)
+    )
+    if protocol == "openai_responses" and tokenhub_endpoint and config["model"] == "kimi-k3" and video:
+        return "openai_compatible", base_url.rstrip("/").removesuffix("/responses")
     return protocol, base_url
 
 
 async def understand_response(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None) -> LLMResponse:
     if not media and not history:
         raise MediaAIError("inputCombination")
-    _validate_inputs(config, media)
     content = media_content(prompt, media)
     messages = [LLMMessage(**message) for message in (history or [])]
     messages.append(LLMMessage(role="user", content=content))
@@ -105,6 +127,7 @@ async def _understanding_attempt(config, media, messages, *, attempts=None):
     client = create_llm_client(
         provider=config["provider"], api_key=config["api_key"], model=config["model"],
         base_url=base_url, timeout=config.get("request_timeout") or 180, api_protocol=protocol,
+        extra_headers=extra_headers(config),
     )
     emitted = False
 
@@ -147,14 +170,7 @@ async def _understanding_attempt(config, media, messages, *, attempts=None):
         raise error from exc
     finally:
         await client.close()
-    _validate_inputs(fallback, media)
     return await _understanding_attempt(fallback, media, messages, attempts=attempts)
-
-
-def _validate_inputs(config: dict, media: list[MediaInput]) -> None:
-    modalities = config.get("input_modalities")
-    if modalities is not None and any(item.kind not in modalities for item in media):
-        raise MediaAIError("inputCombination")
 
 
 async def understand(config: dict, prompt: str, media: list[MediaInput], *, history: list[dict] | None = None) -> tuple[str, dict]:

@@ -23,6 +23,7 @@ from app.services.media_ai_io import MediaAIError, load_media, load_understandin
 from app.services.media_ai_jobs import accept_result, create_intent, find_generation_row, finish_generation
 from app.services.media_ai_provider import connection, generation_payload, request, understand, understand_response
 from app.services.media_ai_tools import error_result
+from app.services.media_model_inputs import freeze_request_connection, history_modalities, resolve_loaded_inputs
 from app.services.read_media_compat import media_input_workspace
 from app.services.llm.failure_outcome import render_message
 from app.services.media_url_source import MediaUrlError
@@ -118,11 +119,38 @@ async def execute_media_turn(run_id, anchor, *, recovering=False) -> bool:
                     if recovering and meta.get("media_read_started"):
                         raise MediaAIError("analysisInterrupted")
                     if media_request["tool"] == "read_media":
-                        args, history = await prepare_media_context(agent, child, anchor, media_request)
-                        with media_input_workspace(agent.id, media_request):
-                            media, input_errors = await load_understanding_media(
-                                agent.id, args.get("files", []), loader=load_media,
+                        media, input_errors, prepared_files = [], [], None
+
+                        async def select_inputs(required):
+                            nonlocal config
+                            selected = await resolve_loaded_inputs(
+                                config, agent.tenant_id, required,
+                                explicit=bool(media_request["arguments"].get("model_id")),
                             )
+                            if selected is not config:
+                                config = connection(selected)
+                                freeze_request_connection(media_request, config)
+                                await _checkpoint_input(run_id, anchor.id, {"media_request": media_request})
+
+                        async def prepare_inputs(prepared_args, previous_context):
+                            nonlocal media, input_errors, prepared_files
+                            prepared_files = prepared_args.get("files", [])
+                            with media_input_workspace(agent.id, media_request):
+                                media, input_errors = await load_understanding_media(
+                                    agent.id, prepared_files, loader=load_media,
+                                )
+                            required = {item.kind for item in media}
+                            required.update(previous_context.get("input_modalities", []))
+                            required.update(config.get("retained_input_modalities", []))
+                            await select_inputs(required)
+
+                        args, history = await prepare_media_context(
+                            agent, child, anchor, media_request, prepare_inputs=prepare_inputs,
+                        )
+                        if args.get("files", []) != prepared_files:
+                            await prepare_inputs(args, {})
+                        input_modalities = {item.kind for item in media} | history_modalities(history)
+                        await select_inputs(input_modalities)
                         await _assert_subagent_running(run_id)
                         await _checkpoint_input(run_id, anchor.id, {"media_read_started": True})
                         if config.get("model_id"):
@@ -145,6 +173,9 @@ async def execute_media_turn(run_id, anchor, *, recovering=False) -> bool:
                     context = {
                         "sources": args.get("_context_sources", args.get("files", [])), "files": result.get("files", []),
                         "parameters": {key: args[key] for key in ("ratio", "size", "resolution", "voice", "duration") if key in args},
+                        "native_parameters": args.get("parameters", {}),
+                        "output_type": args.get("output_type"), "model_id": config.get("model_id"),
+                        **({"input_modalities": sorted(input_modalities)} if media_request["tool"] == "read_media" else {}),
                     }
                     await _checkpoint_input(run_id, anchor.id, {
                         "media_result": result, "media_context": context,
